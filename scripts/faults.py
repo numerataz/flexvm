@@ -54,6 +54,11 @@ p.add_argument("--image", default="public.ecr.aws/docker/library/busybox:1.36",
                help="container image of the app_log and bad_app_log scenarios' template (APP_TEMPLATE names a built one instead)")
 p.add_argument("scenarios", nargs="+")
 args = p.parse_args()
+# Started in the background by a non-interactive shell, SIGINT is ignored here and in every process
+# this starts: a flexvm client then ignores the SIGINT a scenario sends it, as it should
+# (`util::on_signal`). Caught here, it is at its default in them (as scripts/e2e.py does).
+if signal.getsignal(signal.SIGINT) == signal.SIG_IGN:
+    signal.signal(signal.SIGINT, signal.default_int_handler)
 BIN = os.path.abspath(args.bin)
 # The OCI architecture name of the host, which guests and the images they run share.
 ARCH = {"x86_64": "amd64", "aarch64": "arm64"}.get(os.uname().machine, os.uname().machine)
@@ -2035,6 +2040,16 @@ def issued_gen(host, ip):
     return issued()
 
 
+def saved_record(compat):
+    """The saved CPU record a migration request carries (`Saved::to_request`) for a VM state of a
+    template whose compatibility record is `compat`: on x86_64 its TSC rate, the template's as a VM
+    restored on its build host runs at, and no MSRs; on aarch64, tagged, the registers and
+    identification registers of the template's host, which the target must match."""
+    if compat.get("arch", "x86_64") == "aarch64":
+        return {"arch": "aarch64", "regs": compat["regs"], "id_regs": compat["id_regs"]}
+    return {"msrs": [], "tsc_khz": compat["tsc_khz"]}
+
+
 def migrate_in_raw(host, name, ip, source, gen=None, template=None):
     """Asks `host` to prepare an incoming migration as a source would, for a
     VM like `source` (its template id and memory regions, from `source_vm`).
@@ -2046,12 +2061,12 @@ def migrate_in_raw(host, name, ip, source, gen=None, template=None):
     h, port = host.addr.rsplit(":", 1)
     s = socket.create_connection((h, int(port)), timeout=60)
     mig = int.from_bytes(os.urandom(6), "little")
-    # The rate its state was saved at: the template's, as a VM restored on its build host runs at.
+    # What its state carries: the template's record, as a VM restored on its build host saves.
     # A forged template name (forged_peer) has none: the real template's then.
     with open(os.path.join(host.state, "templates", args.template, "meta.json")) as f:
-        tsc_khz = json.load(f)["compatibility"]["tsc_khz"]
+        saved = saved_record(json.load(f)["compatibility"])
     req = {"op": "migrate_in", "name": name, "mig": mig, "template": template or args.template, "id": template_id,
-           "ip": ip, "gen": gen, "rev": 0, "source": A.addr, "regions": regions, "msrs": [], "tsc_khz": tsc_khz}
+           "ip": ip, "gen": gen, "rev": 0, "source": A.addr, "regions": regions, **saved}
     s.sendall((json.dumps(req) + "\n").encode())
     buf = receive_until(s, lambda buf: not buf.endswith(b"\n"))
     return s, (json.loads(buf) if buf else {"ok": False, "error": "hung up"}), mig
@@ -4899,6 +4914,13 @@ def busy_guest(host, name):
     assert code == 0, out
 
 
+def flood_state(host, name):
+    """The guest's account of `busy_guest`'s flood, for a failed check: whether its socat still runs
+    (one that exited stops the flood; a send stuck on eth0 does not), and eth0's transmit counters."""
+    return sh(host, name, "echo socat: $(for f in /proc/[0-9]*/cmdline; do tr '\\0' ' ' <$f; echo; done | grep -c '^socat -u - UDP:169.254.1.1:9 '); "
+              "cd /sys/class/net/eth0/statistics && echo eth0 tx packets, dropped, errors: $(cat tx_packets tx_dropped tx_errors)")
+
+
 def tap_frames(host, name):
     """Frames the VM's Firecracker has put on its tap (and taken off it)."""
     tap = vms(host)[name]["tap"]
@@ -4911,7 +4933,8 @@ def guest_healthy(host, name, label, m):
     check(f"{label}: guest answers, no virtio errors", code == 0 and out.strip() == "0", out)
     before = tap_frames(host, name)[0]
     # Its flood (`busy_guest`) puts frames on the tap continuously: waited for, not counted over a fixed window.
-    check(f"{label}: guest network still sending", wait_for(lambda: tap_frames(host, name)[0] > before + 10, 10), (before, tap_frames(host, name)))
+    sending = wait_for(lambda: tap_frames(host, name)[0] > before + 10, 10)
+    check(f"{label}: guest network still sending", sending, (before, tap_frames(host, name)) + (() if sending else (flood_state(host, name),)))
     # An exec that fails (a timeout, the guest gone) is not a wrong hash: say which it was.
     got = md5(host, name, tries=3)
     if re.fullmatch(r"[0-9a-f]{32}", got):
@@ -4935,6 +4958,10 @@ def held_restore_frozen():
     n, path = "ft-held", ckpt_path("ft-held")
     m = setup(n)
     busy_guest(A, n)
+    # Its flood is sending before the checkpoint, so one that is not after the resume stopped across it.
+    before = tap_frames(A, n)[0]
+    flooding = wait_for(lambda: tap_frames(A, n)[0] > before + 10, 10)
+    check("held: guest network sending before the checkpoint", flooding, (before, tap_frames(A, n)) + (() if flooding else (flood_state(A, n),)))
     time.sleep(0.5)
     old_ip = vms(A)[n]["ip"]
     ok(checkpoint(A, n, path, stop=True))

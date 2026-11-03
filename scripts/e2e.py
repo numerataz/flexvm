@@ -117,6 +117,11 @@ p.add_argument("--selftest", action="store_true",
                help="check the scheduler without KVM: fake templates and workers, one worker that cannot be spawned")
 p.add_argument("cases", nargs="*", help="cases to run (default: all)")
 args = p.parse_args()
+# Started in the background by a non-interactive shell (`e2e.py ... &`, as over ssh), this has SIGINT
+# ignored, and so would every process it starts: a flexvm client then ignores the SIGINT (or Ctrl-C)
+# a case sends it, as it should (`util::on_signal`). Caught here, it is at its default in them.
+if signal.getsignal(signal.SIGINT) == signal.SIG_IGN:
+    signal.signal(signal.SIGINT, signal.default_int_handler)
 if args.faults is None:
     # The self-test schedules every CI shard's scenarios at once: listener-owning batches stay apart.
     args.faults = SHARDS[args.shard] + (" " + RECOVERY_FAULTS if args.selftest else "")
