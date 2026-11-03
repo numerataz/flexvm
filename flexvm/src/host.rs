@@ -6658,7 +6658,7 @@ pub(crate) mod tests {
         );
         let w = c.warnings().join("\n");
         assert!(!w.contains("dns 2001:db8::53"), "{w}");
-        assert!(w.contains("vm_ipv6_prefix fd00:0:0:7::/96 is set"), "{w}");
+        assert!(!w.contains("vm_ipv6_prefix fd00:0:0:7::/96 is set"), "no warning for the prefix itself: {w}");
         // Without the prefix, guests have no IPv6 address to reach them with: left out, with a warning.
         std::fs::write(&path, r#"{"dns": ["2001:db8::53", "192.0.2.53"]}"#).unwrap();
         let c = Host::open(&h.state, &h.run).unwrap().cfg;
