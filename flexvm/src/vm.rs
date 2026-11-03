@@ -980,7 +980,7 @@ impl Vm {
     }
 
     /// A failure leaves the clock unsure (see `leave`).
-    pub fn guest_net(&self, ip: Ipv4Addr, dns: Option<&str>) -> Result<()> {
+    pub fn guest_net(&self, ip: Ipv4Addr, dns: &[std::net::IpAddr]) -> Result<()> {
         self.running_here()?;
         let res = crate::guest::start(&self.vsock, ip, dns);
         if res.is_err() {

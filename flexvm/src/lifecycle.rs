@@ -143,7 +143,7 @@ impl Proc {
             return Ok(());
         }
         let res = crate::fault_result!(fault("readdress_fail") => Err("injected fault: setting the address failed".into());
-            vm.guest_net(vm.ip, self.host.config_now().dns.as_deref()));
+            vm.guest_net(vm.ip, &self.host.config_now().guest_dns()));
         res.map_err(|e| format!("vm {} runs, but setting its address {} failed: {e}; flexvm unpause {} tries again", vm.name, vm.ip, vm.name))?;
         vm.pending_net.store(false, Ordering::SeqCst);
         Ok(())

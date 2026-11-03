@@ -87,16 +87,16 @@ pub fn setup() -> io::Result<()> {
     Ok(())
 }
 
-/// Gives eth0 its per-VM /32 (and optionally a nameserver). Runs right after every restore, so it is
+/// Gives eth0 its per-VM /32 (and optionally nameservers, in order). Runs right after every restore, so it is
 /// one RTM_NEWADDR on a socket opened at template boot (then RTM_DELADDR of a fork's old address):
 /// SIOCSIFADDR, or deleting eth0's last address first, would flush the gateway route and ARP entry.
-pub fn configure(ip: Ipv4Addr, dns: Option<&str>) -> io::Result<()> {
+pub fn configure(ip: Ipv4Addr, dns: &[&str]) -> io::Result<()> {
     // The managed address, kept in snapshot state under the socket's ACK lock.
     static ADDRESS: Mutex<Option<Ipv4Addr>> = Mutex::new(None);
     let mut address = ADDRESS.lock().unwrap();
     let (fd, ifindex) = *NETLINK.get().ok_or_else(|| io::Error::other("no netlink socket"))?;
     update_address(&mut address, ip, |kind, ip| address_request(fd, ifindex, kind, ip))?;
-    if let Some(dns) = dns {
+    if !dns.is_empty() {
         resolv_conf(std::path::Path::new("/etc"), dns)?;
     }
     Ok(())
@@ -105,12 +105,12 @@ pub fn configure(ip: Ipv4Addr, dns: Option<&str>) -> io::Result<()> {
 /// Replaces DIR/resolv.conf with a rename, so a lookup never reads it empty, through DIR's fd. It
 /// follows no symlink (an image's link is replaced, not its target) and opens no special file. A
 /// bind-mounted file cannot be renamed over, so it is rewritten in place.
-fn resolv_conf(dir: &std::path::Path, dns: &str) -> io::Result<()> {
+fn resolv_conf(dir: &std::path::Path, dns: &[&str]) -> io::Result<()> {
     use std::fs::{File, OpenOptions};
     use std::io::Write;
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::fs::OpenOptionsExt;
-    let content = format!("nameserver {dns}\n");
+    let content: String = dns.iter().map(|d| format!("nameserver {d}\n")).collect();
     let dir = OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(dir)?;
     let (fd, name, tmp) = (dir.as_raw_fd(), c"resolv.conf", c"resolv.conf.tmp");
     let at = |name: &std::ffi::CStr, flags| {
@@ -214,26 +214,29 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         let dir = crate::test_util::TempDir::new("resolv");
         let (path, tmp) = (dir.join("resolv.conf"), dir.join("resolv.conf.tmp"));
-        resolv_conf(&dir, "1.1.1.1").unwrap();
+        resolv_conf(&dir, &["1.1.1.1"]).unwrap();
         let old = std::fs::File::open(&path).unwrap();
         let ino = old.metadata().unwrap().ino();
-        resolv_conf(&dir, "1.1.1.1").unwrap();
+        resolv_conf(&dir, &["1.1.1.1"]).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().ino(), ino);
-        resolv_conf(&dir, "8.8.8.8").unwrap();
+        resolv_conf(&dir, &["8.8.8.8"]).unwrap();
         assert_ne!(std::fs::metadata(&path).unwrap().ino(), ino);
         assert_eq!(std::io::read_to_string(old).unwrap(), "nameserver 1.1.1.1\n");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "nameserver 8.8.8.8\n");
         assert!(!tmp.exists());
+        resolv_conf(&dir, &["192.0.2.53", "2001:db8::53"]).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "nameserver 192.0.2.53\nnameserver 2001:db8::53\n");
+        resolv_conf(&dir, &["8.8.8.8"]).unwrap();
         // A failed replacement leaves the published file intact.
         std::fs::create_dir(&tmp).unwrap();
-        resolv_conf(&dir, "8.8.8.8").unwrap();
-        assert!(resolv_conf(&dir, "9.9.9.9").is_err());
+        resolv_conf(&dir, &["8.8.8.8"]).unwrap();
+        assert!(resolv_conf(&dir, &["9.9.9.9"]).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "nameserver 8.8.8.8\n");
         std::fs::remove_dir(&tmp).unwrap();
         // So does one that cannot rename over a directory.
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
-        assert!(resolv_conf(&dir, "1.1.1.1").is_err());
+        assert!(resolv_conf(&dir, &["1.1.1.1"]).is_err());
         assert!(!tmp.exists());
     }
 
@@ -252,7 +255,7 @@ mod tests {
         ];
         for plant in plants {
             plant();
-            resolv_conf(&dir, "1.1.1.1").unwrap();
+            resolv_conf(&dir, &["1.1.1.1"]).unwrap();
             assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "nameserver 1.1.1.1\n");
             assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
@@ -262,7 +265,7 @@ mod tests {
         // The directory itself is not followed either.
         let link = dir.join("link");
         std::os::unix::fs::symlink(&*dir, &link).unwrap();
-        assert!(resolv_conf(&link, "1.1.1.1").is_err());
+        assert!(resolv_conf(&link, &["1.1.1.1"]).is_err());
         assert!(!path.exists());
     }
 
@@ -278,7 +281,7 @@ mod tests {
         let c = |p: &std::path::Path| std::ffi::CString::new(p.as_os_str().as_bytes()).unwrap();
         let mounted = unsafe { libc::mount(c(&source).as_ptr(), c(&path).as_ptr(), std::ptr::null(), libc::MS_BIND, std::ptr::null()) };
         assert_eq!(mounted, 0, "bind mount: {}", std::io::Error::last_os_error());
-        let result = resolv_conf(&dir, "1.1.1.1");
+        let result = resolv_conf(&dir, &["1.1.1.1"]);
         unsafe { libc::umount2(c(&path).as_ptr(), libc::MNT_DETACH) };
         result.unwrap();
         assert_eq!(std::fs::read_to_string(&source).unwrap(), "nameserver 1.1.1.1\n");

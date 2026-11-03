@@ -1,5 +1,5 @@
 //! flexvm-init, PID 1 in the guest: sets up a writable overlay on the read-only (DAX) root, then
-//! serves one-line requests on vsock: `PING`, `START <ip> <secs.nanos> [dns]` (network and
+//! serves one-line requests on vsock: `PING`, `START <ip> <secs.nanos> [dns...]` (network and
 //! host clock), `CLOCK <secs.nanos>`, `FORKS`, and those in session.rs and app.rs.
 //! Replies are frames (proto.rs).
 
@@ -602,7 +602,9 @@ fn handle(out: &File, line: &str, statuses: &Statuses) -> io::Result<()> {
         "PING" => Ok("pong".to_string()),
         // Acked only once the clock is set, so "ok" means it is.
         "START" => match (parts.next().map(|ip| ip.parse()), parts.next().and_then(parse_time)) {
-            (Some(Ok(ip)), Some(now)) => net::configure(ip, parts.next()).map_err(|e| e.to_string()).and_then(|()| set_clock(now)).map(|_| "ok".into()),
+            (Some(Ok(ip)), Some(now)) => {
+                net::configure(ip, &parts.collect::<Vec<_>>()).map_err(|e| e.to_string()).and_then(|()| set_clock(now)).map(|_| "ok".into())
+            }
             _ => Err(format!("bad start request {arg:?}")),
         },
         "CLOCK" => parse_time(arg.trim()).ok_or_else(|| format!("bad time {arg:?}")).and_then(set_clock).map(|off| format!("ok {off}")),

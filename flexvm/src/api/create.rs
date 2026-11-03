@@ -314,6 +314,22 @@ fn refuse_unsupported(config: &Value, host_config: &Value, name: &str) -> Result
 
 /// The record of a container `name` created with docker's `body`: its `run` translated, checked against
 /// its image (`template`, pulled: else docker's "No such image", which docker's CLI answers with a pull).
+/// `IPAMConfig.IPv6Address`: the IPv4 address whose VM has it, which agrees with `IPv4Address` if
+/// that is given. Refused unless it is in `vm_ipv6_prefix`: no other IPv6 address is a VM's.
+fn ipv4_of(cfg: &crate::host::Config, v6: &str, ipv4: Option<&str>) -> Result<String, Error> {
+    let addr: std::net::Ipv6Addr = v6.parse().map_err(|_| Error::bad(format!("bad IPv6Address {v6:?}")))?;
+    let Some(prefix) = cfg.vm_ipv6_prefix else {
+        return Err(Error::unsupported(format!("IPv6Address {v6} without vm_ipv6_prefix in host.json")));
+    };
+    let Some(ip) = prefix.ipv4_of(addr) else {
+        return Err(Error::bad(format!("IPv6Address {v6} is outside vm_ipv6_prefix {prefix}: a VM's IPv6 address is the prefix and its IPv4 address")));
+    };
+    match ipv4.map(|v4| v4.parse::<std::net::Ipv4Addr>()) {
+        Some(Ok(v4)) if v4 != ip => Err(Error::bad(format!("IPv6Address {v6} is not IPv4Address {v4}'s, {}", prefix.vm(v4)))),
+        _ => Ok(ip.to_string()),
+    }
+}
+
 pub fn translate(api: &Api, name: &str, body: &Value) -> Result<Record, Error> {
     let mut config = body.clone();
     if let Some(c) = config.as_object_mut() {
@@ -406,8 +422,14 @@ pub fn translate(api: &Api, name: &str, body: &Value) -> Result<Record, Error> {
         if !matches!(net.as_str(), "bridge" | "flexvm" | "default") {
             return Err(Error::unsupported(format!("network {net:?}: every VM is on flexvm's one network (bridge)")));
         }
-        if let Some(ip) = e["IPAMConfig"]["IPv4Address"].as_str().filter(|i| !i.is_empty()) {
-            run.extend(["--ip".to_string(), ip.to_string()]);
+        let ipv4 = e["IPAMConfig"]["IPv4Address"].as_str().filter(|i| !i.is_empty());
+        // A VM's IPv6 address is derived from its IPv4 one (`Config::vm_ipv6`): one asked for names that.
+        let ipv6 = match e["IPAMConfig"]["IPv6Address"].as_str().filter(|i| !i.is_empty()) {
+            Some(v6) => Some(ipv4_of(&api.host.config_now(), v6, ipv4)?),
+            None => None,
+        };
+        if let Some(ip) = ipv4.map(String::from).or(ipv6) {
+            run.extend(["--ip".to_string(), ip]);
         }
     }
     run.push(generation.clone());
@@ -654,5 +676,35 @@ pub(super) mod tests {
         assert_eq!(r(json!({"Name": "on-failure", "MaximumRetryCount": 3})).unwrap().as_deref(), Some("on-failure:3"));
         assert_eq!(r(json!({"Name": "always", "MaximumRetryCount": 3})).unwrap_err().status, hyper::StatusCode::BAD_REQUEST);
         assert_eq!(r(json!({"Name": "sometimes"})).unwrap_err().status, hyper::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn an_ipam_ipv6_address_is_taken_only_as_the_derived_one() {
+        let (_d, api) = fixture();
+        let ipam = |v4: Option<&str>, v6: &str| {
+            let mut ipam = json!({"IPv6Address": v6});
+            if let Some(v4) = v4 {
+                ipam["IPv4Address"] = json!(v4);
+            }
+            let body = json!({"Image": "image", "NetworkingConfig": {"EndpointsConfig": {"bridge": {"IPAMConfig": ipam}}}});
+            translate(&api, "web", &body).map(|r| r.run.iter().position(|a| a == "--ip").map(|i| r.run[i + 1].clone()))
+        };
+        // No prefix: no IPv6 address is a VM's.
+        assert_eq!(ipam(None, "fd00:7::a09:7").unwrap_err().status, hyper::StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(ipam(Some("10.9.0.7"), "").unwrap().as_deref(), Some("10.9.0.7"));
+        let (path, tmp) = (api.host.state.join("host.json"), api.host.state.join("host.json.tmp"));
+        std::fs::write(&tmp, r#"{"vm_ipv6_prefix": "fd00:7::/96"}"#).unwrap();
+        std::fs::rename(&tmp, &path).unwrap();
+        // Alone it names the IPv4 address; with one, it must be that one's.
+        assert_eq!(ipam(None, "fd00:7::a09:7").unwrap().as_deref(), Some("10.9.0.7"));
+        assert_eq!(ipam(Some("10.9.0.7"), "fd00:7:0:0:0:0:a09:7").unwrap().as_deref(), Some("10.9.0.7"));
+        for (v4, v6, why) in [
+            (Some("10.9.0.8"), "fd00:7::a09:7", "is not IPv4Address 10.9.0.8's, fd00:7::a09:8"),
+            (None, "fd00:8::a09:7", "outside vm_ipv6_prefix fd00:7::/96"),
+            (None, "10.9.0.7", "bad IPv6Address"),
+        ] {
+            let e = ipam(v4, v6).unwrap_err();
+            assert!(e.status == hyper::StatusCode::BAD_REQUEST && e.message.contains(why), "{v6}: {e:?}");
+        }
     }
 }

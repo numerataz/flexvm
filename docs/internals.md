@@ -1184,7 +1184,8 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   `clock_realtime` (which adjusts kvmclock) has no effect: a VM's wall clock
   starts at the template's snapshot time, whether standby or not (minutes to
   days behind). The TSC keeps running while a VM is paused, so a pause adds no
-  further error. The agent's `START <ip> <unix time> [dns]`
+  further error. The agent's `START <ip> <unix time> [dns...]` (one word per
+  nameserver, an older agent taking the first)
   sets the address and steps `CLOCK_REALTIME` to the host's time, and
   answers only then. A standby VM gets its clock stepped (`CLOCK`) while it
   settles, so `START` at take finds it right and skips `clock_settime`, which
@@ -1284,7 +1285,7 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   produce a warning from both `info` and `listen`. `info` reports the effective
   allowlist as `derived.cluster_ips`. `host.json` is edited by hand; loading or
   reloading it validates it (`Config::validate`: range syntax, containment of
-  `vm_ips`, peers, underlays, `dns`, `announce_dev`; unknown keys refused). An
+  `vm_ips`, peers, underlays, `dns`, `vm_ipv6_prefix`, `announce_dev`; unknown keys refused). An
   invalid one refuses every command, and an invalid reload leaves the last
   valid configuration in use. A peer's report
   of its own range never authorizes an address here. Withdrawals of recorded

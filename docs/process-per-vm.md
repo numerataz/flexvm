@@ -163,7 +163,7 @@ STATE (default /var/lib/flexvm, on disk)
   images/                pulled container images: blobs/sha256/, rootfs/KEY.ext4 (see images.md)
   checkpoints/           stored checkpoints: ID/ and names/NAME -> ../ID
   auth.json              saved registry credentials (`flexvm login`), root-owned, mode 0600
-  host.json              host config, edited by hand (listen is `flexvm listen`'s): listen, peers, vm_ips, cluster_ips, underlay, peer_underlays, announce_dev, dns, reserve_mib, evict_mib; unset ones are derived where used
+  host.json              host config, edited by hand (listen is `flexvm listen`'s): listen, peers, vm_ips, cluster_ips, underlay, peer_underlays, announce_dev, dns, vm_ipv6_prefix, reserve_mib, evict_mib; unset ones are derived where used
   run.json               canonical run path, bound on first open under `.locks/open`'s flock; fsynced
   .locks/                root's locks (0700): open (held while a root `Host::open` binds or repairs the root),
                          host (the host lock, held for short critical sections only), evict (one eviction
@@ -268,7 +268,8 @@ regular file, not a symlink, owned by root or the user and writable by no
 one else; an unknown key is refused. Every load validates it
 (`Config::validate`: `vm_ips` inside `cluster_ips`, peers and `listen`
 `HOST:PORT` with nonzero ports, `peer_underlays` non-loopback and unicast,
-`dns` IPv4, `announce_dev` not empty). A validation error makes every command
+`dns` up to three IP addresses, `vm_ipv6_prefix` a usable /96 holding no
+`listen` or peer address, `announce_dev` not empty). A validation error makes every command
 refuse (`STATE/host.json: ... (see README: Configuration)`); running processes
 re-read it when its mtime or inode changes and keep the last valid one
 meanwhile. An explicit loopback or non-unicast `underlay` is refused on

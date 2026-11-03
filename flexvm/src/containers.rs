@@ -755,7 +755,7 @@ impl Filters {
                     let want_image = template::name_of(want).map(|n| template::image_of(&n));
                     image == *want || s("template") == *want || want_image.is_ok_and(|w| w == image)
                 }
-                "ip" => s("ip") == *want,
+                "ip" => s("ip") == *want || want.parse::<std::net::Ipv6Addr>().is_ok_and(|w| s("ipv6").parse() == Ok(w)),
                 _ => false,
             })
         })
@@ -782,9 +782,10 @@ pub enum Part {
 }
 
 /// The fields a template may name, and what `ps --json` calls them.
-const FIELDS: [(&str, &str); 14] = [
+const FIELDS: [(&str, &str); 15] = [
     ("Name", "name"),
     ("IP", "ip"),
+    ("IPv6", "ipv6"),
     ("Image", "image"),
     ("State", "state"),
     ("Status", "state"),
@@ -1437,6 +1438,10 @@ mod tests {
         assert!(f(&["status=exited"]).matches(&job) && !f(&["status=exited"]).matches(&db), "exited: that state alone");
         assert!(f(&["status=stopped"]).matches(&job));
         assert!(f(&["ip=10.0.0.3"]).matches(&db) && !f(&["ip=10.0.0.30"]).matches(&db));
+        // Or its IPv6 address (`vm_ipv6_prefix`), however it is written.
+        let mut db6 = db.clone();
+        db6["ipv6"] = json!("fd00:7::a00:3");
+        assert!(f(&["ip=fd00:7:0:0:0:0:a00:3"]).matches(&db6) && f(&["ip=10.0.0.3"]).matches(&db6) && !f(&["ip=fd00:7::a00:3"]).matches(&db));
         assert!(f(&["status=running"]).has_status() && !f(&["ip=1.2.3.4"]).has_status());
         for bad in ["name", "color=red", ""] {
             assert!(Filters::parse(&[bad.to_string()]).is_err(), "{bad:?}");
@@ -1459,6 +1464,9 @@ mod tests {
         let vms = [row("web", "running", "10.0.0.2", "nginx_latest"), json!({"name": "db", "state": "failed", "error": "died"})];
         let f = Format::parse("{{.Name}}\\t{{ .IP }}").unwrap();
         assert_eq!(f.render(&vms).unwrap(), "web\t10.0.0.2\ndb\t\n");
+        let mut v6 = vms[0].clone();
+        v6["ipv6"] = json!("fd00:7::a00:2");
+        assert_eq!(Format::parse("{{.IP}} {{.IPv6}}").unwrap().render(&[v6, vms[1].clone()]).unwrap(), "10.0.0.2 fd00:7::a00:2\n \n");
         assert_eq!(Format::parse("{{.name}}:{{.cpus}}").unwrap().render(&vms[..1]).unwrap(), "web:2\n", "any case; CPUs falls back to vCPUs");
         assert_eq!(Format::parse("{{.Status}} {{.Error}}").unwrap().render(&vms[1..]).unwrap(), "failed died\n");
         let table = Format::parse("table {{.Name}}\\t{{.State}}").unwrap().render(&vms).unwrap();
@@ -1744,6 +1752,23 @@ mod tests {
         let a = host::Addr { seen: 1, held: 1, holder: Some(name.into()), holder_id: Some(gone), ..host::Addr::default() };
         std::fs::create_dir_all(host.state.join("addrs")).unwrap();
         host::store(&host.state.join("addrs").join(ip), &a, true).unwrap();
+    }
+
+    #[test]
+    fn a_vms_ipv6_address_is_listed_and_inspected_only_with_a_prefix() {
+        let (d, mut host) = host("ipv6");
+        suspended_vm(&host, "web", "10.0.0.7");
+        let paths = template::Paths::new(&d.join("state"));
+        let listed = |host: &Host| crate::vms(host).into_iter().find(|v| v["name"] == "web").unwrap();
+        assert!(listed(&host).get("ipv6").is_none(), "{}", listed(&host));
+        host.configure(|c| {
+            c.vm_ipv6_prefix = Some(crate::net::Ipv6Prefix::parse("fd00:7::/96").unwrap());
+            Ok(())
+        })
+        .unwrap();
+        // Derived where shown, from the live host.json: what is recorded stays keyed by IPv4.
+        assert_eq!(listed(&host)["ipv6"], "fd00:7::a00:7");
+        assert_eq!(described(&host, &paths, "web", listed(&host))["ipv6"], "fd00:7::a00:7");
     }
 
     #[test]

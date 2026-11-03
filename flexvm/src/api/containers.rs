@@ -287,11 +287,11 @@ impl Detail {
 
     /// The network as docker's default bridge network: one flat routed network every VM is on.
     fn networks(&self) -> Value {
-        let ip = self.vm["ip"].as_str().unwrap_or_default();
+        let (ip, ipv6) = (self.vm["ip"].as_str().unwrap_or_default(), self.vm["ipv6"].as_str().unwrap_or_default());
         json!({"bridge": {
             "IPAMConfig": null, "Links": null, "Aliases": null, "MacAddress": "", "NetworkID": "flexvm", "EndpointID": if ip.is_empty() { "" } else { "flexvm" },
-            "Gateway": "", "IPAddress": ip, "IPPrefixLen": if ip.is_empty() { 0 } else { 32 }, "IPv6Gateway": "", "GlobalIPv6Address": "",
-            "GlobalIPv6PrefixLen": 0, "DriverOpts": null, "DNSNames": null,
+            "Gateway": "", "IPAddress": ip, "IPPrefixLen": if ip.is_empty() { 0 } else { 32 }, "IPv6Gateway": "", "GlobalIPv6Address": ipv6,
+            "GlobalIPv6PrefixLen": if ipv6.is_empty() { 0 } else { 128 }, "DriverOpts": null, "DNSNames": null,
         }})
     }
 
@@ -391,6 +391,9 @@ impl Detail {
                 "Ports": ports,
                 "IPAddress": self.vm["ip"].as_str().unwrap_or_default(),
                 "IPPrefixLen": if self.vm["ip"].is_string() { 32 } else { 0 },
+                "GlobalIPv6Address": self.vm["ipv6"].as_str().unwrap_or_default(),
+                "GlobalIPv6PrefixLen": if self.vm["ipv6"].is_string() { 128 } else { 0 },
+                "IPv6Gateway": "",
                 "Gateway": "",
                 "MacAddress": "",
                 "Networks": self.networks(),
@@ -865,6 +868,23 @@ mod tests {
         for name in ["api.v2", "api-v2"] {
             let d = Detail::read(&api, &vm(name, "running"));
             assert!(matches(&d, "name", "api.v2").unwrap());
+        }
+    }
+
+    #[test]
+    fn a_vms_ipv6_address_is_a_global_one_of_128_bits() {
+        let (_d, api) = fixture();
+        let mut v = vm("web", "running");
+        v["ip"] = json!("10.200.0.7");
+        let n = |v: &Value| Detail::read(&api, v).inspect()["NetworkSettings"].clone();
+        let s = n(&v);
+        assert_eq!((&s["GlobalIPv6Address"], &s["GlobalIPv6PrefixLen"]), (&json!(""), &json!(0)), "none without vm_ipv6_prefix");
+        assert_eq!(s["Networks"]["bridge"]["GlobalIPv6Address"], "");
+        v["ipv6"] = json!("fd00:7::ac8:7");
+        let s = n(&v);
+        for s in [&s, &s["Networks"]["bridge"]] {
+            assert_eq!((&s["IPAddress"], &s["IPPrefixLen"]), (&json!("10.200.0.7"), &json!(32)), "{s}");
+            assert_eq!((&s["GlobalIPv6Address"], &s["GlobalIPv6PrefixLen"]), (&json!("fd00:7::ac8:7"), &json!(128)), "{s}");
         }
     }
 
