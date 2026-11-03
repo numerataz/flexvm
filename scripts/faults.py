@@ -23,6 +23,10 @@ up 1500 MiB or more, such as pages_dead, need that.)
 Each scenario ends `ok`, `FAILED` or `SKIPPED` (this host lacks what it tests,
 or it restarts listeners it was not given: --no-listeners); --no-skips counts
 a skip as a failure. BENCHMARKS (ckpt_stall) only run when named.
+
+Scenarios that need KVM (they run VMs, or use templates) are tagged
+@needs_kvm: scripts/e2e.py runs only the untagged ones where /dev/kvm is
+unusable (--no-kvm).
 """
 from contextlib import ExitStack, contextmanager, suppress
 
@@ -567,6 +571,14 @@ class Skip(Exception):
     """This host lacks what the scenario tests: it ends SKIPPED (a failure with --no-skips), never ok."""
 
 
+def needs_kvm(scenario):
+    """Tags a scenario that needs KVM: it runs a VM, or uses a template (which a VM built). scripts/e2e.py
+    leaves the tagged ones out on a host without a usable /dev/kvm (it reads the tags from this source) and
+    runs the rest there, so an untagged scenario that needs a VM fails there, not passes."""
+    scenario.needs_kvm = True
+    return scenario
+
+
 def log(host, name):
     """What VM processes named `name` on `host` wrote (incoming ones included), removed ones too."""
     try:
@@ -903,6 +915,7 @@ def resume_suspended(host, name):
 # --- migration --------------------------------------------------------------
 
 
+@needs_kvm
 def basic(swept=False):
     """A migration there and back. `swept`: a record left by a killed source (`source_killed_basic`) goes
     at a sweep, not at a `done`; each try runs one on A (which settles what it owes) and then on B."""
@@ -936,6 +949,7 @@ EVAC_MAX = int(os.environ.get("EVAC_MAX", "12"))
 EVAC_MIB = int(os.environ.get("EVAC_MIB", "32"))
 
 
+@needs_kvm
 def evacuate():
     """Many small VMs, memory dirtied in each, all migrated A->B at once (post-copy): each arrives running
     with its address and memory, no address is on both hosts, every release completes, B's records retire
@@ -1033,6 +1047,7 @@ def evacuate():
                 kill(h, n)
 
 
+@needs_kvm
 def route():
     n = "ft-route"
     m = setup(n)
@@ -1047,6 +1062,7 @@ def route():
     check("route: md5 intact", md5(B, n) == m)
 
 
+@needs_kvm
 def lost_ack():
     n = "ft-lost-ack"
     m = setup(n)
@@ -1061,6 +1077,7 @@ def lost_ack():
     check("lost ack: md5 intact", md5(B, n) == m)
 
 
+@needs_kvm
 def unknown():
     n = "ft-unknown"
     m = setup(n)
@@ -1076,6 +1093,7 @@ def unknown():
     check("unknown: md5 intact", md5(B, n) == m)
 
 
+@needs_kvm
 def refused():
     n = "ft-refused"
     m = setup(n)
@@ -1091,6 +1109,7 @@ def refused():
         check("refused: a non-peer is told it is not one", not r["ok"] and "is not a peer of" in r.get("error", ""), r)
 
 
+@needs_kvm
 def pages_blip():
     n = "ft-pages-blip"
     m = setup(n, mib=400)
@@ -1112,6 +1131,7 @@ def pages_blip():
     check("pages blip: back on A only, md5 intact", w == {A: "running"} and back == m, (w, back))
 
 
+@needs_kvm
 def pages_dead_restore():
     n = "ft-pages-dead-restore"
     m = setup(n)
@@ -1128,6 +1148,7 @@ def pages_dead_restore():
     check("pages dead at restore: md5 intact on A", md5(A, n) == m)
 
 
+@needs_kvm
 def pages_dead():
     """The source's page server stays down mid-pull: the target's VM dies
     without its memory, and the source, never released, runs its copy again."""
@@ -1142,6 +1163,7 @@ def pages_dead():
     check("pages dead: md5 intact on A", md5(A, n) == m)
 
 
+@needs_kvm
 def resume_kill():
     """Firecracker dies right after a restored VM's resume was sent, so the
     guest may have run: nothing loads the VM again there (that could repeat
@@ -1176,6 +1198,7 @@ def resume_kill():
     check("resume kill: the name runs again", r["ok"], r)
 
 
+@needs_kvm
 def prepared_retry():
     """A migration target whose prepared Firecracker dies before the load,
     its pager having seen it go (`kill_prepared`), loads once more on a fresh
@@ -1203,6 +1226,7 @@ def flood_udp(ip, stop):
             time.sleep(0.0005)
 
 
+@needs_kvm
 def quiet_source():
     """While the source is paused, its devices must not touch guest memory:
     no packets reach its tap and host exec sessions are closed."""
@@ -1258,6 +1282,7 @@ def quiet_source():
     print(f"quiet source: downtime {r['downtime_ms']} ms, checkpoint {r['checkpoint_ms']} ms")
 
 
+@needs_kvm
 def source_killed():
     """SIGKILLs the source VM process mid-pull: its Firecracker dies with it,
     and the target fails cleanly."""
@@ -1273,6 +1298,7 @@ def source_killed():
     kill(B, n)
 
 
+@needs_kvm
 def target_killed():
     """The target VM process is SIGKILLed after it resumed the VM, before it
     had all the memory and before the source knew. The source must never let
@@ -1322,6 +1348,7 @@ def target_killed():
     check("target destroyed: running nowhere", where(n) == {}, where(n))
 
 
+@needs_kvm
 def exec_race():
     """Execs keep starting while the VM migrates there and back: every exec
     finishes, is refused, or says where the VM moved (none hangs), and the
@@ -1368,6 +1395,7 @@ def exec_race():
     check("exec race: md5 intact", md5(A, n) == m)
 
 
+@needs_kvm
 def guest_calls():
     """Guest calls during and just after a migration: execs started while the
     VM moves (the source's page server down for a while, so the guest is
@@ -1442,6 +1470,7 @@ def guest_calls():
     check("guest calls: exec after the lost reply", sh(B, n, "echo hi") == (0, "hi"))
 
 
+@needs_kvm
 def exec_stalled_cap():
     """#1030. 24 abandoned execs (their clients gone, their commands running: held for 10 minutes) and 40 exec
     clients that stop reading take all of the guest's 64 session slots, so the next exec is refused. The 40
@@ -1499,6 +1528,7 @@ def exec_stalled_cap():
     cleanup(n)
 
 
+@needs_kvm
 def exec_burst():
     """#702. 32 execs started at once into one VM all run. The guest reads at most 16 commands at a
     time and asks the rest to try again: with all 16 readers held by commands still arriving, execs
@@ -1550,6 +1580,7 @@ def exec_burst():
     cleanup(n)
 
 
+@needs_kvm
 def exec_background():
     """An exec whose command leaves a background process holding its output returns once the
     shell exits (the process keeps running), and such execs never use up the guest agent's 64
@@ -1842,6 +1873,7 @@ def exec_background():
     sh(A, n, f"rm -f {knob}")
 
 
+@needs_kvm
 def exec_pause_grace():
     """#388: output waits 30 s for a dropped client, counting only time the guest ran. A command whose
     output overflows its session's ring, whose client left just before a pause longer than that, loses
@@ -1905,6 +1937,7 @@ def exec_pause_grace():
     check("exec grace: then the exit", code == 0 and end == 6 + len(expected), (code, end))
 
 
+@needs_kvm
 def exec_ckpt_stalled():
     """#1016: a checkpoint (the VM running on) cuts the guest's connections, an exec's whose client has stopped
     reading too. Its relay attaches again once the VM runs, so the guest goes on holding the output for the
@@ -1937,6 +1970,7 @@ def exec_ckpt_stalled():
     rm_ckpt(path)
 
 
+@needs_kvm
 def guest_hang():
     """A guest that never answers its agent (Firecracker stopped) must not
     hold anything forever: execs fail within their deadline, and once it is
@@ -2049,6 +2083,7 @@ def source_vm():
     return v["template_id"], v["regions"]
 
 
+@needs_kvm
 def prepare_disconnect():
     """A source that goes away after the target prepared leaves nothing behind."""
     n, ip = "ft-prep-gone", spare(B, 0)
@@ -2061,6 +2096,7 @@ def prepare_disconnect():
     check("prepare disconnect: migration fenced as aborted", st["outcome"] == "aborted", st)
 
 
+@needs_kvm
 def prepare_trickle():
     """A source that trickles its header is cut off by one deadline (here 2 s,
     `short_incoming`), however much it keeps sending."""
@@ -2088,6 +2124,7 @@ def prepare_trickle():
     nothing_left("prepare trickle", n, ip)
 
 
+@needs_kvm
 def prepare_fail():
     """A target that fails once everything is prepared refuses before the
     source pauses; the VM never stops running."""
@@ -2106,6 +2143,7 @@ def prepare_fail():
     check("prepare fail: md5 intact on B", md5(B, n) == m)
 
 
+@needs_kvm
 def arrival_flood():
     """Arrivals waiting for a held host lock (#486): at most 4 from one peer (8 in all), more
     refused at once (the source's VM runs on), each refused once its preparation time (7 s) is
@@ -2157,6 +2195,7 @@ def arrival_flood():
 
 
 
+@needs_kvm
 def arrival_cap_restart():
     """Arrivals outlive their listener (#521): a restarted one counts the earlier one's still
     going, from their locked `.incoming-*` logs, and refuses one past the peer's quota (4) at
@@ -2185,6 +2224,7 @@ def arrival_cap_restart():
     lock = os.path.join(B.run, "vms", ".locks", "ft-cap-x.lock")
     check("arrival cap restart: and gives up too", wait_for(lambda: not os.path.exists(lock), 10))
 
+@needs_kvm
 @with_third_peer
 def abort_superseded():
     """A migration that aborts after the source paused does not resume the
@@ -2307,6 +2347,7 @@ def reached_records(host):
     return sorted(f for f in os.listdir(d) if f.isdigit()) if os.path.isdir(d) else []
 
 
+@needs_kvm
 def leave_fail():
     """#460: leaving fails right after the address was lent (`leave_fail`): the VM, never paused,
     runs on; its loan and leaving mark are undone in one write and the prepared target gives up.
@@ -2345,6 +2386,7 @@ def leave_fail():
     check("leave and stay fail: its end frees the loan", wait_for(lambda: not addr(A, ip).get("lent") and not addr(A, ip).get("holder"), 10), addr(A, ip))
 
 
+@needs_kvm
 def capture_fail():
     """#460: the source fails after it became one, before its target has a state: parking the
     balloon (`park_fail`, still running), creating the snapshot (`snapshot_fail`, paused), reading
@@ -2372,6 +2414,7 @@ def capture_fail():
     check("capture fail: md5 intact on B", md5(B, n) == m)
 
 
+@needs_kvm
 def abort_gen_fail():
     """#460: an abort (the target refused a bad preload page) that cannot read its address's
     record (`abort_gen_fail`) cannot tell whether the address went to another VM: the source
@@ -2405,6 +2448,7 @@ def abort_gen_fail():
     kill(A, n2)
 
 
+@needs_kvm
 def commit_fail():
     """#460: the target's commit fails right before ownership moves (`commit_fail`, after the
     route it installs when it does not share its source's routes). Its VM, loaded and never run
@@ -2450,6 +2494,7 @@ def commit_fail():
     check("commit fail: md5 intact on B", md5(B, n) == m)
 
 
+@needs_kvm
 def commit_fail_routed():
     """#460: `commit_fail` between hosts that do not share routes: each host in a network
     namespace of its own on one bridge (as scripts/nettest.sh has them), so the target installs
@@ -2593,6 +2638,7 @@ def glob_idle(pid, start):
         return []
 
 
+@needs_kvm
 @with_third_peer
 def abort_stay_fail():
     """#460: an abort (the target refused a bad preload page) runs the source here again, then
@@ -2640,6 +2686,7 @@ def abort_stay_fail():
     check("abort stay fail: its end frees the loan", wait_for(lambda: not addr(A, ip).get("lent") and not addr(A, ip).get("holder"), 10), addr(A, ip))
 
 
+@needs_kvm
 def same_host_order():
     """#78: hosts sharing a network namespace share routes, so the target must
     not route the VM's address to its tap before the packets the source's
@@ -2648,6 +2695,7 @@ def same_host_order():
     udp_across_migrations("same host order", "ft-same-host")
 
 
+@needs_kvm
 def same_host_slow_route():
     """#136: the target's own hold, which takes the address over from the
     source's, lets go of it with a route change that can wait long (for RTNL,
@@ -2656,6 +2704,7 @@ def same_host_slow_route():
     udp_across_migrations("same host slow route", "ft-slow-route", "release_stall")
 
 
+@needs_kvm
 def same_host_late_handover():
     """#136: when the target lets go of its hold, packets routed to the VM
     from the switch on wait in the kernel until the hold has handed over
@@ -2666,6 +2715,7 @@ def same_host_late_handover():
     udp_across_migrations("same host late handover", "ft-late", "release_late")
 
 
+@needs_kvm
 def same_host_qdisc_backlog():
     """#817: a sender that looked the route up just before the source's hold hands its packet
     to the tap's qdisc, not yet to the tap, when the tap goes down after the pause
@@ -2682,6 +2732,7 @@ def same_host_qdisc_backlog():
     check("same host qdisc backlog: each later source's qdisc held packets past the pause", len(held) == 2 and all(held), held)
 
 
+@needs_kvm
 def same_host_hold_route_fail():
     """#512: the target's hold fails to take the address over from the source's
     (`hold_route_fail`: its route change fails). It routes the address to its
@@ -2712,6 +2763,7 @@ def same_host_hold_route_fail():
     check("same host hold plug fail: nothing re-sent into the loop", not looped, looped)
 
 
+@needs_kvm
 def same_host_flood():
     """#136: traffic that keeps arriving while the target lets go of its hold
     (10k datagrams/s, its route change made slow by `release_stall`) never
@@ -2720,6 +2772,7 @@ def same_host_flood():
     udp_across_migrations("same host flood", "ft-flood", "release_stall", burst=10)
 
 
+@needs_kvm
 def same_host_backlog():
     """#136: frames queued on the source's tap when its VM pauses went with the tap,
     uncounted. `tap_backlog` stops the source's Firecracker for 200 ms at 10k datagrams/s
@@ -2731,6 +2784,7 @@ def same_host_backlog():
     udp_across_migrations("same host backlog", "ft-backlog", burst=10, source_fault="tap_backlog")
 
 
+@needs_kvm
 def same_host_long_hold():
     """#1245: a source held its address long (a slow target: `admitted_stall` makes it 3 s), so
     more packets than the target's tap queues (3k datagrams/s: some 9000, its queue 4096) are
@@ -2739,6 +2793,7 @@ def same_host_long_hold():
     udp_across_migrations("same host long hold", "ft-long-hold", "admitted_stall", burst=3)
 
 
+@needs_kvm
 def same_host_bulk_tcp():
     """#411: a bulk TCP download into a VM (the host's TCP sends TSO frames to its tap) moving
     there and back: nothing held is dropped, and the download goes on after each move. (TSO
@@ -2785,6 +2840,7 @@ def same_host_bulk_tcp():
     check("bulk tcp: the download goes on after each move", all(m > 0 for m in moved), (moved, sent[1:]))
 
 
+@needs_kvm
 def ckpt_backlog():
     """#136: a keep-running checkpoint whose VM is paused with frames still queued on its
     tap (`tap_backlog_stuck`: its Firecracker stopped until the wait for the guest to take
@@ -2829,6 +2885,7 @@ def ckpt_backlog():
     check("ckpt backlog: nothing discarded from its tap", "dropped" not in vm_log, [l for l in vm_log.splitlines() if "dropped" in l])
 
 
+@needs_kvm
 def ckpt_paused_backlog():
     """A paused VM's checkpoint (#207): its Firecracker reads nothing from the tap while paused, so frames sent to it
     stay queued, and the drain does not wait for them (#219); the checkpoint returns it to paused with them still there,
@@ -3124,6 +3181,7 @@ def vm_alive(host, name):
     return bool(pid) and bool(vms(host).get(name, {}).get("pid"))
 
 
+@needs_kvm
 def rx_stall():
     """#149: a guest stopped receiving altogether after a handoff. Under a
     steady inbound UDP stream, migrate, checkpoint, checkpoint --stop and
@@ -3241,6 +3299,7 @@ def rx_stall():
           f"{len(stalls)} stalls in {sum(done.values())} operations {done}, sent {sent[0]}")
 
 
+@needs_kvm
 @with_third_peer
 def handoff_superseded():
     """A same-host arrival routes its address only after the held packets
@@ -3266,6 +3325,7 @@ def handoff_superseded():
     kill(B, n)
 
 
+@needs_kvm
 def delayed_announce():
     """#256: the source's announcement of a VM that reaches a peer only after
     its migration committed (held up in B's listener by `route_stall`; B
@@ -3294,6 +3354,7 @@ def delayed_announce():
     kill(B, n)
 
 
+@needs_kvm
 def delayed_announce_handoff():
     """#492, #533: as delayed_announce, but the source's late announcement reaches
     B while B's handoff is still under way (held at `handoff_gate`). B records
@@ -3328,6 +3389,7 @@ def delayed_announce_handoff():
     kill(B, n)
 
 
+@needs_kvm
 def handoff_onward():
     """#1028: a migration onward waits for the arrival's packet hand-off, whose injections, link-up and
     route changes would otherwise land during or after its device snapshot. B's hand-off of A's held
@@ -3359,6 +3421,7 @@ def handoff_onward():
     kill(A, n)
 
 
+@needs_kvm
 def handoff_rename():
     """#1028: a rename waits for the arrival's packet hand-off. Its ownership checks go by the VM's name:
     renamed between the address's new holder and the process's new name, the hand-off would read the
@@ -3402,6 +3465,7 @@ def echoes(ip, port=7000):
 SO_TIMESTAMPNS = getattr(socket, "SO_TIMESTAMPNS", 35)
 
 
+@needs_kvm
 def announce_arp_timer():
     """#311: a VM's second gratuitous ARP goes out about 200 ms after its first,
     on a timer of its own: a peer that holds up the announcement (B, with
@@ -3467,6 +3531,7 @@ def announce_arp_timer():
     kill(A, n)
 
 
+@needs_kvm
 def prepare_fail_announce():
     """#256: a target that claims the next revision and then fails to prepare
     never outranks its running source: the source's announcement, held up in
@@ -3488,6 +3553,7 @@ def prepare_fail_announce():
     kill(A, n)
 
 
+@needs_kvm
 def reconcile_announce():
     """#256: a source that never heard its target commit (ack lost, status
     unavailable) runs again once the target dies mid-pull (`pages_slow` keeps
@@ -3511,6 +3577,7 @@ def reconcile_announce():
     kill(A, n)
 
 
+@needs_kvm
 def target_renamed():
     """#1117: the target's name resolving elsewhere during a migration (here, to the source's own listener,
     which never saw it and so says aborted) changes nothing: the source asks only where the migration reached
@@ -3598,6 +3665,7 @@ def owed(host):
     return sorted(f for f in os.listdir(d) if f.isdigit()) if os.path.isdir(d) else []
 
 
+@needs_kvm
 def reconcile_kill():
     """#350, #358: SIGINT, SIGQUIT and flexvm kill end a source that never heard its target's
     outcome (ack lost, status unavailable) within seconds, as they do a VM
@@ -3774,6 +3842,7 @@ def reconcile_kill():
     kill(A, n + "-again")
 
 
+@needs_kvm
 def resume_pull_lock():
     """#334: resuming an arriving VM waits for its pages (`pages_slow` keeps
     them coming) before it takes the host lock, so other operations on that
@@ -3799,6 +3868,7 @@ def resume_pull_lock():
     cleanup(n)
 
 
+@needs_kvm
 def page_conns():
     """#335: a peer that knows the migration holds many page connections open
     (more than the 256 control connections a VM process takes): page
@@ -3852,6 +3922,7 @@ def page_conns():
     check("page conns: migration completed, md5 intact", st["released"] is True and where(n) == {B: "running"} and md5(B, n) == m, (st, where(n)))
 
 
+@needs_kvm
 def page_refusals():
     """#352: 64 page requests for a migration that is not this VM's, each
     then trickling a byte just under a second apart (a per-read timeout
@@ -3975,6 +4046,7 @@ def forget_peer_route(ip, gen):
     subprocess.run(["ip", "route", "del", f"{ip}/32"], capture_output=True)
 
 
+@needs_kvm
 @with_third_peer
 def arrival_abort_route():
     """#90: an arrival that fails before it commits leaves the target host's
@@ -3997,6 +4069,7 @@ def arrival_abort_route():
     forget_peer_route(ip, gen)
 
 
+@needs_kvm
 @with_third_peer
 def arrival_killed_route():
     """#90: an arrival SIGKILLed before it commits (no cleanup runs) leaves
@@ -4030,6 +4103,7 @@ def rootfs_link(d, template):
     os.symlink(json.load(open(os.path.join(A.state, "templates", template, "meta.json")))["rootfs"], os.path.join(d, "rootfs"))
 
 
+@needs_kvm
 def fc_prepare():
     """Firecracker's prepared load (firecracker/0002-*.patch): refuses a second
     prepare, a snapshot of another layout, and a load after boot config."""
@@ -4089,6 +4163,7 @@ def fc_prepare():
     run_fc("config", config_between)
 
 
+@needs_kvm
 def forged_vmstate():
     """#548: a vmstate whose devices are not the template's (an extra block
     device on a host file, an extra net device naming another tap) is refused
@@ -4231,6 +4306,7 @@ def forged_vmstate():
         subprocess.run(["rm", "-rf", work])
 
 
+@needs_kvm
 def slow_preload():
     """The pages preloaded with the vmstate arrive late (`slow_preload`): the
     target's load goes ahead (fetching what it needs itself), but it commits
@@ -4265,6 +4341,7 @@ def slow_preload():
     check("slow preload: md5 intact", md5(B, n) == m)
 
 
+@needs_kvm
 def bad_preload():
     """A source whose header names a preload page past guest memory (page
     u64::MAX, `bad_preload`): the target refuses the header at once, rather
@@ -4336,25 +4413,31 @@ def marker_id(host, name):
     return out if code == 0 else None
 
 
-# For each vCPU k after the first, reads the TSC on vCPU 0, k, 0 (rdtsc, run from an executable
-# page), ten times, and prints the tightest bracket: "k skew bracket", in seconds, where skew is
-# vCPU k's TSC minus the midpoint of vCPU 0's two readings around it. The read on k happened
-# somewhere in the bracket, so the true difference is within bracket/2 of skew.
+# For each vCPU k after the first, reads the counter on vCPU 0, k, 0 (run from an executable page: rdtsc
+# on x86_64, isb; mrs cntvct_el0 on aarch64, the guest's arch being the host's), ten times, and prints the tightest
+# bracket: "k skew bracket", in seconds, where skew is vCPU k's counter minus the midpoint of vCPU 0's
+# two readings around it. The read on k happened somewhere in the bracket, so the true difference is
+# within bracket/2 of skew. The counter's rate: the TSC's (tsc_freq_khz, else cpu MHz), or CNTFRQ_EL0.
 TSC_SKEW = r"""
 import ctypes, mmap, os
+arm = os.uname().machine == "aarch64"
+code = bytes.fromhex("df3f03d540e03bd5c0035fd6" "00e03bd5c0035fd6") if arm else bytes([0x0f, 0x31, 0x48, 0xc1, 0xe2, 0x20, 0x48, 0x09, 0xd0, 0xc3])
 buf = mmap.mmap(-1, 4096, prot=mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC)
-buf.write(bytes([0x0f, 0x31, 0x48, 0xc1, 0xe2, 0x20, 0x48, 0x09, 0xd0, 0xc3]))
-rdtsc = ctypes.CFUNCTYPE(ctypes.c_uint64)(ctypes.addressof(ctypes.c_char.from_buffer(buf)))
-f = "/sys/devices/system/cpu/cpu0/tsc_freq_khz"
-hz = int(open(f).read()) * 1e3 if os.path.exists(f) else float(next(l.split(":")[1] for l in open("/proc/cpuinfo") if l.startswith("cpu MHz"))) * 1e6
+buf.write(code)
+fn = lambda off: ctypes.CFUNCTYPE(ctypes.c_uint64)(ctypes.addressof(ctypes.c_char.from_buffer(buf)) + off)
+counter, f = fn(0), "/sys/devices/system/cpu/cpu0/tsc_freq_khz"
+if arm:
+    hz = fn(12)()
+else:
+    hz = int(open(f).read()) * 1e3 if os.path.exists(f) else float(next(l.split(":")[1] for l in open("/proc/cpuinfo") if l.startswith("cpu MHz"))) * 1e6
 for k in sorted(os.sched_getaffinity(0) - {0}):
     best = None
     for _ in range(10):
         t = []
         for cpu in (0, k, 0):
             os.sched_setaffinity(0, {cpu})
-            t.append(rdtsc())
-        if best is None or t[2] - t[0] < best[1]:
+            t.append(counter())
+        if best is None or (t[2] - t[0]) / hz < best[1]:
             best = ((t[1] - (t[0] + t[2]) / 2) / hz, (t[2] - t[0]) / hz)
     print(k, best[0], best[1])
 """
@@ -4457,6 +4540,7 @@ def fv_hash(b):
     return f"{word(h, int.from_bytes(b[n * 8:].ljust(8, b'\0'), 'little')):016x}"
 
 
+@needs_kvm
 def checkpoint_restore():
     """checkpoint --stop on A, restore on B: file contents, a running
     process, the address and an open TCP connection all survive. B borrows
@@ -4494,6 +4578,7 @@ def checkpoint_restore():
     rm_ckpt(path)
 
 
+@needs_kvm
 def checkpoint_fork():
     """checkpoint --keep-running: the VM goes on; the checkpoint restores as
     a second VM elsewhere, but only under a new address."""
@@ -4515,6 +4600,7 @@ def checkpoint_fork():
     rm_ckpt(path)
 
 
+@needs_kvm
 def checkpoint_corrupt():
     """Restores refuse a checkpoint whose metadata does not check out or whose
     template differs, and a VM whose page data turns out corrupt fails
@@ -4595,6 +4681,7 @@ def staged_mib():
     return n
 
 
+@needs_kvm
 def checkpoint_crash():
     """The VM process dies while writing a checkpoint: no checkpoint appears
     (not even a partial one restores), and the next checkpoint to the same
@@ -4635,6 +4722,7 @@ def checkpoint_crash():
     rm_ckpt(path)
 
 
+@needs_kvm
 def pause_resume():
     n = "ft-pause"
     m = setup(n)
@@ -4686,6 +4774,7 @@ def pause_resume():
     check("paused migrate: runs on B after resume, md5 intact", md5(B, n) == m)
 
 
+@needs_kvm
 def pause_lost():
     """A pause whose answer is lost (it landed all the same): the VM process asks Firecracker which state it is in and
     records it, so a SIGCONT resumes it, instead of believing it runs while it sits paused for good."""
@@ -4755,6 +4844,7 @@ def pause_lost():
     rm_ckpt(path)
 
 
+@needs_kvm
 def signals():
     """SIGTERM on a migration source waits for the release (no suspend);
     SIGINT destroys; a suspend is not undone by the SIGCONT systemd sends
@@ -4829,6 +4919,7 @@ def guest_healthy(host, name, label, m):
     check(f"{label}: no OOM kills in the guest", code == 0 and out.strip() == "0", out)
 
 
+@needs_kvm
 def held_restore_frozen():
     """A checkpoint restored with --paused (loaded with resume_vm:false) is
     held paused with its devices frozen too: while frames arrive on its tap,
@@ -4901,6 +4992,7 @@ def fc_api(sock, method, path, body=None, timeout=None):
     return json.loads(out) if out.strip() else None
 
 
+@needs_kvm
 def checkpoint_hotplug():
     """A virtio-mem resize still in flight when a checkpoint starts: the
     checkpoint waits for the guest to carry it out (no device request can
@@ -4939,6 +5031,7 @@ def checkpoint_hotplug():
     rm_ckpt(path)
 
 
+@needs_kvm
 def checkpoint_untrusted_dir():
     """A checkpoint copied into a user's directory (as v0.1.0 wrote them)
     restores by its path, but never through a symlink planted in it."""
@@ -4967,6 +5060,7 @@ def checkpoint_untrusted_dir():
     rm_ckpt(stored)
 
 
+@needs_kvm
 def resume_failures():
     """A suspended VM whose resume fails before its vCPUs ran stays
     suspended; one that fails after they ran is gone, never re-armed (its
@@ -4989,6 +5083,7 @@ def resume_failures():
     check("resume fails after running: no second resume", not r["ok"], r)
 
 
+@needs_kvm
 def resume_slow_guest():
     """A resumed suspended VM whose guest agent answers its first ping late
     (past the 2 s deadline) runs on, the delay reported; its checkpoint stays
@@ -5011,6 +5106,7 @@ def resume_slow_guest():
     check("slow guest: still running after", vms(A).get(n, {}).get("state") == "running", vms(A).get(n))
 
 
+@needs_kvm
 def resume_readdress_fail():
     """A restore at a new address whose readdress fails runs on with the
     address pending (no checkpoint meanwhile), held (--paused) or not: each
@@ -5060,6 +5156,7 @@ def resume_readdress_fail():
     rm_ckpt(path)
 
 
+@needs_kvm
 def resume_unpause_fail():
     """A suspended VM whose vCPUs fail to resume may have run some of them:
     its checkpoint is not resumed again, but the VM, paused again, is kept
@@ -5081,6 +5178,7 @@ def resume_unpause_fail():
     check("unpause fails: md5 intact, same processes", md5(A, n) == m and marker_id(A, n) == proc, (proc, marker_id(A, n)))
 
 
+@needs_kvm
 def resume_unsettled():
     """A resume that failed part way (some vCPUs may run, Firecracker still
     says Paused) and whose pause after it failed too stays unsure: a later
@@ -5116,6 +5214,7 @@ def resume_unsettled():
     rm_ckpt(path)
 
 
+@needs_kvm
 def resume_outcome():
     """#517: `flexvm unpause` answers once the VM's process has tried: a resume
     that fails part way (`resume_partial`) exits non-zero with its error, the
@@ -5133,6 +5232,7 @@ def resume_outcome():
     check("resume outcome: md5 intact", md5(A, n) == m)
 
 
+@needs_kvm
 def kill_prepare():
     """#567: `flexvm kill` while a migration still prepares wins: the target parked before it
     answers the prepare (`incoming_gate`), or the source parked having lent the address, not
@@ -5176,6 +5276,7 @@ def kill_prepare():
         check(f"{what}: the address is not lent, nor left", a.get("lent") is None and not a.get("leaving") and not a.get("holder"), a)
 
 
+@needs_kvm
 def resume_migrating():
     """#569: `flexvm unpause` of a VM whose migration's outcome is unknown (ack lost, status
     unavailable: it stays paused here, reconciling) fails, saying it is migrating away, rather
@@ -5199,6 +5300,7 @@ def resume_migrating():
         check(f"{what}: then it moves on", st["released"] is True and st["state"] == ("paused" if paused else "running"), st)
 
 
+@needs_kvm
 def resume_bind_fail():
     """#569: a resume whose control socket cannot be bound (a directory in its place) fails
     before its VM runs or is published: its checkpoint is kept, not consumed, and it resumes
@@ -5218,6 +5320,7 @@ def resume_bind_fail():
     check("resume bind fails: then it resumes, md5 intact", r["ok"] and md5(A, n) == m, r)
 
 
+@needs_kvm
 def arrival_bind_fail():
     """#593: an arrival whose control socket cannot be bound (a directory in its place on the
     target) refuses the prepare, before its source pauses: the VM never stops running on the
@@ -5261,6 +5364,7 @@ def arrival_bind_fail():
     check("arrival bound: migration fenced as aborted", st["outcome"] == "aborted", st)
 
 
+@needs_kvm
 def back_to_back():
     """#611: migrations A->B->A, each started the moment the last returned (its source may still be
     leaving, its arrival still pulling). Whenever a host's registry says the VM runs there, its control
@@ -5323,6 +5427,7 @@ def back_to_back():
     print(f"  back to back: {len(errors)} refusals retried: {sorted(set(re.sub(r'[0-9]+', 'N', e)[:120] for e in errors))[:4]}", flush=True)
 
 
+@needs_kvm
 def app_abort():
     """#569: an image VM's app output goes on after a migration aborted once its source
     left (the target refuses a bad preload page, `bad_preload`), none lost or repeated."""
@@ -5345,6 +5450,7 @@ def app_abort():
     check("app abort: none lost", not missing, missing[:20])
 
 
+@needs_kvm
 def abort_link_fail():
     """Raising a VM's tap fails as it resumes after an aborted migration or a
     checkpoint: it is left paused (as Firecracker has it), never failed, and
@@ -5373,6 +5479,7 @@ def abort_link_fail():
     rm_ckpt(path)
 
 
+@needs_kvm
 def suspend_resume():
     """SIGTERM suspends: the VM's memory is freed and its process exits;
     `flexvm start` pages it back in lazily, in a new process."""
@@ -5401,6 +5508,7 @@ def suspend_resume():
     check("suspend: paged back in", wait_for(lambda: vms(A)[n].get("pages_mib", {}).get("remote") == 0, 30), vms(A)[n])
 
 
+@needs_kvm
 def suspend_gen():
     """A suspended VM's checkpoint holds its address's generation (GEN); one
     without it is quarantined (never given a new one), and its checkpoint
@@ -5425,6 +5533,7 @@ def suspend_gen():
     cleanup(n + "2")
 
 
+@needs_kvm
 def suspend_unaddressed():
     """A VM restored --paused at a new address (--ip auto), not taken yet,
     refuses suspend (SIGTERM) and checkpoint --stop before any of the
@@ -5456,6 +5565,7 @@ def suspend_unaddressed():
     cleanup(n2)
 
 
+@needs_kvm
 def resume_fence_fails():
     """A resume whose address generation is found withdrawn at the fence
     (test fault resume_fence_fail) never marks STARTED, which is made durable
@@ -5494,6 +5604,7 @@ def free_mib(path):
     return st.f_bavail * st.f_frsize >> 20
 
 
+@needs_kvm
 def suspend_disk_freed():
     """A resumed suspended VM gives its checkpoint's disk space back once
     every page is in (its pager lets go of the page file), while it runs on."""
@@ -5523,6 +5634,7 @@ def rewrite(path, change):
     os.replace(tmp, path)
 
 
+@needs_kvm
 def resume_mark_fails():
     """A resume whose STARTED marker cannot be made durable takes it back
     durably and leaves the VM suspended; if taking it back fails too, the VM
@@ -5598,6 +5710,7 @@ def resume_mark_fails():
     check("quarantined kill: no resume", not r["ok"], r)
 
 
+@needs_kvm
 def standby():
     """Standby VMs: `run` claims one (a resume and START), its replacement
     comes up, `pull --standby 0` stops them all; without one, run loads cold."""
@@ -5631,6 +5744,7 @@ def standby():
 
 
 
+@needs_kvm
 def standby_vm_ips():
     """A `vm_ips` and `dns` change (host.json) reaches a standby VM started before it (#521): its claim
     takes its address from the new range and gives the guest the new DNS server; a VM already
@@ -5681,7 +5795,7 @@ def memwriter_b64():
         cc = "musl-gcc" if subprocess.run(["which", "musl-gcc"], capture_output=True).returncode == 0 else "gcc"
         with tempfile.TemporaryDirectory(prefix="memwriter-") as d:
             out = os.path.join(d, "memwriter")
-            subprocess.run([cc, "-O2", "-static", "-mrdrnd", "-pthread", "-o", out, src], check=True)
+            subprocess.run([cc, "-O2", "-static", "-pthread", "-o", out, src], check=True)
             _memwriter = base64.b64encode(open(out, "rb").read()).decode()
     return _memwriter
 
@@ -5713,6 +5827,7 @@ def writer_check(host, name):
     return errors, sum(int(r[r.index("k") + 1]) for r in rows), out
 
 
+@needs_kvm
 def cow_exact():
     """A keep-running checkpoint of a guest that rewrites its memory all the
     time: the VM pauses only briefly and works during the copy, and the
@@ -5768,6 +5883,7 @@ def cow_exact():
     rm_ckpt(path2)
 
 
+@needs_kvm
 def cow_rescue_fail():
     """#310: a rescue that fails gives its pages back, still protected, and a writer that found one of them RESCUING
     reads it itself rather than failing the checkpoint. With every other rescue failing (ckpt_rescue_fail), keep-running
@@ -5805,6 +5921,21 @@ def cow_rescue_fail():
     check("rescue fail: the original is intact", errors == 0, out)
 
 
+def host_hpage():
+    """The host's PMD size, its transparent huge pages' (2 MiB with 4 KiB pages, on x86_64 and aarch64 alike)."""
+    try:
+        return int(open("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size").read())
+    except (OSError, ValueError):
+        return 2 << 20
+
+
+# The host's page size (what /proc/PID/pagemap and /proc/kpageflags index by) and huge page size; a huge page's
+# pages, and its buddy allocator order.
+HOST_PAGE, HPAGE = os.sysconf("SC_PAGE_SIZE"), host_hpage()
+HPAGE_PAGES = HPAGE // HOST_PAGE
+HPAGE_ORDER = HPAGE_PAGES.bit_length() - 1
+
+
 def huge_mib(host, name):
     """MiB of guest memory Firecracker holds in transparent huge pages, and its RSS."""
     out = {}
@@ -5821,20 +5952,21 @@ def collapse_report(host, name):
 
 
 def require_huge_pages(blocks):
-    """Skips unless the host has `blocks` free 2 MiB blocks (counting what a higher-order buddy block splits into),
+    """Skips unless the host has `blocks` free huge-page-sized (HPAGE) blocks (counting what a higher-order buddy block splits into),
     compacting its memory first if short: the collapse takes whole huge pages, and a fragmented host has none to give
     (#896). Under --no-skips (CI) a skip still fails the run."""
     def free():
         with open("/proc/buddyinfo") as f:
-            return sum(int(n) << (order - 9) for line in f for order, n in enumerate(line.split()[4:]) if order >= 9)
+            return sum(int(n) << (order - HPAGE_ORDER) for line in f for order, n in enumerate(line.split()[4:]) if order >= HPAGE_ORDER)
     if free() < blocks:
         with suppress(OSError), open("/proc/sys/vm/compact_memory", "w") as f:
             f.write("1")
     if (have := free()) < blocks:
-        raise Skip(f"only {have} free order>=9 blocks in /proc/buddyinfo, after compacting; need {blocks}; "
+        raise Skip(f"only {have} free order>={HPAGE_ORDER} blocks in /proc/buddyinfo, after compacting; need {blocks}; "
                    "try /proc/sys/vm/drop_caches")
 
 
+@needs_kvm
 def cow_collapsed():
     """Memory a migration paged in is collapsed into huge pages once the pull is done (#141), and keeps what 4 KiB
     pages guarantee: with the guest rewriting it, a keep-running checkpoint and a delta each hold exactly the memory at
@@ -5887,6 +6019,7 @@ def cow_collapsed():
         rm_ckpt(p)
 
 
+@needs_kvm
 def collapse_abort():
     """A migration that aborts after its source paused, its collapse pass mid-way (#191): the source runs its copy
     again, and the pass goes on to the end instead of leaving the VM on 4 KiB pages for good."""
@@ -5921,6 +6054,7 @@ def collapse_abort():
     check("collapse abort: md5 intact", md5(B, n) == m)
 
 
+@needs_kvm
 def collapse_ckpt_fail():
     """A `checkpoint --stop` that fails while writing, its quiesce having ended the collapse pass mid-way (#207): the VM
     runs on and the pass starts again and goes on to the end, as after an aborted migration."""
@@ -5956,8 +6090,8 @@ def collapse_ckpt_fail():
 
 
 def guest_chunks(host, name):
-    """Firecracker's guest memory by 2 MiB chunk (of its userfaultfd-registered mappings): those backed by one
-    transparent huge page (512 present pages on contiguous PFNs from a 2 MiB-aligned one, each flagged THP), those with
+    """Firecracker's guest memory by HPAGE chunk (of its userfaultfd-registered mappings): those backed by one
+    transparent huge page (HPAGE_PAGES present pages on contiguous PFNs from an HPAGE-aligned one, each flagged THP), those with
     nothing mapped, and those Firecracker made inaccessible (unplugged slots)."""
     pid = fc_pid(host, name)
     vmas, cur = [], None
@@ -5970,19 +6104,19 @@ def guest_chunks(host, name):
     huge, empty, unplugged = set(), set(), set()
     with open(f"/proc/{pid}/pagemap", "rb") as pm, open("/proc/kpageflags", "rb") as kf:
         for a, b, none in vmas:
-            for c in range((a + (2 << 20) - 1) & ~((2 << 20) - 1), b - (2 << 20) + 1, 2 << 20):
+            for c in range((a + HPAGE - 1) & ~(HPAGE - 1), b - HPAGE + 1, HPAGE):
                 if none:
                     unplugged.add(c)
-                pm.seek(c // 4096 * 8)
-                entries = struct.unpack("512Q", pm.read(512 * 8))
+                pm.seek(c // HOST_PAGE * 8)
+                entries = struct.unpack(f"{HPAGE_PAGES}Q", pm.read(HPAGE_PAGES * 8))
                 if not any(e >> 63 & 1 or e >> 62 & 1 for e in entries):
                     empty.add(c)
                     continue
                 pfn = entries[0] & ((1 << 55) - 1)
-                if pfn % 512 or not all(e >> 63 & 1 and e & ((1 << 55) - 1) == pfn + i for i, e in enumerate(entries)):
+                if pfn % HPAGE_PAGES or not all(e >> 63 & 1 and e & ((1 << 55) - 1) == pfn + i for i, e in enumerate(entries)):
                     continue
                 kf.seek(pfn * 8)
-                if all(f >> 22 & 1 for f in struct.unpack("512Q", kf.read(512 * 8))):  # KPF_THP, every page
+                if all(f >> 22 & 1 for f in struct.unpack(f"{HPAGE_PAGES}Q", kf.read(HPAGE_PAGES * 8))):  # KPF_THP, every page
                     huge.add(c)
     return huge, empty, unplugged
 
@@ -6013,6 +6147,7 @@ def guest_blocks(host, name):
     return base, bs, sorted(b for b in online if b * bs >= base)
 
 
+@needs_kvm
 def unplug_collapsed():
     """virtio-mem unplug of memory collapsed into huge pages after a migration (#141): the guest moves the data out of
     the blocks it gives back, Firecracker discards them (2 MiB blocks, whole huge pages), every huge page in them is
@@ -6044,7 +6179,7 @@ def unplug_collapsed():
     # Host address of each hotplugged block (the hotplug region is the last guest memory region).
     offset, _, host_base = control(B, n, {"op": "debug", "what": "status"})["result"]["host_regions"][-1]
     hp_gpa, bs, online = guest_blocks(B, n)
-    chunks_of = lambda blk: {host_base + blk * bs - hp_gpa + i for i in range(0, bs, 2 << 20)}
+    chunks_of = lambda blk: {host_base + blk * bs - hp_gpa + i for i in range(0, bs, HPAGE)}
     # Growth is refused meanwhile (and eviction is off), so the controller never plugs back what the test takes away.
     fault(B, "no_admit", 120000)
     sock = api_sock(B, n)
@@ -6061,9 +6196,9 @@ def unplug_collapsed():
                 if code == 0:
                     chosen.append(blk)
         target = {c for blk in chosen for c in chunks_of(blk)} & huge0
-        print(f"huge unplug: blocks of {bs >> 20} MiB at {hp_gpa:#x}; offlined {chosen}, holding {len(target) * 2} MiB of huge pages "
-              f"(of {len(huge0) * 2} MiB)")
-        check("huge unplug: offlined blocks that hold huge pages", chosen and len(target) * 2 >= 64, (chosen, ranked[:6]))
+        print(f"huge unplug: blocks of {bs >> 20} MiB at {hp_gpa:#x}; offlined {chosen}, holding {len(target) * HPAGE >> 20} MiB of huge pages "
+              f"(of {len(huge0) * HPAGE >> 20} MiB)")
+        check("huge unplug: offlined blocks that hold huge pages", chosen and len(target) * HPAGE >> 20 >= 64, (chosen, ranked[:6]))
         now = vms(B)[n]["plugged_mib"]
         ok(hotplug(B, n, now - len(chosen) * (bs >> 20)))
         hp = lambda: (vms(B)[n]["requested_mib"], vms(B)[n]["plugged_mib"])
@@ -6075,8 +6210,8 @@ def unplug_collapsed():
         released = fc_api(sock, "PATCH", "/balloon/reporting/release")
         fault(B, "no_admit", 0)
     rss1 = settle_rss(B, n)
-    print(f"huge unplug: plugged {now} -> {hp()[1]} MiB (settled: {done}, blocks gone: {gone}); {len(target - empty1) * 2} MiB of the "
-          f"targeted huge pages still mapped; {len(empty1 - empty0) * 2} MiB emptied in all; RSS {rss0} -> {rss1} MiB")
+    print(f"huge unplug: plugged {now} -> {hp()[1]} MiB (settled: {done}, blocks gone: {gone}); {len(target - empty1) * HPAGE >> 20} MiB of the "
+          f"targeted huge pages still mapped; {len(empty1 - empty0) * HPAGE >> 20} MiB emptied in all; RSS {rss0} -> {rss1} MiB")
     check("huge unplug: the offlined blocks were unplugged", done and gone and not st["failed"] and released is None,
           (hp(), gone, st["failed"], released))
     check("huge unplug: every huge page in them is gone", target and not target - empty1, (len(target), len(target - empty1)))
@@ -6085,6 +6220,7 @@ def unplug_collapsed():
     check("huge unplug: guest memory intact", errors == 0 and md5(B, n) == m and sh(B, n, "md5sum /tmp/g")[1].split()[0] == g, out)
 
 
+@needs_kvm
 def cow_abort():
     """A copy that fails half way (and one that a kill cuts short) publishes
     nothing; the VM runs on unharmed, and the next checkpoint is complete."""
@@ -6118,6 +6254,7 @@ def cow_abort():
         rm_ckpt(p)
 
 
+@needs_kvm
 def cow_crash():
     """The VM process dies while a running VM's checkpoint is being copied:
     no checkpoint appears, and the next one to the same place succeeds."""
@@ -6157,6 +6294,7 @@ def cow_crash():
     rm_ckpt(path)
 
 
+@needs_kvm
 def ckpt_hot():
     """#235: a keep-running checkpoint copies the pages the guest keeps writing
     (hot pages) during the pause and leaves them unprotected; the next one
@@ -6212,6 +6350,7 @@ def ckpt_hot():
     cleanup("ft-hot3")
 
 
+@needs_kvm
 def ckpt_incremental():
     """A full checkpoint and two deltas of a running VM: each delta stores
     only what changed, each link of the chain restores exactly its pause-time
@@ -6285,6 +6424,7 @@ def ckpt_incremental():
 
 
 
+@needs_kvm
 def cow_wp_race():
     """#88: a write fault on a page that a checkpoint writer claims while
     the fault is being handled is retried once the page is saved, not
@@ -6316,6 +6456,7 @@ def cow_wp_race():
     check("wp race: a writer claimed a faulting page under the fault", claimed > 0, claimed)
 
 
+@needs_kvm
 def fetch_tail_enomem():
     """A run fetched for a fault whose tail fails to install (a transient
     error, after its first page went in and the pullers passed it) is
@@ -6333,6 +6474,7 @@ def fetch_tail_enomem():
           log(B, n)[-500:])
 
 
+@needs_kvm
 def pull_enomem():
     """Background pull copies that fail for a while (ENOMEM, a transient
     error) are retried as a fault's are, within the fault deadline, instead
@@ -6353,6 +6495,7 @@ def pull_enomem():
         print(f"pull enomem: B's log of {n}:\n{log(B, n)}", flush=True)
 
 
+@needs_kvm
 def fetch_enomem_stuck():
     """Pages a fault needs that keep failing to install (ENOMEM on every
     copy, the pullers held off) make the target give up within the fault
@@ -6389,6 +6532,7 @@ def fetch_enomem_stuck():
         reader.wait()
 
 
+@needs_kvm
 def cow_reports_held():
     """Exercise Firecracker's report hold and the pager's REMOVE fallback
     with disk writers gated until the guest has freed memory."""
@@ -6464,6 +6608,7 @@ def cow_reports_held():
     rm_ckpt(path)
 
 
+@needs_kvm
 def ckpt_failed_stop():
     """A paused (--stop) checkpoint that fails after the freeze must leave
     write tracking whole: pages the guest wrote since the last checkpoint
@@ -6496,6 +6641,7 @@ def ckpt_failed_stop():
         rm_ckpt(path + x)
 
 
+@needs_kvm
 def ckpt_no_wp():
     """On a host whose kernel lacks uffd-wp (test fault uffd_wp_missing, as
     arm64 before 6.10), a checkpoint that keeps the VM running, and an
@@ -6525,6 +6671,7 @@ def ckpt_no_wp():
     rm_ckpt(path)
 
 
+@needs_kvm
 def ckpt_rearm():
     """A failed re-protection turns write tracking off; the next checkpoint
     re-arms it, which forgets which pages changed since the last good one.
@@ -6560,6 +6707,7 @@ def ckpt_rearm():
 
 
 
+@needs_kvm
 def ckpt_packet_hold():
     """Packets for a VM that arrive while a keep-running checkpoint has it
     paused are held and handed to it, not lost on its downed tap: a 1 kHz
@@ -6725,6 +6873,7 @@ def uffd_cpu_ms(pid):
     return None
 
 
+@needs_kvm
 def ckpt_stall():
     """#214: how long a keep-running checkpoint stops the guest as the guest
     sees it: the pause, and the time it loses after the resume to write
@@ -6811,6 +6960,7 @@ def hotplug(host, name, mib):
     return control(host, name, {"op": "debug", "what": "hotplug", "mib": mib})
 
 
+@needs_kvm
 def shrink_stall():
     """A shrink the guest does not carry out must not block growth: when the
     guest then needs memory, the controller cancels the shrink and grows,
@@ -6845,6 +6995,7 @@ def shrink_stall():
     check("shrink stall: resize settled, guest grew", wait_for(lambda: hp()[0] == hp()[1] > plugged, 60), (plugged, hp()))
 
 
+@needs_kvm
 def cow_grow():
     """A guest that needs more memory while a copy-on-write checkpoint of it
     is being copied gets it (growing does not wait for the copy): it fills
@@ -6904,6 +7055,7 @@ def cow_grow():
     rm_ckpt(path)
 
 
+@needs_kvm
 def plug_race():
     """Migrations that start right after a memory hot-plug (or unplug) was
     requested: the plug settles first (or, if it stalls, is cut down to what
@@ -6942,6 +7094,7 @@ def plug_race():
         check(f"plug race {i}: guest can use its memory", code == 0 and out == "512", out)
 
 
+@needs_kvm
 def plug_storm():
     """The memory controller keeps resizing (here: a hot-plug request every
     20 ms, up and down) while the VM migrates back and forth. Resizes and
@@ -7052,6 +7205,7 @@ def throttle(label, host, n, reserve=512):
     return fill
 
 
+@needs_kvm
 def mem_high():
     """A guest filling far beyond its admitted memory while the host refuses
     to admit more is throttled at its mark rather than eating the host's
@@ -7070,6 +7224,7 @@ def mem_high():
     check("mem high: md5 intact", md5(A, n) == m)
 
 
+@needs_kvm
 def mem_high_migrate():
     """A VM throttled at its mark migrates without a stall: its pause is not
     held up by throttled vCPUs, the target pulls all its memory, and there
@@ -7091,6 +7246,7 @@ def mem_high_migrate():
     check("mem high migrate: md5 intact, one copy", md5(B, n) == m and where(n) == {B: "running"}, where(n))
 
 
+@needs_kvm
 def mem_high_evict():
     """A VM its host refuses more memory, throttled at its mark, is moved to
     a peer with room by itself, and grows there."""
@@ -7110,6 +7266,7 @@ def mem_high_evict():
     check("mem high evict: md5 intact", md5(B, n) == m)
 
 
+@needs_kvm
 def mem_refused_headroom():
     """A VM refused a step while it still has headroom below its mark is not
     throttled or starved, so its host does not move it; only at its mark is it."""
@@ -7170,6 +7327,7 @@ def fill(host, name, mib):
     assert code == 0, out
 
 
+@needs_kvm
 def mem_refused_fill():
     """A guest filling past its plugged memory whose host refuses it more
     partway (no plug, no step) is not OOM-killed: it stays throttled at its
@@ -7383,6 +7541,7 @@ def hosts_over(name, secs):
     return seen
 
 
+@needs_kvm
 def evict_no_pingpong():
     """Two hosts near their eviction marks: a VM A evicts is not taken by a
     B it would put under B's own mark (B would only send it back), and once
@@ -7408,6 +7567,7 @@ def evict_no_pingpong():
     check("no ping-pong: md5 intact", md5(B, n) == m)
 
 
+@needs_kvm
 def evict_grower():
     """Three VMs on a host nearing its eviction high-water mark (above its
     reserve), one of them growing fast: that one is moved to B, ranked over
@@ -7461,6 +7621,7 @@ def evict_grower():
         cleanup(n)
 
 
+@needs_kvm
 def evict_skips_cmd():
     """A host under pressure leaves a `run IMAGE CMD` VM where it is (CMD's end
     there ends it, with CMD's status), even starved, and moves another."""
@@ -7505,6 +7666,7 @@ class busy_peer:
         self.s.close()
 
 
+@needs_kvm
 def evict_peer_busy():
     """#599: a peer that refuses every eviction with the text of a VM busy here
     is a refusal like any other: backed off, and the VM moves to the next peer."""
@@ -7529,6 +7691,7 @@ def evict_peer_busy():
     cleanup(n)
 
 
+@needs_kvm
 def standby_relief_no_vm():
     """#600: a host with a standby VM and no running VM (no controller to stop it)
     goes under its reserve: the standby leaves by itself, marks the pressure,
@@ -7556,6 +7719,7 @@ def standby_relief_no_vm():
         wait_for(lambda: not standby_pids(A, t), 30)
 
 
+@needs_kvm
 def standby_refill_mark():
     """#600: a refill leaves the eviction mark available, not just the reserve:
     between the two (where eviction moves VMs away) none starts; above it, it does."""
@@ -7579,6 +7743,7 @@ def standby_refill_mark():
         wait_for(lambda: not standby_pids(A, t), 30)
 
 
+@needs_kvm
 def evict_latency():
     """Measures each VM's controller ticks and memory requests while a
     starved VM is moved away to a target slow to prepare (3 s): the VM process
@@ -7609,6 +7774,7 @@ def evict_latency():
         cleanup(v)
 
 
+@needs_kvm
 def start_admission():
     """Concurrent starts are admitted against the reserve, each with what it
     brings and a step, so together they cannot take the host below it: with
@@ -7657,6 +7823,7 @@ def live_holds(host):
     return sorted(f for f in (os.listdir(d) if os.path.isdir(d) else []) if not f.startswith(".") and held(f))
 
 
+@needs_kvm
 def ckpt_prefetch_hold():
     """#1159: a checkpoint that cuts a cold start's working-set prefetch short keeps the start's admission
     hold, past its grant's window, until the prefetch it starts again finishes; one whose VM stops with the
@@ -7791,6 +7958,7 @@ def addr_records():
     return out
 
 
+@needs_kvm
 def refused_admission():
     """A start refused for the reserve is refused before it claims anything:
     a run mints no generation (so none is withdrawn and broadcast), a restore
@@ -7862,6 +8030,7 @@ def grow_parked(n, grow, grant, label):
     unpark_arrival()
 
 
+@needs_kvm
 def arrival_grew():
     """A guest that grows between its migration's preflight and its pause, to
     a target with room for only what it had at the preflight, is refused
@@ -7909,6 +8078,7 @@ def arrival_grew():
         check("arrival grew: md5 intact, one copy", md5(B, n) == m and where(n) == {B: "running"}, where(n))
 
 
+@needs_kvm
 def arrival_grew_admitted():
     """A guest that grows between its migration's preflight and its pause, to
     a target with room, has its held grant grown by what it grew by before
@@ -7993,6 +8163,7 @@ def grew_admitted():
     cleanup(n)
 
 
+@needs_kvm
 def meminfo_unreadable():
     """/proc/meminfo unreadable (injected) is not 0 MiB available: no standby
     is stopped and nothing is evicted, and a start is refused saying why."""
@@ -8019,6 +8190,7 @@ def meminfo_unreadable():
         cleanup(n)
 
 
+@needs_kvm
 def standby_admission():
     """A standby claim is charged only the step it may grow by (its memory is
     already in use), so it succeeds with little room above the reserve; a
@@ -8041,6 +8213,7 @@ def standby_admission():
         cleanup("ft-sbadm-dup")
 
 
+@needs_kvm
 def kill_source():
     """A migration's paused source copy cannot be killed (the target still
     pulls from it and releases it); the VM lives on at the target."""
@@ -8058,6 +8231,7 @@ def kill_source():
     check("kill source: md5 intact on B", md5(B, n) == m)
 
 
+@needs_kvm
 def kill_refused_checkpoint():
     """A kill refused for a migration's source (a kill that comes while it
     still prepares wins instead: kill_prepare) leaves nothing behind: once
@@ -8098,6 +8272,7 @@ def dual_stack():
         return False
 
 
+@needs_kvm
 def wildcard_listen():
     """A listener on a wildcard address (0.0.0.0, ::, ::ffff:0:0) derives
     its underlay address toward its peers (loopback, as they are all on this
@@ -8239,6 +8414,7 @@ def raw(host, data, timeout=10):
     return out
 
 
+@needs_kvm
 def forged_peer():
     """What a forged or broken peer sends is refused without anything dying:
     arrivals without an address generation (none, 0) or with one older than
@@ -8307,6 +8483,7 @@ def forged_peer():
     check("forged request line: endless line cut off, listener still up", peer(B, {"op": "migration", "mig": 1}).get("ok"))
 
 
+@needs_kvm
 def forged_pages():
     """The page server answers before its binary protocol, refusals too; a
     forged 4 GiB page request on a migration's own connection is refused
@@ -8335,6 +8512,7 @@ def forged_pages():
     check("forged pages: md5 intact", md5(B, n) == m)
 
 
+@needs_kvm
 def restore_ip_peer():
     """run --ip refuses an address that is not the host's to hand out (a
     peer's, or one from no host's range); restore --ip borrows a peer's from
@@ -8377,6 +8555,7 @@ def restore_ip_peer():
     rm_ckpt(path2)
 
 
+@needs_kvm
 def loan_start_retry():
     """#944: a restore borrowing a peer's address retries its claim (lend start) while
     the lender answers busy, or applied it but the reply was lost; the restore runs,
@@ -8404,6 +8583,7 @@ def loan_start_retry():
     rm_ckpt(path)
 
 
+@needs_kvm
 def spoof_filter():
     """#362: what a guest sends leaves its tap only from its own address. A datagram from
     another VM's address (or from one no VM has) is dropped at the tap, while the guest's own
@@ -8467,6 +8647,7 @@ def spoof_filter():
     rm_ckpt(path)
 
 
+@needs_kvm
 def unlend_retry():
     """An aborted migration whose unlend fails keeps its loan (#257): the next
     attempt undoes it, and so does the VM's end."""
@@ -8495,6 +8676,7 @@ def unlend_retry():
     check("unlend retry: its end undoes the loan", wait_for(lambda: not lent(), 10), addr(A, ip))
 
 
+@needs_kvm
 def late_withdrawal():
     """Address generations order the VMs that had an address: a late
     withdrawal for a VM long gone cannot free a newer VM's loan of it or
@@ -8536,6 +8718,7 @@ def late_withdrawal():
     check("late withdrawal: an older one leaves the newer VM alone", r["stale"] and where(n3) == {A: "running"}, (r, where(n3)))
 
 
+@needs_kvm
 def killed_migrated():
     """#361: a VM process SIGKILLed after its VM migrated (as a panic would end
     it) never withdraws the address: a sweep on its host does, so its home host
@@ -8606,6 +8789,7 @@ def killed_migrated():
     check("killed migrated, home back: the address runs a new vm on A", where(n5) == {A: "running"}, where(n5))
 
 
+@needs_kvm
 def incoming_killed():
     """An incoming VM process SIGKILLed after it took the name and address
     (no cleanup runs): both are free again for the next taker once its
@@ -8636,6 +8820,7 @@ def incoming_killed():
     kill(B, n)
 
 
+@needs_kvm
 def start_killed():
     """A VM process SIGKILLed between claiming its address and loading the
     VM: the address is free again, for a VM with a newer generation."""
@@ -8654,6 +8839,7 @@ def start_killed():
     scenario_vms.add(n + "2")
 
 
+@needs_kvm
 def sigkill_restart():
     """A VM process SIGKILLed and started again under the same name: its
     address is the new instance's to take (`--ip` the same one), and
@@ -8722,6 +8908,7 @@ def listen_trickle():
     check("listen trickle: the listener still answers", r.get("ok"), r)
 
 
+@needs_kvm
 def claim_killed():
     """A standby VM SIGKILLed after it resumed the VM for a claim, before it
     answered: `run` says the claim is uncertain and starts nothing else."""
@@ -8746,6 +8933,7 @@ def claim_killed():
     cli(A, "pull", args.template, "--standby", "0")
 
 
+@needs_kvm
 def standby_stop_claim():
     """A standby VM stopped (`pull --standby 0`) while a claim of it is under way:
     the VM the claim made runs on, and SIGTERM suspends it. The stop reaches
@@ -8780,6 +8968,7 @@ def standby_stop_claim():
     cleanup(n)
 
 
+@needs_kvm
 def standby_claim_signal():
     """A foreground `run` interrupted (SIGINT), or killed, while its claim of a
     standby VM is under way: the VM the claim made goes, as a cold foreground
@@ -8834,6 +9023,7 @@ def clear_standby(host, t):
     wait_for(lambda: not [p for p in standby_pids(host, t) if alive(p)], 60)
 
 
+@needs_kvm
 def standby_claim_orphan():
     """A foreground `run` that claimed a standby VM, SIGKILLed once the VM runs (a CI job's
     timeout): the VM goes, as a cold foreground run's would (its process is that run), and
@@ -8877,6 +9067,7 @@ def standby_claim_orphan():
         clear_standby(A, t)
 
 
+@needs_kvm
 def standby_claim_cgroupns():
     """A foreground claim from a private cgroup namespace (#649): its VM process joins the cgroup
     the claimer is in, and never another that its namespace-relative path names here. Without its
@@ -8930,6 +9121,7 @@ def standby_claim_cgroupns():
                 os.rmdir(d)
 
 
+@needs_kvm
 def standby_claim_orphan_migrating():
     """A foreground claim's VM is a migration's source when its run is SIGKILLed: the destroy is
     refused (the target may be pulling its memory), but the hang-up is kept. The target then dies
@@ -8998,6 +9190,7 @@ def standby_socks(host, t):
     return [f for f in os.listdir(d) if f.endswith(".sock")] if os.path.isdir(d) else []
 
 
+@needs_kvm
 def standby_claim_caps():
     """A claim's --cpus and --memory are its own: one refused at its name (taken) leaves the
     standby it reached as it was, and the next claim of it, uncapped, sets its cgroup's cpu.max
@@ -9042,6 +9235,7 @@ def standby_claim_caps():
         cleanup(n)
 
 
+@needs_kvm
 def standby_lost_cgroup():
     """A standby whose Firecracker failed to join its cgroup (#948) can take no --cpus claim: the
     first such claim goes on without it (a cold start) and retires it, its place refilled, so the
@@ -9070,6 +9264,7 @@ def standby_lost_cgroup():
             cleanup(n)
 
 
+@needs_kvm
 def standby_claim_setup_fail():
     """A claim whose guest setup fails after its VM was adopted, its Firecracker still running
     (#948): the standby leaves with that VM killed before it asks for a refill, so the replacement
@@ -9117,6 +9312,7 @@ def standby_claim_setup_fail():
         cleanup(name)
 
 
+@needs_kvm
 def standby_concurrent_claims():
     """Concurrent runs claim different standby VMs at once: none queues on
     another's claim (each parks at the `claim_stall` gate, and both get there
@@ -9161,6 +9357,7 @@ def standbys_exited(host, label, timeout=60):
     check(f"{label}: no standby process left", wait_for(lambda: not standby_starting(host), timeout), standby_starting(host))
 
 
+@needs_kvm
 def standby_stalled():
     """A claimer that connects and stops before sending its request keeps no
     standby VM from stopping; a stopped standby VM keeps no `run` waiting
@@ -9217,6 +9414,7 @@ def standby_stalled():
     check("standby stalled: stopped", wait_for(lambda: not standby_pids(A, t), 30))
 
 
+@needs_kvm
 def standby_refill_race():
     """A refill granted just before pressure starts, whose standby has not
     created its lock file yet (held before it: `standby_lock_gate`): relief does not
@@ -9282,6 +9480,7 @@ def standby_starting(host):
     return out
 
 
+@needs_kvm
 def standby_lock_timeout():
     """A refill's standby that does not create its lock file within
     LOCKED_TIMEOUT (`standby_lock_hang`, held past it) while the host is under
@@ -9343,6 +9542,7 @@ def standby_lock_timeout():
         os.remove(pressure)
 
 
+@needs_kvm
 def fc_died():
     """A VM's Firecracker dies under it (a guest panic, an OOM kill): its
     process notices at once, cleans up as a kill would (address withdrawn,
@@ -9369,6 +9569,7 @@ def fc_died():
     check("fc died: rm clears it", n not in vms(A), vms(A).get(n))
 
 
+@needs_kvm
 def fc_died_starting():
     """A Firecracker that dies once its VM is published running but before its start is done (its
     guest not set up yet: `guest_net_gate`) ends it as any death does (#730): exit status 124 at once,
@@ -9404,6 +9605,7 @@ def fc_died_starting():
         ok(cli_json(A, "rm", n))
 
 
+@needs_kvm
 def fc_died_busy():
     """A Firecracker that dies while an operation holds the VM (a slow
     checkpoint copying its memory) ends the VM at once all the same: the
@@ -9440,6 +9642,7 @@ def fc_died_busy():
     ok(kill(A, n))
 
 
+@needs_kvm
 def pull_died():
     """An arrival whose Firecracker dies mid-pull never releases its source,
     which runs its copy again. A VM coming home whose arrival dies mid-pull
@@ -9479,6 +9682,7 @@ def pull_died():
 
 
 
+@needs_kvm
 def connect_after_pull():
     """#881: a fault fetcher whose connect ahead is still under way when the pull ends and the source lets go, its
     listener gone too, gives up on it: nothing remote is left, so the target runs on instead of failing once the source
@@ -9512,6 +9716,7 @@ def connect_after_pull():
             start_listener(A)
 
 
+@needs_kvm
 @with_third_peer
 def route_abort():
     """#231: a source whose route switch failed retries it in the background. Its target
@@ -9560,6 +9765,7 @@ def route_abort():
             subprocess.run(["ip", "route", "del", f"{ip}/32"], capture_output=True)
 
 
+@needs_kvm
 def route_abandoned():
     """#1174: a source whose route switch fails throughout, its background retries and the last try at
     the release too, gives it up; the release then puts back the target's announced route, so this
@@ -9592,6 +9798,7 @@ def route_abandoned():
             subprocess.run(["ip", "route", "del", f"{ip}/32"], capture_output=True)
 
 
+@needs_kvm
 def arrival_overtaken():
     """Operations that change who owns a VM wait for its arrival to settle
     (every page in, the migration released, a home loan taken back), or are
@@ -9669,6 +9876,7 @@ def arrival_overtaken():
     check("migrate on after the arrival: lent by its home host", lent(ip) is not None, addr(A, ip))
 
 
+@needs_kvm
 def terminal():
     """A foreground run as a shell runs it, signalled through its process
     group: Ctrl-Z pauses the VM (Firecracker is not in the group, so it never
@@ -9705,6 +9913,7 @@ def terminal():
     check("terminal: nothing left, nothing failed", n not in vms(A) and not alive(fc), vms(A).get(n))
 
 
+@needs_kvm
 def run_status():
     """`run IMAGE CMD` exits with CMD's status, started cold or claiming a
     standby VM (whose exit frame may arrive before the claimer reads it)."""
@@ -9747,6 +9956,7 @@ def app_ends(n, status):
     return tell_exit(n, n, ended) and wait_for(ended, 30)
 
 
+@needs_kvm
 def concurrent_start():
     """#1151: two `flexvm start NAME` at once, of a stopped VM and of an exited one, both succeed (the
     loser's start is the winner's VM, once it runs), and the VM runs."""
@@ -9781,6 +9991,7 @@ def concurrent_start():
     check("concurrent start of a vm held starting: it runs", vms(A).get(n, {}).get("state") == "running", vms(A).get(n))
 
 
+@needs_kvm
 def kill_rerun_race():
     """#1151, #1189: `kill` and `rm` of an exited VM that a `start` is running again: while the rerun
     holds the name (stalled before its VM runs) `rm` is refused, and the exited record the rerun goes
@@ -9811,6 +10022,7 @@ def kill_rerun_race():
     check("kill rerun: nothing left", n not in vms(A), vms(A).get(n))
 
 
+@needs_kvm
 def stop_self_exit():
     """#1151: `stop` of a VM whose app exits on its own meanwhile (the VM ending, its SIGTERM takes no
     suspend) is done: the VM is exited, with its app's status, and `start` runs it again."""
@@ -9839,6 +10051,7 @@ def stop_self_exit():
     check("stop self exit --rm: it is gone", n not in vms(A), vms(A).get(n))
 
 
+@needs_kvm
 def migrated_hint():
     """#1161: `kill`, `stop` and `exec` on the host a VM migrated away from say where it went (kill it
     there), and leave its moved record, so each says it again."""
@@ -9875,6 +10088,7 @@ def migrated_hint():
     check("migrated hint: the migration back clears the moved record", not os.path.exists(moved) and where(n) == {A: "running"}, where(n))
 
 
+@needs_kvm
 def kill_held_stopped():
     """#1173, #1189: `kill` of a stopped VM while something else holds its name (a start whose resume
     then fails) never discards its checkpoint: it waits while the name is held (as for a VM
@@ -9915,6 +10129,7 @@ def kill_held_stopped():
     check("kill held: md5 intact", md5(A, n, tries=3) == m)
 
 
+@needs_kvm
 def kill_starting():
     """#1189: `kill` and `rm -f` of a stopped VM whose `start` holds its name (its resume loaded, held
     before it is registered) wait for it, as `stop` does, and kill it once it runs: never refused
@@ -9947,6 +10162,7 @@ def kill_starting():
         cleanup(n)
 
 
+@needs_kvm
 def stop_renamed():
     """#1178: a rename that holds the VM's op (its checks passed) as `stop`'s SIGTERM lands moves the
     VM on before the suspend runs: stop follows the instance it signalled under its new name, and
@@ -9975,6 +10191,7 @@ def stop_renamed():
     check("stop renamed: md5 intact", md5(A, to, tries=3) == m)
 
 
+@needs_kvm
 def restart_renamed():
     """#1189: a rename that holds the VM's op as `restart`'s SIGTERM lands moves the VM on before
     its suspend: restart's stop follows it under its new name, and restart starts it there (never
@@ -10000,6 +10217,7 @@ def restart_renamed():
     check("restart renamed: md5 intact", md5(A, to, tries=3) == m)
 
 
+@needs_kvm
 def rename_moved_hint():
     """#1189: a running VM's rename into the name of a VM that migrated away, failing after it took
     the name (its control socket cannot move), leaves that VM's hint (where it went) and its logs:
@@ -10046,6 +10264,7 @@ def rename_moved_hint():
     kill(B, n)
 
 
+@needs_kvm
 def kill_renamed_into():
     """#1183: `kill` (and `rm -f`) of a running VM, held after its signal (`kill_gate`) while that
     VM ends and a stopped VM is renamed into its name, leaves the stopped VM alone: only what the
@@ -10080,6 +10299,7 @@ def kill_renamed_into():
         check(f"kill renamed into ({what}): cleaned up", name_free(A, n, 30), vms(A).get(n))
 
 
+@needs_kvm
 def kill_crashed_owner():
     """#1184: a delayed `kill` decides by who suspended the checkpoint under the name (its OWNER),
     not by records a crash or a sweep leaves. (1) The VM it signalled published its suspend and was
@@ -10148,6 +10368,7 @@ def kill_crashed_owner():
     check("kill crashed owner (other): md5 intact", md5(A, n, tries=3) == m)
 
 
+@needs_kvm
 def rm_later_exit():
     """#1184: a delayed `rm -f` (held at `kill_gate` after its signal) of a VM that ends, a new VM of
     the name then running and exiting (`--rm`: its exit status its only record), leaves that VM's
@@ -10174,6 +10395,7 @@ def rm_later_exit():
     check("rm later exit: wait gives the later vm's exit status", code == 0 and out.strip() == "7", (code, out, err))
 
 
+@needs_kvm
 def attached_later_exit():
     """#1206: a foreground `run -i` whose cleanup is delayed (held at `attached_cleanup_gate`, its app's
     status in) while, its records removed, another VM of the name runs in the background and exits removes none of that
@@ -10208,6 +10430,7 @@ def attached_later_exit():
     cli(A, "rm", n)
 
 
+@needs_kvm
 def attached_resumed_exit():
     """#1206: a foreground `run -i` whose VM is stopped and started meanwhile (its client paused through
     both) follows the resumed VM, and once its app exits removes that VM's records, its own: no exited
@@ -10244,6 +10467,7 @@ def attached_resumed_exit():
         cli(A, "rm", "-f", n)
 
 
+@needs_kvm
 def attached_resumed_early_exit():
     """#1208: a foreground `run -i` whose VM is stopped and started while its client is paused, and whose app
     exits before the client reconnects, gives its app's status: the resumed VM's end is its own VM's (the same
@@ -10278,6 +10502,7 @@ def attached_resumed_early_exit():
         cli(A, "rm", "-f", n)
 
 
+@needs_kvm
 def attached_remade_exit():
     """#1208: a foreground `run -i` whose VM is killed while its client is paused, another VM then made under
     the name that exits, fails with 125 once its client goes on (that VM's status is not its app's), and
@@ -10314,6 +10539,7 @@ def attached_remade_exit():
         cli(A, "rm", "-f", n)
 
 
+@needs_kvm
 def rm_crashed_replacement():
     """#1185: two delayed `rm -f`s (held at `kill_gate` after their signals) of a VM that ends, a new
     VM of the name then running and dying unrecorded (SIGKILL: the first VM's exit record stale). The
@@ -10356,6 +10582,7 @@ def rm_crashed_replacement():
     check("rm crashed replacement: swept", code == 0 and wait_for(lambda: not name_locked(A, n), 30), (code, err))
 
 
+@needs_kvm
 def rm_unrecorded():
     """#1187: a VM SIGKILLed before it records anything (no failed, lost or exited record) leaves its
     logs and its dead holder's lock; swept (`debug gc`), only its logs. `ps -a` lists no VM of the
@@ -10386,6 +10613,7 @@ def rm_unrecorded():
         check(f"rm unrecorded ({what}): a new vm of the name runs and is removed", code == 0 and name_free(A, n, 30), (code, out, err))
 
 
+@needs_kvm
 def pause_renamed():
     """#1183: a rename that holds the VM's op (its checks passed) as `pause`'s SIGTSTP lands moves
     the VM on before the pause runs: pause follows the instance it signalled under its new name, and
@@ -10415,6 +10643,7 @@ def pause_renamed():
     check("pause renamed: md5 intact", md5(A, to, tries=3) == m)
 
 
+@needs_kvm
 def unread_output():
     """`run IMAGE CMD` whose stdout is a pipe nobody reads (output stuck) still
     ends at once on SIGINT, with status 130: printing never holds it up."""
@@ -10435,6 +10664,7 @@ def unread_output():
     check("unread output: what it printed went to its log", "xxxx" in log(A, n), len(log(A, n)))
 
 
+@needs_kvm
 def suspend_slow_cmd():
     """#505: a `run IMAGE CMD` whose stdout drains slowly is suspended (SIGTERM) in the middle of more output
     than the guest keeps for a session; `flexvm start -a` reattaches and prints the rest. Every byte comes
@@ -10471,6 +10701,7 @@ def suspend_slow_cmd():
     check("suspend slow cmd: gone after it", n not in vms(A), vms(A).get(n))
 
 
+@needs_kvm
 def suspend_killed():
     """SIGINT means destroy, and it wins over a suspend: a kill that comes
     while the suspend is publishing its checkpoint revokes the checkpoint
@@ -10505,6 +10736,7 @@ def suspend_killed():
     check("suspend killed: kill after a suspend destroys it", r["ok"] and n not in vms(A) and not os.path.exists(d), (r, vms(A).get(n)))
 
 
+@needs_kvm
 def suspend_cmd():
     """SIGTERM on a `run -d IMAGE CMD` VM suspends it, CMD and all: the command
     keeps running in the guest's memory, and the process `flexvm start -a`
@@ -10536,6 +10768,7 @@ def suspend_cmd():
     check("suspend cmd: gone after it", n not in vms(A), vms(A).get(n))
 
 
+@needs_kvm
 def suspend_overlap():
     """#351: SIGTERMs that overlap make one suspend at a time, the rest taken
     into it. Each fails (`ckpt_fail_write`, after `suspend_slow` holds the
@@ -10604,6 +10837,7 @@ def first_entry(host, name, timeout=60):
     return None
 
 
+@needs_kvm
 def cmd_flag():
     """A `run IMAGE CMD` VM is published as one from its first entry, whether it
     claimed a standby VM or was resumed with its command (eviction leaves it
@@ -10645,6 +10879,7 @@ def cmd_flag():
     check("cmd flag: and ends with it", p.wait(timeout=30) == 130)
 
 
+@needs_kvm
 def pause_cmd_start():
     """Ctrl-Z while a `run IMAGE CMD` VM starts pauses it before its command
     is under way, which waits for the VM instead of failing (and destroying
@@ -10669,6 +10904,7 @@ def pause_cmd_start():
     check("pause cmd: the command ran, its status", code == 9 and out.count("started") == 1, (code, out))
 
 
+@needs_kvm
 def ctrl_z_long_op():
     """#387: a Ctrl-Z waiting for the VM while a long operation holds it (a
     crawling keep-running checkpoint) never holds up the Ctrl-C after it:
@@ -10700,6 +10936,7 @@ def ctrl_z_long_op():
     check("ctrl-z long op: nothing left", n not in vms(A), vms(A).get(n))
 
 
+@needs_kvm
 def resume_suspending():
     """#387: `flexvm start` (attached or not) during a suspend (when SIGCONT does nothing)
     waits it out: a suspend that finishes is resumed, its command reattached,
@@ -10755,6 +10992,7 @@ def resume_suspending():
     ok(kill(A, n))
 
 
+@needs_kvm
 def exec_recovery_instance():
     """#517: an exec whose connection is lost before the session id comes back
     (`exec_lose_echo`: the guest has the command) tries again, only in the vm
@@ -10800,6 +11038,7 @@ def exec_recovery_instance():
     ok(kill(A, n))
 
 
+@needs_kvm
 def quit_status():
     """Ctrl-\\ (SIGQUIT) destroys the VM as Ctrl-C does, but the exit status is 131 (128 + SIGQUIT)."""
     n = "ft-quit"
@@ -10813,6 +11052,7 @@ def quit_status():
     check("quit: nothing left", n not in vms(A) and not alive(fc), vms(A).get(n))
 
 
+@needs_kvm
 def suspend_died():
     """A Firecracker that dies after a suspend published its checkpoint (but
     before the suspend ended) is a death, not a kill: the checkpoint is
@@ -10835,6 +11075,7 @@ def suspend_died():
     ok(kill(A, n))
 
 
+@needs_kvm
 def suspend_debris():
     """A suspend directory that is not a suspended VM (no manifest: a revoke
     or a removal cut short; or marked STARTED by a resume killed outright) is
@@ -10879,6 +11120,7 @@ def suspend_debris():
     check("debris: run of the name removes it", r["ok"] and gone(), (r, os.path.exists(d)))
 
 
+@needs_kvm
 def revoked_publication():
     """A checkpoint published but not made durable (the directory's fsync
     fails) is revoked, the whole directory removed: a suspend fails with the
@@ -10923,6 +11165,7 @@ def revoked_publication():
     check("revoked: resumes, md5 intact", md5(A, n) == m)
 
 
+@needs_kvm
 def warm_ready():
     """A warm image's ready command uses USER app:group, including its group list."""
     import hashlib, io, shutil, tarfile
@@ -11001,6 +11244,7 @@ def app_lines(text):
     return [int(x) for x in re.findall(r"^applog-(\d+)$", text, re.M)]
 
 
+@needs_kvm
 def app_log():
     """An app's output is never repeated in its VM's log across a suspend and
     resume, or a checkpoint --stop and restore (the offset in the guest's log
@@ -11053,6 +11297,7 @@ def app_log():
     check("app log: none lost across the migration", not missing, missing[:20])
 
 
+@needs_kvm
 def bad_app_log():
     """A source whose header claims more app output than the guest has
     (u64::MAX, `bad_app_log`): the target goes on from the end of the
@@ -11090,6 +11335,7 @@ def no_evict(scenario):
     return run_it
 
 
+@needs_kvm
 def source_unpublished():
     """A released record stays while its source process lives, whatever the
     source's registry says: with its state never published (still `running`)
@@ -11119,6 +11365,7 @@ def source_unpublished():
     cleanup("ft-unpublished-gc")
 
 
+@needs_kvm
 def source_killed_basic():
     """A target whose source was killed after the release (no `done` ever
     comes) forgets the record once the source's listener says no such source
@@ -11153,6 +11400,7 @@ def standby_pids(host, t):
     return [p for p in pids if alive(p)]
 
 
+@needs_kvm
 def unit_restart():
     """A systemd unit restarted with KillMode=control-group, emulated: B's
     listener, a `run -d` and a `pull --standby` started from the unit's cgroup, and
@@ -11214,6 +11462,7 @@ def unit_restart():
         os.rmdir(unit)
 
 
+@needs_kvm
 def log_cap():
     """A detached VM's log is capped by its writer: past 8 MiB, NAME.log
     becomes NAME.log.1 and a new one goes on. Every line of the output is in
@@ -11262,6 +11511,7 @@ def log_cap():
     check("log cap: its move logged after the padding", b"moved to" in after.split(b"pad\n")[-1], after[-300:])
 
 
+@needs_kvm
 def gc_debris():
     """What the sweep removes and what it keeps: old `.moved` markers, the
     log of a name with nothing left here once quiet, a SIGKILLed standby's
@@ -11338,6 +11588,7 @@ def gc_debris():
     rm_ckpt(d)
 
 
+@needs_kvm
 def arrival_log():
     """An arrival's log stays while it runs and goes once it is killed (it
     is never published as NAME.log): the sweep tells them apart by the
@@ -11382,6 +11633,7 @@ def pid_ns():
     return ns, census
 
 
+@needs_kvm
 def template_tap():
     """A template build SIGKILLed after making its tap (PREFIX x PID, its
     owner in its alias): a sweep removes the tap once the build is gone (any
@@ -11443,6 +11695,7 @@ def template_tap():
         subprocess.run(["rm", "-rf", os.path.join(tdir, f".{name}.new-{p.pid}"), other])
 
 
+@needs_kvm
 def pidns_names():
     """#1084: what a host names after a process in what hosts of other PID namespaces may share
     names that namespace too: a VM process's own cgroup (`vm-PID-START-NS`) and a write's
@@ -11519,6 +11772,7 @@ def pidns_names():
         shutil.rmtree(d, ignore_errors=True)
 
 
+@needs_kvm
 def pidns_control():
     """#1111: a VM whose process is pid 1 of a PID namespace of its own (a container on the
     host's network, sharing this host's directories) is controlled from this namespace by the
@@ -11607,6 +11861,7 @@ def own_cgroup():
     return False
 
 
+@needs_kvm
 def pidns_standby():
     """#1139: a standby VM in a PID namespace of its own (a container sharing this host's directories) names its
     socket after that namespace (`PID.PIDNS.sock`), never this one's of its pid, and a sweep here keeps it. A run
@@ -11712,6 +11967,7 @@ def lock_holders(path):
     return [l.split()[4] for l in open("/proc/locks") if l.split()[5].endswith(f":{ino}")]
 
 
+@needs_kvm
 def rmi_suspend():
     """#631: `flexvm rmi IMAGE` parked after its own checks (`rmi_hold`) while a VM of the image
     starts and suspends. The suspended VM has no process left to hold the generation's use lock,
@@ -11765,6 +12021,7 @@ def starttime_of(pid):
         return None
 
 
+@needs_kvm
 def uffd_err():
     """The pager's userfaultfd stops being pollable (POLLERR): the pager
     fails, saying why, rather than stopping silently with every vCPU left
@@ -11815,6 +12072,7 @@ def release(host, gate):
     fault(host, gate, 0)
 
 
+@needs_kvm
 def ckpt_ancestor_corrupt():
     """#461: a page only an ancestor of a delta stores (none of its descendants
     overrides it) turns out corrupt once the head is restored: the real pager
@@ -11895,6 +12153,7 @@ def ckpt_ancestor_corrupt():
     rm_ckpt(base)
 
 
+@needs_kvm
 def resume_listener_restart():
     """#461: the listener restarts while a suspended VM resumes: once with the
     resume parked before it marks the checkpoint STARTED, once after it marked
@@ -11975,6 +12234,7 @@ def resume_listener_restart():
     check("resume listener restart, killed: nothing left once killed", n not in vms(A), vms(A).get(n))
 
 
+@needs_kvm
 def resume_killed_marked():
     """#461: a resume SIGKILLed once its checkpoint's STARTED mark is durable,
     before its vCPUs were unpaused (parked under the fence's host lock, released
@@ -12047,6 +12307,7 @@ class RouteWatch:
         self.proc.wait()
 
 
+@needs_kvm
 @with_third_peer
 def restore_route_fence():
     """#534, #914: a restore holds its address's generation from its claim. Held at
@@ -12103,6 +12364,7 @@ def kill_tree(pid):
     return pids
 
 
+@needs_kvm
 def reboot():
     """#553, #555, #556: B rebooted, emulated: its listener, VM and standby processes SIGKILLed,
     its run directory emptied (tmpfs) and its kernel routes gone. Another state opening first
