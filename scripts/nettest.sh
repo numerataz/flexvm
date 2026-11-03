@@ -7,6 +7,11 @@
 #   ${P}B   $NET.2   host B, VM addresses $NET.192-$NET.250
 #   ${P}C   $NET.10  client: a TCP ping-pong and a sequence-numbered UDP stream
 #
+# With V6=1 the hosts also have $NET6.1 and $NET6.2 (and the client $NET6.10) and listen and peer
+# at those alone, so their underlay is IPv6 only (the VM's IPv4 /32 is routed via an IPv6 next
+# hop); vm_ipv6_prefix is $PREFIX6/96, the client has an on-link route to it (proxy NDP answers),
+# and its TCP and UDP go to the VM's IPv6 address.
+#
 # Fails if a TCP round trip stalls longer than twice the longer migration
 # downtime of its round (a lost packet costs a retransmit timeout, >= 200 ms)
 # or the UDP stream loses more than MAX_UDP_LOSS datagrams in a round.
@@ -15,7 +20,8 @@
 # env: FLEXVM (binary), STATE (whose artifacts and templates to use), P (namespace prefix, default fv5), NET
 #      (default 192.168.155), ROUNDS (default 3), UDP_PPS (default 5000),
 #      MAX_UDP_LOSS (default 0), PORT (listeners, default 7070), WORK (keep logs under this
-#      directory, default /tmp), TEMPLATE (default small: the test image, see scripts/faults.py)
+#      directory, default /tmp), TEMPLATE (default small: the test image, see scripts/faults.py),
+#      V6 (default 0), NET6 (default fd5e::), PREFIX6 (default fd5e:0:0:1::)
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -29,8 +35,16 @@ ROUNDS=${ROUNDS:-3}
 UDP_PPS=${UDP_PPS:-5000}
 MAX_UDP_LOSS=${MAX_UDP_LOSS:-0}
 PORT=${PORT:-7070}
-host_A=$NET.1:$PORT
-host_B=$NET.2:$PORT
+V6=${V6:-0}
+NET6=${NET6:-fd5e::}
+PREFIX6=${PREFIX6:-fd5e:0:0:1::}
+if [[ $V6 == 1 ]]; then
+    host_A=[${NET6}1]:$PORT
+    host_B=[${NET6}2]:$PORT
+else
+    host_A=$NET.1:$PORT
+    host_B=$NET.2:$PORT
+fi
 dir_A=/run/$P-a
 dir_B=/run/$P-b
 name=nettest-$$
@@ -96,16 +110,21 @@ for spec in A:1 B:2 C:10; do
     ip link add eth0 netns "$P$h" type veth peer name "p$h" netns "${P}lan"
     ip -n "${P}lan" link set "p$h" master br0 up
     ip -n "$P$h" addr add "$NET.${spec#*:}/24" dev eth0
+    [[ $V6 != 1 ]] || ip -n "$P$h" -6 addr add "$NET6${spec#*:}/64" dev eth0 nodad
     ip -n "$P$h" link set eth0 up
     ip -n "$P$h" link set lo up
 done
+# The client resolves the VMs' prefix on the LAN (proxy NDP answers), as it does their IPv4 addresses.
+[[ $V6 != 1 ]] || ip -n "${P}C" -6 route add "$PREFIX6/96" dev eth0
 start_listener() {
     local ns=$1 dir=$2 listen=$3 peer=$4 ips=$5
     mkdir -p "$dir/state" "$dir/run"
     ln -sfn "$state/artifacts" "$dir/state/artifacts"
     ln -sfn "$state/templates" "$dir/state/templates"
     # STATE/host.json, written whole and atomically (a fresh state directory has none to merge with).
-    printf '{"peers": ["%s"], "vm_ips": "%s", "cluster_ips": "%s"}\n' "$peer" "$ips" "$NET.128-$NET.250" > "$dir/state/host.json.tmp"
+    local v6=
+    [[ $V6 != 1 ]] || v6=", \"vm_ipv6_prefix\": \"$PREFIX6/96\""
+    printf '{"peers": ["%s"], "vm_ips": "%s", "cluster_ips": "%s"%s}\n' "$peer" "$ips" "$NET.128-$NET.250" "$v6" > "$dir/state/host.json.tmp"
     chmod 644 "$dir/state/host.json.tmp"
     mv -f "$dir/state/host.json.tmp" "$dir/state/host.json"
     ip netns exec "$ns" sh -c 'mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null; exec "$@"' sh \
@@ -118,18 +137,26 @@ start_listener "${P}B" "$dir_B" "$host_B" "$host_A" "$NET.192-$NET.250"
 wait_for grep -q '"listen"' "$dir_A/state/host.json"
 wait_for grep -q '"listen"' "$dir_B/state/host.json"
 sleep 0.5
+if [[ $V6 == 1 ]]; then
+    # Peers at IPv6 addresses alone: no IPv4 underlay, the IPv6 one the host's own address.
+    cli "${P}A" "$dir_A" info | python3 -c 'import json,sys; d=json.load(sys.stdin)["derived"]; sys.exit(not (d["underlay"] is None and d["underlay6"] == sys.argv[1]))' "${NET6}1" \
+        || die "host A's underlay is not ${NET6}1 alone: $(cli "${P}A" "$dir_A" info)"
+fi
 
-addr=$(cli "${P}A" "$dir_A" run --name "$name" -d "${TEMPLATE:-small}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ip"])')
+addr4=$(cli "${P}A" "$dir_A" run --name "$name" -d "${TEMPLATE:-small}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["ip"])')
+addr=$addr4
+[[ $V6 != 1 ]] || addr=$(python3 -c 'import ipaddress,sys; print(ipaddress.IPv6Address(int(ipaddress.IPv6Address(sys.argv[1])) | int(ipaddress.IPv4Address(sys.argv[2]))))' "$PREFIX6" "$addr4")
 say "vm $name at $addr"
 
 cat > "$work/server.py" <<'PY'
 import json, socket, threading
 
-# TCP echo for the ping-pong, one connection per round.
+# TCP echo for the ping-pong, one connection per round; both families, on [::].
 def tcp():
-    with socket.socket() as l:
+    with socket.socket(socket.AF_INET6) as l:
         l.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        l.bind(("0.0.0.0", 19012))
+        l.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        l.bind(("::", 19012))
         l.listen(4)
         while True:
             conn, _ = l.accept()
@@ -142,9 +169,10 @@ def tcp():
 # UDP sequence receiver: 8-byte sequence numbers; "STOP <sent>" ends a round
 # and writes its counts to /tmp/udp-<round>.json.
 def udp():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 16 << 20)
-    s.bind(("0.0.0.0", 19013))
+    s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    s.bind(("::", 19013))
     seen, top, reordered, dups, done, gaps = set(), -1, 0, 0, set(), []
     while True:
         d, _ = s.recvfrom(2048)
@@ -193,7 +221,7 @@ address, directory, rnd, pps = sys.argv[1], pathlib.Path(sys.argv[2]), sys.argv[
 stop = directory / "stop"
 
 def udp():
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s = socket.socket(socket.AF_INET6 if ":" in address else socket.AF_INET, socket.SOCK_DGRAM)
     n, start = 0, time.monotonic()
     while not stop.exists():
         due = start + n / pps
@@ -257,7 +285,10 @@ migrate() {
     python3 -c 'import json,sys; print(json.load(sys.stdin)["downtime_ms"])' <<< "$res" >> "$work/downtime-$round"
     wait_for running "$4" "$5"
     wait_for absent "$1" "$2"
+    [[ $V6 != 1 ]] || wait_for routed_via6 "$1"
 }
+# The source routes both of the VM's addresses via the target's IPv6 underlay (the IPv4 one via inet6).
+routed_via6() { ip -n "$1" route show "$addr4/32" | grep -q 'via inet6 ' && ip -n "$1" -6 route show "$addr/128" | grep -q 'via '; }
 
 failures=0
 for round in $(seq 1 "$ROUNDS"); do

@@ -2979,13 +2979,58 @@ def same_host_bulk_tcp():
     """#411: a bulk TCP download into a VM (the host's TCP sends TSO frames to its tap) moving
     there and back: nothing held is dropped, and the download goes on after each move. (TSO
     frames a source leaves on its tap are cut into segments: hold::tests, needing root.)"""
-    n = "ft-bulk"
+    bulk_tcp("bulk tcp", "ft-bulk")
+
+
+@needs_kvm
+def same_host_bulk_tcp6():
+    """#1301: same_host_bulk_tcp to the VM's IPv6 address (vm_ipv6_prefix): the host's TCPv6 TSO
+    frames, held and injected (and cut into segments when left on a source's tap, #1299) as
+    TCPv4's are."""
+    with ipv6_prefix():
+        bulk_tcp("bulk tcp v6", "ft-bulk6", v6=True)
+
+
+@needs_kvm
+def same_host_order6():
+    """#1301: same_host_order to the VM's IPv6 address (vm_ipv6_prefix): a 1 kHz UDP sequence
+    stream across migrations there and back, its /128 held and handed over with its /32, arrives
+    whole and in order."""
+    with ipv6_prefix():
+        udp_across_migrations("same host order v6", "ft-same-host6", v6=True)
+
+
+# The IPv6 scenarios' vm_ipv6_prefix. Lanes side by side share it: their VMs' IPv4 addresses, so their IPv6 ones, differ.
+V6_PREFIX = "fd00:f17::"
+
+
+@contextmanager
+def ipv6_prefix(prefix=V6_PREFIX):
+    """`vm_ipv6_prefix` set on A and B for the block (VMs started in it get their IPv6 addresses), removed after."""
+    for h in (A, B):
+        configure(h, vm_ipv6_prefix=prefix + "/96")
+    try:
+        yield
+    finally:
+        for h in (A, B):
+            configure(h, vm_ipv6_prefix=None)
+
+
+def vm_ipv6(host, name):
+    """`name`'s IPv6 address on `host` (`ps`), asserted to be there."""
+    v6 = vms(host)[name].get("ipv6")
+    assert v6, f"{name} has no IPv6 address on {host}: {vms(host)[name]}"
+    return v6
+
+
+def bulk_tcp(label, n, v6=False):
+    """same_host_bulk_tcp's download, to `n`'s IPv6 address with `v6`."""
     for h in (A, B):
         clear_log(h, n)
     ok(run(A, n))
-    ip = vm_ip(A, n)
+    ip = vm_ipv6(A, n) if v6 else vm_ip(A, n)
     # A sink: the guest takes all it is sent and answers nothing.
-    code, out = sh(A, n, "setsid socat -u TCP-LISTEN:7001,reuseaddr OPEN:/dev/null >/dev/null 2>&1 < /dev/null &")
+    code, out = sh(A, n, f"setsid socat -u TCP{'6' if v6 else ''}-LISTEN:7001,reuseaddr OPEN:/dev/null >/dev/null 2>&1 < /dev/null &")
     assert code == 0, out
     listening = lambda: ":7001 " in sh(A, n, "ss -Hltn")[1]
     assert wait_for(listening, 10), sh(A, n, "ss -Hltn")
@@ -3014,11 +3059,11 @@ def same_host_bulk_tcp():
     stop.set()
     t.join(15)
     conn.close()
-    check("bulk tcp: migrated there and back, running on A", where(n) == {A: "running"}, where(n))
-    check("bulk tcp: held packets all injected, none dropped",
+    check(f"{label}: migrated there and back, running on A", where(n) == {A: "running"}, where(n))
+    check(f"{label}: held packets all injected, none dropped",
           all(isinstance(h, dict) and h.get("injected") == h.get("packets") and h.get("dropped") == 0 and h.get("dropped_target") == 0
               for h in held), held)
-    check("bulk tcp: the download goes on after each move", all(m > 0 for m in moved), (moved, sent[1:]))
+    check(f"{label}: the download goes on after each move", all(m > 0 for m in moved), (moved, sent[1:]))
 
 
 @needs_kvm
@@ -3093,12 +3138,12 @@ def ckpt_paused_backlog():
     rm_ckpt(path)
 
 
-def udp_receiver(host, n):
+def udp_receiver(host, n, v6=False):
     """Starts socat in the guest appending what UDP port 9000 receives to /tmp/udp (its socket
     buffer large enough for any burst of held packets), and waits until the port is bound:
-    a datagram sent before would be dropped by the guest (NoPorts)."""
+    a datagram sent before would be dropped by the guest (NoPorts). `v6`: on [::]."""
     code, out = sh(host, n, "echo 16777216 > /proc/sys/net/core/rmem_max; "
-                   "setsid socat -u UDP-RECV:9000,rcvbuf=16777216 OPEN:/tmp/udp,creat,append >/dev/null 2>&1 < /dev/null & "
+                   f"setsid socat -u UDP{'6' if v6 else ''}-RECV:9000,rcvbuf=16777216 OPEN:/tmp/udp,creat,append >/dev/null 2>&1 < /dev/null & "
                    "for i in $(seq 200); do grep -qs ':2328 ' /proc/net/udp /proc/net/udp6 && exit 0; sleep 0.05; done; exit 1")
     assert code == 0, f"socat did not bind UDP port 9000 in the guest: {out}"
 
@@ -3121,7 +3166,7 @@ SEND_STALLS = 256
 
 @contextmanager
 def udp_stream(ip, burst=1):
-    """A UDP sequence stream to `ip`'s port 9000 (`burst` datagrams every millisecond), from a process of
+    """A UDP sequence stream to `ip`'s port 9000 (`burst` datagrams every millisecond; `ip` either family), from a process of
     its own, real-time where it may be: a thread of this one, sharing its GIL and scheduled as any other,
     went quiet for as long as a migration's hold on a loaded host, which then held nothing (#1046).
     Yields how many it sent (`.value`) and its sendto calls that took `SEND_STALL_NS` or more, as
@@ -3144,7 +3189,7 @@ def udp_stream(ip, burst=1):
                 os._exit(0)
             with suppress(OSError):
                 os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(1))
-            s, i = socket.socket(socket.AF_INET, socket.SOCK_DGRAM), 0
+            s, i = socket.socket(socket.AF_INET6 if ":" in ip else socket.AF_INET, socket.SOCK_DGRAM), 0
             while not stop.is_set() and os.getppid() == parent:
                 for _ in range(burst):
                     datagram, to = b"%08d\n" % i, (ip, 9000)
@@ -3178,20 +3223,21 @@ def udp_stream(ip, burst=1):
         stalled.sends = [(slow[3 * k], slow[3 * k + 1], slow[3 * k + 2]) for k in range(min(nslow.value, SEND_STALLS))]
 
 
-def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=None, counted=False):
+def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=None, counted=False, v6=False):
     """A UDP sequence stream to `n` (`burst` datagrams every millisecond)
     across migrations A to B, back and to B again, `target_fault` (one or a
     tuple) armed on each target, arrives whole and, at 1 kHz, in order. The
     guest's socket buffer is made large enough for any burst of held packets,
     so a datagram missing was lost by flexvm (the guest's own drops are shown).
-    `counted`: at 1 kHz too, what is lost need only be counted. Returns every
+    `counted`: at 1 kHz too, what is lost need only be counted. `v6`: to its
+    IPv6 address (the caller sets `vm_ipv6_prefix`: `ipv6_prefix`). Returns every
     log its VM processes wrote."""
     target_faults = (target_fault,) if isinstance(target_fault, str) else tuple(target_fault or ())
     for h in (A, B):
         clear_log(h, n)
     ok(run(A, n))
-    ip = vm_ip(A, n)
-    udp_receiver(A, n)
+    ip = vm_ipv6(A, n) if v6 else vm_ip(A, n)
+    udp_receiver(A, n, v6)
     held, at, took, logs, arrivals, windows = [], [], [], [], [], []
     hops = ((A, B), (B, A), (A, B))
     with udp_stream(ip, burst) as (sent, stalled):
@@ -7011,7 +7057,7 @@ def ipv6_packet_hold():
     held and handed to it as IPv4 ones are: a 1 kHz UDP sequence stream to its IPv6 address across a
     keep-running checkpoint and migrations to B and back arrives whole, and a TCP connection over IPv6
     keeps echoing throughout and loses nothing (any retransmit a duplicate, as in ckpt_packet_hold)."""
-    n, prefix = "ft-v6-hold", "fd00:f17::"
+    n, prefix = "ft-v6-hold", V6_PREFIX
     path = ckpt_path(n)
     for h in (A, B):
         configure(h, vm_ipv6_prefix=prefix + "/96")
@@ -8625,6 +8671,63 @@ def wildcard_listen():
     if len(wilds) == 1:
         # The IPv4 case ran (its checks count); the scenario still ends SKIPPED, never ok, without [::].
         raise Skip("no dual-stack loopback here: the [::] listener was not tried")
+
+
+@needs_kvm
+def ipv6_control_plane():
+    """#1301: the control plane over IPv6 alone. A and B listen at [::1] and peer at each other's
+    [::1] port, with vm_ipv6_prefix: the IPv6 underlay is ::1 (the listen address), peers are told the
+    VM's route via it (after `caps`, over IPv6), and a VM migrates there and back (its pages pulled
+    from [::1]), with its md5 intact and TCP connections to both its addresses echoing throughout;
+    exec and a checkpoint work there as on 127.0.0.1."""
+    own_listeners("ipv6 control plane")
+    try:
+        with socket.socket(socket.AF_INET6) as s:
+            s.bind(("::1", 0))
+    except OSError as e:
+        raise Skip(f"no ::1 here: {e}")
+    at = {h: f"[::1]:{h.addr.rsplit(':', 1)[1]}" for h in (A, B)}
+    n, conns = "ft-ctl6", []
+    path = ckpt_path(n)
+    stop_listeners()
+    try:
+        for h, other in ((A, B), (B, A)):
+            start_listener(h, listen=at[h], peer=at[other], extra={"vm_ipv6_prefix": V6_PREFIX + "/96"}, wait=False)
+        up = lambda h: subprocess.run(["bash", "-c", f"exec 3<>/dev/tcp/::1/{h.addr.rsplit(':', 1)[1]}"], capture_output=True).returncode == 0
+        assert wait_for(lambda: up(A) and up(B), 10), "listeners on [::1] did not come up"
+        derived = ok(cli_json(A, "info"))["derived"]
+        check("ipv6 control plane: the IPv6 underlay is ::1", derived.get("underlay6") == "::1", derived)
+        for h in (A, B):
+            clear_log(h, n)
+        m = setup(n)
+        v4, v6 = vm_ip(A, n), vm_ipv6(A, n)
+        code, out = sh(A, n, "setsid socat TCP6-LISTEN:7000,ipv6only=0,fork,reuseaddr EXEC:cat >/dev/null 2>&1 < /dev/null & "
+                             "for i in $(seq 200); do grep -qs ':1B58 ' /proc/net/tcp6 && exit 0; sleep 0.05; done; exit 1")
+        assert code == 0, f"socat did not listen in the guest: {out}"
+        conns = [socket.create_connection((a, 7000), timeout=10) for a in (v4, v6)]
+        # B's record of the VM's route, announced by A over IPv6: via ::1 (an IPv4 underlay B does not know A by is left out).
+        via = lambda: (lambda r: "::1" in (r.get("via"), r.get("via6")))(addr(B, v4))
+        check("ipv6 control plane: B is told the route via ::1", wait_for(via, 15), addr(B, v4))
+        for src, dst in ((A, B), (B, A)):
+            r = cli_json(src, "migrate", n, at[dst])
+            check(f"ipv6 control plane: migrated {src} -> {at[dst]}", r["ok"], r)
+            assert_released(dst, n, src)
+            pulls = re.findall(r"pull from (\S+) ended", log(dst, n))
+            check(f"ipv6 control plane: {dst} pulled from {at[src]}", pulls[-1:] == [at[src]], pulls)
+            check(f"ipv6 control plane: md5 intact on {dst}", md5(dst, n) == m)
+            check(f"ipv6 control plane: both connections echo on {dst}", all(echo(c, b"ctl6\n") for c in conns))
+        check("ipv6 control plane: back on A", where(n) == {A: "running"}, where(n))
+        r = checkpoint(A, n, path)
+        check("ipv6 control plane: a checkpoint", r["ok"], r)
+    finally:
+        for c in conns:
+            c.close()
+        cleanup(n)
+        rm_ckpt(path)
+        stop_listeners()
+        for h in (A, B):
+            configure(h, vm_ipv6_prefix=None)
+        start_listeners()
 
 
 def route_via6():
@@ -13110,7 +13213,7 @@ SCENARIOS = dict(
     ckpt_failed_stop=ckpt_failed_stop, ckpt_no_wp=ckpt_no_wp, ckpt_rearm=ckpt_rearm,
     leave_fail=leave_fail, capture_fail=capture_fail, abort_gen_fail=abort_gen_fail, commit_fail=commit_fail, commit_fail_routed=commit_fail_routed, proxy_ndp_routed=proxy_ndp_routed, abort_stay_fail=abort_stay_fail,
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail, arrival_flood=arrival_flood, arrival_cap_restart=arrival_cap_restart,
-    fc_prepare=fc_prepare, forged_vmstate=forged_vmstate, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ipv6_packet_hold=ipv6_packet_hold, ckpt_stall=ckpt_stall, standby=standby, standby_vm_ips=standby_vm_ips,
+    fc_prepare=fc_prepare, forged_vmstate=forged_vmstate, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ipv6_packet_hold=ipv6_packet_hold, same_host_order6=same_host_order6, same_host_bulk_tcp6=same_host_bulk_tcp6, ipv6_control_plane=ipv6_control_plane, ckpt_stall=ckpt_stall, standby=standby, standby_vm_ips=standby_vm_ips,
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, suspend_unaddressed=suspend_unaddressed, resume_fence_fails=resume_fence_fails, kill_source=kill_source,
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, route_via6=route_via6, peer_by_name=peer_by_name, peer_moved=peer_moved, peer_unresolvable=peer_unresolvable, page_refusals=page_refusals,
     forged_peer=forged_peer, forged_pages=forged_pages, restore_ip_peer=restore_ip_peer, loan_start_retry=loan_start_retry, spoof_filter=spoof_filter, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,

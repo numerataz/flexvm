@@ -393,7 +393,14 @@ wildcard binds; TCP and UDP can use the same number. `ps` shows a PORTS
 column; `ps --json` and `run -d` return `ports` objects with `ip`, `host_port`, `vm_port`, and `protocol`, one per bound address.
 
 These are single-host userspace proxies in the VM process. The guest sees
-the host as the client. Each mapping uses one thread, with up to 256 TCP
+the host as the client. A forward connects to the VM's IPv4 address, also
+with `vm_ipv6_prefix`: a guest app listening on `[::]` takes it too (Linux's
+`[::]` socket also takes IPv4, unless it sets `IPV6_V6ONLY`, as nginx's
+`listen [::]:80` does), so only an app that listens on IPv6 alone is not
+forwarded to; reach that one at the VM's IPv6 address, which is routed. A
+fallback to IPv6 would cost every refused connection a second attempt, and a
+wait until the connect times out for a VM whose template predates IPv6 (it
+has no IPv6 address), for a case that is rare. Each mapping uses one thread, with up to 256 TCP
 connections or UDP client sessions; UDP sessions expire after 60 idle
 seconds. At the TCP cap, a new client can replace the connection idle
 longest if it has been idle for at least 60 seconds. TCP buffers are bounded
@@ -657,9 +664,10 @@ tap, and routes it on each peer via the host it runs on, as its IPv4 address
 is (via that host's IPv6 underlay: a peer with none leaves it to the host's
 own IPv6 routes), holds its IPv6 packets during a migration's or
 checkpoint's pause as it holds the IPv4 ones, and answers for it on the LAN
-(proxy NDP, below). Port forwards (`-p`) reach the guest at its IPv4 address
-only (#1301): a service listening on IPv6 alone in the guest is not
-forwarded to. Without the prefix, nothing changes: taps keep IPv6 off.
+(proxy NDP, below). Port forwards (`-p`) connect to the guest's IPv4
+address (see [Forward host ports](#forward-host-ports)). Without the prefix,
+nothing changes: taps keep IPv6 off. [An IPv6 cluster, end to
+end](#an-ipv6-cluster-end-to-end) closes this section.
 
 On the host, each VM's IPv6 address is a `/128` routed to its tap beside its
 `/32`, with a permanent neighbour entry for the guest's MAC. The tap gets
@@ -736,6 +744,63 @@ address whose IPv6 address is one of this host's or a peer's.
 `IPAMConfig.IPv6Address` is refused unless it is a derived address: alone,
 it picks the IPv4 address it was derived from; with `IPv4Address`, it must
 be that address's.
+
+#### An IPv6 cluster, end to end
+
+Hosts A (`2001:db8:0:1::10`) and B (`2001:db8:0:1::11`) share a LAN whose
+prefix is `2001:db8:0:1::/64` and which also has IPv4 (`192.168.1.0/24`).
+The VMs' `/96` is inside the LAN's `/64` but holds no host's address, so
+machines on the LAN (its router too) look VMs up by NDP, which the host
+running each VM answers, and need no route of their own:
+
+```json
+{
+  "peers": ["[2001:db8:0:1::11]:7070"],
+  "vm_ips": "192.168.1.128-192.168.1.191",
+  "cluster_ips": "192.168.1.128-192.168.1.250",
+  "vm_ipv6_prefix": "2001:db8:0:1:0:1::/96",
+  "dns": ["192.168.1.1", "2001:db8:0:1::1"]
+}
+```
+
+That is A's `host.json`; B's has `"peers": ["[2001:db8:0:1::10]:7070"]` and
+`"vm_ips": "192.168.1.192-192.168.1.250"`, and the same `cluster_ips` and
+`vm_ipv6_prefix`. Then:
+
+```sh
+flexvm listen '[2001:db8:0:1::10]:7070'     # on A
+flexvm listen '[2001:db8:0:1::11]:7070'     # on B
+flexvm info                                 # on A: derived.underlay6 2001:db8:0:1::10, underlay null
+flexvm run -d --name web ubuntu:24.04 sleep infinity   # on A
+flexvm ps --format '{{.Name}} {{.IP}} {{.IPv6}}'       # web 192.168.1.128 2001:db8:0:1:0:1:c0a8:180
+flexvm migrate web '[2001:db8:0:1::11]:7070'           # on A: web runs on B, both addresses kept
+```
+
+What this gives:
+
+- **The guest** has `2001:db8:0:1:0:1:c0a8:180/128` on `eth0`, a default
+  route via `fe80::1`, and both nameservers. Templates built before IPv6
+  support need a new `pull` first.
+- **Peers at IPv6 addresses alone** give each host an IPv6 underlay (its own
+  address toward them) and no IPv4 one, so peers route a VM's `/32` via an
+  IPv6 next hop as well as its `/128` (Linux 5.2 or later). With IPv4
+  `peers` instead, give each host both underlays (`"underlay":
+  ["192.168.1.10", "2001:db8:0:1::10"]`) and list each peer's IPv6 one in
+  `peer_underlays`, or its `/128` is left to the peers' own IPv6 routes.
+- **Migrations** keep TCP connections and UDP flows to either address: the
+  `/128` is held, injected and rerouted with the `/32`, and the target's
+  unsolicited Neighbour Advertisement moves the LAN's entries to it, as its
+  gratuitous ARP does for IPv4.
+- **Reporting**: `ps`, `inspect` and the Docker API show the address.
+- **Port forwards** (`-p`) reach the guest at its IPv4 address. A service
+  that listens on IPv6 alone is reached at its IPv6 address directly.
+
+Check that `ip6tables`' `FORWARD` policy lets the VMs' traffic through,
+and the `accept_ra` note under [Migrate](#migrate). Known limits: every host
+must have the same `vm_ipv6_prefix`, which is not compared between hosts;
+a checkpoint restored at its own IPv4 address keeps the IPv6 address of the
+prefix it was taken under; and in a cluster that mixes IPv4-only and
+IPv6-only peers, a `[::]` listener advertises one address to all of them.
 
 ## Migrate
 
@@ -1335,6 +1400,10 @@ paths under a root-owned directory so another user cannot supply the image.
 
 `scripts/nettest.sh` migrates a VM back and forth under TCP and UDP traffic
 between network namespaces and fails on a lost datagram or a long stall.
+With `V6=1` the hosts listen and peer at IPv6 addresses alone (an IPv6
+underlay), with `vm_ipv6_prefix`, and the client's traffic goes to the VM's
+IPv6 address; `e2e.py`'s `nettest_ipv6` case runs it so. `scripts/netlab.sh`
+takes `V6=1` too.
 
 ## How it works
 

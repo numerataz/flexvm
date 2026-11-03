@@ -5,6 +5,10 @@
 #   fvB  192.168.100.2   host B, hands out VM addresses .192-.250
 #   fvC  192.168.100.10  a plain client machine
 #
+# With V6=1 (for both `up` and `listeners`) they also have fd10::1, fd10::2 and fd10::10, and the
+# hosts listen and peer at those alone (an IPv6 underlay) with vm_ipv6_prefix fd10:0:0:1::/96,
+# which the client has an on-link route to.
+#
 # usage: netlab.sh up | down | listeners | stop | fv A|B ARGS...
 # The hosts use the artifacts and templates of STATE (default $FLEXVM_STATE_DIR, else /var/lib/flexvm).
 set -euo pipefail
@@ -12,6 +16,7 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 flexvm=$root/target/release/flexvm
 state=$(realpath -m "${STATE:-${FLEXVM_STATE_DIR:-/var/lib/flexvm}}")
+V6=${V6:-0}
 source "$root/scripts/net-common.sh"
 
 up() (
@@ -23,16 +28,18 @@ up() (
   created+=(fvlan)
   ip -n fvlan link add br0 type bridge
   ip -n fvlan link set br0 up
-  for spec in A:192.168.100.1 B:192.168.100.2 C:192.168.100.10; do
-    h=${spec%%:*} addr=${spec#*:}
+  for spec in A:1 B:2 C:10; do
+    h=${spec%%:*} i=${spec#*:}
     ip netns add "fv$h"
     created=("fv$h" "${created[@]}")
     ip link add eth0 netns "fv$h" type veth peer name "p$h" netns fvlan
     ip -n fvlan link set "p$h" master br0 up
-    ip -n "fv$h" addr add "$addr/24" dev eth0
+    ip -n "fv$h" addr add "192.168.100.$i/24" dev eth0
+    [[ $V6 != 1 ]] || ip -n "fv$h" -6 addr add "fd10::$i/64" dev eth0 nodad
     ip -n "fv$h" link set eth0 up
     ip -n "fv$h" link set lo up
   done
+  [[ $V6 != 1 ]] || ip -n fvC -6 route add fd10:0:0:1::/96 dev eth0
   trap - EXIT INT TERM
 )
 
@@ -64,10 +71,14 @@ listeners() {
     ln -sfn "$state/artifacts" "/run/flexvm-lab-$h/state/artifacts"
     ln -sfn "$state/templates" "/run/flexvm-lab-$h/state/templates"
   done
-  host_json A '{"peers": ["192.168.100.2:7070"], "vm_ips": "192.168.100.128-192.168.100.191", "cluster_ips": "192.168.100.128-192.168.100.250"}'
-  host_json B '{"peers": ["192.168.100.1:7070"], "vm_ips": "192.168.100.192-192.168.100.250", "cluster_ips": "192.168.100.128-192.168.100.250"}'
-  fv A listen 192.168.100.1:7070 > "$root/listen-A.log" 2>&1 &
-  fv B listen 192.168.100.2:7070 > "$root/listen-B.log" 2>&1 &
+  local a=192.168.100.1:7070 b=192.168.100.2:7070 v6=
+  if [[ $V6 == 1 ]]; then
+    a=[fd10::1]:7070 b=[fd10::2]:7070 v6=', "vm_ipv6_prefix": "fd10:0:0:1::/96"'
+  fi
+  host_json A '{"peers": ["'"$b"'"], "vm_ips": "192.168.100.128-192.168.100.191", "cluster_ips": "192.168.100.128-192.168.100.250"'"$v6"'}'
+  host_json B '{"peers": ["'"$a"'"], "vm_ips": "192.168.100.192-192.168.100.250", "cluster_ips": "192.168.100.128-192.168.100.250"'"$v6"'}'
+  fv A listen "$a" > "$root/listen-A.log" 2>&1 &
+  fv B listen "$b" > "$root/listen-B.log" 2>&1 &
   sleep 1
 }
 
