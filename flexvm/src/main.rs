@@ -1980,8 +1980,9 @@ fn only_standby(args: &Args) -> bool {
 /// `--max` is the host's memory unless given (at most what a peer takes, never below `--mem`:
 /// then there is no hotplug), and at most what fits Firecracker's hotplug window beside the root
 /// filesystem (`template::hotplug_room`, of `rootfs_bytes`, or the smallest before it is made).
-/// Either given past what a peer takes is refused, as is `--max` below `--mem` or past the window,
-/// and `--mem` past what fits below Firecracker's 64-bit MMIO gap on `arch` (`template::boot_room`).
+/// `--max` given past what a peer takes is refused, as is one below `--mem` or past the window, and
+/// `--mem` past what fits below Firecracker's 64-bit MMIO gap on `arch` (`template::boot_room`, far
+/// below what a peer takes).
 fn pull_size(args: &Args, ram_mib: u64, rootfs_bytes: Option<u64>, arch: compat::Arch) -> Result<template::Size> {
     let room = template::hotplug_room(rootfs_bytes.unwrap_or(0))?;
     let mem_of = |max: u64| args.parse_or("mem", template::base_mib(max));
@@ -1998,17 +1999,15 @@ fn pull_size(args: &Args, ram_mib: u64, rootfs_bytes: Option<u64>, arch: compat:
     };
     let max = args.parse_or("max", largest(ram_mib.min(template::MAX_MEM_MIB))?)?;
     let (mem, plug) = (mem_of(max)?, args.parse_or("plug", template::PLUG_MIB)?);
-    for (flag, mib) in [("max", max), ("mem", mem)] {
-        if mib > template::MAX_MEM_MIB {
-            bail!("--{flag} must be at most {} MiB", template::MAX_MEM_MIB);
-        }
-    }
     if mem > template::boot_room(arch) {
         bail!(
             "--mem {mem} MiB does not fit: Firecracker maps boot memory past its 64-bit MMIO gap where it places the hotplug region \
              and the root filesystem, so on {arch} it is at most {} MiB",
             template::boot_room(arch)
         );
+    }
+    if max > template::MAX_MEM_MIB {
+        bail!("--max must be at most {} MiB", template::MAX_MEM_MIB);
     }
     if max < mem && args.has("max") {
         bail!("--max must be at least --mem ({mem} MiB)");
@@ -2858,7 +2857,7 @@ mod exec_tests {
         assert_eq!((size.mem_mib, size.max_mib), (32768, 32768), "--mem past the host's memory: no hotplug");
         for ram in [16 << 10, 2 << 20] {
             let err = pull_size(&parse(&["pull", "busybox", "--mem", "2097153"]), ram, None, compat::Arch::HOST).unwrap_err().to_string();
-            assert_eq!(err, "--mem must be at most 2097152 MiB");
+            assert_eq!(err, boot_refusal(2097153, compat::Arch::HOST), "the boot room is the tighter limit");
         }
     }
 
