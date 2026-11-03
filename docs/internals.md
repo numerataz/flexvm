@@ -155,22 +155,43 @@ of `flexvm bench --dirty-mib 200`, 15 trials each:
 
 ## Host compatibility
 
-A template records the host it was built on: CPU vendor, family and model,
-the CPU feature bits KVM offered its guest (including invariant TSC), the XSAVE
-layout, TSC rate, saved MSR index set, and the Firecracker version and build.
-Checkpoints and migrations pin their template by content id and so carry its
-guest CPU. Every snapshot load (run, a standby VM's load, restore, resume, and a migration target before its source pauses)
-refuses a host with a different CPU model or Firecracker, a missing feature
-bit, another XSAVE layout, or a missing saved MSR, naming the mismatch. TSC
-rates may differ by up to 250 ppm (Firecracker’s calibration tolerance); larger
-differences require target KVM TSC scaling. Extra feature bits and MSRs are
-fine. Firecracker saves the MSRs of the host that takes the snapshot, so a
-migration's source also sends its own set, which the target checks before the
-source pauses. Checkpoints (including suspended VMs) record the saving host's
-MSR set and effective vCPU TSC rate in their manifest and check them before loading
-their VM state. A saved VM without either record cannot be restored. Templates built before these records must be rebuilt, and
-checkpoints and suspended VMs of such a template cannot be restored. Host
-probes are cached per process while the Firecracker binary is unchanged.
+A template records the host it was built on: its architecture, the CPU, what
+KVM offered a vCPU as Firecracker sets one up (no CPU template), and the
+Firecracker version and build. Checkpoints and migrations pin their template
+by content id and so carry its guest CPU. Every snapshot load (run, a standby
+VM's load, restore, resume, and a migration target before its source pauses)
+refuses a host of another architecture, CPU model or Firecracker, naming the
+mismatch, and then compares per architecture:
+
+- **x86_64**: CPU vendor, family and model, the CPU feature bits KVM offered
+  (including invariant TSC), the XSAVE layout, TSC rate and saved MSR index
+  set. A missing feature bit, another XSAVE layout or a missing saved MSR
+  refuses the host. TSC rates may differ by up to 250 ppm (Firecracker’s
+  calibration tolerance); larger differences require target KVM TSC scaling.
+  Extra feature bits and MSRs are fine.
+- **aarch64**: MIDR_EL1 (implementer, part, variant and revision), the
+  counter frequency (CNTFRQ_EL0), the registers `KVM_GET_REG_LIST` names on a
+  vCPU initialised as Firecracker does (PSCI 0.2), the identification
+  registers among them (REVIDR, the `ID_*` registers, CLIDR, AIDR, CTR), the
+  largest SVE vector length, the vGIC Firecracker creates (GICv3 with an ITS,
+  else GICv2) and stolen-time support. The counter frequency must be the same:
+  the guest reads the host's and KVM cannot scale it. Firecracker sets every
+  saved register on a load, and kernels before 6.7 refuse an ID register that
+  differs at all, so the identification registers must match exactly, as must
+  the SVE length and vGIC; extra registers are fine, and so is stolen time on
+  a host whose template was booted without it.
+
+Firecracker saves the MSRs (or registers) of the host that takes the snapshot,
+so a migration's source also sends its own set, which the target checks before
+the source pauses. Checkpoints (including suspended VMs) record the saving
+host's set, and on x86_64 its effective vCPU TSC rate, in their manifest and
+check them before loading their VM state. A saved VM without either record
+cannot be restored. Templates built before these records must be rebuilt, and
+checkpoints and suspended VMs of such a template cannot be restored. Records
+written before aarch64 carry no architecture and read as x86_64; x86_64
+records are still written exactly as before (`"arch": "aarch64"` tags the
+others), so content ids do not change. Host probes are cached per process
+while the Firecracker binary is unchanged.
 
 ### Pages
 

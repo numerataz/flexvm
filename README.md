@@ -75,9 +75,11 @@ artifacts](#releasing-the-artifacts).
 
 The host needs Linux 5.16+: Firecracker patch `0004` uses `KVM_VCPU_TSC_OFFSET`.
 
-Hosts that migrate or restore each other's VMs need the same CPU model and
-a byte-identical Firecracker: a snapshot records both (the binary by its
-content hash), and any difference refuses it ("Firecracker differs"). Builds
+Hosts that migrate or restore each other's VMs need the same architecture,
+CPU model and a byte-identical Firecracker: a snapshot records all three (the
+binary by its content hash), and any difference refuses it ("Firecracker
+differs"). arm64 hosts also need the same counter frequency, ID registers,
+SVE vector length and vGIC ([Host compatibility](docs/internals.md#host-compatibility)). Builds
 pinning the same release download the same binary; a Firecracker of your own (for a build pinning none)
 is built once and copied to every host (`/var/lib/flexvm/artifacts`) rather than
 built on each. Replacing the binary also invalidates every template

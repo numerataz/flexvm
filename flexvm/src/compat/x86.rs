@@ -1,21 +1,15 @@
-//! Snapshot compatibility preflight. A template records its build host's CPU model, the
-//! features KVM offered (passed through: no CPU template), XSAVE layout, TSC rate,
-//! saved MSR set and Firecracker. Checkpoints and migrations pin their template and check
-//! the saving host's MSRs and effective TSC rate. Topology, cache and leaf-limit words are
-//! not compared: Firecracker rewrites the first, the rest do not change what the guest can run.
+//! x86_64: the CPU model and feature words from KVM_GET_SUPPORTED_CPUID, the XSAVE layout,
+//! the default vCPU TSC rate and whether KVM can scale it, and the MSRs Firecracker saves.
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::File;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::template::{hash_file, Stamp};
+#[cfg(target_arch = "x86_64")]
+use super::ioctl;
 use crate::{bail, util::Result};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct Compat {
+pub struct X86 {
     pub cpu: String,
     /// Default vCPU TSC rate used when building this template.
     pub tsc_khz: u32,
@@ -32,6 +26,7 @@ pub struct Compat {
 }
 
 /// CPUID words that are feature bitmaps: (leaf, subleaf, registers).
+#[cfg(any(target_arch = "x86_64", test))]
 const FEATURES: [(u32, u32, &[usize]); 11] = [
     (0x1, 0, &[2, 3]),
     (0x7, 0, &[1, 2, 3]),
@@ -45,22 +40,19 @@ const FEATURES: [(u32, u32, &[usize]); 11] = [
     (0x8000_0008, 0, &[1]),
     (0x8000_0021, 0, &[0]),
 ];
+#[cfg(any(target_arch = "x86_64", test))]
 const REGS: [&str; 4] = ["eax", "ebx", "ecx", "edx"];
 
-impl Compat {
-    pub fn check(&self, host: &Self) -> Result<()> {
+impl X86 {
+    #[cfg(test)]
+    fn check(&self, host: &Self) -> Result<()> {
         self.check_saved(host, self.tsc_khz, &self.msrs).map(drop)
     }
 
     /// Later snapshots save the effective vCPU rate and the saving host's MSRs. Returns the
     /// effective restored rate: Firecracker keeps the host default within 250 ppm, else scales.
     pub fn check_saved(&self, host: &Self, tsc_khz: u32, msrs: &BTreeSet<u32>) -> Result<u32> {
-        let hints = ["every host needs the same CPU model", "copy one Firecracker binary to every host; templates built with another must be rebuilt"];
-        for ((what, snapshot, here), hint) in [("CPU", &self.cpu, &host.cpu), ("Firecracker", &self.firecracker, &host.firecracker)].into_iter().zip(hints) {
-            if snapshot != here {
-                bail!("snapshot incompatible with this host: {what} differs (snapshot: {snapshot}; host: {here}): {hint}");
-            }
-        }
+        super::check_identity([&self.cpu, &self.firecracker], [&host.cpu, &host.firecracker])?;
         check_tsc(tsc_khz, host)?;
         check_msrs(msrs, &host.msrs)?;
         for (word, &want) in &self.features {
@@ -77,6 +69,7 @@ impl Compat {
         Ok(if tsc_scaling_required(tsc_khz, host.tsc_khz) { tsc_khz } else { host.tsc_khz })
     }
 
+    #[cfg(any(target_arch = "x86_64", test))]
     fn of_cpuid(entries: &[[u32; 6]], firecracker: String) -> Result<Self> {
         let word = |leaf, sub, reg: usize| entries.iter().find(|e| e[0] == leaf && e[1] == sub).map(|e| e[2 + reg]);
         let vendor: Vec<u8> = [1, 3, 2].iter().flat_map(|&r| word(0, 0, r).unwrap_or(0).to_le_bytes()).collect();
@@ -84,7 +77,7 @@ impl Compat {
         let (family, model) = ((sig >> 8) & 0xf, (sig >> 4) & 0xf);
         let family = family + if family == 0xf { (sig >> 20) & 0xff } else { 0 };
         let model = model | if family >= 6 { (sig >> 12) & 0xf0 } else { 0 };
-        Ok(Compat {
+        Ok(X86 {
             cpu: format!("{} family {family:#x} model {model:#x}", String::from_utf8_lossy(&vendor)),
             firecracker,
             tsc_khz: 0,
@@ -100,126 +93,8 @@ impl Compat {
     }
 }
 
-/// Identity of the host probe: this boot, this flexvm and Firecracker, and the KVM device
-/// and modules by (device, inode), which a module reload changes and a ctime touch does not.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct HostKey {
-    boot_id: String,
-    microcode: Vec<String>,
-    flexvm: Stamp,
-    firecracker: Stamp,
-    kvm: (u64, u64),
-    modules: [Option<(u64, u64)>; 3],
-}
-
-fn node(m: &std::fs::Metadata) -> (u64, u64) {
-    use std::os::unix::fs::MetadataExt;
-    (m.dev(), m.ino())
-}
-
-impl HostKey {
-    fn local(firecracker: Stamp) -> Result<Self> {
-        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
-        if boot_id.trim().is_empty() {
-            bail!("empty boot id");
-        }
-        let mut modules = [None, None, None];
-        for (slot, name) in modules.iter_mut().zip(["kvm", "kvm_intel", "kvm_amd"]) {
-            match std::fs::metadata(format!("/sys/module/{name}")) {
-                Ok(m) => *slot = Some(node(&m)),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
-        }
-        let flexvm = Stamp::of(&std::fs::metadata("/proc/self/exe")?);
-        // A late microcode load changes what the CPU reports; a host that shows no revision (a guest,
-        // a non-x86 CPU) keeps an empty, still stable, key rather than probing every time.
-        let mut microcode: Vec<_> = std::fs::read_to_string("/proc/cpuinfo")?
-            .lines()
-            .filter_map(|line| {
-                let (key, value) = line.split_once(':')?;
-                (key.trim() == "microcode").then(|| value.trim().to_string())
-            })
-            .collect();
-        microcode.dedup();
-        Ok(Self { boot_id, microcode, flexvm, firecracker, kvm: node(&std::fs::metadata("/dev/kvm")?), modules })
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct HostCache {
-    key: HostKey,
-    compat: Compat,
-}
-
-/// Cache failures only cost another probe. Version the probe as well as its inputs
-/// so a future change to the CPUID/MSR selection can invalidate older results.
-fn host_compat(run: Option<&Path>, key: Option<&HostKey>, probe: impl FnOnce() -> Result<Compat>) -> Result<Compat> {
-    let read = run.and_then(|d| std::fs::read(d.join("compat.json")).ok()).and_then(|b| serde_json::from_slice::<HostCache>(&b).ok());
-    if let Some(cached) = read.filter(|c| Some(&c.key) == key) {
-        return Ok(cached.compat);
-    }
-    let compat = probe()?;
-    if let (Some(run), Some(key)) = (run, key) {
-        let cached = HostCache { key: key.clone(), compat: compat.clone() };
-        let _ = crate::util::write_file(run, "compat.json", &serde_json::to_vec(&cached)?, false);
-    }
-    Ok(compat)
-}
-
-/// Shared across VM processes and cached in-process while the host key is unchanged.
-pub fn local(pid: u32) -> Result<Compat> {
-    local_binary(&PathBuf::from(format!("/proc/{pid}/exe")))
-}
-
-/// Probe the host without starting a VM, using the binary a pull would boot.
-pub fn local_binary(firecracker: &Path) -> Result<Compat> {
-    static CACHE: Mutex<Option<(HostKey, Compat)>> = Mutex::new(None);
-    let stamp = Stamp::of(&std::fs::metadata(firecracker)?);
-    // If an identity cannot be read, probe rather than trust an unverifiable cache.
-    let key = HostKey::local(stamp).ok();
-    let mut cache = CACHE.lock().unwrap();
-    if let Some((_, c)) = cache.as_ref().filter(|(k, _)| Some(k) == key.as_ref()) {
-        return Ok(c.clone());
-    }
-    let run = crate::host::run_dir();
-    let compat = host_compat(run, key.as_ref(), || {
-        let (_, binary) = firecracker_id(firecracker, run)?;
-        let kvm = File::open("/dev/kvm").map_err(|e| format!("/dev/kvm: {e}"))?;
-        let mut compat = Compat::of_cpuid(&supported_cpuid(&kvm)?, binary)?;
-        compat.tsc_khz = tsc_khz(&kvm)?;
-        compat.tsc_control = ioctl(&kvm, 0xae03, 60, "KVM_CHECK_EXTENSION(TSC_CONTROL)")? > 0;
-        compat.msrs = saved_msrs(&kvm)?;
-        Ok(compat)
-    })?;
-    *cache = key.map(|key| (key, compat.clone()));
-    Ok(compat)
-}
-
-/// Shared across VM processes; an unreadable cache is only a miss.
-fn firecracker_id(path: &Path, run: Option<&Path>) -> Result<(Stamp, String)> {
-    let stamp = Stamp::of(&std::fs::metadata(path)?);
-    if let Some(cached) = run
-        .and_then(|d| std::fs::read(d.join("firecracker.json")).ok())
-        .and_then(|b| serde_json::from_slice::<(Stamp, String)>(&b).ok())
-        .filter(|(s, _)| *s == stamp)
-    {
-        return Ok(cached);
-    }
-    // As a VM process spawns Firecracker: signals unblocked, its open-file limit as found.
-    let version = crate::util::unblock_signals_in(std::process::Command::new(path).arg("--version")).output()?;
-    let version = String::from_utf8_lossy(&version.stdout);
-    let version = version.lines().next().filter(|v| !v.is_empty()).ok_or("firecracker --version printed nothing")?;
-    let binary = hash_file(path)?;
-    let cached = (binary.metadata, format!("{version} (content {})", binary.hash));
-    if let Some(run) = run {
-        let _ = crate::util::write_file(run, "firecracker.json", &serde_json::to_vec(&cached)?, false);
-    }
-    Ok(cached)
-}
-
 /// Match Firecracker's is_tsc_scaling_required: tolerance is relative to the saved rate.
-pub fn check_tsc(saved_khz: u32, host: &Compat) -> Result<()> {
+fn check_tsc(saved_khz: u32, host: &X86) -> Result<()> {
     if saved_khz == 0 || host.tsc_khz == 0 {
         bail!("snapshot incompatible with this host: missing TSC rate; rebuild the template");
     }
@@ -239,7 +114,7 @@ fn tsc_scaling_required(saved_khz: u32, host_khz: u32) -> bool {
 
 /// Firecracker saves the MSRs of the host that took the snapshot, not the template's: a VM
 /// that moved to a host with more brings them along, and a load on a host without them fails.
-pub fn check_msrs(saved: &BTreeSet<u32>, host: &BTreeSet<u32>) -> Result<()> {
+fn check_msrs(saved: &BTreeSet<u32>, host: &BTreeSet<u32>) -> Result<()> {
     let missing: Vec<_> = saved.difference(host).map(|index| format!("{index:#x}")).collect();
     if !missing.is_empty() {
         bail!("snapshot incompatible with this host: KVM lacks saved MSRs {}", missing.join(", "));
@@ -247,8 +122,20 @@ pub fn check_msrs(saved: &BTreeSet<u32>, host: &BTreeSet<u32>) -> Result<()> {
     Ok(())
 }
 
+/// Probe what KVM offers a vCPU as Firecracker sets it up, with no CPU template.
+#[cfg(target_arch = "x86_64")]
+pub(super) fn probe(kvm: &std::fs::File, firecracker: String) -> Result<X86> {
+    let mut compat = X86::of_cpuid(&supported_cpuid(kvm)?, firecracker)?;
+    compat.tsc_khz = tsc_khz(kvm)?;
+    compat.tsc_control = ioctl(kvm, 0xae03, 60, "KVM_CHECK_EXTENSION(TSC_CONTROL)")? > 0;
+    compat.msrs = saved_msrs(kvm)?;
+    Ok(compat)
+}
+
 /// KVM_GET_SUPPORTED_CPUID as [function, index, eax, ebx, ecx, edx].
-fn supported_cpuid(kvm: &File) -> Result<Vec<[u32; 6]>> {
+#[cfg(target_arch = "x86_64")]
+fn supported_cpuid(kvm: &std::fs::File) -> Result<Vec<[u32; 6]>> {
+    use std::os::fd::AsRawFd;
     const MAX: usize = 256;
     // struct kvm_cpuid2 { u32 nent, padding; struct kvm_cpuid_entry2 entries[] },
     // each entry { function, index, flags, eax, ebx, ecx, edx, padding[3] }.
@@ -261,7 +148,9 @@ fn supported_cpuid(kvm: &File) -> Result<Vec<[u32; 6]>> {
 
 /// An unstarted vCPU uses the same default TSC rate as a freshly built template.
 /// No memory, guest code, or KVM_RUN: these probe descriptors are immediately closed.
-fn tsc_khz(kvm: &File) -> Result<u32> {
+#[cfg(target_arch = "x86_64")]
+fn tsc_khz(kvm: &std::fs::File) -> Result<u32> {
+    use std::os::fd::{FromRawFd, OwnedFd};
     let vm = unsafe { OwnedFd::from_raw_fd(ioctl(kvm, 0xae01, 0, "KVM_CREATE_VM")?) };
     let vcpu = unsafe { OwnedFd::from_raw_fd(ioctl(&vm, 0xae41, 0, "KVM_CREATE_VCPU")?) };
     let khz = ioctl(&vcpu, 0xaea3, 0, "KVM_GET_TSC_KHZ")? as u32;
@@ -274,13 +163,9 @@ fn tsc_khz(kvm: &File) -> Result<u32> {
     Ok(khz)
 }
 
-fn ioctl(fd: &impl AsRawFd, request: libc::c_ulong, arg: libc::c_ulong, name: &str) -> Result<i32> {
-    let value = unsafe { libc::ioctl(fd.as_raw_fd(), request, arg) };
-    crate::syscall_check!(value < 0, "{name}");
-    Ok(value)
-}
-
-fn saved_msrs(kvm: &File) -> Result<BTreeSet<u32>> {
+#[cfg(target_arch = "x86_64")]
+fn saved_msrs(kvm: &std::fs::File) -> Result<BTreeSet<u32>> {
+    use std::os::fd::AsRawFd;
     // KVM reports the required size with E2BIG. Do not silently truncate a future kernel's list.
     let mut buf = vec![0u32; 1];
     let result = unsafe { libc::ioctl(kvm.as_raw_fd(), 0xc004_ae02, buf.as_mut_ptr()) };
@@ -292,6 +177,7 @@ fn saved_msrs(kvm: &File) -> Result<BTreeSet<u32>> {
 
 /// Firecracker v1.17.0 arch/x86_64/msr.rs SERIALIZABLE_MSR_RANGES,
 /// including IA32_XSS. Keep in sync when changing Firecracker's save filter.
+#[cfg(any(target_arch = "x86_64", test))]
 fn msr_should_serialize(index: u32) -> bool {
     const RANGES: &[(u32, u32)] = &[
         (0x0, 0x1),          // MSR_IA32_P5_MC_ADDR
@@ -373,10 +259,10 @@ fn msr_should_serialize(index: u32) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn host() -> Compat {
+    pub(crate) fn host() -> X86 {
         let entries = [
             [0, 0, 0xd, 0x6874_7541, 0x444d_4163, 0x6974_6e65],
             [1, 0, 0x0087_0f10, 0x1320_0800, 0xf7f8_3203, 0x078b_fbff],
@@ -384,112 +270,10 @@ mod tests {
             [0x8000_0007, 0, 0, 0, 0, 1 << 8],
             [0xd, 2, 0x100, 0x240, 0, 0],
         ];
-        let mut h = Compat::of_cpuid(&entries, "Firecracker v1.17.0 (content a)".into()).unwrap();
+        let mut h = X86::of_cpuid(&entries, "Firecracker v1.17.0 (content a)".into()).unwrap();
         h.tsc_khz = 2_000_000;
         h.msrs = [0x10, 0x122, 0xda0].into();
         h
-    }
-
-    fn host_key(root: &Path) -> HostKey {
-        let m = std::fs::metadata(root).unwrap();
-        let stamp = Stamp::of(&m);
-        HostKey {
-            boot_id: "boot-a".into(),
-            microcode: vec!["0x1".into()],
-            flexvm: stamp.clone(),
-            firecracker: stamp,
-            kvm: node(&m),
-            modules: [Some(node(&m)), None, None],
-        }
-    }
-
-    /// How many times `host_compat` probed the host (as `host()`) for `key`.
-    fn probes(root: &Path, key: &HostKey) -> usize {
-        let calls = std::cell::Cell::new(0);
-        let compat = host_compat(Some(root), Some(key), || {
-            calls.set(calls.get() + 1);
-            Ok(host())
-        });
-        assert_eq!(compat.unwrap(), host());
-        calls.get()
-    }
-
-    #[test]
-    fn host_cache_miss_probes_and_hit_skips_probe() {
-        let root = crate::test_util::TempDir::new("host-compat");
-        let key = host_key(&root);
-        let expected = host();
-        assert_eq!(host_compat(Some(&root), Some(&key), || Ok(expected.clone())).unwrap(), expected);
-        assert!(root.join("compat.json").is_file());
-        assert_eq!(host_compat(Some(&root), Some(&key), || panic!("cache hit must not probe KVM")).unwrap(), expected);
-        // A missing run directory or unverifiable host identity must still work.
-        assert_eq!(host_compat(None, Some(&key), || Ok(expected.clone())).unwrap(), expected);
-        let mut changed = expected.clone();
-        changed.tsc_khz += 1;
-        assert_eq!(host_compat(Some(&root), None, || Ok(changed.clone())).unwrap(), changed);
-        assert_eq!(host_compat(Some(&root), Some(&key), || panic!("missing identity must not overwrite cache")).unwrap(), expected);
-    }
-
-    #[test]
-    fn host_cache_invalidates_each_host_identity() {
-        let root = crate::test_util::TempDir::new("host-compat-key");
-        let key = host_key(&root);
-        // A different inode provides a distinct stamp without relying on clock resolution.
-        let replacement = root.join("replacement");
-        std::fs::write(&replacement, b"replacement").unwrap();
-        let m = std::fs::metadata(replacement).unwrap();
-        let (stamp, inode) = (Stamp::of(&m), node(&m));
-        let mut keys = vec![key.clone(); 9];
-        keys[0].boot_id = "boot-b".into();
-        keys[1].firecracker = stamp.clone();
-        keys[2].kvm = inode;
-        keys[3].modules[0] = Some(inode);
-        keys[4].modules[1] = Some(inode);
-        keys[5].modules[2] = Some(inode);
-        keys[6].modules[0] = None;
-        keys[7].flexvm = stamp;
-        keys[8].microcode = vec!["0x2".into()];
-        for changed in keys {
-            host_compat(Some(&root), Some(&key), || Ok(host())).unwrap();
-            assert_eq!(probes(&root, &changed), 1, "{changed:?}");
-            host_compat(Some(&root), Some(&changed), || panic!("replacement must be cached")).unwrap();
-        }
-    }
-
-    #[test]
-    fn a_ctime_change_alone_keeps_the_node_identity() {
-        let root = crate::test_util::TempDir::new("host-compat-ctime");
-        let before = node(&std::fs::metadata(&root).unwrap());
-        // chmod changes the ctime, not the device or inode.
-        std::fs::set_permissions(&root, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
-        assert_eq!(node(&std::fs::metadata(&root).unwrap()), before);
-    }
-
-    #[test]
-    fn host_cache_reprobes_corrupt_and_incomplete_entries() {
-        let root = crate::test_util::TempDir::new("host-compat-invalid");
-        let key = host_key(&root);
-        let cached = HostCache { key: key.clone(), compat: host() };
-        let valid = serde_json::to_value(&cached).unwrap();
-        let mut invalid = vec![b"broken".to_vec(), b"{}".to_vec()];
-        for field in ["tsc_khz", "tsc_control", "msrs", "features", "xsave", "cpu", "firecracker"] {
-            let mut value = valid.clone();
-            value["compat"].as_object_mut().unwrap().remove(field);
-            invalid.push(serde_json::to_vec(&value).unwrap());
-        }
-        let mut old_key = valid.clone();
-        old_key["key"].as_object_mut().unwrap().remove("microcode");
-        invalid.push(serde_json::to_vec(&old_key).unwrap());
-        for bytes in invalid {
-            std::fs::write(root.join("compat.json"), bytes).unwrap();
-            assert_eq!(probes(&root, &key), 1);
-            host_compat(Some(&root), Some(&key), || panic!("repaired cache must hit")).unwrap();
-        }
-        std::fs::remove_file(root.join("compat.json")).unwrap();
-        assert!(host_compat(Some(&root), Some(&key), || bail!("probe failed")).is_err());
-        assert!(!root.join("compat.json").exists());
-        std::fs::create_dir(root.join("compat.json")).unwrap();
-        assert_eq!(host_compat(Some(&root), Some(&key), || Ok(host())).unwrap(), host());
     }
 
     #[test]
@@ -601,52 +385,13 @@ mod tests {
     }
 
     #[test]
-    fn firecracker_cache_hits_and_invalidates_on_stamp_changes() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let root = crate::test_util::TempDir::new("compat");
-        let binary = root.join("firecracker");
-        let calls = root.join("firecracker.calls");
-        let write = |version| {
-            let temp = root.join("firecracker.tmp");
-            std::fs::write(&temp, format!("#!/bin/sh\necho {version}\necho called >> \"$0.calls\"\n")).unwrap();
-            std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).unwrap();
-            // Publish the executable only after closing its write descriptor.
-            std::fs::rename(&temp, &binary).unwrap();
-        };
-        write("v1");
-        let first = firecracker_id(&binary, Some(&root)).unwrap();
-        assert!(first.1.starts_with("v1 (content "));
-        assert_eq!(firecracker_id(&binary, Some(&root)).unwrap(), first);
-        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
-        // A replacement inode invalidates the cache even with identical bytes.
-        std::fs::rename(&binary, root.join("old")).unwrap();
-        write("v1");
-        let replaced = firecracker_id(&binary, Some(&root)).unwrap();
-        assert_ne!(replaced.0, first.0);
-        assert_eq!(replaced.1, first.1);
-        write("v2-longer");
-        let changed = firecracker_id(&binary, Some(&root)).unwrap();
-        assert_ne!(changed.0, replaced.0);
-        assert!(changed.1.starts_with("v2-longer (content "));
-        assert_eq!(firecracker_id(&binary, Some(&root)).unwrap(), changed);
-        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 3);
-        std::fs::write(root.join("firecracker.json"), b"broken").unwrap();
-        assert_eq!(firecracker_id(&binary, Some(&root)).unwrap(), changed);
-        std::fs::remove_file(root.join("firecracker.json")).unwrap();
-        std::fs::create_dir(root.join("firecracker.json")).unwrap();
-        assert_eq!(firecracker_id(&binary, Some(&root)).unwrap(), changed);
-        assert_eq!(std::fs::read_to_string(calls).unwrap().lines().count(), 5);
-    }
-
-    #[test]
     fn decodes_cpu_and_words() {
         let h = host();
         assert_eq!(h.cpu, "AuthenticAMD family 0x17 model 0x71");
         assert_eq!(h.features["0x7.0.ebx"], 0x219c_01ab);
         assert!(!h.features.contains_key("0x7.1.eax"));
         assert_eq!(h.xsave[&2], [0x100, 0x240]);
-        assert_eq!(serde_json::from_slice::<Compat>(&serde_json::to_vec(&h).unwrap()).unwrap(), h);
+        assert_eq!(serde_json::from_slice::<X86>(&serde_json::to_vec(&h).unwrap()).unwrap(), h);
     }
 
     #[test]
@@ -664,7 +409,7 @@ mod tests {
     #[test]
     fn rejects_each_mismatch_with_its_name() {
         let snapshot = host();
-        type Change = fn(&mut Compat);
+        type Change = fn(&mut X86);
         let cases: [(Change, &str); 5] = [
             (|h| h.cpu = "GenuineIntel family 0x6 model 0x55".into(), "CPU differs"),
             (|h| h.firecracker = "Firecracker v1.18.0 (content a)".into(), "Firecracker differs"),

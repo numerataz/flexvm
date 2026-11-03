@@ -608,13 +608,9 @@ impl Proc {
     #[allow(clippy::too_many_arguments)]
     fn prepare_target(&self, vm: &Vm, to: &str, mig: u64, gen: u64, source: &str, evict: bool, vouched: Value) -> Result<(TcpStream, Value)> {
         let pid = vm.pid().ok_or("firecracker is gone")?;
-        let msrs = crate::compat::local(pid)?.msrs;
-        let tsc_khz = vm.tsc_khz;
-        let (conn, prepared) = crate::util::rpc(
-            to,
-            Duration::from_secs(2),
-            Instant::now() + if fault("long_preflight") { LONG_PREFLIGHT } else { PREFLIGHT_TIMEOUT },
-            &json!({
+        // What its vmstate will hold: this host's MSRs or registers, which may be more than the template's.
+        let saved = crate::compat::local(pid)?.saves(&vm.saved)?;
+        let mut req = json!({
                 "op": "migrate_in",
                 "name": vm.name,
                 "mig": mig,
@@ -635,15 +631,14 @@ impl Proc {
                 // What becomes of it once its app exits goes with it; its forwards stay here.
                 "spec": self.spec.lock().unwrap().moving(),
                 "regions": vm.pager.regions(),
-                // The MSRs its vmstate will hold: this host's, which may be more than the template's.
-                "msrs": msrs,
-                "tsc_khz": tsc_khz,
                 "evict": evict,
                 // This network namespace's, which the target compares with its own: the same, it shares our routes.
                 "netns": crate::net::netns_id(),
-            }),
-        )
-        .map_err(|e| format!("cannot move vm {} to {e}", vm.name))?;
+        });
+        req.as_object_mut().unwrap().extend(saved.to_request());
+        let (conn, prepared) =
+            crate::util::rpc(to, Duration::from_secs(2), Instant::now() + if fault("long_preflight") { LONG_PREFLIGHT } else { PREFLIGHT_TIMEOUT }, &req)
+                .map_err(|e| format!("cannot move vm {} to {e}", vm.name))?;
         conn.set_nodelay(true)?;
         conn.set_read_timeout(Some(Duration::from_secs(30)))?;
         conn.set_write_timeout(Some(Duration::from_secs(30)))?;
@@ -1296,9 +1291,8 @@ impl Proc {
         crate::host::gate("incoming_gate");
         t.mark("spawn");
         let load_set = crate::standby::load_set(&self.host, &tpl);
-        let saved = serde_json::from_value(req["msrs"].clone()).map_err(|e| format!("bad msrs: {e}"))?;
-        let tsc_khz = serde_json::from_value(req["tsc_khz"].clone()).map_err(|e| format!("bad tsc_khz: {e}"))?;
-        let vm = crate::vm::Prepared::with_saved_tsc(idle, tpl, || Ok((tsc_khz, &saved)))?;
+        let saved = crate::compat::Saved::of_request(req)?;
+        let vm = crate::vm::Prepared::with_saved(idle, tpl, || Ok(&saved))?;
         t.mark("pager_start");
         // All of routing the address here but the route itself, which waits for the commit.
         let ifindex = crate::net::neighbour(ip, &vm.firecracker().tap)?;
