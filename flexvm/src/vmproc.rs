@@ -831,7 +831,7 @@ impl Proc {
         let h = host.clone();
         let announcer = Announcer::start(
             |f| thread::Builder::new().spawn(f).map(drop),
-            |peer, req| peer_call(peer, req.clone()).map(drop),
+            |peer, req| announce(peer, req, peer_call),
             Box::new(move || h.config_now().peers),
             ANNOUNCE_RETRY,
         )?;
@@ -3809,14 +3809,14 @@ impl Announcer {
     /// The route part of `Proc::announce`, independent of the VM and its ARP device.
     fn route(&self, cfg: &crate::host::Config, ip: Ipv4Addr, gen: u64, rev: u64, local: impl FnOnce() -> bool) -> bool {
         let peers = cfg.peers.clone();
-        let Some(via) = cfg.underlay() else {
+        let Some(hop) = cfg.hop() else {
             if !peers.is_empty() {
                 crate::log!("announce {ip}: no underlay address (give flexvm listen an ADDR peers can reach, or set underlay in host.json); peers not told");
             }
             return false;
         };
         if local() {
-            self.tell(peers, json!({"op": "route", "ip": ip.to_string(), "via": via.to_string(), "gen": gen, "rev": rev}));
+            self.tell(peers, route_message(ip, hop, gen, rev));
         }
         true
     }
@@ -3899,6 +3899,36 @@ impl Announcer {
         }
         self.wake.notify_all();
     }
+}
+
+/// The announcement that `ip` (generation `gen`, revision `rev`) runs here, routed via `hop`:
+/// `via` the /32's next hop, and `via6` the IPv6 underlay, if any.
+fn route_message(ip: Ipv4Addr, hop: crate::host::Hop, gen: u64, rev: u64) -> Value {
+    let mut req = json!({"op": "route", "ip": ip.to_string(), "via": hop.via().to_string(), "gen": gen, "rev": rev});
+    if let Some(v6) = hop.via6() {
+        req["via6"] = v6.to_string().into();
+    }
+    req
+}
+
+/// Sends announcement `req` to `peer` by `call`, as far as it takes it. An IPv6 next hop only to a
+/// peer that says it takes one (`listen::VIA6`, asked first): an older one is sent the announcement
+/// without `via6`, as before, and none with an IPv6 `via`, which it would refuse each time. That is
+/// a failure, so the announcer tries again (and asks again) until it is upgraded or no longer a peer.
+fn announce(peer: &str, req: &Value, call: impl Fn(&str, Value) -> Result<Value>) -> Result<()> {
+    let v6 = |k: &str| req[k].as_str().is_some_and(|v| v.parse::<std::net::Ipv6Addr>().is_ok());
+    if !v6("via") && !v6("via6") {
+        return call(peer, req.clone()).map(drop);
+    }
+    if crate::listen::takes(call(peer, json!({"op": "caps"})), crate::listen::VIA6)? {
+        return call(peer, req.clone()).map(drop);
+    }
+    if v6("via") {
+        bail!("{peer} runs an older flexvm, which takes no IPv6 next hop (this host has no IPv4 underlay); told once it is upgraded");
+    }
+    let mut old = req.clone();
+    old.as_object_mut().map(|o| o.remove("via6"));
+    call(peer, old).map(drop)
 }
 
 /// A route message, sent once more a second after it fails: nothing else
@@ -4264,6 +4294,65 @@ mod tests {
     }
 
     /// An announcement waits out refused threads and failed lookups, and is delivered (the newest one) once both can be had.
+    /// #1295: an announcement names the /32's next hop (`via`: the IPv4 underlay, else the IPv6 one)
+    /// and the IPv6 underlay (`via6`); one without an IPv6 underlay is as before.
+    #[test]
+    fn announcements_carry_both_underlays() {
+        let ip = "10.9.0.7".parse().unwrap();
+        let (v4, v6) = ("192.0.2.7".parse().unwrap(), "2001:db8::7".parse().unwrap());
+        let msg = |v4, v6| route_message(ip, crate::host::Hop::of(v4, v6).unwrap(), 3, 1);
+        assert_eq!(msg(Some(v4), None), json!({"op": "route", "ip": "10.9.0.7", "via": "192.0.2.7", "gen": 3, "rev": 1}));
+        assert_eq!(msg(Some(v4), Some(v6)), json!({"op": "route", "ip": "10.9.0.7", "via": "192.0.2.7", "via6": "2001:db8::7", "gen": 3, "rev": 1}));
+        assert_eq!(msg(None, Some(v6)), json!({"op": "route", "ip": "10.9.0.7", "via": "2001:db8::7", "via6": "2001:db8::7", "gen": 3, "rev": 1}));
+    }
+
+    /// #1295: an IPv6 next hop goes only to a peer that says it takes one (`caps`). An older peer is
+    /// sent exactly what an older build sends (an IPv4 `via`, no `via6`), or, for a host with only an
+    /// IPv6 underlay, nothing: a failure, tried again. A newer one gets it all.
+    #[test]
+    fn ipv6_next_hops_go_only_to_peers_that_take_them() {
+        let sent = Mutex::new(Vec::new());
+        // A peer as `listen::handle` answers it: an older one knows no `caps`, and takes only an IPv4 `via`.
+        let peer = |old: bool, down: bool| {
+            let sent = &sent;
+            move |_: &str, req: Value| -> Result<Value> {
+                sent.lock().unwrap().push(req.clone());
+                match req["op"].as_str() {
+                    _ if down => Err("connection refused".into()),
+                    Some("caps") if old => Err("p:7070: unknown op \"caps\"".into()),
+                    Some("caps") => Ok(json!({"caps": [crate::listen::VIA6]})),
+                    _ if old => req["via"].as_str().unwrap().parse::<Ipv4Addr>().map(|_| json!({})).map_err(Into::into),
+                    _ => Ok(json!({})),
+                }
+            }
+        };
+        let ip = "10.9.0.7".parse().unwrap();
+        let (v4, v6) = ("192.0.2.7".parse().unwrap(), "2001:db8::7".parse().unwrap());
+        let [only4, both, only6] =
+            [(Some(v4), None), (Some(v4), Some(v6)), (None, Some(v6))].map(|(a, b)| route_message(ip, crate::host::Hop::of(a, b).unwrap(), 3, 0));
+        let caps = json!({"op": "caps"});
+        let take = || std::mem::take(&mut *sent.lock().unwrap());
+        // IPv4 only: sent as ever, without asking, to either.
+        for old in [true, false] {
+            announce("p:7070", &only4, peer(old, false)).unwrap();
+            assert_eq!(take(), vec![only4.clone()]);
+        }
+        // With an IPv6 underlay: asked first; an older peer gets the IPv4 announcement alone.
+        announce("p:7070", &both, peer(true, false)).unwrap();
+        assert_eq!(take(), vec![caps.clone(), only4.clone()]);
+        announce("p:7070", &both, peer(false, false)).unwrap();
+        assert_eq!(take(), vec![caps.clone(), both.clone()]);
+        // Only an IPv6 underlay: never sent to an older peer, which would refuse it each time.
+        let e = announce("p:7070", &only6, peer(true, false)).unwrap_err().to_string();
+        assert!(e.contains("older flexvm, which takes no IPv6 next hop"), "{e}");
+        assert_eq!(take(), vec![caps.clone()]);
+        announce("p:7070", &only6, peer(false, false)).unwrap();
+        assert_eq!(take(), vec![caps.clone(), only6.clone()]);
+        // A peer that cannot be asked is not sent it either: tried again, and asked again.
+        assert!(announce("p:7070", &both, peer(false, true)).is_err());
+        assert_eq!(take(), vec![caps]);
+    }
+
     #[test]
     fn an_announcement_is_delivered_once_threads_and_its_lookup_can_be_had() {
         use std::sync::atomic::AtomicUsize;

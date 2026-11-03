@@ -8350,6 +8350,48 @@ def wildcard_listen():
         raise Skip("no dual-stack loopback here: the [::] listener was not tried")
 
 
+def route_via6():
+    """#1295: a peer at an IPv6 address announces routes via it (a host with only an IPv6
+    underlay: an IPv4 route via an IPv6 next hop, RTA_VIA), after asking `caps`; the next hop is
+    recorded and withdrawn by that peer. An IPv6 underlay beside an IPv4 one (`via6`) that is not
+    the sender's is left out, the route taken. B listens on [::] with a peer at [::1] (A's port):
+    loopback next hops, so no route is installed and no VM runs."""
+    own_listeners("route via6")
+    if not dual_stack():
+        raise Skip("no dual-stack loopback here: no listener takes both 127.0.0.1 and ::1")
+    port = B.addr.rsplit(":", 1)[1]
+    ip = spare(A, 41)
+
+    def from6(req):
+        with socket.create_connection(("::1", int(port)), timeout=30, source_address=("::1", 0)) as s:
+            s.sendall((json.dumps(req) + "\n").encode())
+            buf = receive_until(s, lambda buf: not buf.endswith(b"\n"))
+        return json.loads(buf) if buf else {"ok": False, "error": "hung up"}
+
+    stop_listener(B)
+    try:
+        start_listener(B, f"[::]:{port}", extra={"peers": ["[::1]:" + A.addr.rsplit(":", 1)[1]]})
+        r = from6({"op": "caps"})
+        check("route via6: caps says via6", r.get("ok") and "via6" in r["result"]["caps"], r)
+        gen = addr(B, ip).get("seen", 0) + 1
+        r = from6({"op": "route", "ip": ip, "via": "::1", "via6": "::1", "gen": gen, "rev": 0})
+        check("route via6: an IPv6 next hop is taken", r.get("ok") and not r["result"].get("stale"), r)
+        check("route via6: and recorded", addr(B, ip).get("via") == "::1" and addr(B, ip).get("via6") == "::1", addr(B, ip))
+        # A (127.0.0.1) at the next revision: its IPv4 underlay, and ::1 beside it, which is another peer's.
+        r = peer(B, {"op": "route", "ip": ip, "via": "127.0.0.1", "via6": "::1", "gen": gen, "rev": 1})
+        check("route via6: another peer's IPv6 underlay beside an IPv4 one is left out", r.get("ok") and addr(B, ip).get("via") == "127.0.0.1"
+              and "via6" not in addr(B, ip), (r, addr(B, ip)))
+        r = from6({"op": "route", "ip": ip, "via": "::1", "gen": gen, "rev": 2})
+        check("route via6: moved back to the IPv6 peer", r.get("ok") and addr(B, ip).get("via") == "::1", (r, addr(B, ip)))
+        r = peer(B, {"op": "route", "ip": ip, "gen": gen, "rev": 2})
+        check("route via6: another peer does not withdraw it", not r.get("ok") and not addr(B, ip).get("withdrawn"), (r, addr(B, ip)))
+        r = from6({"op": "route", "ip": ip, "gen": gen, "rev": 2})
+        check("route via6: its peer withdraws it", r.get("ok") and addr(B, ip).get("withdrawn") is True and addr(B, ip).get("via") is None, (r, addr(B, ip)))
+    finally:
+        stop_listener(B)
+        start_listener(B)
+
+
 def peer_by_name():
     """A peer configured by name (localhost:PORT) is admitted by a listener
     just restarted, its lookup of the name not finished yet: the first
@@ -12793,7 +12835,7 @@ SCENARIOS = dict(
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail, arrival_flood=arrival_flood, arrival_cap_restart=arrival_cap_restart,
     fc_prepare=fc_prepare, forged_vmstate=forged_vmstate, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ckpt_stall=ckpt_stall, standby=standby, standby_vm_ips=standby_vm_ips,
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, suspend_unaddressed=suspend_unaddressed, resume_fence_fails=resume_fence_fails, kill_source=kill_source,
-    kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, peer_by_name=peer_by_name, peer_moved=peer_moved, peer_unresolvable=peer_unresolvable, page_refusals=page_refusals,
+    kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, route_via6=route_via6, peer_by_name=peer_by_name, peer_moved=peer_moved, peer_unresolvable=peer_unresolvable, page_refusals=page_refusals,
     forged_peer=forged_peer, forged_pages=forged_pages, restore_ip_peer=restore_ip_peer, loan_start_retry=loan_start_retry, spoof_filter=spoof_filter, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,
     unit_restart=unit_restart, log_cap=log_cap, gc_debris=gc_debris, arrival_log=arrival_log, template_tap=template_tap, pidns_names=pidns_names, pidns_control=pidns_control, pidns_standby=pidns_standby, rmi_suspend=rmi_suspend,
     incoming_killed=incoming_killed, start_killed=start_killed, claim_killed=claim_killed, standby_stalled=standby_stalled, standby_refill_race=standby_refill_race, standby_lock_timeout=standby_lock_timeout, fc_died=fc_died, fc_died_starting=fc_died_starting,

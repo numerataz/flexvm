@@ -667,10 +667,6 @@ fn set_mac(ifindex: u32, mac: &[u8; 6]) -> Result<()> {
     netlink(RTM_SETLINK, 0, &msg)
 }
 
-pub fn is_local_addr(ip: Ipv4Addr) -> Result<bool> {
-    is_local_ip(ip.into())
-}
-
 /// This network namespace's identity: the boot's id with the namespace's device and inode, unique on this kernel
 /// while it runs. A peer sharing this host's routes has the same; an address cannot tell (a router's hairpin NAT
 /// shows a peer here as the router's address, #1028).
@@ -793,16 +789,58 @@ fn parse_new_route(reply: &[u8]) -> Option<(u32, IpAddr)> {
 }
 
 /// Hosts sharing a netns share routes: never replace the target's tap route with one via us.
-pub fn route_via(ip: Ipv4Addr, via: Ipv4Addr) -> Result<()> {
-    if is_local_addr(via)? {
+/// An IPv6 `via` (a peer with only an IPv6 underlay) is an `RTA_VIA` next hop, Linux 5.2+.
+pub fn route_via(ip: Ipv4Addr, via: IpAddr) -> Result<()> {
+    if is_local_ip(via)? {
         static LOGGED: std::sync::Once = std::sync::Once::new();
         LOGGED.call_once(|| crate::info!("not routing {ip} via {via}: a local address (hosts sharing a network namespace); this is logged once"));
         return Ok(());
     }
+    netlink(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE, &route_via_msg(ip, via)).map_err(|e| match via {
+        IpAddr::V6(_) => format!("{e} (an IPv4 route via an IPv6 next hop needs Linux 5.2 or later)").into(),
+        IpAddr::V4(_) => e,
+    })
+}
+
+/// The attribute of a next hop of any family (`struct rtvia`: the family, then the address).
+const RTA_VIA: u16 = 18;
+
+/// `route_via`'s request: `ip`'s /32 via an IPv4 gateway (`RTA_GATEWAY`), or an IPv6 one (`RTA_VIA`).
+fn route_via_msg(ip: Ipv4Addr, via: IpAddr) -> Vec<u8> {
     let mut route = rtmsg(RT_SCOPE_UNIVERSE);
     attr(&mut route, RTA_DST, &ip.octets());
-    attr(&mut route, RTA_GATEWAY, &via.octets());
-    netlink(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE, &route)
+    match via {
+        IpAddr::V4(v4) => attr(&mut route, RTA_GATEWAY, &v4.octets()),
+        IpAddr::V6(v6) => attr(&mut route, RTA_VIA, &[&(libc::AF_INET6 as u16).to_ne_bytes()[..], &v6.octets()].concat()),
+    }
+    route
+}
+
+/// The next hop in a route message (`struct rtmsg`, then its attributes): its `RTA_GATEWAY`, of
+/// the route's family, or its `RTA_VIA`, of the family that names. None for a malformed one.
+#[cfg(test)]
+fn next_hop(msg: &[u8]) -> Option<IpAddr> {
+    let addr = |family: c_int, data: &[u8]| match (family, data.len()) {
+        (libc::AF_INET, 4) => <[u8; 4]>::try_from(data).ok().map(IpAddr::from),
+        (libc::AF_INET6, 16) => <[u8; 16]>::try_from(data).ok().map(IpAddr::from),
+        _ => None,
+    };
+    let (family, mut at, mut hop) = (c_int::from(*msg.first()?), 12, None);
+    while at + 4 <= msg.len() {
+        let len = u16::from_ne_bytes([msg[at], msg[at + 1]]) as usize;
+        if len < 4 || at + len > msg.len() {
+            return None;
+        }
+        let data = &msg[at + 4..at + len];
+        match u16::from_ne_bytes([msg[at + 2], msg[at + 3]]) {
+            RTA_GATEWAY => hop = Some(addr(family, data)?),
+            RTA_VIA if data.len() >= 2 => hop = Some(addr(u16::from_ne_bytes([data[0], data[1]]).into(), &data[2..])?),
+            RTA_VIA => return None,
+            _ => {}
+        }
+        at += len.next_multiple_of(4);
+    }
+    hop
 }
 
 /// The next hops in `table` (`/proc/net/route`: hex, in network byte order).
@@ -1615,10 +1653,51 @@ mod tests {
 
     #[test]
     fn loopback_routes_are_noops() {
-        for via in [Ipv4Addr::LOCALHOST, Ipv4Addr::new(127, 42, 3, 4), Ipv4Addr::new(127, 255, 255, 255)] {
+        let loopback: [IpAddr; 4] =
+            [Ipv4Addr::LOCALHOST.into(), Ipv4Addr::new(127, 42, 3, 4).into(), Ipv4Addr::new(127, 255, 255, 255).into(), Ipv6Addr::LOCALHOST.into()];
+        for via in loopback {
             // Works without CAP_NET_ADMIN: no route request is sent.
             route_via(Ipv4Addr::new(192, 0, 2, 123), via).unwrap();
         }
+    }
+
+    /// #1295: a VM's /32 via an IPv4 next hop is an `RTA_GATEWAY`; via an IPv6 one, an `RTA_VIA`
+    /// (`struct rtvia`: AF_INET6, then the address), padded to 4 bytes.
+    #[test]
+    fn route_messages_name_next_hops_of_either_family() {
+        let ip = Ipv4Addr::new(192, 0, 2, 123);
+        let rta = |len: u16, kind: u16| [len.to_ne_bytes(), kind.to_ne_bytes()].concat();
+        let head = [libc::AF_INET as u8, 32, 0, 0, RT_TABLE_MAIN, RTPROT_STATIC, RT_SCOPE_UNIVERSE, RTN_UNICAST, 0, 0, 0, 0];
+        let dst = [&rta(8, RTA_DST)[..], &[192, 0, 2, 123]].concat();
+        let v4 = Ipv4Addr::new(192, 0, 2, 1);
+        let gateway = route_via_msg(ip, v4.into());
+        assert_eq!(gateway, [&head[..], &dst, &rta(8, RTA_GATEWAY), &v4.octets()].concat());
+        let v6: Ipv6Addr = "2001:db8::2".parse().unwrap();
+        let via = route_via_msg(ip, v6.into());
+        assert_eq!(via, [&head[..], &dst, &rta(22, RTA_VIA), &(libc::AF_INET6 as u16).to_ne_bytes(), &v6.octets(), &[0, 0]].concat());
+        assert_eq!(via.len() % 4, 0);
+        // Parsed back, and as the kernel may send them: an RTA_VIA of an IPv4 address, among other attributes.
+        assert_eq!(next_hop(&gateway), Some(v4.into()));
+        assert_eq!(next_hop(&via), Some(v6.into()));
+        let mut other = head.to_vec();
+        attr(&mut other, libc::RTA_TABLE, &254u32.to_ne_bytes());
+        attr(&mut other, RTA_VIA, &[&(libc::AF_INET as u16).to_ne_bytes()[..], &v4.octets()].concat());
+        attr(&mut other, RTA_OIF, &3u32.to_ne_bytes());
+        assert_eq!(next_hop(&other), Some(v4.into()));
+        // None: no next hop, or a malformed one.
+        assert_eq!(next_hop(&[&head[..], &dst].concat()), None);
+        let bad = |data: &[u8]| {
+            let mut m = head.to_vec();
+            attr(&mut m, RTA_VIA, data);
+            next_hop(&m)
+        };
+        assert_eq!(bad(&[10]), None, "no whole family");
+        assert_eq!(bad(&[&(libc::AF_INET6 as u16).to_ne_bytes()[..], &v4.octets()].concat()), None, "an IPv6 family, 4 bytes");
+        assert_eq!(bad(&[&(libc::AF_PACKET as u16).to_ne_bytes()[..], &[0; 6]].concat()), None, "another family");
+        assert_eq!(next_hop(&via[..via.len() - 4]), None, "cut short");
+        let mut gw6 = vec![libc::AF_INET6 as u8, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        attr(&mut gw6, RTA_GATEWAY, &v6.octets());
+        assert_eq!(next_hop(&gw6), Some(v6.into()), "an IPv6 route's gateway");
     }
 
     #[test]
@@ -1628,7 +1707,7 @@ mod tests {
             // A fresh process has no cached addresses; no spare fd makes getifaddrs fail.
             let limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
             assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
-            let e = route_via(Ipv4Addr::new(198, 51, 100, 7), Ipv4Addr::new(192, 0, 2, 1)).unwrap_err().to_string();
+            let e = route_via(Ipv4Addr::new(198, 51, 100, 7), Ipv4Addr::new(192, 0, 2, 1).into()).unwrap_err().to_string();
             assert!(e.contains("getifaddrs"), "{e}");
             return;
         }
@@ -1668,9 +1747,15 @@ mod tests {
             route_dev(true, target, index).unwrap();
             unroute(target);
             assert!(route().contains("dev peer0"), "a tap route survives a withdrawal");
-            route_via(target, Ipv4Addr::new(192, 0, 2, 2)).unwrap();
+            route_via(target, Ipv4Addr::new(192, 0, 2, 2).into()).unwrap();
             unroute(target);
             assert!(route().is_empty(), "a route via any peer goes");
+            // Via an IPv6 next hop (RTA_VIA, Linux 5.2+), and withdrawn the same way (#1295).
+            ip(&["-6", "addr", "add", "2001:db8::3/64", "dev", "peer0", "nodad"]);
+            route_via(target, "2001:db8::2".parse().unwrap()).unwrap();
+            assert!(route().contains("via inet6 2001:db8::2 dev peer0"), "{}", route());
+            unroute(target);
+            assert!(route().is_empty(), "a route via an IPv6 peer goes");
         })
         .join()
         .unwrap();

@@ -1344,7 +1344,8 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   listener's strict peer lookup; migration replies use its last-known peer
   addresses plus the target connection's address.
 - Reachability:
-  - **Peers** get a route pushed to them: `<vm-ip>/32 via <host underlay ip>`.
+  - **Peers** get a route pushed to them: `<vm-ip>/32 via <host underlay ip>`
+    (an IPv6 one with no IPv4 underlay, see below).
     Routes via an address local to the host's network namespace (including
     loopback) are skipped, so test hosts sharing a machine keep each other's
     tap routes; the first skip is logged.
@@ -1373,9 +1374,29 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
     device, else the IPv6 one's. If no peer elsewhere has a known address of
     either family, nothing is derived and a diagnostic is logged, saying to
     start `flexvm listen` when the listener has not looked a peer up (no
-    peers, or all local, uses loopback: 127.0.0.1 and ::1). VM routes and a
-    migration's `via` use the IPv4 underlay; the IPv6 one is so far only
-    advertised for a `[::]` listener without an IPv4 one.
+    peers, or all local, uses loopback: 127.0.0.1 and ::1). A next hop
+    (`host::Hop`) is both underlays: a VM's /32 goes via the IPv4 one, else
+    via the IPv6 one (`RTA_VIA`, `<vm-ip>/32 via inet6 <underlay6>`, Linux
+    5.2+); the IPv6 one is also its /128's (#1297). A route announcement
+    carries `via` (the /32's next hop) and `via6` (the IPv6 underlay; not a derived ::1
+    beside 127.0.0.1 without `vm_ipv6_prefix`, so a one-machine cluster
+    announces as before), and the peer's record keeps both (`via`, `via6`).
+    A migration's prepare, commit and outcome answers carry `underlay` and
+    `underlay6`; the source checks the prepare's before it pauses (a failure
+    is logged) and routes by the commit's. An underlay the receiver does not
+    know the sender by (one derived there, not in `peer_underlays` here) is
+    left out and the other taken alone; only when neither is taken is the
+    announcement refused.
+  - **Mixed versions.** A peer says what it takes beyond an older build in
+    answer to `{"op": "caps"}` (`{"caps": ["via6"]}`); an older listener
+    answers "unknown op". An announcement with an IPv6 next hop is sent only
+    after asking: an older peer gets it without `via6` (exactly as an older
+    build sends it), or, from a host with no IPv4 underlay, not at all (a
+    failure, retried and asked again with the usual backoff). A migration's
+    source says `caps` in its `migrate_in`; a target with only an IPv6
+    underlay refuses one without it at the prepare, before the source pauses.
+    A record with an IPv6 `via` (no IPv4 underlay) is not readable by an
+    older build.
     Explicit `underlay` and `announce_dev` settings
     override derivation (`announce_dev` `"none"` disables announcements).
 - On migration, the target routes the address to its new tap at the commit,

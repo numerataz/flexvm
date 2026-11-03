@@ -768,8 +768,16 @@ warns until then). Derived values:
   Peers take it as one of the addresses they know this host by (its `peers`
   address, or one its name resolves to); an underlay on another network
   than that address (a separate data-plane network) is listed on each peer
-  in `peer_underlays`. VM routes and migrations go via the IPv4 underlay. A
-  `[::]` listener is advertised at the IPv4 underlay, but at the IPv6 one
+  in `peer_underlays`. VM routes and migrations go via the IPv4 underlay;
+  a host with only an IPv6 one has its VMs' IPv4 routes go via that (an
+  IPv4 route via an IPv6 next hop, which needs Linux 5.2 or later on the
+  peers). Peers are also told the IPv6 underlay next to the IPv4 one, for
+  the VMs' IPv6 routes and for a peer that knows this host only by it. A
+  peer running an older flexvm is never sent an
+  IPv6 next hop: it is told the IPv4 one alone, and with none it is not told
+  (logged, and tried again until it is upgraded); a migration from an older
+  host to one with only an IPv6 underlay is refused before the VM pauses.
+  A `[::]` listener is advertised at the IPv4 underlay, but at the IPv6 one
   when only that is set, when there is no IPv4 one, or when the peers
   elsewhere have only IPv6 addresses.
 - `peer_underlays`: a peer's next hops besides its `peers` address, its

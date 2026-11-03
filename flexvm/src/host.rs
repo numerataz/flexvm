@@ -232,6 +232,92 @@ impl<'de> Deserialize<'de> for Underlay {
     }
 }
 
+/// Routes `ip`, a VM a peer runs, via that peer: its /32 via `hop.via()`.
+pub fn route_hop(ip: Ipv4Addr, hop: Hop) -> Result<()> {
+    crate::net::route_via(ip, hop.via())
+}
+
+/// The next hop toward a VM a peer runs: that peer's underlays, IPv4, IPv6 or both, as it
+/// announces them (a route message's `via` and `via6`) and this host records them (`Addr`).
+/// The VM's /32 is routed via the IPv4 one, else via the IPv6 one (`net::route_via`, by
+/// `RTA_VIA`); the IPv6 one is also its /128's (`vm_ipv6_prefix`, #1297).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hop {
+    v4: Option<Ipv4Addr>,
+    // Set whenever `v4` is not.
+    v6: Option<Ipv6Addr>,
+}
+
+impl Hop {
+    /// From `via` and `via6` (a route message's, a record's): an IPv6 `via` is the IPv6 one,
+    /// and a `via6` with it must be the same.
+    pub fn new(via: IpAddr, via6: Option<Ipv6Addr>) -> Result<Hop> {
+        match via {
+            IpAddr::V4(v4) => Ok(Hop { v4: Some(v4), v6: via6 }),
+            IpAddr::V6(v6) if via6.is_none_or(|v| v == v6) => Ok(Hop { v4: None, v6: Some(v6) }),
+            IpAddr::V6(v6) => bail!("next hop {v6} with another IPv6 one ({})", via6.unwrap_or(v6)),
+        }
+    }
+
+    /// A host's underlays (`Config::underlay`, `Config::underlay6`); None without either.
+    pub fn of(v4: Option<Ipv4Addr>, v6: Option<Ipv6Addr>) -> Option<Hop> {
+        (v4.is_some() || v6.is_some()).then_some(Hop { v4, v6 })
+    }
+
+    /// The next hop of the VM's IPv4 /32: the IPv4 underlay, else the IPv6 one.
+    pub fn via(&self) -> IpAddr {
+        match (self.v4, self.v6) {
+            (Some(v4), _) => IpAddr::V4(v4),
+            (None, Some(v6)) => IpAddr::V6(v6),
+            (None, None) => unreachable!("a next hop has an address"),
+        }
+    }
+
+    /// The IPv6 underlay, the next hop of the VM's /128.
+    pub fn via6(&self) -> Option<Ipv6Addr> {
+        self.v6
+    }
+
+    pub fn addrs(&self) -> impl Iterator<Item = IpAddr> {
+        self.v4.map(IpAddr::V4).into_iter().chain(self.v6.map(IpAddr::V6))
+    }
+
+    /// As told to a peer that takes no IPv6 next hop (`listen::VIA6`): the IPv4 one alone, if any.
+    pub fn v4_only(&self) -> Option<Hop> {
+        self.v4.map(Hop::from)
+    }
+}
+
+impl From<Ipv4Addr> for Hop {
+    fn from(v4: Ipv4Addr) -> Hop {
+        Hop { v4: Some(v4), v6: None }
+    }
+}
+
+impl From<IpAddr> for Hop {
+    fn from(ip: IpAddr) -> Hop {
+        match ip {
+            IpAddr::V4(v4) => Hop::from(v4),
+            IpAddr::V6(v6) => Hop { v4: None, v6: Some(v6) },
+        }
+    }
+}
+
+/// One address, of either family.
+impl std::str::FromStr for Hop {
+    type Err = std::net::AddrParseError;
+    fn from_str(s: &str) -> std::result::Result<Hop, Self::Err> {
+        s.parse::<IpAddr>().map(Hop::from)
+    }
+}
+
+/// The /32's next hop, as logs always named it.
+impl std::fmt::Display for Hop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.via())
+    }
+}
+
 /// The reserve of a host that sets none: a sixteenth of its RAM, from 256 MiB to 4 GiB.
 pub fn default_reserve() -> u64 {
     static TOTAL: OnceLock<u64> = OnceLock::new();
@@ -558,6 +644,20 @@ impl Config {
     /// migration's downtime.
     pub fn underlay_known(&self) -> Option<Ipv4Addr> {
         self.underlay_by(false)
+    }
+
+    /// `underlay6` starting no lookup, as `underlay_known`.
+    pub fn underlay6_known(&self) -> Option<Ipv6Addr> {
+        self.underlay6_by(false)
+    }
+
+    /// The next hop peers route this host's VMs via: both underlays (a peer that knows this host only
+    /// by its IPv6 one routes the /32 via that), but not ::1 beside 127.0.0.1 without `vm_ipv6_prefix`:
+    /// a cluster on one machine with IPv4 VMs announces exactly as before, never asking `caps`.
+    pub fn hop(&self) -> Option<Hop> {
+        let v4 = self.underlay();
+        let v6 = self.underlay6().filter(|v6| !(v6.is_loopback() && v4.is_some() && self.vm_ipv6_prefix.is_none()));
+        Hop::of(v4, v6)
     }
 
     fn underlay_by(&self, look: bool) -> Option<Ipv4Addr> {
@@ -1968,7 +2068,8 @@ impl Host {
         }
         let (arriving, rev) = (rev.is_some(), rev.unwrap_or(if gen > a.seen { 0 } else { a.rev.saturating_add(1) }));
         if gen > a.seen {
-            (a.seen, a.withdrawn, a.via, a.rev) = (gen, false, None, 0);
+            (a.seen, a.withdrawn, a.rev) = (gen, false, 0);
+            a.set_hop(None);
         }
         if !arriving {
             a.rev = a.rev.max(rev);
@@ -2085,7 +2186,7 @@ impl Host {
     /// one). A withdrawal frees a loan of that gen or older.
     /// The record's revision may trail the one its holder here runs at (published, `live`): the
     /// newer of the two decides.
-    pub fn observe(&self, l: &Locked, ip: Ipv4Addr, gen: u64, rev: u64, via: Option<Ipv4Addr>) -> Result<bool> {
+    pub fn observe(&self, l: &Locked, ip: Ipv4Addr, gen: u64, rev: u64, via: Option<Hop>) -> Result<bool> {
         // All generations supplied by peers, including withdrawals, are bounded.
         if gen > RECV_MAX {
             return Ok(false);
@@ -2109,7 +2210,7 @@ impl Host {
         l: &Locked,
         ip: Ipv4Addr,
         (gen, rev): GenRev,
-        via: Option<Ipv4Addr>,
+        via: Option<Hop>,
         sender: &[IpAddr],
         named: impl FnOnce(&str) -> Vec<IpAddr>,
     ) -> Result<()> {
@@ -2125,14 +2226,14 @@ impl Host {
         let newest = a.rev.max(self.live_of(ip, &a).unwrap_or(0));
         // One location per revision: its next hop changes only by the host it names (by any of its addresses),
         // never by another peer announcing the same revision via itself (`observe` takes an equal one).
-        if let (Some(v), Some(old)) = (via, a.via) {
-            if gen == a.seen && !a.withdrawn && rev == newest && v != old && !from(&[IpAddr::V4(old)]) {
+        if let (Some(v), Some(old)) = (via, a.hop()) {
+            if gen == a.seen && !a.withdrawn && rev == newest && v.via() != old.via() && !from(&old.addrs().collect::<Vec<_>>()) {
                 bail!("{ip} generation {gen} revision {rev} is routed via {old}: only that host changes its next hop");
             }
         }
         let here = self.held(&a) && a.held == a.seen && !a.withdrawn;
         // A move: a withdrawal, a newer revision, or the newest one somewhere other than recorded.
-        let moves = via.is_none() || rev > newest || (rev == newest && via != a.via);
+        let moves = via.is_none() || rev > newest || (rev == newest && via.map(|v| v.via()) != a.via);
         if gen < a.seen || !here || !moves {
             return Ok(());
         }
@@ -2206,7 +2307,7 @@ impl Host {
     }
 
     /// `observe`, with `also` applied to the record in the same write.
-    fn observe_and(&self, l: &Locked, ip: Ipv4Addr, gen: u64, rev: u64, via: Option<Ipv4Addr>, also: impl FnOnce(&mut Addr)) -> Result<bool> {
+    fn observe_and(&self, l: &Locked, ip: Ipv4Addr, gen: u64, rev: u64, via: Option<Hop>, also: impl FnOnce(&mut Addr)) -> Result<bool> {
         let live = via.and_then(|_| self.live_of(ip, &self.addr(l, ip).ok()?)).unwrap_or(0);
         self.update(l, ip, true, |a| {
             // Only a local withdrawal of the recorded generation may exceed the peer bound.
@@ -2224,7 +2325,8 @@ impl Host {
             if via.is_some() || gen > a.seen {
                 a.rev = rev;
             }
-            (a.seen, a.withdrawn, a.via) = (gen, via.is_none(), via);
+            (a.seen, a.withdrawn) = (gen, via.is_none());
+            a.set_hop(via);
             if via.is_none() && a.lent.is_some_and(|lent| lent <= gen) {
                 a.lent = None;
             }
@@ -2242,7 +2344,8 @@ impl Host {
     pub fn advance(&self, l: &Locked, ip: Ipv4Addr, gen: u64, rev: u64) -> Result<()> {
         self.update(l, ip, true, |a| {
             if gen == a.seen && rev > a.rev {
-                (a.rev, a.via) = (rev, None);
+                a.rev = rev;
+                a.set_hop(None);
             }
         })
     }
@@ -2332,17 +2435,17 @@ impl Host {
     pub fn reinstall(&self, l: &Locked, ip: Ipv4Addr, dead: Option<&Ident>) -> Result<bool> {
         let a = self.addr(l, ip)?;
         let dying = dead.is_some() && a.holder_id.as_ref() == dead;
-        let Some(via) = a.via.filter(|_| !a.withdrawn && (dying || !self.held(&a))) else { return Ok(false) };
+        let Some(via) = a.hop().filter(|_| !a.withdrawn && (dying || !self.held(&a))) else { return Ok(false) };
         if !self.route_allowed(ip, via) {
             return Ok(false);
         }
-        crate::net::route_via(ip, via)?;
+        route_hop(ip, via)?;
         crate::info!("put back route {ip} via {via} (generation {})", a.seen);
         Ok(true)
     }
 
     /// Recheck saved routes against current configuration, without DNS or a wait under the lock.
-    fn route_allowed(&self, ip: Ipv4Addr, via: Ipv4Addr) -> bool {
+    fn route_allowed(&self, ip: Ipv4Addr, via: Hop) -> bool {
         self.route_check(ip, via).unwrap_or_else(|e| {
             crate::log!("route {ip} via {via}: not put back: {e}");
             false
@@ -2353,12 +2456,12 @@ impl Host {
     /// cannot be told yet, to try again later. A next hop that is no peer's known address while a
     /// peer by name has none known (a name no listener has looked up since a boot, or whose lookup
     /// failed) may be that peer's.
-    fn route_check(&self, ip: Ipv4Addr, via: Ipv4Addr) -> Result<bool> {
+    fn route_check(&self, ip: Ipv4Addr, via: Hop) -> Result<bool> {
         let peers = crate::listen::known_peers(self)?;
-        let checked = crate::listen::check_vm_ip(self, ip, &peers).and_then(|()| crate::listen::check_via(via, &peers));
+        let checked = crate::listen::check_vm_ip(self, ip, &peers).and_then(|()| crate::listen::check_via(via.via(), &peers));
         if let Err(e) = &checked {
             let unknown = crate::listen::unknown_peers(self);
-            if !unknown.is_empty() && !peers.iter().any(|p| p.to_canonical() == IpAddr::V4(via)) {
+            if !unknown.is_empty() && !peers.iter().any(|p| p.to_canonical() == via.via().to_canonical()) {
                 bail!("{e}, while no address of peer {} is known yet", unknown.join(", "));
             }
             crate::log!("route {ip} via {via}: not put back: {e}");
@@ -3353,7 +3456,12 @@ pub struct Addr {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub holder_id: Option<Ident>,
     pub held: u64,
-    pub via: Option<Ipv4Addr>,
+    /// Where a peer runs it (`hop`): the /32's next hop, an IPv6 one only from a peer with no IPv4
+    /// underlay (which an older build cannot read).
+    pub(crate) via: Option<IpAddr>,
+    /// And that peer's IPv6 underlay, the /128's next hop; older builds ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) via6: Option<Ipv6Addr>,
     /// Of `seen`, the newest location's revision: a migration's target takes the next.
     pub rev: u64,
     /// The migration its holder's VM is arriving by, until that record is
@@ -3396,6 +3504,15 @@ fn let_go(a: &mut Addr, holder: &str, id: Option<&Ident>) -> Option<Ident> {
 impl Addr {
     pub fn current(&self, gen: u64) -> bool {
         gen > self.seen || (gen == self.seen && !self.withdrawn)
+    }
+
+    /// The peer it is routed via, if any (see `Hop`). A record whose two differ (by hand) goes by `via`.
+    pub fn hop(&self) -> Option<Hop> {
+        self.via.map(|via| Hop::new(via, self.via6).unwrap_or_else(|_| Hop::from(via)))
+    }
+
+    fn set_hop(&mut self, hop: Option<Hop>) {
+        (self.via, self.via6) = (hop.map(|h| h.via()), hop.and_then(|h| h.via6()));
     }
 }
 
@@ -4648,10 +4765,10 @@ impl Host {
     /// step succeeded. Local cleanup is marked in `.boot` before routes are retried; full
     /// recovery is marked separately in `.boot-ready`.
     pub fn after_boot(&self) -> Result<Option<bool>> {
-        self.after_boot_with(boot_id(), crate::net::route_via)
+        self.after_boot_with(boot_id(), route_hop)
     }
 
-    fn after_boot_with(&self, boot: &str, mut route: impl FnMut(Ipv4Addr, Ipv4Addr) -> Result<()>) -> Result<Option<bool>> {
+    fn after_boot_with(&self, boot: &str, mut route: impl FnMut(Ipv4Addr, Hop) -> Result<()>) -> Result<Option<bool>> {
         let ready = || std::fs::read_to_string(self.run.join(".boot-ready")).is_ok_and(|b| b == boot);
         if boot.is_empty() || ready() {
             return Ok(None);
@@ -4680,7 +4797,7 @@ impl Host {
                     continue;
                 }
             };
-            let Some(via) = a.via.filter(|_| !a.withdrawn && !self.held(&a)) else { continue };
+            let Some(via) = a.hop().filter(|_| !a.withdrawn && !self.held(&a)) else { continue };
             // Peers never announce again what they delivered (#553): one not checkable yet is tried again.
             match self.route_check(ip, via) {
                 Ok(true) => {}
@@ -6718,17 +6835,17 @@ pub(crate) mod tests {
         let (_dir, mut h) = host("saved-route-check");
         h.cfg.cluster_ips = Some("0.0.0.0-255.255.255.255".into());
         h.cfg.peers = vec!["192.0.2.7:7070".into(), "10.9.5.1:7070".into()];
-        let via = ip("192.0.2.7");
+        let via = Hop::from(ip("192.0.2.7"));
         assert!(h.route_allowed(ip("10.9.5.2"), via));
         for dest in [ip("10.9.5.1"), ip("127.0.0.1")] {
             assert!(!h.route_allowed(dest, via));
-            h.put_addr(dest, &Addr { seen: 3, via: Some(via), ..Addr::default() }, true).unwrap();
+            h.put_addr(dest, &Addr { seen: 3, via: Some(via.via()), ..Addr::default() }, true).unwrap();
             assert!(!h.reinstall(&h.lock().unwrap(), dest, None).unwrap());
         }
         for gateway in crate::net::gateways(&std::fs::read_to_string("/proc/net/route").unwrap()) {
             assert!(!h.route_allowed(gateway, via));
         }
-        assert!(!h.route_allowed(ip("10.9.5.2"), ip("192.0.2.99")));
+        assert!(!h.route_allowed(ip("10.9.5.2"), Hop::from(ip("192.0.2.99"))));
     }
 
     #[test]
@@ -6862,6 +6979,11 @@ pub(crate) mod tests {
 
     fn ip(s: &str) -> Ipv4Addr {
         s.parse().unwrap()
+    }
+
+    /// An IPv4 peer's next hop.
+    fn hop(s: &str) -> Option<Hop> {
+        Some(Hop::from(ip(s)))
     }
 
     #[test]
@@ -7643,7 +7765,7 @@ pub(crate) mod tests {
         assert!(h.start_loan(&l, first, gen, "b", None).is_err());
         assert_eq!(h.addr(&l, first).unwrap(), before);
         // An announced loan no longer counts.
-        assert!(h.observe_and(&l, n(1), gens[0], 1, Some(ip("192.0.2.1")), |_| ()).unwrap());
+        assert!(h.observe_and(&l, n(1), gens[0], 1, hop("192.0.2.1"), |_| ()).unwrap());
         h.lend_new(&l, n(MAX_UNANNOUNCED_LOANS + 2), "a", true).unwrap();
         // Expiry: not a moment early, then withdrawn.
         let until = before.loan.unwrap().until_ms.unwrap();
@@ -7655,7 +7777,7 @@ pub(crate) mod tests {
         let expired = h.addr(&l, first).unwrap();
         assert!(expired.withdrawn && expired.lent.is_none() && expired.loan.is_none(), "{expired:?}");
         assert!(h.start_loan(&l, first, gen, "a", None).is_err());
-        assert!(!h.observe_and(&l, first, gen, 1, Some(ip("192.0.2.1")), |_| ()).unwrap());
+        assert!(!h.observe_and(&l, first, gen, 1, hop("192.0.2.1"), |_| ()).unwrap());
         assert!(h.lend_new(&l, first, "a", true).unwrap() > gen);
         // What is left: the claimed one, the older borrower's (odd), the announced one not.
         let mut kept: Vec<Ipv4Addr> = left.into_iter().map(|(ip, _)| ip).collect();
@@ -7687,7 +7809,7 @@ pub(crate) mod tests {
         let second = ip("10.9.0.2");
         let gen = h.lend_new(&l, first, "a", true).unwrap();
         assert_eq!(h.loan_addresses(&l), [first]);
-        h.observe_and(&l, first, gen, 1, Some(ip("192.0.2.1")), |_| ()).unwrap();
+        h.observe_and(&l, first, gen, 1, hop("192.0.2.1"), |_| ()).unwrap();
         assert!(h.loan_addresses(&l).is_empty());
         // Another process uses the same host lock, but has its own cache.
         let mut other = h.clone();
@@ -7829,9 +7951,9 @@ pub(crate) mod tests {
         assert!(!h.observe(&l, a_ip, g1 - 1, 0, None).unwrap(), "older withdrawal is stale");
         assert!(h.addr(&l, a_ip).unwrap().lent.is_some());
         assert!(h.observe(&l, a_ip, g1, 0, None).unwrap() && h.addr(&l, a_ip).unwrap().lent.is_none());
-        let via = Some(ip("192.0.2.1"));
+        let via = hop("192.0.2.1");
         assert!(!h.observe(&l, a_ip, g1, 0, via).unwrap() && !h.current(&l, a_ip, g1).unwrap());
-        assert!(h.observe(&l, a_ip, g1 + 5, 0, via).unwrap() && h.addr(&l, a_ip).unwrap().via == via);
+        assert!(h.observe(&l, a_ip, g1 + 5, 0, via).unwrap() && h.addr(&l, a_ip).unwrap().hop() == via);
         assert!(h.claim_incoming(&l, "y", a_ip, g1, None).is_err() && h.claim_incoming(&l, "y", a_ip, 0, None).is_err());
         h.claim_incoming(&l, "y", a_ip, g1 + 5, None).unwrap().keep();
         drop(h.fence(a_ip, g1 + 5).unwrap());
@@ -7892,7 +8014,7 @@ pub(crate) mod tests {
         std::fs::remove_file(h.unsynced_marker(x)).unwrap();
         let a = h.addr(&l, x).unwrap();
         assert!(a.seen == mark && a.withdrawn && a.holder.is_none() && a.lent.is_none());
-        assert!(!h.observe(&l, x, gen, 0, Some(ip("192.0.2.1"))).unwrap(), "its old generation is stale");
+        assert!(!h.observe(&l, x, gen, 0, hop("192.0.2.1")).unwrap(), "its old generation is stale");
         assert!(!h.owes(&gone));
         drop(l);
         h.withdraw_dead(false).unwrap();
@@ -8079,7 +8201,7 @@ pub(crate) mod tests {
         let (_d, h) = host("peer-update");
         let l = h.lock().unwrap();
         let (t, c): (IpAddr, IpAddr) = ("192.0.2.7".parse().unwrap(), "192.0.2.8".parse().unwrap());
-        let (t4, c4) = (Some(ip("192.0.2.7")), Some(ip("192.0.2.8")));
+        let (t4, c4) = (hop("192.0.2.7"), hop("192.0.2.8"));
         let none = |_: &str| Vec::new();
         let _names = ["vm", "vm2", "vm3", "arrival"].map(|n| h.take_name(n, false).unwrap());
         // Held here: no peer brings a newer generation, announced or withdrawn.
@@ -8146,7 +8268,7 @@ pub(crate) mod tests {
             let a = h.addr(&l, x).unwrap();
             let e = h.newer_gen(&a, x, gen + 1).unwrap_err().to_string();
             assert!(e.contains("lent from here"), "{range}: {e}");
-            for via in [None, Some(ip("192.0.2.8"))] {
+            for via in [None, hop("192.0.2.8")] {
                 assert!(h.peer_update(&l, x, (gen + 1, 0), via, &[], |_| vec![]).is_err());
             }
             // Without a loan, an invalid range still cannot bypass the home check.
@@ -8163,7 +8285,7 @@ pub(crate) mod tests {
         let (_d, h) = host("peer-update-review");
         let l = h.lock().unwrap();
         let (src, c): (IpAddr, IpAddr) = ("192.0.2.7".parse().unwrap(), "192.0.2.8".parse().unwrap());
-        let c4 = Some(ip("192.0.2.8"));
+        let c4 = hop("192.0.2.8");
         let none = |_: &str| Vec::new();
         let _names = ["arrival", "old", "vm"].map(|n| h.take_name(n, false).unwrap());
         // Arriving by migration 5 (another host's address), pending or committed (its background pull
@@ -8176,7 +8298,7 @@ pub(crate) mod tests {
             let e = h.peer_update(&l, x, (8, rev), via, &[c], none).unwrap_err().to_string();
             assert!(e.contains("only from its source"), "{e}");
         }
-        h.peer_update(&l, x, (8, 3), Some(ip("192.0.2.7")), &[src], none).unwrap();
+        h.peer_update(&l, x, (8, 3), hop("192.0.2.7"), &[src], none).unwrap();
         h.peer_update(&l, x, (8, 0), None, &[src], none).unwrap();
         store(&h.mig_path(5), &Mig::Committed { owner: Ident::me(), peer: Some(src) }, true).unwrap();
         for (rev, via) in [(u64::MAX, None), (u64::MAX, c4)] {
@@ -8217,6 +8339,69 @@ pub(crate) mod tests {
         drop(claim);
     }
 
+    /// #1295: a next hop is a peer's IPv4 underlay, its IPv6 one, or both; the /32 goes via the IPv4
+    /// one when there is one. A record keeps the IPv6 one beside it (`via6`), which an older build
+    /// ignores, and writes none without one, as an older build does.
+    #[test]
+    fn next_hops_of_either_family_and_their_records() {
+        let (v4, v6): (Ipv4Addr, Ipv6Addr) = ("192.0.2.7".parse().unwrap(), "2001:db8::7".parse().unwrap());
+        let both = Hop::new(v4.into(), Some(v6)).unwrap();
+        assert_eq!((both.via(), both.via6(), both.v4_only()), (IpAddr::V4(v4), Some(v6), Some(Hop::from(v4))));
+        assert_eq!(both.to_string(), "192.0.2.7", "logged as the /32's next hop: one word (faults.py held_routes)");
+        let only6 = Hop::new(v6.into(), None).unwrap();
+        assert_eq!((only6.via(), only6.via6(), only6.v4_only()), (IpAddr::V6(v6), Some(v6), None));
+        assert_eq!(Hop::new(v6.into(), Some(v6)).unwrap(), only6);
+        assert!(Hop::new(v6.into(), Some("2001:db8::8".parse().unwrap())).is_err(), "two IPv6 next hops");
+        assert_eq!(Hop::of(None, None), None);
+        assert_eq!("2001:db8::7".parse::<Hop>().unwrap(), only6);
+        // Records: as an older build writes and reads them.
+        let mut a = Addr { seen: 3, ..Addr::default() };
+        a.set_hop(Some(Hop::from(v4)));
+        let old = serde_json::to_value(&a).unwrap();
+        assert_eq!((old["via"].clone(), old.get("via6")), (serde_json::json!("192.0.2.7"), None));
+        a.set_hop(Some(both));
+        let new = serde_json::to_value(&a).unwrap();
+        assert_eq!((new["via"].clone(), new["via6"].clone()), (serde_json::json!("192.0.2.7"), serde_json::json!("2001:db8::7")));
+        assert_eq!(serde_json::from_value::<Addr>(new).unwrap().hop(), Some(both));
+        let older = serde_json::json!({"seen": 3, "withdrawn": false, "lent": null, "holder": null, "held": 0, "via": "192.0.2.7", "rev": 0});
+        assert_eq!(serde_json::from_value::<Addr>(older).unwrap().hop(), Some(Hop::from(v4)));
+        a.set_hop(Some(only6));
+        assert_eq!(serde_json::to_value(&a).unwrap()["via"], serde_json::json!("2001:db8::7"));
+        assert_eq!(serde_json::from_value::<Addr>(serde_json::to_value(&a).unwrap()).unwrap().hop(), Some(only6));
+        a.set_hop(None);
+        assert_eq!((a.via, a.via6), (None, None));
+        // A host's: both underlays, a peer that knows it only by its IPv6 one routing the /32 via that.
+        let peers = vec!["[2001:db8::99]:7070".to_string(), "192.0.2.99:7070".to_string()];
+        let cfg = Config { underlay: Underlay { v4: Some(v4), v6: Some(v6) }, peers, ..Config::default() };
+        assert_eq!(cfg.hop(), Some(both));
+        let only = Config { underlay: Underlay { v4: None, v6: Some(v6) }, peers: vec!["[2001:db8::99]:7070".into()], ..Config::default() };
+        assert_eq!(only.hop(), Some(only6));
+        // On one machine (every peer local: 127.0.0.1 and ::1), ::1 only for VMs' IPv6 addresses.
+        let mut local = Config { listen: Some("127.0.0.1:7070".into()), peers: vec!["127.0.0.1:7071".into()], ..Config::default() };
+        assert_eq!(local.hop(), Some(Hop::from(Ipv4Addr::LOCALHOST)), "announced as before, never asking caps");
+        local.vm_ipv6_prefix = Some(crate::net::Ipv6Prefix::parse("fd00:1::/96").unwrap());
+        assert_eq!(local.hop(), Hop::of(Some(Ipv4Addr::LOCALHOST), Some(Ipv6Addr::LOCALHOST)));
+        // Edited by hand to name two IPv6 ones: by `via`.
+        let odd = Addr { via: Some(v6.into()), via6: Some("2001:db8::8".parse().unwrap()), ..Addr::default() };
+        assert_eq!(odd.hop(), Some(only6));
+    }
+
+    /// #1295: a next hop recorded with its IPv6 underlay belongs to that host by either address: it
+    /// changes it, and no other peer does at the same revision.
+    #[test]
+    fn an_ipv6_next_hop_is_its_hosts() {
+        let (_d, h) = host("hop-owner");
+        let l = h.lock().unwrap();
+        let (b4, b6, c): (IpAddr, IpAddr, IpAddr) = ("192.0.2.7".parse().unwrap(), "2001:db8::7".parse().unwrap(), "192.0.2.8".parse().unwrap());
+        let none = |_: &str| Vec::new();
+        let x = ip("10.9.2.6");
+        assert!(h.observe(&l, x, 4, 1, Some(Hop::new(b4, Some("2001:db8::7".parse().unwrap())).unwrap())).unwrap());
+        assert!(h.peer_update(&l, x, (4, 1), hop("192.0.2.8"), &[c], none).unwrap_err().to_string().contains("only that host changes its next hop"));
+        h.peer_update(&l, x, (4, 1), Some(Hop::from(b6)), &[b6], none).unwrap();
+        assert!(h.observe(&l, x, 4, 1, Some(Hop::from(b6))).unwrap());
+        assert_eq!(h.addr(&l, x).unwrap().hop(), Some(Hop::from(b6)));
+    }
+
     /// #914 review: one location per revision. A peer announcing the newest revision via itself does not
     /// take over the next hop recorded for it (which `observe` would replace on an equal revision), so the
     /// host it names still withdraws it; that host may change it, by another of its addresses.
@@ -8225,7 +8410,7 @@ pub(crate) mod tests {
         let (_d, h) = host("equal-revision");
         let l = h.lock().unwrap();
         let (b, b2, c): (IpAddr, IpAddr, IpAddr) = ("192.0.2.7".parse().unwrap(), "198.51.100.7".parse().unwrap(), "192.0.2.8".parse().unwrap());
-        let (b4, b24, c4) = (Some(ip("192.0.2.7")), Some(ip("198.51.100.7")), Some(ip("192.0.2.8")));
+        let (b4, b24, c4) = (hop("192.0.2.7"), hop("198.51.100.7"), hop("192.0.2.8"));
         let none = |_: &str| Vec::new();
         // A's VM went to B, which announced revision 1 (A is no longer its holder: lent only).
         let x = ip("10.9.2.5");
@@ -9110,16 +9295,16 @@ pub(crate) mod tests {
         let (_h_dir, mut h) = host("after-boot");
         h.cfg.cluster_ips = Some("10.9.0.0/16".into());
         let (peer, gone, mine, withdrawn) = (ip("10.9.5.1"), ip("10.9.5.2"), ip("10.9.5.3"), ip("10.9.5.4"));
-        let via = ip("192.0.2.7");
+        let (via, v6) = (ip("192.0.2.7"), "2001:db8::7".parse().unwrap());
         h.cfg.peers = vec![format!("{via}:7070")];
         let dead = dead_owner(&h, 999_999_946, &[]);
         {
             let l = h.lock().unwrap();
-            h.put_addr(peer, &Addr { seen: 3, via: Some(via), ..Addr::default() }, true).unwrap();
+            h.put_addr(peer, &Addr { seen: 3, via: Some(via.into()), via6: Some(v6), ..Addr::default() }, true).unwrap();
             // Recorded before #584 (or under a wider cluster range): never put back.
-            h.put_addr(ip("169.254.169.254"), &Addr { seen: 3, via: Some(via), ..Addr::default() }, true).unwrap();
+            h.put_addr(ip("169.254.169.254"), &Addr { seen: 3, via: Some(via.into()), ..Addr::default() }, true).unwrap();
             assert!(!h.reinstall(&l, ip("169.254.169.254"), None).unwrap(), "outside cluster_ips");
-            h.put_addr(withdrawn, &Addr { seen: 3, via: Some(via), withdrawn: true, ..Addr::default() }, true).unwrap();
+            h.put_addr(withdrawn, &Addr { seen: 3, via: Some(via.into()), withdrawn: true, ..Addr::default() }, true).unwrap();
             h.put_addr(gone, &Addr { seen: 5, holder: Some("web".into()), holder_id: Some(dead), held: 5, ..Addr::default() }, true).unwrap();
             let c = h.claim_new_in(&l, &Config { vm_ips: "10.9.5.3-10.9.5.3".into(), ..Config::default() }, "alive", Some(mine)).unwrap();
             c.keep();
@@ -9134,7 +9319,7 @@ pub(crate) mod tests {
         };
         // A route that cannot be put back yet (its interface not up): not complete, tried again.
         assert_eq!(h.after_boot_with("boot-1", route).unwrap(), Some(false));
-        assert_eq!(*routes.borrow(), vec![(peer, via)], "only a peer's live generation, not one withdrawn or held here");
+        assert_eq!(*routes.borrow(), vec![(peer, Hop::new(via.into(), Some(v6)).unwrap())], "only a peer's live generation, not one withdrawn or held here");
         let l = h.lock().unwrap();
         assert!(h.addr(&l, gone).unwrap().withdrawn && h.addr(&l, gone).unwrap().holder.is_none());
         assert!(!h.addr(&l, mine).unwrap().withdrawn, "a live holder's is kept");
@@ -9165,14 +9350,14 @@ pub(crate) mod tests {
         h.cfg.cluster_ips = Some("10.9.0.0/16".into());
         h.cfg.peers = vec!["peer.invalid:7070".into()];
         let (peer, via) = (ip("10.9.5.1"), ip("192.0.2.7"));
-        h.put_addr(peer, &Addr { seen: 3, via: Some(via), ..Addr::default() }, true).unwrap();
+        h.put_addr(peer, &Addr { seen: 3, via: Some(via.into()), ..Addr::default() }, true).unwrap();
         let routes = std::cell::RefCell::new(Vec::new());
         let route = |ip, via| {
             routes.borrow_mut().push((ip, via));
             Ok(())
         };
         // Never a peer's next hop: skipped for good once every peer is known.
-        h.put_addr(ip("10.9.5.2"), &Addr { seen: 3, via: Some(ip("192.0.2.99")), ..Addr::default() }, true).unwrap();
+        h.put_addr(ip("10.9.5.2"), &Addr { seen: 3, via: Some(ip("192.0.2.99").into()), ..Addr::default() }, true).unwrap();
         assert_eq!(h.after_boot_with("boot-1", route).unwrap(), Some(false));
         assert!(routes.borrow().is_empty());
         // The listener's lookup at its start failed (DNS timed out): an empty entry, still not known.
@@ -9181,7 +9366,7 @@ pub(crate) mod tests {
         assert!(routes.borrow().is_empty());
         crate::util::write_file(&h.run, "peers.json", br#"{"names": {"peer.invalid:7070": ["192.0.2.7"]}}"#, false).unwrap();
         assert_eq!(h.after_boot_with("boot-1", route).unwrap(), Some(true));
-        assert_eq!(*routes.borrow(), vec![(peer, via)]);
+        assert_eq!(*routes.borrow(), vec![(peer, Hop::from(via))]);
     }
 
     #[test]
@@ -9189,7 +9374,7 @@ pub(crate) mod tests {
         let (_dir, mut h) = host("boot-local-once");
         h.cfg.cluster_ips = Some("10.9.0.0/16".into());
         h.cfg.peers = vec!["peer.invalid:7070".into()];
-        h.put_addr(ip("10.9.5.1"), &Addr { seen: 3, via: Some(ip("192.0.2.7")), ..Addr::default() }, true).unwrap();
+        h.put_addr(ip("10.9.5.1"), &Addr { seen: 3, via: Some(ip("192.0.2.7").into()), ..Addr::default() }, true).unwrap();
         assert_eq!(h.after_boot_with(boot_id(), |_, _| panic!("peer is unknown")).unwrap(), Some(false));
         assert!(h.recovered(boot_id()));
         let dead = dead_owner(&h, 999_999_943, &[]);
@@ -10105,20 +10290,20 @@ pub(crate) mod tests {
     fn revisions_order_locations_within_a_generation() {
         let (_h_dir, h) = host("revs");
         let l = h.lock().unwrap();
-        let (x, a, b) = (ip("10.9.0.1"), Some(ip("192.0.2.1")), Some(ip("192.0.2.2")));
+        let (x, a, b) = (ip("10.9.0.1"), hop("192.0.2.1"), hop("192.0.2.2"));
         assert!(h.observe(&l, x, 7, 3, b).unwrap());
-        assert!(!h.observe(&l, x, 7, 2, a).unwrap() && h.addr(&l, x).unwrap().via == b, "a source's delayed announcement is stale");
+        assert!(!h.observe(&l, x, 7, 2, a).unwrap() && h.addr(&l, x).unwrap().hop() == b, "a source's delayed announcement is stale");
         assert!(h.observe(&l, x, 7, 3, b).unwrap(), "repeated");
         let _y = h.take_name("y", false).unwrap();
         assert_eq!(h.claim_incoming(&l, "y", x, 7, None).unwrap().rev, 4, "past the newest recorded");
         assert_eq!(h.claim_incoming(&l, "y", x, 7, Some(9)).unwrap().rev, 9);
         assert!(h.observe(&l, x, 7, 4, b).unwrap(), "an arrival's revision counts only once it commits");
         h.advance(&l, x, 7, 6).unwrap();
-        assert_eq!(h.addr(&l, x).unwrap().via, None, "a route for an older revision goes with it");
+        assert_eq!(h.addr(&l, x).unwrap().hop(), None, "a route for an older revision goes with it");
         assert!(!h.observe(&l, x, 7, 5, b).unwrap());
         assert!(h.observe(&l, x, 7, 6, b).unwrap());
         h.advance(&l, x, 7, 6).unwrap();
-        assert_eq!(h.addr(&l, x).unwrap().via, b, "one for the same revision stays");
+        assert_eq!(h.addr(&l, x).unwrap().hop(), b, "one for the same revision stays");
         assert!(h.observe(&l, x, 8, 0, a).unwrap(), "a newer generation starts over");
         assert!(h.observe(&l, x, 8, 0, None).unwrap() && !h.observe(&l, x, 8, 9, b).unwrap(), "a withdrawal takes every revision");
     }
@@ -10319,7 +10504,7 @@ pub(crate) mod tests {
         let x = ip("10.9.0.2");
         let gen = {
             let l = h.lock().unwrap();
-            assert!(h.observe(&l, x, RECV_MAX, 0, Some(ip("10.1.0.2"))).unwrap());
+            assert!(h.observe(&l, x, RECV_MAX, 0, hop("10.1.0.2")).unwrap());
             assert!(h.observe(&l, x, RECV_MAX, 0, None).unwrap(), "the peer withdraws it");
             h.lend_new(&l, x, "borrower", false).unwrap()
         };
@@ -10743,7 +10928,7 @@ pub(crate) mod tests {
     #[test]
     fn announcements_are_judged_by_the_holders_published_revision() {
         let (_dir, h) = host("live-rev");
-        let (x, gone, a) = (ip("10.9.4.1"), ip("10.9.4.2"), Some(ip("192.0.2.1")));
+        let (x, gone, a) = (ip("10.9.4.1"), ip("10.9.4.2"), hop("192.0.2.1"));
         let l = h.lock().unwrap();
         let _y = h.take_name("y", false).unwrap();
         h.claim_incoming(&l, "y", x, 7, None).unwrap().keep();
@@ -10756,8 +10941,8 @@ pub(crate) mod tests {
         h.publish_live(&l, x, 7, 1).unwrap();
         assert_eq!((h.live(&l, x).unwrap(), h.addr(&l, x).unwrap().rev), (Some(1), 0));
         assert!(!h.observe(&l, x, 7, 0, a).unwrap(), "a late announcement of the record's revision is stale");
-        assert_eq!(h.addr(&l, x).unwrap().via, None);
-        assert!(h.observe(&l, x, 7, 1, a).unwrap() && h.addr(&l, x).unwrap().via == a, "not older: taken");
+        assert_eq!(h.addr(&l, x).unwrap().hop(), None);
+        assert!(h.observe(&l, x, 7, 1, a).unwrap() && h.addr(&l, x).unwrap().hop() == a, "not older: taken");
         assert!(h.observe(&l, x, 7, 0, None).unwrap(), "a withdrawal is not an announcement");
         // A dead holder's file is stale: the record decides.
         let dead = dead_owner(&h, 999_999_940, &[]);
@@ -11088,7 +11273,7 @@ pub(crate) mod tests {
         for gen in [0, RECV_MAX + 1, GEN_MAX - 1025, GEN_MAX - 1024, GEN_MAX - 1, GEN_MAX, GEN_MAX + 1, u64::MAX] {
             assert!(h.claim_incoming(&l, "incoming", addr, gen, None).is_err());
             assert!(h.claim_arrival(&l, "arrival", addr, gen, 1, 1).is_err());
-            assert!(!h.observe(&l, addr, gen, 0, Some(ip("10.1.0.2"))).unwrap());
+            assert!(!h.observe(&l, addr, gen, 0, hop("10.1.0.2")).unwrap());
             assert!(!h.observe(&l, addr, gen, 0, None).unwrap());
             assert_eq!(h.addr(&l, addr).unwrap(), Addr::default());
         }
@@ -11099,7 +11284,7 @@ pub(crate) mod tests {
         let (_dir, h) = host("local-gen-bound");
         let l = h.lock().unwrap();
         let peer_addr = ip("10.9.0.1");
-        assert!(h.observe(&l, peer_addr, RECV_MAX, 0, Some(ip("10.1.0.2"))).unwrap());
+        assert!(h.observe(&l, peer_addr, RECV_MAX, 0, hop("10.1.0.2")).unwrap());
         let first = h.claim_new(&l, "first", Some(peer_addr)).unwrap();
         let second = h.claim_new(&l, "second", Some(ip("10.9.0.2"))).unwrap();
         for claim in [first, second] {
@@ -11150,7 +11335,7 @@ pub(crate) mod tests {
             if incoming {
                 h.claim_incoming(&l, "incoming", addr, gen, None).unwrap().release(&l).unwrap();
             } else {
-                assert!(h.observe(&l, addr, gen, 0, Some(ip("10.1.0.2"))).unwrap());
+                assert!(h.observe(&l, addr, gen, 0, hop("10.1.0.2")).unwrap());
             }
             drop(l);
             for _ in 0..2048 {

@@ -84,7 +84,7 @@ FAULTS = ("basic route route_abort route_abandoned lost_ack unknown refused page
 # The ones that restart the listeners (faults.py starts its own for them: LISTENER_FAULTS), the
 # terminal's, and the ones bound by timeouts (a guest that never answers; a pager that fails or
 # never gets its pages, gated deterministically).
-LISTENER_FAULTS = {"suspend_resume", "target_killed", "unit_restart", "wildcard_listen", "peer_by_name", "peer_moved",
+LISTENER_FAULTS = {"suspend_resume", "target_killed", "unit_restart", "wildcard_listen", "route_via6", "peer_by_name", "peer_moved",
                    "peer_unresolvable", "late_withdrawal", "resume_listener_restart", "arrival_cap_restart", "reboot", "connect_after_pull"}
 RECOVERY_FAULTS = " ".join(sorted(LISTENER_FAULTS)) + " terminal guest_hang uffd_err fetch_tail_enomem fetch_enomem_stuck cow_wp_race"
 # GiB-scale guests (pages_dead, source_killed_basic, which runs source_killed, pull_died, kill_source,
