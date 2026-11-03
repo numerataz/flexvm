@@ -114,6 +114,13 @@ firecracker_fetched() {
     echo "$out/firecracker is not recorded in firecracker.sha256; fetching it again"
     return 1
   fi
+  # Recorded, but perhaps for another ARCH (a state directory fetched for one and then the other): its ELF e_machine.
+  local machine
+  machine=$(sudo od -An -tx1 -j18 -N2 "$out/firecracker" | tr -d ' \n')
+  if [ "$machine" != "$([ "$ARCH" = aarch64 ] && echo b700 || echo 3e00)" ]; then
+    echo "$out/firecracker is not an $ARCH binary; fetching it again"
+    return 1
+  fi
 }
 
 if [ -z "$only_kernel" ]; then

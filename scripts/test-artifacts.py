@@ -86,22 +86,27 @@ class Pins(unittest.TestCase):
                 self.assertIn(f'vmlinux {self.url}/{vmlinux}\n', result.stdout)
 
     def test_unknown_arch(self):
-        self.env['ARCH'] = 'arm64'
-        result = self.run_script('fetch.sh', '--urls')
-        self.assertEqual(result.returncode, 1)
-        self.assertIn('ARCH must be one of x86_64 aarch64', result.stderr)
-        self.assertEqual(result.stdout, '')
+        for arch in ('arm64', 'x86_64 aarch64', 'x86'):
+            for script, args in (('fetch.sh', ['--urls']), ('pin-artifacts.sh', ['--inputs'])):
+                with self.subTest(arch=arch, script=script):
+                    self.env['ARCH'] = arch
+                    result = self.run_script(script, *args)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn('ARCH must be one of x86_64 aarch64', result.stderr)
+                    self.assertEqual(result.stdout, '')
 
     def test_malformed_release_never_falls_back(self):
-        for asset in ('firecracker', 'vmlinux'):
-            for line in (f'bad {self.url}/{asset}\n', f'{self.url}/{asset}\n',
-                         f'{self.digest} {self.url}/{asset}\n' * 2):
-                with self.subTest(asset=asset, line=line):
-                    self.checksums.write_text(line)
-                    result = self.run_script('fetch.sh', '--urls')
-                    self.assertEqual(result.returncode, 1)
-                    self.assertIn('Malformed SHA256', result.stderr)
-                    self.assertEqual(result.stdout, '')
+        for arch, assets in self.assets.items():
+            for asset in assets[:2]:
+                for line in (f'bad {self.url}/{asset}\n', f'{self.url}/{asset}\n',
+                             f'{self.digest} {self.url}/{asset}\n' * 2):
+                    with self.subTest(arch=arch, asset=asset, line=line):
+                        self.env['ARCH'] = arch
+                        self.checksums.write_text(line)
+                        result = self.run_script('fetch.sh', '--urls')
+                        self.assertEqual(result.returncode, 1)
+                        self.assertIn('Malformed SHA256', result.stderr)
+                        self.assertEqual(result.stdout, '')
 
     def test_inputs_reject_bad_kernel(self):
         self.checksums.write_text(f'{self.digest} {self.kernel}\n' * 2)

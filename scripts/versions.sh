@@ -11,10 +11,13 @@ KERNEL=${KERNEL:-vmlinux-6.1.155}
 # ARCHES.
 ARCHES=(x86_64 aarch64)
 ARCH=${ARCH:-$(uname -m)}
-if [[ " ${ARCHES[*]} " != *" $ARCH "* ]]; then
-  echo "ARCH must be one of ${ARCHES[*]}, not $ARCH" >&2
-  return 1
-fi
+case $ARCH in
+  x86_64 | aarch64) ;;
+  *)
+    echo "ARCH must be one of ${ARCHES[*]}, not $ARCH" >&2
+    return 1
+    ;;
+esac
 # Firecracker's CI bucket for an architecture (default ARCH).
 ci_url() { echo "https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/$CI_VERSION/${1:-$ARCH}"; }
 CI=$(ci_url)
@@ -28,7 +31,7 @@ CI=$(ci_url)
 ARTIFACTS_TAG=${ARTIFACTS_TAG:-v0.3.0}
 ARTIFACTS_URL=https://github.com/numerataz/flexvm/releases/download/$ARTIFACTS_TAG
 
-# A release asset's name for an architecture (default ARCH): firecracker, vmlinux, inputs.txt or SHA256SUMS. x86_64's
+# A release asset's name for an architecture (default ARCH): firecracker, vmlinux or inputs.txt. x86_64's
 # keep the names of the releases before any other architecture had assets (v0.2.2 and older are x86_64 only, and
 # their pins stay valid); the others' end in -ARCH (firecracker-aarch64, inputs-aarch64.txt). flexvm/build.rs names
 # them the same way.
