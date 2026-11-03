@@ -1373,8 +1373,8 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
     (`host::Hop`) is both underlays: a VM's /32 goes via the IPv4 one, else
     via the IPv6 one (`RTA_VIA`, `<vm-ip>/32 via inet6 <underlay6>`, Linux
     5.2+); the IPv6 one is also its /128's (#1297). A route announcement
-    carries `via` (the /32's next hop) and `via6` (the IPv6 underlay, sent
-    only with `vm_ipv6_prefix` set or no IPv4 underlay, so an IPv4 cluster
+    carries `via` (the /32's next hop) and `via6` (the IPv6 underlay; not a derived ::1
+    beside 127.0.0.1 without `vm_ipv6_prefix`, so a one-machine cluster
     announces as before), and the peer's record keeps both (`via`, `via6`).
     A migration's prepare, commit and outcome answers carry `underlay` and
     `underlay6`; the source checks the prepare's before it pauses (a failure

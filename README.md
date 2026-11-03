@@ -759,8 +759,9 @@ warns until then). Derived values:
   in `peer_underlays`. VM routes and migrations go via the IPv4 underlay;
   a host with only an IPv6 one has its VMs' IPv4 routes go via that (an
   IPv4 route via an IPv6 next hop, which needs Linux 5.2 or later on the
-  peers). With `vm_ipv6_prefix` set, peers are also told the IPv6 underlay
-  next to the IPv4 one, for the VMs' IPv6 routes. A peer running an older flexvm is never sent an
+  peers). Peers are also told the IPv6 underlay next to the IPv4 one, for
+  the VMs' IPv6 routes and for a peer that knows this host only by it. A
+  peer running an older flexvm is never sent an
   IPv6 next hop: it is told the IPv4 one alone, and with none it is not told
   (logged, and tried again until it is upgraded); a migration from an older
   host to one with only an IPv6 underlay is refused before the VM pauses.

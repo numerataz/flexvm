@@ -647,12 +647,12 @@ impl Config {
         self.underlay6_by(false)
     }
 
-    /// The next hop peers route this host's VMs via: the IPv4 underlay, and the IPv6 one when the VMs
-    /// have IPv6 addresses (`vm_ipv6_prefix`: their /128s go via it) or there is no IPv4 one. Without
-    /// a prefix an IPv4 cluster announces exactly as before, never asking `caps` (a derived ::1 included).
+    /// The next hop peers route this host's VMs via: both underlays (a peer that knows this host only
+    /// by its IPv6 one routes the /32 via that), but not ::1 beside 127.0.0.1 without `vm_ipv6_prefix`:
+    /// a cluster on one machine with IPv4 VMs announces exactly as before, never asking `caps`.
     pub fn hop(&self) -> Option<Hop> {
         let v4 = self.underlay();
-        let v6 = if v4.is_none() || self.vm_ipv6_prefix.is_some() { self.underlay6() } else { None };
+        let v6 = self.underlay6().filter(|v6| !(v6.is_loopback() && v4.is_some() && self.vm_ipv6_prefix.is_none()));
         Hop::of(v4, v6)
     }
 
@@ -8360,14 +8360,17 @@ pub(crate) mod tests {
         assert_eq!(serde_json::from_value::<Addr>(serde_json::to_value(&a).unwrap()).unwrap().hop(), Some(only6));
         a.set_hop(None);
         assert_eq!((a.via, a.via6), (None, None));
-        // A host's: its IPv6 underlay only with VM IPv6 addresses (their /128s), or with no IPv4 one.
+        // A host's: both underlays, a peer that knows it only by its IPv6 one routing the /32 via that.
         let peers = vec!["[2001:db8::99]:7070".to_string(), "192.0.2.99:7070".to_string()];
-        let mut cfg = Config { underlay: Underlay { v4: Some(v4), v6: Some(v6) }, peers, ..Config::default() };
-        assert_eq!(cfg.hop(), Some(Hop::from(v4)), "an IPv4 cluster announces as before");
-        cfg.vm_ipv6_prefix = Some(crate::net::Ipv6Prefix::parse("fd00:1::/96").unwrap());
+        let cfg = Config { underlay: Underlay { v4: Some(v4), v6: Some(v6) }, peers, ..Config::default() };
         assert_eq!(cfg.hop(), Some(both));
         let only = Config { underlay: Underlay { v4: None, v6: Some(v6) }, peers: vec!["[2001:db8::99]:7070".into()], ..Config::default() };
         assert_eq!(only.hop(), Some(only6));
+        // On one machine (every peer local: 127.0.0.1 and ::1), ::1 only for VMs' IPv6 addresses.
+        let mut local = Config { listen: Some("127.0.0.1:7070".into()), peers: vec!["127.0.0.1:7071".into()], ..Config::default() };
+        assert_eq!(local.hop(), Some(Hop::from(Ipv4Addr::LOCALHOST)), "announced as before, never asking caps");
+        local.vm_ipv6_prefix = Some(crate::net::Ipv6Prefix::parse("fd00:1::/96").unwrap());
+        assert_eq!(local.hop(), Hop::of(Some(Ipv4Addr::LOCALHOST), Some(Ipv6Addr::LOCALHOST)));
         // Edited by hand to name two IPv6 ones: by `via`.
         let odd = Addr { via: Some(v6.into()), via6: Some("2001:db8::8".parse().unwrap()), ..Addr::default() };
         assert_eq!(odd.hop(), Some(only6));
