@@ -1,11 +1,13 @@
 name: Release artifacts
 
-# Pushing a semver tag (vMAJOR.MINOR.PATCH) builds the patched Firecracker and re-hosts the pinned guest kernel as the
-# release flexvm downloads from on first use. The tag must be ARTIFACTS_TAG in scripts/versions.sh at the
-# tagged commit. Afterwards, scripts/pin-artifacts.sh pins the assets' sha256 in scripts/checksums.sha256
-# (a follow-up commit) once their build provenance (attested here) verifies: from then on, flexvm builds
-# download them. A release's assets never change. This file is one of a release's inputs (scripts/pin-artifacts.sh
-# --inputs hashes it): changing it needs a new ARTIFACTS_TAG. The steps: "Releasing the artifacts" in README.md.
+# Pushing a semver tag (vMAJOR.MINOR.PATCH) builds the patched Firecracker and re-hosts the pinned guest kernel, for
+# x86_64 and aarch64 each natively on a runner of its own, as the release flexvm downloads from on first use
+# (x86_64's assets are firecracker, vmlinux and inputs.txt; aarch64's end in -aarch64: asset in scripts/versions.sh).
+# The tag must be ARTIFACTS_TAG in scripts/versions.sh at the tagged commit. Afterwards, scripts/pin-artifacts.sh
+# pins the assets' sha256 in scripts/checksums.sha256 (a follow-up commit) once their build provenance (attested
+# here) verifies: from then on, flexvm builds download them. A release's assets never change. This file is one of a
+# release's inputs (scripts/pin-artifacts.sh --inputs hashes it): changing it needs a new ARTIFACTS_TAG. The steps:
+# "Releasing the artifacts" in README.md.
 
 on:
   push:
@@ -20,11 +22,14 @@ concurrency:
 
 jobs:
   build:
-    name: build ${{ github.ref_name }}
-    runs-on: ubuntu-24.04
+    name: build ${{ github.ref_name }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
-    outputs:
-      artifact-id: ${{ steps.upload.outputs.artifact-id }}
+    strategy:
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
     env:
       TAG: ${{ github.ref_name }}
       GH_REPO: ${{ github.repository }}
@@ -59,7 +64,7 @@ jobs:
         id: upload
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: release-assets
+          name: release-assets-${{ matrix.arch }}
           path: ${{ runner.temp }}/assets/
           if-no-files-found: error
 
@@ -80,7 +85,8 @@ jobs:
       - name: Download assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          artifact-ids: ${{ needs.build.outputs.artifact-id }}
+          # This run's, one per architecture.
+          pattern: release-assets-*
           path: ${{ runner.temp }}/assets
           merge-multiple: true
           digest-mismatch: error
@@ -89,8 +95,11 @@ jobs:
         working-directory: ${{ runner.temp }}/assets
         run: |
           ls -l
-          sha256sum --check --strict SHA256SUMS
-          [ "$(cut -d' ' -f3 SHA256SUMS | sort | tr '\n' ' ')" = "firecracker inputs.txt vmlinux " ]
+          [ "$(LC_ALL=C ls | tr '\n' ' ')" = "SHA256SUMS-aarch64 SHA256SUMS-x86_64 firecracker firecracker-aarch64 inputs-aarch64.txt inputs.txt vmlinux vmlinux-aarch64 " ]
+          sha256sum --check --strict SHA256SUMS-x86_64 SHA256SUMS-aarch64
+          [ "$(cut -d' ' -f3 SHA256SUMS-x86_64 | sort | tr '\n' ' ')" = "firecracker inputs.txt vmlinux " ]
+          [ "$(cut -d' ' -f3 SHA256SUMS-aarch64 | sort | tr '\n' ' ')" = "firecracker-aarch64 inputs-aarch64.txt vmlinux-aarch64 " ]
+          cat SHA256SUMS-x86_64 SHA256SUMS-aarch64 > SHA256SUMS
 
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
@@ -99,6 +108,9 @@ jobs:
             ${{ runner.temp }}/assets/firecracker
             ${{ runner.temp }}/assets/vmlinux
             ${{ runner.temp }}/assets/inputs.txt
+            ${{ runner.temp }}/assets/firecracker-aarch64
+            ${{ runner.temp }}/assets/vmlinux-aarch64
+            ${{ runner.temp }}/assets/inputs-aarch64.txt
 
       - name: Publish
         env:
@@ -106,7 +118,7 @@ jobs:
         run: |
           out=$RUNNER_TEMP/assets
           {
-            echo "Prebuilt patched Firecracker ($(head -1 "$out/inputs.txt" | cut -d' ' -f2)) and guest kernel for flexvm, built from ${GITHUB_SHA}."
+            echo "Prebuilt patched Firecracker ($(head -1 "$out/inputs.txt" | cut -d' ' -f2)) and guest kernel for flexvm, x86_64 and aarch64 (assets ending in -aarch64), built from ${GITHUB_SHA}."
             echo
             echo "Pin them with scripts/pin-artifacts.sh at a commit whose scripts/versions.sh names ${TAG}."
             echo
@@ -115,4 +127,5 @@ jobs:
             echo '```'
           } > "$RUNNER_TEMP/notes.md"
           gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md" \
-            "$out/firecracker" "$out/vmlinux" "$out/inputs.txt" "$out/SHA256SUMS"
+            "$out/firecracker" "$out/vmlinux" "$out/inputs.txt" \
+            "$out/firecracker-aarch64" "$out/vmlinux-aarch64" "$out/inputs-aarch64.txt" "$out/SHA256SUMS"

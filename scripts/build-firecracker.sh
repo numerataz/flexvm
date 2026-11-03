@@ -20,12 +20,13 @@ source "$root/scripts/versions.sh"
 src=${FC_SRC:-$root/build/firecracker-src}
 stamp=$src/.flexvm-patched
 patches=$(cd "$root/firecracker" && sha256sum -- *.patch)
-# Built for the host's architecture: the kernel headers below are the host's, so there is no cross build.
-case $(uname -m) in
-  x86_64) triple=x86_64-unknown-linux-musl ;;
-  aarch64) triple=aarch64-unknown-linux-musl ;;
-  *) echo "Firecracker builds only on x86_64 and aarch64 hosts, not $(uname -m)" >&2; exit 1 ;;
-esac
+# Built for ARCH (scripts/versions.sh: x86_64 or aarch64), which must be the host's: the kernel headers below are
+# the host's, so there is no cross build.
+if [ "$ARCH" != "$(uname -m)" ]; then
+  echo "Firecracker builds only for this host's architecture ($(uname -m)), not ARCH=$ARCH" >&2
+  exit 1
+fi
+triple=$ARCH-unknown-linux-musl
 # The checkout is redone when the version, the commit, a patch or this script changes.
 patched=$(printf '%s %s\n%s\n%s\n' "$FC_VERSION" "$FC_COMMIT" "$patches" "$(sha256sum < "$root/scripts/build-firecracker.sh")")
 
@@ -62,7 +63,7 @@ ln -sfn /usr/include/linux "$kh/linux"
 ln -sfn /usr/include/asm-generic "$kh/asm-generic"
 asm=
 multiarch=$(${CC:-cc} -print-multiarch 2>/dev/null || true)
-for path in "/usr/include/$multiarch/asm" /usr/include/asm "/usr/include/$(uname -m)-linux-gnu/asm"; do
+for path in "/usr/include/$multiarch/asm" /usr/include/asm "/usr/include/$ARCH-linux-gnu/asm"; do
   if [ -d "$path" ]; then asm=$path; break; fi
 done
 if [ -z "$asm" ]; then echo 'Cannot find the system asm headers; install the kernel headers.' >&2; exit 1; fi

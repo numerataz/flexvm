@@ -4,6 +4,10 @@
 06094a1108ae9e82aa4c23a775aa92758f53f1175d422270d9d6162cb9ade558 https://github.com/firecracker-microvm/firecracker/releases/download/v1.17.0/firecracker-v1.17.0-x86_64.tgz
 e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2 https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/vmlinux-6.1.155
 68321e0482baeb3844dafe8a6b08a6902401a7afc41fbfd8c3d9ea08aadd244f https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/ubuntu-24.04.squashfs
+# aarch64's: Firecracker's matches its release's .sha256.txt; the CI kernel and rootfs match their S3 ETags (MD5, unmodified since 2025-12-18).
+e351ebe4f7a16b5873bbd51005d2e6767103cff4d5ebc829df2d3f95a93e2256 https://github.com/firecracker-microvm/firecracker/releases/download/v1.17.0/firecracker-v1.17.0-aarch64.tgz
+e3544b10603acbf3db492cb52e000d22ba202cb4b63b9add027565683e11c591 https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/aarch64/vmlinux-6.1.155
+0efb6a3ff2982baa6ca7e3d940966516ba7ddd2df5deb3e6c2161d369a15d608 https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/aarch64/ubuntu-24.04.squashfs
 c3a4d1681f0a86fff78401df509ceb0ae8189a7bb8f990898b3bfa4cf793d474 https://github.com/kevmo314/flexvm/releases/download/artifacts-1/firecracker
 e20e46d0c36c55c0d1014eb20576171b3f3d922260d9f792017aeff53af3d4f2 https://github.com/kevmo314/flexvm/releases/download/artifacts-1/vmlinux
 2595de54101a5e1661d576897837542f794706418249ba7459a6a0b7fd434dbb https://github.com/kevmo314/flexvm/releases/download/artifacts-1/inputs.txt

@@ -1,6 +1,7 @@
 //! The prebuilt patched Firecracker and guest kernel: on first use, a missing `STATE/artifacts/firecracker` or
 //! `vmlinux` is downloaded from the semver release scripts/versions.sh names (`ARTIFACTS_TAG`, e.g. `v0.2.0`),
-//! checked against the sha256 scripts/checksums.sha256 pins for it (build.rs), and renamed into place.
+//! checked against the sha256 scripts/checksums.sha256 pins for it (build.rs), and renamed into place. The release
+//! holds each architecture's: x86_64's as `firecracker` and `vmlinux`, aarch64's as `firecracker-aarch64` and so on.
 //! A file already there must match the pin,
 //! and a VM process checks its Firecracker against it too (`check_pinned`).
 //! Only a build without a pin accepts a recorded file, built with the scripts or copied in for an offline host: `NAME.sha256`
@@ -24,8 +25,10 @@ pub static INIT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/flexvm-init")
 
 /// A release asset flexvm can download.
 pub struct Asset {
-    /// Its name in the release and in `STATE/artifacts`.
+    /// Its name in `STATE/artifacts`.
     pub name: &'static str,
+    /// Its name in the release, for this build's architecture (build.rs): `name` on x86_64, `name-ARCH` on others.
+    release_name: &'static str,
     /// Its pinned sha256 (hex), if this build pins the release's.
     sha256: Option<&'static str>,
     mode: u32,
@@ -33,9 +36,15 @@ pub struct Asset {
     by_hand: &'static str,
 }
 
-pub const FIRECRACKER: Asset =
-    Asset { name: "firecracker", sha256: option_env!("FLEXVM_PIN_FIRECRACKER"), mode: 0o755, by_hand: "scripts/build-firecracker.sh" };
-pub const KERNEL: Asset = Asset { name: "vmlinux", sha256: option_env!("FLEXVM_PIN_VMLINUX"), mode: 0o644, by_hand: "scripts/fetch.sh" };
+pub const FIRECRACKER: Asset = Asset {
+    name: "firecracker",
+    release_name: env!("FLEXVM_ASSET_FIRECRACKER"),
+    sha256: option_env!("FLEXVM_PIN_FIRECRACKER"),
+    mode: 0o755,
+    by_hand: "scripts/build-firecracker.sh",
+};
+pub const KERNEL: Asset =
+    Asset { name: "vmlinux", release_name: env!("FLEXVM_ASSET_VMLINUX"), sha256: option_env!("FLEXVM_PIN_VMLINUX"), mode: 0o644, by_hand: "scripts/fetch.sh" };
 
 /// The release the assets come from; `FLEXVM_ARTIFACTS_URL` names a mirror holding the same files (they are checked
 /// against the same pins).
@@ -70,7 +79,7 @@ fn ensure_one(path: &Path, asset: &Asset, sha256: Option<&str>, base: &str) -> R
             asset.by_hand
         );
     };
-    let url = format!("{}/{}", base.trim_end_matches('/'), asset.name);
+    let url = format!("{}/{}", base.trim_end_matches('/'), asset.release_name);
     crate::log!("flexvm: downloading {} (sha256 {sha256}) from {url}", asset.name);
     fetch(&url, sha256, path, asset.mode).map_err(|e| {
         format!(
@@ -261,7 +270,7 @@ mod tests {
                 while r.read_line(&mut String::new()).unwrap() > 2 {}
                 let reply = if line.starts_with("GET /moved/") {
                     format!("HTTP/1.1 302 Found\r\nlocation: /{}\r\ncontent-length: 0\r\n\r\n", line.split('/').nth(2).unwrap().split(' ').next().unwrap())
-                } else if line.starts_with("GET /asset ") || line.starts_with("GET /firecracker ") {
+                } else if line.starts_with("GET /asset ") || line.starts_with(&format!("GET /{} ", FIRECRACKER.release_name)) {
                     format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n", body.len())
                 } else {
                     "HTTP/1.1 404 Not Found\r\ncontent-length: 0\r\n\r\n".into()

@@ -4,10 +4,14 @@
 #                                    the release's tag, whose commit must be in this checkout's history, attested by
 #                                    GitHub; needs gh), checks they were built from this checkout's inputs, and pins
 #                                    them in scripts/checksums.sha256 (commit it). Nothing downloaded is ever run.
-#        pin-artifacts.sh --inputs   prints what a release is built from (the release's inputs.txt): Firecracker's
-#                                    version, commit and patches, the build recipe (release.yml and the scripts it
-#                                    runs), and the kernel
-#        pin-artifacts.sh --check    whether ARTIFACTS_TAG is pinned and was built from this checkout's inputs; exits
+#                                    A release carries every architecture in ARCHES (scripts/versions.sh), each its
+#                                    own assets (asset in versions.sh: firecracker, firecracker-aarch64, ...); this
+#                                    pins them all.
+#        pin-artifacts.sh --inputs   prints what ARCH's assets of a release are built from (its inputs.txt, or
+#                                    inputs-ARCH.txt): Firecracker's version and architecture, commit and patches,
+#                                    the build recipe (release.yml and the scripts it runs), and the kernel
+#        pin-artifacts.sh --check    whether ARTIFACTS_TAG is pinned for every architecture and was built from this
+#                                    checkout's inputs (the same answer on any host); exits
 #                                    0 if so; 1 if it is stale (pinned, or tagged at a commit, with other inputs:
 #                                    bump ARTIFACTS_TAG), its pins are broken, or the tag cannot be looked up; 3 if
 #                                    it is pending (not pinned yet, and not tagged at other inputs) since it came to
@@ -25,22 +29,46 @@ if ! [[ $ARTIFACTS_TAG =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 checksums=$root/scripts/checksums.sha256
 REPO=numerataz/flexvm
+# Each architecture's assets, by their plain names (asset in versions.sh names them in a release).
 ASSETS=(firecracker vmlinux inputs.txt)
+# Every architecture's names in a release.
+release_assets() {
+  local arch name
+  for arch in "${ARCHES[@]}"; do
+    for name in "${ASSETS[@]}"; do asset "$name" "$arch"; done
+  done
+}
+mapfile -t RELEASE_ASSETS < <(release_assets)
 # How long main may name an unpinned ARTIFACTS_TAG: tag, release and pin take well under an hour.
 RELEASE_WINDOW_HOURS=24
 
-# What a release is built from, by content: Firecracker's version, the commit its tag names and the patches; the
-# recipe (release.yml, which runs scripts/release-assets.sh, which runs build-firecracker.sh and fetch.sh); and the
-# kernel.
+# What an architecture's assets (default ARCH) are built from, by content: Firecracker's version, the commit its tag
+# names and the patches; the recipe (release.yml, which runs scripts/release-assets.sh, which runs
+# build-firecracker.sh and fetch.sh); and the kernel.
 inputs() {
-  local kernel
-  kernel=$(pinned "$CI/$KERNEL") || return 1
+  local arch=${1:-$ARCH} kernel
+  kernel=$(pinned "$(ci_url "$arch")/$KERNEL") || return 1
   # Each failure returns explicitly: callers test this in conditions, where errexit is off.
-  printf 'firecracker %s %s\n' "$FC_VERSION" "$ARCH" || return 1
+  printf 'firecracker %s %s\n' "$FC_VERSION" "$arch" || return 1
   printf 'commit %s\n' "$FC_COMMIT" || return 1
   (cd "$root/firecracker" && sha256sum -- *.patch) || return 1
   (cd "$root" && sha256sum .github/workflows/release.yml scripts/release-assets.sh scripts/build-firecracker.sh scripts/fetch.sh scripts/versions.sh) || return 1
   printf 'vmlinux %s %s\n' "$kernel" "$KERNEL"
+}
+
+# Every architecture's inputs, each after a line naming it: a whole release's, as pending compares them. With
+# SCRIPT, another checkout's pin-artifacts.sh prints each (one from before releases had other architectures prints
+# x86_64's for all of them).
+all_inputs() {
+  local arch
+  for arch in "${ARCHES[@]}"; do
+    printf '%s:\n' "$arch" || return 1
+    if [ -n "${1:-}" ]; then
+      ARCH=$arch bash "$1" --inputs || return 1
+    else
+      inputs "$arch" || return 1
+    fi
+  done
 }
 
 # The commit ARTIFACTS_TAG names upstream; returns 2 if there is no such tag, 1 if that cannot be told.
@@ -78,7 +106,7 @@ pending() (
     in_history "$tagged" || return 1
     tree=$(mktemp -d)
     if ! { git -C "$root" archive "$tagged" .github scripts firecracker | tar -x -C "$tree"; } ||
-      ! theirs=$("$tree/scripts/pin-artifacts.sh" --inputs); then
+      ! theirs=$(all_inputs "$tree/scripts/pin-artifacts.sh"); then
       echo "cannot tell what $ARTIFACTS_TAG at $tagged is built from" >&2
       return 1
     fi
@@ -109,7 +137,7 @@ case "${1:-}" in
     ;;
   --check)
     # This checkout's inputs must be well-formed whatever the release's state.
-    ours=$(inputs) || exit 1
+    ours=$(all_inputs) || exit 1
     # The crates' versions are the tag's, without its v.
     for manifest in flexvm/Cargo.toml guest/Cargo.toml; do
       version=$(sed -n 's/^version = "\(.*\)"$/\1/p' "$root/$manifest" | head -1)
@@ -119,7 +147,7 @@ case "${1:-}" in
       fi
     done
     pins=0
-    for asset in "${ASSETS[@]}"; do
+    for asset in "${RELEASE_ASSETS[@]}"; do
       if pinned "$ARTIFACTS_URL/$asset" > /dev/null; then
         pins=$((pins + 1))
       else
@@ -131,16 +159,18 @@ case "${1:-}" in
       pending "$ours" || status=$?
       exit "$status"
     fi
-    if [ "$pins" != "${#ASSETS[@]}" ]; then
-      echo "scripts/checksums.sha256 pins only some of $ARTIFACTS_TAG's assets (${ASSETS[*]}): run scripts/pin-artifacts.sh" >&2
+    if [ "$pins" != "${#RELEASE_ASSETS[@]}" ]; then
+      echo "scripts/checksums.sha256 pins only some of $ARTIFACTS_TAG's assets (${RELEASE_ASSETS[*]}): run scripts/pin-artifacts.sh" >&2
       exit 1
     fi
-    want=$(pinned "$ARTIFACTS_URL/inputs.txt")
-    if [ "$(printf '%s\n' "$ours" | sha256sum | cut -d' ' -f1)" != "$want" ]; then
-      echo "The pinned release $ARTIFACTS_TAG was built from other inputs than this checkout's (scripts/pin-artifacts.sh --inputs): bump ARTIFACTS_TAG in scripts/versions.sh in the same change (RELEASING in README.md)" >&2
-      exit 1
-    fi
-    echo "$ARTIFACTS_TAG matches this checkout's inputs"
+    for arch in "${ARCHES[@]}"; do
+      want=$(pinned "$ARTIFACTS_URL/$(asset inputs.txt "$arch")")
+      if [ "$(inputs "$arch" | sha256sum | cut -d' ' -f1)" != "$want" ]; then
+        echo "The pinned release $ARTIFACTS_TAG was built ($arch) from other inputs than this checkout's (scripts/pin-artifacts.sh --inputs): bump ARTIFACTS_TAG in scripts/versions.sh in the same change (RELEASING in README.md)" >&2
+        exit 1
+      fi
+    done
+    echo "$ARTIFACTS_TAG matches this checkout's inputs (${ARCHES[*]})"
     exit 0
     ;;
   "") ;;
@@ -156,7 +186,7 @@ trap 'rm -rf -- "$work"; rm -f -- "$placing"' EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 work=$(mktemp -d)
-for asset in "${ASSETS[@]}"; do
+for asset in "${RELEASE_ASSETS[@]}"; do
   echo "downloading $ARTIFACTS_URL/$asset"
   # Never executable: nothing downloaded here is run.
   curl -fsSL -o "$work/$asset" "$ARTIFACTS_URL/$asset"
@@ -169,29 +199,33 @@ if [ "$status" != 0 ]; then exit 1; fi
 in_history "$tagged"
 # Each asset must have been built by this repository's release workflow, from this tag at that commit, on a
 # GitHub-hosted runner.
-for asset in "${ASSETS[@]}"; do
+for asset in "${RELEASE_ASSETS[@]}"; do
   echo "verifying the build provenance of $asset"
   gh attestation verify "$work/$asset" --repo "$REPO" \
     --signer-workflow "$REPO/.github/workflows/release.yml" \
     --source-ref "refs/tags/$ARTIFACTS_TAG" --source-digest "$tagged" --deny-self-hosted-runners > /dev/null
 done
-if ! inputs | cmp -s - "$work/inputs.txt"; then
-  echo "$ARTIFACTS_TAG was built from other inputs than this checkout's:" >&2
-  inputs | diff - "$work/inputs.txt" >&2 || true
-  exit 1
-fi
-# The kernel is re-hosted, not built: it must be the pinned upstream one.
-if [ "$(sha256sum < "$work/vmlinux" | cut -d' ' -f1)" != "$(pinned "$CI/$KERNEL")" ]; then
-  echo "$ARTIFACTS_URL/vmlinux is not the pinned $CI/$KERNEL" >&2
-  exit 1
-fi
-# What Firecracker is, from the attested inputs.txt (never by running it).
-head -1 "$work/inputs.txt"
+for arch in "${ARCHES[@]}"; do
+  listed=$work/$(asset inputs.txt "$arch")
+  if ! inputs "$arch" | cmp -s - "$listed"; then
+    echo "$ARTIFACTS_TAG was built ($arch) from other inputs than this checkout's:" >&2
+    inputs "$arch" | diff - "$listed" >&2 || true
+    exit 1
+  fi
+  # The kernel is re-hosted, not built: it must be the pinned upstream one.
+  kernel=$(ci_url "$arch")/$KERNEL
+  if [ "$(sha256sum < "$work/$(asset vmlinux "$arch")" | cut -d' ' -f1)" != "$(pinned "$kernel")" ]; then
+    echo "$ARTIFACTS_URL/$(asset vmlinux "$arch") is not the pinned $kernel" >&2
+    exit 1
+  fi
+  # What Firecracker is, from the attested inputs (never by running it).
+  head -1 "$listed"
+done
 
 # This release's lines replace any it had; other lines stay.
 {
   awk -v base="$ARTIFACTS_URL/" 'index($2, base) != 1' "$checksums"
-  for asset in "${ASSETS[@]}"; do
+  for asset in "${RELEASE_ASSETS[@]}"; do
     printf '%s %s\n' "$(sha256sum < "$work/$asset" | cut -d' ' -f1)" "$ARTIFACTS_URL/$asset"
   done
 } > "$work/checksums"

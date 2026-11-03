@@ -8,8 +8,9 @@ use std::process::Command;
 
 /// The repository whose releases hold the prebuilt artifacts.
 const REPO: &str = "numerataz/flexvm";
-/// The assets flexvm downloads, and the `rustc-env` each one's pin goes in.
-const ASSETS: [(&str, &str); 2] = [("firecracker", "FLEXVM_PIN_FIRECRACKER"), ("vmlinux", "FLEXVM_PIN_VMLINUX")];
+/// The assets flexvm downloads, and the `rustc-env`s each one's pin and its name in the release go in.
+const ASSETS: [(&str, &str, &str); 2] =
+    [("firecracker", "FLEXVM_PIN_FIRECRACKER", "FLEXVM_ASSET_FIRECRACKER"), ("vmlinux", "FLEXVM_PIN_VMLINUX", "FLEXVM_ASSET_VMLINUX")];
 
 fn main() {
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
@@ -66,6 +67,16 @@ fn shell_default(text: &str, name: &str) -> Option<String> {
     Some(value.trim_matches('"').to_string())
 }
 
+/// An asset's name in a release for an architecture, as asset() in scripts/versions.sh names it: x86_64's keep the
+/// names of the releases that had no other architecture (v0.2.2 and older), the others' end in `-ARCH`.
+fn release_name(asset: &str, arch: &str) -> String {
+    match (arch, asset.strip_suffix(".txt")) {
+        ("x86_64", _) => asset.into(),
+        (_, Some(stem)) => format!("{stem}-{arch}.txt"),
+        (_, None) => format!("{asset}-{arch}"),
+    }
+}
+
 /// The same vMAJOR.MINOR.PATCH form as release.yml and pin-artifacts.sh.
 fn valid_tag(tag: &str) -> bool {
     let Some(version) = tag.strip_prefix('v') else { return false };
@@ -84,8 +95,12 @@ fn pins(root: &Path) {
     let base = format!("https://github.com/{REPO}/releases/download/{tag}");
     println!("cargo:rustc-env=FLEXVM_ARTIFACTS_BASE={base}");
     let checksums = std::fs::read_to_string(&checksums).expect("scripts/checksums.sha256");
-    for (asset, var) in ASSETS {
-        let url = format!("{base}/{asset}");
+    // The assets for the architecture flexvm is built for: it runs guests of its own.
+    let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+    for (asset, var, name_var) in ASSETS {
+        let name = release_name(asset, &arch);
+        println!("cargo:rustc-env={name_var}={name}");
+        let url = format!("{base}/{name}");
         // As pinned() in scripts/versions.sh: any non-comment line naming the URL is its pin, and must be `SHA256 URL`.
         let found: Vec<Vec<&str>> = checksums
             .lines()
@@ -145,7 +160,7 @@ fn init(root: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::valid_tag;
+    use super::{release_name, valid_tag};
 
     #[test]
     fn packed_refs_do_not_leave_missing_cargo_inputs() {
@@ -163,6 +178,20 @@ mod tests {
         assert!(after.iter().any(|p| p.ends_with("logs/HEAD")));
         assert!(before.iter().any(|p| !after.contains(p)));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn release_names() {
+        for (asset, arch, name) in [
+            ("firecracker", "x86_64", "firecracker"),
+            ("vmlinux", "x86_64", "vmlinux"),
+            ("inputs.txt", "x86_64", "inputs.txt"),
+            ("firecracker", "aarch64", "firecracker-aarch64"),
+            ("vmlinux", "aarch64", "vmlinux-aarch64"),
+            ("inputs.txt", "aarch64", "inputs-aarch64.txt"),
+        ] {
+            assert_eq!(release_name(asset, arch), name);
+        }
     }
 
     #[test]
