@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Downloads Firecracker, a guest kernel and a base rootfs into STATE/artifacts. Once scripts/checksums.sha256
 # pins the flexvm artifacts release (scripts/versions.sh), Firecracker (patched) and the kernel come from it;
-# until then, the kernel comes from Firecracker's CI bucket and Firecracker is the stock release. flexvm itself
+# until then, the kernel comes from Firecracker's CI bucket and Firecracker is the stock release. All are for ARCH
+# (this host's; scripts/versions.sh). flexvm itself
 # downloads the release's on first use; this is for fetching ahead (an offline host, say: --state a directory
 # to copy over).
 # usage: fetch.sh [--state DIR (${FLEXVM_STATE_DIR:-/var/lib/flexvm})] [--urls | --kernel (the kernel only)]
@@ -28,15 +29,16 @@ done
 # shellcheck source=versions.sh
 source "$root/scripts/versions.sh"
 
-if pinned "$ARTIFACTS_URL/firecracker" > /dev/null; then
-  FC_URL=$ARTIFACTS_URL/firecracker
+# This architecture's assets of the release (scripts/versions.sh asset), installed under their plain names.
+if pinned "$ARTIFACTS_URL/$(asset firecracker)" > /dev/null; then
+  FC_URL=$ARTIFACTS_URL/$(asset firecracker)
 else
   [ "$?" = 2 ] || exit 1
   FC_URL=https://github.com/firecracker-microvm/firecracker/releases/download/$FC_VERSION/firecracker-$FC_VERSION-$ARCH.tgz
 fi
 KERNEL_URL=$CI/$KERNEL
-if pinned "$ARTIFACTS_URL/vmlinux" > /dev/null; then
-  KERNEL_URL=$ARTIFACTS_URL/vmlinux
+if pinned "$ARTIFACTS_URL/$(asset vmlinux)" > /dev/null; then
+  KERNEL_URL=$ARTIFACTS_URL/$(asset vmlinux)
 else
   [ "$?" = 2 ] || exit 1
 fi

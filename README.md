@@ -56,7 +56,11 @@ built with it again. A build that pins no release (between a release's tag and
 its pin) goes by the record instead: `NAME.sha256` beside the file holds the
 sha256 of a file that flexvm downloaded, or that the scripts below built or
 fetched and verified. Copying artifacts to another host takes the `.sha256`
-files along.
+files along. The artifacts are the host's architecture's (x86_64 or aarch64):
+a release carries both, aarch64's as `firecracker-aarch64`, `vmlinux-aarch64`
+and `inputs-aarch64.txt` (x86_64's keep the plain names of the releases
+before, which were x86_64 only). The scripts take it from `uname -m`, or
+`ARCH`.
 
 For a host without network access, put the files in `artifacts/` first (the
 scripts install with sudo; give them `--state DIR` for another state
@@ -114,8 +118,10 @@ A release (`ARTIFACTS_TAG` in `scripts/versions.sh`) is built from what
 its tag names (`FC_COMMIT`; the build refuses any other), the patches, the
 recipe (`.github/workflows/release.yml` and the scripts it runs:
 `scripts/release-assets.sh`, `scripts/build-firecracker.sh`,
-`scripts/fetch.sh`, and their shared `scripts/versions.sh`) and the kernel. That list is
-the release's `inputs.txt`, and its assets never change. So a change to any
+`scripts/fetch.sh`, and their shared `scripts/versions.sh`) and the kernel,
+for each architecture (`ARCH=aarch64 scripts/pin-artifacts.sh --inputs`). That
+list is the release's `inputs.txt` (`inputs-aarch64.txt`), and its assets
+never change. So a change to any
 of those inputs bumps `ARTIFACTS_TAG` in the same pull request; CI fails it
 otherwise. Then:
 
@@ -125,15 +131,18 @@ otherwise. Then:
    `git tag vX.Y.Z <commit> && git push origin vX.Y.Z`, with the
    `ARTIFACTS_TAG` it names.
    `.github/workflows/release.yml` checks that `versions.sh` there names it,
-   builds the assets with `scripts/release-assets.sh` in a read-only job
-   (Firecracker uses `cargo build --locked`). A separate job downloads that
-   job's uploaded artifact, attests the three assets and publishes them;
-   only it has write and signing permissions.
-3. Run `scripts/pin-artifacts.sh` on main once the release exists. It checks
-   that the tag's commit is in your history, verifies the attestations
-   (release.yml at that tag and commit, on a GitHub-hosted runner), and checks
-   that `inputs.txt` matches the checkout. It then writes the three pins to
-   `scripts/checksums.sha256` by atomic replacement. Merge that commit.
+   builds the assets with `scripts/release-assets.sh` in a read-only job per
+   architecture, each natively on its own runner (`ubuntu-24.04` and
+   `ubuntu-24.04-arm`; Firecracker uses `cargo build --locked`). A separate
+   job downloads those jobs' uploaded artifacts, attests the six assets and
+   publishes them; only it has write and signing permissions.
+3. Run `scripts/pin-artifacts.sh` on main once the release exists (on either
+   architecture). It checks that the tag's commit is in your history, verifies
+   the attestations (release.yml at that tag and commit, on a GitHub-hosted
+   runner), and checks that each architecture's inputs file matches the
+   checkout. It then writes the six pins to `scripts/checksums.sha256` by
+   atomic replacement. Merge that commit. `--check` wants all six, on any
+   host.
 
 `fetch.sh` falls back to upstream assets only when their release pins are
 absent. A malformed or duplicate pin fails instead; `fetch.sh` and

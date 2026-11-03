@@ -26,10 +26,17 @@ class Pins(unittest.TestCase):
             (self.root / name / 'Cargo.toml').write_text('version = "0.2.1"\n')
         self.checksums = self.root / 'scripts/checksums.sha256'
         self.checksums.write_text('')
-        self.env = dict(os.environ, ARTIFACTS_TAG='v0.2.1', FC_VERSION='v1.17.0', CI_VERSION='v1.15', KERNEL='vmlinux-6.1.155')
+        # x86_64 unless a test says otherwise, whatever this host is.
+        self.env = dict(os.environ, ARTIFACTS_TAG='v0.2.1', FC_VERSION='v1.17.0', CI_VERSION='v1.15', KERNEL='vmlinux-6.1.155',
+                        ARCH='x86_64')
         self.url = 'https://github.com/numerataz/flexvm/releases/download/v0.2.1'
-        self.kernel = 'https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/x86_64/vmlinux-6.1.155'
+        self.kernels = {arch: f'https://s3.amazonaws.com/spec.ccfc.min/firecracker-ci/v1.15/{arch}/vmlinux-6.1.155'
+                        for arch in ('x86_64', 'aarch64')}
+        self.kernel = self.kernels['x86_64']
         self.digest = 'a' * 64
+        # Each architecture's assets in a release: x86_64's keep their names.
+        self.assets = {'x86_64': ('firecracker', 'vmlinux', 'inputs.txt'),
+                       'aarch64': ('firecracker-aarch64', 'vmlinux-aarch64', 'inputs-aarch64.txt')}
 
     def run_script(self, name, *args):
         return subprocess.run(['bash', str(self.root / 'scripts' / name), *args], env=self.env, text=True, capture_output=True)
@@ -57,15 +64,33 @@ class Pins(unittest.TestCase):
         self.assertEqual(self.pinned().returncode, 1)
 
     def test_fetch_fallback(self):
+        for arch, (firecracker, vmlinux, _) in self.assets.items():
+            with self.subTest(arch=arch):
+                self.env['ARCH'] = arch
+                self.checksums.write_text('')
+                result = self.run_script('fetch.sh', '--urls')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'firecracker-v1.17.0-{arch}.tgz', result.stdout)
+                self.assertIn(self.kernels[arch], result.stdout)
+                self.assertIn(f'/v1.15/{arch}/ubuntu-24.04.squashfs', result.stdout)
+                # Another architecture's pins are not this one's.
+                other = next(a for a in self.assets if a != arch)
+                self.checksums.write_text(''.join(f'{self.digest} {self.url}/{asset}\n' for asset in self.assets[other][:2]))
+                result = self.run_script('fetch.sh', '--urls')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'firecracker-v1.17.0-{arch}.tgz', result.stdout)
+                self.checksums.write_text(''.join(f'{self.digest} {self.url}/{asset}\n' for asset in (firecracker, vmlinux)))
+                result = self.run_script('fetch.sh', '--urls')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f'firecracker {self.url}/{firecracker}\n', result.stdout)
+                self.assertIn(f'vmlinux {self.url}/{vmlinux}\n', result.stdout)
+
+    def test_unknown_arch(self):
+        self.env['ARCH'] = 'arm64'
         result = self.run_script('fetch.sh', '--urls')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('firecracker-v1.17.0-x86_64.tgz', result.stdout)
-        self.assertIn(self.kernel, result.stdout)
-        self.checksums.write_text(''.join(f'{self.digest} {self.url}/{asset}\n' for asset in ('firecracker', 'vmlinux')))
-        result = self.run_script('fetch.sh', '--urls')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(f'firecracker {self.url}/firecracker\n', result.stdout)
-        self.assertIn(f'vmlinux {self.url}/vmlinux\n', result.stdout)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('ARCH must be one of x86_64 aarch64', result.stderr)
+        self.assertEqual(result.stdout, '')
 
     def test_malformed_release_never_falls_back(self):
         for asset in ('firecracker', 'vmlinux'):
@@ -85,33 +110,60 @@ class Pins(unittest.TestCase):
         self.assertIn('Malformed SHA256', result.stderr)
 
     def test_check_pins(self):
-        upstream = f'{self.digest} {self.kernel}\n'
+        upstream = ''.join(f'{"b" * 64 if arch == "aarch64" else self.digest} {kernel}\n' for arch, kernel in self.kernels.items())
         self.checksums.write_text(upstream)
-        result = self.run_script('pin-artifacts.sh', '--inputs')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        digest = hashlib.sha256(result.stdout.encode()).hexdigest()
-        pins = f'{self.digest} {self.url}/firecracker\n{self.digest} {self.url}/vmlinux\n{digest} {self.url}/inputs.txt\n'
-        self.checksums.write_text(upstream + pins)
-        result = self.run_script('pin-artifacts.sh', '--check')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        for asset in ('firecracker', 'vmlinux', 'inputs.txt'):
-            self.checksums.write_text(upstream + pins + f'{self.url}/{asset}\n')
-            result = self.run_script('pin-artifacts.sh', '--check')
-            self.assertEqual(result.returncode, 1)
-            self.assertIn('Malformed SHA256', result.stderr)
+        pins = {}
+        for arch, (firecracker, vmlinux, inputs) in self.assets.items():
+            self.env['ARCH'] = arch
+            result = self.run_script('pin-artifacts.sh', '--inputs')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(result.stdout.startswith(f'firecracker v1.17.0 {arch}\n'), result.stdout)
+            self.assertIn(f'vmlinux {"b" * 64 if arch == "aarch64" else self.digest} vmlinux-6.1.155\n', result.stdout)
+            digest = hashlib.sha256(result.stdout.encode()).hexdigest()
+            pins[arch] = f'{self.digest} {self.url}/{firecracker}\n{self.digest} {self.url}/{vmlinux}\n{digest} {self.url}/{inputs}\n'
+        everything = upstream + pins['x86_64'] + pins['aarch64']
+        # The same answer on either host.
+        for arch in self.assets:
+            with self.subTest(arch=arch):
+                self.env['ARCH'] = arch
+                self.checksums.write_text(everything)
+                result = self.run_script('pin-artifacts.sh', '--check')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                # A release pinned for one architecture only is broken.
+                self.checksums.write_text(upstream + pins['x86_64'])
+                result = self.run_script('pin-artifacts.sh', '--check')
+                self.assertEqual(result.returncode, 1)
+                self.assertIn('pins only some', result.stderr)
+                # Each architecture's inputs are its own.
+                swapped = everything.replace(pins['aarch64'].split()[-2], pins['x86_64'].split()[-2])
+                self.checksums.write_text(swapped)
+                result = self.run_script('pin-artifacts.sh', '--check')
+                self.assertEqual(result.returncode, 1)
+                self.assertIn('built (aarch64) from other inputs', result.stderr)
+                for asset in self.assets['x86_64'] + self.assets['aarch64']:
+                    self.checksums.write_text(everything + f'{self.url}/{asset}\n')
+                    result = self.run_script('pin-artifacts.sh', '--check')
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn('Malformed SHA256', result.stderr)
 
     def test_atomic_pins(self):
         assets = self.root / 'assets'
         assets.mkdir()
-        (assets / 'firecracker').write_text('not executable')
-        (assets / 'vmlinux').write_text('kernel')
-        kernel = hashlib.sha256(b'kernel').hexdigest()
-        original = f'{kernel} {self.kernel}\n{self.digest} https://unrelated\n'
+        original = ''
+        for arch, (firecracker, vmlinux, _) in self.assets.items():
+            (assets / firecracker).write_text(f'not executable {arch}')
+            (assets / vmlinux).write_text(f'kernel {arch}')
+            original += f'{hashlib.sha256(f"kernel {arch}".encode()).hexdigest()} {self.kernels[arch]}\n'
+        original += f'{self.digest} https://unrelated\n'
         self.checksums.write_text(original)
         self.checksums.chmod(0o644)
-        inputs = self.run_script('pin-artifacts.sh', '--inputs')
-        self.assertEqual(inputs.returncode, 0, inputs.stderr)
-        (assets / 'inputs.txt').write_text(inputs.stdout)
+        for arch, (_, _, inputs_name) in self.assets.items():
+            # Run on any host, for each architecture.
+            self.env['ARCH'] = arch
+            inputs = self.run_script('pin-artifacts.sh', '--inputs')
+            self.assertEqual(inputs.returncode, 0, inputs.stderr)
+            (assets / inputs_name).write_text(inputs.stdout)
+        self.env['ARCH'] = 'x86_64'
         commands = self.root / 'bin'
         commands.mkdir()
         self.env.update(PATH=f'{commands}:{os.environ["PATH"]}', TEST_ASSETS=str(assets))
@@ -135,9 +187,16 @@ class Pins(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(self.checksums.read_text().startswith(original))
         self.assertEqual(self.checksums.stat().st_mode & 0o777, 0o644)
-        for asset in ('firecracker', 'vmlinux', 'inputs.txt'):
+        for asset in self.assets['x86_64'] + self.assets['aarch64']:
             digest = hashlib.sha256((assets / asset).read_bytes()).hexdigest()
             self.assertIn(f'{digest} {self.url}/{asset}\n', self.checksums.read_text())
+        # A release whose aarch64 kernel is not the pinned upstream one is never pinned.
+        (assets / 'vmlinux-aarch64').write_text('another kernel')
+        self.checksums.write_text(original)
+        result = self.run_script('pin-artifacts.sh')
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('vmlinux-aarch64 is not the pinned', result.stderr)
+        self.assertEqual(self.checksums.read_text(), original)
 
 
 if __name__ == '__main__':
