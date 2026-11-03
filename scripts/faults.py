@@ -4958,11 +4958,11 @@ def held_restore_frozen():
     n, path = "ft-held", ckpt_path("ft-held")
     m = setup(n)
     busy_guest(A, n)
-    # Its flood is sending before the checkpoint, so one that is not after the resume stopped across it.
+    time.sleep(0.5)
+    # Its flood is still sending just before the checkpoint, so one that is not after the resume stopped across it.
     before = tap_frames(A, n)[0]
     flooding = wait_for(lambda: tap_frames(A, n)[0] > before + 10, 10)
     check("held: guest network sending before the checkpoint", flooding, (before, tap_frames(A, n)) + (() if flooding else (flood_state(A, n),)))
-    time.sleep(0.5)
     old_ip = vms(A)[n]["ip"]
     ok(checkpoint(A, n, path, stop=True))
     wait_for(lambda: n not in vms(A), 10)
