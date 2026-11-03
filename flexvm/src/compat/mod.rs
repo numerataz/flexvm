@@ -44,6 +44,9 @@ impl std::fmt::Display for Arch {
 }
 
 impl Arch {
+    /// This build's, which is the host's.
+    pub const HOST: Arch = if cfg!(target_arch = "aarch64") { Arch::Aarch64 } else { Arch::X86_64 };
+
     /// A record's `arch`; one without is from before aarch64, so x86_64.
     fn of(record: &Map<String, Value>) -> std::result::Result<Self, serde_json::Error> {
         record.get("arch").map_or(Ok(Arch::X86_64), Arch::deserialize)

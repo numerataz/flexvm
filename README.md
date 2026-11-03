@@ -1058,7 +1058,7 @@ and `--memory` cap a VM below them):
 |---|---|---|
 | `--vcpus N` | host CPUs, at most 32, rounded down to even | vCPUs (Firecracker cannot add vCPUs to a running VM) |
 | `--max MIB` | host RAM, at most what fits the window | memory ceiling: boot memory plus the hot-plug region, in whole 1 GiB slots; the region and the root filesystem share Firecracker's 512 GiB window, so a larger `--max` is refused |
-| `--mem MIB` | 256 + max/32, rounded up to 128 | boot memory, which holds kernel memory for the whole ceiling |
+| `--mem MIB` | 256 + max/32, rounded up to 128 | boot memory, which holds kernel memory for the whole ceiling; at most 255 GiB on x86_64 and 254 GiB on aarch64, what fits below Firecracker's 64-bit MMIO gap |
 | `--plug MIB` | 4096 | plugged in the snapshot (free until touched); a VM never shrinks below it |
 
 Overrides follow `docker run`: `--entrypoint`, `--cmd`, `--env K[=V]`
