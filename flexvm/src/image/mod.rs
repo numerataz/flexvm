@@ -34,6 +34,13 @@ pub use unpack::Hashed;
 pub use unpack::Limits;
 use unpack::{check, open_at, Root};
 
+/// The host's OCI architecture name: guests run the host's arch, so images must be built for it.
+pub const HOST_ARCH: &str = match std::env::consts::ARCH.as_bytes() {
+    b"x86_64" => "amd64",
+    b"aarch64" => "arm64",
+    _ => std::env::consts::ARCH,
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageMeta {
     pub source: String,
@@ -160,9 +167,9 @@ pub fn prepare(cache: &Path, init: Option<&Path>, o: &Options) -> Result<(PathBu
     let _cache_lock = crate::host::lock_at(crate::host::host_locks()?, &key, libc::LOCK_SH)?;
     let img = source::resolve(cache, &o.image, &o.limits)?;
     let config: Value = serde_json::from_slice(&img.config)?;
-    let (os, arch) = (config["os"].as_str().unwrap_or("linux"), config["architecture"].as_str().unwrap_or("amd64"));
-    if os != "linux" || arch != "amd64" {
-        bail!("image is {os}/{arch}; only linux/amd64 is supported");
+    let (os, arch) = (config["os"].as_str().unwrap_or("linux"), config["architecture"].as_str().unwrap_or(HOST_ARCH));
+    if os != "linux" || arch != HOST_ARCH {
+        bail!("image is {os}/{arch}; only linux/{HOST_ARCH} runs on this host");
     }
     let app = app_config(&config, o)?;
     if o.warm && app.argv.is_empty() {
@@ -2093,7 +2100,7 @@ mod tests {
     }
 
     fn config(layer: &[u8]) -> String {
-        json!({"architecture": "amd64", "os": "linux", "config": {"Cmd": ["/x"]}, "rootfs": {"type": "layers", "diff_ids": [sha256_hex(layer)]}}).to_string()
+        json!({"architecture": HOST_ARCH, "os": "linux", "config": {"Cmd": ["/x"]}, "rootfs": {"type": "layers", "diff_ids": [sha256_hex(layer)]}}).to_string()
     }
 
     fn fetch(src: &Path, limits: &Limits) -> Result<source::Image> {

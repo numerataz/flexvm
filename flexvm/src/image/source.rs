@@ -266,7 +266,34 @@ fn descriptors(manifest: &Value, limits: &Limits) -> Result<Vec<(String, u64)>> 
     Ok(out)
 }
 
-fn resolve_index(mut v: Value, mut digest: String, mut get: impl FnMut(&str) -> Result<Value>) -> Result<(Value, String)> {
+/// The rank of an index entry's platform on an `arch` host (an OCI architecture name), lowest first,
+/// or `None` if it can't run there. amd64 takes the baseline, then v1, then v2: a v3 or v4 build may
+/// need instructions (AVX2, AVX-512) this CPU lacks. arm64 takes no variant, then v8 (the same
+/// ARMv8-A baseline); v9 and the v8.x/v9.x revisions may need instructions (SVE2, LSE, ...) it lacks.
+fn platform_rank(arch: &str, os: Option<&str>, architecture: Option<&str>, variant: Option<&str>) -> Option<u8> {
+    if os != Some("linux") || architecture != Some(arch) {
+        return None;
+    }
+    match (arch, variant) {
+        (_, None) => Some(0),
+        ("amd64", Some("v1")) | ("arm64", Some("v8")) => Some(1),
+        ("amd64", Some("v2")) => Some(2),
+        _ => None,
+    }
+}
+
+/// The images `platform_rank` takes on an `arch` host, for errors.
+fn accepted(arch: &str) -> String {
+    match arch {
+        "amd64" => "linux/amd64 image (baseline, v1 or v2)".into(),
+        "arm64" => "linux/arm64 image (baseline or v8)".into(),
+        _ => format!("linux/{arch} image"),
+    }
+}
+
+/// Follows `v` down to an image manifest, taking the best entry for an `arch` host (`platform_rank`)
+/// from each index.
+fn resolve_index(arch: &str, mut v: Value, mut digest: String, mut get: impl FnMut(&str) -> Result<Value>) -> Result<(Value, String)> {
     let mut depth = 0;
     while let Some(manifests) = v["manifests"].as_array() {
         depth += 1;
@@ -276,14 +303,11 @@ fn resolve_index(mut v: Value, mut digest: String, mut get: impl FnMut(&str) -> 
         fn plat(m: &Value) -> (Option<&str>, Option<&str>, Option<&str>) {
             (m["platform"]["os"].as_str(), m["platform"]["architecture"].as_str(), m["platform"]["variant"].as_str().filter(|v| !v.is_empty()))
         }
-        // The baseline first: a v3 or v4 build may need instructions (AVX2, AVX-512) this CPU lacks.
         let found = manifests
             .iter()
-            .filter_map(|m| match plat(m) {
-                (Some("linux"), Some("amd64"), None) => Some((0, m)),
-                (Some("linux"), Some("amd64"), Some("v1")) => Some((1, m)),
-                (Some("linux"), Some("amd64"), Some("v2")) => Some((2, m)),
-                _ => None,
+            .filter_map(|m| {
+                let (os, a, variant) = plat(m);
+                platform_rank(arch, os, a, variant).map(|rank| (rank, m))
             })
             .min_by_key(|(rank, _)| *rank)
             .map(|(_, m)| m)
@@ -291,7 +315,7 @@ fn resolve_index(mut v: Value, mut digest: String, mut get: impl FnMut(&str) -> 
             .or_else(|| manifests.iter().find(|m| m["platform"].is_null()));
         let Some(m) = found else {
             let have: Vec<String> = manifests.iter().map(|m| format!("{:?}", plat(m))).collect();
-            bail!("no linux/amd64 image (baseline, v1 or v2) in the index (has {})", have.join(", "))
+            bail!("no {} in the index (has {})", accepted(arch), have.join(", "))
         };
         digest = m["digest"].as_str().ok_or("index entry without digest")?.to_string();
         blob_path(Path::new(""), &digest)?;
@@ -306,7 +330,7 @@ fn pull(cache: &Path, reg: Registry, limits: &Limits) -> Result<Image> {
     let private = super::private_blobs(&blobs)?;
     super::registry::sweep_parts(&blobs.join("sha256"));
     let (manifest, digest) = reg.manifest(&reg.r.reference.clone())?;
-    let (manifest, digest) = resolve_index(manifest, digest, |d| Ok(reg.manifest(d)?.0))?;
+    let (manifest, digest) = resolve_index(super::HOST_ARCH, manifest, digest, |d| Ok(reg.manifest(d)?.0))?;
     crate::log!("image: {} -> {digest}", reg.r);
     let descs = descriptors(&manifest, limits)?;
     let config_digest = manifest["config"]["digest"].as_str().ok_or("manifest has no config")?.to_string();
@@ -440,7 +464,7 @@ fn from_files(blob: &dyn Fn(&str) -> Result<Blob>, limits: &Limits) -> Result<Im
     if blob("index.json").is_ok() {
         // OCI image layout (also what `docker save` writes since Docker 25).
         let index = serde_json::from_slice(&read("index.json")?)?;
-        let (v, digest) = resolve_index(index, String::new(), |d| Ok(serde_json::from_slice(&read_blob(d)?)?))?;
+        let (v, digest) = resolve_index(super::HOST_ARCH, index, String::new(), |d| Ok(serde_json::from_slice(&read_blob(d)?)?))?;
         let config_digest = v["config"]["digest"].as_str().ok_or("manifest has no config")?.to_string();
         let descs = descriptors(&v, limits)?;
         let config = read_blob(&config_digest)?;
@@ -478,30 +502,56 @@ mod tests {
     #[test]
     fn platform_selection_prefers_baseline_and_rejects_newer_isa() {
         let digest = sha256_hex(b"baseline");
-        let baseline = |v: &Option<&str>| matches!(v, None | Some("v1" | "v2"));
-        for variants in [vec![Some("v3"), None, Some("v1")], vec![Some("v4"), Some("v1")], vec![Some("v3"), Some("v2")], vec![Some("v3"), Some("v4")]] {
-            let manifests: Vec<_> = variants
-                .iter()
-                .map(|v| serde_json::json!({"digest": if baseline(v) {digest.clone()} else {sha256_hex(b"unsupported")}, "platform": {"os": "linux", "architecture": "amd64", "variant": v}}))
-                .collect();
-            let result = resolve_index(serde_json::json!({"manifests": manifests}), String::new(), |d| {
-                assert_eq!(d, digest);
-                Ok(serde_json::json!({"layers": []}))
-            });
-            assert_eq!(result.is_ok(), variants.iter().any(baseline), "{variants:?}");
+        // Both hosts' rules, whichever arch runs the test: the variants each takes, best first, and
+        // ones it never picks.
+        type Variants<'a> = &'a [Option<&'a str>];
+        let hosts: [(&str, Variants, Variants); 2] = [
+            ("amd64", &[None, Some("v1"), Some("v2")], &[Some("v3"), Some("v4")]),
+            ("arm64", &[None, Some("v8")], &[Some("v9"), Some("v8.2"), Some("v9.1"), Some("v7")]),
+        ];
+        for (arch, good, bad) in hosts {
+            let baseline = |v: &Option<&str>| good.contains(v);
+            let mut cases = vec![bad.to_vec()];
+            cases.extend(good.iter().map(|g| [&bad[..1], &[*g], &bad[1..]].concat()));
+            for variants in cases {
+                let manifests: Vec<_> = variants
+                    .iter()
+                    .map(|v| serde_json::json!({"digest": if baseline(v) {digest.clone()} else {sha256_hex(b"unsupported")}, "platform": {"os": "linux", "architecture": arch, "variant": v}}))
+                    .collect();
+                let result = resolve_index(arch, serde_json::json!({"manifests": manifests}), String::new(), |d| {
+                    assert_eq!(d, digest);
+                    Ok(serde_json::json!({"layers": []}))
+                });
+                assert_eq!(result.is_ok(), variants.iter().any(baseline), "{arch} {variants:?}");
+            }
+            // Lower variants win in either order; the other arch's entry, listed first with no variant,
+            // is never picked.
+            let other = if arch == "amd64" { "arm64" } else { "amd64" };
+            for best_last in [false, true] {
+                let mut ours: Vec<_> = good
+                    .iter()
+                    .map(|v| {
+                        let d = if v == &good[0] { digest.clone() } else { sha256_hex(v.unwrap().as_bytes()) };
+                        serde_json::json!({"digest": d, "platform": {"os": "linux", "architecture": arch, "variant": v}})
+                    })
+                    .collect();
+                if best_last {
+                    ours.reverse();
+                }
+                // Without the baseline, the next variant wins.
+                let mut next = ours.clone();
+                next.retain(|m| m["digest"] != digest.as_str());
+                let next_digest = sha256_hex(good[1].unwrap().as_bytes());
+                for (mut entries, want) in [(ours, &digest), (next, &next_digest)] {
+                    entries.insert(0, serde_json::json!({"digest": sha256_hex(b"other"), "platform": {"os": "linux", "architecture": other}}));
+                    let index = serde_json::json!({"manifests": entries});
+                    assert_eq!(&resolve_index(arch, index, String::new(), |_| Ok(serde_json::json!({}))).unwrap().1, want, "{arch}");
+                }
+            }
+            let index = serde_json::json!({"manifests": [{"digest": digest, "platform": {"os": "linux", "architecture": other}}]});
+            let err = resolve_index(arch, index, String::new(), |_| panic!("{other} must not be fetched")).unwrap_err().to_string();
+            assert!(err.contains(&format!("no linux/{arch} image")), "{err}");
         }
-        // Lower variants win; an arm64 entry listed first is never picked.
-        let index = serde_json::json!({"manifests": [
-            {"digest": sha256_hex(b"arm"), "platform": {"os": "linux", "architecture": "arm64"}},
-            {"digest": sha256_hex(b"v2"), "platform": {"os": "linux", "architecture": "amd64", "variant": "v2"}},
-            {"digest": digest, "platform": {"os": "linux", "architecture": "amd64", "variant": "v1"}}
-        ]});
-        assert_eq!(resolve_index(index, String::new(), |_| Ok(serde_json::json!({}))).unwrap().1, digest);
-        let index = serde_json::json!({"manifests": [
-            {"digest": sha256_hex(b"v1"), "platform": {"os": "linux", "architecture": "amd64", "variant": "v1"}},
-            {"digest": digest, "platform": {"os": "linux", "architecture": "amd64"}}
-        ]});
-        assert_eq!(resolve_index(index, String::new(), |_| Ok(serde_json::json!({}))).unwrap().1, digest);
     }
 
     #[test]
@@ -533,18 +583,18 @@ mod tests {
     fn index_children_must_be_sha256_digests() {
         for digest in ["latest", "sha512:abcd", "sha256:abcd", "sha256:../../manifest"] {
             let index = serde_json::json!({"manifests": [{"digest": digest, "platform": {"os": "linux", "architecture": "amd64"}}]});
-            assert!(resolve_index(index, String::new(), |_| panic!("invalid digest must not be fetched")).is_err());
+            assert!(resolve_index("amd64", index, String::new(), |_| panic!("invalid digest must not be fetched")).is_err());
         }
         let digest = sha256_hex(b"manifest");
         let index = serde_json::json!({"manifests": [{"digest": digest}]});
-        let (_, resolved) = resolve_index(index, String::new(), |d| {
+        let (_, resolved) = resolve_index("amd64", index, String::new(), |d| {
             assert_eq!(d, digest);
             Ok(serde_json::json!({"layers": []}))
         })
         .unwrap();
         assert_eq!(resolved, digest);
         let nested = serde_json::json!({"manifests": [{"digest": digest}]});
-        assert!(resolve_index(nested, String::new(), |_| Ok(serde_json::json!({"manifests": [{"digest": "latest"}]}))).is_err());
+        assert!(resolve_index("amd64", nested, String::new(), |_| Ok(serde_json::json!({"manifests": [{"digest": "latest"}]}))).is_err());
     }
 
     #[test]

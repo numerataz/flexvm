@@ -45,7 +45,7 @@ pub async fn version(api: &Arc<Api>) -> Reply {
         "Platform": {"Name": "flexvm"},
         "Components": [
             {"Name": "Engine", "Version": env!("CARGO_PKG_VERSION"), "Details": {
-                "ApiVersion": API_VERSION, "MinAPIVersion": MIN_API_VERSION, "GitCommit": env!("FLEXVM_GIT_COMMIT"), "Os": "linux", "Arch": "amd64",
+                "ApiVersion": API_VERSION, "MinAPIVersion": MIN_API_VERSION, "GitCommit": env!("FLEXVM_GIT_COMMIT"), "Os": "linux", "Arch": crate::image::HOST_ARCH,
                 "KernelVersion": kernel, "Experimental": "false"}},
             {"Name": "firecracker", "Version": option_env!("FLEXVM_PIN_FIRECRACKER").unwrap_or("unpinned"), "Details": {"Path": fc}},
             {"Name": "guest kernel", "Version": option_env!("FLEXVM_PIN_VMLINUX").unwrap_or("unpinned"), "Details": {"Path": vmlinux}},
@@ -56,7 +56,7 @@ pub async fn version(api: &Arc<Api>) -> Reply {
         "GitCommit": env!("FLEXVM_GIT_COMMIT"),
         "GoVersion": "",
         "Os": "linux",
-        "Arch": "amd64",
+        "Arch": crate::image::HOST_ARCH,
         "KernelVersion": kernel,
     }))
 }
