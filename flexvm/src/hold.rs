@@ -920,7 +920,8 @@ fn from_tap(f: &[u8], room: usize) -> Option<std::result::Result<Vec<Vec<u8>>, u
     // `h` as for one packet: what each segment must pass, and the whole frame first.
     let one = [&[h[0], 0][..], &h[2..]].concat();
     match (v6, h[1] & 0x7f) {
-        (_, 0) => return (h[1] == 0 && accept(h, 14, &mut p)).then(|| if p.len() <= room { Ok(vec![p]) } else { Err(1) }),
+        // An IPv6 packet may be 40 bytes longer than an IPv4 one: never more than a frame (`valid`).
+        (_, 0) => return (h[1] == 0 && (!v6 || p.len() <= MAX_FRAME) && accept(h, 14, &mut p)).then(|| if p.len() <= room { Ok(vec![p]) } else { Err(1) }),
         // TCPv4 (0x80: ECN), its checksum left to the device: only in TCP's own field.
         (false, 1) if p.get(9) == Some(&6) && h[0] & 1 != 0 && accept(&one, 14, &mut p.clone()) => {}
         // TCPv6, right after the fixed header (`accept6`), likewise.
@@ -931,6 +932,10 @@ fn from_tap(f: &[u8], room: usize) -> Option<std::result::Result<Vec<Vec<u8>>, u
     let thl = usize::from(*p.get(ihl + 12)? >> 4) * 4;
     let (head, body) = p.split_at_checked(ihl + thl)?;
     if mss < MIN_MSS || thl < 20 || body.is_empty() {
+        return None;
+    }
+    // Nor a segment of more than a frame (whose length would not fit its own fields).
+    if v6 && head.len() + mss.min(body.len()) > MAX_FRAME {
         return None;
     }
     let (id, seq, n) = (u16::from_be_bytes([p[4], p[5]]), u32::from_be_bytes(p[ihl + 4..ihl + 8].try_into().ok()?), body.len().div_ceil(mss));
@@ -1288,11 +1293,12 @@ pub fn receive(
     replied
 }
 
-/// A whole IPv4 packet for `addr`'s IPv4 address, or a whole IPv6 one for its IPv6 address that
-/// `upper6` takes: all a guest is ever handed.
+/// A whole IPv4 packet for `addr`'s IPv4 address, or a whole IPv6 one of at most `MAX_FRAME` for
+/// its IPv6 address that `upper6` takes: all a guest is ever handed.
 pub fn valid(p: &[u8], addr: crate::net::VmAddr) -> bool {
     if p.first().is_some_and(|b| b >> 4 == 6) {
-        return addr.v6.is_some_and(|v6| upper6(p).is_some() && p[24..40] == v6.octets());
+        // At most a frame, as an IPv4 packet is by its own length: a longer one would break the stream.
+        return addr.v6.is_some_and(|v6| p.len() <= MAX_FRAME && upper6(p).is_some() && p[24..40] == v6.octets());
     }
     let ip = addr.v4;
     let ihl = (p.first().copied().unwrap_or(0) & 15) as usize * 4;
@@ -2113,6 +2119,12 @@ mod tests {
         assert!(!valid(&p, crate::net::VmAddr { v4, v6: Some("fd00:8::a09:8".parse().unwrap()) }), "another's");
         assert!(!valid(&p[..48], both) && !valid(&[&p[..], &[0]].concat(), both), "not its payload length");
         assert!(!valid(&p[..39], both), "truncated");
+        let mut big = [&p[..], &vec![0; MAX_FRAME - p.len()]].concat();
+        big[4..6].copy_from_slice(&((MAX_FRAME - 40) as u16).to_be_bytes());
+        assert!(valid(&big, both), "a frame's worth");
+        big.push(0);
+        big[4..6].copy_from_slice(&((MAX_FRAME - 39) as u16).to_be_bytes());
+        assert!(!valid(&big, both) && cut(&tap_frame6(&big, 0, 0, (0, 0), 0)).is_none(), "more than a frame");
         for (next, ok) in [(6, true), (17, true), (0, false), (43, false), (44, false), (60, false), (50, false), (59, false)] {
             let mut q = p.clone();
             q[6] = next;
@@ -2203,6 +2215,12 @@ mod tests {
         tiny[4..6].copy_from_slice(&(MIN_MSS as u16 - 1).to_le_bytes());
         assert_eq!(cut(&tiny), None, "under MIN_MSS");
         assert_eq!(from_tap(&tso((14 + 40, 16)), 1000), Some(Err(3)), "over the room left: counted, not made");
+        // A jumbo segment (a payload of 65,500 with a gso_size of 65,535) would be more than a frame.
+        let big = vec![7u8; 65500];
+        let jumbo = |mss: u16| tso6_frame(&big, mss, (14 + 40, 16));
+        assert_eq!(cut(&jumbo(65535)), None, "more than a frame");
+        let segs = cut(&jumbo(65535 - 60)).unwrap();
+        assert!(segs.len() == 2 && segs[0].len() == MAX_FRAME && segs.iter().all(|s| valid(s, both) && sum6(s) == 0xffff));
     }
 
     /// An IPv6 straggler to a let-go /128 that moved on is re-sent by `resend6`, to its own
