@@ -1232,10 +1232,25 @@ fn enable_proxy_arp(on: &mut ProxyArp, what: &str, dev: &str, index: Result<u32>
 /// nsfs file, one inode for every process in it (hosts sharing one included). So an entry added
 /// while its VM's address is served here (`proxy_add`) is never removed by a sweep that read the
 /// routes before it was (`proxy_sweep`), nor added after a removal that saw the VM go.
+/// Waited for `PROXY_LOCK_WAIT` at most: a holder stopped (SIGSTOP) holds up no sweep, route
+/// switch or kill for longer; each caller logs the failure, and a sweep or tick tries again.
 fn proxy_lock() -> Result<crate::host::Flock> {
-    let ns = std::fs::File::open("/proc/thread-self/ns/net").map_err(|e| format!("the network namespace: {e}"))?;
-    Ok(crate::host::Flock::new(ns, libc::LOCK_EX).map_err(|e| format!("locking the network namespace's proxy entries: {e}"))?)
+    let until = std::time::Instant::now() + PROXY_LOCK_WAIT;
+    loop {
+        let ns = std::fs::File::open("/proc/thread-self/ns/net").map_err(|e| format!("the network namespace: {e}"))?;
+        match crate::host::Flock::new(ns, libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(lock) => return Ok(lock),
+            Err(e) if e.raw_os_error() != Some(libc::EWOULDBLOCK) => bail!("locking the network namespace's proxy entries: {e}"),
+            Err(_) if std::time::Instant::now() >= until => {
+                bail!("the network namespace's proxy entries stayed locked for {} s; not changed", PROXY_LOCK_WAIT.as_secs())
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+        }
+    }
 }
+
+/// How long `proxy_lock` waits for another process's add, removal or sweep (each a few netlink requests).
+const PROXY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The proxy entry of VM address `ip` on announce device `dev`, with proxy NDP on there: the
 /// kernel answers neighbour solicitations for `ip` from the LAN (`ip -6 neigh add proxy`). Only
@@ -1259,15 +1274,34 @@ pub fn proxy_remove(ip: Ipv6Addr) -> Result<()> {
     Ok(())
 }
 
+/// `proxy_remove`, unless a device here other than those in `not` (the VM's own tap, the announce
+/// device) is routed to `ip` (`dev_routes6`): a host sharing this network namespace that runs it
+/// now (the target of a migration whose source ends without knowing its outcome), whose entry the
+/// same one is. Without `prefix` (unset since), removed.
+pub fn proxy_release(ip: Ipv6Addr, prefix: Option<Ipv6Prefix>, not: &[&str]) -> Result<()> {
+    let _lock = proxy_lock()?;
+    if prefix.map(|p| routes6().map(|t| dev_routes6(&t, p, not).contains(&ip))).transpose()? == Some(true) {
+        return Ok(());
+    }
+    for (index, _) in proxy_entries()?.into_iter().filter(|&(_, at)| at == ip) {
+        unproxy(index, ip)?;
+    }
+    Ok(())
+}
+
+/// This thread's IPv6 routes, as the kernel lists them: its namespace's, the one its netlink
+/// requests go to (`/proc/net` is the process's).
+fn routes6() -> Result<String> {
+    Ok(std::fs::read_to_string("/proc/thread-self/net/ipv6_route").map_err(|e| format!("/proc/net/ipv6_route: {e}"))?)
+}
+
 /// Removes the proxy entries in `prefix` (VMs' addresses) whose address no device here is routed
 /// to: those a VM process gone without removing its own left (killed). A device route is the /128
 /// of a tap or the hold device (`route_dev`); one via a peer (`route_via6`) is not, nor are
 /// `announce`'s, the LAN's. Returns the addresses removed.
 pub fn proxy_sweep(prefix: Ipv6Prefix, announce: Option<&str>) -> Result<Vec<Ipv6Addr>> {
     let _lock = proxy_lock()?;
-    // This thread's namespace, the one its netlink requests go to (`/proc/net` is the process's).
-    let table = std::fs::read_to_string("/proc/thread-self/net/ipv6_route").map_err(|e| format!("/proc/net/ipv6_route: {e}"))?;
-    let served = dev_routes6(&table, prefix, announce);
+    let served = dev_routes6(&routes6()?, prefix, announce.as_slice());
     let mut removed = Vec::new();
     for (index, ip) in proxy_entries()?.into_iter().filter(|&(_, ip)| prefix.ipv4_of(ip).is_some() && !served.contains(&ip)) {
         unproxy(index, ip)?;
@@ -1374,8 +1408,8 @@ fn dump_part(buf: &[u8], each: &mut impl FnMut(&[u8])) -> Result<bool> {
 
 /// The addresses in `prefix` with a device route in `table` (`/proc/net/ipv6_route`): a /128 that
 /// is up, with no next hop, not a reject route (an unreachable one is loopback's), on a device
-/// other than loopback or `announce`.
-fn dev_routes6(table: &str, prefix: Ipv6Prefix, announce: Option<&str>) -> std::collections::BTreeSet<Ipv6Addr> {
+/// other than loopback or those in `not` (the announce device's routes are the LAN's).
+fn dev_routes6(table: &str, prefix: Ipv6Prefix, not: &[&str]) -> std::collections::BTreeSet<Ipv6Addr> {
     const RTF_UP: u32 = 0x1;
     const RTF_GATEWAY: u32 = 0x2;
     const RTF_REJECT: u32 = 0x200;
@@ -1386,7 +1420,7 @@ fn dev_routes6(table: &str, prefix: Ipv6Prefix, announce: Option<&str>) -> std::
             (u128::from_str_radix(f.first()?, 16).ok()?, u128::from_str_radix(f.get(4)?, 16).ok()?, u32::from_str_radix(f.get(8)?, 16).ok()?);
         let (ip, dev) = (Ipv6Addr::from(dst), *f.get(9)?);
         let on_dev = *f.get(1)? == "80" && hop == 0 && flags & RTF_UP != 0 && flags & (RTF_GATEWAY | RTF_REJECT) == 0;
-        (on_dev && prefix.ipv4_of(ip).is_some() && dev != "lo" && Some(dev) != announce).then_some(ip)
+        (on_dev && prefix.ipv4_of(ip).is_some() && dev != "lo" && !not.contains(&dev)).then_some(ip)
     };
     table.lines().filter_map(route).collect()
 }
@@ -2351,9 +2385,11 @@ mod tests {
         ]
         .concat();
         let want: std::collections::BTreeSet<_> = [six("fd00:7::a09"), six("fd00:7::a0a")].into();
-        assert_eq!(dev_routes6(&table, prefix, Some("eth0")), want);
+        assert_eq!(dev_routes6(&table, prefix, &["eth0"]), want);
         let with_eth0: std::collections::BTreeSet<_> = [six("fd00:7::a09"), six("fd00:7::a0a"), six("fd00:7::a0f")].into();
-        assert_eq!(dev_routes6(&table, prefix, None), with_eth0, "no announce device: one there is a device route too");
+        assert_eq!(dev_routes6(&table, prefix, &[]), with_eth0, "no announce device: one there is a device route too");
+        let without_tap: std::collections::BTreeSet<_> = [six("fd00:7::a0a")].into();
+        assert_eq!(dev_routes6(&table, prefix, &["eth0", "fx0t1"]), without_tap, "a VM's own tap left out");
     }
 
     /// The unsolicited Neighbour Advertisement's bytes, field by field; its checksum computed apart.
@@ -2597,6 +2633,20 @@ mod tests {
             proxy_remove(v6).unwrap();
             assert!(!has(v6, "old0") && !has(v6, "lan0") && has(foreign, "lan0"), "{}", proxies());
             proxy_remove(v6).unwrap();
+            // Released by its own process (its tap `vm0`): kept while another device is routed to it
+            // (a host sharing the namespace runs it now), removed once none is.
+            ip(&["link", "add", "vm1", "type", "dummy"]);
+            ip(&["link", "set", "vm1", "up"]);
+            unroute6(v6);
+            proxy_add("lan0", v6, || true).unwrap();
+            route_dev(true, VmAddr { v4: Ipv4Addr::new(10, 9, 0, 2), v6: Some(v6) }, ifindex("vm1").unwrap()).unwrap();
+            proxy_release(v6, Some(prefix), &["vm0", "lan0"]).unwrap();
+            assert!(has(v6, "lan0"), "another tap serves it: {}", proxies());
+            proxy_release(v6, Some(prefix), &["vm1", "lan0"]).unwrap();
+            assert!(!has(v6, "lan0"), "only its own: {}", proxies());
+            proxy_add("lan0", v6, || true).unwrap();
+            proxy_release(v6, None, &[]).unwrap();
+            assert!(!has(v6, "lan0"), "no prefix: removed");
             // The advertisement, as it goes out on the announce device (ETH_P_ALL sees what is sent).
             let cap = socket(libc::AF_PACKET, libc::SOCK_RAW, (libc::ETH_P_ALL as u16).to_be() as i32, "capture").unwrap();
             let mut at: libc::sockaddr_ll = unsafe { std::mem::zeroed() };

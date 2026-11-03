@@ -1720,11 +1720,17 @@ impl Proc {
     }
 
     /// The VM's proxy entry goes once it is gone from here (`finish`), however it went: killed, died,
-    /// suspended, or never started. Not once moved: its route to its target took it then
+    /// suspended, owed or never started. Not once moved: its route to its target took it then
     /// (`host::route_hop`), unless the target shares this network namespace, whose entry it now is.
+    /// Nor while another tap here is routed to its address (`net::proxy_release`): a target sharing
+    /// the namespace that runs it, whatever this process knows of the outcome (`End::Owed`).
     fn drop_proxy_ndp(&self, end: &End) {
-        let Some(v6) = self.vm.get().and_then(|vm| vm.addr().v6).filter(|_| !matches!(end, End::Moved(_))) else { return };
-        if let Err(e) = crate::net::proxy_remove(v6) {
+        let Some(vm) = self.vm.get().filter(|_| !matches!(end, End::Moved(_))) else { return };
+        let Some(v6) = vm.addr().v6 else { return };
+        let cfg = self.host.config_now();
+        let not: Vec<String> = std::iter::once(vm.tap.clone()).chain(cfg.announce_dev()).collect();
+        let not: Vec<&str> = not.iter().map(String::as_str).collect();
+        if let Err(e) = crate::net::proxy_release(v6, cfg.vm_ipv6_prefix, &not) {
             crate::log!("vm {}: {e}", self.name());
         }
     }
