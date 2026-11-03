@@ -8,7 +8,7 @@ migration protocol are in [process-per-vm.md](process-per-vm.md).
 | Concern | Mechanism |
 |---|---|
 | CPU | vCPUs = host cores, rounded down to an even count (Firecracker takes 1 or an even count, at most 32; `pull --vcpus` overrides). Idle vCPUs halt and cost nothing. Each VM's Firecracker runs in a cgroup of its own with the `cpu` controller on, all at the default `cpu.weight`, so busy VMs share contended CPU equally however many threads each runs. |
-| Memory growth | Boot memory (256 MiB + 1/32 of the ceiling) + a virtio-mem region up to host RAM, of which 4 GiB is already plugged in the template. Past that the guest asks for more over vsock the moment it runs low, and its VM process keeps a quarter of the guest (at least 1 GiB) free. See [Memory](#memory). |
+| Memory growth | Boot memory (256 MiB + 1/32 of the ceiling) + a virtio-mem region up to host RAM (at most what fits Firecracker's 512 GiB window beside the root filesystem), of which 4 GiB is already plugged in the template. Past that the guest asks for more over vsock the moment it runs low, and its VM process keeps a quarter of the guest (at least 1 GiB) free. See [Memory](#memory). |
 | Memory return | virtio-balloon **free page reporting**: pages the guest frees go back to the host within seconds. |
 | Root filesystem | One read-only ext4 image on virtio-pmem with DAX, shared by every VM through the host page cache. Writes go to a tmpfs overlay inside the guest, so they migrate with memory. Snapshots name it `rootfs`, a file in each Firecracker's directory that every load links to the generation's own (`template::ROOTFS`): a generation's root filesystem can be anywhere, so a migration target need not have pulled the image (generations built by v0.1.0 name it by its path, which a target must then hold). |
 | Start | Every VM is a **UFFD restore of a template snapshot** into a pre-spawned, pre-cgrouped Firecracker. The template's recorded working set is copied in bulk; everything else is faulted in lazily from a shared, sparse template image. **Standby VMs** are already restored and paused, so `run` is usually just a resume. |
@@ -87,6 +87,19 @@ not wait on the host:
   built before this, and their checkpoints, keep the old onlining; rebuild
   them. Unplug takes movable blocks first; kernel blocks may not unplug, but
   their free pages go back through free page reporting.
+- **The hotplug window.** Firecracker places the virtio-mem region, then
+  every virtio-pmem device, in the guest physical window past its 64-bit MMIO
+  gap: 512 GiB from 512 GiB on both arches (`PAST_64BITS_MMIO_SIZE`). The
+  region is aligned to 128 MiB and a pmem device to 2 MiB (its file rounded up
+  to that), so whole 1 GiB slots of hotplug and the root filesystem, a
+  template's only pmem device, fit when their sizes add up to at most 512 GiB
+  (`template::hotplug_room`). Past that Firecracker refuses to start ("The
+  requested resource is not available", #1292). So the default ceiling is host
+  RAM down to the largest that fits (about 528 GiB with a small root
+  filesystem: 511 GiB of hotplug plus the 17 GiB boot memory that ceiling
+  defaults to). A larger `--max` is refused as `pull` starts (against the
+  smallest root filesystem) and again once the root filesystem is made, before
+  Firecracker starts; a received template with more hotplug is refused.
 - **Shrinking** is free page reporting (freed pages go back within seconds,
   plugged or not), plus unplugging memory above the template's plug once a
   guest has had more than three times its headroom free for 10 s. A shrink

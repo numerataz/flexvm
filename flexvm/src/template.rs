@@ -50,6 +50,25 @@ pub fn base_mib(max_mib: u64) -> u64 {
 /// on the host; the controller never shrinks a VM below it.
 pub const PLUG_MIB: u64 = 4096;
 
+/// Firecracker allocates the hotplug region, then each virtio-pmem device, from the guest physical
+/// window past its 64-bit MMIO gap: `PAST_64BITS_MMIO_SIZE`, 512 GiB from 512 GiB on both arches
+/// (`arch/*/layout.rs`). The region is aligned to 128 MiB (`VIRTIO_MEM_DEFAULT_SLOT_SIZE_MIB`), a
+/// pmem device to 2 MiB, its file rounded up to that (`Pmem::ALIGNMENT`). From the window's start,
+/// whole slots of hotplug leave the root filesystem's device aligned: the two fit if their sizes do.
+pub const WINDOW_MIB: u64 = 512 << 10;
+const PMEM_ALIGN_MIB: u64 = 2;
+const _: () = assert!(SLOT_MIB % 128 == 0 && SLOT_MIB % PMEM_ALIGN_MIB == 0);
+
+/// The largest hotplug region, in whole slots, that fits the window beside a root filesystem (a
+/// template's only pmem device) of `rootfs_bytes` (Firecracker refuses an empty one), if that fits.
+pub fn hotplug_room(rootfs_bytes: u64) -> Result<u64> {
+    let pmem = rootfs_bytes.max(1).div_ceil(PMEM_ALIGN_MIB << 20) * PMEM_ALIGN_MIB;
+    match WINDOW_MIB.checked_sub(pmem) {
+        Some(room) => Ok(room / SLOT_MIB * SLOT_MIB),
+        None => bail!("the root filesystem, {pmem} MiB, does not fit Firecracker's {} GiB window for pmem devices", WINDOW_MIB >> 10),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
     pub compatibility: crate::compat::Compat,
@@ -1172,7 +1191,7 @@ pub struct Size {
 }
 
 impl Size {
-    fn hotplug_mib(&self) -> u64 {
+    pub fn hotplug_mib(&self) -> u64 {
         self.max_mib.saturating_sub(self.mem_mib) / SLOT_MIB * SLOT_MIB
     }
 
@@ -1713,7 +1732,9 @@ fn receive_inner<R: Read>(
     let mut bytes = vec![0u8; len as usize];
     r.read_exact(&mut bytes)?;
     let mut meta: Meta = serde_json::from_slice(&bytes).map_err(|e| format!("template {id}: its metadata: {e}"))?;
-    if meta.id != id || !meta.identified() || !meta.rootfs.is_absolute() || meta.max_mib > MAX_MEM_MIB {
+    // No template with more hotplug than the window holds beside the smallest root filesystem boots.
+    let hotplug = meta.max_mib.saturating_sub(meta.mem_mib);
+    if meta.id != id || !meta.identified() || !meta.rootfs.is_absolute() || meta.max_mib > MAX_MEM_MIB || hotplug > hotplug_room(0)? {
         bail!("template {id}: the metadata sent is not that template's, or past the limits");
     }
     // The kernel is in guest memory; restores never read it (`Meta::verify`).
@@ -1766,6 +1787,14 @@ fn receive_inner<R: Read>(
     // As long as its guest memory, which opening it maps a bitmap of.
     let mem = file(r, "mem", meta.max_mib << 20..=meta.max_mib << 20)?;
     let staged = |n: &str| staging.dir.join(n);
+    // As its Firecracker placed them: the hotplug region beside this root filesystem.
+    let rootfs_len = match &local {
+        Some((have, _)) => have.metadata()?.len(),
+        None => std::fs::metadata(staged("rootfs"))?.len(),
+    };
+    if hotplug > hotplug_room(rootfs_len).map_err(|e| format!("template {id}: {e}"))? {
+        bail!("template {id}: its hotplug region and root filesystem do not fit Firecracker's {} GiB window", WINDOW_MIB >> 10);
+    }
     let (rootfs, rootfs_use) = match local {
         Some((have, held)) => {
             // Read the stream before hashing the cached copy: a slow disk must not stall the paced sender.
@@ -1879,7 +1908,7 @@ fn receive_file(
 
 #[allow(clippy::too_many_arguments)]
 fn build(host: &crate::host::Host, paths: &Paths, dir: &Path, name: &str, size: Size, rootfs: &Path, tap: &str, image: ImageMeta) -> Result<()> {
-    let Size { vcpus, mem_mib, max_mib, plug_mib } = size;
+    let Size { vcpus, mem_mib, plug_mib, .. } = size;
     let run = dir.join("boot");
     std::fs::create_dir_all(&run)?;
 
@@ -1893,7 +1922,11 @@ fn build(host: &crate::host::Host, paths: &Paths, dir: &Path, name: &str, size: 
     let kernel_source = crate::host::fd_path(kernel_file.as_raw_fd());
     let sockets = SocketRoot::unique(&std::fs::canonicalize(dir)?)?;
     let start = Instant::now();
-    let hotplug = max_mib.saturating_sub(mem_mib) / SLOT_MIB * SLOT_MIB;
+    let hotplug = size.hotplug_mib();
+    let room = hotplug_room(std::fs::metadata(&rootfs)?.len())?;
+    if hotplug > room {
+        bail!("a hotplug region of {hotplug} MiB does not fit Firecracker's {} GiB window beside the root filesystem: at most {room} MiB", WINDOW_MIB >> 10);
+    }
     let mut admission = crate::limit::Building::admit(host, mem_mib)?;
     let mut fc = Firecracker::spawn(&paths.firecracker, &run, sockets.allocate()?, crate::fc::SPAWN_READY)?;
     admission.start(&mut fc, mem_mib + plug_mib.min(hotplug) / STEP_MIB * STEP_MIB)?;
@@ -2639,6 +2672,31 @@ pub(crate) mod tests {
     }
 
     /// A generation in `f.dir` with a sparse memory file and a vmstate naming `rootfs` as given, sent.
+    #[test]
+    fn run_memory_past_a_template_at_the_window_does_not_suggest_a_larger_pull() {
+        let f = Fixture::new();
+        let run_beside = |rootfs: &Path, m: u64, mem_mib: u64, max_mib: u64| {
+            let meta = Meta { mem_mib, max_mib, rootfs: rootfs.into(), ..f.meta.clone() };
+            crate::vm::Resources { cpus: None, memory_mib: Some(m) }.check(&meta).map_err(|e| e.to_string())
+        };
+        let run = |m, mem_mib, max_mib| run_beside(&f.meta.rootfs, m, mem_mib, max_mib);
+        assert_eq!(run(2048, 256, 1024).unwrap_err(), "--memory 2048 MiB is more than the image's ceiling, 1024 MiB (pull it with --max for more)");
+        let full = 17280 + hotplug_room(0).unwrap();
+        run(full, 17280, full).unwrap();
+        assert_eq!(
+            run(full + 1, 17280, full).unwrap_err(),
+            format!("--memory {} MiB is more than the image's ceiling, {full} MiB (the most Firecracker's hotplug window holds)", full + 1)
+        );
+        let short = full - SLOT_MIB;
+        assert!(run(full, 17280, short).unwrap_err().ends_with("(pull it with --max for more)"));
+        // Beside a 20 GiB root filesystem, that is a full template.
+        let big = f.dir.join("big-rootfs");
+        File::create(&big).unwrap().set_len(20 << 30).unwrap();
+        let full = 16640 + hotplug_room(20 << 30).unwrap();
+        assert!(run_beside(&big, full + 1, 16640, full).unwrap_err().ends_with("(the most Firecracker's hotplug window holds)"));
+        assert!(run_beside(&big, full, 16640, full - SLOT_MIB).unwrap_err().ends_with("(pull it with --max for more)"));
+    }
+
     fn sent(f: &mut Fixture, rootfs_named: &str) -> (Arc<Template>, Vec<u8>) {
         std::fs::write(f.dir.join("vmstate"), format!("state, pmem at {rootfs_named}")).unwrap();
         let mem = File::create(f.dir.join("mem")).unwrap();
@@ -2748,9 +2806,11 @@ pub(crate) mod tests {
         let e = receive(&paths, &mut &corrupt[..], id, None, |_| Ok(()), |_| Ok(())).err().unwrap().to_string();
         assert!(e.contains("its mem does not hash"), "{e}");
         assert!(receive(&paths, &mut &buf[..buf.len() - 10], id, None, |_| Ok(()), |_| Ok(())).is_err());
-        // A root filesystem path that is empty or relative, or memory past the cap, is refused before anything is read.
+        // A root filesystem path that is empty or relative, or memory past the cap or the hotplug
+        // window, is refused before anything is read.
         assert!(!names_by_path(b"anything", Path::new("")));
-        for (rootfs, max_mib) in [("", tpl.meta.max_mib), ("rootfs", tpl.meta.max_mib), ("/r", MAX_MEM_MIB + 1)] {
+        let past_window = tpl.meta.mem_mib + hotplug_room(0).unwrap() + SLOT_MIB;
+        for (rootfs, max_mib) in [("", tpl.meta.max_mib), ("rootfs", tpl.meta.max_mib), ("/r", MAX_MEM_MIB + 1), ("/r", past_window)] {
             let meta = serde_json::to_vec(&Meta { rootfs: rootfs.into(), max_mib, ..tpl.meta.clone() }).unwrap();
             let forged = [&(meta.len() as u64).to_le_bytes()[..], &meta, &buf[8 + u64::from_le_bytes(buf[..8].try_into().unwrap()) as usize..]].concat();
             assert!(receive(&paths, &mut &forged[..], id, None, |_| Ok(()), |_| Ok(())).err().unwrap().to_string().contains("past the limits"));

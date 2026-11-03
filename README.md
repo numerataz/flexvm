@@ -2,7 +2,8 @@
 
 Elastic Firecracker microVMs. By default, a VM sees the host's CPUs, capped at
 32 and rounded down to even (1 on a single-CPU host), and a memory ceiling of
-host RAM, but only uses what it touches. It starts in about 5 ms, pauses,
+host RAM (at most about 528 GiB, what Firecracker's hotplug window holds), but
+only uses what it touches. It starts in about 5 ms, pauses,
 checkpoints and suspends to disk, and live-migrates to another host
 (post-copy) in tens of milliseconds, keeping its address and TCP connections.
 
@@ -1015,7 +1016,7 @@ and `--memory` cap a VM below them):
 | option | default | what |
 |---|---|---|
 | `--vcpus N` | host CPUs, at most 32, rounded down to even | vCPUs (Firecracker cannot add vCPUs to a running VM) |
-| `--max MIB` | host RAM | memory ceiling: boot memory plus the hot-plug region, in whole 1 GiB slots |
+| `--max MIB` | host RAM, at most what fits the window | memory ceiling: boot memory plus the hot-plug region, in whole 1 GiB slots; the region and the root filesystem share Firecracker's 512 GiB window, so a larger `--max` is refused |
 | `--mem MIB` | 256 + max/32, rounded up to 128 | boot memory, which holds kernel memory for the whole ceiling |
 | `--plug MIB` | 4096 | plugged in the snapshot (free until touched); a VM never shrinks below it |
 
