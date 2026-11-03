@@ -34,6 +34,9 @@ fn paused(name: &str) -> String {
     format!("{} once flexvm unpause {name} resumes it", crate::guest::TRY_AGAIN)
 }
 const NO_REALTIME: &str = "clock_realtime requested but not present in the snapshot state";
+/// Firecracker on aarch64 refuses `clock_realtime` (it adjusts kvmclock, which arm64 has not). Neither
+/// arch's guest needs it: the agent steps its clock after every load.
+pub const CLOCK_REALTIME: bool = cfg!(target_arch = "x86_64");
 
 /// The vmstate a VM is restored from.
 #[derive(Clone, Copy)]
@@ -1291,7 +1294,7 @@ impl Prepared {
         t: &mut Phases,
     ) -> Result<(Arc<Vm>, Duration)> {
         let (tpl, neighbour, saved) = (self.template.clone(), self.neighbour, self.saved.clone());
-        let (e, realtime) = match self.load_once(name, vmstate, seed.clone(), ip, hold, true, deadline, t) {
+        let (e, realtime) = match self.load_once(name, vmstate, seed.clone(), ip, hold, CLOCK_REALTIME, deadline, t) {
             Ok(r) => return Ok(r),
             Err((e, None)) => return Err(e),
             Err((e, Some(realtime))) => (e, realtime),

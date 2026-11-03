@@ -476,7 +476,9 @@ VM that is busy, paused or suspended.
     after the snapshot.
 - **Clock.** A restored guest's wall clock resumes from when it was saved.
   The guest uses the TSC clocksource, whose saved value Firecracker
-  restores, while `clock_realtime` only moves kvmclock. A restore or a
+  restores, while `clock_realtime` only moves kvmclock (an aarch64 guest's
+  counter is restored the same way, and Firecracker there refuses
+  `clock_realtime`, so it is not passed). A restore or a
   suspended VM's resume therefore steps the guest clock under the VM's
   reservation, within a 5 s deadline, with the agent's `CLOCK` (it sets the
   host's time and reports how far off it was), up to three tries, stopping

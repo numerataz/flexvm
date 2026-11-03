@@ -331,11 +331,14 @@ pub(crate) mod tests {
         Arm64::of_probe(regs, &ids, 25_000_000, None, 3, true, "Firecracker v1.17.0 (content a)".into()).unwrap()
     }
 
-    /// Needs /dev/kvm: `cargo test -p flexvm probes_this_host -- --ignored --nocapture`.
+    /// Probes this host's KVM, which CI's arm runners lack (and `--ignored` is for root-only
+    /// tests): `FLEXVM_TEST_KVM=1 cargo test -p flexvm probes_this_host -- --nocapture`.
     #[cfg(target_arch = "aarch64")]
     #[test]
-    #[ignore]
     fn probes_this_host() {
+        if std::env::var_os("FLEXVM_TEST_KVM").is_none() {
+            return;
+        }
         let kvm = std::fs::File::open("/dev/kvm").unwrap();
         let probed = kvm::probe(&kvm, "f".into()).unwrap();
         println!("{}", serde_json::to_string_pretty(&super::super::Compat::Aarch64(probed.clone())).unwrap());

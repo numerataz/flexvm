@@ -896,7 +896,7 @@ fn record_working_set(host: &crate::host::Host, paths: &Paths, dir: &Path, tap: 
         admission.start(&mut fc, tpl.meta.mem_mib + tpl.meta.plugged_mib)?;
         let p = crate::vm::Prepared::new(fc, tpl.clone())?;
         // Like VM restores: stepping the clock touches pages of its own. Loaded paused.
-        p.firecracker().load_snapshot(&tpl.vmstate(), &tpl, tap, Some(true), crate::fc::API_TIMEOUT)?;
+        p.firecracker().load_snapshot(&tpl.vmstate(), &tpl, tap, Some(crate::vm::CLOCK_REALTIME), crate::fc::API_TIMEOUT)?;
         p.pager.wait_ready(Duration::from_secs(5))?;
         // As for a restore: memory mapped behind the pager's back would be recorded from zeroes (#949).
         p.pager.check_foreign(Duration::from_secs(10))?;
