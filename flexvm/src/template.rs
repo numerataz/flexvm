@@ -69,6 +69,19 @@ pub fn hotplug_room(rootfs_bytes: u64) -> Result<u64> {
     }
 }
 
+/// Firecracker maps boot memory up to its 64-bit MMIO gap at `MMIO64_MEM_START` (256 GiB) and the
+/// rest past the gap (`arch_memory_regions`), from 512 GiB: where the window above starts, which its
+/// allocator hands out as if that memory were not there. So boot memory fits below the gap: on
+/// x86_64 from 0, less the 1 GiB 32-bit MMIO gap below 4 GiB (`MMIO32_MEM_SIZE`), 255 GiB; on
+/// aarch64 from `DRAM_MEM_START`, 2 GiB, 254 GiB.
+pub const fn boot_room(arch: crate::compat::Arch) -> u64 {
+    const MMIO64_MEM_START_MIB: u64 = 256 << 10;
+    match arch {
+        crate::compat::Arch::X86_64 => MMIO64_MEM_START_MIB - 1024,
+        crate::compat::Arch::Aarch64 => MMIO64_MEM_START_MIB - 2048,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Meta {
     pub compatibility: crate::compat::Compat,
@@ -1732,9 +1745,11 @@ fn receive_inner<R: Read>(
     let mut bytes = vec![0u8; len as usize];
     r.read_exact(&mut bytes)?;
     let mut meta: Meta = serde_json::from_slice(&bytes).map_err(|e| format!("template {id}: its metadata: {e}"))?;
-    // No template with more hotplug than the window holds beside the smallest root filesystem boots.
+    // No template with more hotplug than the window holds beside the smallest root filesystem, or
+    // more boot memory than fits below the 64-bit MMIO gap, boots.
     let hotplug = meta.max_mib.saturating_sub(meta.mem_mib);
-    if meta.id != id || !meta.identified() || !meta.rootfs.is_absolute() || meta.max_mib > MAX_MEM_MIB || hotplug > hotplug_room(0)? {
+    let past_limits = meta.max_mib > MAX_MEM_MIB || hotplug > hotplug_room(0)? || meta.mem_mib > boot_room(meta.compatibility.arch());
+    if meta.id != id || !meta.identified() || !meta.rootfs.is_absolute() || past_limits {
         bail!("template {id}: the metadata sent is not that template's, or past the limits");
     }
     // The kernel is in guest memory; restores never read it (`Meta::verify`).
@@ -1926,6 +1941,10 @@ fn build(host: &crate::host::Host, paths: &Paths, dir: &Path, name: &str, size: 
     let room = hotplug_room(std::fs::metadata(&rootfs)?.len())?;
     if hotplug > room {
         bail!("a hotplug region of {hotplug} MiB does not fit Firecracker's {} GiB window beside the root filesystem: at most {room} MiB", WINDOW_MIB >> 10);
+    }
+    let boot = boot_room(crate::compat::Arch::HOST);
+    if mem_mib > boot {
+        bail!("boot memory of {mem_mib} MiB does not fit below Firecracker's 64-bit MMIO gap: at most {boot} MiB");
     }
     let mut admission = crate::limit::Building::admit(host, mem_mib)?;
     let mut fc = Firecracker::spawn(&paths.firecracker, &run, sockets.allocate()?, crate::fc::SPAWN_READY)?;
@@ -2806,12 +2825,16 @@ pub(crate) mod tests {
         let e = receive(&paths, &mut &corrupt[..], id, None, |_| Ok(()), |_| Ok(())).err().unwrap().to_string();
         assert!(e.contains("its mem does not hash"), "{e}");
         assert!(receive(&paths, &mut &buf[..buf.len() - 10], id, None, |_| Ok(()), |_| Ok(())).is_err());
-        // A root filesystem path that is empty or relative, or memory past the cap or the hotplug
-        // window, is refused before anything is read.
+        // A root filesystem path that is empty or relative, or memory past the cap, the hotplug
+        // window or the 64-bit MMIO gap (boot memory), is refused before anything is read.
         assert!(!names_by_path(b"anything", Path::new("")));
-        let past_window = tpl.meta.mem_mib + hotplug_room(0).unwrap() + SLOT_MIB;
-        for (rootfs, max_mib) in [("", tpl.meta.max_mib), ("rootfs", tpl.meta.max_mib), ("/r", MAX_MEM_MIB + 1), ("/r", past_window)] {
-            let meta = serde_json::to_vec(&Meta { rootfs: rootfs.into(), max_mib, ..tpl.meta.clone() }).unwrap();
+        let (mem, max) = (tpl.meta.mem_mib, tpl.meta.max_mib);
+        let past_window = mem + hotplug_room(0).unwrap() + SLOT_MIB;
+        let past_gap = boot_room(tpl.meta.compatibility.arch()) + STEP_MIB;
+        for (rootfs, mem_mib, max_mib) in
+            [("", mem, max), ("rootfs", mem, max), ("/r", mem, MAX_MEM_MIB + 1), ("/r", mem, past_window), ("/r", past_gap, past_gap)]
+        {
+            let meta = serde_json::to_vec(&Meta { rootfs: rootfs.into(), mem_mib, max_mib, ..tpl.meta.clone() }).unwrap();
             let forged = [&(meta.len() as u64).to_le_bytes()[..], &meta, &buf[8 + u64::from_le_bytes(buf[..8].try_into().unwrap()) as usize..]].concat();
             assert!(receive(&paths, &mut &forged[..], id, None, |_| Ok(()), |_| Ok(())).err().unwrap().to_string().contains("past the limits"));
         }
