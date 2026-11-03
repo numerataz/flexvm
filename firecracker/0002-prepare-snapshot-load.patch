@@ -253,7 +253,7 @@
              .rate_limiter
 --- a/src/vmm/src/persist.rs
 +++ b/src/vmm/src/persist.rs
-@@ -366,6 +366,281 @@
+@@ -366,6 +366,292 @@
      GuestMemory(#[from] RestoreFromSnapshotGuestMemoryError),
      /// Failed to build microVM from snapshot: {0}
      Build(#[from] BuildMicrovmFromSnapshotError),
@@ -437,6 +437,17 @@
 +    if state.device_states.serial_state.is_some() {
 +        set.push("serial".into());
 +    }
++    // On aarch64 the serial console and the RTC are MMIO devices, placed where the snapshot says.
++    #[cfg(target_arch = "aarch64")]
++    {
++        let platform = &state.device_states.mmio_platform_state;
++        if let Some(d) = &platform.serial {
++            set.push(format!("mmio serial at {d:?}"));
++        }
++        if let Some(d) = &platform.rtc {
++            set.push(format!("rtc at {d:?}"));
++        }
++    }
 +    Some(set)
 +}
 +
@@ -535,7 +546,7 @@
  }
  /// Sub-Error type for [`restore_from_snapshot`] to contain either [`GuestMemoryFromFileError`] or
  /// [`GuestMemoryFromUffdError`] within [`RestoreFromSnapshotError`].
-@@ -384,8 +659,10 @@
+@@ -384,8 +670,10 @@
      seccomp_filters: &BpfThreadMap,
      params: &LoadSnapshotParams,
      vm_resources: &mut VmResources,
@@ -546,7 +557,7 @@
      for entry in &params.network_overrides {
          // Only the active transport carries virtio device state, so we look at whichever
          // variant this snapshot was saved with. The MMIO and PCI transports wrap their net
-@@ -428,6 +705,16 @@
+@@ -428,6 +716,16 @@
              .clone_from(&vsock_override.uds_path);
      }
  
@@ -563,7 +574,7 @@
      let track_dirty_pages = params.track_dirty_pages;
  
      let vcpu_count = microvm_state
-@@ -453,6 +740,23 @@
+@@ -453,6 +751,23 @@
      // Some sanity checks before building the microvm.
      snapshot_state_sanity_check(&microvm_state)?;
  
@@ -587,7 +598,7 @@
      let mem_backend_path = &params.mem_backend.backend_path;
      let mem_state = &microvm_state.vm_state.memory;
  
-@@ -487,6 +791,7 @@
+@@ -487,6 +802,7 @@
          instance_info,
          event_manager,
          microvm_state,
@@ -595,7 +606,7 @@
          guest_memory,
          uffd,
          seccomp_filters,
-@@ -794,6 +1099,169 @@
+@@ -794,6 +1110,188 @@
          assert_eq!(restored_mmio, mmio)
      }
  
@@ -747,6 +758,25 @@
 +            &good,
 +            "balloon",
 +        );
++        // On aarch64, an RTC the reference does not have, or one placed elsewhere.
++        #[cfg(target_arch = "aarch64")]
++        {
++            let mut with_rtc = state(&overridden);
++            let VirtioDevicesState::Mmio(mmio) = &with_rtc.device_states.virtio_state else {
++                unreachable!()
++            };
++            let mut at = mmio.net_devices[0].device_info;
++            with_rtc.device_states.mmio_platform_state.rtc = Some(at);
++            refused(&with_rtc, &good, "rtc");
++            let mut moved_reference = state(&|_| {});
++            at.addr += 0x1000;
++            moved_reference.device_states.mmio_platform_state.rtc = Some(at);
++            assert!(matches!(
++                check_devices(&moved_reference, &with_rtc, &good),
++                Err(RestoreFromSnapshotError::Devices(_))
++            ));
++            check_devices(&with_rtc, &with_rtc, &good).unwrap();
++        }
 +    }
 +
 +    fn vmm_block_devices(
