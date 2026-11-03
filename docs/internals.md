@@ -742,8 +742,8 @@ through, so the checkpoint is exactly the memory at the pause.
   `UFFDIO_API` reports (`uffd::wp_supported`: `UFFD_FEATURE_PAGEFAULT_FLAG_WP`;
   `WP_HUGETLBFS_SHMEM` does not matter, guest memory being anonymous). Without
   it, a checkpoint that keeps the VM running is refused before anything is
-  reserved or paused, the VM running on, and so is an incremental one, `--stop`
-  or not: a delta builds on a checkpoint taken with tracking on. That is the
+  waited on, reserved or paused, the VM running on, and so is an incremental
+  one, `--stop` or not: a delta builds on a checkpoint taken with tracking on. That is the
   only path that arms write protection; `--stop` checkpoints, suspend, restore,
   post-copy migration and templates need none. Test fault `uffd_wp_missing`
   makes a host refuse as if it lacked it (`scripts/faults.py ckpt_no_wp`).

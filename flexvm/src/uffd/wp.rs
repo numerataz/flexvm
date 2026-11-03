@@ -1298,7 +1298,9 @@ mod tests {
         let fd = unsafe { libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | libc::O_NONBLOCK | UFFD_USER_MODE_ONLY) };
         if fd < 0 {
             // A sandbox that forbids it (seccomp, a container): nothing to compare.
-            crate::log!("no userfaultfd ({}): skipped", io::Error::last_os_error());
+            let e = io::Error::last_os_error();
+            assert!(matches!(e.raw_os_error(), Some(libc::EPERM | libc::ENOSYS)), "userfaultfd: {e}");
+            crate::log!("no userfaultfd ({e}): skipped");
             return;
         }
         let fd = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };

@@ -6498,15 +6498,19 @@ def ckpt_no_wp():
     """On a host whose kernel lacks uffd-wp (test fault uffd_wp_missing, as
     arm64 before 6.10), a checkpoint that keeps the VM running, and an
     incremental one, are refused up front with an error naming uffd-wp and
-    --stop: nothing is staged, write tracking stays off and the VM runs on,
-    intact. A checkpoint with --stop still works and restores."""
+    --stop, before any of the disk is reserved (prealloc_fail armed too
+    never shows): nothing is staged, write tracking stays off and the VM runs
+    on, intact. A checkpoint with --stop still works and restores."""
     n, path = "ft-nowp", ckpt_path("ft-nowp")
     rm_ckpt(path)
     m = setup(n, mib=20)
     with armed_fault(A, "uffd_wp_missing", 60000):
-        for inc, stop in ((False, False), (True, False), (True, True)):
-            r = checkpoint(A, n, path, stop=stop, incremental=inc)
-            check(f"no uffd-wp: refused (incremental {inc}, stop {stop})", not r["ok"] and "uffd-wp" in r["error"] and "--stop" in r["error"], r)
+        # With prealloc_fail armed too, the refusal is uffd-wp's, never the injected fault: it comes first.
+        with armed_fault(A, "prealloc_fail", 60000):
+            for inc, stop in ((False, False), (True, False), (True, True)):
+                r = checkpoint(A, n, path, stop=stop, incremental=inc)
+                check(f"no uffd-wp: refused before preallocating (incremental {inc}, stop {stop})",
+                      not r["ok"] and "uffd-wp" in r["error"] and "--stop" in r["error"] and "injected" not in r["error"], r)
         check("no uffd-wp: nothing staged or published", not staging() and not os.path.exists(path), staging())
         st = control(A, n, {"op": "debug", "what": "status"})["result"]["describe"]
         check("no uffd-wp: VM runs on, write tracking off", where(n) == {A: "running"} and st["write_tracking"] is False, (where(n), st))
