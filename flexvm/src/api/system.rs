@@ -111,7 +111,7 @@ pub async fn info(api: &Arc<Api>) -> Reply {
         "OperatingSystem": "flexvm",
         "OSVersion": env!("CARGO_PKG_VERSION"),
         "OSType": "linux",
-        "Architecture": "x86_64",
+        "Architecture": std::env::consts::ARCH,
         "NCPU": crate::util::host_cpus(),
         "MemTotal": mem,
         "IndexServerAddress": "https://index.docker.io/v1/",

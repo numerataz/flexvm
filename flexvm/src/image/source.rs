@@ -270,7 +270,7 @@ fn descriptors(manifest: &Value, limits: &Limits) -> Result<Vec<(String, u64)>> 
 /// or `None` if it can't run there. amd64 takes the baseline, then v1, then v2: a v3 or v4 build may
 /// need instructions (AVX2, AVX-512) this CPU lacks. arm64 takes no variant, then v8 (the same
 /// ARMv8-A baseline); v9 and the v8.x/v9.x revisions may need instructions (SVE2, LSE, ...) it lacks.
-fn platform_rank(arch: &str, os: Option<&str>, architecture: Option<&str>, variant: Option<&str>) -> Option<u8> {
+pub(super) fn platform_rank(arch: &str, os: Option<&str>, architecture: Option<&str>, variant: Option<&str>) -> Option<u8> {
     if os != Some("linux") || architecture != Some(arch) {
         return None;
     }
