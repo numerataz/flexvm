@@ -554,6 +554,11 @@ fn filter_msg(ifindex: u32, parent: u32, ops: &[libc::sock_filter]) -> Vec<u8> {
 /// (each from a link-local source, which `source_filter` drops anyway).
 const ICMPV6_ROUTER: [u32; 3] = [133, 134, 137];
 
+/// Extension headers an ICMPv6 message could follow, unread by `source_filter`, so dropped: hop-by-hop
+/// options, routing and destination options. A guest has no use for them (its MLD reports, behind
+/// hop-by-hop options, come from its link-local address); fragments pass, as NDP is never fragmented.
+const IPV6_HIDING: [u32; 3] = [0, 43, 60];
+
 /// The classic BPF program of `guard`, run on frames from their Ethernet header on; a load
 /// past a frame's end would end it with 0 (pass), so lengths are checked first.
 fn source_filter(ip: Option<VmAddr>) -> Vec<libc::sock_filter> {
@@ -583,44 +588,48 @@ fn source_filter(ip: Option<VmAddr>) -> Vec<libc::sock_filter> {
             op(ret, 0, 0, TC_ACT_OK),   // 14
         ];
     };
-    // The same, then IPv6 from `v6` (its NDP too), but no router's ICMPv6 (`ICMPV6_ROUTER`).
-    // Jumps are relative to the next instruction; 32 drops, 33 passes.
+    // The same, then IPv6 from `v6` (its NDP too), but no router's ICMPv6 (`ICMPV6_ROUTER`), nor
+    // an extension header it could hide behind (`IPV6_HIDING`); a fragment's ICMPv6 is never NDP.
+    // Jumps are relative to the next instruction; 35 drops, 36 passes.
     let word = |i: usize| u32::from_be_bytes(v6.octets()[i * 4..i * 4 + 4].try_into().unwrap());
     vec![
         op(ld_w, 0, 0, vlan),            // 0
-        op(jeq, 0, 30, 0),               // 1: tagged: drop
+        op(jeq, 0, 33, 0),               // 1: tagged: drop
         op(ld_h, 0, 0, 12),              // 2: ethertype
         op(jeq, 0, 4, 0x0800),           // 3: not IPv4: 8
         op(ld_len, 0, 0, 0),             // 4
-        op(jge, 0, 26, 14 + 20),         // 5: Ethernet and an IPv4 header
+        op(jge, 0, 29, 14 + 20),         // 5: Ethernet and an IPv4 header
         op(ld_w, 0, 0, 14 + 12),         // 6: source
-        op(jeq, 25, 24, ip),             // 7
+        op(jeq, 28, 27, ip),             // 7
         op(jeq, 0, 4, 0x0806),           // 8: not ARP: 13
         op(ld_len, 0, 0, 0),             // 9
-        op(jge, 0, 21, 14 + 28),         // 10: Ethernet and an Ethernet/IPv4 ARP body
+        op(jge, 0, 24, 14 + 28),         // 10: Ethernet and an Ethernet/IPv4 ARP body
         op(ld_w, 0, 0, 14 + 14),         // 11: sender protocol address
-        op(jeq, 20, 19, ip),             // 12
-        op(jeq, 0, 18, 0x86dd),          // 13: not IPv6: drop
+        op(jeq, 23, 22, ip),             // 12
+        op(jeq, 0, 21, 0x86dd),          // 13: not IPv6: drop
         op(ld_len, 0, 0, 0),             // 14
-        op(jge, 0, 16, 14 + 40),         // 15: Ethernet and an IPv6 header
+        op(jge, 0, 19, 14 + 40),         // 15: Ethernet and an IPv6 header
         op(ld_w, 0, 0, 14 + 8),          // 16: source, a word at a time
-        op(jeq, 0, 14, word(0)),         // 17
+        op(jeq, 0, 17, word(0)),         // 17
         op(ld_w, 0, 0, 14 + 12),         // 18
-        op(jeq, 0, 12, word(1)),         // 19
+        op(jeq, 0, 15, word(1)),         // 19
         op(ld_w, 0, 0, 14 + 16),         // 20
-        op(jeq, 0, 10, word(2)),         // 21
+        op(jeq, 0, 13, word(2)),         // 21
         op(ld_w, 0, 0, 14 + 20),         // 22
-        op(jeq, 0, 8, word(3)),          // 23
+        op(jeq, 0, 11, word(3)),         // 23
         op(ld_b, 0, 0, 14 + 6),          // 24: next header
-        op(jeq, 0, 7, 58),               // 25: not ICMPv6: pass
-        op(ld_len, 0, 0, 0),             // 26
-        op(jge, 0, 4, 14 + 40 + 1),      // 27: and its type
-        op(ld_b, 0, 0, 14 + 40),         // 28
-        op(jeq, 2, 0, ICMPV6_ROUTER[0]), // 29
-        op(jeq, 1, 0, ICMPV6_ROUTER[1]), // 30
-        op(jeq, 0, 1, ICMPV6_ROUTER[2]), // 31
-        op(ret, 0, 0, TC_ACT_SHOT),      // 32
-        op(ret, 0, 0, TC_ACT_OK),        // 33
+        op(jeq, 3, 0, 58),               // 25: ICMPv6: 29
+        op(jeq, 8, 0, IPV6_HIDING[0]),   // 26
+        op(jeq, 7, 0, IPV6_HIDING[1]),   // 27
+        op(jeq, 6, 7, IPV6_HIDING[2]),   // 28: anything else passes
+        op(ld_len, 0, 0, 0),             // 29
+        op(jge, 0, 4, 14 + 40 + 1),      // 30: and its type
+        op(ld_b, 0, 0, 14 + 40),         // 31
+        op(jeq, 2, 0, ICMPV6_ROUTER[0]), // 32
+        op(jeq, 1, 0, ICMPV6_ROUTER[1]), // 33
+        op(jeq, 0, 1, ICMPV6_ROUTER[2]), // 34
+        op(ret, 0, 0, TC_ACT_SHOT),      // 35
+        op(ret, 0, 0, TC_ACT_OK),        // 36
     ]
 }
 
@@ -1932,6 +1941,10 @@ mod tests {
             assert!(!pass(&ipv6(v6, six("ff02::2"), 58, &[ty as u8, 0, 0, 0])), "a router's ICMPv6 {ty}");
         }
         assert!(!pass(&ipv6(v6, TAP_ADDR6, 58, &[])), "ICMPv6 short of its type");
+        for next in IPV6_HIDING {
+            assert!(!pass(&ipv6(v6, six("ff02::2"), next as u8, &[58, 0, 0, 0, 0, 0, 0, 0, 134, 0, 0, 0])), "a router advertisement behind header {next}");
+        }
+        assert!(pass(&ipv6(v6, there, 44, &[17, 0, 0, 1, 0, 0, 0, 1])), "a fragment");
         assert!(!pass(&ipv6(other, there, 17, &udp)), "another's source");
         for i in 0..16 {
             let mut src = v6.octets();
