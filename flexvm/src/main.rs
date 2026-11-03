@@ -1970,12 +1970,25 @@ fn only_standby(args: &Args) -> bool {
     args.flags.iter().all(|(f, _)| GLOBAL.contains(&f.as_str()) || matches!(f.as_str(), "standby" | "tag"))
 }
 
-/// `--max` is the host's memory unless given (at most what a peer takes, and never below `--mem`:
-/// then there is no hotplug); either given past what a peer takes is refused, as is `--max` below `--mem`.
-fn pull_size(args: &Args) -> Result<template::Size> {
-    let ram = (proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20).min(template::MAX_MEM_MIB);
-    let max = args.parse_or("max", ram)?;
-    let (mem, plug) = (args.parse_or("mem", template::base_mib(max))?, args.parse_or("plug", template::PLUG_MIB)?);
+/// `--max` is the host's memory unless given (at most what a peer takes, never below `--mem`:
+/// then there is no hotplug), and at most what fits Firecracker's hotplug window beside the root
+/// filesystem (`template::hotplug_room`, of `rootfs_bytes`, or the smallest before it is made).
+/// Either given past what a peer takes is refused, as is `--max` below `--mem` or past the window.
+fn pull_size(args: &Args, ram_mib: u64, rootfs_bytes: Option<u64>) -> Result<template::Size> {
+    let room = template::hotplug_room(rootfs_bytes.unwrap_or(0));
+    let mem_of = |max: u64| args.parse_or("mem", template::base_mib(max));
+    let fits = |max: u64, mem: u64| max.saturating_sub(mem) / template::SLOT_MIB * template::SLOT_MIB <= room;
+    // The largest ceiling from `from` down that fits: each step drops the excess hotplug, which
+    // lowers --mem's default (1/32 of the ceiling) and so lets a little back in.
+    let largest = |from: u64| -> Result<u64> {
+        let mut max = from;
+        while !fits(max, mem_of(max)?) {
+            max = mem_of(max)? + room;
+        }
+        Ok(max)
+    };
+    let max = args.parse_or("max", largest(ram_mib.min(template::MAX_MEM_MIB))?)?;
+    let (mem, plug) = (mem_of(max)?, args.parse_or("plug", template::PLUG_MIB)?);
     for (flag, mib) in [("max", max), ("mem", mem)] {
         if mib > template::MAX_MEM_MIB {
             bail!("--{flag} must be at most {} MiB", template::MAX_MEM_MIB);
@@ -1984,7 +1997,20 @@ fn pull_size(args: &Args) -> Result<template::Size> {
     if max < mem && args.has("max") {
         bail!("--max must be at least --mem ({mem} MiB)");
     }
+    if !fits(max, mem) {
+        bail!(
+            "--max {max} MiB does not fit: Firecracker holds the hotplug region and the root filesystem in a {} GiB window, \
+             so the hotplug region is at most {room} MiB; give --max {} or less",
+            template::WINDOW_MIB >> 10,
+            largest(template::MAX_MEM_MIB)?
+        );
+    }
     Ok(template::Size { vcpus: template_vcpus(args)?, mem_mib: mem, max_mib: max.max(mem), plug_mib: plug })
+}
+
+/// MemTotal in MiB.
+fn host_ram_mib() -> u64 {
+    proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20
 }
 
 /// `pull SRC`: the template named after the image (or `--tag`), built unless it is up to date;
@@ -1995,7 +2021,8 @@ fn pull(args: &Args, src: &str) -> Result<()> {
         None if std::path::Path::new(src).exists() => bail!("{src} is a file or directory: name its image with --tag NAME[:TAG]"),
         None => template::name_of(src)?,
     };
-    let size = pull_size(args)?;
+    // Checked again once the root filesystem is made (`image::prepare`), before Firecracker starts.
+    pull_size(args, host_ram_mib(), None)?;
     let standby = args.get("standby").map(|n| n.parse::<usize>().map_err(|_| format!("bad --standby {n:?}: give a count"))).transpose()?;
     if unsafe { libc::geteuid() } != 0 {
         bail!("run flexvm as root");
@@ -2030,6 +2057,7 @@ fn pull(args: &Args, src: &str) -> Result<()> {
         let init = args.get("init").map(PathBuf::from);
         // Held until the template is published: `rmi` leaves the root filesystem to this build.
         let (rootfs, meta, _reserved, _cache_lock) = image::prepare(&state(args)?.join("images"), init.as_deref(), &opts)?;
+        let size = pull_size(args, host_ram_mib(), Some(std::fs::metadata(&rootfs)?.len()))?;
         if let Some(id) = template::up_to_date(&paths, &name, size, &rootfs, &meta) {
             output(format_args!("image {} is up to date (template {name}, id {id})\n", template::image_of(&name)))?;
             return Ok(None);
@@ -2702,13 +2730,94 @@ mod exec_tests {
             ("255", "256", "--max must be at least --mem (256 MiB)"),
             ("2097153", "256", "--max must be at most 2097152 MiB"),
             ("18446744073709551615", "256", "--max must be at most 2097152 MiB"),
+            ("2097152", "256", window_refusal(2097152, 523264, 523520).as_str()),
+            ("524544", "256", window_refusal(524544, 523264, 523520).as_str()),
         ] {
             let args = parse(&["pull", "busybox", "--max", max, "--mem", mem]);
             assert_eq!(real_main(&args).unwrap_err().to_string(), message);
         }
-        for max in ["256", "2097152"] {
-            let size = pull_size(&parse(&["pull", "busybox", "--max", max, "--mem", "256"])).unwrap();
+        // The hotplug region is whole slots: what is past the last one is not hotplug.
+        for max in ["256", "523520", "524543"] {
+            let size = pull_size(&parse(&["pull", "busybox", "--max", max, "--mem", "256"]), host_ram_mib(), None).unwrap();
             assert_eq!(size.max_mib.to_string(), max);
+        }
+    }
+
+    fn window_refusal(max: u64, room: u64, largest: u64) -> String {
+        format!(
+            "--max {max} MiB does not fit: Firecracker holds the hotplug region and the root filesystem in a 512 GiB window, \
+             so the hotplug region is at most {room} MiB; give --max {largest} or less"
+        )
+    }
+
+    #[test]
+    fn hotplug_room_leaves_the_root_filesystem_its_aligned_device() {
+        // 512 GiB less a 2 MiB-aligned device, in whole 1 GiB slots.
+        for (rootfs, room) in [(0, 523264), (1, 523264), (2 << 20, 523264), (1 << 30, 523264), ((1 << 30) + 1, 522240), (20 << 30, 503808), (512 << 30, 0)] {
+            assert_eq!(template::hotplug_room(rootfs), room, "{rootfs}");
+        }
+    }
+
+    #[test]
+    fn pull_max_defaults_to_what_fits_firecrackers_window() {
+        const GIB: u64 = 1024;
+        let small = 64 << 20;
+        let big = 20 << 30;
+        let size = |argv: &[&str], ram: u64, rootfs: Option<u64>| {
+            let mut v = vec!["pull", "busybox"];
+            v.extend_from_slice(argv);
+            pull_size(&parse(&v), ram, rootfs).map(|s| (s.mem_mib, s.max_mib, s.hotplug_mib()))
+        };
+        // (host RAM, root filesystem) -> (--mem, --max, hotplug region): up to 512 GiB the
+        // host's memory, unchanged (a template too big for the window never built).
+        for (ram, rootfs, want) in [
+            (16 * GIB, None, (768, 16384, 15360)),
+            (16 * GIB, Some(big), (768, 16384, 15360)),
+            (512 * GIB, None, (16640, 524288, 506880)),
+            (512 * GIB, Some(small), (16640, 524288, 506880)),
+            (512 * GIB, Some(big), (16640, 520448, 503808)),
+            (743 * GIB, None, (17152, 540672, 523264)),
+            (743 * GIB, Some(small), (17152, 540672, 523264)),
+            (743 * GIB, Some(big), (16640, 520576, 503808)),
+            (2048 * GIB, None, (17152, 540544, 523264)),
+            (2048 * GIB, Some(big), (16640, 520448, 503808)),
+            (4096 * GIB, None, (17152, 540544, 523264)),
+        ] {
+            assert_eq!(size(&[], ram, rootfs).unwrap(), want, "{ram} MiB of RAM, rootfs {rootfs:?}");
+            let (mem, max, hotplug) = want;
+            assert_eq!(mem, template::base_mib(max));
+            assert!(hotplug + rootfs.unwrap_or(0).div_ceil(1 << 20).max(2) <= template::WINDOW_MIB);
+        }
+        // An explicit --max, whatever the host has: refused past the window (of this root
+        // filesystem once it is made), at pull time and again before Firecracker starts.
+        for ram in [16 * GIB, 512 * GIB, 743 * GIB, 2048 * GIB] {
+            assert_eq!(size(&["--max", "524288"], ram, None).unwrap(), (16640, 524288, 506880));
+            assert_eq!(size(&["--max", "540672"], ram, Some(small)).unwrap(), (17152, 540672, 523264));
+            assert_eq!(size(&["--max", "8192", "--mem", "512"], ram, Some(big)).unwrap(), (512, 8192, 7168));
+            for (max, rootfs, room, largest) in [
+                (600000, None, 523264, 540544),
+                (700000, None, 523264, 540544),
+                (740000, Some(small), 523264, 540544),
+                (2097152, None, 523264, 540544),
+                (524288, Some(big), 503808, 520448),
+            ] {
+                let err = size(&["--max", &max.to_string()], ram, rootfs).unwrap_err().to_string();
+                assert_eq!(err, window_refusal(max, room, largest), "{ram} MiB of RAM, --max {max}");
+            }
+            let err = size(&["--max", "540672", "--mem", "16384"], ram, None).unwrap_err().to_string();
+            assert_eq!(err, window_refusal(540672, 523264, 16384 + 523264));
+        }
+    }
+
+    #[test]
+    fn pull_max_defaults_to_the_host_and_never_below_mem() {
+        let size = pull_size(&parse(&["pull", "busybox"]), host_ram_mib(), None).unwrap();
+        assert!(size.max_mib <= template::MAX_MEM_MIB && size.mem_mib <= size.max_mib);
+        assert!(size.hotplug_mib() <= template::hotplug_room(0));
+        for ram in [16 << 10, 2 << 20] {
+            let size = pull_size(&parse(&["pull", "busybox", "--mem", "2097152"]), ram, None).unwrap();
+            assert_eq!((size.mem_mib, size.max_mib), (2097152, 2097152), "--mem past the host's memory: no hotplug");
+            assert_eq!(pull_size(&parse(&["pull", "busybox", "--mem", "2097153"]), ram, None).unwrap_err().to_string(), "--mem must be at most 2097152 MiB");
         }
     }
 
@@ -2770,15 +2879,6 @@ mod exec_tests {
         check_applies(&cp).unwrap();
         assert_eq!(cp.names(), ["-", "web:/x"]);
         assert!(cp.rest.is_empty());
-    }
-
-    #[test]
-    fn pull_max_defaults_to_the_host_and_never_below_mem() {
-        let size = pull_size(&parse(&["pull", "busybox"])).unwrap();
-        assert!(size.max_mib <= template::MAX_MEM_MIB && size.mem_mib <= size.max_mib);
-        let size = pull_size(&parse(&["pull", "busybox", "--mem", "2097152"])).unwrap();
-        assert_eq!((size.mem_mib, size.max_mib), (2097152, 2097152), "--mem past the host's memory: no hotplug");
-        assert_eq!(pull_size(&parse(&["pull", "busybox", "--mem", "2097153"])).unwrap_err().to_string(), "--mem must be at most 2097152 MiB");
     }
 
     #[test]
