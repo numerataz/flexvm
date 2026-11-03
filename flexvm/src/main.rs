@@ -1882,6 +1882,13 @@ fn vms(host: &Host) -> Vec<Value> {
         };
         vms.push(json!({"name": n, "state": state, "error": error}));
     }
+    // Derived where shown, never recorded: its IPv4 address under `vm_ipv6_prefix` (#1296).
+    let cfg = host.config_now();
+    for v in &mut vms {
+        if let Some(v6) = v["ip"].as_str().and_then(|ip| ip.parse().ok()).and_then(|ip| cfg.vm_ipv6(ip)) {
+            v["ipv6"] = json!(v6.to_string());
+        }
+    }
     vms
 }
 

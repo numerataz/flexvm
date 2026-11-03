@@ -613,7 +613,8 @@ warnings about likely mistakes.
 | `peers` | none | the other hosts' listen addresses, `HOST:PORT`: the only hosts this one takes migrations and routes from |
 | `vm_ips` | `10.200.0.0/16` | this host's VM addresses (CIDR or `FIRST-LAST`); disjoint from every peer's |
 | `cluster_ips` | `vm_ips` | every host's VM addresses: a peer's VM may have, route or borrow only one in it |
-| `dns` | none | the guests' DNS server (IPv4) |
+| `dns` | none | the guests' DNS server, or a list of up to three, in order (`["192.168.1.1", "1.1.1.1"]`). IPv6 ones are accepted but not given to guests yet (see [IPv6 addresses](#ipv6-addresses)) |
+| `vm_ipv6_prefix` | none | an IPv6 `/96`, the same on every host: each VM's IPv6 address is it plus the VM's IPv4 address (see [IPv6 addresses](#ipv6-addresses)) |
 | `underlay` | derived | the address peers route this host's VMs through |
 | `peer_underlays` | none | `{"HOST:PORT": ["IP", ...]}`: a peer's next hops besides its `peers` address |
 | `announce_dev` | derived | where the host answers ARP for its VMs and announces arrivals; `"none"`: off |
@@ -624,8 +625,10 @@ warnings about likely mistakes.
 Every command checks the file as it loads it (`Config::validate`): a key it
 does not know, a malformed address or range, a `peers` entry that is not
 `HOST:PORT`, a `peer_underlays` address that is loopback or not unicast, a
-non-IPv4 `dns`, a `listen` address without a nonzero port, or a `vm_ips`
-not inside `cluster_ips` makes every command refuse to start, naming the
+`dns` entry that is not an IP address (or more than three), a
+`vm_ipv6_prefix` that is not a usable `/96`, a `listen` address without a
+nonzero port, or a `vm_ips` not inside `cluster_ips` makes every command
+refuse to start, naming the
 file and the problem, until it is fixed. An explicit `underlay` that is
 loopback or not unicast is refused on write; on read it is ignored with a
 warning and the underlay is derived instead. A running process keeps the
@@ -643,6 +646,43 @@ There is no `config` command: the file is the interface, and a reload is
 how every process already picks up changes, so a command would only write
 the same JSON. `info` covers what a command added: the derived values and
 the warnings.
+
+### IPv6 addresses
+
+**Not usable yet.** With `vm_ipv6_prefix` set, flexvm derives and reports
+each VM's IPv6 address, but does not yet configure it in the guest or route
+it (the taps, routes and guest agent come with #1297 and #1298). Nothing
+answers at the address. `info` and the listener warn about this for as long
+as it is true. Setting the prefix now only lets every host agree on it
+before the data plane lands. Without it, nothing changes.
+
+A VM's IPv6 address is `vm_ipv6_prefix` with the VM's IPv4 address in the
+low 32 bits: with `"vm_ipv6_prefix": "fd00:0:0:1::/96"`, the VM at
+`10.200.0.7` is `fd00:0:0:1::ac8:7`. Nothing about it is stored: addresses,
+generations, loans, checkpoints and the peer protocol stay keyed by the IPv4
+address, and an address moves between hosts with its IPv4 address. Each host
+derives it from its own `vm_ipv6_prefix` and never from what a peer says, as
+with `cluster_ips`, so the prefix must be the same on every host. A VM that
+migrates to a host with another prefix is reported there under that host's
+prefix.
+
+The prefix must be a `/96` with its last 32 bits zero. A shorter prefix
+would leave bits between it and the IPv4 address that no VM uses, so to use
+a delegated `/64` (or any shorter prefix), give a `/96` inside it, such as
+`2001:db8:1:2::/96`. It may not be in the unspecified, loopback,
+IPv4-compatible (`::/96`), IPv4-mapped (`::ffff:0:0/96`), IPv4-translated
+(`::ffff:0:0:0/96`), NAT64 (`64:ff9b::/32`), link-local (`fe80::/10`) or
+multicast (`ff00::/8`) ranges. The `/96` is for VMs only: a `listen` or
+`peers` address inside it is refused, `info` and the listener warn about any
+of this host's interface addresses inside it, and no VM is given an IPv4
+address whose IPv6 address is one of this host's or a peer's.
+
+`ps --json`, `inspect` and `ps --format '{{.IPv6}}'` show it as `ipv6`, and
+`ps --filter ip=` matches either address. The Docker API reports it as
+`GlobalIPv6Address` with `GlobalIPv6PrefixLen` 128. A create that asks for
+`IPAMConfig.IPv6Address` is refused unless it is a derived address: alone,
+it picks the IPv4 address it was derived from; with `IPv4Address`, it must
+be that address's.
 
 ## Migrate
 
@@ -668,7 +708,8 @@ unnamed: its own tag stays as it was, and `images` shows the sent one as
 
 Networking is routed IPv4: flexvm provides no NAT or automatic internet
 egress. Arrange upstream routes or NAT yourself if guests need it. There is
-no default DNS server; set `dns`.
+no default DNS server; set `dns`. Guests get its IPv4 nameservers, in order
+(a rootfs whose agent predates lists takes only the first).
 
 Every host's `vm_ips` must be disjoint and inside `cluster_ips`, the
 same range on every host covering all of them: a peer's VM may have, route or

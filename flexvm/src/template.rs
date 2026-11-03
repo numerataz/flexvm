@@ -940,7 +940,7 @@ fn record_working_set(host: &crate::host::Host, paths: &Paths, dir: &Path, tap: 
     let fc = p.firecracker();
     fc.resume(crate::fc::API_TIMEOUT)?;
     retry(Duration::from_secs(10), Duration::from_millis(10), || guest::ping(&fc.sockets.vsock))?;
-    guest::start(&fc.sockets.vsock, "10.255.255.254".parse()?, None)?;
+    guest::start(&fc.sockets.vsock, "10.255.255.254".parse()?, &[])?;
     if tpl.meta.image.as_ref().is_some_and(|i| i.starts_at_run()) {
         guest::start_app(&fc.sockets.vsock, "")?;
     }

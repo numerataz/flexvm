@@ -91,7 +91,12 @@ pub struct Config {
     pub underlay: Option<Ipv4Addr>,
     /// None: derived (`announce_dev`); `none`: no announcements.
     pub announce_dev: Option<String>,
-    pub dns: Option<String>,
+    /// The guests' nameservers (`guest_dns`).
+    pub dns: Option<Dns>,
+    /// Every host's VM IPv6 prefix, the same on each (#1296): a VM's IPv6 address is it and the
+    /// VM's IPv4 address (`vm_ipv6`). None: VMs have no IPv6 address, and host.json no key an older build would refuse.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vm_ipv6_prefix: Option<crate::net::Ipv6Prefix>,
     /// None: `default_reserve`.
     pub reserve_mib: Option<u64>,
     /// Eviction's high-water mark (MiB available): below it VMs start moving
@@ -111,8 +116,29 @@ impl Default for Config {
             underlay: None,
             announce_dev: None,
             dns: None,
+            vm_ipv6_prefix: None,
             reserve_mib: None,
             evict_mib: None,
+        }
+    }
+}
+
+/// `dns`: one nameserver, or a list (#1296), each an IPv4 or IPv6 address; kept as written.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Dns {
+    One(String),
+    Many(Vec<String>),
+}
+
+/// As many nameservers as a guest's resolver reads (glibc's and musl's MAXNS).
+const MAX_DNS: usize = 3;
+
+impl Dns {
+    fn listed(&self) -> &[String] {
+        match self {
+            Dns::One(d) => std::slice::from_ref(d),
+            Dns::Many(ds) => ds,
         }
     }
 }
@@ -235,8 +261,19 @@ impl Config {
                 bail!("peer_underlays {peer}: {ip} is loopback or not unicast");
             }
         }
-        if let Some(d) = self.dns.as_deref().filter(|d| d.parse::<Ipv4Addr>().is_err()) {
-            bail!("bad dns {d:?}: give an IPv4 address");
+        let dns = self.dns.as_ref().map_or(&[][..], Dns::listed);
+        if let Some(d) = dns.iter().find(|d| d.parse::<IpAddr>().is_err()) {
+            bail!("bad dns {d:?}: give an IPv4 or IPv6 address, or a list of them");
+        }
+        if dns.len() > MAX_DNS {
+            bail!("dns lists {} nameservers: a guest's resolver reads at most {MAX_DNS}", dns.len());
+        }
+        if let Some(p) = self.vm_ipv6_prefix {
+            // The /96 is VMs' alone: never an address this host or a peer is reached by.
+            let mut reached = self.listen.iter().chain(&self.peers).filter_map(|a| a.parse::<SocketAddr>().ok()).map(|a| a.ip().to_canonical());
+            if let Some(a) = reached.find(|a| matches!(a, IpAddr::V6(v6) if p.ipv4_of(*v6).is_some())) {
+                bail!("vm_ipv6_prefix {p} covers {a}, a listen or peer address: the prefix is VMs' alone");
+            }
         }
         if self.announce_dev.as_deref() == Some("") {
             bail!("announce_dev is empty: name an interface, or \"none\"");
@@ -268,17 +305,35 @@ impl Config {
     }
 
     /// `here`: this host's own addresses and next hops (`here`).
-    fn warnings_by(&self, local: impl Fn(Ipv4Addr) -> Result<bool>, here: Result<Vec<(Ipv4Addr, &str)>>) -> Vec<String> {
+    fn warnings_by(&self, local: impl Fn(Ipv4Addr) -> Result<bool>, here: Result<Vec<(IpAddr, &str)>>) -> Vec<String> {
         let mut w = Vec::new();
         // Never handed out (`claim_new_in`), so likely a range meant for elsewhere (#1078).
         match (self.range(), here) {
             (Ok(range), Ok(here)) => {
-                for (ip, what) in here.into_iter().filter(|(ip, _)| range.contains(*ip)) {
-                    w.push(format!("flexvm: warning: vm_ips {} covers {ip}, this host's {what}: no vm is given it", self.vm_ips));
+                for (ip, what) in here {
+                    // An interface's IPv6 address can change after the config was saved too: warned, not refused.
+                    let in_prefix = |v6| self.vm_ipv6_prefix.and_then(|p| Some((p, p.ipv4_of(v6)?)));
+                    match ip {
+                        IpAddr::V4(v4) if range.contains(v4) => {
+                            w.push(format!("flexvm: warning: vm_ips {} covers {ip}, this host's {what}: no vm is given it", self.vm_ips))
+                        }
+                        IpAddr::V6(v6) => w.extend(in_prefix(v6).map(|(p, v4)| {
+                            format!("flexvm: warning: vm_ipv6_prefix {p} covers {ip}, this host's {what}: the prefix is VMs' alone, and no vm is given {v4}")
+                        })),
+                        IpAddr::V4(_) => {}
+                    }
                 }
             }
             (Ok(_), Err(e)) => w.push(format!("flexvm: warning: cannot check whether vm_ips {} covers this host's addresses: {e}", self.vm_ips)),
             (Err(_), _) => {}
+        }
+        if let Some(p) = self.vm_ipv6_prefix {
+            w.push(format!(
+                "flexvm: warning: vm_ipv6_prefix {p} is set: VMs' IPv6 addresses are reported, but not configured in guests or routed yet (#1297, #1298)"
+            ));
+        }
+        if let Some(d) = self.dns.as_ref().map_or(&[][..], Dns::listed).iter().find(|d| d.parse::<std::net::Ipv6Addr>().is_ok()) {
+            w.push(format!("flexvm: warning: dns {d} is IPv6: guests are not given IPv6 nameservers yet (#1298), only the IPv4 ones"));
         }
         if !self.peers.is_empty() && self.cluster_ips.is_none() {
             w.push(format!("flexvm: warning: cluster_ips is unset; peer VM addresses outside vm_ips {} are refused", self.vm_ips));
@@ -321,6 +376,19 @@ impl Config {
     /// Every configured peer's configured underlays.
     pub fn peer_underlay_addrs(&self) -> Vec<IpAddr> {
         self.peers.iter().flat_map(|p| self.underlays_of(p)).map(|&u| IpAddr::V4(u)).collect()
+    }
+
+    /// The IPv6 address of the VM with IPv4 address `ip` (`vm_ipv6_prefix`); None without a prefix.
+    /// Everything else (allocation, routes, records) stays keyed by `ip`.
+    pub fn vm_ipv6(&self, ip: Ipv4Addr) -> Option<std::net::Ipv6Addr> {
+        self.vm_ipv6_prefix.map(|p| p.vm(ip))
+    }
+
+    /// The nameservers guests are given: `dns`'s IPv4 ones, in order. IPv6 ones wait for guests to
+    /// have IPv6 (#1298); `warnings` says so.
+    pub fn guest_dns(&self) -> Vec<IpAddr> {
+        let listed = self.dns.as_ref().map_or(&[][..], Dns::listed).iter().filter_map(|d| d.parse::<IpAddr>().ok());
+        listed.filter(IpAddr::is_ipv4).collect()
     }
 
     pub fn effective_cluster_ips(&self) -> &str {
@@ -4852,13 +4920,10 @@ fn withdrawal_backoff(tries: u32) -> u64 {
 
 const REPAIR: &str = "; no dead vm's address is withdrawn here until it is repaired or removed by hand (or the address taken back with `flexvm reclaim`)";
 
-/// This network namespace's IPv4 addresses and next hops, each once: what no VM here is given.
-fn here() -> Result<Vec<(Ipv4Addr, &'static str)>> {
-    let local = crate::net::local_ips()?.into_iter().filter_map(|a| match a {
-        IpAddr::V4(v4) => Some((v4, "address")),
-        IpAddr::V6(_) => None,
-    });
-    let gateways = crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?).into_iter().map(|g| (g, "gateway"));
+/// This network namespace's addresses and IPv4 next hops, each once: what no VM here is given.
+fn here() -> Result<Vec<(IpAddr, &'static str)>> {
+    let local = crate::net::local_ips()?.into_iter().map(|a| (a, "address"));
+    let gateways = crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?).into_iter().map(|g| (IpAddr::V4(g), "gateway"));
     let mut all: Vec<_> = local.chain(gateways).collect();
     all.sort();
     all.dedup_by_key(|(ip, _)| *ip);
@@ -6191,7 +6256,13 @@ pub(crate) mod tests {
             r#"{"peers": ["192.168.1.11"]}"#,
             r#"{"peers": ["a:1"], "peer_underlays": {"a:1": ["127.0.0.1"]}}"#,
             r#"{"peers": ["a:1"], "peer_underlays": {"a:1": ["224.0.0.1"]}}"#,
-            r#"{"dns": "::1"}"#,
+            r#"{"dns": "dns.example"}"#,
+            r#"{"dns": ["1.1.1.1", "x"]}"#,
+            r#"{"dns": ["1.1.1.1", "1.0.0.1", "2606:4700:4700::1111", "8.8.8.8"]}"#,
+            r#"{"vm_ipv6_prefix": "fd00::/64"}"#,
+            r#"{"vm_ipv6_prefix": "fe80::/96"}"#,
+            r#"{"vm_ipv6_prefix": "fd00::/96", "listen": "[fd00::a09:1]:7070"}"#,
+            r#"{"vm_ipv6_prefix": "fd00::/96", "peers": ["[fd00::a09:2]:7070"]}"#,
             r#"{"announce_dev": ""}"#,
             r#"{"vm_ip": "10.9.0.0/24"}"#,
             r#"{"reserve_mib": "x"}"#,
@@ -6213,6 +6284,44 @@ pub(crate) mod tests {
         assert!(w.contains("gone:1") && w.contains("under the 300 MiB reserve"), "{w}");
         std::fs::write(&path, format!(r#"{{"reserve_mib": {}}}"#, total + 1)).unwrap();
         assert!(Host::open(&h.state, &h.run).unwrap().cfg.warnings().join("").contains("every start is refused"));
+    }
+
+    #[test]
+    fn dns_lists_and_the_vm_ipv6_prefix_round_trip_as_written() {
+        let (_dir, h) = host("dns-v6");
+        let path = h.state.join("host.json");
+        // Without them, nothing changes: no IPv6 address, the same one nameserver.
+        std::fs::write(&path, r#"{"dns": "192.0.2.53"}"#).unwrap();
+        let c = Host::open(&h.state, &h.run).unwrap().cfg;
+        assert_eq!((c.vm_ipv6(ip("10.200.0.7")), c.guest_dns()), (None, vec![IpAddr::V4(ip("192.0.2.53"))]));
+        let set = serde_json::to_value(&c).unwrap();
+        // Written back as read, and no new key unset: an older build refuses one it does not know.
+        assert!(set["dns"] == "192.0.2.53" && set.get("vm_ipv6_prefix").is_none(), "{set}");
+        assert!(!c.warnings().join("\n").contains("IPv6"));
+        std::fs::write(
+            &path,
+            r#"{"dns": ["2001:db8::53", "192.0.2.53", "192.0.2.54"], "vm_ipv6_prefix": "fd00:0:0:7:0:0::/96", "listen": "[fd00:0:0:8::1]:7070"}"#,
+        )
+        .unwrap();
+        let c = Host::open(&h.state, &h.run).unwrap().cfg;
+        assert_eq!(c.vm_ipv6(ip("10.200.0.7")), Some("fd00:0:0:7::ac8:7".parse().unwrap()));
+        // IPv6 nameservers wait for guests' IPv6 (#1298), with a warning.
+        assert_eq!(c.guest_dns(), [ip("192.0.2.53"), ip("192.0.2.54")].map(IpAddr::V4));
+        let set = serde_json::to_value(&c).unwrap();
+        assert_eq!(
+            (&set["dns"], &set["vm_ipv6_prefix"]),
+            (&serde_json::json!(["2001:db8::53", "192.0.2.53", "192.0.2.54"]), &serde_json::json!("fd00:0:0:7::/96"))
+        );
+        let w = c.warnings().join("\n");
+        assert!(w.contains("dns 2001:db8::53 is IPv6: guests are not given IPv6 nameservers yet"), "{w}");
+        assert!(w.contains("vm_ipv6_prefix fd00:0:0:7::/96 is set"), "{w}");
+        // An empty list gives guests none, as an unset one.
+        std::fs::write(&path, r#"{"dns": []}"#).unwrap();
+        assert!(Host::open(&h.state, &h.run).unwrap().cfg.guest_dns().is_empty());
+        // A bad prefix names the setting and why.
+        std::fs::write(&path, r#"{"vm_ipv6_prefix": "ff02::/96"}"#).unwrap();
+        let e = Host::open(&h.state, &h.run).err().unwrap().to_string();
+        assert!(e.contains("bad vm_ipv6_prefix \"ff02::/96\": multicast"), "{e}");
     }
 
     #[test]
@@ -7344,7 +7453,7 @@ pub(crate) mod tests {
         let (_dir, h) = host("fresh-gateway");
         let cfg = Config { vm_ips: "10.9.0.1-10.9.0.4".into(), ..Config::default() };
         let (gw, local) = (ip("10.9.0.1"), ip("10.9.0.3"));
-        let ok = |ip| crate::listen::routable_by(ip, &cfg, &[], &[gw], |ip| Ok(ip == local));
+        let ok = |ip| crate::listen::routable_by(ip, &cfg, &[], &[gw], |ip| Ok(ip == IpAddr::V4(local)));
         let _names = [h.take_name("a", false).unwrap(), h.take_name("b", false).unwrap()];
         let l = h.lock().unwrap();
         for want in [gw, local] {
@@ -7363,13 +7472,33 @@ pub(crate) mod tests {
 
     #[test]
     fn warnings_name_local_and_gateway_addresses_in_vm_ips() {
-        let cfg = Config { vm_ips: "10.9.0.0/24".into(), ..Config::default() };
-        let w = cfg.warnings_by(|_| Ok(false), Ok(vec![(ip("10.9.0.1"), "gateway"), (ip("10.9.0.7"), "address"), (ip("192.0.2.1"), "address")])).join("\n");
+        let mut cfg = Config { vm_ips: "10.9.0.0/24".into(), ..Config::default() };
+        let v6 = |s: &str| IpAddr::V6(s.parse().unwrap());
+        let here = || {
+            Ok(vec![
+                (ip("10.9.0.1").into(), "gateway"),
+                (ip("10.9.0.7").into(), "address"),
+                (ip("192.0.2.1").into(), "address"),
+                (v6("fd00:1::a09:7"), "address"),
+            ])
+        };
+        let w = cfg.warnings_by(|_| Ok(false), here()).join("\n");
         assert!(w.contains("vm_ips 10.9.0.0/24 covers 10.9.0.1, this host's gateway"), "{w}");
         assert!(w.contains("covers 10.9.0.7, this host's address") && !w.contains("192.0.2.1"), "{w}");
+        assert!(!w.contains("fd00:1::") && !w.contains("vm_ipv6_prefix"), "no prefix, no IPv6 warning: {w}");
         let w = cfg.warnings_by(|_| Ok(false), Err("getifaddrs failed".into())).join("\n");
         assert!(w.contains("cannot check whether vm_ips 10.9.0.0/24 covers this host's addresses: getifaddrs failed"), "{w}");
         assert!(!cfg.warnings_by(|_| Ok(false), Ok(vec![])).join("").contains("covers"));
+        // The prefix is VMs' alone: any address of this host in it, whatever vm_ips says.
+        cfg.vm_ipv6_prefix = Some(crate::net::Ipv6Prefix::parse("fd00:1::/96").unwrap());
+        let w = cfg.warnings_by(|_| Ok(false), here()).join("\n");
+        assert!(
+            w.contains("vm_ipv6_prefix fd00:1::/96 covers fd00:1::a09:7, this host's address: the prefix is VMs' alone, and no vm is given 10.9.0.7"),
+            "{w}"
+        );
+        assert!(w.contains("VMs' IPv6 addresses are reported, but not configured in guests or routed yet"), "{w}");
+        let w = cfg.warnings_by(|_| Ok(false), Ok(vec![(v6("fd00:2::a09:7"), "address")])).join("\n");
+        assert!(!w.contains("covers"), "{w}");
     }
 
     /// The periodic sweep expires loans, and an unreadable record neither fails it nor a loan.
@@ -9694,12 +9823,12 @@ pub(crate) mod tests {
         let mut writer = h.clone();
         writer
             .configure(|c| {
-                (c.vm_ips, c.dns) = ("10.7.0.5-10.7.0.5".into(), Some("10.7.0.53".into()));
+                (c.vm_ips, c.dns) = ("10.7.0.5-10.7.0.5".into(), Some(Dns::One("10.7.0.53".into())));
                 Ok(())
             })
             .unwrap();
         assert_eq!(h.cfg.vm_ips, "10.9.0.1-10.9.0.3", "opened before the change");
-        assert_eq!(h.config_now().dns.as_deref(), Some("10.7.0.53"));
+        assert_eq!(h.config_now().guest_dns(), [IpAddr::V4(ip("10.7.0.53"))]);
         let l = h.lock().unwrap();
         let e = h.claim_new(&l, "x", Some(old)).err().unwrap().to_string();
         assert!(e.contains("range 10.7.0.5-10.7.0.5"), "{e}");

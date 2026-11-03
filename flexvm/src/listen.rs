@@ -1296,7 +1296,7 @@ impl Cached {
 
 /// A peer routes only a VM's address, never one this host reaches its peers or network by (#365).
 fn routable(ip: Ipv4Addr, cfg: &crate::host::Config, peers: &[IpAddr], gateways: &[Ipv4Addr]) -> Result<()> {
-    routable_by(ip, cfg, peers, gateways, crate::net::is_local_addr)
+    routable_by(ip, cfg, peers, gateways, crate::net::is_local_ip)
 }
 
 /// `routable`'s refusals for a fresh VM's address (`Host::claim_new_in`), by the peers' addresses as
@@ -1307,15 +1307,16 @@ pub fn assignable<'a>(run: &std::path::Path, cfg: &'a crate::host::Config) -> Re
     let peers: Vec<IpAddr> = cfg.peers.iter().flat_map(|n| cache.addrs(n).unwrap_or_default()).collect();
     let gateways = crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?);
     let local = crate::net::local_ips()?;
-    Ok(move |ip: Ipv4Addr| routable_by(ip, cfg, &peers, &gateways, |ip| Ok(ip.is_loopback() || local.contains(&IpAddr::V4(ip)))))
+    Ok(move |ip: Ipv4Addr| routable_by(ip, cfg, &peers, &gateways, |ip| Ok(ip.is_loopback() || local.contains(&ip))))
 }
 
+/// `local`: whether an address (the VM's, or its IPv6 address) is this host's.
 pub(crate) fn routable_by(
     ip: Ipv4Addr,
     cfg: &crate::host::Config,
     peers: &[IpAddr],
     gateways: &[Ipv4Addr],
-    local: impl FnOnce(Ipv4Addr) -> Result<bool>,
+    local: impl Fn(IpAddr) -> Result<bool>,
 ) -> Result<()> {
     // Only local configuration authorizes a VM address; a peer's range is untrusted.
     if !cfg.cluster()?.contains(ip) {
@@ -1326,8 +1327,14 @@ pub(crate) fn routable_by(
     let listen = cfg.listen.as_deref().and_then(|s| s.parse::<SocketAddr>().ok()).map(|a| a.ip().to_canonical());
     let underlay = cfg.underlay == Some(ip) || listen == Some(IpAddr::V4(ip));
     let special = ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || underlay || gateways.contains(&ip);
-    if peer || special || local(ip)? {
+    if peer || special || local(IpAddr::V4(ip))? {
         bail!("{ip} is not a vm's address: a local, peer, underlay or gateway address, or not unicast");
+    }
+    // Its IPv6 address, the same on every host (`vm_ipv6_prefix`), is never one either.
+    if let Some(v6) = cfg.vm_ipv6(ip).map(IpAddr::V6) {
+        if is_peer(peers, v6) || is_peer(&cfg.peer_underlay_addrs(), v6) || local(v6)? {
+            bail!("{ip} is not a vm's address: its IPv6 address {v6} is a local or peer address");
+        }
     }
     Ok(())
 }
@@ -2053,6 +2060,25 @@ mod tests {
             assert!(check(ip, &cfg).is_err(), "{ip} is refused even inside cluster_ips");
         }
         assert!(routable_by("10.201.0.7".parse().unwrap(), &cfg, &peers, &[gw], |_| Ok(true)).is_err());
+    }
+
+    #[test]
+    fn a_vms_ipv6_address_is_never_a_local_or_peer_address() {
+        let prefix = crate::net::Ipv6Prefix::parse("fd00:7::/96").unwrap();
+        let mut cfg = crate::host::Config::default();
+        let (vm, peer, here): (Ipv4Addr, Ipv4Addr, Ipv4Addr) = ("10.200.0.7".parse().unwrap(), "10.200.0.9".parse().unwrap(), "10.200.0.8".parse().unwrap());
+        let peers = [IpAddr::V6(prefix.vm(peer))];
+        let local = |ip: IpAddr| Ok(ip == IpAddr::V6(prefix.vm(here)));
+        // Without a prefix, IPv6 addresses say nothing of a VM's.
+        for ip in [vm, peer, here] {
+            routable_by(ip, &cfg, &peers, &[], local).unwrap();
+        }
+        cfg.vm_ipv6_prefix = Some(prefix);
+        routable_by(vm, &cfg, &peers, &[], local).unwrap();
+        for ip in [peer, here] {
+            let e = routable_by(ip, &cfg, &peers, &[], local).unwrap_err().to_string();
+            assert!(e.contains(&format!("its IPv6 address {} is a local or peer address", prefix.vm(ip))), "{e}");
+        }
     }
 
     #[test]

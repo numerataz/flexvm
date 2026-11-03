@@ -1033,6 +1033,69 @@ impl IpRange {
     }
 }
 
+/// `vm_ipv6_prefix` (#1296): a /96 whose low 32 bits are a VM's IPv4 address. Only a /96: a
+/// shorter prefix would leave bits between it and the IPv4 address that no VM tells apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ipv6Prefix(std::net::Ipv6Addr);
+
+/// Ranges a VM's IPv6 address must never be in, each as (first address, prefix length, what).
+const NOT_VM_IPV6: [(std::net::Ipv6Addr, u32, &str); 6] = [
+    (std::net::Ipv6Addr::UNSPECIFIED, 96, "unspecified, loopback or IPv4-compatible"),
+    (std::net::Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0), 96, "IPv4-mapped"),
+    (std::net::Ipv6Addr::new(0, 0, 0, 0, 0xffff, 0, 0, 0), 96, "IPv4-translated"),
+    (std::net::Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0, 0), 32, "NAT64"),
+    (std::net::Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0), 10, "link-local"),
+    (std::net::Ipv6Addr::new(0xff00, 0, 0, 0, 0, 0, 0, 0), 8, "multicast"),
+];
+
+impl Ipv6Prefix {
+    /// `ADDR/96`, its low 32 bits zero; never one a VM's address must not be in (`NOT_VM_IPV6`).
+    pub fn parse(s: &str) -> Result<Ipv6Prefix> {
+        let (net, len) = s.split_once('/').ok_or_else(|| format!("bad vm_ipv6_prefix {s:?}: give an IPv6 /96, as fd00:0:0:1::/96"))?;
+        let net: std::net::Ipv6Addr = net.parse().map_err(|_| format!("bad vm_ipv6_prefix {s:?}: {net:?} is not an IPv6 address"))?;
+        if len != "96" {
+            bail!("bad vm_ipv6_prefix {s:?}: the prefix length must be 96, the IPv4 address filling the other 32 bits");
+        }
+        if u128::from(net) as u32 != 0 {
+            bail!("bad vm_ipv6_prefix {s:?}: its last 32 bits must be zero (they are each VM's IPv4 address)");
+        }
+        if let Some((_, _, what)) = NOT_VM_IPV6.iter().find(|(first, len, _)| u128::from(net) >> (128 - len) == u128::from(*first) >> (128 - len)) {
+            bail!("bad vm_ipv6_prefix {s:?}: {what} addresses are never a VM's");
+        }
+        Ok(Ipv6Prefix(net))
+    }
+
+    /// The VM IPv6 address for `ip`: this prefix, with `ip` in the low 32 bits. Only local
+    /// configuration says it: a peer is told and tells IPv4 addresses alone.
+    pub fn vm(&self, ip: Ipv4Addr) -> std::net::Ipv6Addr {
+        (u128::from(self.0) | u128::from(u32::from(ip))).into()
+    }
+
+    /// Whether `ip` is in this /96, and the IPv4 address it would be a VM's.
+    pub fn ipv4_of(&self, ip: std::net::Ipv6Addr) -> Option<Ipv4Addr> {
+        let n = u128::from(ip);
+        (n >> 32 == u128::from(self.0) >> 32).then(|| Ipv4Addr::from(n as u32))
+    }
+}
+
+impl std::fmt::Display for Ipv6Prefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}/96", self.0)
+    }
+}
+
+impl serde::Serialize for Ipv6Prefix {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Ipv6Prefix {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        Ipv6Prefix::parse(&String::deserialize(d)?).map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1138,6 +1201,38 @@ mod tests {
         assert_eq!(writes.get(), 1, "success alone skips a write");
         enable_proxy_arp(&mut on, "eth0", Ok(2), write).unwrap();
         assert_eq!(writes.get(), 2, "the same name with a new index needs setup");
+    }
+
+    #[test]
+    fn a_vm_ipv6_address_is_the_prefix_and_its_ipv4_address() {
+        let p = Ipv6Prefix::parse("fd00:0:0:1:0:0::/96").unwrap();
+        assert_eq!(p.to_string(), "fd00:0:0:1::/96");
+        assert_eq!(p.vm("10.200.0.7".parse().unwrap()), "fd00:0:0:1::ac8:7".parse::<std::net::Ipv6Addr>().unwrap());
+        assert_eq!(p.ipv4_of("fd00:0:0:1::ac8:7".parse().unwrap()), Some("10.200.0.7".parse().unwrap()));
+        assert_eq!(p.ipv4_of("fd00:0:0:2::ac8:7".parse().unwrap()), None);
+        assert_eq!(serde_json::to_value(p).unwrap(), "fd00:0:0:1::/96");
+        assert_eq!(
+            serde_json::from_value::<Ipv6Prefix>(serde_json::json!("2001:db8::/96")).unwrap().vm(Ipv4Addr::new(192, 0, 2, 1)).to_string(),
+            "2001:db8::c000:201"
+        );
+        for (bad, why) in [
+            ("fd00::", "give an IPv6 /96"),
+            ("10.0.0.0/96", "not an IPv6 address"),
+            ("fd00::/64", "must be 96"),
+            ("fd00::/97", "must be 96"),
+            ("fd00::1/96", "last 32 bits"),
+            ("::/96", "loopback"),
+            ("::ffff:0:0/96", "IPv4-mapped"),
+            ("::ffff:0:0:0/96", "IPv4-translated"),
+            ("64:ff9b::/96", "NAT64"),
+            ("64:ff9b:1::/96", "NAT64"),
+            ("fe80::/96", "link-local"),
+            ("febf:1::/96", "link-local"),
+            ("ff02::/96", "multicast"),
+        ] {
+            let e = Ipv6Prefix::parse(bad).unwrap_err().to_string();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
     }
 
     #[test]

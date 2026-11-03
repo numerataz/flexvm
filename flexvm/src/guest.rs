@@ -372,10 +372,11 @@ fn refused(verb: &'static str, m: &[u8]) -> Error {
     format!("guest {}: {}", verb.to_lowercase(), refusal(m)).into()
 }
 
-/// Address, nameserver and wall clock; doubles as the readiness check.
-pub fn start(uds: &Path, ip: std::net::Ipv4Addr, dns: Option<&str>) -> Result<()> {
-    let dns = dns.unwrap_or("");
-    answered("START", Instant::now() + TIMEOUT, |by| match ask(uds, &format!("START {ip} {} {dns}", now()?), by)? {
+/// Address, nameservers and wall clock; doubles as the readiness check. An agent that predates
+/// lists of nameservers takes the first one.
+pub fn start(uds: &Path, ip: std::net::Ipv4Addr, dns: &[std::net::IpAddr]) -> Result<()> {
+    let dns: String = dns.iter().map(|d| format!(" {d}")).collect();
+    answered("START", Instant::now() + TIMEOUT, |by| match ask(uds, &format!("START {ip} {}{dns}", now()?), by)? {
         (FRAME_MSG, m) if m == b"ok" => Ok(()),
         (_, m) => Err(refused("START", &m)),
     })
@@ -822,7 +823,8 @@ mod tests {
                     "START" => {
                         assert_eq!(parts[1], "10.0.0.2");
                         assert!(parts[2].parse::<f64>().is_ok());
-                        assert_eq!(parts[3], "1.1.1.1");
+                        // Each nameserver a word of its own (an older agent takes the first), or none.
+                        assert!(matches!(parts[3..], ["1.1.1.1", "2001:db8::53"] | []), "{line}");
                     }
                     "CLOCK" => assert!(parts[1].parse::<f64>().is_ok()),
                     _ => assert_eq!(parts.len(), 1),
@@ -832,8 +834,8 @@ mod tests {
             }
         });
         let ip = "10.0.0.2".parse().unwrap();
-        start(&path, ip, Some("1.1.1.1")).unwrap();
-        let e = start(&path, ip, Some("1.1.1.1")).unwrap_err();
+        start(&path, ip, &["1.1.1.1".parse().unwrap(), "2001:db8::53".parse().unwrap()]).unwrap();
+        let e = start(&path, ip, &[]).unwrap_err();
         assert!(e.to_string().contains("guest start: unknown request START; rebuild the rootfs and its templates"), "{e}");
         assert_eq!(clock(&path, TIMEOUT).unwrap(), -2.5);
         assert!(clock(&path, TIMEOUT).unwrap_err().to_string().contains("guest clock: unknown request CLOCK; rebuild the rootfs and its templates"));
