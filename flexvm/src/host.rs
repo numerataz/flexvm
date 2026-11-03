@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -80,15 +80,16 @@ pub struct Config {
     pub listen: Option<String>,
     pub peers: Vec<String>,
     /// A peer's data-plane addresses besides those it is reached by (`peer_underlays`): next hops
-    /// it may report for its VMs, as its own `underlay` on another network. Only a configured peer's count.
+    /// it may report for its VMs, as its own `underlay` on another network, IPv4 or IPv6. Only a
+    /// configured peer's count.
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    pub peer_underlays: std::collections::BTreeMap<String, Vec<Ipv4Addr>>,
+    pub peer_underlays: std::collections::BTreeMap<String, Vec<IpAddr>>,
     /// Disjoint across hosts.
     pub vm_ips: String,
     /// Every host's VM addresses. None: only this host's `vm_ips`.
     pub cluster_ips: Option<String>,
-    /// None: derived (`underlay`).
-    pub underlay: Option<Ipv4Addr>,
+    /// Unset: derived (`underlay`, `underlay6`).
+    pub underlay: Underlay,
     /// None: derived (`announce_dev`); `none`: no announcements.
     pub announce_dev: Option<String>,
     /// The guests' nameservers (`guest_dns`).
@@ -113,7 +114,7 @@ impl Default for Config {
             peer_underlays: Default::default(),
             vm_ips: "10.200.0.0/16".into(),
             cluster_ips: None,
-            underlay: None,
+            underlay: Underlay::default(),
             announce_dev: None,
             dns: None,
             vm_ipv6_prefix: None,
@@ -143,6 +144,94 @@ impl Dns {
     }
 }
 
+/// This host's explicit underlay addresses, at most one of each family: `underlay` in host.json
+/// is an address (as it always was, now of either family), or a list of an IPv4 and an IPv6
+/// address. A family left out is derived (`Config::underlay`, `Config::underlay6`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Underlay {
+    pub v4: Option<Ipv4Addr>,
+    pub v6: Option<Ipv6Addr>,
+}
+
+impl Underlay {
+    pub fn addrs(&self) -> impl Iterator<Item = IpAddr> {
+        self.v4.map(IpAddr::V4).into_iter().chain(self.v6.map(IpAddr::V6))
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        self.addrs().any(|u| u == ip)
+    }
+
+    fn remove(&mut self, ip: IpAddr) {
+        match ip {
+            IpAddr::V4(_) => self.v4 = None,
+            IpAddr::V6(_) => self.v6 = None,
+        }
+    }
+
+    fn from_addrs(addrs: impl IntoIterator<Item = IpAddr>) -> std::result::Result<Underlay, String> {
+        let mut u = Underlay::default();
+        for ip in addrs {
+            let taken = match ip {
+                IpAddr::V4(v4) => u.v4.replace(v4).is_some(),
+                IpAddr::V6(v6) => u.v6.replace(v6).is_some(),
+            };
+            if taken {
+                return Err(format!("underlay lists two {} addresses: give at most one of each family", if ip.is_ipv4() { "IPv4" } else { "IPv6" }));
+            }
+        }
+        Ok(u)
+    }
+}
+
+impl From<IpAddr> for Underlay {
+    fn from(ip: IpAddr) -> Underlay {
+        let mut u = Underlay::default();
+        match ip {
+            IpAddr::V4(v4) => u.v4 = Some(v4),
+            IpAddr::V6(v6) => u.v6 = Some(v6),
+        }
+        u
+    }
+}
+
+/// One address, of either family.
+impl std::str::FromStr for Underlay {
+    type Err = std::net::AddrParseError;
+    fn from_str(s: &str) -> std::result::Result<Underlay, Self::Err> {
+        s.parse::<IpAddr>().map(Underlay::from)
+    }
+}
+
+/// A single address is written as one, as before; none as null.
+impl Serialize for Underlay {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        match self.addrs().collect::<Vec<_>>().as_slice() {
+            [] => s.serialize_none(),
+            [one] => one.serialize(s),
+            all => all.serialize(s),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Underlay {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Given {
+            One(String),
+            List(Vec<String>),
+        }
+        let given = match Option::<Given>::deserialize(d)? {
+            None => Vec::new(),
+            Some(Given::One(a)) => vec![a],
+            Some(Given::List(l)) => l,
+        };
+        let parse = |a: &String| a.parse::<IpAddr>().map_err(|e| serde::de::Error::custom(format!("bad underlay {a:?}: {e}")));
+        Underlay::from_addrs(given.iter().map(parse).collect::<std::result::Result<Vec<_>, D::Error>>()?).map_err(serde::de::Error::custom)
+    }
+}
+
 /// The reserve of a host that sets none: a sixteenth of its RAM, from 256 MiB to 4 GiB.
 pub fn default_reserve() -> u64 {
     static TOTAL: OnceLock<u64> = OnceLock::new();
@@ -153,30 +242,54 @@ fn reserve_for(total_mib: u64) -> u64 {
     (total_mib / 16).clamp(256, 4096)
 }
 
-/// The underlay address and announce device derived toward the peers.
-type Derived = (Option<Ipv4Addr>, Option<String>);
+/// The underlay addresses (one of each family, either may be missing) and announce device
+/// derived toward the peers.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Derived {
+    v4: Option<Ipv4Addr>,
+    v6: Option<Ipv6Addr>,
+    dev: Option<String>,
+}
 
 /// Which peer the underlay and announce device are derived toward.
 #[derive(Debug, PartialEq)]
 pub enum Toward {
     /// Every peer is on this machine (loopback, or one of its addresses), or there is none.
     Local,
-    /// The first peer elsewhere with an IPv4 address.
-    Remote(Ipv4Addr),
-    /// Peers elsewhere, none with an IPv4 address (or a name that did not resolve).
+    /// The first peer elsewhere with an address of the family.
+    Remote(IpAddr),
+    /// Peers elsewhere, none with an address of the family (or a name that did not resolve).
     Unknown,
 }
 
-/// `peers`: each peer's addresses, none for a name that did not resolve.
-pub fn toward(peers: &[Vec<IpAddr>], local: impl Fn(Ipv4Addr) -> bool) -> Toward {
+/// The addresses of a peer's that `toward` takes.
+#[derive(Debug, Clone, Copy)]
+pub enum Family {
+    V4,
+    /// Not link-local: a next hop of link scope needs an interface named with it.
+    V6,
+    Either,
+}
+
+impl Family {
+    fn takes(self, a: IpAddr) -> bool {
+        match a {
+            IpAddr::V4(_) => matches!(self, Family::V4 | Family::Either),
+            IpAddr::V6(v6) => matches!(self, Family::V6 | Family::Either) && !v6.is_unicast_link_local(),
+        }
+    }
+}
+
+/// `peers`: each peer's addresses, none for a name that did not resolve; an IPv4-mapped one is its IPv4.
+pub fn toward(peers: &[Vec<IpAddr>], family: Family, local: impl Fn(IpAddr) -> bool) -> Toward {
     let mut out = Toward::Local;
     for addrs in peers {
-        let v4: Vec<Ipv4Addr> = addrs.iter().filter_map(|a| if let IpAddr::V4(v) = a.to_canonical() { Some(v) } else { None }).collect();
-        if addrs.iter().any(|a| a.to_canonical().is_loopback()) || v4.iter().any(|&a| local(a)) {
+        let addrs: Vec<IpAddr> = addrs.iter().map(IpAddr::to_canonical).collect();
+        if addrs.iter().any(|&a| a.is_loopback() || local(a)) {
             continue;
         }
-        match v4.first() {
-            Some(&a) => return Toward::Remote(a),
+        match addrs.into_iter().find(|&a| family.takes(a)) {
+            Some(a) => return Toward::Remote(a),
             None => out = Toward::Unknown,
         }
     }
@@ -193,21 +306,43 @@ type LookedUp = Mutex<Option<HashMap<String, Vec<IpAddr>>>>;
 /// What a derivation found, and the peers whose addresses were unknown.
 type Outcome = (std::result::Result<Derived, String>, Vec<String>);
 
-/// The underlay address and announce device toward `peers`, and the peers that did not
+/// The underlay addresses and announce device toward `peers`, and the peers that did not
 /// resolve: `lookup` gives a peer's addresses, `route` the device, source and whether the
 /// device is Ethernet (one that is not, a WireGuard or tun link, takes no ARP announcements).
+/// Each family's underlay is the source toward the first peer elsewhere with an address of
+/// it; the announce device is the IPv4 route's, else the IPv6 one's. An error only when
+/// neither family has one.
 fn derive(
     peers: &[String],
     lookup: impl Fn(&str) -> std::io::Result<Vec<IpAddr>>,
-    local: impl Fn(Ipv4Addr) -> bool,
-    route: impl Fn(Ipv4Addr) -> Result<(String, Ipv4Addr, bool)>,
+    local: impl Fn(IpAddr) -> bool,
+    route: impl Fn(IpAddr) -> Result<(String, IpAddr, bool)>,
 ) -> Outcome {
     let mut unresolved = Vec::new();
     let addrs: Vec<Vec<IpAddr>> = peers.iter().map(|p| lookup(p).unwrap_or_else(|e| (unresolved.push(format!("peer {p}: {e}")), Vec::new()).1)).collect();
-    let out = match toward(&addrs, local) {
-        Toward::Local => Ok((Some(Ipv4Addr::LOCALHOST), None)),
-        Toward::Remote(to) => route(to).map(|(dev, src, ether)| (Some(src), ether.then_some(dev))).map_err(|e| e.to_string()),
-        Toward::Unknown => Err("no peer elsewhere has a known IPv4 address".into()),
+    // Local or not is the same for both families: whether any peer is elsewhere.
+    if toward(&addrs, Family::Either, &local) == Toward::Local {
+        return (Ok(Derived { v4: Some(Ipv4Addr::LOCALHOST), v6: Some(Ipv6Addr::LOCALHOST), dev: None }), unresolved);
+    }
+    let from = |family| match toward(&addrs, family, &local) {
+        Toward::Remote(to) => Some(route(to).and_then(|(dev, src, ether)| match underlay_fault(src) {
+            Some(why) if src.is_ipv6() => bail!("the route toward {to} has source {src}, {why}"),
+            _ => Ok((src, ether.then_some(dev))),
+        })),
+        Toward::Local | Toward::Unknown => None,
+    };
+    let (mut d, mut errs) = (Derived::default(), Vec::new());
+    for found in [from(Family::V4), from(Family::V6)].into_iter().flatten() {
+        match found {
+            Ok((IpAddr::V4(src), dev)) => (d.v4, d.dev) = (Some(src), dev),
+            Ok((IpAddr::V6(src), dev)) => (d.v6, d.dev) = (Some(src), if d.v4.is_some() { d.dev } else { dev }),
+            Err(e) => errs.push(e.to_string()),
+        }
+    }
+    let out = match (d.v4, d.v6, errs.is_empty()) {
+        (None, None, true) => Err("no peer elsewhere has a known IPv4 or IPv6 address".into()),
+        (None, None, false) => Err(errs.join("; ")),
+        _ => Ok(d),
     };
     (out, unresolved)
 }
@@ -252,13 +387,13 @@ impl Config {
         if let Some(p) = self.peers.iter().find(|p| !is_endpoint(p)) {
             bail!("bad peer {p:?}: give HOST:PORT, a peer's flexvm listen address");
         }
-        if let Some(ip) = self.underlay.filter(|ip| !is_underlay(ip)) {
-            bail!("underlay {ip} is loopback or not unicast");
+        if let Some((ip, why)) = self.underlay.addrs().find_map(|ip| Some((ip, underlay_fault(ip)?))) {
+            bail!("underlay {ip} is {why}");
         }
         // A peer's underlays count only while it is a peer (`underlays_of`): a dropped peer's are ignored.
         for (peer, ips) in &self.peer_underlays {
-            if let Some(ip) = ips.iter().find(|ip| !is_underlay(ip)) {
-                bail!("peer_underlays {peer}: {ip} is loopback or not unicast");
+            if let Some((ip, why)) = ips.iter().find_map(|&ip| Some((ip, underlay_fault(ip)?))) {
+                bail!("peer_underlays {peer}: {ip} is {why}");
             }
         }
         let dns = self.dns.as_ref().map_or(&[][..], Dns::listed);
@@ -285,15 +420,15 @@ impl Config {
     /// in this process, including repeated opens and live reloads.
     fn read(path: &Path) -> Result<Option<Self>> {
         let Some(mut cfg) = load::<Self>(path)? else { return Ok(None) };
-        let bad = cfg.underlay.filter(|ip| !is_underlay(ip));
-        if bad.is_some() {
-            cfg.underlay = None;
+        let bad: Vec<(IpAddr, &str)> = cfg.underlay.addrs().filter_map(|ip| Some((ip, underlay_fault(ip)?))).collect();
+        for &(ip, _) in &bad {
+            cfg.underlay.remove(ip);
         }
         cfg.validate()?;
-        if let Some(ip) = bad {
-            static WARNED: Mutex<Option<HashSet<(PathBuf, Ipv4Addr)>>> = Mutex::new(None);
+        for (ip, why) in bad {
+            static WARNED: Mutex<Option<HashSet<(PathBuf, IpAddr)>>> = Mutex::new(None);
             if WARNED.lock().unwrap().get_or_insert_default().insert((path.to_path_buf(), ip)) {
-                crate::log!("flexvm: warning: {}: underlay {ip} is loopback or not unicast; ignoring it and deriving underlay instead", path.display());
+                crate::log!("flexvm: warning: {}: underlay {ip} is {why}; ignoring it and deriving underlay instead", path.display());
             }
         }
         Ok(Some(cfg))
@@ -301,11 +436,11 @@ impl Config {
 
     /// What `flexvm info` and the listener warn of: valid, but likely a mistake.
     pub fn warnings(&self) -> Vec<String> {
-        self.warnings_by(crate::net::is_local_addr, here())
+        self.warnings_by(crate::net::is_local_ip, here())
     }
 
     /// `here`: this host's own addresses and next hops (`here`).
-    fn warnings_by(&self, local: impl Fn(Ipv4Addr) -> Result<bool>, here: Result<Vec<(IpAddr, &str)>>) -> Vec<String> {
+    fn warnings_by(&self, local: impl Fn(IpAddr) -> Result<bool>, here: Result<Vec<(IpAddr, &str)>>) -> Vec<String> {
         let mut w = Vec::new();
         // Never handed out (`claim_new_in`), so likely a range meant for elsewhere (#1078).
         match (self.range(), here) {
@@ -366,7 +501,7 @@ impl Config {
     }
 
     /// `peer`'s configured underlays (`peer_underlays`), none unless it is a configured peer.
-    pub fn underlays_of(&self, peer: &str) -> &[Ipv4Addr] {
+    pub fn underlays_of(&self, peer: &str) -> &[IpAddr] {
         match self.peers.iter().any(|p| p == peer) {
             true => self.peer_underlays.get(peer).map_or(&[], Vec::as_slice),
             false => &[],
@@ -375,7 +510,7 @@ impl Config {
 
     /// Every configured peer's configured underlays.
     pub fn peer_underlay_addrs(&self) -> Vec<IpAddr> {
-        self.peers.iter().flat_map(|p| self.underlays_of(p)).map(|&u| IpAddr::V4(u)).collect()
+        self.peers.iter().flat_map(|p| self.underlays_of(p)).copied().collect()
     }
 
     /// The IPv6 address of the VM with IPv4 address `ip` (`vm_ipv6_prefix`); None without a prefix.
@@ -395,11 +530,19 @@ impl Config {
         self.cluster_ips.as_deref().unwrap_or(&self.vm_ips)
     }
 
-    /// Never a wildcard address. Unset: the listen address, else the source
-    /// address of the kernel's route toward the first peer elsewhere, or
-    /// loopback when every peer is on this machine; never loopback with peers elsewhere.
+    /// The IPv4 underlay, the next hop peers route this host's VMs via. Never a wildcard
+    /// address. Unset: the listen address, else the source address of the kernel's route
+    /// toward the first peer elsewhere with an IPv4 address, or loopback when every peer is
+    /// on this machine; never loopback with peers elsewhere.
     pub fn underlay(&self) -> Option<Ipv4Addr> {
         self.underlay_by(true)
+    }
+
+    /// The IPv6 underlay, as `underlay` is the IPv4 one: set, the listen address (one of more
+    /// than link scope), else derived toward the first peer elsewhere with an IPv6 address
+    /// (not link-local), or ::1 when every peer is on this machine.
+    pub fn underlay6(&self) -> Option<Ipv6Addr> {
+        self.underlay6_by(true)
     }
 
     /// `underlay` starting no lookup (see `derived`): for callers under the host lock or on a
@@ -413,8 +556,16 @@ impl Config {
             IpAddr::V4(v4) => Some(v4),
             IpAddr::V6(_) => None,
         };
-        let listen = self.underlay.or_else(from_listen).filter(|u| !u.is_unspecified());
-        listen.or_else(|| self.derived(look).0)
+        let listen = self.underlay.v4.or_else(from_listen).filter(|u| !u.is_unspecified());
+        listen.or_else(|| self.derived(look).v4)
+    }
+
+    fn underlay6_by(&self, look: bool) -> Option<Ipv6Addr> {
+        let from_listen = || match self.listen.as_deref()?.parse::<SocketAddr>().ok()?.ip().to_canonical() {
+            IpAddr::V4(_) => None,
+            IpAddr::V6(v6) => Some(v6).filter(|v6| !v6.is_unspecified() && !v6.is_unicast_link_local()),
+        };
+        self.underlay.v6.or_else(from_listen).or_else(|| self.derived(look).v6)
     }
 
     /// Unset: that route's device, none for peers on this machine; `none`: no announcements.
@@ -422,7 +573,7 @@ impl Config {
         match self.announce_dev.as_deref() {
             Some("none") => None,
             Some(dev) => Some(dev.into()),
-            None => self.derived(true).1,
+            None => self.derived(true).dev,
         }
     }
 
@@ -465,7 +616,7 @@ impl Config {
             })
         };
         let route = |to| crate::net::route_get(to).map(|(dev, src)| (dev.clone(), src, crate::net::is_ethernet(&dev)));
-        let (out, unresolved) = derive(&self.peers, find, |a| crate::net::is_local_addr(a).unwrap_or(false), route);
+        let (out, unresolved) = derive(&self.peers, find, |a| crate::net::is_local_ip(a).unwrap_or(false), route);
         match out {
             Ok(d) => (d, None),
             Err(e) if unseen.is_empty() => {
@@ -490,7 +641,8 @@ impl Config {
     /// Where peers reach this host's listener (a migration target pulls
     /// pages from it): the listen address, or for a wildcard one (0.0.0.0,
     /// ::, ::ffff:0.0.0.0) or an IPv6 link-local one (its scope id means
-    /// nothing elsewhere) the underlay address with the listen port. None
+    /// nothing elsewhere) the underlay address with the listen port: an IPv6
+    /// one's the IPv4 underlay, else (only IPv6 peers) the IPv6 one. None
     /// without a listener.
     pub fn advertise(&self) -> Result<Option<String>> {
         self.advertise_by(true)
@@ -511,8 +663,12 @@ impl Config {
         if !local_only {
             return Ok(Some(SocketAddr::new(ip, addr.port()).to_string()));
         }
-        match self.underlay_by(look) {
-            Some(u) => Ok(Some(SocketAddr::from((u, addr.port())).to_string())),
+        let underlay = match ip {
+            IpAddr::V4(_) => self.underlay_by(look).map(IpAddr::V4),
+            IpAddr::V6(_) => self.underlay_by(look).map(IpAddr::V4).or_else(|| self.underlay6_by(look).map(IpAddr::V6)),
+        };
+        match underlay {
+            Some(u) => Ok(Some(SocketAddr::new(u, addr.port()).to_string())),
             None => bail!(
                 "listening on {listen} needs an underlay address (none derived toward the peers: set underlay in host.json): peers cannot reach a wildcard or link-local address"
             ),
@@ -520,9 +676,17 @@ impl Config {
     }
 }
 
-/// Explicit host and peer underlays must be non-loopback unicast addresses.
-fn is_underlay(ip: &Ipv4Addr) -> bool {
-    !ip.is_unspecified() && !ip.is_broadcast() && !ip.is_multicast() && !ip.is_loopback()
+/// Why `ip` is no explicit host or peer underlay: one is a unicast address other than
+/// loopback, and an IPv6 one is not link-local (a next hop there needs an interface) nor
+/// IPv4-mapped (an IPv4 underlay is given as one).
+fn underlay_fault(ip: IpAddr) -> Option<&'static str> {
+    match ip {
+        IpAddr::V4(v4) if v4.is_unspecified() || v4.is_broadcast() || v4.is_multicast() || v4.is_loopback() => Some("loopback or not unicast"),
+        IpAddr::V6(v6) if v6.is_unspecified() || v6.is_multicast() || v6.is_loopback() => Some("loopback or not unicast"),
+        IpAddr::V6(v6) if v6.is_unicast_link_local() => Some("link-local"),
+        IpAddr::V6(v6) if v6.to_ipv4_mapped().is_some() => Some("IPv4-mapped: give the IPv4 address"),
+        _ => None,
+    }
 }
 
 /// HOST:PORT, an IPv6 address in brackets; a name is resolved only when used.
@@ -4920,11 +5084,17 @@ fn withdrawal_backoff(tries: u32) -> u64 {
 
 const REPAIR: &str = "; no dead vm's address is withdrawn here until it is repaired or removed by hand (or the address taken back with `flexvm reclaim`)";
 
-/// This network namespace's addresses and IPv4 next hops, each once: what no VM here is given.
+/// This network namespace's addresses and next hops, IPv4 and IPv6, each once: what no VM here is given.
 fn here() -> Result<Vec<(IpAddr, &'static str)>> {
     let local = crate::net::local_ips()?.into_iter().map(|a| (a, "address"));
-    let gateways = crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?).into_iter().map(|g| (IpAddr::V4(g), "gateway"));
-    let mut all: Vec<_> = local.chain(gateways).collect();
+    let gateways = crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?).into_iter().map(|g| (g.into(), "gateway"));
+    // None without IPv6 (`ipv6.disable=1`).
+    let table6 = match std::fs::read_to_string("/proc/net/ipv6_route") {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        t => t?,
+    };
+    let gateways6 = crate::net::gateways6(&table6).into_iter().map(|g| (g.into(), "gateway"));
+    let mut all: Vec<_> = local.chain(gateways).chain(gateways6).collect();
     all.sort();
     all.dedup_by_key(|(ip, _)| *ip);
     Ok(all)
@@ -6358,20 +6528,62 @@ pub(crate) mod tests {
             ("239.255.255.255", false),
             ("127.0.0.1", false),
             ("127.1.2.3", false),
+            ("2001:db8::7", true),
+            ("fd00::1", true),
+            ("::", false),
+            ("::1", false),
+            ("ff02::1", false),
+            ("fe80::1", false),
+            ("::ffff:192.0.2.7", false),
         ] {
-            let ip = ip.parse().unwrap();
-            let mut cfg = Config { underlay: Some(ip), ..Config::default() };
+            let ip: IpAddr = ip.parse().unwrap();
+            let mut cfg = Config { underlay: ip.into(), ..Config::default() };
             assert_eq!(cfg.validate().is_ok(), valid, "underlay {ip}");
-            cfg.underlay = None;
+            cfg.underlay = Default::default();
             cfg.peer_underlays.insert("peer:7070".into(), vec![ip]);
             assert_eq!(cfg.validate().is_ok(), valid, "peer_underlays {ip}");
         }
     }
 
+    /// `underlay` in host.json: an address of either family, or one of each in a list; one is
+    /// written back as it was, a lone address.
+    #[test]
+    fn the_host_underlay_is_an_address_or_one_of_each_family() {
+        let parse = |json: &str| serde_json::from_str::<Config>(json).map(|c| c.underlay).map_err(|e| e.to_string());
+        let (v4, v6) = ("192.0.2.7".parse::<Ipv4Addr>().unwrap(), "2001:db8::7".parse::<Ipv6Addr>().unwrap());
+        assert_eq!(parse(r#"{}"#), Ok(Underlay::default()));
+        assert_eq!(parse(r#"{"underlay": null}"#), Ok(Underlay::default()));
+        assert_eq!(parse(r#"{"underlay": []}"#), Ok(Underlay::default()));
+        assert_eq!(parse(r#"{"underlay": "192.0.2.7"}"#), Ok(Underlay { v4: Some(v4), v6: None }));
+        assert_eq!(parse(r#"{"underlay": "2001:db8::7"}"#), Ok(Underlay { v4: None, v6: Some(v6) }));
+        assert_eq!(parse(r#"{"underlay": ["2001:db8::7", "192.0.2.7"]}"#), Ok(Underlay { v4: Some(v4), v6: Some(v6) }));
+        for (bad, why) in [
+            (r#"{"underlay": ["192.0.2.7", "192.0.2.8"]}"#, "two IPv4 addresses"),
+            (r#"{"underlay": ["2001:db8::7", "2001:db8::8"]}"#, "two IPv6 addresses"),
+            (r#"{"underlay": "192.0.2.300"}"#, "bad underlay \"192.0.2.300\""),
+            (r#"{"underlay": 7}"#, ""),
+        ] {
+            let e = parse(bad).unwrap_err();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+        // Saved as read: a lone address as one (as every existing host.json has it), both as a list.
+        let saved = |u: Underlay| serde_json::to_value(Config { underlay: u, ..Config::default() }).unwrap()["underlay"].clone();
+        assert_eq!(saved(Underlay::default()), serde_json::Value::Null);
+        assert_eq!(saved(Underlay { v4: Some(v4), v6: None }), serde_json::json!("192.0.2.7"));
+        assert_eq!(saved(Underlay { v4: None, v6: Some(v6) }), serde_json::json!("2001:db8::7"));
+        assert_eq!(saved(Underlay { v4: Some(v4), v6: Some(v6) }), serde_json::json!(["192.0.2.7", "2001:db8::7"]));
+        // Each is checked on its own; peer_underlays take either family too.
+        let both = Config { underlay: Underlay { v4: Some(v4), v6: Some("fe80::1".parse().unwrap()) }, ..Config::default() };
+        assert!(both.validate().unwrap_err().to_string().contains("underlay fe80::1 is link-local"));
+        let c: Config = serde_json::from_str(r#"{"peers": ["a:1"], "peer_underlays": {"a:1": ["198.51.100.7", "2001:db8::9"]}}"#).unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.underlays_of("a:1"), ["198.51.100.7".parse::<IpAddr>().unwrap(), "2001:db8::9".parse().unwrap()]);
+    }
+
     #[test]
     fn invalid_explicit_underlay_is_ignored_on_open_and_reload_with_one_warning() {
         const CHILD: &str = "FLEXVM_TEST_INVALID_UNDERLAY";
-        const BAD: [&str; 6] = ["0.0.0.0", "255.255.255.255", "224.0.0.1", "239.255.255.255", "127.0.0.1", "127.1.2.3"];
+        const BAD: [&str; 8] = ["0.0.0.0", "255.255.255.255", "224.0.0.1", "239.255.255.255", "127.0.0.1", "127.1.2.3", "::1", "ff02::1"];
         if std::env::var_os(CHILD).is_none() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "host::tests::invalid_explicit_underlay_is_ignored_on_open_and_reload_with_one_warning", "--nocapture"])
@@ -6391,12 +6603,12 @@ pub(crate) mod tests {
             for reload in [false, true] {
                 let (_dir, mut h) = host("legacy-underlay");
                 h.configure(|c| {
-                    c.underlay = Some("192.0.2.7".parse().unwrap());
+                    c.underlay = "192.0.2.7".parse().unwrap();
                     Ok(())
                 })
                 .unwrap();
                 let path = h.state.join("host.json");
-                let bad = Config { underlay: Some(ip.parse().unwrap()), reserve_mib: Some(123), ..Config::default() };
+                let bad = Config { underlay: ip.parse().unwrap(), reserve_mib: Some(123), ..Config::default() };
                 store(&path, &bad, true).unwrap();
                 let saved = std::fs::read(&path).unwrap();
                 if !reload {
@@ -6404,10 +6616,10 @@ pub(crate) mod tests {
                 }
                 for _ in 0..2 {
                     let cfg = h.config_now();
-                    assert!(cfg.underlay.is_none(), "{ip}");
+                    assert!(cfg.underlay == Default::default(), "{ip}");
                     assert_eq!(cfg.underlay(), Some(Ipv4Addr::LOCALHOST), "derived for no peers: {ip}");
                     assert_eq!(cfg.reserve_mib, Some(123), "other live edits still apply");
-                    assert!(Host::open(&h.state, &h.run).unwrap().cfg.underlay.is_none());
+                    assert!(Host::open(&h.state, &h.run).unwrap().cfg.underlay == Default::default());
                     // A fresh inode forces another read of the same invalid address.
                     store(&path, &bad, true).unwrap();
                 }
@@ -6421,29 +6633,29 @@ pub(crate) mod tests {
     fn explicit_underlay_content_is_checked_on_write() {
         let (_dir, mut h) = host("explicit-underlay-write");
         let path = h.state.join("host.json");
-        for good in ["192.0.2.7", "10.0.0.1"] {
+        for good in ["192.0.2.7", "10.0.0.1", "2001:db8::7"] {
             h.configure(|c| {
-                c.underlay = Some(good.parse().unwrap());
+                c.underlay = good.parse().unwrap();
                 Ok(())
             })
             .unwrap();
-            assert_eq!(Host::open(&h.state, &h.run).unwrap().cfg.underlay, Some(good.parse().unwrap()));
+            assert_eq!(Host::open(&h.state, &h.run).unwrap().cfg.underlay, good.parse().unwrap());
         }
-        for ip in ["0.0.0.0", "255.255.255.255", "224.0.0.1", "239.255.255.255", "127.0.0.1", "127.1.2.3"] {
+        for ip in ["0.0.0.0", "255.255.255.255", "224.0.0.1", "239.255.255.255", "127.0.0.1", "127.1.2.3", "::", "ff02::1"] {
             let saved = std::fs::read(&path).unwrap();
             let e = h
                 .configure(|c| {
-                    c.underlay = Some(ip.parse().unwrap());
+                    c.underlay = ip.parse().unwrap();
                     Ok(())
                 })
                 .unwrap_err()
                 .to_string();
             assert!(e.contains(&format!("underlay {ip} is loopback or not unicast")), "{e}");
             assert_eq!(std::fs::read(&path).unwrap(), saved, "invalid writes leave the file unchanged");
-            store(&path, &Config { underlay: Some(ip.parse().unwrap()), ..Config::default() }, true).unwrap();
+            store(&path, &Config { underlay: ip.parse().unwrap(), ..Config::default() }, true).unwrap();
             assert!(h.configure(|_| Ok(())).is_err(), "existing invalid underlays must also be refused on write");
             h.configure(|c| {
-                c.underlay = None;
+                c.underlay = Default::default();
                 Ok(())
             })
             .unwrap();
@@ -6946,7 +7158,7 @@ pub(crate) mod tests {
         let peers = vec!["flexvm-no-such-host.invalid:7070".into()];
         let cfg = |listen: Option<&str>, underlay: Option<&str>| Config {
             listen: listen.map(String::from),
-            underlay: underlay.map(ip),
+            underlay: underlay.map_or_else(Underlay::default, |u| u.parse().unwrap()),
             peers: peers.clone(),
             ..Config::default()
         };
@@ -6960,6 +7172,12 @@ pub(crate) mod tests {
             assert_eq!(cfg(Some(wild), Some("10.1.0.2")).advertise().unwrap().as_deref(), Some("10.1.0.2:7070"), "{wild}");
         }
         assert!(cfg(Some("0.0.0.0:7070"), Some("0.0.0.0")).advertise().is_err());
+        // An IPv6 wildcard takes the IPv6 underlay when there is no IPv4 one (only IPv6 peers);
+        // an IPv4 wildcard never does, as it takes no IPv6 connections.
+        assert_eq!(cfg(Some("[::]:7070"), Some("2001:db8::2")).advertise().unwrap().as_deref(), Some("[2001:db8::2]:7070"));
+        assert!(cfg(Some("0.0.0.0:7070"), Some("2001:db8::2")).advertise().is_err());
+        let both = Config { underlay: Underlay { v4: Some(ip("10.1.0.2")), v6: Some("2001:db8::2".parse().unwrap()) }, ..cfg(Some("[::]:7070"), None) };
+        assert_eq!(both.advertise().unwrap().as_deref(), Some("10.1.0.2:7070"), "as before, the IPv4 one first");
         // An IPv4-mapped wildcard binds as 0.0.0.0; a mapped address is its IPv4 one.
         assert!(cfg(Some("[::ffff:0:0]:7070"), None).advertise().is_err());
         assert_eq!(cfg(Some("[::ffff:0:0]:7070"), Some("10.1.0.2")).advertise().unwrap().as_deref(), Some("10.1.0.2:7070"));
@@ -9330,12 +9548,12 @@ pub(crate) mod tests {
         set(&mut h, |c| (c.listen, c.peers) = (Some("0.0.0.0:7070".into()), vec!["127.0.0.1:7071".into()]));
         let now = |r: &Host| (r.config_now().underlay(), r.config_now().announce_dev());
         assert_eq!(now(&running), (Some(Ipv4Addr::LOCALHOST), None));
-        set(&mut h, |c| (c.underlay, c.announce_dev) = (Some(Ipv4Addr::new(10, 3, 0, 1)), Some("lo".into())));
+        set(&mut h, |c| (c.underlay, c.announce_dev) = (IpAddr::from(Ipv4Addr::new(10, 3, 0, 1)).into(), Some("lo".into())));
         assert_eq!(now(&running), (Some(Ipv4Addr::new(10, 3, 0, 1)), Some("lo".into())));
         assert_eq!(running.config_now().advertise().unwrap().as_deref(), Some("10.3.0.1:7070"));
         set(&mut h, |c| c.announce_dev = Some("none".into()));
         assert_eq!(now(&running).1, None);
-        set(&mut h, |c| (c.underlay, c.peers) = (None, vec!["flexvm-no-such-host.invalid:7070".into()]));
+        set(&mut h, |c| (c.underlay, c.peers) = (Underlay::default(), vec!["flexvm-no-such-host.invalid:7070".into()]));
         assert_eq!(now(&running).0, None, "never loopback with a peer elsewhere");
     }
 
@@ -9366,7 +9584,7 @@ pub(crate) mod tests {
         assert_eq!(now(), (literal.underlay(), literal.announce_dev()), "derive the current route from cached addresses");
 
         h.configure(|c| {
-            c.underlay = Some("192.0.2.10".parse().unwrap());
+            c.underlay = "192.0.2.10".parse().unwrap();
             c.announce_dev = Some("lo".into());
             Ok(())
         })
@@ -9400,7 +9618,7 @@ pub(crate) mod tests {
             Err(std::io::Error::other("DNS lookup timed out"))
         };
         let write = |json: &str| std::fs::write(dir.join("peers.json"), json).unwrap();
-        let local = (Some(Ipv4Addr::LOCALHOST), None);
+        let local = Derived { v4: Some(Ipv4Addr::LOCALHOST), v6: Some(Ipv6Addr::LOCALHOST), dev: None };
 
         // No listener yet: both names looked up, and found on this machine; once.
         let memo = Memo::default();
@@ -9410,17 +9628,17 @@ pub(crate) mod tests {
         assert!(asked.take().is_empty(), "looked up once per process");
         // A caller under the host lock starts none, but has what this process found.
         assert_eq!(cfg.derived_by(&memo, None), (local.clone(), None));
-        assert_eq!(cfg.derived_by(&Memo::default(), None).0, (None, None));
+        assert_eq!(cfg.derived_by(&Memo::default(), None).0, Derived::default());
         assert!(asked.take().is_empty());
 
         // A lookup that hangs is waited for once: then the name counts as seen, with no addresses.
         let memo = Memo::default();
         let (d, why) = cfg.derived_by(&memo, Some(&hung));
-        assert_eq!((d, asked.take().len()), ((None, None), 2));
+        assert_eq!((d, asked.take().len()), (Derived::default(), 2));
         let why = why.unwrap();
         assert!(why.contains("start flexvm listen") && why.contains("seen.example:1, unseen.example:1") && why.contains("timed out"), "{why}");
         let (d, why) = cfg.derived_by(&memo, Some(&hung));
-        assert_eq!((d, asked.take()), ((None, None), Vec::<String>::new()));
+        assert_eq!((d, asked.take()), (Derived::default(), Vec::<String>::new()));
         assert!(why.unwrap().contains("start flexvm listen"), "the listener has still not looked them up");
         // Until the listener's entry stands instead.
         write(r#"{"names":{"seen.example:1":["127.0.0.1"],"unseen.example:1":["127.0.0.1"]}}"#);
@@ -9430,49 +9648,73 @@ pub(crate) mod tests {
         // The listener saw one, with no addresses: only the other is looked up.
         write(r#"{"names":{"seen.example:1":[]}}"#);
         let (d, why) = cfg.derived_by(&Memo::default(), Some(&hung));
-        assert_eq!((d, asked.take()), ((None, None), vec!["unseen.example:1".to_string()]));
+        assert_eq!((d, asked.take()), (Derived::default(), vec!["unseen.example:1".to_string()]));
         assert!(why.unwrap().contains("not looked up unseen.example:1 yet: start flexvm listen"));
 
         // It saw both: nothing is looked up, nor is the listener blamed.
         write(r#"{"names":{"seen.example:1":[],"unseen.example:1":["127.0.0.1"]}}"#);
         let (d, why) = cfg.derived_by(&Memo::default(), Some(&ok));
-        assert_eq!((d, asked.take()), ((None, None), Vec::<String>::new()));
+        assert_eq!((d, asked.take()), (Derived::default(), Vec::<String>::new()));
         let why = why.unwrap();
-        assert!(why.starts_with("no peer elsewhere has a known IPv4 address") && !why.contains("flexvm listen"), "{why}");
+        assert!(why.starts_with("no peer elsewhere has a known IPv4 or IPv6 address") && !why.contains("flexvm listen"), "{why}");
     }
 
     #[test]
     fn the_underlay_is_derived_toward_a_peer_elsewhere() {
         let ip = |s: &str| s.parse::<IpAddr>().unwrap();
-        let mine = |a: Ipv4Addr| a == Ipv4Addr::new(10, 0, 0, 5);
+        let mine = |a: IpAddr| a == ip("10.0.0.5") || a == ip("2001:db8::5");
         let peers = |p: &[&[&str]]| p.iter().map(|a| a.iter().map(|s| ip(s)).collect()).collect::<Vec<Vec<_>>>();
-        assert_eq!(toward(&[], mine), Toward::Local);
-        // Loopback (either family) or one of this host's addresses: on this machine, skipped.
-        assert_eq!(toward(&peers(&[&["127.0.0.1"], &["::1", "127.0.0.1"], &["10.0.0.5"]]), mine), Toward::Local);
-        assert_eq!(toward(&peers(&[&["127.0.0.1"], &["::1"], &["192.168.1.11"]]), mine), Toward::Remote("192.168.1.11".parse().unwrap()));
-        assert_eq!(toward(&peers(&[&["::ffff:192.168.1.11"]]), mine), Toward::Remote("192.168.1.11".parse().unwrap()));
-        // A name that did not resolve, or an IPv6-only peer: elsewhere, address unknown.
-        assert_eq!(toward(&peers(&[&["127.0.0.1"], &[]]), mine), Toward::Unknown);
-        assert_eq!(toward(&peers(&[&["2001:db8::2"], &["192.168.1.12"]]), mine), Toward::Remote("192.168.1.12".parse().unwrap()));
-        assert_eq!(toward(&peers(&[&["2001:db8::2"]]), mine), Toward::Unknown);
+        let (v4, v6) = (|p: &[&[&str]]| toward(&peers(p), Family::V4, mine), |p: &[&[&str]]| toward(&peers(p), Family::V6, mine));
+        assert_eq!(v4(&[]), Toward::Local);
+        assert_eq!(v6(&[]), Toward::Local);
+        // Loopback (either family) or one of this host's addresses (either family): on this machine, skipped.
+        let local: &[&[&str]] = &[&["127.0.0.1"], &["::1", "127.0.0.1"], &["10.0.0.5"], &["2001:db8::5", "192.168.1.11"]];
+        assert_eq!((v4(local), v6(local)), (Toward::Local, Toward::Local));
+        assert_eq!(v4(&[&["127.0.0.1"], &["::1"], &["192.168.1.11"]]), Toward::Remote(ip("192.168.1.11")));
+        assert_eq!(v4(&[&["::ffff:192.168.1.11"]]), Toward::Remote(ip("192.168.1.11")));
+        assert_eq!(v6(&[&["::ffff:192.168.1.11"]]), Toward::Unknown, "an IPv4-mapped address is IPv4");
+        // A name that did not resolve, or a peer with no address of the family: elsewhere, address unknown.
+        assert_eq!(v4(&[&["127.0.0.1"], &[]]), Toward::Unknown);
+        assert_eq!(v6(&[&["127.0.0.1"], &[]]), Toward::Unknown);
+        assert_eq!(v4(&[&["2001:db8::2"], &["192.168.1.12"]]), Toward::Remote(ip("192.168.1.12")));
+        assert_eq!(v4(&[&["2001:db8::2"]]), Toward::Unknown);
+        // Each family toward the first peer elsewhere with one; a link-local address is none.
+        assert_eq!(v6(&[&["2001:db8::2"], &["192.168.1.12"]]), Toward::Remote(ip("2001:db8::2")));
+        assert_eq!(v6(&[&["192.168.1.12"], &["192.168.1.13", "2001:db8::3"]]), Toward::Remote(ip("2001:db8::3")));
+        assert_eq!(v6(&[&["fe80::2"]]), Toward::Unknown);
+        assert_eq!(toward(&peers(&[&["fe80::2"], &["2001:db8::3"]]), Family::Either, mine), Toward::Remote(ip("2001:db8::3")));
+        assert_eq!(toward(&peers(&[&["2001:db8::2", "192.168.1.12"]]), Family::Either, mine), Toward::Remote(ip("2001:db8::2")));
         // Loopback only without peers elsewhere; the listen address, or one set, comes first.
         let cfg =
             |listen: &str, peers: &[&str]| Config { listen: Some(listen.into()), peers: peers.iter().map(|p| p.to_string()).collect(), ..Config::default() };
         assert_eq!(cfg("0.0.0.0:7070", &["127.0.0.1:7071"]).underlay(), Some(Ipv4Addr::LOCALHOST));
+        assert_eq!(cfg("0.0.0.0:7070", &["127.0.0.1:7071"]).underlay6(), Some(Ipv6Addr::LOCALHOST));
         assert_eq!(cfg("0.0.0.0:7070", &["127.0.0.1:7071", "flexvm-no-such-host.invalid:7070"]).underlay(), None);
+        assert_eq!(cfg("0.0.0.0:7070", &["127.0.0.1:7071", "flexvm-no-such-host.invalid:7070"]).underlay6(), None);
         assert_eq!(cfg("10.1.0.1:7070", &["flexvm-no-such-host.invalid:7070"]).underlay(), Some("10.1.0.1".parse().unwrap()));
-        let set = Config { underlay: Some("10.2.0.1".parse().unwrap()), ..cfg("0.0.0.0:7070", &["flexvm-no-such-host.invalid:7070"]) };
-        assert_eq!(set.underlay(), Some("10.2.0.1".parse().unwrap()));
-        // An IPv6 listener is told as it is, with or without an IPv4 underlay.
-        assert_eq!(cfg("[2001:db8::1]:7070", &["flexvm-no-such-host.invalid:7070"]).advertise().unwrap().as_deref(), Some("[2001:db8::1]:7070"));
+        let set = Config { underlay: "10.2.0.1".parse().unwrap(), ..cfg("0.0.0.0:7070", &["flexvm-no-such-host.invalid:7070"]) };
+        assert_eq!((set.underlay(), set.underlay6()), (Some("10.2.0.1".parse().unwrap()), None));
+        let set = Config { underlay: "2001:db8::7".parse().unwrap(), ..cfg("0.0.0.0:7070", &["flexvm-no-such-host.invalid:7070"]) };
+        assert_eq!((set.underlay(), set.underlay6()), (None, Some("2001:db8::7".parse().unwrap())));
+        // An IPv6 listener is told as it is, with or without an IPv4 underlay, and is the IPv6 underlay
+        // unless one is set; a wildcard or link-local one is none.
+        let v6 = cfg("[2001:db8::1]:7070", &["flexvm-no-such-host.invalid:7070"]);
+        assert_eq!(v6.advertise().unwrap().as_deref(), Some("[2001:db8::1]:7070"));
+        assert_eq!((v6.underlay(), v6.underlay6()), (None, Some("2001:db8::1".parse().unwrap())));
+        let set = Config { underlay: "2001:db8::7".parse().unwrap(), ..v6 };
+        assert_eq!(set.underlay6(), Some("2001:db8::7".parse().unwrap()));
+        for l in ["[::]:7070", "[fe80::1%2]:7070"] {
+            assert_eq!(cfg(l, &["flexvm-no-such-host.invalid:7070"]).underlay6(), None, "{l}");
+        }
         // The kernel's route toward a peer elsewhere: its device and source, as set ones override.
         let any = cfg("0.0.0.0:7070", &["192.0.2.1:7070"]);
         // Whatever the kernel answers is checked, a failed lookup included: then nothing is derived, never loopback.
-        let want = match crate::net::route_get("192.0.2.1".parse().unwrap()) {
-            Ok((dev, src)) => (Some(src), crate::net::is_ethernet(&dev).then_some(dev)),
-            Err(_) => (None, None),
+        let want = match crate::net::route_get(ip("192.0.2.1")) {
+            Ok((dev, IpAddr::V4(src))) => (Some(src), crate::net::is_ethernet(&dev).then_some(dev)),
+            _ => (None, None),
         };
         assert_eq!((any.underlay(), any.announce_dev()), want);
+        assert_eq!(any.underlay6(), None, "no IPv6 peer");
         let off = Config { announce_dev: Some("none".into()), ..any };
         assert_eq!(off.announce_dev(), None);
     }
@@ -9482,27 +9724,49 @@ pub(crate) mod tests {
         let peers = |p: &[&str]| p.iter().map(|p| p.to_string()).collect::<Vec<_>>();
         let lookup = |p: &str| match p {
             "far:1" => Ok(vec!["192.0.2.9".parse().unwrap()]),
+            "far6:1" => Ok(vec!["2001:db8::9".parse().unwrap()]),
+            "dual:1" => Ok(vec!["2001:db8::9".parse().unwrap(), "192.0.2.9".parse().unwrap()]),
             "near:1" => Ok(vec!["127.0.0.1".parse().unwrap()]),
             _ => Err(std::io::Error::other("no such name")),
         };
-        let src: Ipv4Addr = "192.0.2.1".parse().unwrap();
+        let (src, src6): (Ipv4Addr, Ipv6Addr) = ("192.0.2.1".parse().unwrap(), "2001:db8::1".parse().unwrap());
+        // IPv4 by eth0 (Ethernet if `ether`), IPv6 by wg0.
         let route = |ether: bool| {
-            move |to: Ipv4Addr| -> Result<(String, Ipv4Addr, bool)> {
-                assert_eq!(to, Ipv4Addr::new(192, 0, 2, 9));
-                Ok(("eth0".into(), src, ether))
+            move |to: IpAddr| -> Result<(String, IpAddr, bool)> {
+                match to {
+                    IpAddr::V4(to) => assert_eq!(to, Ipv4Addr::new(192, 0, 2, 9)),
+                    IpAddr::V6(_) => return Ok(("wg0".into(), src6.into(), false)),
+                }
+                Ok(("eth0".into(), src.into(), ether))
             }
         };
+        let d = |v4: Option<Ipv4Addr>, v6: Option<Ipv6Addr>, dev: Option<&str>| Derived { v4, v6, dev: dev.map(String::from) };
         let derive = |p: &[&str], ether| derive(&peers(p), lookup, |_| false, route(ether));
-        assert_eq!(derive(&["near:1"], true), (Ok((Some(Ipv4Addr::LOCALHOST), None)), vec![]));
-        assert_eq!(derive(&["near:1", "far:1"], true), (Ok((Some(src), Some("eth0".into()))), vec![]));
+        assert_eq!(derive(&["near:1"], true), (Ok(d(Some(Ipv4Addr::LOCALHOST), Some(Ipv6Addr::LOCALHOST), None)), vec![]));
+        assert_eq!(derive(&["near:1", "far:1"], true), (Ok(d(Some(src), None, Some("eth0"))), vec![]));
         // A WireGuard or tun device: the source still, but no ARP announcements on it.
-        assert_eq!(derive(&["far:1"], false), (Ok((Some(src), None)), vec![]));
+        assert_eq!(derive(&["far:1"], false), (Ok(d(Some(src), None, None)), vec![]));
         let gone = || vec!["peer gone:1: no such name".to_string()];
-        assert_eq!(derive(&["near:1", "gone:1"], true), (Err("no peer elsewhere has a known IPv4 address".into()), gone()));
+        assert_eq!(derive(&["near:1", "gone:1"], true), (Err("no peer elsewhere has a known IPv4 or IPv6 address".into()), gone()));
         // A peer that did not resolve is named even when the derivation succeeds by another.
-        assert_eq!(derive(&["gone:1", "far:1"], true), (Ok((Some(src), Some("eth0".into()))), gone()));
+        assert_eq!(derive(&["gone:1", "far:1"], true), (Ok(d(Some(src), None, Some("eth0"))), gone()));
         let failed = super::derive(&peers(&["far:1"]), lookup, |_| false, |_| Err("no route toward 192.0.2.9: Network is unreachable".into()));
         assert_eq!(failed.0, Err("no route toward 192.0.2.9: Network is unreachable".into()));
+        // IPv6 peers only: the IPv6 underlay alone (wg0 takes no announcements).
+        assert_eq!(derive(&["far6:1"], true), (Ok(d(None, Some(src6), None)), vec![]));
+        // Both families: each its own route's source; the IPv4 route's device announces.
+        assert_eq!(derive(&["far6:1", "far:1"], true), (Ok(d(Some(src), Some(src6), Some("eth0"))), vec![]));
+        assert_eq!(derive(&["dual:1"], false), (Ok(d(Some(src), Some(src6), None)), vec![]));
+        // One family's route failing leaves the other's.
+        let v6_fails = |to: IpAddr| match to {
+            IpAddr::V4(_) => Ok(("eth0".into(), src.into(), true)),
+            IpAddr::V6(_) => Err("no route toward 2001:db8::9: Network is unreachable".into()),
+        };
+        assert_eq!(super::derive(&peers(&["dual:1"]), lookup, |_| false, v6_fails).0, Ok(d(Some(src), None, Some("eth0"))));
+        // A route's IPv6 source must be a usable underlay: a link-local one is not.
+        let link_local = |_: IpAddr| Ok(("eth0".into(), "fe80::1".parse().unwrap(), true));
+        let e = super::derive(&peers(&["far6:1"]), lookup, |_| false, link_local).0.unwrap_err();
+        assert!(e.contains("source fe80::1, link-local"), "{e}");
     }
 
     /// A tap is this host's by its alias alone, whatever its name: hosts

@@ -4318,7 +4318,7 @@ mod tests {
             .configure(|cfg| {
                 cfg.reserve_mib = Some(u64::MAX / 4);
                 cfg.peers = vec![first_peer.clone()];
-                cfg.underlay = Some("192.0.2.10".parse().unwrap());
+                cfg.underlay = "192.0.2.10".parse().unwrap();
                 cfg.announce_dev = Some("none".into());
                 Ok(())
             })
@@ -4406,7 +4406,7 @@ mod tests {
             .configure(|cfg| {
                 cfg.reserve_mib = Some(0);
                 cfg.peers = vec![second_peer.clone()];
-                cfg.underlay = Some("192.0.2.20".parse().unwrap());
+                cfg.underlay = "192.0.2.20".parse().unwrap();
                 Ok(())
             })
             .unwrap();

@@ -615,8 +615,8 @@ warnings about likely mistakes.
 | `cluster_ips` | `vm_ips` | every host's VM addresses: a peer's VM may have, route or borrow only one in it |
 | `dns` | none | the guests' DNS server, or a list of up to three, in order (`["192.168.1.1", "1.1.1.1"]`). IPv6 ones are accepted but not given to guests yet (see [IPv6 addresses](#ipv6-addresses)) |
 | `vm_ipv6_prefix` | none | an IPv6 `/96`, the same on every host: each VM's IPv6 address is it plus the VM's IPv4 address (see [IPv6 addresses](#ipv6-addresses)) |
-| `underlay` | derived | the address peers route this host's VMs through |
-| `peer_underlays` | none | `{"HOST:PORT": ["IP", ...]}`: a peer's next hops besides its `peers` address |
+| `underlay` | derived | the address peers route this host's VMs through: an IPv4 or IPv6 address, or `["IPv4", "IPv6"]` for one of each |
+| `peer_underlays` | none | `{"HOST:PORT": ["IP", ...]}`: a peer's next hops besides its `peers` address, IPv4 or IPv6 |
 | `announce_dev` | derived | where the host answers ARP for its VMs and announces arrivals; `"none"`: off |
 | `reserve_mib` | a sixteenth of RAM, 256 MiB to 4 GiB | memory kept free |
 | `evict_mib` | the reserve plus the reserve or 512 | below this much available, VMs move to peers |
@@ -624,14 +624,16 @@ warnings about likely mistakes.
 
 Every command checks the file as it loads it (`Config::validate`): a key it
 does not know, a malformed address or range, a `peers` entry that is not
-`HOST:PORT`, a `peer_underlays` address that is loopback or not unicast, a
+`HOST:PORT`, a `peer_underlays` address that is loopback, not unicast, or
+IPv6 link-local or IPv4-mapped, an `underlay` listing two addresses of one family, a
 `dns` entry that is not an IP address (or more than three), a
 `vm_ipv6_prefix` that is not a usable `/96`, a `listen` address without a
 nonzero port, or a `vm_ips` not inside `cluster_ips` makes every command
 refuse to start, naming the
-file and the problem, until it is fixed. An explicit `underlay` that is
-loopback or not unicast is refused on write; on read it is ignored with a
-warning and the underlay is derived instead. A running process keeps the
+file and the problem, until it is fixed. An explicit `underlay` address that
+is loopback or not unicast (or IPv6 link-local or IPv4-mapped) is refused on
+write; on read it is ignored with a warning and that family's underlay is
+derived instead. A running process keeps the
 last valid configuration meanwhile, so an edit
 mid-write is never taken. Write it whole (an editor's save, or a temporary
 file renamed over it); it must be a regular file, not a link, that no one
@@ -743,19 +745,24 @@ again before reinstalling them. The default range, `10.200.0.0/16`, is the
 same on every host, so give each host its own once it has peers (`info`
 warns until then). Derived values:
 
-- `underlay`, the address peers route this host's VMs through: the listen
-  address, or for a wildcard one the source address of the kernel's route
-  toward the first peer not on this machine (`ip route get`, policy routing
-  included). With every peer on this machine (loopback, or one of its
-  addresses) it is loopback; with peers elsewhere, never. Peers take it as
-  one of the addresses they know this host by (its `peers` address, or one
-  its name resolves to); an underlay on another network than that address
-  (a separate data-plane network) is listed on each peer in
-  `peer_underlays`.
+- `underlay`, the address peers route this host's VMs through, one of each
+  family: the listen address, or for a wildcard one the source address of
+  the kernel's route toward the first peer not on this machine with an
+  address of that family (`ip route get`, `ip -6 route get` for IPv6 peers;
+  policy routing included; never toward a link-local address). With every
+  peer on this machine (loopback, or one of its addresses) it is loopback
+  (127.0.0.1 and ::1); with peers elsewhere, never. A family with no peer
+  elsewhere has none (`info` shows both, as `underlay` and `underlay6`).
+  Peers take it as one of the addresses they know this host by (its `peers`
+  address, or one its name resolves to); an underlay on another network
+  than that address (a separate data-plane network) is listed on each peer
+  in `peer_underlays`. VM routes and migrations go via the IPv4 underlay; a
+  `[::]` listener with only IPv6 peers is advertised at its IPv6 underlay.
 - `peer_underlays`: a peer's next hops besides its `peers` address, its
   `underlay` on another network. Only these, set here, are trusted: never an
-  address because it is on-link. Each must be non-loopback and unicast;
-  a local address is accepted with a warning.
+  address because it is on-link. Each must be non-loopback and unicast, and
+  an IPv6 one neither link-local nor IPv4-mapped; a local address is
+  accepted with a warning.
   Entries for a host no longer in `peers` are ignored (`info` warns).
 - `announce_dev`, where the host answers ARP for its VMs (`proxy_arp`) and
   announces a VM that arrives: that route's device, none for peers on this

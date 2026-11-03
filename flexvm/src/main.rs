@@ -891,7 +891,7 @@ fn child_args(args: &Args, words: &[&str]) -> Vec<String> {
 /// `info`: host.json as set, what is derived for the rest, and what looks like a mistake.
 fn info(host: &Host) -> Value {
     let c = &host.cfg;
-    let derived = json!({"prefix": host.tap_prefix(), "cluster_ips": c.effective_cluster_ips(), "underlay": c.underlay(), "announce_dev": c.announce_dev(), "reserve_mib": c.reserve(), "evict_at_mib": c.evict_at()});
+    let derived = json!({"prefix": host.tap_prefix(), "cluster_ips": c.effective_cluster_ips(), "underlay": c.underlay(), "underlay6": c.underlay6(), "announce_dev": c.announce_dev(), "reserve_mib": c.reserve(), "evict_at_mib": c.evict_at()});
     json!({"version": env!("CARGO_PKG_VERSION"), "config": host.state.join("host.json"), "set": c, "derived": derived, "warnings": c.warnings()})
 }
 
