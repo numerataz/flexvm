@@ -1787,6 +1787,14 @@ fn receive_inner<R: Read>(
     // As long as its guest memory, which opening it maps a bitmap of.
     let mem = file(r, "mem", meta.max_mib << 20..=meta.max_mib << 20)?;
     let staged = |n: &str| staging.dir.join(n);
+    // As its Firecracker placed them: the hotplug region beside this root filesystem.
+    let rootfs_len = match &local {
+        Some((have, _)) => have.metadata()?.len(),
+        None => std::fs::metadata(staged("rootfs"))?.len(),
+    };
+    if hotplug > hotplug_room(rootfs_len).map_err(|e| format!("template {id}: {e}"))? {
+        bail!("template {id}: its hotplug region and root filesystem do not fit Firecracker's {} GiB window", WINDOW_MIB >> 10);
+    }
     let (rootfs, rootfs_use) = match local {
         Some((have, held)) => {
             // Read the stream before hashing the cached copy: a slow disk must not stall the paced sender.
@@ -2664,6 +2672,24 @@ pub(crate) mod tests {
     }
 
     /// A generation in `f.dir` with a sparse memory file and a vmstate naming `rootfs` as given, sent.
+    #[test]
+    fn run_memory_past_a_template_at_the_window_does_not_suggest_a_larger_pull() {
+        let f = Fixture::new();
+        let run = |m: u64, mem_mib: u64, max_mib: u64| {
+            let meta = Meta { mem_mib, max_mib, ..f.meta.clone() };
+            crate::vm::Resources { cpus: None, memory_mib: Some(m) }.check(&meta).map_err(|e| e.to_string())
+        };
+        assert_eq!(run(2048, 256, 1024).unwrap_err(), "--memory 2048 MiB is more than the image's ceiling, 1024 MiB (pull it with --max for more)");
+        let full = 17280 + hotplug_room(0).unwrap();
+        run(full, 17280, full).unwrap();
+        assert_eq!(
+            run(full + 1, 17280, full).unwrap_err(),
+            format!("--memory {} MiB is more than the image's ceiling, {full} MiB (the most Firecracker's hotplug window holds)", full + 1)
+        );
+        let short = full - SLOT_MIB;
+        assert!(run(full, 17280, short).unwrap_err().ends_with("(pull it with --max for more)"));
+    }
+
     fn sent(f: &mut Fixture, rootfs_named: &str) -> (Arc<Template>, Vec<u8>) {
         std::fs::write(f.dir.join("vmstate"), format!("state, pmem at {rootfs_named}")).unwrap();
         let mem = File::create(f.dir.join("mem")).unwrap();

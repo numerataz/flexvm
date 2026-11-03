@@ -1124,7 +1124,12 @@ impl Resources {
                 );
             }
             if m > meta.max_mib {
-                bail!("--memory {m} MiB is more than the image's ceiling, {} MiB (pull it with --max for more)", meta.max_mib);
+                // A template with no room for another slot in Firecracker's window cannot be pulled larger.
+                let more = match meta.max_mib - meta.mem_mib + crate::template::SLOT_MIB <= crate::template::hotplug_room(0)? {
+                    true => "pull it with --max for more",
+                    false => "the most Firecracker's hotplug window holds",
+                };
+                bail!("--memory {m} MiB is more than the image's ceiling, {} MiB ({more})", meta.max_mib);
             }
         }
         Ok(())
