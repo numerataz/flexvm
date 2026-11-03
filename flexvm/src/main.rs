@@ -434,7 +434,9 @@ fn main() {
     };
     util::set_verbose(args.has("verbose") || logged);
     let vm = matches!(args.positional.first().map(String::as_str), Some("run" | "start" | "exec"));
-    let result = error.map_or_else(|| real_main(&args), Err);
+    // Here, not in `real_main`, which unit tests run on any host; after the arguments, whose errors come first.
+    let host_fits = || if reads_only(&args) { Ok(()) } else { check_applies(&args).and_then(|()| util::check_page_size()) };
+    let result = error.map_or_else(|| host_fits().and_then(|()| real_main(&args)), Err);
     if let Some(sig) = template::interrupted_signal() {
         util::raise_signal(sig);
     }
@@ -681,6 +683,20 @@ pub fn open_host(args: &Args) -> Result<Host> {
 
 fn paths(args: &Args) -> Result<Paths> {
     Ok(Paths::new(&state(args)?))
+}
+
+/// Commands that only read the state, so they run on any host: every other one may start a VM or a
+/// pager (`run`, `pull`, `listen`, `api`, a restart's) or act on one, and is refused on a host whose
+/// pages they cannot work in (`util::check_page_size`).
+fn reads_only(args: &Args) -> bool {
+    if args.has("help") || args.has("version") {
+        return true;
+    }
+    let words: Vec<&str> = args.positional.iter().take(2).map(String::as_str).collect();
+    matches!(
+        words[..],
+        [] | ["ps" | "images" | "inspect" | "logs" | "info" | "version" | "wait" | "login" | "logout", ..] | ["checkpoint", "ls"] | ["system", "df"]
+    )
 }
 
 fn real_main(args: &Args) -> Result<()> {

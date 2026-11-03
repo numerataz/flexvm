@@ -4137,7 +4137,7 @@ def forged_vmstate():
         try:
             for path, body in [("/machine-config", {"vcpu_count": 1, "mem_size_mib": 128}),
                                ("/boot-source", {"kernel_image_path": os.path.join(A.state, "artifacts", "vmlinux"),
-                                                 "boot_args": "console=ttyS0 reboot=k panic=1"}),
+                                                 "boot_args": f"console=ttyS0 {'reboot=k' if os.uname().machine == 'x86_64' else 'keep_bootcon'} panic=1"}),
                                ("/network-interfaces/eth0", {"iface_id": "eth0", "host_dev_name": tap + "a"}),
                                ("/vsock", {"guest_cid": 3, "uds_path": f"{d}/v.sock"}), *extra,
                                ("/actions", {"action_type": "InstanceStart"})]:

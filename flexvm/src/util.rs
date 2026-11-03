@@ -313,6 +313,18 @@ impl Drop for Slot {
 
 pub const PAGE_SIZE: usize = 4096;
 
+/// Fail before any VM or pager when host pages are not `PAGE_SIZE`: userfaultfd and pagemap
+/// work in host pages, which flexvm takes for guest ones (#1270).
+pub fn check_page_size() -> Result<()> {
+    page_size_refused(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).map_or(Ok(()), |e| Err(e.into()))
+}
+
+fn page_size_refused(size: libc::c_long) -> Option<String> {
+    (size != PAGE_SIZE as libc::c_long).then(|| {
+        format!("the host's page size is {size} bytes: flexvm runs only on a kernel with {PAGE_SIZE}-byte pages for now (https://github.com/numerataz/flexvm/issues/1270)")
+    })
+}
+
 /// Anonymous writable memory, unmapped on drop. Nonzero alignment also requests huge pages.
 pub struct Mmap {
     ptr: *mut u8,
@@ -663,9 +675,15 @@ pub fn check_kvm() -> Result<()> {
         .read(true)
         .write(true)
         .open("/dev/kvm")
-        .map_err(|e| format!("/dev/kvm: {e} (enable virtualization or nested virtualization; load kvm_intel/kvm_amd)"))?;
+        .map_err(|e| format!("/dev/kvm: {e} (enable virtualization or nested virtualization; {KVM_HINT})"))?;
     Ok(())
 }
+
+#[cfg(target_arch = "x86_64")]
+const KVM_HINT: &str = "load kvm_intel/kvm_amd";
+/// arm64 KVM is built in, and there only once the kernel boots at EL2.
+#[cfg(target_arch = "aarch64")]
+const KVM_HINT: &str = "the host kernel must boot at EL2";
 
 /// Looks `addr` up and sends `req` and reads its answer, all by `at`, connecting within `wait` of that;
 /// any failure names `addr`. The stream stays open for whatever follows.
@@ -1837,6 +1855,14 @@ fn scope(prefix: &[u8], pid: u32, start: u64, ns: Option<u64>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_4k_host_pages_are_taken() {
+        assert_eq!(page_size_refused(4096), None);
+        let e = page_size_refused(65536).unwrap();
+        assert!(e.contains("65536 bytes") && e.contains("issues/1270"), "{e}");
+        assert!(page_size_refused(16384).is_some());
+    }
 
     #[test]
     fn a_paced_deadline_moves_with_the_bytes() {
