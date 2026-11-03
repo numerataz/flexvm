@@ -243,6 +243,13 @@ pub fn route_hop(ip: crate::net::VmAddr, hop: Hop) -> Result<()> {
     if ip.v6.is_some() && crate::net::is_local_ip(hop.via())? {
         return Ok(());
     }
+    // Run there, it is not answered for on the LAN here (`net::proxy_add`): the peer is, as it
+    // announces it. A failure leaves the entry to a sweep (`gc::sweep`), not the route undone.
+    if let Some(v6) = ip.v6 {
+        if let Err(e) = crate::net::proxy_remove(v6) {
+            crate::log!("route {} via {}: {e}", ip.v4, hop.via());
+        }
+    }
     match (ip.v6, hop.via6()) {
         (Some(v6), Some(via6)) => crate::net::route_via6(v6, via6),
         (Some(v6), None) => {
@@ -568,11 +575,6 @@ impl Config {
             }
             (Ok(_), Err(e)) => w.push(format!("flexvm: warning: cannot check whether vm_ips {} covers this host's addresses: {e}", self.vm_ips)),
             (Err(_), _) => {}
-        }
-        if let Some(p) = self.vm_ipv6_prefix {
-            w.push(format!(
-                "flexvm: warning: vm_ipv6_prefix {p} is set: VMs' IPv6 addresses are configured in guests, routed (to peers via their IPv6 underlays) and held in migrations, but not answered for on the LAN (#1300)"
-            ));
         }
         let v6_dns = self.dns.as_ref().map_or(&[][..], Dns::listed).iter().find(|d| d.parse::<std::net::Ipv6Addr>().is_ok());
         if let Some(d) = v6_dns.filter(|_| self.vm_ipv6_prefix.is_none()) {
@@ -7906,7 +7908,7 @@ pub(crate) mod tests {
             "{w}"
         );
         assert!(
-            w.contains("VMs' IPv6 addresses are configured in guests, routed (to peers via their IPv6 underlays) and held in migrations, but not answered for on the LAN (#1300)"),
+            !w.contains("vm_ipv6_prefix fd00:1::/96 is set"),
             "{w}"
         );
         let w = cfg.warnings_by(|_| Ok(false), Ok(vec![(v6("fd00:2::a09:7"), "address")])).join("\n");

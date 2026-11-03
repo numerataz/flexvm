@@ -1412,6 +1412,7 @@ impl Proc {
         self.set_leaving(true);
         self.kill_vm();
         self.release_hold();
+        self.drop_proxy_ndp(&end);
         drop(self.standby.lock().unwrap().take());
         // Once its VM is gone, however it leaves (#948).
         self.refund_standby();
@@ -1679,6 +1680,7 @@ impl Proc {
         let (ip, gen, rev, dev) = (vm.ip, self.gen(), self.rev(), cfg.announce_dev());
         if let Some(dev) = &dev {
             let _ = crate::net::proxy_arp(dev);
+            self.proxy_ndp(dev);
         }
         if !self.announcer.route(&cfg, ip, gen, rev, || vm.state().local()) {
             return;
@@ -1688,6 +1690,10 @@ impl Proc {
             let arp = || {
                 if vm.state().local() {
                     crate::net::gratuitous_arp(&dev, ip).unwrap_or_else(|e| crate::log!("announce {ip}: {e}"));
+                    // Its IPv6 address's (`vm_ipv6_prefix`) beside it, as many and as far apart.
+                    if let Some(v6) = vm.addr().v6 {
+                        crate::net::unsolicited_na(&dev, v6).unwrap_or_else(|e| crate::log!("announce {v6}: {e}"));
+                    }
                 }
             };
             arp();
@@ -1696,6 +1702,30 @@ impl Proc {
             arp();
         }) {
             crate::log!("announce {ip}: no thread for its ARPs: {e}");
+        }
+    }
+
+    /// With `vm_ipv6_prefix`, the VM's IPv6 address answered for on the LAN (`net::proxy_add`): as it
+    /// is announced and on every tick while its address is served here, never once it is leaving
+    /// (`finish`, which removes it). A failure is logged once until one succeeds.
+    fn proxy_ndp(&self, dev: &str) {
+        static FAILED: AtomicBool = AtomicBool::new(false);
+        let vm = self.vm();
+        let Some(v6) = vm.addr().v6 else { return };
+        match crate::net::proxy_add(dev, v6, || vm.state().local() && !self.leaving.load(Ordering::SeqCst)) {
+            Ok(()) => FAILED.store(false, Ordering::SeqCst),
+            Err(e) if !FAILED.swap(true, Ordering::SeqCst) => crate::log!("vm {}: {e}; the LAN may not reach {v6}", vm.name),
+            Err(_) => {}
+        }
+    }
+
+    /// The VM's proxy entry goes once it is gone from here (`finish`), however it went: killed, died,
+    /// suspended, or never started. Not once moved: its route to its target took it then
+    /// (`host::route_hop`), unless the target shares this network namespace, whose entry it now is.
+    fn drop_proxy_ndp(&self, end: &End) {
+        let Some(v6) = self.vm.get().and_then(|vm| vm.addr().v6).filter(|_| !matches!(end, End::Moved(_))) else { return };
+        if let Err(e) = crate::net::proxy_remove(v6) {
+            crate::log!("vm {}: {e}", self.name());
         }
     }
 
@@ -2418,9 +2448,11 @@ impl Proc {
             let short = relief_needs_memory(&cfg, avail, self.host.run.join("evict.active").exists()) || vm.starving();
             self.ready_room(short);
             relieve(&self.host, avail, vm.starving(), &mut stopping);
-            // A derived announce device follows the routes (one that changed gets proxy ARP).
+            // A derived announce device follows the routes (one that changed gets proxy ARP, and the
+            // VM's proxy entry: one a removal took while it was served here comes back).
             if let Some(dev) = self.host.config_now().announce_dev() {
                 let _ = crate::net::proxy_arp(&dev);
+                self.proxy_ndp(&dev);
             }
         }
     }
@@ -2914,6 +2946,9 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     let _ = crate::net::ip_forward();
     if let Some(dev) = &host.cfg.announce_dev() {
         let _ = crate::net::proxy_arp(dev);
+        if host.cfg.vm_ipv6_prefix.is_some() {
+            let _ = crate::net::proxy_ndp(dev);
+        }
     }
     crate::artifacts::check_pinned(&paths.firecracker, &crate::artifacts::FIRECRACKER)?;
     let p = Proc::new(host, paths)?;

@@ -1246,7 +1246,8 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
 ```
  guest eth0 192.168.100.128/32 ── tap (host) ── route 192.168.100.128/32 dev tap
    gateway 169.254.1.1, MAC pinned           peers: route 192.168.100.128/32 via <host>
-   (identical in every VM)                   LAN:   host answers ARP for it (proxy ARP)
+   (identical in every VM)                   LAN:   host answers ARP for it (proxy ARP;
+                                                    proxy NDP for its /128, an entry each)
 ```
 
 - Every guest's network setup is the same except for its address. The gateway
@@ -1387,7 +1388,23 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
     peers, or host.json's `announce_dev`): the host answers ARP for its VMs
     (proxy ARP) and sends a gratuitous ARP whenever a VM arrives. Other
     machines on the LAN therefore follow a migrated VM without any
-    configuration. Give VMs addresses from the LAN's subnet and they can use
+    configuration. With `vm_ipv6_prefix`, proxy NDP and an unsolicited
+    Neighbour Advertisement (`net::unsolicited_na`: ICMPv6 136, override, to
+    ff02::1, hop limit 255, from the VM's address) do the same for its IPv6
+    address. Proxy NDP answers only for addresses with a proxy entry
+    (NTF_PROXY) on the device, so each VM has one (`net::proxy_add`), added
+    by its process as it announces and on every tick while its state is
+    local, and removed by `Proc::finish` (any end but a move), by
+    `host::route_hop` (its route to a peer: a migration's switch, a peer's
+    announcement, a reinstall; not for a peer sharing the network
+    namespace, whose entry it is), and by every sweep (`gc::network`) for an
+    address in the prefix with no /128 to a device here (a tap's or the hold
+    device's, `/proc/net/ipv6_route`), which is what a VM process killed
+    outright leaves. Adds, removals and the sweep hold an flock of the
+    network namespace's nsfs file, one inode for every process in it, and an
+    add checks the VM is still served under it: a removal is never overtaken
+    by an add that checked before, nor a fresh entry swept by a sweep that
+    read the routes before. Give VMs addresses from the LAN's subnet and they can use
     the LAN's normal gateway for internet access.
   - Underlay and announce-device derivation uses the listener's last-known
     peer addresses in `RUN/peers.json`, whatever their age, and IP literals

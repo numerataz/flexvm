@@ -79,7 +79,10 @@ pub fn after_boot(host: &Host, rest: bool) -> Result<bool> {
     if !std::fs::read_to_string(&rest_marker).is_ok_and(|b| b == boot_id()) {
         let ipv6 = host.config_now().vm_ipv6_prefix.is_some();
         let forwarding = crate::net::ip_forward().and_then(|()| if ipv6 { crate::net::ipv6_forward() } else { Ok(()) });
-        let proxy_arp = host.config_now().announce_dev().map_or(Ok(()), |dev| crate::net::proxy_arp(&dev));
+        let proxy_arp = host
+            .config_now()
+            .announce_dev()
+            .map_or(Ok(()), |dev| crate::net::proxy_arp(&dev).and_then(|()| if ipv6 { crate::net::proxy_ndp(&dev) } else { Ok(()) }));
         recover(host);
         // Before the pass is marked done (it runs again until it is): those it lost that their policies run again.
         crate::restart::after_boot(host);
@@ -128,6 +131,22 @@ pub fn sweep(host: &Host) {
     network(host);
 }
 
+/// With `vm_ipv6_prefix`, the proxy entries of VMs' addresses no device here is routed to any longer
+/// (`net::proxy_sweep`): what a VM process killed before removing its own leaves answering for an
+/// address that has moved on or gone. A reboot leaves none: the kernel keeps them in memory alone.
+fn proxy_entries(host: &Host) {
+    let cfg = host.config_now();
+    let Some(prefix) = cfg.vm_ipv6_prefix.filter(|_| unsafe { libc::geteuid() } == 0) else { return };
+    match crate::net::proxy_sweep(prefix, cfg.announce_dev().as_deref()) {
+        Ok(removed) => {
+            for ip in removed {
+                crate::info!("flexvm: removed the proxy entry of {ip}: no VM here has it");
+            }
+        }
+        Err(e) => crate::log!("flexvm: sweeping proxy entries: {e}"),
+    }
+}
+
 /// How long `flexvm debug gc` waits for a sweep under way: one stopped or stuck (on the host lock, say)
 /// fails it, never hangs it.
 const SWEEP_WAIT: Duration = Duration::from_secs(30);
@@ -147,6 +166,7 @@ fn sweep_within(host: &Host, wait: Duration) -> Result<()> {
 }
 
 fn network(host: &Host) {
+    proxy_entries(host);
     // Its own nonblocking lock: a peer that is down holds up no local cleanup.
     host.deliver_withdrawals();
     host.retire_migrations();
