@@ -1190,7 +1190,12 @@ selection: `pr` (`main` and `recovery`: listener restarts, timeouts) runs on
 every change, in four `--split`s side by side, `heavy` (GiB-scale guests)
 nightly. A scenario that
 finds the host lacks what it tests reports SKIP, never PASS; `--no-skips`
-fails on one, as CI does. Its templates are pulled from the test image,
+fails on one, as CI does. The cases and scenarios that need KVM (they run
+VMs, or use templates) are tagged `@needs_kvm`; where `/dev/kvm` is missing or
+unusable, or with `--no-kvm`, `e2e.py` runs only the others, and builds no
+template. CI runs it so on its aarch64 runner, which has no KVM (and with
+the aarch64 shards once one has it); its KVM runners pass `--require-kvm`,
+which fails instead. Its templates are pulled from the test image,
 which `scripts/test-image.py` makes from the base root filesystem `fetch.sh`
 downloads (Firecracker CI's ubuntu 24.04, with the python3, socat and
 iproute2 the guests run) as an OCI layout with no command. `scripts/faults.py`,
