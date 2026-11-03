@@ -1361,10 +1361,16 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
     has run since a boot) is looked up within 2 s, once per process (a failed
     lookup counts as no addresses until the listener's entry stands), so a VM
     started before the listener still announces its routes. Nothing under the
-    host lock or on a migration's downtime starts such a lookup. If a peer elsewhere has no known
-    IPv4 address, nothing is derived and a diagnostic is logged, saying to
+    host lock or on a migration's downtime starts such a lookup. Each family's
+    underlay (`Config::underlay`, `Config::underlay6`) is the source of the
+    route toward the first peer elsewhere with an address of that family (an
+    IPv6 one not link-local), and the announce device is the IPv4 route's
+    device, else the IPv6 one's. If no peer elsewhere has a known address of
+    either family, nothing is derived and a diagnostic is logged, saying to
     start `flexvm listen` when the listener has not looked a peer up (no
-    peers, or all local, uses loopback).
+    peers, or all local, uses loopback: 127.0.0.1 and ::1). VM routes and a
+    migration's `via` use the IPv4 underlay; the IPv6 one is so far only
+    advertised for a `[::]` listener without an IPv4 one.
     Explicit `underlay` and `announce_dev` settings
     override derivation (`announce_dev` `"none"` disables announcements).
 - On migration, the target routes the address to its new tap at the commit,

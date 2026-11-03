@@ -1499,7 +1499,7 @@ fn send_paused(conn: &TcpStream, header: &Header<'_>, state: &[u8], data: &[u8],
 
 /// The target's authority comes from its connection and its own configured underlays.
 fn target_at(cfg: &crate::host::Config, to: &str, peer: Option<IpAddr>) -> Vec<IpAddr> {
-    peer.into_iter().chain(cfg.underlays_of(to).iter().copied().map(IpAddr::V4)).collect()
+    peer.into_iter().chain(cfg.underlays_of(to).iter().copied()).collect()
 }
 
 /// Check the target before forwarding held packets or changing any route.

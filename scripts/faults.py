@@ -8296,8 +8296,10 @@ def wildcard_listen():
         stop_listener(A)
         try:
             start_listener(A, f"{wild}:{port}")
-            underlay = ok(cli_json(A, "info"))["derived"]["underlay"]
-            check(f"wildcard listen {wild}: the underlay detected", underlay == host_ip, underlay)
+            derived = ok(cli_json(A, "info"))["derived"]
+            check(f"wildcard listen {wild}: the underlay detected", derived["underlay"] == host_ip, derived)
+            # With every peer on this machine the IPv6 underlay is loopback too; migrations still go via the IPv4 one.
+            check(f"wildcard listen {wild}: the IPv6 underlay is loopback", derived.get("underlay6") == "::1", derived)
             n = "ft-wildcard"
             clear_log(B, n)
             m = setup(n)

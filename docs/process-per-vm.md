@@ -267,13 +267,16 @@ Write it atomically (a temp file in `STATE`, renamed over it). It must be a
 regular file, not a symlink, owned by root or the user and writable by no
 one else; an unknown key is refused. Every load validates it
 (`Config::validate`: `vm_ips` inside `cluster_ips`, peers and `listen`
-`HOST:PORT` with nonzero ports, `peer_underlays` non-loopback and unicast,
+`HOST:PORT` with nonzero ports, `underlay` and `peer_underlays` addresses of
+either family, non-loopback and unicast (an IPv6 one neither link-local nor
+IPv4-mapped), `underlay` at most one of each family,
 `dns` up to three IP addresses, `vm_ipv6_prefix` a usable /96 holding no
 `listen` or peer address, `announce_dev` not empty). A validation error makes every command
 refuse (`STATE/host.json: ... (see README: Configuration)`); running processes
 re-read it when its mtime or inode changes and keep the last valid one
-meanwhile. An explicit loopback or non-unicast `underlay` is refused on
-write; on read it is ignored with a warning and derived instead. Local
+meanwhile. An explicit `underlay` address that fails those checks is refused
+on write; on read it is ignored with a warning and that family's is derived
+instead. Local
 `peer_underlays` addresses are accepted with a warning; locality depends on
 the current interfaces. `flexvm info` shows what is set, what is derived for
 the rest, and warnings.

@@ -161,8 +161,10 @@ pub fn validate(listeners: &[TcpListener], cfg: &crate::host::Config) -> Result<
     }
     // Under the host lock: from what was just seeded, never a lookup.
     let advertised = cfg.advertise_by(false)?;
-    let toward =
-        || crate::host::toward(&found.iter().map(|a| a.clone().unwrap_or_default()).collect::<Vec<_>>(), |a| crate::net::is_local_addr(a).unwrap_or(false));
+    let toward = || {
+        let found: Vec<_> = found.iter().map(|a| a.clone().unwrap_or_default()).collect();
+        crate::host::toward(&found, crate::host::Family::Either, |a| crate::net::is_local_ip(a).unwrap_or(false))
+    };
     for listener in listeners {
         let local = listener.local_addr()?;
         if let Some(e) = unreachable_at(local, v6only(listener), advertised.as_deref()) {
@@ -470,7 +472,7 @@ impl Peers {
         for n in &cfg.peers {
             if let Some(addrs) = Self::matching_addrs(&r, cfg, n, from) {
                 out.extend(addrs);
-                out.extend(cfg.underlays_of(n).iter().map(|&u| IpAddr::V4(u)));
+                out.extend(cfg.underlays_of(n));
             }
         }
         out
@@ -489,7 +491,7 @@ impl Peers {
 
     fn matching_addrs(r: &HashMap<String, Vec<IpAddr>>, cfg: &crate::host::Config, name: &str, from: IpAddr) -> Option<Vec<IpAddr>> {
         let addrs = name.parse::<SocketAddr>().map_or_else(|_| r.get(name).cloned().unwrap_or_default(), |a| vec![a.ip()]);
-        (is_peer(&addrs, from) || cfg.underlays_of(name).iter().any(|&u| IpAddr::V4(u) == from.to_canonical())).then_some(addrs)
+        (is_peer(&addrs, from) || cfg.underlays_of(name).contains(&from.to_canonical())).then_some(addrs)
     }
 
     /// The addresses of `names`; a name not resolved yet is looked up.
@@ -1325,7 +1327,7 @@ pub(crate) fn routable_by(
     let peer = is_peer(peers, IpAddr::V4(ip)) || is_peer(&cfg.peer_underlay_addrs(), IpAddr::V4(ip));
     // A derived underlay is an interface's source address, covered by is_local_addr below.
     let listen = cfg.listen.as_deref().and_then(|s| s.parse::<SocketAddr>().ok()).map(|a| a.ip().to_canonical());
-    let underlay = cfg.underlay == Some(ip) || listen == Some(IpAddr::V4(ip));
+    let underlay = cfg.underlay.contains(IpAddr::V4(ip)) || listen == Some(IpAddr::V4(ip));
     let special = ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || underlay || gateways.contains(&ip);
     if peer || special || local(IpAddr::V4(ip))? {
         bail!("{ip} is not a vm's address: a local, peer, underlay or gateway address, or not unicast");
@@ -1691,9 +1693,10 @@ mod tests {
     fn configured_peer_underlays_are_next_hops() {
         let mut cfg = crate::host::Config { peers: vec!["192.0.2.7:7070".into()], ..Default::default() };
         let data: Ipv4Addr = "198.51.100.7".parse().unwrap();
-        cfg.peer_underlays.insert("192.0.2.7:7070".into(), vec![data]);
+        let data6: IpAddr = "2001:db8:51::7".parse().unwrap();
+        cfg.peer_underlays.insert("192.0.2.7:7070".into(), vec![data.into(), data6]);
         cfg.peer_underlays.insert("192.0.2.9:7070".into(), vec!["198.51.100.9".parse().unwrap()]);
-        assert_eq!(cfg.peer_underlay_addrs(), [IpAddr::V4(data)]);
+        assert_eq!(cfg.peer_underlay_addrs(), [IpAddr::V4(data), data6]);
         let known = [vec!["192.0.2.7".parse().unwrap()], cfg.peer_underlay_addrs()].concat();
         check_via(data, &known).unwrap();
         assert!(check_via("198.51.100.9".parse().unwrap(), &known).is_err(), "not a configured peer's");
@@ -1702,6 +1705,8 @@ mod tests {
         cfg.peer_underlays.insert("192.0.2.10:7070".into(), vec!["198.51.100.10".parse().unwrap()]);
         let sender = Peers::default().sender(&cfg, "192.0.2.7".parse().unwrap());
         assert!(is_peer(&sender, IpAddr::V4(data)) && !is_peer(&sender, "198.51.100.10".parse().unwrap()), "{sender:?}");
+        // An IPv6 underlay is one of its addresses too: a request from it is that peer's.
+        assert!(is_peer(&Peers::default().sender(&cfg, data6), "192.0.2.7".parse().unwrap()));
         cfg.cluster_ips = Some("198.51.100.0/24".into());
         cfg.vm_ips = "198.51.100.0/25".into();
         assert!(routable_by(data, &cfg, &[], &[], |_| Ok(false)).is_err());
@@ -1892,7 +1897,7 @@ mod tests {
         assert!(!known_peers(&host).unwrap().contains(&"10.93.0.1".parse().unwrap()));
         routable_by("10.200.0.7".parse().unwrap(), &host.config_now(), &[], &[], |_| Ok(false)).unwrap();
         host.configure(|cfg| {
-            cfg.underlay = Some("10.97.0.1".parse().unwrap());
+            cfg.underlay = "10.97.0.1".parse().unwrap();
             cfg.listen = Some("[::ffff:10.96.0.1]:7000".into());
             Ok(())
         })
@@ -2008,7 +2013,7 @@ mod tests {
     fn peers_route_only_vm_addresses() {
         let mut cfg = crate::host::Config {
             peers: vec!["10.98.0.1:7000".into(), "peer.example:7000".into()],
-            underlay: Some("10.97.0.1".parse().unwrap()),
+            underlay: "10.97.0.1".parse().unwrap(),
             ..Default::default()
         };
         let gw: Ipv4Addr = "10.96.0.1".parse().unwrap();
@@ -2629,10 +2634,13 @@ mod tests {
     fn a_loopback_listener_is_refused_with_a_peer_elsewhere() {
         use crate::host::Toward;
         let at = |s: &str| s.parse::<SocketAddr>().unwrap();
-        let remote = || Toward::Remote(Ipv4Addr::new(192, 168, 1, 11));
+        let remote = || Toward::Remote(Ipv4Addr::new(192, 168, 1, 11).into());
         let e = loopback_with_remote(at("127.0.0.1:7070"), remote).unwrap();
         assert!(e.contains("192.168.1.11 is elsewhere"), "{e}");
         assert!(loopback_with_remote(at("[::ffff:127.0.0.1]:7070"), remote).is_some());
+        // So is one with an IPv6 peer elsewhere.
+        let e = loopback_with_remote(at("[::1]:7070"), || Toward::Remote("2001:db8::2".parse().unwrap())).unwrap();
+        assert!(e.contains("2001:db8::2 is elsewhere"), "{e}");
         // Peers are not even looked up for an address that is not loopback.
         assert!(loopback_with_remote(at("0.0.0.0:7070"), || unreachable!()).is_none());
         // Peers on this machine, or none, or one whose address is unknown (a name that may yet be local): allowed.
