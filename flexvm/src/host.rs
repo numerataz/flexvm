@@ -238,6 +238,11 @@ impl<'de> Deserialize<'de> for Underlay {
 /// another peer goes.
 pub fn route_hop(ip: crate::net::VmAddr, hop: Hop) -> Result<()> {
     crate::net::route_via(ip.v4, hop.via())?;
+    // A peer sharing this network namespace: neither is routed (`route_via` skipped the /32), and
+    // its tap's /128 stays, whatever IPv6 underlay it names.
+    if ip.v6.is_some() && crate::net::is_local_ip(hop.via())? {
+        return Ok(());
+    }
     match (ip.v6, hop.via6()) {
         (Some(v6), Some(via6)) => crate::net::route_via6(v6, via6),
         (Some(v6), None) => {

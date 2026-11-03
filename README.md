@@ -676,7 +676,9 @@ goes to the hold device with its `/32`, but IPv6 packets there are dropped
 (with the prefix set) and every VM process that routes an IPv6 address turn
 on IPv6 forwarding (see [Migrate](#migrate) for `accept_ra`). A new prefix
 applies to VMs routed after it (started, restored or arriving); running VMs
-keep the address they were routed by.
+keep the address they were routed by, and routes to peers' VMs under the old
+prefix stay until the host reboots: set the prefix
+before VMs run, and do not change it while they do.
 
 In the guest, flexvm-init gives `eth0` the address as a `/128` and a default
 route via `fe80::1`, the host's tap, whose MAC is pinned by a permanent
