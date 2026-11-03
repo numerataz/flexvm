@@ -2764,8 +2764,8 @@ def proxy_ndp_routed():
         code, out, err = nscli("a", "kill", n)
         assert code == 0, err or out
         check("proxy ndp: a kill removes its entry", wait_for(lambda: proxied("a", v6) == [], 10), ip("a", "-6", "neigh", "show", "proxy"))
-        # Killed outright, its process removes nothing: a sweep does (the listener's periodic one, or this
-        # one), once its tap's /128 is gone.
+        # Killed outright, its process removes nothing, and its tap (with its /128, link down) stays: a
+        # sweep (the listener's periodic one, or this one) removes the tap, then the entry.
         r = nsjson("a", "run", "--name", killed, "-d", args.template)
         v6k = str(ipaddress.IPv6Address(int(ipaddress.IPv6Address(prefix)) | int(ipaddress.IPv4Address(r["ip"]))))
         check("proxy ndp: the second VM's entry", wait_for(lambda: proxied("a", v6k) == ["eth0"], 10), ip("a", "-6", "neigh", "show", "proxy"))
@@ -2773,10 +2773,10 @@ def proxy_ndp_routed():
         seen.add((victim["pid"], victim["start"]))
         pids = kill_tree(victim["pid"])
         check("proxy ndp: the second VM's processes are dead", wait_for(lambda: not any(alive(p) for p in pids), 15), pids)
-        gone = lambda: ip("a", "-6", "route", "show", "exact", f"{v6k}/128") == ""
-        check("proxy ndp: its /128 went with its tap", wait_for(gone, 15), ip("a", "-6", "route", "show", "exact", f"{v6k}/128"))
         code, out, err = nscli("a", "debug", "gc")
-        check("proxy ndp: a sweep removes it", code == 0 and proxied("a", v6k) == [], (code, err, ip("a", "-6", "neigh", "show", "proxy")))
+        route = ip("a", "-6", "route", "show", "exact", f"{v6k}/128")
+        check("proxy ndp: a sweep removes its tap's /128", code == 0 and route == "", (code, err, route))
+        check("proxy ndp: and its entry", proxied("a", v6k) == [], ip("a", "-6", "neigh", "show", "proxy"))
     finally:
         for p in procs:
             p.terminate()
