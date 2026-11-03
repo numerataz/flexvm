@@ -4424,7 +4424,11 @@ arm = os.uname().machine == "aarch64"
 code = bytes.fromhex("df3f03d540e03bd5c0035fd6" "00e03bd5c0035fd6") if arm else bytes([0x0f, 0x31, 0x48, 0xc1, 0xe2, 0x20, 0x48, 0x09, 0xd0, 0xc3])
 buf = mmap.mmap(-1, 4096, prot=mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC)
 buf.write(code)
-fn = lambda off: ctypes.CFUNCTYPE(ctypes.c_uint64)(ctypes.addressof(ctypes.c_char.from_buffer(buf)) + off)
+base = ctypes.addressof(ctypes.c_char.from_buffer(buf))
+if arm:
+    # Written as data: made visible to instruction fetch (__clear_cache cleans and invalidates) before it runs.
+    getattr(ctypes.CDLL("libgcc_s.so.1"), "__clear_cache")(ctypes.c_void_p(base), ctypes.c_void_p(base + len(code)))
+fn = lambda off: ctypes.CFUNCTYPE(ctypes.c_uint64)(base + off)
 counter, f = fn(0), "/sys/devices/system/cpu/cpu0/tsc_freq_khz"
 if arm:
     hz = fn(12)()
@@ -6191,7 +6195,7 @@ def unplug_collapsed():
         ranked = sorted(online, key=lambda blk: -len(chunks_of(blk) & huge0))
         chosen = []
         for blk in ranked[:6]:
-            if len(chunks_of(blk) & huge0) >= 16 and len(chosen) < 2:
+            if len(chunks_of(blk) & huge0) >= (32 << 20) // HPAGE and len(chosen) < 2:
                 code, out = sh(B, n, f"echo offline > /sys/devices/system/memory/memory{blk}/state")
                 if code == 0:
                     chosen.append(blk)
