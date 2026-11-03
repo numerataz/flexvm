@@ -329,11 +329,14 @@ impl Config {
         }
         if let Some(p) = self.vm_ipv6_prefix {
             w.push(format!(
-                "flexvm: warning: vm_ipv6_prefix {p} is set: VMs' IPv6 addresses are reported, but not configured in guests or routed yet (#1297, #1298)"
+                "flexvm: warning: vm_ipv6_prefix {p} is set: VMs' IPv6 addresses are reported and configured in guests, but not routed yet (#1297)"
             ));
         }
-        if let Some(d) = self.dns.as_ref().map_or(&[][..], Dns::listed).iter().find(|d| d.parse::<std::net::Ipv6Addr>().is_ok()) {
-            w.push(format!("flexvm: warning: dns {d} is IPv6: guests are not given IPv6 nameservers yet (#1298), only the IPv4 ones"));
+        let v6_dns = self.dns.as_ref().map_or(&[][..], Dns::listed).iter().find(|d| d.parse::<std::net::Ipv6Addr>().is_ok());
+        if let Some(d) = v6_dns.filter(|_| self.vm_ipv6_prefix.is_none()) {
+            w.push(format!(
+                "flexvm: warning: dns {d} is IPv6, but vm_ipv6_prefix is unset: guests have no IPv6 address, so are given only the IPv4 nameservers"
+            ));
         }
         if !self.peers.is_empty() && self.cluster_ips.is_none() {
             w.push(format!("flexvm: warning: cluster_ips is unset; peer VM addresses outside vm_ips {} are refused", self.vm_ips));
@@ -384,11 +387,12 @@ impl Config {
         self.vm_ipv6_prefix.map(|p| p.vm(ip))
     }
 
-    /// The nameservers guests are given: `dns`'s IPv4 ones, in order. IPv6 ones wait for guests to
-    /// have IPv6 (#1298); `warnings` says so.
+    /// The nameservers guests are given, in order: `dns`'s IPv4 ones, and with `vm_ipv6_prefix` its IPv6
+    /// ones too. A guest without an IPv6 address would wait on each first; `warnings` says they are left
+    /// out, and `guest::start` leaves them out for an agent that predates IPv6.
     pub fn guest_dns(&self) -> Vec<IpAddr> {
         let listed = self.dns.as_ref().map_or(&[][..], Dns::listed).iter().filter_map(|d| d.parse::<IpAddr>().ok());
-        listed.filter(IpAddr::is_ipv4).collect()
+        listed.filter(|d| d.is_ipv4() || self.vm_ipv6_prefix.is_some()).collect()
     }
 
     pub fn effective_cluster_ips(&self) -> &str {
@@ -6305,16 +6309,22 @@ pub(crate) mod tests {
         .unwrap();
         let c = Host::open(&h.state, &h.run).unwrap().cfg;
         assert_eq!(c.vm_ipv6(ip("10.200.0.7")), Some("fd00:0:0:7::ac8:7".parse().unwrap()));
-        // IPv6 nameservers wait for guests' IPv6 (#1298), with a warning.
-        assert_eq!(c.guest_dns(), [ip("192.0.2.53"), ip("192.0.2.54")].map(IpAddr::V4));
+        // Guests with an IPv6 address get the IPv6 nameservers too, in order.
+        assert_eq!(c.guest_dns(), ["2001:db8::53", "192.0.2.53", "192.0.2.54"].map(|d| d.parse::<IpAddr>().unwrap()));
         let set = serde_json::to_value(&c).unwrap();
         assert_eq!(
             (&set["dns"], &set["vm_ipv6_prefix"]),
             (&serde_json::json!(["2001:db8::53", "192.0.2.53", "192.0.2.54"]), &serde_json::json!("fd00:0:0:7::/96"))
         );
         let w = c.warnings().join("\n");
-        assert!(w.contains("dns 2001:db8::53 is IPv6: guests are not given IPv6 nameservers yet"), "{w}");
+        assert!(!w.contains("dns 2001:db8::53"), "{w}");
         assert!(w.contains("vm_ipv6_prefix fd00:0:0:7::/96 is set"), "{w}");
+        // Without the prefix, guests have no IPv6 address to reach them with: left out, with a warning.
+        std::fs::write(&path, r#"{"dns": ["2001:db8::53", "192.0.2.53"]}"#).unwrap();
+        let c = Host::open(&h.state, &h.run).unwrap().cfg;
+        assert_eq!(c.guest_dns(), [IpAddr::V4(ip("192.0.2.53"))]);
+        let w = c.warnings().join("\n");
+        assert!(w.contains("dns 2001:db8::53 is IPv6, but vm_ipv6_prefix is unset: guests have no IPv6 address"), "{w}");
         // An empty list gives guests none, as an unset one.
         std::fs::write(&path, r#"{"dns": []}"#).unwrap();
         assert!(Host::open(&h.state, &h.run).unwrap().cfg.guest_dns().is_empty());
@@ -7496,7 +7506,7 @@ pub(crate) mod tests {
             w.contains("vm_ipv6_prefix fd00:1::/96 covers fd00:1::a09:7, this host's address: the prefix is VMs' alone, and no vm is given 10.9.0.7"),
             "{w}"
         );
-        assert!(w.contains("VMs' IPv6 addresses are reported, but not configured in guests or routed yet"), "{w}");
+        assert!(w.contains("VMs' IPv6 addresses are reported and configured in guests, but not routed yet"), "{w}");
         let w = cfg.warnings_by(|_| Ok(false), Ok(vec![(v6("fd00:2::a09:7"), "address")])).join("\n");
         assert!(!w.contains("covers"), "{w}");
     }

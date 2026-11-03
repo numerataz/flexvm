@@ -1198,8 +1198,9 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   starts at the template's snapshot time, whether standby or not (minutes to
   days behind). The TSC keeps running while a VM is paused, so a pause adds no
   further error. The agent's `START <ip> <unix time> [dns...]` (one word per
-  nameserver, an older agent taking the first)
-  sets the address and steps `CLOCK_REALTIME` to the host's time, and
+  nameserver, an older agent taking the first), or `START6 <ip> <ip6> <unix
+  time> [dns...]` for a VM with an IPv6 address (`vm_ipv6_prefix`; START
+  deletes one), sets the addresses and steps `CLOCK_REALTIME` to the host's time, and
   answers only then. A standby VM gets its clock stepped (`CLOCK`) while it
   settles, so `START` at take finds it right and skips `clock_settime`, which
   can take tens of ms in a 24-vCPU guest. A migration target, after resuming,
@@ -1211,6 +1212,10 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   land, stale, after the snapshot. An agent that answers `unknown request` to
   any request (`START`, `CLOCK`, `FORKS`, an exec's `SESSION`) is too old: the
   call fails with that answer and a hint to rebuild the rootfs and its templates.
+  `START6` is the exception: an agent that answers it so is sent `START`, with
+  the IPv4 nameservers alone, and the VM runs without its IPv6 address (logged).
+  An older host sends `START` to a newer agent, which is the same request as
+  before.
   KVM saves the realtime clock that `clock_realtime` needs only while the VM
   has a master clock, and drops that for good once the vCPUs' TSCs were
   restored more than a second apart: a migration target whose load waited

@@ -613,7 +613,7 @@ warnings about likely mistakes.
 | `peers` | none | the other hosts' listen addresses, `HOST:PORT`: the only hosts this one takes migrations and routes from |
 | `vm_ips` | `10.200.0.0/16` | this host's VM addresses (CIDR or `FIRST-LAST`); disjoint from every peer's |
 | `cluster_ips` | `vm_ips` | every host's VM addresses: a peer's VM may have, route or borrow only one in it |
-| `dns` | none | the guests' DNS server, or a list of up to three, in order (`["192.168.1.1", "1.1.1.1"]`). IPv6 ones are accepted but not given to guests yet (see [IPv6 addresses](#ipv6-addresses)) |
+| `dns` | none | the guests' DNS server, or a list of up to three, in order (`["192.168.1.1", "1.1.1.1"]`). IPv6 ones are given to guests only with `vm_ipv6_prefix` (see [IPv6 addresses](#ipv6-addresses)) |
 | `vm_ipv6_prefix` | none | an IPv6 `/96`, the same on every host: each VM's IPv6 address is it plus the VM's IPv4 address (see [IPv6 addresses](#ipv6-addresses)) |
 | `underlay` | derived | the address peers route this host's VMs through |
 | `peer_underlays` | none | `{"HOST:PORT": ["IP", ...]}`: a peer's next hops besides its `peers` address |
@@ -650,11 +650,20 @@ the warnings.
 ### IPv6 addresses
 
 **Not usable yet.** With `vm_ipv6_prefix` set, flexvm derives and reports
-each VM's IPv6 address, but does not yet configure it in the guest or route
-it (the taps, routes and guest agent come with #1297 and #1298). Nothing
-answers at the address. `info` and the listener warn about this for as long
-as it is true. Setting the prefix now only lets every host agree on it
+each VM's IPv6 address and configures it in the guest, but does not yet
+route it (the taps and routes come with #1297). Nothing answers at the
+address from outside the VM. `info` and the listener warn about this for as
+long as it is true. Setting the prefix now only lets every host agree on it
 before the data plane lands. Without it, nothing changes.
+
+In the guest, flexvm-init gives `eth0` the address as a `/128` and a default
+route via `fe80::1`, the host's tap, whose MAC is pinned by a permanent
+neighbour entry as the IPv4 gateway's is. Router advertisements,
+autoconfiguration and duplicate address detection are off. A VM started
+without the prefix has no IPv6 address and no IPv6 default route. A template
+built by an older flexvm has an agent that predates this: its VMs start
+with IPv4 alone, and the VM's log says so. Pull the image again to rebuild
+its template.
 
 A VM's IPv6 address is `vm_ipv6_prefix` with the VM's IPv4 address in the
 low 32 bits: with `"vm_ipv6_prefix": "fd00:0:0:1::/96"`, the VM at
@@ -708,8 +717,10 @@ unnamed: its own tag stays as it was, and `images` shows the sent one as
 
 Networking is routed IPv4: flexvm provides no NAT or automatic internet
 egress. Arrange upstream routes or NAT yourself if guests need it. There is
-no default DNS server; set `dns`. Guests get its IPv4 nameservers, in order
-(a rootfs whose agent predates lists takes only the first).
+no default DNS server; set `dns`. Guests get its nameservers in order: the
+IPv4 ones, and with `vm_ipv6_prefix` the IPv6 ones too (a rootfs whose agent
+predates lists takes only the first, and one whose agent predates IPv6 gets
+the IPv4 ones alone).
 
 Every host's `vm_ips` must be disjoint and inside `cluster_ips`, the
 same range on every host covering all of them: a peer's VM may have, route or

@@ -1816,7 +1816,8 @@ impl Proc {
         if crate::host::fault("guest_setup_fail") {
             bail!("injected fault: setting up its guest failed");
         }
-        vm.guest_net(vm.ip, &self.host.config_now().guest_dns())?;
+        let cfg = self.host.config_now();
+        vm.guest_net(vm.ip, cfg.vm_ipv6(vm.ip), &cfg.guest_dns())?;
         if t.mark("guest_net") >= crate::vm::CLOCK_RTT {
             self.sync_clock_later();
         }
