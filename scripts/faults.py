@@ -3018,7 +3018,9 @@ def ipv6_prefix(prefix=V6_PREFIX):
 
 def reachable6(label, v6, timeout=10):
     """Waits until the guest answers a ping at `v6`, as ipv6_packet_hold and e2e's ipv6_taps wait to connect
-    first: a VM just started may not take IPv6 from this host at once (printed: how long it took)."""
+    first: a VM just started may not take IPv6 from this host at once (printed: how long it took). That is
+    #1316 (same_host_order6 once lost every datagram before its first migration, none reaching the guest's
+    eth0): this wait works around it, and goes once it is fixed."""
     t = time.monotonic()
     up = wait_for(lambda: subprocess.run(["ping", "-6", "-c1", "-W1", v6], capture_output=True).returncode == 0, timeout)
     print(f"{label}: {v6} answered a ping after {time.monotonic() - t:.2f} s" if up else f"{label}: {v6} answered no ping in {timeout} s", flush=True)
