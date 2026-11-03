@@ -1382,7 +1382,7 @@ def suspend_resume():
 def ipv6_taps():
     """vm_ipv6_prefix (#1297): a VM's tap gets IPv6, a /128 route and a permanent neighbour entry beside its
     /32, and passes IPv6 from that address alone; on a migration they move to the target's tap. Without the
-    prefix, IPv6 stays off on taps. The guest is given its address by hand here (the agent does it with #1298)."""
+    prefix, IPv6 stays off on taps. The guest's agent gives it its address (#1308)."""
     sysctl = lambda tap, key: open(f"/proc/sys/net/ipv6/conf/{tap}/{key}").read().strip()
     ip6 = lambda *a: subprocess.run(["ip", "-6", *a], capture_output=True, text=True).stdout
     plain = "e2e-v4tap"
@@ -1419,43 +1419,36 @@ def ipv6_taps():
         echo_server(A, vm, ip)
         conn = socket.create_connection((ip, 7000), timeout=10)
         check("IPv4 as before", echo(conn, b"v4\n"))
-        guest_v6 = A.exec(vm, "test -d /proc/sys/net/ipv6")[0] == 0
-        if guest_v6:
-            must(A, vm, "sysctl -qw net.ipv6.conf.eth0.accept_ra=0 net.ipv6.conf.eth0.accept_dad=0"
-                        f" && ip -6 addr add {v6}/128 dev eth0 nodad"
-                        " && ip -6 neigh replace fe80::1 lladdr 06:00:a9:fe:01:01 dev eth0 nud permanent"
-                        " && ip -6 route replace default via fe80::1 dev eth0")
-            must(A, vm, "setsid socat TCP6-LISTEN:7006,fork,reuseaddr EXEC:cat >/dev/null 2>&1 </dev/null &")
+        addrs = must(A, vm, "ip -6 -o addr show dev eth0")
+        check("the guest has its IPv6 address", f"inet6 {v6}/128" in addrs, addrs)
+        must(A, vm, "setsid socat TCP6-LISTEN:7006,fork,reuseaddr EXEC:cat >/dev/null 2>&1 </dev/null &")
 
-            def up():
-                try:
-                    with socket.create_connection((v6, 7006), timeout=1) as s:
-                        return echo(s, b"v6\n")
-                except OSError:
-                    return False
-            check("the host reaches the guest at its IPv6 address", wait_for(up, 10))
-            rx = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
-            rx.bind(("::", 0))
-            rx.settimeout(0.2)
-            port, other = rx.getsockname()[1], v6[:-1] + ("1" if v6[-1] != "1" else "2")
-            must(A, vm, f"ip -6 addr add {other}/128 dev eth0 nodad && for src in {v6} {other}; do for i in 1 2 3; do"
-                        f" echo $src | socat -u - UDP6-SENDTO:[fe80::1%eth0]:{port},bind=[$src]; done; done; ip -6 addr del {other}/128 dev eth0")
-            got, end = set(), time.time() + 1.5
-            while time.time() < end:
-                try:
-                    got.add(rx.recvfrom(100)[0].decode().strip())
-                except socket.timeout:
-                    pass
-            rx.close()
-            check("IPv6 from its own address gets through, from another is dropped at the tap", got == {v6}, got)
-        else:
-            print("  note: the guest kernel has no IPv6; only the host's side is checked")
+        def up():
+            try:
+                with socket.create_connection((v6, 7006), timeout=1) as s:
+                    return echo(s, b"v6\n")
+            except OSError:
+                return False
+        check("the host reaches the guest at its IPv6 address", wait_for(up, 10))
+        rx = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        rx.bind(("::", 0))
+        rx.settimeout(0.2)
+        port, other = rx.getsockname()[1], v6[:-1] + ("1" if v6[-1] != "1" else "2")
+        must(A, vm, f"ip -6 addr add {other}/128 dev eth0 nodad && for src in {v6} {other}; do for i in 1 2 3; do"
+                    f" echo $src | socat -u - UDP6-SENDTO:[fe80::1%eth0]:{port},bind=[$src]; done; done; ip -6 addr del {other}/128 dev eth0")
+        got, end = set(), time.time() + 1.5
+        while time.time() < end:
+            try:
+                got.add(rx.recvfrom(100)[0].decode().strip())
+            except socket.timeout:
+                pass
+        rx.close()
+        check("IPv6 from its own address gets through, from another is dropped at the tap", got == {v6}, got)
         A.migrate(vm, B)
         check("migrated: on B", wait_for(lambda: where(vm) == {B.label: "running"}, 60), where(vm))
         tap_b = on_tap(B)
         check("migrated: IPv4 connection survived", echo(conn, b"after\n"))
-        if guest_v6:
-            check("migrated: the host reaches the guest at its IPv6 address on B's tap", wait_for(up, 10))
+        check("migrated: the host reaches the guest at its IPv6 address on B's tap", wait_for(up, 10))
         conn.close()
         check("no frame lost on the way to the guest (the host's MLD reports dropped before)",
               open(f"/sys/class/net/{tap_b}/statistics/tx_dropped").read().strip() == "0")
