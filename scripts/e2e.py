@@ -1478,11 +1478,25 @@ def nettest_ipv6():
     """scripts/nettest.sh with V6=1 (#1301): two hosts and a LAN client, each in a network namespace of its own,
     the hosts listening and peering at IPv6 addresses alone (an IPv6 underlay: the VM's /32 is routed via an
     IPv6 next hop) with vm_ipv6_prefix. The client's TCP ping-pong and 5 kHz UDP stream to the VM's IPv6
-    address (proxy NDP, the unsolicited NA) lose nothing across migrations A -> B -> A."""
+    address (proxy NDP) lose nothing across migrations A -> B -> A, and the client's neighbour entry follows
+    the VM (the unsolicited NA). A TCP stall may exceed twice the downtime by 100 ms (STALL_SLACK_MS: a
+    runner's scheduling, beside a downtime of a few tens of ms), still short of a retransmit timeout."""
     env = {**ENV, "V6": "1", "FLEXVM": BIN, "STATE": BUILD, "TEMPLATE": args.template, "P": f"fv6{A.port}", "ROUNDS": "1",
-           "WORK": os.path.join(args.log_dir, "nettest-ipv6")}
-    r = subprocess.run([os.path.join(ROOT, "scripts", "nettest.sh")], capture_output=True, text=True, timeout=300, env=env)
-    check("nettest V6=1: passes", r.returncode == 0 and r.stdout.strip().endswith("PASS"), (r.stdout + r.stderr)[-3000:])
+           "STALL_SLACK_MS": "100", "WORK": os.path.join(args.log_dir, "nettest-ipv6")}
+    p = subprocess.Popen([os.path.join(ROOT, "scripts", "nettest.sh")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                         env=env, start_new_session=True)
+    try:
+        out, _ = p.communicate(timeout=300)
+    except subprocess.TimeoutExpired:
+        # SIGTERM, so its EXIT trap removes its namespaces, processes and directories; SIGKILL only if that hangs.
+        os.killpg(p.pid, signal.SIGTERM)
+        try:
+            out, _ = p.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+            out, _ = p.communicate()
+        out += "\n(timed out after 300 s)"
+    check("nettest V6=1: passes", p.returncode == 0 and out.strip().endswith("PASS"), out[-3000:])
 
 
 @case

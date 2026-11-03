@@ -3016,6 +3016,15 @@ def ipv6_prefix(prefix=V6_PREFIX):
             configure(h, vm_ipv6_prefix=None)
 
 
+def reachable6(label, v6, timeout=10):
+    """Waits until the guest answers a ping at `v6`, as ipv6_packet_hold and e2e's ipv6_taps wait to connect
+    first: a VM just started may not take IPv6 from this host at once (printed: how long it took)."""
+    t = time.monotonic()
+    up = wait_for(lambda: subprocess.run(["ping", "-6", "-c1", "-W1", v6], capture_output=True).returncode == 0, timeout)
+    print(f"{label}: {v6} answered a ping after {time.monotonic() - t:.2f} s" if up else f"{label}: {v6} answered no ping in {timeout} s", flush=True)
+    assert up, f"{v6} unreachable"
+
+
 def vm_ipv6(host, name):
     """`name`'s IPv6 address on `host` (`ps`), asserted to be there."""
     v6 = vms(host)[name].get("ipv6")
@@ -3029,6 +3038,8 @@ def bulk_tcp(label, n, v6=False):
         clear_log(h, n)
     ok(run(A, n))
     ip = vm_ipv6(A, n) if v6 else vm_ip(A, n)
+    if v6:
+        reachable6(label, ip)
     # A sink: the guest takes all it is sent and answers nothing.
     code, out = sh(A, n, f"setsid socat -u TCP{'6' if v6 else ''}-LISTEN:7001,reuseaddr OPEN:/dev/null >/dev/null 2>&1 < /dev/null &")
     assert code == 0, out
@@ -3064,6 +3075,7 @@ def bulk_tcp(label, n, v6=False):
           all(isinstance(h, dict) and h.get("injected") == h.get("packets") and h.get("dropped") == 0 and h.get("dropped_target") == 0
               for h in held), held)
     check(f"{label}: the download goes on after each move", all(m > 0 for m in moved), (moved, sent[1:]))
+    cleanup(n)
 
 
 @needs_kvm
@@ -3238,6 +3250,8 @@ def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=Non
     ok(run(A, n))
     ip = vm_ipv6(A, n) if v6 else vm_ip(A, n)
     udp_receiver(A, n, v6)
+    if v6:
+        reachable6(label, ip)
     held, at, took, logs, arrivals, windows = [], [], [], [], [], []
     hops = ((A, B), (B, A), (A, B))
     with udp_stream(ip, burst) as (sent, stalled):
@@ -3288,7 +3302,11 @@ def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=Non
     missing = sorted(set(range(sent)) - set(got))
     runs = [[a, b] for a, b in zip([m for i, m in enumerate(missing) if i == 0 or missing[i - 1] != m - 1],
                                   [m for i, m in enumerate(missing) if i + 1 == len(missing) or missing[i + 1] != m + 1])]
-    udp = sh(B, n, "grep Udp: /proc/net/snmp; grep Ip: /proc/net/snmp; cd /sys/class/net/eth0/statistics && echo Eth: rx_packets rx_dropped && "
+    # IPv6's counters are snmp6's (Udp6InDatagrams, ...), given here in snmp's two-line form under the same names.
+    counters = ("grep Udp: /proc/net/snmp; grep Ip: /proc/net/snmp" if not v6 else
+                "for f in Udp Ip; do awk -v f=$f '$1 ~ \"^\" f \"6\" {sub(f \"6\", \"\", $1); k = k \" \" $1; v = v \" \" $2} "
+                "END {print f \":\" k; print f \":\" v}' /proc/net/snmp6; done")
+    udp = sh(B, n, counters + "; cd /sys/class/net/eth0/statistics && echo Eth: rx_packets rx_dropped && "
                    "echo Eth: $(cat rx_packets rx_dropped); pidof socat >/dev/null && echo receiving")[1].splitlines()
     guest = {k: v for k, v in zip(udp[0].split()[1:], udp[1].split()[1:]) if k in ("InDatagrams", "NoPorts", "RcvbufErrors")} if len(udp) >= 2 else udp
     # Where else the guest would have counted one: a bad checksum, or the IP layer.
@@ -8678,8 +8696,8 @@ def ipv6_control_plane():
     """#1301: the control plane over IPv6 alone. A and B listen at [::1] and peer at each other's
     [::1] port, with vm_ipv6_prefix: the IPv6 underlay is ::1 (the listen address), peers are told the
     VM's route via it (after `caps`, over IPv6), and a VM migrates there and back (its pages pulled
-    from [::1]), with its md5 intact and TCP connections to both its addresses echoing throughout;
-    exec and a checkpoint work there as on 127.0.0.1."""
+    from [::1]), with its md5 intact and TCP connections to both its addresses echoing throughout. Its
+    checkpoint, restored on B once it is gone from A, borrows its address from A over [::1]."""
     own_listeners("ipv6 control plane")
     try:
         with socket.socket(socket.AF_INET6) as s:
@@ -8701,6 +8719,7 @@ def ipv6_control_plane():
             clear_log(h, n)
         m = setup(n)
         v4, v6 = vm_ip(A, n), vm_ipv6(A, n)
+        reachable6("ipv6 control plane", v6)
         code, out = sh(A, n, "setsid socat TCP6-LISTEN:7000,ipv6only=0,fork,reuseaddr EXEC:cat >/dev/null 2>&1 < /dev/null & "
                              "for i in $(seq 200); do grep -qs ':1B58 ' /proc/net/tcp6 && exit 0; sleep 0.05; done; exit 1")
         assert code == 0, f"socat did not listen in the guest: {out}"
@@ -8712,13 +8731,23 @@ def ipv6_control_plane():
             r = cli_json(src, "migrate", n, at[dst])
             check(f"ipv6 control plane: migrated {src} -> {at[dst]}", r["ok"], r)
             assert_released(dst, n, src)
-            pulls = re.findall(r"pull from (\S+) ended", log(dst, n))
-            check(f"ipv6 control plane: {dst} pulled from {at[src]}", pulls[-1:] == [at[src]], pulls)
+            # Logged once the pull ends, maybe after the release; its first arrival there.
+            pulls = lambda: re.findall(r"pull from (\S+) ended", log(dst, n))
+            check(f"ipv6 control plane: {dst} pulled from {at[src]}", wait_for(lambda: pulls() == [at[src]], 10), pulls())
             check(f"ipv6 control plane: md5 intact on {dst}", md5(dst, n) == m)
             check(f"ipv6 control plane: both connections echo on {dst}", all(echo(c, b"ctl6\n") for c in conns))
         check("ipv6 control plane: back on A", where(n) == {A: "running"}, where(n))
         r = checkpoint(A, n, path)
         check("ipv6 control plane: a checkpoint", r["ok"], r)
+        for c in conns:
+            c.close()
+        conns = []
+        kill(A, n)
+        assert wait_for(lambda: not addr(A, v4).get("holder"), 10), addr(A, v4)
+        r = restore(B, path)
+        check("ipv6 control plane: restored on B, its address lent by A", r["ok"] and where(n) == {B: "running"}
+              and addr(A, v4).get("lent"), (r, where(n), addr(A, v4)))
+        check("ipv6 control plane: md5 intact after the restore", md5(B, n) == m)
     finally:
         for c in conns:
             c.close()
