@@ -9,7 +9,7 @@
 //! Records from before aarch64 have no `arch` and read as x86_64; an x86_64 record is written
 //! exactly as before, so a template's content id does not change. A record from one
 //! architecture is refused on the other.
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -99,7 +99,7 @@ impl Compat {
     pub fn saved(&self) -> Saved {
         match self {
             Compat::X86_64(c) => Saved::X86_64 { tsc_khz: c.tsc_khz, msrs: c.msrs.clone() },
-            Compat::Aarch64(c) => Saved::Aarch64 { regs: c.regs.clone() },
+            Compat::Aarch64(c) => Saved::Aarch64 { regs: c.regs.clone(), id_regs: c.id_regs.clone() },
         }
     }
 
@@ -118,8 +118,8 @@ impl Compat {
             (Compat::X86_64(snapshot), Compat::X86_64(host), Saved::X86_64 { tsc_khz, msrs }) => {
                 Ok(Saved::X86_64 { tsc_khz: snapshot.check_saved(host, *tsc_khz, msrs)?, msrs: msrs.clone() })
             }
-            (Compat::Aarch64(snapshot), Compat::Aarch64(host), Saved::Aarch64 { regs }) => {
-                snapshot.check_saved(host, regs)?;
+            (Compat::Aarch64(snapshot), Compat::Aarch64(host), Saved::Aarch64 { regs, id_regs }) => {
+                snapshot.check_saved(host, regs, id_regs)?;
                 Ok(saved.clone())
             }
             _ => bail!("VM state saved on {} for a template built on {}", saved.arch(), self.arch()),
@@ -131,7 +131,7 @@ impl Compat {
     pub fn saves(&self, loaded: &Saved) -> Result<Saved> {
         Ok(match (self, loaded) {
             (Compat::X86_64(host), Saved::X86_64 { tsc_khz, .. }) => Saved::X86_64 { tsc_khz: *tsc_khz, msrs: host.msrs.clone() },
-            (Compat::Aarch64(host), Saved::Aarch64 { .. }) => Saved::Aarch64 { regs: host.regs.clone() },
+            (Compat::Aarch64(host), Saved::Aarch64 { .. }) => Saved::Aarch64 { regs: host.regs.clone(), id_regs: host.id_regs.clone() },
             _ => bail!("{} VM on an {} host", loaded.arch(), self.arch()),
         })
     }
@@ -150,8 +150,9 @@ impl Compat {
 pub enum Saved {
     /// The effective vCPU TSC rate, which can differ from its template's, and the KVM MSRs.
     X86_64 { tsc_khz: u32, msrs: BTreeSet<u32> },
-    /// The KVM_GET_REG_LIST registers. The counter frequency is the template's: arm64 cannot scale it.
-    Aarch64 { regs: BTreeSet<u64> },
+    /// The KVM_GET_REG_LIST registers, and the identification and firmware registers' values,
+    /// which a load sets. The counter frequency is the template's: arm64 cannot scale it.
+    Aarch64 { regs: BTreeSet<u64>, id_regs: BTreeMap<String, u64> },
 }
 
 impl Saved {
@@ -170,9 +171,10 @@ impl Saved {
                 map.insert(format!("{prefix}msrs"), serde_json::json!(msrs));
                 map.insert(format!("{prefix}tsc_khz"), serde_json::json!(tsc_khz));
             }
-            Saved::Aarch64 { regs } => {
+            Saved::Aarch64 { regs, id_regs } => {
                 map.insert("arch".into(), serde_json::json!(Arch::Aarch64));
                 map.insert(format!("{prefix}regs"), serde_json::json!(regs));
+                map.insert(format!("{prefix}id_regs"), serde_json::json!(id_regs));
             }
         }
         map
@@ -185,7 +187,7 @@ impl Saved {
         }
         Ok(match Arch::of(map).map_err(|e| format!("bad arch: {e}"))? {
             Arch::X86_64 => Saved::X86_64 { msrs: field(map, format!("{prefix}msrs"))?, tsc_khz: field(map, format!("{prefix}tsc_khz"))? },
-            Arch::Aarch64 => Saved::Aarch64 { regs: field(map, format!("{prefix}regs"))? },
+            Arch::Aarch64 => Saved::Aarch64 { regs: field(map, format!("{prefix}regs"))?, id_regs: field(map, format!("{prefix}id_regs"))? },
         })
     }
 
@@ -563,6 +565,12 @@ mod tests {
         let saved = more.saves(&arm.check_saved(&more, &arm.saved()).unwrap()).unwrap();
         assert!(arm.check_saved(&arm, &saved).unwrap_err().to_string().contains("saved registers"));
         arm.check_saved(&more, &saved).unwrap();
+        // An ID register its template did not list, as the host that saved it had it.
+        let Compat::Aarch64(mut newer) = more.clone() else { unreachable!() };
+        newer.id_regs.insert("ID_AA64PFR2_EL1".into(), 1);
+        let saved = Compat::Aarch64(newer).saves(&saved).unwrap();
+        let error = arm.check_saved(&more, &saved).unwrap_err().to_string();
+        assert!(error.contains("ID_AA64PFR2_EL1 differs (snapshot: 0x1; host: none)"), "{error}");
     }
 
     #[test]
@@ -570,9 +578,9 @@ mod tests {
         let x86 = Saved::X86_64 { tsc_khz: 2_000_000, msrs: [0x10].into() };
         assert_eq!(serde_json::to_string(&x86).unwrap(), r#"{"saved_msrs":[16],"saved_tsc_khz":2000000}"#);
         assert_eq!(Value::Object(x86.to_request()), serde_json::json!({"msrs": [16], "tsc_khz": 2000000}));
-        let arm = Saved::Aarch64 { regs: [0x6030_0000_0013_c000].into() };
-        assert_eq!(serde_json::to_string(&arm).unwrap(), r#"{"arch":"aarch64","saved_regs":[6931039826524487680]}"#);
-        assert_eq!(Value::Object(arm.to_request()), serde_json::json!({"arch": "aarch64", "regs": [0x6030_0000_0013_c000u64]}));
+        let arm = Saved::Aarch64 { regs: [0x6030_0000_0013_c000].into(), id_regs: [("MIDR_EL1".into(), 1)].into() };
+        assert_eq!(serde_json::to_string(&arm).unwrap(), r#"{"arch":"aarch64","saved_id_regs":{"MIDR_EL1":1},"saved_regs":[6931039826524487680]}"#);
+        assert_eq!(Value::Object(arm.to_request()), serde_json::json!({"arch": "aarch64", "regs": [0x6030_0000_0013_c000u64], "id_regs": {"MIDR_EL1": 1}}));
         for saved in [&x86, &arm] {
             assert_eq!(&serde_json::from_str::<Saved>(&serde_json::to_string(saved).unwrap()).unwrap(), saved);
             assert_eq!(&Saved::of_request(&Value::Object(saved.to_request())).unwrap(), saved);

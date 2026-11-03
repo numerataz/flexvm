@@ -1,5 +1,5 @@
 //! aarch64: MIDR_EL1 and the other identification registers of a vCPU as Firecracker sets it up
-//! (PSCI 0.2, no CPU template), the counter frequency, the registers KVM_GET_REG_LIST names,
+//! (PSCI 0.2, no CPU template), its firmware pseudo-registers, the counter frequency, the registers KVM_GET_REG_LIST names,
 //! which Firecracker saves and restores one by one, the largest SVE vector length, the vGIC
 //! version and stolen-time support. ioctl numbers and register encodings follow the arm64 KVM
 //! uapi (linux/kvm.h, asm/kvm.h).
@@ -19,7 +19,8 @@ pub struct Arm64 {
     pub regs: BTreeSet<u64>,
     /// `firecracker --version` and the binary's content hash.
     pub firecracker: String,
-    /// Identification registers (MIDR, REVIDR, ID_*, CLIDR, AIDR, CTR) by name.
+    /// Identification registers (MIDR, REVIDR, ID_*, CLIDR, AIDR, CTR) and firmware
+    /// pseudo-registers (PSCI version, SMCCC workarounds, hypercall bitmaps) by name.
     pub id_regs: BTreeMap<String, u64>,
     /// Largest SVE vector length KVM offers, in bytes; 0 without SVE.
     pub sve_max_vl: u32,
@@ -35,6 +36,18 @@ const KVM_REG_SIZE_MASK: u64 = 0x00f0_0000_0000_0000;
 const KVM_REG_SIZE_U64: u64 = 0x0030_0000_0000_0000;
 const KVM_REG_ARM_COPROC_MASK: u64 = 0x0fff_0000;
 const KVM_REG_ARM64_SYSREG: u64 = 0x0013 << 16;
+/// KVM_REG_ARM_FW and KVM_REG_ARM_FW_FEAT_BMAP.
+const KVM_REG_ARM_FW: u64 = 0x0014 << 16;
+const KVM_REG_ARM_FW_FEAT_BMAP: u64 = 0x0016 << 16;
+
+/// A 64-bit firmware register's (coprocessor, index).
+fn fw_reg_fields(id: u64) -> Option<(u64, u64)> {
+    let coproc = id & KVM_REG_ARM_COPROC_MASK;
+    let fw = id & KVM_REG_ARCH_MASK == KVM_REG_ARM64
+        && id & KVM_REG_SIZE_MASK == KVM_REG_SIZE_U64
+        && (coproc == KVM_REG_ARM_FW || coproc == KVM_REG_ARM_FW_FEAT_BMAP);
+    fw.then_some((coproc, id & 0xffff))
+}
 
 #[cfg(any(target_arch = "aarch64", test))]
 /// ARM64_SYS_REG(op0, op1, crn, crm, op2).
@@ -53,8 +66,12 @@ fn sys_reg_fields(id: u64) -> Option<[u64; 5]> {
 
 #[cfg(any(target_arch = "aarch64", test))]
 /// The identification space (op0 3, CRn 0): MIDR, REVIDR and the ID registers, CLIDR, AIDR,
-/// CTR and DCZID. Not MPIDR, which KVM derives from the vCPU's index.
+/// and CTR, but not MPIDR, which KVM derives from the vCPU's index. And the firmware registers:
+/// KVM refuses to set a workaround level or hypercall bit its host lacks.
 fn is_id_reg(id: u64) -> bool {
+    if fw_reg_fields(id).is_some() {
+        return true;
+    }
     match sys_reg_fields(id) {
         Some([3, 0, 0, crm, op2]) => !(crm == 0 && op2 == 5),
         Some([3, 1, 0, 0, _]) => true,
@@ -93,9 +110,15 @@ fn reg_name(id: u64) -> String {
         ([3, 3, 0, 0, 1], "CTR_EL0"),
         ([3, 3, 0, 0, 7], "DCZID_EL0"),
     ];
-    match sys_reg_fields(id) {
-        Some(f) => NAMES.iter().find(|(e, _)| *e == f).map_or_else(|| format!("S{}_{}_C{}_C{}_{}", f[0], f[1], f[2], f[3], f[4]), |(_, n)| n.to_string()),
-        None => format!("{id:#x}"),
+    const FW: [&str; 4] = ["PSCI_VERSION", "SMCCC_ARCH_WORKAROUND_1", "SMCCC_ARCH_WORKAROUND_2", "SMCCC_ARCH_WORKAROUND_3"];
+    const BMAP: [&str; 4] = ["STD_BMAP", "STD_HYP_BMAP", "VENDOR_HYP_BMAP", "VENDOR_HYP_BMAP_2"];
+    match (sys_reg_fields(id), fw_reg_fields(id)) {
+        (Some(f), _) => NAMES.iter().find(|(e, _)| *e == f).map_or_else(|| format!("S{}_{}_C{}_C{}_{}", f[0], f[1], f[2], f[3], f[4]), |(_, n)| n.to_string()),
+        (None, Some((coproc, i))) => {
+            let (names, kind) = if coproc == KVM_REG_ARM_FW { (FW, "FW") } else { (BMAP, "FW_FEAT_BMAP") };
+            names.get(i as usize).map_or_else(|| format!("{kind}_{i}"), |n| n.to_string())
+        }
+        (None, None) => format!("{id:#x}"),
     }
 }
 
@@ -139,7 +162,7 @@ fn gic_version(v3: bool, its: bool, v2: bool) -> Result<u32> {
 
 impl Arm64 {
     #[cfg(any(target_arch = "aarch64", test))]
-    /// `ids` holds every identification register `regs` names, and MIDR_EL1.
+    /// `ids` holds every identification and firmware register `regs` names, and MIDR_EL1.
     fn of_probe(
         regs: BTreeSet<u64>,
         ids: &BTreeMap<u64, u64>,
@@ -167,8 +190,9 @@ impl Arm64 {
 
     /// Firecracker saves every register KVM lists and sets each on a load, which fails for one
     /// the target lacks. Kernels before writable ID registers (6.7) refuse an ID register that
-    /// differs at all, so these must match exactly, as must what the guest reads unvirtualised.
-    pub fn check_saved(&self, host: &Self, regs: &BTreeSet<u64>) -> Result<()> {
+    /// differs at all, so these must match exactly, the template's and those of the host that
+    /// saved this state (`id_regs`), which may list more; as must what the guest reads unvirtualised.
+    pub fn check_saved(&self, host: &Self, regs: &BTreeSet<u64>, id_regs: &BTreeMap<String, u64>) -> Result<()> {
         super::check_identity([&self.cpu, &self.firecracker], [&host.cpu, &host.firecracker])?;
         if self.cntfrq_hz != host.cntfrq_hz {
             bail!(
@@ -181,7 +205,7 @@ impl Arm64 {
         if !missing.is_empty() {
             bail!("snapshot incompatible with this host: KVM lacks saved registers {}", missing.join(", "));
         }
-        for (name, want) in &self.id_regs {
+        for (name, want) in self.id_regs.iter().chain(id_regs) {
             if host.id_regs.get(name) != Some(want) {
                 let here = host.id_regs.get(name).map_or("none".into(), |v| format!("{v:#x}"));
                 bail!("snapshot incompatible with this host: {name} differs (snapshot: {want:#x}; host: {here})");
@@ -403,6 +427,10 @@ pub(crate) mod tests {
         assert_eq!(reg_name(sys_reg(3, 3, 0, 0, 1)), "CTR_EL0");
         assert_eq!(reg_name(sys_reg(3, 0, 0, 2, 3)), "S3_0_C0_C2_3");
         assert_eq!(reg_name(X0), "0x6030000000100000");
+        // KVM_REG_ARM_FW_REG(1) and KVM_REG_ARM_FW_FEAT_BMAP_REG(3), as a GCE c4a's KVM lists them.
+        for (id, name) in [(0x6030_0000_0014_0001, "SMCCC_ARCH_WORKAROUND_1"), (0x6030_0000_0016_0003, "VENDOR_HYP_BMAP_2"), (0x6030_0000_0014_0009, "FW_9")] {
+            assert!(is_id_reg(id) && reg_name(id) == name, "{}", reg_name(id));
+        }
     }
 
     #[test]
@@ -446,20 +474,20 @@ pub(crate) mod tests {
     #[test]
     fn accepts_the_same_host_and_extra_registers() {
         let snapshot = host();
-        snapshot.check_saved(&snapshot, &snapshot.regs).unwrap();
+        snapshot.check_saved(&snapshot, &snapshot.regs, &snapshot.id_regs).unwrap();
         let mut more = snapshot.clone();
         more.regs.insert(sys_reg(3, 0, 1, 0, 0));
         more.id_regs.insert("ID_AA64PFR2_EL1".into(), 0);
         more.pvtime = true;
-        snapshot.check_saved(&more, &snapshot.regs).unwrap();
+        snapshot.check_saved(&more, &snapshot.regs, &snapshot.id_regs).unwrap();
         // A VM state saved where there were more registers needs them all.
-        let error = snapshot.check_saved(&snapshot, &more.regs).unwrap_err().to_string();
+        let error = snapshot.check_saved(&snapshot, &more.regs, &more.id_regs).unwrap_err().to_string();
         assert!(error.contains("KVM lacks saved registers S3_0_C1_C0_0"), "{error}");
-        snapshot.check_saved(&more, &more.regs).unwrap();
+        snapshot.check_saved(&more, &more.regs, &more.id_regs).unwrap();
         // A guest booted without stolen time loads where there is.
         let mut without = snapshot.clone();
         without.pvtime = false;
-        without.check_saved(&snapshot, &snapshot.regs).unwrap();
+        without.check_saved(&snapshot, &snapshot.regs, &snapshot.id_regs).unwrap();
     }
 
     #[test]
@@ -497,12 +525,12 @@ pub(crate) mod tests {
         for (change, expected) in cases {
             let mut h = snapshot.clone();
             change(&mut h);
-            let e = snapshot.check_saved(&h, &snapshot.regs).unwrap_err().to_string();
+            let e = snapshot.check_saved(&h, &snapshot.regs, &snapshot.id_regs).unwrap_err().to_string();
             assert!(e.contains(expected), "{e}");
         }
         let mut sve = snapshot.clone();
         sve.sve_max_vl = 32;
-        let e = sve.check_saved(&snapshot, &snapshot.regs).unwrap_err().to_string();
+        let e = sve.check_saved(&snapshot, &snapshot.regs, &snapshot.id_regs).unwrap_err().to_string();
         assert!(e.contains("SVE vector length differs (snapshot: 32 bytes; host: 0 bytes)"), "{e}");
     }
 }

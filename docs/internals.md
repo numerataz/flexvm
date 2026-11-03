@@ -172,12 +172,16 @@ mismatch, and then compares per architecture:
 - **aarch64**: MIDR_EL1 (implementer, part, variant and revision), the
   counter frequency (CNTFRQ_EL0), the registers `KVM_GET_REG_LIST` names on a
   vCPU initialised as Firecracker does (PSCI 0.2), the identification
-  registers among them (REVIDR, the `ID_*` registers, CLIDR, AIDR, CTR), the
+  registers among them (REVIDR, the `ID_*` registers, CLIDR, AIDR, CTR) and
+  its firmware registers (PSCI version, SMCCC workaround levels, hypercall
+  bitmaps), the
   largest SVE vector length, the vGIC Firecracker creates (GICv3 with an ITS,
   else GICv2) and stolen-time support. The counter frequency must be the same:
   the guest reads the host's and KVM cannot scale it. Firecracker sets every
   saved register on a load, and kernels before 6.7 refuse an ID register that
-  differs at all, so the identification registers must match exactly, as must
+  differs at all (and every kernel one whose workaround level or hypercall
+  bits the host lacks), so these must match exactly, the template's and those
+  of the host that saved the VM state, as must
   the SVE length and vGIC; extra registers are fine, and so is stolen time on
   a host whose template was booted without it.
 
