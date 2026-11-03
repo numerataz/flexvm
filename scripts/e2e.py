@@ -1479,10 +1479,11 @@ def nettest_ipv6():
     the hosts listening and peering at IPv6 addresses alone (an IPv6 underlay: the VM's /32 is routed via an
     IPv6 next hop) with vm_ipv6_prefix. The client's TCP ping-pong and 5 kHz UDP stream to the VM's IPv6
     address (proxy NDP) lose nothing across migrations A -> B -> A, and the client's neighbour entry follows
-    the VM (the unsolicited NA). A TCP stall may exceed twice the downtime by up to 100 ms (STALL_SLACK_MS: a
-    runner's scheduling, beside a downtime of a few tens of ms), never to a retransmit timeout's 200."""
+    the VM (the unsolicited NA). A TCP stall may last up to 190 ms however short the downtime (STALL_SLACK_MS):
+    CI saw 113-181 ms beside 30-46 ms downtimes with nothing lost, while a lost segment of the one-segment
+    ping-pong costs at least 200 ms (the minimum retransmit timeout, and a loss probe's delayed-ACK allowance)."""
     env = {**ENV, "V6": "1", "FLEXVM": BIN, "STATE": BUILD, "TEMPLATE": args.template, "P": f"fv6{A.port}", "ROUNDS": "1",
-           "STALL_SLACK_MS": "100", "WORK": os.path.join(args.log_dir, "nettest-ipv6")}
+           "STALL_SLACK_MS": "190", "WORK": os.path.join(args.log_dir, "nettest-ipv6")}
     p = subprocess.Popen([os.path.join(ROOT, "scripts", "nettest.sh")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                          env=env, start_new_session=True)
     try:
