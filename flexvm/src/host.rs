@@ -243,6 +243,15 @@ pub fn route_hop(ip: crate::net::VmAddr, hop: Hop) -> Result<()> {
     if ip.v6.is_some() && crate::net::is_local_ip(hop.via())? {
         return Ok(());
     }
+    // Run there, it is not answered for on the LAN here (`net::proxy_add`): the peer is, as it
+    // announces it. A failure leaves the entry to a sweep (`gc::sweep`), not the route undone.
+    // Nor for a peer here by its IPv6 underlay alone (`route_via6` skips it too).
+    let local6 = || hop.via6().is_some_and(|v| crate::net::is_local_ip(v.into()).unwrap_or(false));
+    if let Some(v6) = ip.v6.filter(|_| !local6()) {
+        if let Err(e) = crate::net::proxy_remove(v6) {
+            crate::log!("route {} via {}: {e}", ip.v4, hop.via());
+        }
+    }
     match (ip.v6, hop.via6()) {
         (Some(v6), Some(via6)) => crate::net::route_via6(v6, via6),
         (Some(v6), None) => {
@@ -568,11 +577,6 @@ impl Config {
             }
             (Ok(_), Err(e)) => w.push(format!("flexvm: warning: cannot check whether vm_ips {} covers this host's addresses: {e}", self.vm_ips)),
             (Err(_), _) => {}
-        }
-        if let Some(p) = self.vm_ipv6_prefix {
-            w.push(format!(
-                "flexvm: warning: vm_ipv6_prefix {p} is set: VMs' IPv6 addresses are configured in guests, routed (to peers via their IPv6 underlays) and held in migrations, but not answered for on the LAN (#1300)"
-            ));
         }
         let v6_dns = self.dns.as_ref().map_or(&[][..], Dns::listed).iter().find(|d| d.parse::<std::net::Ipv6Addr>().is_ok());
         if let Some(d) = v6_dns.filter(|_| self.vm_ipv6_prefix.is_none()) {
@@ -6654,7 +6658,7 @@ pub(crate) mod tests {
         );
         let w = c.warnings().join("\n");
         assert!(!w.contains("dns 2001:db8::53"), "{w}");
-        assert!(w.contains("vm_ipv6_prefix fd00:0:0:7::/96 is set"), "{w}");
+        assert!(!w.contains("vm_ipv6_prefix fd00:0:0:7::/96 is set"), "no warning for the prefix itself: {w}");
         // Without the prefix, guests have no IPv6 address to reach them with: left out, with a warning.
         std::fs::write(&path, r#"{"dns": ["2001:db8::53", "192.0.2.53"]}"#).unwrap();
         let c = Host::open(&h.state, &h.run).unwrap().cfg;
@@ -7905,10 +7909,7 @@ pub(crate) mod tests {
             w.contains("vm_ipv6_prefix fd00:1::/96 covers fd00:1::a09:7, this host's address: the prefix is VMs' alone, and no vm is given 10.9.0.7"),
             "{w}"
         );
-        assert!(
-            w.contains("VMs' IPv6 addresses are configured in guests, routed (to peers via their IPv6 underlays) and held in migrations, but not answered for on the LAN (#1300)"),
-            "{w}"
-        );
+        assert!(!w.contains("vm_ipv6_prefix fd00:1::/96 is set"), "{w}");
         let w = cfg.warnings_by(|_| Ok(false), Ok(vec![(v6("fd00:2::a09:7"), "address")])).join("\n");
         assert!(!w.contains("covers"), "{w}");
     }

@@ -194,6 +194,9 @@ pub fn main(host: Host, listeners: Vec<TcpListener>, validated: Cached) -> Resul
     let dev = host.cfg.announce_dev();
     if let Some(dev) = &dev {
         let _ = crate::net::proxy_arp(dev);
+        if host.cfg.vm_ipv6_prefix.is_some() {
+            let _ = crate::net::proxy_ndp(dev);
+        }
     }
     let underlay = host.cfg.underlay().map_or("none".into(), |u| u.to_string());
     let at = listeners.iter().map(|l| l.local_addr().map(|a| a.to_string())).collect::<std::io::Result<Vec<_>>>()?.join(", ");

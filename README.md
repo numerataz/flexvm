@@ -651,15 +651,15 @@ the warnings.
 
 ### IPv6 addresses
 
-**Not usable yet.** With `vm_ipv6_prefix` set, flexvm derives and reports
+With `vm_ipv6_prefix` set, flexvm derives and reports
 each VM's IPv6 address, configures it in the guest, routes it to the VM's
 tap, and routes it on each peer via the host it runs on, as its IPv4 address
 is (via that host's IPv6 underlay: a peer with none leaves it to the host's
-own IPv6 routes), and holds its IPv6 packets during a migration's or
-checkpoint's pause as it holds the IPv4 ones. It is not yet answered for on
-the LAN (#1300): machines that are not peers need a route to the prefix via a
-host. `info` and the listener warn about this for as long as it is true.
-Without the prefix, nothing changes: taps keep IPv6 off.
+own IPv6 routes), holds its IPv6 packets during a migration's or
+checkpoint's pause as it holds the IPv4 ones, and answers for it on the LAN
+(proxy NDP, below). Port forwards (`-p`) reach the guest at its IPv4 address
+only (#1301): a service listening on IPv6 alone in the guest is not
+forwarded to. Without the prefix, nothing changes: taps keep IPv6 off.
 
 On the host, each VM's IPv6 address is a `/128` routed to its tap beside its
 `/32`, with a permanent neighbour entry for the guest's MAC. The tap gets
@@ -681,6 +681,24 @@ applies to VMs routed after it (started, restored or arriving); running VMs
 keep the address they were routed by, and routes to peers' VMs under the old
 prefix stay until the host reboots: set the prefix
 before VMs run, and do not change it while they do.
+
+On the LAN, NDP takes the place of ARP. The announce device gets
+`proxy_ndp=1` beside `proxy_arp`, but proxy NDP answers only for addresses
+with a proxy entry of their own, so each VM's IPv6 address gets one there
+(`ip -6 neigh show proxy`) while it runs on the host: added as it is
+announced (started, restored, arrived or resumed after an aborted
+migration) and checked every second, and removed when it leaves (killed,
+died, suspended, moved), when it is routed to a peer (the source of a migration,
+once its route moves to the target; a peer's announcement of it) and by
+every garbage-collection sweep for an address no tap or hold device on the
+host is routed to any longer (a VM process killed outright). The kernel
+forgets them in a reboot. Beside each gratuitous ARP, the host sends an
+unsolicited Neighbour Advertisement for the VM's IPv6 address (override set,
+to `ff02::1`), so the LAN's entries for it follow it to its new host. A
+machine on the LAN reaches the VMs with a route to the prefix on that link
+(`ip -6 route add PREFIX/96 dev eth0`), or via a host. An entry stays on an
+announce device that changed (a derived one that follows the routes) until
+its VM leaves, and one of an old prefix stays until the host reboots.
 
 In the guest, flexvm-init gives `eth0` the address as a `/128` and a default
 route via `fe80::1`, the host's tap, whose MAC is pinned by a permanent
@@ -809,8 +827,9 @@ warns until then). Derived values:
   an IPv6 one neither link-local nor IPv4-mapped; a local address is
   accepted with a warning.
   Entries for a host no longer in `peers` are ignored (`info` warns).
-- `announce_dev`, where the host answers ARP for its VMs (`proxy_arp`) and
-  announces a VM that arrives: that route's device, none for peers on this
+- `announce_dev`, where the host answers ARP for its VMs (`proxy_arp`), and
+  with `vm_ipv6_prefix` neighbour solicitations (`proxy_ndp`, an entry per
+  VM), and announces a VM that arrives: that route's device, none for peers on this
   machine. `"none"` turns this off, for routed or WireGuard links.
 - `reserve_mib`, the memory a host keeps free (starts and growth that would
   take it below are refused): a sixteenth of the host's RAM, from 256 MiB to
@@ -836,7 +855,7 @@ Every VM process and listener sets `net.ipv4.ip_forward=1`, and
 `proxy_arp` on the announce device, and never reverts them: the host routes
 between all its interfaces from then on, so check its `FORWARD` policy.
 With `vm_ipv6_prefix`, they also set `net.ipv6.conf.all.forwarding=1` (and
-check `ip6tables`' `FORWARD` policy). An interface that forwards takes router
+check `ip6tables`' `FORWARD` policy) and `proxy_ndp` on the announce device. An interface that forwards takes router
 advertisements only with `accept_ra=2`, so before turning forwarding on,
 flexvm sets `accept_ra=2` on each interface that had `1` (IPv6 on and not
 forwarding yet) and logs it: an uplink configured by advertisements keeps its
@@ -1341,7 +1360,9 @@ between network namespaces and fails on a lost datagram or a long stall.
 - **Checkpoints** write only pages that differ from the template, while the
   VM runs (copy-on-write through userfaultfd write protection).
 - **Networking**: each VM has a /32 routed to its tap; peers get a route,
-  the LAN a gratuitous ARP (proxy ARP), when it moves.
+  the LAN a gratuitous ARP (proxy ARP), when it moves (with
+  `vm_ipv6_prefix`, its /128 too, and an unsolicited Neighbour Advertisement
+  with proxy NDP).
 
 Design and internals: [docs/process-per-vm.md](docs/process-per-vm.md)
 (processes, state, migration protocol, invariants) and

@@ -2644,6 +2644,172 @@ def commit_fail_routed():
         subprocess.run(["rm", "-rf", root])
 
 
+@needs_kvm
+def proxy_ndp_routed():
+    """#1300: a client on the LAN reaches a VM at its IPv6 address (`vm_ipv6_prefix`) through proxy
+    NDP, before and after it migrates there and back. Each host in a network namespace of its own on
+    one bridge, with a client beside them (as scripts/nettest.sh has them): the host the VM runs on
+    has its proxy entry on its announce device, the other none; the target's unsolicited Neighbour
+    Advertisement points the client's entry at it without the client asking; a kill removes the
+    entry, and so does a sweep once a VM process killed outright left it. IPv4 reaches it as before."""
+    tag = f"fn{A.addr.rsplit(':', 1)[1]}"
+    net, net6, prefix, port = "10.253.0", "fd99::", "fd00:d0::", 7070
+    ns = {h: f"{tag}{h}" for h in ("a", "b", "c", "lan")}
+    root = tempfile.mkdtemp(prefix=f"{tag}-ndp-", dir="/var/tmp")
+    hosts = {h: Host(f"{net}.{i}:{port}", os.path.join(root, h), f"{net}.{lo}-{net}.{hi}")
+             for h, i, lo, hi in (("a", 1, 128, 191), ("b", 2, 192, 250))}
+    procs, seen = [], set()
+
+    def nscli(h, *a, timeout=120):
+        r = subprocess.run(["ip", "netns", "exec", ns[h], "sh", "-c", 'mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null; exec "$@"', "sh",
+                            BIN, "--state", hosts[h].state, "--run", hosts[h].run, *a], capture_output=True, text=True, timeout=timeout, env=ENV)
+        return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+    def nsjson(h, *a):
+        code, out, err = nscli(h, *a)
+        assert code == 0, (a, err or out)
+        return json.loads(out) if out else None
+
+    def ip(h, *a):
+        return subprocess.run(["ip", "-n", ns[h], *a], capture_output=True, text=True).stdout.strip()
+
+    def mac(h):
+        return ip(h, "link", "show", "eth0").split("link/ether ")[1].split()[0]
+
+    def proxied(h, v6):
+        """Whether host `h` has a proxy entry for `v6`, and on which device."""
+        return [l.split()[2] for l in ip(h, "-6", "neigh", "show", "proxy").splitlines() if l.split()[:2] == [v6, "dev"]]
+
+    def client_sees(v6):
+        """The MAC the client's neighbour entry for `v6` names, if it has one."""
+        out = ip("c", "-6", "neigh", "show", v6, "dev", "eth0")
+        return out.split("lladdr ")[1].split()[0] if "lladdr " in out else None
+
+    def reach(addr, port_):
+        """An echo from the guest's `port_` at `addr`, as the client sees it."""
+        r = subprocess.run(["ip", "netns", "exec", ns["c"], "python3", "-c",
+                            "import socket, sys; s = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=3); s.sendall(b'hi\\n'); "
+                            "print(s.recv(16).decode().strip())", addr, str(port_)], capture_output=True, text=True, timeout=10)
+        return r.returncode == 0 and r.stdout.strip() == "hi"
+
+    def ours():
+        out = []
+        for p in filter(str.isdigit, os.listdir("/proc")):
+            try:
+                argv = open(f"/proc/{p}/cmdline", "rb").read().split(b"\0")
+            except OSError:
+                continue
+            if any(hosts[h].state.encode() in argv for h in hosts):
+                out.append(int(p))
+        return out
+
+    def ls(h):
+        return {v["name"]: v for v in nsjson(h, "ps", "-a", "--json")}
+
+    def serve(h, n):
+        code, out, err = nscli(h, "exec", n, "sh", "-c", "for p in 7000 7006; do setsid socat TCP6-LISTEN:$p,ipv6only=0,fork,reuseaddr EXEC:cat >/dev/null 2>&1 </dev/null & done")
+        assert code == 0, err or out
+
+    n, killed = "ft-ndp", "ft-ndp-killed"
+    try:
+        for h in ns.values():
+            subprocess.run(["ip", "netns", "add", h], check=True)
+        subprocess.run(["ip", "-n", ns["lan"], "link", "add", "br0", "type", "bridge"], check=True)
+        subprocess.run(["ip", "-n", ns["lan"], "link", "set", "br0", "up"], check=True)
+        for h, i in (("a", 1), ("b", 2), ("c", 10)):
+            subprocess.run(["ip", "link", "add", "eth0", "netns", ns[h], "type", "veth", "peer", "name", f"p{h}", "netns", ns["lan"]], check=True)
+            subprocess.run(["ip", "-n", ns["lan"], "link", "set", f"p{h}", "master", "br0", "up"], check=True)
+            subprocess.run(["ip", "-n", ns[h], "addr", "add", f"{net}.{i}/24", "dev", "eth0"], check=True)
+            subprocess.run(["ip", "-n", ns[h], "-6", "addr", "add", f"{net6}{i}/64", "dev", "eth0", "nodad"], check=True)
+            for dev in ("eth0", "lo"):
+                subprocess.run(["ip", "-n", ns[h], "link", "set", dev, "up"], check=True)
+        # The client resolves the VMs' prefix on the LAN, as it would a subnet the hosts proxy for.
+        subprocess.run(["ip", "-n", ns["c"], "-6", "route", "add", f"{prefix}/96", "dev", "eth0"], check=True)
+        for h, other in (("a", "b"), ("b", "a")):
+            x = hosts[h]
+            os.makedirs(x.state)
+            os.makedirs(x.run)
+            for d in ("artifacts", "templates"):
+                os.symlink(os.path.realpath(os.path.join(A.state, d)), os.path.join(x.state, d))
+            configure(x, peers=[hosts[other].addr], vm_ips=x.ips, cluster_ips=f"{net}.128-{net}.250", reserve_mib=512, vm_ipv6_prefix=f"{prefix}/96")
+            lg = open(os.path.join(root, f"listen-{h}.log"), "a")
+            procs.append(subprocess.Popen(["ip", "netns", "exec", ns[h], "sh", "-c", 'mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null; exec "$@"', "sh",
+                                           BIN, "--state", x.state, "--run", x.run, "listen", x.addr], stdout=lg, stderr=lg, env=ENV))
+        up = lambda h: subprocess.run(["ip", "netns", "exec", ns[h], "bash", "-c", f"exec 3<>/dev/tcp/{hosts[h].addr.replace(':', '/')}"],
+                                      capture_output=True).returncode == 0
+        assert wait_for(lambda: up("a") and up("b"), 10), "listeners did not come up"
+        r = nsjson("a", "run", "--name", n, "-d", args.template)
+        v4 = r["ip"]
+        v6 = str(ipaddress.IPv6Address(int(ipaddress.IPv6Address(prefix)) | int(ipaddress.IPv4Address(v4))))
+        seen.add((ls("a")[n]["pid"], ls("a")[n]["start"]))
+        serve("a", n)
+        for h in ("a", "b"):
+            check(f"proxy ndp: proxy NDP on {h}'s announce device", open_ns_sysctl(ns[h], "net/ipv6/conf/eth0/proxy_ndp") == "1")
+        check("proxy ndp: A answers for the VM on its announce device", wait_for(lambda: proxied("a", v6) == ["eth0"], 10), ip("a", "-6", "neigh", "show", "proxy"))
+        check("proxy ndp: B does not", proxied("b", v6) == [], ip("b", "-6", "neigh", "show", "proxy"))
+        check("proxy ndp: IPv4 from the LAN as before (proxy ARP)", wait_for(lambda: reach(v4, 7000), 20))
+        check("proxy ndp: the client reaches the VM's IPv6 address", wait_for(lambda: reach(v6, 7006), 20))
+        check("proxy ndp: through A", client_sees(v6) == mac("a"), (client_sees(v6), mac("a")))
+        for src, dst in (("a", "b"), ("b", "a")):
+            code, out, err = nscli(src, "migrate", n, hosts[dst].addr)
+            moved = lambda: n in ls(dst) and ls(dst)[n]["state"] == "running" and n not in ls(src)
+            check(f"proxy ndp: migrated {src} -> {dst}", code == 0 and wait_for(moved, 60), (code, err))
+            seen.add((ls(dst)[n]["pid"], ls(dst)[n]["start"]))
+            check(f"proxy ndp: {dst} answers for it now", wait_for(lambda: proxied(dst, v6) == ["eth0"], 10), ip(dst, "-6", "neigh", "show", "proxy"))
+            check(f"proxy ndp: {src} answers for it no longer", wait_for(lambda: proxied(src, v6) == [], 10), ip(src, "-6", "neigh", "show", "proxy"))
+            # The client asked nothing since: the target's unsolicited advertisement (override) moved its entry.
+            check(f"proxy ndp: the client's entry points at {dst}, unasked", wait_for(lambda: client_sees(v6) == mac(dst), 10), (client_sees(v6), mac(dst)))
+            check(f"proxy ndp: the client reaches it on {dst}", wait_for(lambda: reach(v6, 7006), 20))
+            check(f"proxy ndp: IPv4 too on {dst}", wait_for(lambda: reach(v4, 7000), 20))
+        code, out, err = nscli("a", "kill", n)
+        assert code == 0, err or out
+        check("proxy ndp: a kill removes its entry", wait_for(lambda: proxied("a", v6) == [], 10), ip("a", "-6", "neigh", "show", "proxy"))
+        # Killed outright, its process removes nothing, and its tap (with its /128, link down) stays: a
+        # sweep (the listener's periodic one, or this one) removes the tap, then the entry.
+        r = nsjson("a", "run", "--name", killed, "-d", args.template)
+        v6k = str(ipaddress.IPv6Address(int(ipaddress.IPv6Address(prefix)) | int(ipaddress.IPv4Address(r["ip"]))))
+        check("proxy ndp: the second VM's entry", wait_for(lambda: proxied("a", v6k) == ["eth0"], 10), ip("a", "-6", "neigh", "show", "proxy"))
+        victim = ls("a")[killed]
+        seen.add((victim["pid"], victim["start"]))
+        pids = kill_tree(victim["pid"])
+        check("proxy ndp: the second VM's processes are dead", wait_for(lambda: not any(alive(p) for p in pids), 15), pids)
+        code, out, err = nscli("a", "debug", "gc")
+        route = ip("a", "-6", "route", "show", "exact", f"{v6k}/128")
+        check("proxy ndp: a sweep removes its tap's /128", code == 0 and route == "", (code, err, route))
+        check("proxy ndp: and its entry", proxied("a", v6k) == [], ip("a", "-6", "neigh", "show", "proxy"))
+    finally:
+        for p in procs:
+            p.terminate()
+            p.wait()
+        gone = wait_for(lambda: not ours(), 10)
+        pids = ours()
+        for p in pids:
+            seen.add((p, starttime_of(p)))
+        for p in pids:
+            with suppress(OSError):
+                os.kill(p, signal.SIGKILL)
+        check("proxy ndp: no process of either host left", gone, pids)
+        cgs = lambda: [c for p, start in seen for c in glob_idle(p, start)]
+        check("proxy ndp: no cgroup left", wait_for(lambda: not cgs(), 10), cgs())
+        for c in cgs():
+            os.rmdir(c)
+        for h in ns.values():
+            subprocess.run(["ip", "netns", "del", h], capture_output=True)
+        records = os.path.join(A.state, "templates", ".states")
+        for f in os.listdir(records) if os.path.isdir(records) else []:
+            with suppress(OSError):
+                with open(os.path.join(records, f), "rb") as r:
+                    gone = r.read().startswith(os.path.realpath(root).encode() + b"/")
+                if gone:
+                    os.remove(os.path.join(records, f))
+        subprocess.run(["rm", "-rf", root])
+
+
+def open_ns_sysctl(netns, key):
+    """`/proc/sys/KEY` in network namespace `netns` (its own: `ip netns exec`)."""
+    return subprocess.run(["ip", "netns", "exec", netns, "cat", f"/proc/sys/{key}"], capture_output=True, text=True).stdout.strip()
+
+
 def glob_idle(pid, start):
     """The Firecracker cgroups of VM process `pid` (started at `start`): `flexvm/idle-PID-START-N`."""
     d = "/sys/fs/cgroup/flexvm"
@@ -12942,7 +13108,7 @@ SCENARIOS = dict(
     resume_failures=resume_failures, resume_unpause_fail=resume_unpause_fail, abort_link_fail=abort_link_fail, resume_unsettled=resume_unsettled, resume_slow_guest=resume_slow_guest, resume_readdress_fail=resume_readdress_fail, held_restore_frozen=held_restore_frozen, cow_exact=cow_exact, cow_rescue_fail=cow_rescue_fail, cow_collapsed=cow_collapsed, unplug_collapsed=no_evict(unplug_collapsed), cow_abort=cow_abort,
     cow_crash=cow_crash, cow_reports_held=cow_reports_held, ckpt_incremental=ckpt_incremental, ckpt_hot=ckpt_hot,
     ckpt_failed_stop=ckpt_failed_stop, ckpt_no_wp=ckpt_no_wp, ckpt_rearm=ckpt_rearm,
-    leave_fail=leave_fail, capture_fail=capture_fail, abort_gen_fail=abort_gen_fail, commit_fail=commit_fail, commit_fail_routed=commit_fail_routed, abort_stay_fail=abort_stay_fail,
+    leave_fail=leave_fail, capture_fail=capture_fail, abort_gen_fail=abort_gen_fail, commit_fail=commit_fail, commit_fail_routed=commit_fail_routed, proxy_ndp_routed=proxy_ndp_routed, abort_stay_fail=abort_stay_fail,
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail, arrival_flood=arrival_flood, arrival_cap_restart=arrival_cap_restart,
     fc_prepare=fc_prepare, forged_vmstate=forged_vmstate, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ipv6_packet_hold=ipv6_packet_hold, ckpt_stall=ckpt_stall, standby=standby, standby_vm_ips=standby_vm_ips,
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, suspend_unaddressed=suspend_unaddressed, resume_fence_fails=resume_fence_fails, kill_source=kill_source,

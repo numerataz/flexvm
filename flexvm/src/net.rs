@@ -2,7 +2,8 @@
 //! /128 beside it (`VmAddr`).
 //!
 //! All taps share one MAC, as do all guests, so moving a VM between hosts is just moving
-//! its route (plus, with `announce_dev`, a gratuitous ARP for proxy-ARP LAN peers).
+//! its route (plus, with `announce_dev`, a gratuitous ARP for proxy-ARP LAN peers, and with
+//! `vm_ipv6_prefix` an unsolicited Neighbour Advertisement and a proxy NDP entry).
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -1196,13 +1197,21 @@ type ProxyArp = std::collections::BTreeMap<String, std::result::Result<u32, std:
 /// is tried again, after `PROXY_ARP_RETRY`.
 pub fn proxy_arp(dev: &str) -> Result<()> {
     static ON: std::sync::Mutex<ProxyArp> = std::sync::Mutex::new(ProxyArp::new());
-    enable_proxy_arp(&mut ON.lock().unwrap(), dev, ifindex(dev), || conf("ipv4", dev, "proxy_arp", "1"))
+    enable_proxy_arp(&mut ON.lock().unwrap(), "proxy ARP", dev, ifindex(dev), || conf("ipv4", dev, "proxy_arp", "1"))
 }
 
-fn enable_proxy_arp(on: &mut ProxyArp, dev: &str, index: Result<u32>, write: impl FnOnce() -> Result<()>) -> Result<()> {
+/// `proxy_arp`'s IPv6 counterpart (`vm_ipv6_prefix`), set up the same way: proxy NDP on the
+/// announce device. Unlike proxy ARP it infers nothing from the routes: it answers only for the
+/// addresses with a proxy entry there (`proxy_add`).
+pub fn proxy_ndp(dev: &str) -> Result<()> {
+    static ON: std::sync::Mutex<ProxyArp> = std::sync::Mutex::new(ProxyArp::new());
+    enable_proxy_arp(&mut ON.lock().unwrap(), "proxy NDP", dev, ifindex(dev), || conf("ipv6", dev, "proxy_ndp", "1"))
+}
+
+fn enable_proxy_arp(on: &mut ProxyArp, what: &str, dev: &str, index: Result<u32>, write: impl FnOnce() -> Result<()>) -> Result<()> {
     match (on.get(dev), &index) {
         (Some(Ok(was)), Ok(now)) if was == now => return Ok(()),
-        (Some(Err(at)), _) if at.elapsed() < PROXY_ARP_RETRY => bail!("proxy ARP on {dev} failed; tried again shortly"),
+        (Some(Err(at)), _) if at.elapsed() < PROXY_ARP_RETRY => bail!("{what} on {dev} failed; tried again shortly"),
         _ => {}
     }
     match index.and_then(|i| write().map(|()| i)) {
@@ -1212,11 +1221,213 @@ fn enable_proxy_arp(on: &mut ProxyArp, dev: &str, index: Result<u32>, write: imp
         }
         Err(e) => {
             if !matches!(on.insert(dev.into(), Err(std::time::Instant::now())), Some(Err(_))) {
-                crate::log!("WARNING: proxy ARP on {dev}: {e}");
+                crate::log!("WARNING: {what} on {dev}: {e}");
             }
             Err(e)
         }
     }
+}
+
+/// Proxy entries (NTF_PROXY) change under a lock of the whole network namespace: an flock of its
+/// nsfs file, one inode for every process in it (hosts sharing one included). So an entry added
+/// while its VM's address is served here (`proxy_add`) is never removed by a sweep that read the
+/// routes before it was (`proxy_sweep`), nor added after a removal that saw the VM go.
+/// Waited for `PROXY_LOCK_WAIT` at most: a holder stopped (SIGSTOP) holds up no sweep, route
+/// switch or kill for longer; each caller logs the failure, and a sweep or tick tries again.
+fn proxy_lock() -> Result<crate::host::Flock> {
+    let until = std::time::Instant::now() + PROXY_LOCK_WAIT;
+    loop {
+        let ns = std::fs::File::open("/proc/thread-self/ns/net").map_err(|e| format!("the network namespace: {e}"))?;
+        match crate::host::Flock::new(ns, libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(lock) => return Ok(lock),
+            Err(e) if e.raw_os_error() != Some(libc::EWOULDBLOCK) => bail!("locking the network namespace's proxy entries: {e}"),
+            Err(_) if std::time::Instant::now() >= until => {
+                bail!("the network namespace's proxy entries stayed locked for {} s; not changed", PROXY_LOCK_WAIT.as_secs())
+            }
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(5)),
+        }
+    }
+}
+
+/// How long `proxy_lock` waits for another process's add, removal or sweep (each a few netlink requests).
+const PROXY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The proxy entry of VM address `ip` on announce device `dev`, with proxy NDP on there: the
+/// kernel answers neighbour solicitations for `ip` from the LAN (`ip -6 neigh add proxy`). Only
+/// while `served` says the VM's address is still served here, asked under the lock, so a removal
+/// once it is not (`proxy_remove`) is never overtaken.
+pub fn proxy_add(dev: &str, ip: Ipv6Addr, served: impl FnOnce() -> bool) -> Result<()> {
+    let _lock = proxy_lock()?;
+    if !served() {
+        return Ok(());
+    }
+    // Warned of by itself; the entry still goes in (a read-only /proc/sys with proxy_ndp set by its admin).
+    let _ = proxy_ndp(dev);
+    netlink(RTM_NEWNEIGH, NLM_F_CREATE | NLM_F_REPLACE, &proxy_msg(ip, ifindex(dev)?)).map_err(|e| format!("the proxy entry of {ip} on {dev}: {e}").into())
+}
+
+/// Removes every proxy entry of `ip`, on whichever device (the announce device may have changed).
+pub fn proxy_remove(ip: Ipv6Addr) -> Result<()> {
+    let _lock = proxy_lock()?;
+    for (index, _) in proxy_entries()?.into_iter().filter(|&(_, at)| at == ip) {
+        unproxy(index, ip)?;
+    }
+    Ok(())
+}
+
+/// `proxy_remove`, unless a device here other than those in `not` (the VM's own tap, the announce
+/// device) is routed to `ip` (`dev_routes6`): a host sharing this network namespace that runs it
+/// now (the target of a migration whose source ends without knowing its outcome), whose entry the
+/// same one is. By `ip`'s own /96, whatever the prefix is now (changed or unset since).
+pub fn proxy_release(ip: Ipv6Addr, not: &[&str]) -> Result<()> {
+    let _lock = proxy_lock()?;
+    let own = Ipv6Prefix((u128::from(ip) & !u128::from(u32::MAX)).into());
+    if dev_routes6(&routes6()?, own, not).contains(&ip) {
+        return Ok(());
+    }
+    for (index, _) in proxy_entries()?.into_iter().filter(|&(_, at)| at == ip) {
+        unproxy(index, ip)?;
+    }
+    Ok(())
+}
+
+/// This thread's IPv6 routes, as the kernel lists them: its namespace's, the one its netlink
+/// requests go to (`/proc/net` is the process's).
+fn routes6() -> Result<String> {
+    Ok(std::fs::read_to_string("/proc/thread-self/net/ipv6_route").map_err(|e| format!("/proc/net/ipv6_route: {e}"))?)
+}
+
+/// Removes the proxy entries in `prefix` (VMs' addresses) whose address no device here is routed
+/// to: those a VM process gone without removing its own left (killed). A device route is the /128
+/// of a tap or the hold device (`route_dev`); one via a peer (`route_via6`) is not, nor are
+/// `announce`'s, the LAN's. Returns the addresses removed.
+pub fn proxy_sweep(prefix: Ipv6Prefix, announce: Option<&str>) -> Result<Vec<Ipv6Addr>> {
+    let _lock = proxy_lock()?;
+    let served = dev_routes6(&routes6()?, prefix, announce.as_slice());
+    let mut removed = Vec::new();
+    for (index, ip) in proxy_entries()?.into_iter().filter(|&(_, ip)| prefix.ipv4_of(ip).is_some() && !served.contains(&ip)) {
+        unproxy(index, ip)?;
+        removed.push(ip);
+    }
+    Ok(removed)
+}
+
+/// Deletes the proxy entry of `ip` on the device at `ifindex`; one gone already is no error.
+fn unproxy(ifindex: u32, ip: Ipv6Addr) -> Result<()> {
+    match request(libc::RTM_DELNEIGH, 0, &proxy_msg(ip, ifindex)) {
+        Ok(()) => Ok(()),
+        Err(Failed::Unchanged(e)) if e.to_string() == format!("netlink: {}", std::io::Error::from_raw_os_error(libc::ENOENT)) => Ok(()),
+        Err(Failed::Unchanged(e) | Failed::Unanswered(e)) => Err(format!("removing the proxy entry of {ip}: {e}").into()),
+    }
+}
+
+/// A proxy entry (NTF_PROXY) of `ip` on the device at `ifindex`: struct ndmsg (family, pad,
+/// index, state, flags, type), then the address.
+fn proxy_msg(ip: Ipv6Addr, ifindex: u32) -> Vec<u8> {
+    let mut neigh = [&[libc::AF_INET6 as u8, 0, 0, 0][..], &ifindex.to_ne_bytes(), &NUD_PERMANENT.to_ne_bytes(), &[libc::NTF_PROXY, 0]].concat();
+    attr(&mut neigh, NDA_DST, &ip.octets());
+    neigh
+}
+
+/// The dump of IPv6 proxy entries alone: an ndmsg whose flags are exactly NTF_PROXY.
+fn proxy_dump_msg() -> Vec<u8> {
+    [&[libc::AF_INET6 as u8, 0, 0, 0][..], &[0; 4], &[0, 0], &[libc::NTF_PROXY, 0]].concat()
+}
+
+/// This network namespace's IPv6 proxy entries, each as (device index, address).
+fn proxy_entries() -> Result<Vec<(u32, Ipv6Addr)>> {
+    let mut entries = Vec::new();
+    dump(libc::RTM_GETNEIGH, &proxy_dump_msg(), |msg| entries.extend(proxy_entry(msg)))?;
+    Ok(entries)
+}
+
+/// A neighbour message's IPv6 proxy entry (RTM_NEWNEIGH, NTF_PROXY): its device index and address.
+fn proxy_entry(msg: &[u8]) -> Option<(u32, Ipv6Addr)> {
+    // nlmsghdr (16), then struct ndmsg (12): family, pad (3), index, state (2), flags, type.
+    if msg.len() < 28 || u16::from_ne_bytes([msg[4], msg[5]]) != RTM_NEWNEIGH || c_int::from(msg[16]) != libc::AF_INET6 || msg[26] & libc::NTF_PROXY == 0 {
+        return None;
+    }
+    let index = u32::from_ne_bytes(msg[20..24].try_into().ok()?);
+    let end = (u32::from_ne_bytes(msg[..4].try_into().ok()?) as usize).min(msg.len());
+    let mut at = 28;
+    while at + 4 <= end {
+        let len = u16::from_ne_bytes([msg[at], msg[at + 1]]) as usize;
+        if len < 4 || at + len > end {
+            return None;
+        }
+        if u16::from_ne_bytes([msg[at + 2], msg[at + 3]]) == NDA_DST {
+            return <[u8; 16]>::try_from(&msg[at + 4..at + len]).ok().map(|a| (index, Ipv6Addr::from(a)));
+        }
+        at += len.next_multiple_of(4);
+    }
+    None
+}
+
+/// A dump request (NLM_F_DUMP) on a socket of its own: `each` message of the answer, read until
+/// NLMSG_DONE.
+fn dump(kind: u16, body: &[u8], mut each: impl FnMut(&[u8])) -> Result<()> {
+    let sock = socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE, "netlink socket")?;
+    // The kernel always ends a dump; never waited on longer than this all the same.
+    let timeout = libc::timeval { tv_sec: 5, tv_usec: 0 };
+    let size = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+    crate::syscall_check!(
+        unsafe { libc::setsockopt(sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVTIMEO, (&timeout as *const libc::timeval).cast(), size) } != 0,
+        "netlink receive timeout"
+    );
+    let mut buf = vec![0u8; 32 << 10];
+    let mut n = exchange(&sock, kind, libc::NLM_F_DUMP, body, &mut buf).map_err(|(Failed::Unchanged(e) | Failed::Unanswered(e))| e)?.len();
+    loop {
+        if dump_part(&buf[..n], &mut each)? {
+            return Ok(());
+        }
+        let got = unsafe { libc::recv(sock.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+        crate::syscall_check!(got < 0, "netlink dump");
+        n = got as usize;
+    }
+}
+
+/// One read of a dump's answer: `each` of its messages, then whether it was the last (NLMSG_DONE).
+fn dump_part(buf: &[u8], each: &mut impl FnMut(&[u8])) -> Result<bool> {
+    let mut at = 0;
+    while at + 16 <= buf.len() {
+        let len = u32::from_ne_bytes(buf[at..at + 4].try_into().unwrap()) as usize;
+        if len < 16 || at + len > buf.len() {
+            bail!("netlink: a malformed dump");
+        }
+        let msg = &buf[at..at + len];
+        match c_int::from(u16::from_ne_bytes([msg[4], msg[5]])) {
+            libc::NLMSG_DONE => return Ok(true),
+            NLMSG_ERROR if len >= 20 => match i32::from_ne_bytes(msg[16..20].try_into().unwrap()) {
+                0 => {}
+                code => bail!("netlink: {}", std::io::Error::from_raw_os_error(-code)),
+            },
+            _ => each(msg),
+        }
+        at += len.next_multiple_of(4);
+    }
+    Ok(false)
+}
+
+/// The addresses in `prefix` with a device route in `table` (`/proc/net/ipv6_route`): a /128 that
+/// is up, with no next hop, not a reject, local or cached route (an unreachable one is loopback's), on a device
+/// other than loopback or those in `not` (the announce device's routes are the LAN's).
+fn dev_routes6(table: &str, prefix: Ipv6Prefix, not: &[&str]) -> std::collections::BTreeSet<Ipv6Addr> {
+    const RTF_UP: u32 = 0x1;
+    const RTF_GATEWAY: u32 = 0x2;
+    const RTF_REJECT: u32 = 0x200;
+    // The local table's (an address of this host's) and the kernel's cached clones: no VM's route.
+    const RTF_CACHE: u32 = 0x0100_0000;
+    const RTF_LOCAL: u32 = 0x8000_0000;
+    let route = |l: &str| {
+        // Destination, its length, source, its length, next hop, metric, references, use, flags, device.
+        let f: Vec<&str> = l.split_whitespace().collect();
+        let (dst, hop, flags) =
+            (u128::from_str_radix(f.first()?, 16).ok()?, u128::from_str_radix(f.get(4)?, 16).ok()?, u32::from_str_radix(f.get(8)?, 16).ok()?);
+        let (ip, dev) = (Ipv6Addr::from(dst), *f.get(9)?);
+        let on_dev = *f.get(1)? == "80" && hop == 0 && flags & RTF_UP != 0 && flags & (RTF_GATEWAY | RTF_REJECT | RTF_CACHE | RTF_LOCAL) == 0;
+        (on_dev && prefix.ipv4_of(ip).is_some() && dev != "lo" && !not.contains(&dev)).then_some(ip)
+    };
+    table.lines().filter_map(route).collect()
 }
 
 pub fn ip_forward() -> Result<()> {
@@ -1264,6 +1475,69 @@ fn enable(path: &std::path::Path) -> std::io::Result<()> {
         return Ok(());
     }
     std::fs::write(path, "1")
+}
+
+/// `gratuitous_arp`'s IPv6 counterpart (`vm_ipv6_prefix`): an unsolicited Neighbour Advertisement
+/// of VM address `ip` at `dev`'s MAC (`na_frame`), so the LAN's neighbour entries for it, which a
+/// migration left pointing at its last host, point here.
+pub fn unsolicited_na(dev: &str, ip: Ipv6Addr) -> Result<()> {
+    let ifindex = ifindex(dev)?;
+    let mac = parse_mac(&std::fs::read_to_string(format!("/sys/class/net/{dev}/address"))?)?;
+    send_na(ifindex, &mac, ip)
+}
+
+fn send_na(ifindex: u32, mac: &[u8; 6], ip: Ipv6Addr) -> Result<()> {
+    // Protocol 0: it sends, and hooks nothing to receive.
+    let fd = socket(libc::AF_PACKET, libc::SOCK_RAW, 0, "packet socket")?;
+    let frame = na_frame(mac, ip);
+    let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+    addr.sll_family = libc::AF_PACKET as u16;
+    addr.sll_protocol = (libc::ETH_P_IPV6 as u16).to_be();
+    addr.sll_ifindex = ifindex as i32;
+    addr.sll_halen = 6;
+    addr.sll_addr[..6].copy_from_slice(&frame[..6]);
+    crate::syscall_check!(send_to(&fd, &frame, &addr) < 0, "send unsolicited neighbour advertisement");
+    Ok(())
+}
+
+/// All nodes (ff02::1), an unsolicited advertisement's destination (RFC 4861 7.2.6).
+const ALL_NODES: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+
+/// The Ethernet frame of an unsolicited Neighbour Advertisement (RFC 4861 4.4): ICMPv6 type 136
+/// with the override flag (neither solicited nor a router's), `target` and its target link-layer
+/// address option (`mac`), to all nodes with hop limit 255 (a receiver drops any other). Its
+/// source is `target`, as the gratuitous ARP's sender is the VM's address: a receiver updates the
+/// entry it has by the target and its option, whatever the source.
+fn na_frame(mac: &[u8; 6], target: Ipv6Addr) -> Vec<u8> {
+    let mut icmp = vec![136, 0, 0, 0, 0x20, 0, 0, 0];
+    icmp.extend_from_slice(&target.octets());
+    icmp.extend_from_slice(&[2, 1]);
+    icmp.extend_from_slice(mac);
+    let sum = icmpv6_checksum(target, ALL_NODES, &icmp);
+    icmp[2..4].copy_from_slice(&sum.to_be_bytes());
+    // 33:33 and the group's last 32 bits (RFC 2464 7).
+    let mut frame = [&[0x33, 0x33][..], &ALL_NODES.octets()[12..], mac, &[0x86, 0xdd]].concat();
+    // Version 6 (no traffic class or flow label), the payload's length, next header ICMPv6, hop limit 255.
+    frame.extend_from_slice(&[0x60, 0, 0, 0]);
+    frame.extend_from_slice(&(icmp.len() as u16).to_be_bytes());
+    frame.extend_from_slice(&[libc::IPPROTO_ICMPV6 as u8, 255]);
+    frame.extend_from_slice(&target.octets());
+    frame.extend_from_slice(&ALL_NODES.octets());
+    frame.extend_from_slice(&icmp);
+    frame
+}
+
+/// The ICMPv6 checksum of `msg` (its checksum field zero) from `src` to `dst`: the ones' complement
+/// of the ones' complement sum over the pseudo-header (RFC 8200 8.1: the addresses, the length and
+/// next header 58) and `msg`.
+fn icmpv6_checksum(src: Ipv6Addr, dst: Ipv6Addr, msg: &[u8]) -> u16 {
+    let pseudo = [&src.octets()[..], &dst.octets(), &(msg.len() as u32).to_be_bytes(), &[0, 0, 0, libc::IPPROTO_ICMPV6 as u8]].concat();
+    let word = |w: &[u8]| u32::from(u16::from_be_bytes([w[0], w.get(1).copied().unwrap_or(0)]));
+    let mut sum: u32 = pseudo.chunks(2).chain(msg.chunks(2)).map(word).sum();
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
 }
 
 pub fn gratuitous_arp(dev: &str, ip: Ipv4Addr) -> Result<()> {
@@ -1507,16 +1781,16 @@ mod tests {
             Ok(())
         };
         let expire = |on: &mut ProxyArp| on.insert("eth0".into(), Err(std::time::Instant::now() - PROXY_ARP_RETRY));
-        assert!(enable_proxy_arp(&mut on, "eth0", Err("missing".into()), write).is_err());
-        assert!(enable_proxy_arp(&mut on, "eth0", Ok(1), write).is_err(), "a failure waits before it is tried again");
+        assert!(enable_proxy_arp(&mut on, "proxy ARP", "eth0", Err("missing".into()), write).is_err());
+        assert!(enable_proxy_arp(&mut on, "proxy ARP", "eth0", Ok(1), write).is_err(), "a failure waits before it is tried again");
         assert_eq!(writes.get(), 0);
         expire(&mut on);
-        assert!(enable_proxy_arp(&mut on, "eth0", Ok(1), || Err("write failed".into())).is_err());
+        assert!(enable_proxy_arp(&mut on, "proxy ARP", "eth0", Ok(1), || Err("write failed".into())).is_err());
         expire(&mut on);
-        enable_proxy_arp(&mut on, "eth0", Ok(1), write).unwrap();
-        enable_proxy_arp(&mut on, "eth0", Ok(1), write).unwrap();
+        enable_proxy_arp(&mut on, "proxy ARP", "eth0", Ok(1), write).unwrap();
+        enable_proxy_arp(&mut on, "proxy ARP", "eth0", Ok(1), write).unwrap();
         assert_eq!(writes.get(), 1, "success alone skips a write");
-        enable_proxy_arp(&mut on, "eth0", Ok(2), write).unwrap();
+        enable_proxy_arp(&mut on, "proxy ARP", "eth0", Ok(2), write).unwrap();
         assert_eq!(writes.get(), 2, "the same name with a new index needs setup");
     }
 
@@ -2039,6 +2313,126 @@ mod tests {
         assert_eq!(addr[8..], [&20u16.to_ne_bytes()[..], &IFA_ADDRESS.to_ne_bytes(), &TAP_ADDR6.octets()].concat());
     }
 
+    /// `ip -6 neigh add proxy ADDR dev DEV`'s message, and the dump of proxy entries alone.
+    #[test]
+    fn proxy_entries_are_ipv6_neighbours_flagged_proxy() {
+        let v6 = six("fd00:7::a09:2");
+        let msg = proxy_msg(v6, 7);
+        assert_eq!(msg[..12], [&[libc::AF_INET6 as u8, 0, 0, 0][..], &7u32.to_ne_bytes(), &NUD_PERMANENT.to_ne_bytes(), &[libc::NTF_PROXY, 0]].concat());
+        assert_eq!(msg[12..], [&20u16.to_ne_bytes()[..], &NDA_DST.to_ne_bytes(), &v6.octets()].concat());
+        assert_eq!(msg.len(), 32, "no link-layer address: the kernel answers with the device's");
+        // Any index, any state, the flags exactly NTF_PROXY: the kernel dumps its proxy table then.
+        assert_eq!(proxy_dump_msg(), [libc::AF_INET6 as u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, libc::NTF_PROXY, 0]);
+    }
+
+    /// A proxy entry as the kernel dumps it (`pneigh_fill_info`): nlmsghdr, ndmsg, attributes.
+    fn dumped(kind: u16, family: u8, index: u32, flags: u8, attrs: &[(u16, &[u8])]) -> Vec<u8> {
+        let mut body = [&[family, 0, 0, 0][..], &index.to_ne_bytes(), &0u16.to_ne_bytes(), &[flags, 0]].concat();
+        for (t, d) in attrs {
+            attr(&mut body, *t, d);
+        }
+        [&((16 + body.len()) as u32).to_ne_bytes()[..], &kind.to_ne_bytes(), &[2, 0], &[1, 0, 0, 0, 0, 0, 0, 0], &body].concat()
+    }
+
+    #[test]
+    fn dumped_proxy_entries_give_their_device_and_address() {
+        let v6 = six("fd00:7::a09:2");
+        let proto: &[u8] = &[3];
+        let entry = dumped(RTM_NEWNEIGH, libc::AF_INET6 as u8, 4, libc::NTF_PROXY, &[(9, proto), (NDA_DST, &v6.octets())]);
+        assert_eq!(proxy_entry(&entry), Some((4, v6)), "after an attribute of another kind");
+        let router = dumped(RTM_NEWNEIGH, libc::AF_INET6 as u8, 4, libc::NTF_PROXY | libc::NTF_ROUTER, &[(NDA_DST, &v6.octets())]);
+        assert_eq!(proxy_entry(&router), Some((4, v6)));
+        for not in [
+            dumped(RTM_NEWNEIGH, libc::AF_INET6 as u8, 4, 0, &[(NDA_DST, &v6.octets())]),
+            dumped(RTM_NEWNEIGH, libc::AF_INET as u8, 4, libc::NTF_PROXY, &[(NDA_DST, &[10, 9, 0, 2])]),
+            dumped(libc::RTM_DELNEIGH, libc::AF_INET6 as u8, 4, libc::NTF_PROXY, &[(NDA_DST, &v6.octets())]),
+            dumped(RTM_NEWNEIGH, libc::AF_INET6 as u8, 4, libc::NTF_PROXY, &[(NDA_DST, &v6.octets()[..8])]),
+            dumped(RTM_NEWNEIGH, libc::AF_INET6 as u8, 4, libc::NTF_PROXY, &[]),
+            entry[..entry.len() - 4].to_vec(),
+            entry[..20].to_vec(),
+        ] {
+            assert_eq!(proxy_entry(&not), None, "{not:?}");
+        }
+        // A dump's reads: each message, until NLMSG_DONE; a kernel error or a malformed one fails it.
+        let done = dumped(libc::NLMSG_DONE as u16, 0, 0, 0, &[]);
+        let other = dumped(RTM_NEWNEIGH, libc::AF_INET6 as u8, 5, libc::NTF_PROXY, &[(NDA_DST, &six("fd00:7::a09:3").octets())]);
+        let mut got = Vec::new();
+        assert!(!dump_part(&[entry.clone(), other.clone()].concat(), &mut |m: &[u8]| got.extend(proxy_entry(m))).unwrap());
+        assert!(dump_part(&[entry.clone(), done.clone(), other.clone()].concat(), &mut |m: &[u8]| got.extend(proxy_entry(m))).unwrap());
+        assert_eq!(got, [(4, v6), (5, six("fd00:7::a09:3")), (4, v6)], "nothing read after NLMSG_DONE");
+        let mut error = dumped(NLMSG_ERROR as u16, 0, 0, 0, &[]);
+        error[16..20].copy_from_slice(&(-libc::EPERM).to_ne_bytes());
+        let e = dump_part(&error, &mut |_: &[u8]| {}).unwrap_err().to_string();
+        assert!(e.contains(&std::io::Error::from_raw_os_error(libc::EPERM).to_string()), "{e}");
+        assert!(dump_part(&entry[..entry.len() - 1], &mut |_: &[u8]| {}).is_err(), "truncated");
+    }
+
+    /// Only a VM address's /128 on a device of its own (a tap, the hold device) is served here.
+    #[test]
+    fn served_addresses_are_device_routes_of_vms_addresses() {
+        let prefix = Ipv6Prefix::parse("fd00:7::/96").unwrap();
+        let none = "00000000000000000000000000000000";
+        let line =
+            |dst: &str, len: &str, hop: &str, flags: &str, dev: &str| format!("{dst} {len} {none} 00 {hop} 00000400 00000001 00000000 {flags} {dev:>8}\n");
+        let table = [
+            line("fd000007000000000000000000000a09", "80", none, "00000001", "fx0t1"),
+            line("fd000007000000000000000000000a0a", "80", none, "00000001", "flexvm-h"),
+            // Via a peer, unreachable, down, on loopback or the announce device: not served here.
+            line("fd000007000000000000000000000a0b", "80", "fd000099000000000000000000000002", "00000003", "eth0"),
+            line("fd000007000000000000000000000a0c", "80", none, "00200201", "lo"),
+            line("fd000007000000000000000000000a0d", "80", none, "00000000", "fx0t2"),
+            line("fd000007000000000000000000000a0e", "80", none, "00000001", "lo"),
+            line("fd000007000000000000000000000a0f", "80", none, "00000001", "eth0"),
+            line("fd000007000000000000000000000a10", "80", none, "80200001", "fx0t5"),
+            line("fd000007000000000000000000000a11", "80", none, "01000001", "fx0t6"),
+            // Not a /128, or not a VM's address.
+            line("fd000007000000000000000000000000", "60", none, "00000001", "fx0t3"),
+            line("fd000008000000000000000000000a09", "80", none, "00000001", "fx0t4"),
+            "garbage\n".into(),
+        ]
+        .concat();
+        let want: std::collections::BTreeSet<_> = [six("fd00:7::a09"), six("fd00:7::a0a")].into();
+        assert_eq!(dev_routes6(&table, prefix, &["eth0"]), want);
+        let with_eth0: std::collections::BTreeSet<_> = [six("fd00:7::a09"), six("fd00:7::a0a"), six("fd00:7::a0f")].into();
+        assert_eq!(dev_routes6(&table, prefix, &[]), with_eth0, "no announce device: one there is a device route too");
+        let without_tap: std::collections::BTreeSet<_> = [six("fd00:7::a0a")].into();
+        assert_eq!(dev_routes6(&table, prefix, &["eth0", "fx0t1"]), without_tap, "a VM's own tap left out");
+    }
+
+    /// The unsolicited Neighbour Advertisement's bytes, field by field; its checksum computed apart.
+    #[test]
+    fn an_unsolicited_neighbour_advertisement() {
+        let mac = [0x02, 0x42, 0xac, 0x11, 0x00, 0x02];
+        let target = six("fd00:e2e::a0a:80");
+        let f = na_frame(&mac, target);
+        assert_eq!(f.len(), 14 + 40 + 32);
+        assert_eq!(f[..6], [0x33, 0x33, 0, 0, 0, 1], "ff02::1's MAC");
+        assert_eq!(f[6..12], mac);
+        assert_eq!(f[12..14], [0x86, 0xdd]);
+        let ip = &f[14..54];
+        assert_eq!(ip[..4], [0x60, 0, 0, 0]);
+        assert_eq!(ip[4..6], 32u16.to_be_bytes(), "the payload's length");
+        assert_eq!((ip[6], ip[7]), (58, 255), "ICMPv6, hop limit 255");
+        assert_eq!(ip[8..24], target.octets(), "from the target");
+        assert_eq!(ip[24..40], ALL_NODES.octets());
+        assert_eq!(ALL_NODES, six("ff02::1"));
+        let icmp = &f[54..];
+        assert_eq!((icmp[0], icmp[1]), (136, 0), "a Neighbour Advertisement");
+        assert_eq!(icmp[4..8], [0x20, 0, 0, 0], "override; not solicited, not a router");
+        assert_eq!(icmp[8..24], target.octets());
+        assert_eq!(icmp[24..26], [2, 1], "a target link-layer address option, 8 bytes");
+        assert_eq!(icmp[26..32], mac);
+        // Computed apart (Python's 16-bit sum over the pseudo-header and the message).
+        assert_eq!(icmp[2..4], 0x7cd8u16.to_be_bytes());
+        // A receiver's check: the sum over the pseudo-header and the message, its checksum in, is all ones.
+        assert_eq!(icmpv6_checksum(target, ALL_NODES, icmp), 0);
+        let mut bad = icmp.to_vec();
+        bad[31] ^= 1;
+        assert_ne!(icmpv6_checksum(target, ALL_NODES, &bad), 0);
+        // An odd length pads with a zero byte (RFC 1071).
+        assert_eq!(icmpv6_checksum(target, ALL_NODES, &[1]), icmpv6_checksum(target, ALL_NODES, &[1, 0]).wrapping_add(1), "one length apart");
+    }
+
     /// Forwarding stops interfaces with accept_ra 1 taking router advertisements: those that take
     /// them are set to 2 first, and no other; once it is on, nothing is touched.
     #[test]
@@ -2192,6 +2586,94 @@ mod tests {
             assert!(route6().contains("via 2001:db8::2 dev peer0"), "{}", route6());
             unroute(both);
             assert!(route6().is_empty(), "a /128 via a peer goes: {}", route6());
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// Needs CAP_SYS_ADMIN and CAP_NET_ADMIN, and iproute2; no VM. In a private netns: a VM address's
+    /// proxy entry on the announce device, with proxy NDP on, only while it is served; removed on
+    /// any device; swept once no device here is routed to it, and only then; other entries never
+    /// touched; and its unsolicited advertisement goes out on the announce device as built.
+    #[test]
+    #[ignore]
+    fn proxy_entries_follow_where_the_vm_is_served() {
+        std::thread::spawn(|| {
+            assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0, "{}", std::io::Error::last_os_error());
+            let ip = |args: &[&str]| {
+                let out = std::process::Command::new("ip").args(args).output().unwrap();
+                assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+                String::from_utf8(out.stdout).unwrap()
+            };
+            for dev in ["lan0", "old0", "vm0"] {
+                ip(&["link", "add", dev, "type", "dummy"]);
+                ip(&["link", "set", dev, "up"]);
+            }
+            ip(&["-6", "addr", "add", "fd99::1/64", "dev", "lan0", "nodad"]);
+            let prefix = Ipv6Prefix::parse("fd00:7::/96").unwrap();
+            let (v6, other, foreign) = (prefix.vm(Ipv4Addr::new(10, 9, 0, 2)), prefix.vm(Ipv4Addr::new(10, 9, 0, 3)), six("fd99::77"));
+            let proxies = || ip(&["-6", "neigh", "show", "proxy"]);
+            let has = |a: Ipv6Addr, dev: &str| proxies().lines().any(|l| l.starts_with(&format!("{a} dev {dev} ")) || l == format!("{a} dev {dev}"));
+            proxy_add("lan0", v6, || false).unwrap();
+            assert!(!has(v6, "lan0"), "not served: none");
+            proxy_add("lan0", v6, || true).unwrap();
+            assert!(has(v6, "lan0"), "{}", proxies());
+            assert_eq!(std::fs::read_to_string("/proc/sys/net/ipv6/conf/lan0/proxy_ndp").unwrap().trim(), "1");
+            proxy_add("lan0", v6, || true).unwrap();
+            assert_eq!(proxies().matches(&v6.to_string()).count(), 1, "added again: still one");
+            // Not routed to a device here: swept; routed to one (a tap's, the hold device's): kept.
+            proxy_add("lan0", other, || true).unwrap();
+            ip(&["-6", "neigh", "add", "proxy", &foreign.to_string(), "dev", "lan0"]);
+            let index = ifindex("vm0").unwrap();
+            route_dev(true, VmAddr { v4: Ipv4Addr::new(10, 9, 0, 2), v6: Some(v6) }, index).unwrap();
+            assert_eq!(proxy_sweep(prefix, Some("lan0")).unwrap(), [other]);
+            assert!(has(v6, "lan0") && !has(other, "lan0") && has(foreign, "lan0"), "{}", proxies());
+            // A /128 via a peer (`route_via6`) is not served here.
+            route_dev(false, VmAddr { v4: Ipv4Addr::new(10, 9, 0, 2), v6: Some(v6) }, index).unwrap();
+            route_via6(v6, six("fd99::2")).unwrap();
+            assert_eq!(proxy_sweep(prefix, Some("lan0")).unwrap(), [v6]);
+            assert!(!has(v6, "lan0") && has(foreign, "lan0"), "{}", proxies());
+            assert!(proxy_sweep(prefix, Some("lan0")).unwrap().is_empty());
+            // An announce device that changed: removed from both.
+            proxy_add("old0", v6, || true).unwrap();
+            proxy_add("lan0", v6, || true).unwrap();
+            proxy_remove(v6).unwrap();
+            assert!(!has(v6, "old0") && !has(v6, "lan0") && has(foreign, "lan0"), "{}", proxies());
+            proxy_remove(v6).unwrap();
+            // Released by its own process (its tap `vm0`): kept while another device is routed to it
+            // (a host sharing the namespace runs it now), removed once none is.
+            ip(&["link", "add", "vm1", "type", "dummy"]);
+            ip(&["link", "set", "vm1", "up"]);
+            unroute6(v6);
+            proxy_add("lan0", v6, || true).unwrap();
+            route_dev(true, VmAddr { v4: Ipv4Addr::new(10, 9, 0, 2), v6: Some(v6) }, ifindex("vm1").unwrap()).unwrap();
+            proxy_release(v6, &["vm0", "lan0"]).unwrap();
+            assert!(has(v6, "lan0"), "another tap serves it: {}", proxies());
+            proxy_release(v6, &["vm1", "lan0"]).unwrap();
+            assert!(!has(v6, "lan0"), "only its own: {}", proxies());
+            route_dev(false, VmAddr { v4: Ipv4Addr::new(10, 9, 0, 2), v6: Some(v6) }, ifindex("vm1").unwrap()).unwrap();
+            // The advertisement, as it goes out on the announce device (ETH_P_ALL sees what is sent).
+            let cap = socket(libc::AF_PACKET, libc::SOCK_RAW, (libc::ETH_P_ALL as u16).to_be() as i32, "capture").unwrap();
+            let mut at: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+            at.sll_family = libc::AF_PACKET as u16;
+            at.sll_protocol = (libc::ETH_P_ALL as u16).to_be();
+            at.sll_ifindex = ifindex("lan0").unwrap() as i32;
+            let size = std::mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
+            assert_eq!(unsafe { libc::bind(cap.as_raw_fd(), (&at as *const libc::sockaddr_ll).cast(), size) }, 0);
+            // Its MAC as `ip` reads it: this thread's namespace is not sysfs's (`unsolicited_na` reads it there).
+            let link = ip(&["-o", "link", "show", "lan0"]);
+            let mac = parse_mac(link.split("link/ether ").nth(1).unwrap().split_whitespace().next().unwrap()).unwrap();
+            send_na(ifindex("lan0").unwrap(), &mac, v6).unwrap();
+            let mut buf = [0u8; 2048];
+            let got = loop {
+                let n = unsafe { libc::recv(cap.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
+                assert!(n > 0, "{}", std::io::Error::last_os_error());
+                // Past the kernel's own (its MLD reports, say).
+                if buf[12..14] == [0x86, 0xdd] && buf[20] == 58 && buf[54] == 136 {
+                    break buf[..n as usize].to_vec();
+                }
+            };
+            assert_eq!(got, na_frame(&mac, v6));
         })
         .join()
         .unwrap();
