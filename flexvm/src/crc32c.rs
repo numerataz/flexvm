@@ -1,6 +1,6 @@
-//! CRC32C, the checksum of checkpoint pages. With SSE4.2 a page is three interleaved streams
-//! (`crc32` has 3-cycle latency but issues every cycle) combined with shift tables; the same
-//! pass tells whether the page is all zero.
+//! CRC32C, the checksum of checkpoint pages. With SSE4.2 or the Arm CRC extension a page is
+//! three interleaved streams (`crc32`/`crc32cx` have 2-3 cycle latency but issue every cycle)
+//! combined with shift tables; the same pass tells whether the page is all zero.
 
 use std::sync::OnceLock;
 
@@ -36,14 +36,19 @@ pub fn crc32c(bytes: &[u8]) -> u32 {
         // SAFETY: the CPU has SSE4.2.
         return !unsafe { hw::update(!0, bytes) };
     }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("crc") {
+        // SAFETY: the CPU has the CRC extension.
+        return !unsafe { hw::update(!0, bytes) };
+    }
     !update_sw(!0, bytes)
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 const STREAM: usize = crate::util::PAGE_SIZE / 24 * 8;
 
 /// Advance a CRC register over `STREAM` zero bytes, a register byte at a time (it is linear).
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 fn shift_tables() -> &'static [[u32; 256]; 4] {
     static T: OnceLock<[[u32; 256]; 4]> = OnceLock::new();
     T.get_or_init(|| {
@@ -59,11 +64,21 @@ fn shift_tables() -> &'static [[u32; 256]; 4] {
     })
 }
 
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn shift(t: &[[u32; 256]; 4], c: u32) -> u32 {
+    t[0][(c & 0xff) as usize] ^ t[1][((c >> 8) & 0xff) as usize] ^ t[2][((c >> 16) & 0xff) as usize] ^ t[3][(c >> 24) as usize]
+}
+
 pub fn page(p: &[u8]) -> (u32, bool) {
     debug_assert_eq!(p.len(), crate::util::PAGE_SIZE);
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("sse4.2") {
         // SAFETY: the CPU has SSE4.2.
+        return unsafe { hw::page(p, shift_tables()) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if std::arch::is_aarch64_feature_detected!("crc") {
+        // SAFETY: the CPU has the CRC extension.
         return unsafe { hw::page(p, shift_tables()) };
     }
     let zero = p.chunks_exact(8).fold(0u64, |a, w| a | u64::from_ne_bytes(w.try_into().unwrap())) == 0;
@@ -74,7 +89,7 @@ pub fn page(p: &[u8]) -> (u32, bool) {
 mod hw {
     use std::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
 
-    use super::STREAM;
+    use super::{shift, STREAM};
 
     #[target_feature(enable = "sse4.2")]
     pub(super) unsafe fn update(c: u32, bytes: &[u8]) -> u32 {
@@ -88,10 +103,6 @@ mod hw {
             c = _mm_crc32_u8(c, b);
         }
         c
-    }
-
-    fn shift(t: &[[u32; 256]; 4], c: u32) -> u32 {
-        t[0][(c & 0xff) as usize] ^ t[1][((c >> 8) & 0xff) as usize] ^ t[2][((c >> 16) & 0xff) as usize] ^ t[3][(c >> 24) as usize]
     }
 
     #[target_feature(enable = "sse4.2")]
@@ -117,6 +128,55 @@ mod hw {
             or |= x;
         }
         (!(r as u32), or == 0)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod hw {
+    use std::arch::aarch64::{__crc32cb, __crc32cd, __crc32cw};
+
+    use super::{shift, STREAM};
+
+    #[target_feature(enable = "crc")]
+    pub(super) unsafe fn update(mut c: u32, bytes: &[u8]) -> u32 {
+        let mut words = bytes.chunks_exact(8);
+        for w in &mut words {
+            c = __crc32cd(c, u64::from_le_bytes(w.try_into().unwrap()));
+        }
+        let mut rest = words.remainder();
+        if let Some((w, r)) = rest.split_first_chunk::<4>() {
+            c = __crc32cw(c, u32::from_le_bytes(*w));
+            rest = r;
+        }
+        for &b in rest {
+            c = __crc32cb(c, b);
+        }
+        c
+    }
+
+    #[target_feature(enable = "crc")]
+    pub(super) unsafe fn page(p: &[u8], t: &[[u32; 256]; 4]) -> (u32, bool) {
+        let word = |w: &[u8]| u64::from_le_bytes(w.try_into().unwrap());
+        let (streams, rest) = p.split_at(3 * STREAM);
+        let (s0, s12) = streams.split_at(STREAM);
+        let (s1, s2) = s12.split_at(STREAM);
+        let (mut a, mut b, mut c, mut or) = (!0u32, 0u32, 0u32, 0u64);
+        // Fixed-size chunks: no bounds checks in the loop.
+        for ((x, y), z) in s0.chunks_exact(8).zip(s1.chunks_exact(8)).zip(s2.chunks_exact(8)) {
+            let (x, y, z) = (word(x), word(y), word(z));
+            a = __crc32cd(a, x);
+            b = __crc32cd(b, y);
+            c = __crc32cd(c, z);
+            or |= x | y | z;
+        }
+        // raw(r, X) = shift(r, |X|) ^ raw(0, X): stitch the streams together.
+        let mut r = shift(t, shift(t, a) ^ b) ^ c;
+        for x in rest.chunks_exact(8) {
+            let x = word(x);
+            r = __crc32cd(r, x);
+            or |= x;
+        }
+        (!r, or == 0)
     }
 }
 
@@ -146,6 +206,33 @@ mod tests {
             }
             p[(seed as usize * 61) % PAGE_SIZE] = seed as u8 | 1;
             assert_eq!(page(&p), (!update_sw(!0, &p), false), "seed {seed}");
+        }
+    }
+
+    /// The hardware path against the software one, at every offset and every short length
+    /// (the word and byte tails), and on buffers of several pages.
+    #[test]
+    fn hw_matches_sw() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let buf: Vec<u8> = (0..4 * PAGE_SIZE + 64)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        for off in 0..16 {
+            for len in 0..=64 {
+                let b = &buf[off..off + len];
+                assert_eq!(crc32c(b), !update_sw(!0, b), "offset {off} length {len}");
+            }
+            for len in [PAGE_SIZE - 1, PAGE_SIZE, PAGE_SIZE + 7, 4 * PAGE_SIZE + 13] {
+                let b = &buf[off..off + len];
+                assert_eq!(crc32c(b), !update_sw(!0, b), "offset {off} length {len}");
+            }
+            let p = &buf[off..off + PAGE_SIZE];
+            assert_eq!(page(p), (!update_sw(!0, p), false), "offset {off}");
         }
     }
 }
