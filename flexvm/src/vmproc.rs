@@ -1733,7 +1733,7 @@ impl Proc {
         let hold = format!("{}{:x}h", self.host.tap_prefix(), self.ident.pid);
         let not: Vec<String> = [vm.tap.clone(), hold].into_iter().chain(cfg.announce_dev()).collect();
         let not: Vec<&str> = not.iter().map(String::as_str).collect();
-        if let Err(e) = crate::net::proxy_release(v6, cfg.vm_ipv6_prefix, &not) {
+        if let Err(e) = crate::net::proxy_release(v6, &not) {
             crate::log!("vm {}: {e}", self.name());
         }
     }

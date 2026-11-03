@@ -1278,10 +1278,11 @@ pub fn proxy_remove(ip: Ipv6Addr) -> Result<()> {
 /// `proxy_remove`, unless a device here other than those in `not` (the VM's own tap, the announce
 /// device) is routed to `ip` (`dev_routes6`): a host sharing this network namespace that runs it
 /// now (the target of a migration whose source ends without knowing its outcome), whose entry the
-/// same one is. Without `prefix` (unset since), removed.
-pub fn proxy_release(ip: Ipv6Addr, prefix: Option<Ipv6Prefix>, not: &[&str]) -> Result<()> {
+/// same one is. By `ip`'s own /96, whatever the prefix is now (changed or unset since).
+pub fn proxy_release(ip: Ipv6Addr, not: &[&str]) -> Result<()> {
     let _lock = proxy_lock()?;
-    if prefix.map(|p| routes6().map(|t| dev_routes6(&t, p, not).contains(&ip))).transpose()? == Some(true) {
+    let own = Ipv6Prefix((u128::from(ip) & !u128::from(u32::MAX)).into());
+    if dev_routes6(&routes6()?, own, not).contains(&ip) {
         return Ok(());
     }
     for (index, _) in proxy_entries()?.into_iter().filter(|&(_, at)| at == ip) {
@@ -2646,13 +2647,11 @@ mod tests {
             unroute6(v6);
             proxy_add("lan0", v6, || true).unwrap();
             route_dev(true, VmAddr { v4: Ipv4Addr::new(10, 9, 0, 2), v6: Some(v6) }, ifindex("vm1").unwrap()).unwrap();
-            proxy_release(v6, Some(prefix), &["vm0", "lan0"]).unwrap();
+            proxy_release(v6, &["vm0", "lan0"]).unwrap();
             assert!(has(v6, "lan0"), "another tap serves it: {}", proxies());
-            proxy_release(v6, Some(prefix), &["vm1", "lan0"]).unwrap();
+            proxy_release(v6, &["vm1", "lan0"]).unwrap();
             assert!(!has(v6, "lan0"), "only its own: {}", proxies());
-            proxy_add("lan0", v6, || true).unwrap();
-            proxy_release(v6, None, &[]).unwrap();
-            assert!(!has(v6, "lan0"), "no prefix: removed");
+            route_dev(false, VmAddr { v4: Ipv4Addr::new(10, 9, 0, 2), v6: Some(v6) }, ifindex("vm1").unwrap()).unwrap();
             // The advertisement, as it goes out on the announce device (ETH_P_ALL sees what is sent).
             let cap = socket(libc::AF_PACKET, libc::SOCK_RAW, (libc::ETH_P_ALL as u16).to_be() as i32, "capture").unwrap();
             let mut at: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
