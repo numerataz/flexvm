@@ -533,17 +533,20 @@ const UFFD_FEATURE_PAGEFAULT_FLAG_WP: u64 = 1 << 0;
 /// tracking needs: arm64 has it only from Linux 6.10 (`HAVE_ARCH_USERFAULTFD_WP`), x86_64 from 5.7. Without it,
 /// registering `MODE_WP` fails with EINVAL. Firecracker's userfaultfd has had its `UFFDIO_API` call, which a context
 /// takes only once, so this asks a context of its own (user-mode only: no privilege needed), whose answer lists every
-/// feature the kernel has, requested or not. Probed once per process. A probe that cannot run says yes: registering
-/// tells then.
+/// feature the kernel has, requested or not. Probed once per process, until a probe answers. One that cannot run (say,
+/// out of descriptors) says yes, and the next call probes again: registering tells meanwhile.
 pub fn wp_supported() -> bool {
     static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SUPPORTED.get_or_init(|| match probe_features() {
-        Ok(features) => features & UFFD_FEATURE_PAGEFAULT_FLAG_WP != 0,
+    if let Some(&s) = SUPPORTED.get() {
+        return s;
+    }
+    match probe_features() {
+        Ok(features) => *SUPPORTED.get_or_init(|| features & UFFD_FEATURE_PAGEFAULT_FLAG_WP != 0),
         Err(e) => {
             crate::log!("could not probe userfaultfd features ({e}); assuming write protection");
             true
         }
-    })
+    }
 }
 
 /// The features a new userfaultfd context reports at `UFFDIO_API`.
@@ -1293,7 +1296,11 @@ mod tests {
     fn wp_probe_matches_registration() {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
         let fd = unsafe { libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | libc::O_NONBLOCK | UFFD_USER_MODE_ONLY) };
-        assert!(fd >= 0, "userfaultfd: {}", io::Error::last_os_error());
+        if fd < 0 {
+            // A sandbox that forbids it (seccomp, a container): nothing to compare.
+            crate::log!("no userfaultfd ({}): skipped", io::Error::last_os_error());
+            return;
+        }
         let fd = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
         let mut api = [UFFD_API, 0u64, 0];
         assert_eq!(unsafe { libc::ioctl(fd.as_raw_fd(), UFFDIO_API, api.as_mut_ptr()) }, 0, "{}", io::Error::last_os_error());
