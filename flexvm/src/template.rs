@@ -60,10 +60,13 @@ const PMEM_ALIGN_MIB: u64 = 2;
 const _: () = assert!(SLOT_MIB % 128 == 0 && SLOT_MIB % PMEM_ALIGN_MIB == 0);
 
 /// The largest hotplug region, in whole slots, that fits the window beside a root filesystem (a
-/// template's only pmem device) of `rootfs_bytes`; Firecracker refuses an empty one.
-pub fn hotplug_room(rootfs_bytes: u64) -> u64 {
+/// template's only pmem device) of `rootfs_bytes` (Firecracker refuses an empty one), if that fits.
+pub fn hotplug_room(rootfs_bytes: u64) -> Result<u64> {
     let pmem = rootfs_bytes.max(1).div_ceil(PMEM_ALIGN_MIB << 20) * PMEM_ALIGN_MIB;
-    WINDOW_MIB.saturating_sub(pmem) / SLOT_MIB * SLOT_MIB
+    match WINDOW_MIB.checked_sub(pmem) {
+        Some(room) => Ok(room / SLOT_MIB * SLOT_MIB),
+        None => bail!("the root filesystem, {pmem} MiB, does not fit Firecracker's {} GiB window for pmem devices", WINDOW_MIB >> 10),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1731,7 +1734,7 @@ fn receive_inner<R: Read>(
     let mut meta: Meta = serde_json::from_slice(&bytes).map_err(|e| format!("template {id}: its metadata: {e}"))?;
     // No template with more hotplug than the window holds beside the smallest root filesystem boots.
     let hotplug = meta.max_mib.saturating_sub(meta.mem_mib);
-    if meta.id != id || !meta.identified() || !meta.rootfs.is_absolute() || meta.max_mib > MAX_MEM_MIB || hotplug > hotplug_room(0) {
+    if meta.id != id || !meta.identified() || !meta.rootfs.is_absolute() || meta.max_mib > MAX_MEM_MIB || hotplug > hotplug_room(0)? {
         bail!("template {id}: the metadata sent is not that template's, or past the limits");
     }
     // The kernel is in guest memory; restores never read it (`Meta::verify`).
@@ -1912,7 +1915,7 @@ fn build(host: &crate::host::Host, paths: &Paths, dir: &Path, name: &str, size: 
     let sockets = SocketRoot::unique(&std::fs::canonicalize(dir)?)?;
     let start = Instant::now();
     let hotplug = size.hotplug_mib();
-    let room = hotplug_room(std::fs::metadata(&rootfs)?.len());
+    let room = hotplug_room(std::fs::metadata(&rootfs)?.len())?;
     if hotplug > room {
         bail!("a hotplug region of {hotplug} MiB does not fit Firecracker's {} GiB window beside the root filesystem: at most {room} MiB", WINDOW_MIB >> 10);
     }
@@ -2773,7 +2776,7 @@ pub(crate) mod tests {
         // A root filesystem path that is empty or relative, or memory past the cap or the hotplug
         // window, is refused before anything is read.
         assert!(!names_by_path(b"anything", Path::new("")));
-        let past_window = tpl.meta.mem_mib + hotplug_room(0) + SLOT_MIB;
+        let past_window = tpl.meta.mem_mib + hotplug_room(0).unwrap() + SLOT_MIB;
         for (rootfs, max_mib) in [("", tpl.meta.max_mib), ("rootfs", tpl.meta.max_mib), ("/r", MAX_MEM_MIB + 1), ("/r", past_window)] {
             let meta = serde_json::to_vec(&Meta { rootfs: rootfs.into(), max_mib, ..tpl.meta.clone() }).unwrap();
             let forged = [&(meta.len() as u64).to_le_bytes()[..], &meta, &buf[8 + u64::from_le_bytes(buf[..8].try_into().unwrap()) as usize..]].concat();
