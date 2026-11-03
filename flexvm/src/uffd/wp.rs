@@ -523,6 +523,52 @@ impl Pager {
     }
 }
 
+// From linux/userfaultfd.h.
+const UFFD_USER_MODE_ONLY: libc::c_int = 1;
+const UFFD_API: u64 = 0xAA;
+const UFFDIO_API: libc::c_ulong = 0xC018_AA3F;
+const UFFD_FEATURE_PAGEFAULT_FLAG_WP: u64 = 1 << 0;
+
+/// Whether this host's kernel has userfaultfd write protection for anonymous memory (guest memory is), which write
+/// tracking needs: arm64 has it only from Linux 6.10 (`HAVE_ARCH_USERFAULTFD_WP`), x86_64 from 5.7. Without it,
+/// registering `MODE_WP` fails with EINVAL. Firecracker's userfaultfd has had its `UFFDIO_API` call, which a context
+/// takes only once, so this asks a context of its own (user-mode only: no privilege needed), whose answer lists every
+/// feature the kernel has, requested or not. Probed once per process. A probe that cannot run says yes: registering
+/// tells then.
+pub fn wp_supported() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| match probe_features() {
+        Ok(features) => features & UFFD_FEATURE_PAGEFAULT_FLAG_WP != 0,
+        Err(e) => {
+            crate::log!("could not probe userfaultfd features ({e}); assuming write protection");
+            true
+        }
+    })
+}
+
+/// The features a new userfaultfd context reports at `UFFDIO_API`.
+fn probe_features() -> io::Result<u64> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let open = |flags: libc::c_int| unsafe { libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | libc::O_NONBLOCK | flags) };
+    // Before 5.11 the flag is unknown (EINVAL); root opens one without it.
+    let mut fd = open(UFFD_USER_MODE_ONLY);
+    if fd < 0 && io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL) {
+        fd = open(0);
+    }
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: a new descriptor, owned here.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
+    // struct uffdio_api: api, features (in: requested, out: available), ioctls (out).
+    let mut api = [UFFD_API, 0u64, 0];
+    // SAFETY: `api` is a struct uffdio_api the kernel reads and writes.
+    if unsafe { libc::ioctl(std::os::fd::AsRawFd::as_raw_fd(&fd), UFFDIO_API, api.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(api[1])
+}
+
 impl Pager {
     /// Write-protects (or unprotects, waking writers waiting on them) `n` pages from `page`.
     pub(super) fn writeprotect(&self, page: usize, n: usize, protect: bool) -> io::Result<()> {
@@ -1238,6 +1284,33 @@ mod tests {
             pager.pages().mark_dirty(8);
             pager.unfreeze(&frozen);
             assert_eq!(pager.pages().dirty_bits(false).pages(0, n).collect::<Vec<_>>(), [7, 8, CHUNK + 9, last]);
+        }
+    }
+
+    /// The probe agrees with the kernel: write-protect registration of anonymous memory works exactly when the probe
+    /// reports uffd-wp (x86_64, arm64 6.10+), and fails with EINVAL otherwise (arm64 6.8).
+    #[test]
+    fn wp_probe_matches_registration() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let fd = unsafe { libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | libc::O_NONBLOCK | UFFD_USER_MODE_ONLY) };
+        assert!(fd >= 0, "userfaultfd: {}", io::Error::last_os_error());
+        let fd = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
+        let mut api = [UFFD_API, 0u64, 0];
+        assert_eq!(unsafe { libc::ioctl(fd.as_raw_fd(), UFFDIO_API, api.as_mut_ptr()) }, 0, "{}", io::Error::last_os_error());
+        // In host pages.
+        let len = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let prot = libc::PROT_READ | libc::PROT_WRITE;
+        let mem = unsafe { libc::mmap(std::ptr::null_mut(), len, prot, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+        assert_ne!(mem, libc::MAP_FAILED);
+        let mut r = [mem as u64, len as u64, UFFDIO_REGISTER_MODE_MISSING | UFFDIO_REGISTER_MODE_WP, 0];
+        let registered = match unsafe { libc::ioctl(fd.as_raw_fd(), UFFDIO_REGISTER, r.as_mut_ptr()) } {
+            0 => Ok(()),
+            _ => Err(io::Error::last_os_error()),
+        };
+        unsafe { libc::munmap(mem, len) };
+        match wp_supported() {
+            true => assert!(registered.is_ok(), "uffd-wp reported, but registering failed: {registered:?}"),
+            false => assert_eq!(registered.map_err(|e| e.raw_os_error()), Err(Some(libc::EINVAL))),
         }
     }
 }

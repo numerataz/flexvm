@@ -75,6 +75,12 @@ artifacts](#releasing-the-artifacts).
 
 The host needs Linux 5.16+: Firecracker patch `0004` uses `KVM_VCPU_TSC_OFFSET`.
 
+A checkpoint that keeps the VM running, and an incremental one, track writes
+with userfaultfd write protection (uffd-wp), which arm64 kernels have only
+from Linux 6.10 (x86_64 from 5.7). Without it they are refused, naming uffd-wp,
+and the VM runs on; `checkpoint create --stop`, suspend, restore and
+migration need none of it.
+
 Hosts that migrate or restore each other's VMs need the same CPU model and
 a byte-identical Firecracker: a snapshot records both (the binary by its
 content hash), and any difference refuses it ("Firecracker differs"). Builds
@@ -507,7 +513,8 @@ digits (an id); a checkpoint loaded again under another name has both. One being
 not listed, restored or built on until it is complete. `--incremental` stores
 a delta on the VM's last checkpoint, taken here since it last started, was
 restored or migrated, that it ran on after; with that one removed, take a
-full one. `checkpoint rm NAME|ID...` (an id's first 4 or more digits will do)
+full one. On a host without uffd-wp (see [Setup](#setup)) only `--stop`
+checkpoints are taken. `checkpoint rm NAME|ID...` (an id's first 4 or more digits will do)
 is refused while a checkpoint not removed with it builds on it; `-f` removes
 those too. `checkpoint prune` removes every checkpoint, or with
 `--older-than AGE` (`90s`, `30m`, `24h`, `7d`) those older, except what a kept one

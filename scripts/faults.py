@@ -6494,6 +6494,30 @@ def ckpt_failed_stop():
         rm_ckpt(path + x)
 
 
+def ckpt_no_wp():
+    """On a host whose kernel lacks uffd-wp (test fault uffd_wp_missing, as
+    arm64 before 6.10), a checkpoint that keeps the VM running, and an
+    incremental one, are refused up front with an error naming uffd-wp and
+    --stop: nothing is staged, write tracking stays off and the VM runs on,
+    intact. A checkpoint with --stop still works and restores."""
+    n, path = "ft-nowp", ckpt_path("ft-nowp")
+    rm_ckpt(path)
+    m = setup(n, mib=20)
+    with armed_fault(A, "uffd_wp_missing", 60000):
+        for inc, stop in ((False, False), (True, False), (True, True)):
+            r = checkpoint(A, n, path, stop=stop, incremental=inc)
+            check(f"no uffd-wp: refused (incremental {inc}, stop {stop})", not r["ok"] and "uffd-wp" in r["error"] and "--stop" in r["error"], r)
+        check("no uffd-wp: nothing staged or published", not staging() and not os.path.exists(path), staging())
+        st = control(A, n, {"op": "debug", "what": "status"})["result"]["describe"]
+        check("no uffd-wp: VM runs on, write tracking off", where(n) == {A: "running"} and st["write_tracking"] is False, (where(n), st))
+        check("no uffd-wp: memory intact", md5(A, n) == m)
+        ok(checkpoint(A, n, path, stop=True))
+    ok(restore(B, path, name=n + "2", ip="auto"))
+    check("no uffd-wp: the --stop checkpoint restores, md5 intact", md5(B, n + "2") == m)
+    cleanup(n + "2")
+    cleanup(n)
+    rm_ckpt(path)
+
 
 def ckpt_rearm():
     """A failed re-protection turns write tracking off; the next checkpoint
@@ -12464,7 +12488,7 @@ SCENARIOS = dict(
     suspend_gen=suspend_gen, checkpoint_hotplug=checkpoint_hotplug, checkpoint_untrusted_dir=checkpoint_untrusted_dir,
     resume_failures=resume_failures, resume_unpause_fail=resume_unpause_fail, abort_link_fail=abort_link_fail, resume_unsettled=resume_unsettled, resume_slow_guest=resume_slow_guest, resume_readdress_fail=resume_readdress_fail, held_restore_frozen=held_restore_frozen, cow_exact=cow_exact, cow_rescue_fail=cow_rescue_fail, cow_collapsed=cow_collapsed, unplug_collapsed=no_evict(unplug_collapsed), cow_abort=cow_abort,
     cow_crash=cow_crash, cow_reports_held=cow_reports_held, ckpt_incremental=ckpt_incremental, ckpt_hot=ckpt_hot,
-    ckpt_failed_stop=ckpt_failed_stop, ckpt_rearm=ckpt_rearm,
+    ckpt_failed_stop=ckpt_failed_stop, ckpt_no_wp=ckpt_no_wp, ckpt_rearm=ckpt_rearm,
     leave_fail=leave_fail, capture_fail=capture_fail, abort_gen_fail=abort_gen_fail, commit_fail=commit_fail, commit_fail_routed=commit_fail_routed, abort_stay_fail=abort_stay_fail,
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail, arrival_flood=arrival_flood, arrival_cap_restart=arrival_cap_restart,
     fc_prepare=fc_prepare, forged_vmstate=forged_vmstate, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ckpt_stall=ckpt_stall, standby=standby, standby_vm_ips=standby_vm_ips,

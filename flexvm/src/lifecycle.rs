@@ -153,6 +153,15 @@ impl Proc {
     /// paused for the caller to destroy.
     pub fn checkpoint(&self, _op: &Op, name: Option<&str>, stop: bool, incremental: bool) -> Result<Value> {
         let vm = self.vm();
+        // Write tracking needs uffd-wp: refused before anything is reserved or paused, the VM running on. A delta
+        // builds on a checkpoint the VM ran on after, which only tracking leaves. Test fault `uffd_wp_missing`: as if
+        // the kernel lacked it.
+        if (!stop || incremental) && (!crate::uffd::wp_supported() || fault("uffd_wp_missing")) {
+            bail!(
+                "vm {}: this host's kernel lacks userfaultfd write protection (uffd-wp), which a checkpoint that keeps the vm running, and an incremental one, need: take a full one with --stop (arm64 kernels have uffd-wp from Linux 6.10)",
+                vm.name
+            );
+        }
         let mut t = Phases::new();
         let state = &self.host.state;
         // Shared until it is named: a removal waits, so the parent of a delta stays.

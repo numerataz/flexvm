@@ -734,6 +734,19 @@ through, so the checkpoint is exactly the memory at the pause.
   pause is the template's or zero, which the page map records) and
   `WP_ASYNC` would let writes through unsaved. Checked on 6.18 against a
   context created like Firecracker's (`EVENT_REMOVE` only).
+- **Hosts without uffd-wp.** The kernel must have write protection for
+  anonymous memory at all (`HAVE_ARCH_USERFAULTFD_WP`): x86_64 from 5.7,
+  arm64 only from 6.10. Without it, registering `MODE_WP` fails with EINVAL.
+  Firecracker's context has had its one `UFFDIO_API` call, so each VM process
+  opens a user-mode-only context of its own once and reads the features its
+  `UFFDIO_API` reports (`uffd::wp_supported`: `UFFD_FEATURE_PAGEFAULT_FLAG_WP`;
+  `WP_HUGETLBFS_SHMEM` does not matter, guest memory being anonymous). Without
+  it, a checkpoint that keeps the VM running is refused before anything is
+  reserved or paused, the VM running on, and so is an incremental one, `--stop`
+  or not: a delta builds on a checkpoint taken with tracking on. That is the
+  only path that arms write protection; `--stop` checkpoints, suspend, restore,
+  post-copy migration and templates need none. Test fault `uffd_wp_missing`
+  makes a host refuse as if it lacked it (`scripts/faults.py ckpt_no_wp`).
 - **Write tracking.** The first keep-running checkpoint registers write
   protection and protects all guest memory while the VM still runs (in 2 MiB
   calls: KVM retries guest faults anywhere in a range the kernel is
@@ -951,7 +964,7 @@ processes' environment) cover each failure path: migration (`pages`,
 `route`, `lost_ack`, `status`, `prepare_fail`, `short_incoming`,
 `slow_preload`, `kill_prepared`), restores (`restore_no_hold`,
 `restore_before_run`, `restore_after_run`, `resume_kill`, `started_fsync`,
-`started_unmark`, `resume_fence_fail`), checkpoints (`prealloc_fail`, `ckpt_memhash`, `ckpt_fail_protect`,
+`started_unmark`, `resume_fence_fail`), checkpoints (`uffd_wp_missing`, `prealloc_fail`, `ckpt_memhash`, `ckpt_fail_protect`,
 `ckpt_hot_read_fail`, `ckpt_no_hold`, `ckpt_abort`, `ckpt_slow`, `ckpt_fail_write`,
 `ckpt_copy_wait`) and guest requests (`guest_drop`, `guest_lose_reply`);
 `scripts/faults.py` uses them.
