@@ -15,6 +15,8 @@ ARCH=$(uname -m)
 export ARCH
 # shellcheck source=versions.sh
 source "$root/scripts/versions.sh"
+# Made first, as this user: the builds make STATE with sudo, and with it any missing parent OUT shares.
+mkdir -p "$out"
 
 # Firecracker builds with the toolchain its own rust-toolchain.toml (at FC_COMMIT) pins; rustup installs it.
 sudo apt-get update -q
@@ -24,7 +26,6 @@ sudo apt-get install -y -q --no-install-recommends musl-tools libseccomp-dev
 "$root/scripts/fetch.sh" --state "$state" --kernel
 
 firecracker=$(asset firecracker) vmlinux=$(asset vmlinux) inputs=$(asset inputs.txt) sums=SHA256SUMS-$ARCH
-mkdir -p "$out"
 install -m 755 "$state/artifacts/firecracker" "$out/$firecracker"
 install -m 644 "$state/artifacts/vmlinux" "$out/$vmlinux"
 "$root/scripts/pin-artifacts.sh" --inputs > "$out/$inputs"
