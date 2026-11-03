@@ -2675,10 +2675,11 @@ pub(crate) mod tests {
     #[test]
     fn run_memory_past_a_template_at_the_window_does_not_suggest_a_larger_pull() {
         let f = Fixture::new();
-        let run = |m: u64, mem_mib: u64, max_mib: u64| {
-            let meta = Meta { mem_mib, max_mib, ..f.meta.clone() };
+        let run_beside = |rootfs: &Path, m: u64, mem_mib: u64, max_mib: u64| {
+            let meta = Meta { mem_mib, max_mib, rootfs: rootfs.into(), ..f.meta.clone() };
             crate::vm::Resources { cpus: None, memory_mib: Some(m) }.check(&meta).map_err(|e| e.to_string())
         };
+        let run = |m, mem_mib, max_mib| run_beside(&f.meta.rootfs, m, mem_mib, max_mib);
         assert_eq!(run(2048, 256, 1024).unwrap_err(), "--memory 2048 MiB is more than the image's ceiling, 1024 MiB (pull it with --max for more)");
         let full = 17280 + hotplug_room(0).unwrap();
         run(full, 17280, full).unwrap();
@@ -2688,6 +2689,12 @@ pub(crate) mod tests {
         );
         let short = full - SLOT_MIB;
         assert!(run(full, 17280, short).unwrap_err().ends_with("(pull it with --max for more)"));
+        // Beside a 20 GiB root filesystem, that is a full template.
+        let big = f.dir.join("big-rootfs");
+        File::create(&big).unwrap().set_len(20 << 30).unwrap();
+        let full = 16640 + hotplug_room(20 << 30).unwrap();
+        assert!(run_beside(&big, full + 1, 16640, full).unwrap_err().ends_with("(the most Firecracker's hotplug window holds)"));
+        assert!(run_beside(&big, full, 16640, full - SLOT_MIB).unwrap_err().ends_with("(pull it with --max for more)"));
     }
 
     fn sent(f: &mut Fixture, rootfs_named: &str) -> (Arc<Template>, Vec<u8>) {

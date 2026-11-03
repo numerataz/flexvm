@@ -1124,8 +1124,11 @@ impl Resources {
                 );
             }
             if m > meta.max_mib {
-                // A template with no room for another slot in Firecracker's window cannot be pulled larger.
-                let more = match meta.max_mib - meta.mem_mib + crate::template::SLOT_MIB <= crate::template::hotplug_room(0)? {
+                // A template with no room for another slot in Firecracker's window beside its root
+                // filesystem cannot be pulled larger.
+                let rootfs = std::fs::metadata(&meta.rootfs).map_or(0, |m| m.len());
+                let room = crate::template::hotplug_room(rootfs).unwrap_or(0);
+                let more = match meta.max_mib - meta.mem_mib + crate::template::SLOT_MIB <= room {
                     true => "pull it with --max for more",
                     false => "the most Firecracker's hotplug window holds",
                 };
