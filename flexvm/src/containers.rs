@@ -396,6 +396,9 @@ pub(crate) fn described(host: &Host, paths: &template::Paths, name: &str, mut v:
         "socket": if running { json!(path("sock")) } else { Value::Null },
         "checkpoint": host.is_suspended(name).then(|| host.suspended(name).ok()).flatten(),
     });
+    if let Some(v6) = v.get("ipv6") {
+        config["ipv6"] = v6.clone();
+    }
     // Its ports and run settings: a running VM's registry entry has them, a stopped one's
     // checkpoint, an exited one's record (with what it ran, as `start` runs it again).
     config["ports"] = v.get("ports").cloned().unwrap_or_else(|| json!([]));
@@ -1768,7 +1771,8 @@ mod tests {
         .unwrap();
         // Derived where shown, from the live host.json: what is recorded stays keyed by IPv4.
         assert_eq!(listed(&host)["ipv6"], "fd00:7::a00:7");
-        assert_eq!(described(&host, &paths, "web", listed(&host))["ipv6"], "fd00:7::a00:7");
+        let v = described(&host, &paths, "web", listed(&host));
+        assert!(v["ipv6"] == "fd00:7::a00:7" && v["config"]["ipv6"] == "fd00:7::a00:7", "{v}");
     }
 
     #[test]

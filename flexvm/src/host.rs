@@ -94,7 +94,8 @@ pub struct Config {
     /// The guests' nameservers (`guest_dns`).
     pub dns: Option<Dns>,
     /// Every host's VM IPv6 prefix, the same on each (#1296): a VM's IPv6 address is it and the
-    /// VM's IPv4 address (`vm_ipv6`). None: VMs have no IPv6 address.
+    /// VM's IPv4 address (`vm_ipv6`). None: VMs have no IPv6 address, and host.json no key an older build would refuse.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub vm_ipv6_prefix: Option<crate::net::Ipv6Prefix>,
     /// None: `default_reserve`.
     pub reserve_mib: Option<u64>,
@@ -6293,7 +6294,9 @@ pub(crate) mod tests {
         std::fs::write(&path, r#"{"dns": "192.0.2.53"}"#).unwrap();
         let c = Host::open(&h.state, &h.run).unwrap().cfg;
         assert_eq!((c.vm_ipv6(ip("10.200.0.7")), c.guest_dns()), (None, vec![IpAddr::V4(ip("192.0.2.53"))]));
-        assert_eq!(serde_json::to_value(&c).unwrap()["dns"], "192.0.2.53");
+        let set = serde_json::to_value(&c).unwrap();
+        // Written back as read, and no new key unset: an older build refuses one it does not know.
+        assert!(set["dns"] == "192.0.2.53" && set.get("vm_ipv6_prefix").is_none(), "{set}");
         assert!(!c.warnings().join("\n").contains("IPv6"));
         std::fs::write(
             &path,

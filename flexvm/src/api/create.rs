@@ -324,8 +324,9 @@ fn ipv4_of(cfg: &crate::host::Config, v6: &str, ipv4: Option<&str>) -> Result<St
     let Some(ip) = prefix.ipv4_of(addr) else {
         return Err(Error::bad(format!("IPv6Address {v6} is outside vm_ipv6_prefix {prefix}: a VM's IPv6 address is the prefix and its IPv4 address")));
     };
-    match ipv4.map(|v4| v4.parse::<std::net::Ipv4Addr>()) {
-        Some(Ok(v4)) if v4 != ip => Err(Error::bad(format!("IPv6Address {v6} is not IPv4Address {v4}'s, {}", prefix.vm(v4)))),
+    match ipv4.map(|v4| (v4, v4.parse::<std::net::Ipv4Addr>())) {
+        Some((_, Ok(v4))) if v4 != ip => Err(Error::bad(format!("IPv6Address {v6} is not IPv4Address {v4}'s, {}", prefix.vm(v4)))),
+        Some((given, Err(_))) => Err(Error::bad(format!("IPv6Address {v6} with IPv4Address {given:?}, which is not an IPv4 address"))),
         _ => Ok(ip.to_string()),
     }
 }
@@ -428,7 +429,7 @@ pub fn translate(api: &Api, name: &str, body: &Value) -> Result<Record, Error> {
             Some(v6) => Some(ipv4_of(&api.host.config_now(), v6, ipv4)?),
             None => None,
         };
-        if let Some(ip) = ipv4.map(String::from).or(ipv6) {
+        if let Some(ip) = ipv6.or(ipv4.map(String::from)) {
             run.extend(["--ip".to_string(), ip]);
         }
     }
@@ -702,6 +703,7 @@ pub(super) mod tests {
             (Some("10.9.0.8"), "fd00:7::a09:7", "is not IPv4Address 10.9.0.8's, fd00:7::a09:8"),
             (None, "fd00:8::a09:7", "outside vm_ipv6_prefix fd00:7::/96"),
             (None, "10.9.0.7", "bad IPv6Address"),
+            (Some("auto"), "fd00:7::a09:7", "which is not an IPv4 address"),
         ] {
             let e = ipam(v4, v6).unwrap_err();
             assert!(e.status == hyper::StatusCode::BAD_REQUEST && e.message.contains(why), "{v6}: {e:?}");
