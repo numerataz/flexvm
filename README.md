@@ -756,8 +756,10 @@ warns until then). Derived values:
   Peers take it as one of the addresses they know this host by (its `peers`
   address, or one its name resolves to); an underlay on another network
   than that address (a separate data-plane network) is listed on each peer
-  in `peer_underlays`. VM routes and migrations go via the IPv4 underlay; a
-  `[::]` listener with only IPv6 peers is advertised at its IPv6 underlay.
+  in `peer_underlays`. VM routes and migrations go via the IPv4 underlay. A
+  `[::]` listener is advertised at the IPv4 underlay, but at the IPv6 one
+  when only that is set, when there is no IPv4 one, or when the peers
+  elsewhere have only IPv6 addresses.
 - `peer_underlays`: a peer's next hops besides its `peers` address, its
   `underlay` on another network. Only these, set here, are trusted: never an
   address because it is on-link. Each must be non-loopback and unicast, and

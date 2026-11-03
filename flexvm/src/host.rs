@@ -343,10 +343,11 @@ fn derive(
             Err(e) => errs.push(e.to_string()),
         }
     }
+    // A family whose route failed is said, even when the other was derived.
     let why = match (d.v4, d.v6, errs.is_empty()) {
         (None, None, true) => Some("no peer elsewhere has a known IPv4 or IPv6 address".into()),
-        (None, None, false) => Some(errs.join("; ")),
-        _ => None,
+        (_, _, true) => None,
+        _ => Some(errs.join("; ")),
     };
     (d, why, unresolved)
 }
@@ -569,7 +570,7 @@ impl Config {
             IpAddr::V4(_) => None,
             IpAddr::V6(v6) => Some(v6).filter(|v6| !v6.is_unspecified() && !v6.is_unicast_link_local()),
         };
-        self.underlay.v6.or_else(from_listen).or_else(|| self.derived(look).v6)
+        self.underlay.v6.filter(|v6| underlay_fault(IpAddr::V6(*v6)).is_none()).or_else(from_listen).or_else(|| self.derived(look).v6)
     }
 
     /// Unset: that route's device, none for peers on this machine; `none`: no announcements.
@@ -623,6 +624,10 @@ impl Config {
         let (d, why, unresolved) = derive(&self.peers, find, |a| crate::net::is_local_ip(a).unwrap_or(false), route);
         match why {
             None => (d, None),
+            Some(e) if d.v4.is_some() || d.v6.is_some() => {
+                let family = if d.v4.is_none() { "IPv4" } else { "IPv6" };
+                (d, Some(format!("{e}: no {family} underlay derived (set underlay in host.json)")))
+            }
             Some(e) if unseen.is_empty() => {
                 (d, Some(format!("{e}: no underlay address or announce device derived (set underlay and announce_dev in host.json)")))
             }
@@ -645,10 +650,10 @@ impl Config {
     /// Where peers reach this host's listener (a migration target pulls
     /// pages from it): the listen address, or for a wildcard one (0.0.0.0,
     /// ::, ::ffff:0.0.0.0) or an IPv6 link-local one (its scope id means
-    /// nothing elsewhere) the underlay address with the listen port: for an
-    /// IPv6 one, the IPv4 underlay, but the IPv6 one when there is no IPv4
-    /// one or the peers elsewhere have only IPv6 addresses. None without a
-    /// listener.
+    /// nothing elsewhere) the IPv4 underlay with the listen port. For [::],
+    /// the IPv6 underlay instead when it is set and the IPv4 one is not, when
+    /// there is no IPv4 one, or when the peers elsewhere have only IPv6
+    /// addresses. None without a listener.
     pub fn advertise(&self) -> Result<Option<String>> {
         self.advertise_by(true)
     }
@@ -668,12 +673,15 @@ impl Config {
         if !local_only {
             return Ok(Some(SocketAddr::new(ip, addr.port()).to_string()));
         }
+        // A link-local socket takes connections at its own address only: never the IPv6 underlay.
         let underlay = match ip {
-            IpAddr::V4(_) => self.underlay_by(look).map(IpAddr::V4),
-            IpAddr::V6(_) => match (self.underlay_by(look), self.underlay6_by(look)) {
+            IpAddr::V6(v6) if v6.is_unspecified() => match (self.underlay_by(look), self.underlay6_by(look)) {
+                // One set beats one derived; else IPv4, unless the peers have only IPv6 addresses.
+                (_, Some(v6)) if self.underlay.v6.is_some() && self.underlay.v4.is_none() => Some(IpAddr::V6(v6)),
                 (Some(v4), Some(v6)) => Some(if self.derived(look).v6_only { IpAddr::V6(v6) } else { IpAddr::V4(v4) }),
                 (v4, v6) => v4.map(IpAddr::V4).or(v6.map(IpAddr::V6)),
             },
+            _ => self.underlay_by(look).map(IpAddr::V4),
         };
         match underlay {
             Some(u) => Ok(Some(SocketAddr::new(u, addr.port()).to_string())),
@@ -7191,6 +7199,11 @@ pub(crate) mod tests {
         assert_eq!(v6_peers.advertise().unwrap().as_deref(), Some("[2001:db8::2]:7070"));
         let dual_peers = Config { peers: vec!["[2001:db8::9]:7070".into(), "192.0.2.9:7070".into()], ..both };
         assert_eq!(dual_peers.advertise().unwrap().as_deref(), Some("10.1.0.2:7070"));
+        // One set beats one derived (here loopback, every peer on this machine).
+        let set6 = Config { listen: Some("[::]:7070".into()), underlay: "2001:db8::2".parse().unwrap(), ..Config::default() };
+        assert_eq!(set6.advertise().unwrap().as_deref(), Some("[2001:db8::2]:7070"));
+        // A link-local listener takes connections at its own address only: never advertised at the IPv6 underlay.
+        assert!(cfg(Some("[fe80::1%3]:7070"), Some("2001:db8::2")).advertise().is_err());
         // An IPv4-mapped wildcard binds as 0.0.0.0; a mapped address is its IPv4 one.
         assert!(cfg(Some("[::ffff:0:0]:7070"), None).advertise().is_err());
         assert_eq!(cfg(Some("[::ffff:0:0]:7070"), Some("10.1.0.2")).advertise().unwrap().as_deref(), Some("10.1.0.2:7070"));
@@ -9760,6 +9773,14 @@ pub(crate) mod tests {
             v6_only: v4.is_none() && v6.is_some(),
         };
         let derive = |p: &[&str], ether| derive(&peers(p), lookup, |_| false, route(ether));
+        let v4_fails = |to: IpAddr| match to {
+            IpAddr::V4(_) => Err("no route toward 192.0.2.9: Network is unreachable".into()),
+            IpAddr::V6(_) => Ok(("eth0".into(), "2001:db8::1".parse().unwrap(), true)),
+        };
+        // The IPv6 underlay derived, and why there is no IPv4 one said.
+        let (found, why, _) = super::derive(&peers(&["dual:1"]), lookup, |_| false, v4_fails);
+        assert_eq!((found.v4, found.v6, found.dev.as_deref()), (None, Some("2001:db8::1".parse().unwrap()), Some("eth0")));
+        assert_eq!(why.as_deref(), Some("no route toward 192.0.2.9: Network is unreachable"));
         let local = Derived { v6_only: false, ..d(Some(Ipv4Addr::LOCALHOST), Some(Ipv6Addr::LOCALHOST), None) };
         assert_eq!(derive(&["near:1"], true), (local, None, vec![]));
         assert_eq!(derive(&["near:1", "far:1"], true), (d(Some(src), None, Some("eth0")), None, vec![]));
@@ -9782,7 +9803,8 @@ pub(crate) mod tests {
             IpAddr::V4(_) => Ok(("eth0".into(), src.into(), true)),
             IpAddr::V6(_) => Err("no route toward 2001:db8::9: Network is unreachable".into()),
         };
-        assert_eq!(super::derive(&peers(&["dual:1"]), lookup, |_| false, v6_fails).0, d(Some(src), None, Some("eth0")));
+        let (found, why, _) = super::derive(&peers(&["dual:1"]), lookup, |_| false, v6_fails);
+        assert_eq!((found, why.as_deref()), (d(Some(src), None, Some("eth0")), Some("no route toward 2001:db8::9: Network is unreachable")));
         // A route's IPv6 source must be a usable underlay: a link-local one is not.
         let link_local = |_: IpAddr| Ok(("eth0".into(), "fe80::1".parse().unwrap(), true));
         let (found, e, _) = super::derive(&peers(&["far6:1"]), lookup, |_| false, link_local);
