@@ -652,7 +652,8 @@ the warnings.
 **Not usable yet.** With `vm_ipv6_prefix` set, flexvm derives and reports
 each VM's IPv6 address and configures it in the guest, but does not yet
 route it (the taps and routes come with #1297). Nothing answers at the
-address from outside the VM. `info` and the listener warn about this for as
+address from outside the VM, and the guest's IPv6 traffic, to IPv6
+nameservers in `dns` too, is dropped at its tap. `info` and the listener warn about this for as
 long as it is true. Setting the prefix now only lets every host agree on it
 before the data plane lands. Without it, nothing changes.
 

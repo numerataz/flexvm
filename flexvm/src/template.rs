@@ -940,7 +940,9 @@ fn record_working_set(host: &crate::host::Host, paths: &Paths, dir: &Path, tap: 
     let fc = p.firecracker();
     fc.resume(crate::fc::API_TIMEOUT)?;
     retry(Duration::from_secs(10), Duration::from_millis(10), || guest::ping(&fc.sockets.vsock))?;
-    guest::start(&fc.sockets.vsock, "10.255.255.254".parse()?, None, &[])?;
+    // With vm_ipv6_prefix, VMs start with START6, so it is recorded too.
+    let ip = "10.255.255.254".parse()?;
+    guest::start(&fc.sockets.vsock, ip, host.config_now().vm_ipv6(ip), &[])?;
     if tpl.meta.image.as_ref().is_some_and(|i| i.starts_at_run()) {
         guest::start_app(&fc.sockets.vsock, "")?;
     }

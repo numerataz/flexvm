@@ -987,7 +987,10 @@ impl Vm {
             Ok(true) => Ok(()),
             Ok(false) => {
                 let ip6 = ip6.map_or(String::new(), |a| a.to_string());
-                crate::log!("vm {}: its template's flexvm-init predates IPv6, so it runs without its IPv6 address {ip6}: pull its image again", self.name);
+                crate::log!(
+                    "vm {}: its template's flexvm-init predates IPv6, so it runs without its IPv6 address {ip6} and IPv6 nameservers: pull its image again",
+                    self.name
+                );
                 Ok(())
             }
             Err(e) => {

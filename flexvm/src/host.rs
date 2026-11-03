@@ -329,7 +329,7 @@ impl Config {
         }
         if let Some(p) = self.vm_ipv6_prefix {
             w.push(format!(
-                "flexvm: warning: vm_ipv6_prefix {p} is set: VMs' IPv6 addresses are reported and configured in guests, but not routed yet (#1297)"
+                "flexvm: warning: vm_ipv6_prefix {p} is set: VMs' IPv6 addresses are reported and configured in guests, but not routed yet (#1297): guests' IPv6 traffic, to IPv6 nameservers too, is dropped"
             ));
         }
         let v6_dns = self.dns.as_ref().map_or(&[][..], Dns::listed).iter().find(|d| d.parse::<std::net::Ipv6Addr>().is_ok());
