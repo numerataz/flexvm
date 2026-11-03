@@ -75,6 +75,12 @@ artifacts](#releasing-the-artifacts).
 
 The host needs Linux 5.16+: Firecracker patch `0004` uses `KVM_VCPU_TSC_OFFSET`.
 
+The host kernel needs 4 KiB pages. On another page size (an arm64 kernel built
+for 16 or 64 KiB pages, such as Ubuntu's `-64k` flavours) every command that
+runs or acts on a VM fails at once, naming the page size; only `ps`, `images`,
+`inspect`, `logs`, `info`, `version`, `wait`, `login`, `logout`, `checkpoint ls`
+and `system df` still run (#1270).
+
 A checkpoint that keeps the VM running, and an incremental one, track writes
 with userfaultfd write protection (uffd-wp), which arm64 kernels have only
 from Linux 6.10 (x86_64 from 5.7). Without it they are refused, naming uffd-wp,

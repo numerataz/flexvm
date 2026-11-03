@@ -23,8 +23,16 @@ use crate::util::{ms, retry, Result, PAGE_SIZE};
 
 pub const BALLOON_STATS_S: u16 = 1;
 
+/// Per guest arch (the host's): x86 reboots through the keyboard controller (`reboot=k`, which
+/// Firecracker takes for an exit) and needs no probing of the rest of its i8042; arm64 has neither
+/// and exits by PSCI, and keeps its boot console (`keep_bootcon`). Templates are named by them.
+#[cfg(target_arch = "x86_64")]
 pub const BOOT_ARGS: &str = "console=ttyS0 quiet reboot=k panic=1 pci=off \
     i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd \
+    rootflags=dax init=/sbin/flexvm-init psi=1 \
+    memhp_default_state=online memory_hotplug.online_policy=auto-movable memory_hotplug.auto_movable_ratio=2000";
+#[cfg(target_arch = "aarch64")]
+pub const BOOT_ARGS: &str = "console=ttyS0 quiet keep_bootcon panic=1 pci=off \
     rootflags=dax init=/sbin/flexvm-init psi=1 \
     memhp_default_state=online memory_hotplug.online_policy=auto-movable memory_hotplug.auto_movable_ratio=2000";
 

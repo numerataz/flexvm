@@ -499,9 +499,29 @@ fn host_context(template: &str) -> Value {
         "loadavg": read("/proc/loadavg"),
         "cpu_model": model.map(|(_, v)| v.trim()),
         "host_cpus": crate::util::host_cpus(),
-        "nested_virt": cpuinfo.split_whitespace().any(|f| f == "hypervisor"),
+        "nested_virt": nested_virt(&cpuinfo),
         "template": template,
     })
+}
+
+/// Whether this host is itself a VM. An x86 CPU says so (cpuinfo's `hypervisor` flag); arm64 has no
+/// such flag, so there the firmware names its hypervisor, as `systemd-detect-virt` reads it.
+fn nested_virt(cpuinfo: &str) -> bool {
+    if cfg!(target_arch = "x86_64") {
+        return cpuinfo.split_whitespace().any(|f| f == "hypervisor");
+    }
+    let dmi = |f| std::fs::read_to_string(format!("/sys/class/dmi/id/{f}")).unwrap_or_default();
+    std::path::Path::new("/proc/device-tree/hypervisor").exists() || virtual_dmi(dmi("sys_vendor").trim(), dmi("product_name").trim())
+}
+
+fn virtual_dmi(vendor: &str, product: &str) -> bool {
+    match vendor {
+        "QEMU" | "Xen" | "VMware, Inc." | "innotek GmbH" | "Google" | "Alibaba Cloud" => true,
+        "Microsoft Corporation" => product == "Virtual Machine",
+        // EC2's bare-metal instances have the vendor of its VMs.
+        "Amazon EC2" => !product.ends_with(".metal"),
+        _ => product.starts_with("KVM"),
+    }
 }
 
 fn wait_ready(h: &Hosts, addr: SocketAddr, http: bool, deadline: Instant) -> Result<()> {
@@ -596,6 +616,16 @@ fn command(bin: &str, args: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hypervisor_is_told_by_its_firmware() {
+        for (vendor, product) in [("QEMU", "KVM Virtual Machine"), ("Amazon EC2", "c7g.large"), ("Microsoft Corporation", "Virtual Machine"), ("", "KVM")] {
+            assert!(virtual_dmi(vendor, product), "{vendor} {product}");
+        }
+        for (vendor, product) in [("Amazon EC2", "c7g.metal"), ("Microsoft Corporation", "Surface Laptop"), ("Ampere", "Mt.Jade"), ("", "")] {
+            assert!(!virtual_dmi(vendor, product), "{vendor} {product}");
+        }
+    }
 
     #[test]
     fn duplicate_lifecycle_sizes_are_rejected_before_running() {

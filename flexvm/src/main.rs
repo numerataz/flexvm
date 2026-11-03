@@ -683,6 +683,17 @@ fn paths(args: &Args) -> Result<Paths> {
     Ok(Paths::new(&state(args)?))
 }
 
+/// Commands that only read the state, so they run on any host: every other one may start a VM or a
+/// pager (`run`, `pull`, `listen`, `api`, a restart's) or act on one, and is refused on a host whose
+/// pages they cannot work in (`util::check_page_size`).
+fn reads_only(args: &Args) -> bool {
+    let words: Vec<&str> = args.positional.iter().take(2).map(String::as_str).collect();
+    matches!(
+        words[..],
+        [] | ["ps" | "images" | "inspect" | "logs" | "info" | "version" | "wait" | "login" | "logout", ..] | ["checkpoint", "ls"] | ["system", "df"]
+    )
+}
+
 fn real_main(args: &Args) -> Result<()> {
     if args.has("help") {
         return output(format_args!("{USAGE}"));
@@ -691,6 +702,9 @@ fn real_main(args: &Args) -> Result<()> {
         return output(format_args!("flexvm {}\n", env!("CARGO_PKG_VERSION")));
     }
     check_applies(args)?;
+    if !reads_only(args) {
+        util::check_page_size()?;
+    }
     let pos: Vec<&str> = args.positional.iter().map(|s| s.as_str()).collect();
     let (name, arg2) = (pos.get(1).copied().unwrap_or(""), pos.get(2).copied());
     let call = |req: Value| print(vmproc::call(&open_host(args)?, name, req, None)?);
