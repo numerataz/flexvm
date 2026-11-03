@@ -303,10 +303,14 @@ impl Holder {
         on.is_ok()
     }
 
-    /// The hold's /128 of `e`, once its /32 was routed elsewhere (`route_via` routes no /128 yet,
-    /// #1295): by this device, so never the one a VM here has taken meanwhile.
-    fn unroute6(&self, e: &Entry) {
-        if let Some(v6) = e.v6 {
+    /// `unhold` once `e`'s /32 was routed elsewhere, and its /128 here with it (`route_via` moves no
+    /// /128 yet, #1295): by this device, so never the one a VM here has taken meanwhile. Under
+    /// `routes`, and only while `e` is still the hold, so a newer hold of `ip` keeps its /128.
+    fn unhold_switched(&self, ip: Ipv4Addr, e: &Arc<Entry>) {
+        let _routes = self.routes.lock().unwrap();
+        let current = self.entry(ip).is_some_and(|x| Arc::ptr_eq(&x, e));
+        self.unhold(ip, e, true);
+        if let Some(v6) = e.v6.filter(|_| current) {
             let _ = crate::net::unroute_dev(v6.into(), self.ifindex);
         }
     }
@@ -417,10 +421,7 @@ impl Holder {
             }
         }
         match switched {
-            Switch::Switched => {
-                self.unhold(ip, &e, true);
-                self.unroute6(&e);
-            }
+            Switch::Switched => self.unhold_switched(ip, &e),
             Switch::Refused => self.unhold(ip, &e, false),
             // Left to the TUN, the address would be dropped here until the caller's retry.
             Switch::Lost(_) => self.unroute(ip, &e),
@@ -496,8 +497,7 @@ impl Holder {
             }
         }
         if switched.is_ok() {
-            self.unhold(ip, &e, true);
-            self.unroute6(&e);
+            self.unhold_switched(ip, &e);
         }
         // After `unhold`: a packet read since is a straggler, re-sent, not discarded below.
         give(&mut o);
