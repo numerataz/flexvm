@@ -7909,10 +7909,7 @@ pub(crate) mod tests {
             w.contains("vm_ipv6_prefix fd00:1::/96 covers fd00:1::a09:7, this host's address: the prefix is VMs' alone, and no vm is given 10.9.0.7"),
             "{w}"
         );
-        assert!(
-            !w.contains("vm_ipv6_prefix fd00:1::/96 is set"),
-            "{w}"
-        );
+        assert!(!w.contains("vm_ipv6_prefix fd00:1::/96 is set"), "{w}");
         let w = cfg.warnings_by(|_| Ok(false), Ok(vec![(v6("fd00:2::a09:7"), "address")])).join("\n");
         assert!(!w.contains("covers"), "{w}");
     }
