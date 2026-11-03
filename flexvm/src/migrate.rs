@@ -455,6 +455,13 @@ impl Proc {
         // Before the pause: dropped, the connection ends the target's arrival.
         check_app_support(to, &vm.name.get(), &prepared, &self.spec.lock().unwrap().moving(), vm.template.meta.image.as_ref())?;
         let reached = Reached::new(to, &conn, &prepared)?;
+        // Its underlays as of the prepare (an older target sends none): one this host cannot route via is said
+        // now, while the VM runs on. The commit's answer decides; a reroute that fails then is retried.
+        if prepared.get("underlay").is_some() || prepared.get("underlay6").is_some() {
+            if let Err(e) = target_via(&self.host, &prepared, to, conn.peer_addr().ok().map(|a| a.ip())) {
+                crate::log!("vm {}: migration {mig} to {to}: its underlay is no next hop here ({e}); its route is retried after the commit", vm.name);
+            }
+        }
         let prepare = prep.elapsed();
         // The pages worth sending with the state, ours and the target's: read and sorted before the pause.
         let mut wanted = crate::standby::load_set(&self.host, &vm.template);
@@ -973,8 +980,10 @@ impl Proc {
         };
         // `follows_app`: this side takes the VM's run settings (`spec`) and follows its app; `attaches`: -i and -t too.
         let (prepared, token) = prepared;
-        let result =
-            json!({"timings_ms": prep.json(), "load_set": prepared.load_set, "hold_switch2": true, "follows_app": true, "attaches": true, "token": token});
+        // Its underlays too, which the source checks before it pauses (it routes by the commit's answer).
+        let cfg = self.host.config_now();
+        let result = json!({"timings_ms": prep.json(), "load_set": prepared.load_set, "hold_switch2": true, "follows_app": true, "attaches": true, "token": token,
+            "underlay": cfg.underlay_known(), "underlay6": cfg.underlay6_known()});
         send_json(&mut w, &json!({"ok": true, "result": result}))?;
         let deadline = Instant::now()
             + match () {

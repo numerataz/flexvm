@@ -4318,7 +4318,7 @@ mod tests {
                 sent.lock().unwrap().push(req.clone());
                 match req["op"].as_str() {
                     _ if down => Err("connection refused".into()),
-                    Some("caps") if old => Err("unknown op \"caps\"".into()),
+                    Some("caps") if old => Err("p:7070: unknown op \"caps\"".into()),
                     Some("caps") => Ok(json!({"caps": [crate::listen::VIA6]})),
                     _ if old => req["via"].as_str().unwrap().parse::<Ipv4Addr>().map(|_| json!({})).map_err(Into::into),
                     _ => Ok(json!({})),

@@ -311,13 +311,10 @@ impl std::str::FromStr for Hop {
     }
 }
 
-/// The /32's next hop, and an IPv6 one beside it.
+/// The /32's next hop, as logs always named it.
 impl std::fmt::Display for Hop {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match (self.v4, self.v6) {
-            (Some(v4), Some(v6)) => write!(f, "{v4} (IPv6 {v6})"),
-            _ => write!(f, "{}", self.via()),
-        }
+        write!(f, "{}", self.via())
     }
 }
 
@@ -650,9 +647,13 @@ impl Config {
         self.underlay6_by(false)
     }
 
-    /// The next hop peers route this host's VMs via: both underlays.
+    /// The next hop peers route this host's VMs via: the IPv4 underlay, and the IPv6 one when the VMs
+    /// have IPv6 addresses (`vm_ipv6_prefix`: their /128s go via it) or there is no IPv4 one. Without
+    /// a prefix an IPv4 cluster announces exactly as before, never asking `caps` (a derived ::1 included).
     pub fn hop(&self) -> Option<Hop> {
-        Hop::of(self.underlay(), self.underlay6())
+        let v4 = self.underlay();
+        let v6 = if v4.is_none() || self.vm_ipv6_prefix.is_some() { self.underlay6() } else { None };
+        Hop::of(v4, v6)
     }
 
     fn underlay_by(&self, look: bool) -> Option<Ipv4Addr> {
@@ -8336,7 +8337,7 @@ pub(crate) mod tests {
         let (v4, v6): (Ipv4Addr, Ipv6Addr) = ("192.0.2.7".parse().unwrap(), "2001:db8::7".parse().unwrap());
         let both = Hop::new(v4.into(), Some(v6)).unwrap();
         assert_eq!((both.via(), both.via6(), both.v4_only()), (IpAddr::V4(v4), Some(v6), Some(Hop::from(v4))));
-        assert_eq!(both.to_string(), "192.0.2.7 (IPv6 2001:db8::7)");
+        assert_eq!(both.to_string(), "192.0.2.7", "logged as the /32's next hop: one word (faults.py held_routes)");
         let only6 = Hop::new(v6.into(), None).unwrap();
         assert_eq!((only6.via(), only6.via6(), only6.v4_only()), (IpAddr::V6(v6), Some(v6), None));
         assert_eq!(Hop::new(v6.into(), Some(v6)).unwrap(), only6);
@@ -8359,6 +8360,14 @@ pub(crate) mod tests {
         assert_eq!(serde_json::from_value::<Addr>(serde_json::to_value(&a).unwrap()).unwrap().hop(), Some(only6));
         a.set_hop(None);
         assert_eq!((a.via, a.via6), (None, None));
+        // A host's: its IPv6 underlay only with VM IPv6 addresses (their /128s), or with no IPv4 one.
+        let peers = vec!["[2001:db8::99]:7070".to_string(), "192.0.2.99:7070".to_string()];
+        let mut cfg = Config { underlay: Underlay { v4: Some(v4), v6: Some(v6) }, peers, ..Config::default() };
+        assert_eq!(cfg.hop(), Some(Hop::from(v4)), "an IPv4 cluster announces as before");
+        cfg.vm_ipv6_prefix = Some(crate::net::Ipv6Prefix::parse("fd00:1::/96").unwrap());
+        assert_eq!(cfg.hop(), Some(both));
+        let only = Config { underlay: Underlay { v4: None, v6: Some(v6) }, peers: vec!["[2001:db8::99]:7070".into()], ..Config::default() };
+        assert_eq!(only.hop(), Some(only6));
         // Edited by hand to name two IPv6 ones: by `via`.
         let odd = Addr { via: Some(v6.into()), via6: Some("2001:db8::8".parse().unwrap()), ..Addr::default() };
         assert_eq!(odd.hop(), Some(only6));

@@ -1373,11 +1373,15 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
     (`host::Hop`) is both underlays: a VM's /32 goes via the IPv4 one, else
     via the IPv6 one (`RTA_VIA`, `<vm-ip>/32 via inet6 <underlay6>`, Linux
     5.2+); the IPv6 one is also its /128's (#1297). A route announcement
-    carries `via` (the /32's next hop) and `via6` (the IPv6 underlay), the
-    peer's record keeps both (`via`, `via6`), and a migration's commit and
-    outcome answers carry `underlay` and `underlay6`. A `via6` the receiver
-    does not know the sender by (one derived there, not in `peer_underlays`
-    here) is left out and the /32 routed still.
+    carries `via` (the /32's next hop) and `via6` (the IPv6 underlay, sent
+    only with `vm_ipv6_prefix` set or no IPv4 underlay, so an IPv4 cluster
+    announces as before), and the peer's record keeps both (`via`, `via6`).
+    A migration's prepare, commit and outcome answers carry `underlay` and
+    `underlay6`; the source checks the prepare's before it pauses (a failure
+    is logged) and routes by the commit's. An underlay the receiver does not
+    know the sender by (one derived there, not in `peer_underlays` here) is
+    left out and the other taken alone; only when neither is taken is the
+    announcement refused.
   - **Mixed versions.** A peer says what it takes beyond an older build in
     answer to `{"op": "caps"}` (`{"caps": ["via6"]}`); an older listener
     answers "unknown op". An announcement with an IPv6 next hop is sent only
