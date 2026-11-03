@@ -249,6 +249,9 @@ struct Derived {
     v4: Option<Ipv4Addr>,
     v6: Option<Ipv6Addr>,
     dev: Option<String>,
+    /// The peers elsewhere have IPv6 addresses and none an IPv4 one (whether or not a route
+    /// toward them was found): a wildcard IPv6 listener is advertised at the IPv6 underlay.
+    v6_only: bool,
 }
 
 /// Which peer the underlay and announce device are derived toward.
@@ -303,8 +306,8 @@ const PEER_WAIT: Duration = Duration::from_secs(2);
 type Lookup<'a> = &'a dyn Fn(&str) -> std::io::Result<Vec<IpAddr>>;
 type LookedUp = Mutex<Option<HashMap<String, Vec<IpAddr>>>>;
 
-/// What a derivation found, and the peers whose addresses were unknown.
-type Outcome = (std::result::Result<Derived, String>, Vec<String>);
+/// What a derivation found, why no underlay was (if none was), and the peers whose addresses were unknown.
+type Outcome = (Derived, Option<String>, Vec<String>);
 
 /// The underlay addresses and announce device toward `peers`, and the peers that did not
 /// resolve: `lookup` gives a peer's addresses, `route` the device, source and whether the
@@ -322,8 +325,9 @@ fn derive(
     let addrs: Vec<Vec<IpAddr>> = peers.iter().map(|p| lookup(p).unwrap_or_else(|e| (unresolved.push(format!("peer {p}: {e}")), Vec::new()).1)).collect();
     // Local or not is the same for both families: whether any peer is elsewhere.
     if toward(&addrs, Family::Either, &local) == Toward::Local {
-        return (Ok(Derived { v4: Some(Ipv4Addr::LOCALHOST), v6: Some(Ipv6Addr::LOCALHOST), dev: None }), unresolved);
+        return (Derived { v4: Some(Ipv4Addr::LOCALHOST), v6: Some(Ipv6Addr::LOCALHOST), dev: None, v6_only: false }, None, unresolved);
     }
+    let v6_only = toward(&addrs, Family::V4, &local) == Toward::Unknown && matches!(toward(&addrs, Family::V6, &local), Toward::Remote(_));
     let from = |family| match toward(&addrs, family, &local) {
         Toward::Remote(to) => Some(route(to).and_then(|(dev, src, ether)| match underlay_fault(src) {
             Some(why) if src.is_ipv6() => bail!("the route toward {to} has source {src}, {why}"),
@@ -331,7 +335,7 @@ fn derive(
         })),
         Toward::Local | Toward::Unknown => None,
     };
-    let (mut d, mut errs) = (Derived::default(), Vec::new());
+    let (mut d, mut errs) = (Derived { v6_only, ..Derived::default() }, Vec::new());
     for found in [from(Family::V4), from(Family::V6)].into_iter().flatten() {
         match found {
             Ok((IpAddr::V4(src), dev)) => (d.v4, d.dev) = (Some(src), dev),
@@ -339,12 +343,12 @@ fn derive(
             Err(e) => errs.push(e.to_string()),
         }
     }
-    let out = match (d.v4, d.v6, errs.is_empty()) {
-        (None, None, true) => Err("no peer elsewhere has a known IPv4 or IPv6 address".into()),
-        (None, None, false) => Err(errs.join("; ")),
-        _ => Ok(d),
+    let why = match (d.v4, d.v6, errs.is_empty()) {
+        (None, None, true) => Some("no peer elsewhere has a known IPv4 or IPv6 address".into()),
+        (None, None, false) => Some(errs.join("; ")),
+        _ => None,
     };
-    (out, unresolved)
+    (d, why, unresolved)
 }
 
 impl Config {
@@ -616,20 +620,20 @@ impl Config {
             })
         };
         let route = |to| crate::net::route_get(to).map(|(dev, src)| (dev.clone(), src, crate::net::is_ethernet(&dev)));
-        let (out, unresolved) = derive(&self.peers, find, |a| crate::net::is_local_ip(a).unwrap_or(false), route);
-        match out {
-            Ok(d) => (d, None),
-            Err(e) if unseen.is_empty() => {
-                (Derived::default(), Some(format!("{e}: no underlay address or announce device derived (set underlay and announce_dev in host.json)")))
+        let (d, why, unresolved) = derive(&self.peers, find, |a| crate::net::is_local_ip(a).unwrap_or(false), route);
+        match why {
+            None => (d, None),
+            Some(e) if unseen.is_empty() => {
+                (d, Some(format!("{e}: no underlay address or announce device derived (set underlay and announce_dev in host.json)")))
             }
-            Err(e) => {
+            Some(e) => {
                 let why = match unresolved.is_empty() {
                     true => String::new(),
                     false => format!(" ({})", unresolved.join("; ")),
                 };
                 let unseen = unseen.join(", ");
                 (
-                    Derived::default(),
+                    d,
                     Some(format!(
                         "{e}{why}: no underlay address or announce device derived; this host's listener has not looked up {unseen} yet: start flexvm listen (or set underlay and announce_dev in host.json)"
                     )),
@@ -641,9 +645,10 @@ impl Config {
     /// Where peers reach this host's listener (a migration target pulls
     /// pages from it): the listen address, or for a wildcard one (0.0.0.0,
     /// ::, ::ffff:0.0.0.0) or an IPv6 link-local one (its scope id means
-    /// nothing elsewhere) the underlay address with the listen port: an IPv6
-    /// one's the IPv4 underlay, else (only IPv6 peers) the IPv6 one. None
-    /// without a listener.
+    /// nothing elsewhere) the underlay address with the listen port: for an
+    /// IPv6 one, the IPv4 underlay, but the IPv6 one when there is no IPv4
+    /// one or the peers elsewhere have only IPv6 addresses. None without a
+    /// listener.
     pub fn advertise(&self) -> Result<Option<String>> {
         self.advertise_by(true)
     }
@@ -665,7 +670,10 @@ impl Config {
         }
         let underlay = match ip {
             IpAddr::V4(_) => self.underlay_by(look).map(IpAddr::V4),
-            IpAddr::V6(_) => self.underlay_by(look).map(IpAddr::V4).or_else(|| self.underlay6_by(look).map(IpAddr::V6)),
+            IpAddr::V6(_) => match (self.underlay_by(look), self.underlay6_by(look)) {
+                (Some(v4), Some(v6)) => Some(if self.derived(look).v6_only { IpAddr::V6(v6) } else { IpAddr::V4(v4) }),
+                (v4, v6) => v4.map(IpAddr::V4).or(v6.map(IpAddr::V6)),
+            },
         };
         match underlay {
             Some(u) => Ok(Some(SocketAddr::new(u, addr.port()).to_string())),
@@ -7178,6 +7186,11 @@ pub(crate) mod tests {
         assert!(cfg(Some("0.0.0.0:7070"), Some("2001:db8::2")).advertise().is_err());
         let both = Config { underlay: Underlay { v4: Some(ip("10.1.0.2")), v6: Some("2001:db8::2".parse().unwrap()) }, ..cfg(Some("[::]:7070"), None) };
         assert_eq!(both.advertise().unwrap().as_deref(), Some("10.1.0.2:7070"), "as before, the IPv4 one first");
+        // Unless the peers have only IPv6 addresses: a v6only socket, or an IPv6-only network, takes no IPv4.
+        let v6_peers = Config { peers: vec!["[2001:db8::9]:7070".into()], ..both.clone() };
+        assert_eq!(v6_peers.advertise().unwrap().as_deref(), Some("[2001:db8::2]:7070"));
+        let dual_peers = Config { peers: vec!["[2001:db8::9]:7070".into(), "192.0.2.9:7070".into()], ..both };
+        assert_eq!(dual_peers.advertise().unwrap().as_deref(), Some("10.1.0.2:7070"));
         // An IPv4-mapped wildcard binds as 0.0.0.0; a mapped address is its IPv4 one.
         assert!(cfg(Some("[::ffff:0:0]:7070"), None).advertise().is_err());
         assert_eq!(cfg(Some("[::ffff:0:0]:7070"), Some("10.1.0.2")).advertise().unwrap().as_deref(), Some("10.1.0.2:7070"));
@@ -9618,7 +9631,7 @@ pub(crate) mod tests {
             Err(std::io::Error::other("DNS lookup timed out"))
         };
         let write = |json: &str| std::fs::write(dir.join("peers.json"), json).unwrap();
-        let local = Derived { v4: Some(Ipv4Addr::LOCALHOST), v6: Some(Ipv6Addr::LOCALHOST), dev: None };
+        let local = Derived { v4: Some(Ipv4Addr::LOCALHOST), v6: Some(Ipv6Addr::LOCALHOST), dev: None, v6_only: false };
 
         // No listener yet: both names looked up, and found on this machine; once.
         let memo = Memo::default();
@@ -9740,33 +9753,45 @@ pub(crate) mod tests {
                 Ok(("eth0".into(), src.into(), ether))
             }
         };
-        let d = |v4: Option<Ipv4Addr>, v6: Option<Ipv6Addr>, dev: Option<&str>| Derived { v4, v6, dev: dev.map(String::from) };
+        let d = |v4: Option<Ipv4Addr>, v6: Option<Ipv6Addr>, dev: Option<&str>| Derived {
+            v4,
+            v6,
+            dev: dev.map(String::from),
+            v6_only: v4.is_none() && v6.is_some(),
+        };
         let derive = |p: &[&str], ether| derive(&peers(p), lookup, |_| false, route(ether));
-        assert_eq!(derive(&["near:1"], true), (Ok(d(Some(Ipv4Addr::LOCALHOST), Some(Ipv6Addr::LOCALHOST), None)), vec![]));
-        assert_eq!(derive(&["near:1", "far:1"], true), (Ok(d(Some(src), None, Some("eth0"))), vec![]));
+        let local = Derived { v6_only: false, ..d(Some(Ipv4Addr::LOCALHOST), Some(Ipv6Addr::LOCALHOST), None) };
+        assert_eq!(derive(&["near:1"], true), (local, None, vec![]));
+        assert_eq!(derive(&["near:1", "far:1"], true), (d(Some(src), None, Some("eth0")), None, vec![]));
         // A WireGuard or tun device: the source still, but no ARP announcements on it.
-        assert_eq!(derive(&["far:1"], false), (Ok(d(Some(src), None, None)), vec![]));
+        assert_eq!(derive(&["far:1"], false), (d(Some(src), None, None), None, vec![]));
         let gone = || vec!["peer gone:1: no such name".to_string()];
-        assert_eq!(derive(&["near:1", "gone:1"], true), (Err("no peer elsewhere has a known IPv4 or IPv6 address".into()), gone()));
+        let why = Some("no peer elsewhere has a known IPv4 or IPv6 address".to_string());
+        assert_eq!(derive(&["near:1", "gone:1"], true), (Derived::default(), why, gone()));
         // A peer that did not resolve is named even when the derivation succeeds by another.
-        assert_eq!(derive(&["gone:1", "far:1"], true), (Ok(d(Some(src), None, Some("eth0"))), gone()));
+        assert_eq!(derive(&["gone:1", "far:1"], true), (d(Some(src), None, Some("eth0")), None, gone()));
         let failed = super::derive(&peers(&["far:1"]), lookup, |_| false, |_| Err("no route toward 192.0.2.9: Network is unreachable".into()));
-        assert_eq!(failed.0, Err("no route toward 192.0.2.9: Network is unreachable".into()));
+        assert_eq!((failed.0, failed.1), (Derived::default(), Some("no route toward 192.0.2.9: Network is unreachable".into())));
         // IPv6 peers only: the IPv6 underlay alone (wg0 takes no announcements).
-        assert_eq!(derive(&["far6:1"], true), (Ok(d(None, Some(src6), None)), vec![]));
+        assert_eq!(derive(&["far6:1"], true), (d(None, Some(src6), None), None, vec![]));
         // Both families: each its own route's source; the IPv4 route's device announces.
-        assert_eq!(derive(&["far6:1", "far:1"], true), (Ok(d(Some(src), Some(src6), Some("eth0"))), vec![]));
-        assert_eq!(derive(&["dual:1"], false), (Ok(d(Some(src), Some(src6), None)), vec![]));
+        assert_eq!(derive(&["far6:1", "far:1"], true), (d(Some(src), Some(src6), Some("eth0")), None, vec![]));
+        assert_eq!(derive(&["dual:1"], false), (d(Some(src), Some(src6), None), None, vec![]));
         // One family's route failing leaves the other's.
         let v6_fails = |to: IpAddr| match to {
             IpAddr::V4(_) => Ok(("eth0".into(), src.into(), true)),
             IpAddr::V6(_) => Err("no route toward 2001:db8::9: Network is unreachable".into()),
         };
-        assert_eq!(super::derive(&peers(&["dual:1"]), lookup, |_| false, v6_fails).0, Ok(d(Some(src), None, Some("eth0"))));
+        assert_eq!(super::derive(&peers(&["dual:1"]), lookup, |_| false, v6_fails).0, d(Some(src), None, Some("eth0")));
         // A route's IPv6 source must be a usable underlay: a link-local one is not.
         let link_local = |_: IpAddr| Ok(("eth0".into(), "fe80::1".parse().unwrap(), true));
-        let e = super::derive(&peers(&["far6:1"]), lookup, |_| false, link_local).0.unwrap_err();
-        assert!(e.contains("source fe80::1, link-local"), "{e}");
+        let (found, e, _) = super::derive(&peers(&["far6:1"]), lookup, |_| false, link_local);
+        assert!(e.as_ref().unwrap().contains("source fe80::1, link-local"), "{e:?}");
+        // Still known to be IPv6-only peers, as when their route fails.
+        let v6_only = Derived { v6_only: true, ..Derived::default() };
+        assert_eq!(found, v6_only);
+        let failed6 = |_: IpAddr| Err("no route toward 2001:db8::9: Network is unreachable".into());
+        assert_eq!(super::derive(&peers(&["far6:1"]), lookup, |_| false, failed6).0, v6_only);
     }
 
     /// A tap is this host's by its alias alone, whatever its name: hosts
