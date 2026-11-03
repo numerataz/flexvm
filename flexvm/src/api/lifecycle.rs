@@ -20,8 +20,9 @@ async fn found(api: &Arc<Api>, key: &str) -> Result<(String, Value), Error> {
 /// `POST /containers/create?name=NAME`: the record of a `run` to come (`create::translate`), under NAME or
 /// a name made up as `run` makes one up.
 pub async fn create(api: &Arc<Api>, q: Query, body: Value) -> Reply {
-    if let Some(p) = q.get("platform").filter(|p| !p.is_empty() && !matches!(*p, "linux" | "linux/amd64")) {
-        return Err(Error::bad(format!("platform {p:?}: flexvm runs linux/amd64")));
+    let arch = crate::image::HOST_ARCH;
+    if let Some(p) = q.get("platform").filter(|p| !p.is_empty() && !crate::image::runs_on(arch, p)) {
+        return Err(Error::bad(format!("platform {p:?}: flexvm runs linux/{arch}")));
     }
     let given = q.get("name").filter(|n| !n.is_empty()).map(|n| n.strip_prefix('/').unwrap_or(n).to_string());
     if let Some(n) = &given {

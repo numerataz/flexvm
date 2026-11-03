@@ -51,6 +51,8 @@ p.add_argument("--image", default="public.ecr.aws/docker/library/busybox:1.36",
 p.add_argument("scenarios", nargs="+")
 args = p.parse_args()
 BIN = os.path.abspath(args.bin)
+# The OCI architecture name of the host, which guests and the images they run share.
+ARCH = {"x86_64": "amd64", "aarch64": "arm64"}.get(os.uname().machine, os.uname().machine)
 
 
 def free_port():
@@ -10936,7 +10938,7 @@ def warm_ready():
         ld = blob(layer.getvalue())
         identity = 'test "$(id -u)" = 1000 && test "$(id -g)" = 2000 && test "$(id -G)" = 2000'
         cmd = ["/bin/sh", "-c", identity + " && echo app-ready > /tmp/app-ready && exec sleep 10000"]
-        conf = blob(json.dumps({"architecture": "amd64", "os": "linux", "config": {
+        conf = blob(json.dumps({"architecture": ARCH, "os": "linux", "config": {
             "User": "app:group", "Env": ["PATH=/bin:/usr/bin"], "Cmd": cmd},
             "rootfs": {"type": "layers", "diff_ids": [ld["digest"]]}}).encode())
         manifest = blob(json.dumps({"schemaVersion": 2, "config": conf, "layers": [ld]}).encode())

@@ -40,13 +40,16 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   tokens, or credentials saved by `flexvm login` in root-owned, mode 0600
   `STATE/auth.json`, falling back to `$DOCKER_CONFIG`, `~/.docker/config.json`
   or, under sudo, the invoking user's. Credential helpers and `identitytoken`
-  are not supported. Indexes resolve to linux/amd64. Blobs
+  are not supported. Indexes resolve to the host's arch (linux/amd64 on x86_64,
+  linux/arm64 on aarch64), and an image built for another arch is refused. Blobs
   are streamed to `STATE/images/blobs/sha256/` and checked against their
   digests; gzip, zstd and uncompressed layers are supported. Archives are read
   in place (layers are located inside the tarball, not extracted); indexing
   seeks past layer payloads. GNU sparse PAX layers are rejected. Image indexes
   prefer linux/amd64 with no variant, then v1, then v2; v3 and v4 (which
-  need AVX2 or AVX-512) are never selected. Registry
+  need AVX2 or AVX-512) are never selected. On arm64 they prefer no variant,
+  then v8 (the same ARMv8-A baseline); v9 and the v8.x and v9.x revisions
+  (which may need SVE2 or other extensions) are never selected. Registry
   credentials go only over HTTPS, to the registry's own host (port included)
   or to a token service on a fixed list: auth.docker.io for Docker Hub
   (registry-1.docker.io) and gitlab.com for registry.gitlab.com. The list is

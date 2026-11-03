@@ -24,6 +24,8 @@ args = p.parse_args()
 squashfs = args.squashfs or os.path.join(args.state, "artifacts", "base.squashfs")
 out = os.path.abspath(args.out)
 EPOCH = 1700000000
+# The guest runs the host's arch, so the image is built for it (an OCI architecture name).
+ARCH = {"x86_64": "amd64", "aarch64": "arm64"}.get(os.uname().machine, os.uname().machine)
 
 
 def sha256_file(path):
@@ -79,7 +81,7 @@ try:
         return {"digest": "sha256:" + digest, "size": os.path.getsize(dest)}
 
     layer_desc = {"mediaType": "application/vnd.oci.image.layer.v1.tar", **blob(path=layer)}
-    config = {"architecture": "amd64", "os": "linux",
+    config = {"architecture": ARCH, "os": "linux",
               "config": {"Env": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"]},
               "rootfs": {"type": "layers", "diff_ids": [layer_desc["digest"]]}}
     config_desc = {"mediaType": "application/vnd.oci.image.config.v1+json", **blob(json.dumps(config, sort_keys=True).encode())}

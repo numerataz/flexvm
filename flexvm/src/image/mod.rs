@@ -34,6 +34,21 @@ pub use unpack::Hashed;
 pub use unpack::Limits;
 use unpack::{check, open_at, Root};
 
+/// The host's OCI architecture name: guests run the host's arch, so images must be built for it.
+pub const HOST_ARCH: &str = match std::env::consts::ARCH.as_bytes() {
+    b"x86_64" => "amd64",
+    b"aarch64" => "arm64",
+    _ => std::env::consts::ARCH,
+};
+
+/// Whether an image for `platform` (`os[/arch[/variant]]`, as Docker clients name one) runs on an
+/// `arch` host: the platforms index resolution takes (`source::platform_rank`).
+pub fn runs_on(arch: &str, platform: &str) -> bool {
+    let mut parts = platform.split('/');
+    let (os, a, variant) = (parts.next(), parts.next(), parts.next());
+    parts.next().is_none() && (a.is_none() && os == Some("linux") || source::platform_rank(arch, os, a, variant).is_some())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageMeta {
     pub source: String,
@@ -160,9 +175,9 @@ pub fn prepare(cache: &Path, init: Option<&Path>, o: &Options) -> Result<(PathBu
     let _cache_lock = crate::host::lock_at(crate::host::host_locks()?, &key, libc::LOCK_SH)?;
     let img = source::resolve(cache, &o.image, &o.limits)?;
     let config: Value = serde_json::from_slice(&img.config)?;
-    let (os, arch) = (config["os"].as_str().unwrap_or("linux"), config["architecture"].as_str().unwrap_or("amd64"));
-    if os != "linux" || arch != "amd64" {
-        bail!("image is {os}/{arch}; only linux/amd64 is supported");
+    let (os, arch) = (config["os"].as_str().unwrap_or("linux"), config["architecture"].as_str().unwrap_or(HOST_ARCH));
+    if os != "linux" || arch != HOST_ARCH {
+        bail!("image is {os}/{arch}; only linux/{HOST_ARCH} runs on this host");
     }
     let app = app_config(&config, o)?;
     if o.warm && app.argv.is_empty() {
@@ -2093,7 +2108,7 @@ mod tests {
     }
 
     fn config(layer: &[u8]) -> String {
-        json!({"architecture": "amd64", "os": "linux", "config": {"Cmd": ["/x"]}, "rootfs": {"type": "layers", "diff_ids": [sha256_hex(layer)]}}).to_string()
+        json!({"architecture": HOST_ARCH, "os": "linux", "config": {"Cmd": ["/x"]}, "rootfs": {"type": "layers", "diff_ids": [sha256_hex(layer)]}}).to_string()
     }
 
     fn fetch(src: &Path, limits: &Limits) -> Result<source::Image> {
@@ -2167,10 +2182,13 @@ mod tests {
     }
 
     fn oci_layout(dir: &Path, layer: &[u8]) -> (String, String) {
+        oci_layout_with(dir, layer, &config(layer))
+    }
+
+    fn oci_layout_with(dir: &Path, layer: &[u8], config: &str) -> (String, String) {
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         gz.write_all(layer).unwrap();
         let blob = gz.finish().unwrap();
-        let config = config(layer);
         let put = |data: &[u8]| {
             let d = sha256_hex(data);
             let p = registry::blob_path(&dir.join("blobs"), &d).unwrap();
@@ -2183,6 +2201,36 @@ mod tests {
         let md = put(manifest.as_bytes());
         std::fs::write(dir.join("index.json"), json!({"manifests": [{"digest": md, "size": manifest.len()}]}).to_string()).unwrap();
         (cd, ld)
+    }
+
+    #[test]
+    fn only_the_hosts_arch_runs() {
+        // Docker's platform names, for both hosts whichever arch runs the test.
+        for p in ["linux", "linux/amd64", "linux/amd64/v1", "linux/amd64/v2"] {
+            assert!(runs_on("amd64", p), "{p}");
+        }
+        for p in ["linux/amd64/v3", "linux/arm64", "linux/arm64/v8", "windows/amd64", "linux/amd64/v1/x", "linux/"] {
+            assert!(!runs_on("amd64", p), "{p}");
+        }
+        for p in ["linux", "linux/arm64", "linux/arm64/v8"] {
+            assert!(runs_on("arm64", p), "{p}");
+        }
+        for p in ["linux/arm64/v9", "linux/arm64/v8.2", "linux/amd64", "linux/arm/v7"] {
+            assert!(!runs_on("arm64", p), "{p}");
+        }
+        // An image whose config names another arch is refused before anything is built.
+        let other = if HOST_ARCH == "amd64" { "arm64" } else { "amd64" };
+        let d = tmpdir("other-arch");
+        let src = d.join("src");
+        std::fs::create_dir(&src).unwrap();
+        let layer = layer(&[("a", 'f', "data")]);
+        let config = json!({"architecture": other, "os": "linux", "config": {"Cmd": ["/x"]}, "rootfs": {"type": "layers", "diff_ids": [sha256_hex(&layer)]}});
+        oci_layout_with(&src, &layer, &config.to_string());
+        let init = d.join("init");
+        std::fs::write(&init, b"init").unwrap();
+        let o = Options { image: src.display().to_string(), ..Options::default() };
+        let err = prepare(&d.join("cache"), Some(&init), &o).err().unwrap().to_string();
+        assert!(err.contains(&format!("image is linux/{other}; only linux/{HOST_ARCH} runs on this host")), "{err}");
     }
 
     #[test]
