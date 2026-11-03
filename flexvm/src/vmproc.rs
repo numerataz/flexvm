@@ -1666,7 +1666,7 @@ impl Proc {
             }
         }
         if ours && !self.host.reinstall(&l, ip, None).unwrap_or(false) {
-            crate::net::unroute(ip);
+            crate::net::unroute(self.host.config_now().vm_addr(ip));
         }
         drop(l);
         self.host.deliver_withdrawals();
@@ -1762,7 +1762,8 @@ impl Proc {
         if learn {
             prepared.pager.learn_load_set();
         }
-        let (vm, _) = prepared.load(&self.spawner, name, Snapshot::Path(&tpl.vmstate()), None, ip, false, None, || Ok(()), &mut t)?;
+        let (vm, _) =
+            prepared.load(&self.spawner, name, Snapshot::Path(&tpl.vmstate()), None, self.host.config_now().vm_addr(ip), false, None, || Ok(()), &mut t)?;
         if learn {
             crate::standby::save_load_set(&self.host, &tpl);
         }

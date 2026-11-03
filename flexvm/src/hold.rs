@@ -257,7 +257,9 @@ impl Holder {
                 }
                 held.insert(ip, Arc::new(Entry { mig, q: Mutex::default() }));
             }
-            let routed = crate::net::route_dev(true, ip, self.ifindex);
+            // The /32 alone: a VM's IPv6 address (`vm_ipv6_prefix`) is not held yet (#1299); its /128
+            // stays on the VM's tap meanwhile.
+            let routed = crate::net::route_dev(true, ip.into(), self.ifindex);
             let pending = match &routed {
                 Ok(()) => self.gone.lock().unwrap().remove(&ip),
                 // Not held after all: its stragglers are still counted.
@@ -549,7 +551,7 @@ impl Holder {
         let _routes = self.routes.lock().unwrap();
         if self.entry(ip).is_some_and(|x| Arc::ptr_eq(&x, e)) {
             self.unhold(ip, e, false);
-            let _ = crate::net::route_dev(false, ip, self.ifindex);
+            let _ = crate::net::route_dev(false, ip.into(), self.ifindex);
         }
     }
 
@@ -1969,7 +1971,7 @@ mod tests {
             ok("TUNSETOFFLOAD", libc::ioctl(fd.as_raw_fd(), 0x4004_54d0, 0x3 as libc::c_ulong /* CSUM, TSO4 */));
         }
         crate::net::set_link_up(&tap, true).unwrap();
-        crate::net::attach(ip, &tap).unwrap();
+        crate::net::attach(ip.into(), &tap).unwrap();
         let mut buf = vec![0u8; 70000];
         let mut next = |what: &dyn Fn(&[u8]) -> bool| loop {
             assert!(crate::util::readable(&fd, Duration::from_secs(5)).unwrap(), "no frame came");
@@ -2252,7 +2254,7 @@ mod tests {
         crate::test_util::wait_until("b to queue the straggler", || !b.entry(ip).unwrap().q.lock().unwrap().packets.is_empty());
         let (stats, _) = b.release_local(ip, 2, &mut sink, || Ok(()), Duration::ZERO).unwrap();
         b.forget(ip, 2);
-        let _ = crate::net::route_dev(false, ip, b.ifindex);
+        let _ = crate::net::route_dev(false, ip.into(), b.ifindex);
         assert_eq!((stats.packets, stats.dropped), (1, 0));
         assert!(got[0].ends_with(b"late") && got[0][8] == 63, "{got:?}");
         // A fragment with IP ID 0 would get a new ID if re-sent (no longer reassembling with its

@@ -77,7 +77,8 @@ pub fn after_boot(host: &Host, rest: bool) -> Result<bool> {
     }
     let rest_marker = host.run.join(".boot-rest");
     if !std::fs::read_to_string(&rest_marker).is_ok_and(|b| b == boot_id()) {
-        let forwarding = crate::net::ip_forward();
+        let ipv6 = host.config_now().vm_ipv6_prefix.is_some();
+        let forwarding = crate::net::ip_forward().and_then(|()| if ipv6 { crate::net::ipv6_forward() } else { Ok(()) });
         let proxy_arp = host.config_now().announce_dev().map_or(Ok(()), |dev| crate::net::proxy_arp(&dev));
         recover(host);
         // Before the pass is marked done (it runs again until it is): those it lost that their policies run again.

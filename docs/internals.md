@@ -14,7 +14,7 @@ migration protocol are in [process-per-vm.md](process-per-vm.md).
 | Start | Every VM is a **UFFD restore of a template snapshot** into a pre-spawned, pre-cgrouped Firecracker. The template's recorded working set is copied in bulk; everything else is faulted in lazily from a shared, sparse template image. **Standby VMs** are already restored and paused, so `run` is usually just a resume. |
 | Migration | **Post-copy**: the target gets everything ready first (template, address, a Firecracker with the template's VM structure already built); then pause, save vCPU and device state only (~20–200 KiB), load it and resume on the target, then the target's pager fetches pages from the paused source on fault and in the background. The source releases the VM once every page has arrived, and never resumes it once the target may own it. |
 | Pressure | If a VM needs to grow and the host would drop below its reserve (`reserve_mib`), or the host is already below it, that VM is migrated to a peer with room. |
-| Network | Each VM has its own IPv4 /32 routed to a per-VM tap. The address moves with the VM, so open TCP connections survive migration. The tap's ingress (a clsact classic BPF filter) passes only IPv4 from that /32 and ARP naming it, so a guest cannot spoof another's address; it follows the address on a readdress, restore or migration. See below. |
+| Network | Each VM has its own IPv4 /32 routed to a per-VM tap (with `vm_ipv6_prefix`, its IPv6 /128 too). The address moves with the VM, so open TCP connections survive migration. The tap's ingress (a clsact classic BPF filter) passes only IPv4 from that /32 and ARP naming it (and IPv6 from the /128, no router ICMPv6), so a guest cannot spoof another's address; it follows the address on a readdress, restore or migration. See below. |
 | Container images | `flexvm pull IMAGE` builds the root filesystem from an OCI/Docker image and snapshots a VM of it as the image's template; flexvm-init runs and supervises its entrypoint. See [images.md](images.md). |
 
 ## Memory
@@ -1255,6 +1255,20 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
 - Taps are created with each VM's Firecracker (ahead of time for standby VMs). The
   host route and a permanent neighbour entry are set with rtnetlink while the
   snapshot loads, so networking adds nothing to start time.
+- With `vm_ipv6_prefix`, the VM's IPv6 address (`net::VmAddr`) goes wherever the
+  IPv4 one does on the tap: the source filter, a permanent neighbour entry and a
+  /128 route beside the /32, all at the same points. IPv6 stays off on a tap
+  (`disable_ipv6`, as on the hold device) until a VM with an IPv6 address has
+  it, then comes on with `addr_gen_mode=1`, `accept_ra=0` and `fe80::1`
+  (`IFA_F_NODAD`) as the gateway, redone at each `neighbour` (the address goes
+  when the tap goes down). IPv6 was off because the host's MLD reports, sent as a
+  tap comes up before any Firecracker reads it, count as a frame lost on the way
+  to the guest (`tx_dropped`): a clsact egress filter drops the host's IPv6
+  multicast to the tap instead. The hold device holds the /32 alone (#1299), and
+  routes to peers (`route_via`, `unroute`) take the `VmAddr` but route the IPv4
+  address only until peers have IPv6 underlays (#1295); an IPv6 delete would
+  have to name its next hop, as IPv6 route deletes ignore the scope that keeps
+  `unroute` off tap routes.
 - TCP port forwards (`ports.rs`) track blocked readers with `TCP_INFO` acknowledgements:
   a reader can drain its kernel queue before the proxy's socket becomes writable.
   Each direction takes a baseline when it first holds unwritten data, then samples
