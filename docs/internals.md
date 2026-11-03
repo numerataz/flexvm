@@ -653,7 +653,8 @@ check it for zeroes (plus a template compare where the template has data). Up to
 threads take 1 MiB units of PRESENT pages in turn. A thread copies its unit
 out of Firecracker with `process_vm_readv`, compares each page with the
 template (only where the template has data) and computes its CRC32C and
-whether it is all zero in the same read (SSE4.2, three interleaved streams).
+whether it is all zero in the same read (SSE4.2 or the Arm CRC extension, three
+interleaved streams).
 It then reserves the unit's place at the end of `pages` and writes its DATA
 pages there with `pwritev` and `O_DIRECT`, straight from its buffer, so the
 page cache is never involved. Units land in the order they finish, which the
