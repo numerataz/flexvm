@@ -11695,7 +11695,6 @@ def template_tap():
         subprocess.run(["rm", "-rf", os.path.join(tdir, f".{name}.new-{p.pid}"), other])
 
 
-@needs_kvm
 def pidns_names():
     """#1084: what a host names after a process in what hosts of other PID namespaces may share
     names that namespace too: a VM process's own cgroup (`vm-PID-START-NS`) and a write's
