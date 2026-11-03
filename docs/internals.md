@@ -1421,7 +1421,12 @@ binds the vsock socket and maps the pmem file into KVM. The next
 configuration and memory layout; hot-plugged slots are replugged to match)
 then only restores vCPU, VM and device state. Under nested virtualization
 those prepared steps are most of a load (creating a KVM memory slot alone
-takes 3–10 ms on a busy host).
+takes 3–10 ms on a busy host). On aarch64 a prepare also creates and
+initializes the vGIC, right after the vCPUs as in a stock load (KVM refuses
+`KVM_CREATE_VCPU` once it is initialized), for the prepared snapshot's vCPU
+count, which the load must match. The load then does what a stock one does
+in the same order: each vCPU's `KVM_ARM_VCPU_INIT` with its saved target and
+features, its registers, and only then the GIC state.
 
 The same patch makes a load refuse a snapshot whose devices are not exactly
 the template's (#548): the vmstate comes from a peer or a checkpoint
@@ -1466,7 +1471,13 @@ down for a while. The vCPUs' TSCs then ended up apart by that long. The
 guest's clocksource is the TSC, so its clock jumped by that much after the
 step to host time (#136, `guest_calls`: +3.3 s after a 3 s page server
 outage). Without the attribute, loading a snapshot of more than one vCPU
-fails, rather than run a guest whose clock may jump.
+fails, rather than run a guest whose clock may jump. The patch is x86_64 only;
+aarch64 needs no analog. There each vCPU's restore writes its virtual counter
+(`KVM_REG_ARM_TIMER_CNT`), but KVM keeps one counter offset for the whole VM
+(since 6.4 a VM-wide offset, before that the write updated every vCPU's), so
+the last write sets it for all and restored vCPUs cannot drift apart however
+long restoring each one takes. Timer deadlines (`CNTV_CVAL`) are absolute
+counter values and need no fixing up either.
 
 `firecracker/0005-reraise-pending-interrupts.patch`: every resume raises
 again the interrupt of each virtio device whose interrupt status is still
@@ -1490,7 +1501,12 @@ set. If the guest already had the interrupt, the re-raise costs it at most
 one spurious interrupt per device and resume: the handler reads and
 acknowledges the status, finds nothing new and returns. The patch has a
 unit test of the re-raise; there is no deterministic end-to-end case, as
-losing the interrupt on purpose would need a debug hook in Firecracker.
+losing the interrupt on purpose would need a debug hook in Firecracker. The
+race is x86_64's: on aarch64 the irqfd is a GIC SPI, which KVM injects within
+the eventfd write (`kvm_arch_set_irq_inatomic`, once the vGIC is initialized,
+as Firecracker does when it creates it), so the GIC state a snapshot saves
+afterwards already has it pending. The re-raise runs there too and costs the
+same at most one spurious interrupt.
 
 `firecracker/0006-sparse-full-snapshot.patch`: a full snapshot of anonymous
 guest memory with no userfaultfd (the template's boot, the only full snapshot
@@ -1504,7 +1520,11 @@ snapshot plus 2.5-3 s of punching; with the patch 0.2-1.1 s plus ~30 ms, for
 the same bytes: #764). `mincore(2)` would not do: it reports a swapped-out page
 as absent. Memory mapped from a file (a restore without UFFD), served by a
 userfaultfd handler, or a memfd can hold data where this process maps nothing,
-so those, and a Firecracker without `/proc`, still write every page.
+so those, and a Firecracker without `/proc`, still write every page. The
+snapshot runs on the VMM thread under its seccomp filter, which on both
+x86_64 and aarch64 already allows what the patch adds (`open`/`openat` of the
+pagemap, `fcntl(F_SETFD, FD_CLOEXEC)`, `lseek`, `read`), so it needs no
+filter change.
 
 `firecracker/0007-unmap-premapped-guest-memory.patch`: Firecracker maps a
 restore's guest memory and only then registers it with the userfaultfd it
@@ -1523,7 +1543,9 @@ REMOVE event reaches the pager, the range being unregistered) and registers it
 again, up to 16 times (a unit test reads through `/proc/self/mem` before registering). The pager checks for the same thing after every load
 (`Pager::foreign_pages`: pages mapped while it has them BASE or REMOTE, and
 installs that hit EEXIST), so a Firecracker without the patch fails the load
-with a clear error instead of starting a guest with zeroed memory.
+with a clear error instead of starting a guest with zeroed memory. A load runs
+before Firecracker installs the VMM thread's seccomp filter, and that filter
+allows `mincore` and `madvise` on both architectures anyway.
 
 ### Kernel patches (optional, host kernel)
 

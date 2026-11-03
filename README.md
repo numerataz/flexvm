@@ -65,7 +65,7 @@ pinning no release, as after a change to the patches (which bumps
 `ARTIFACTS_TAG`, see [Releasing the artifacts](#releasing-the-artifacts)):
 
 ```sh
-./scripts/build-firecracker.sh   # patched firecracker (needs musl-tools, libseccomp-dev)
+./scripts/build-firecracker.sh   # patched firecracker for this host (x86_64 or aarch64; needs musl-tools, libseccomp-dev)
 ./scripts/fetch.sh               # guest kernel, the pinned release's firecracker (else a recorded build, else the stock one), and the tests' base rootfs
 ```
 
@@ -73,7 +73,7 @@ pinning no release, as after a change to the patches (which bumps
 same pins apply). How a release is cut: [Releasing the
 artifacts](#releasing-the-artifacts).
 
-The host needs Linux 5.16+: Firecracker patch `0004` uses `KVM_VCPU_TSC_OFFSET`.
+An x86_64 host needs Linux 5.16+: Firecracker patch `0004` uses `KVM_VCPU_TSC_OFFSET`.
 
 The host kernel needs 4 KiB pages. On another page size (an arm64 kernel built
 for 16 or 64 KiB pages, such as Ubuntu's `-64k` flavours) every command that

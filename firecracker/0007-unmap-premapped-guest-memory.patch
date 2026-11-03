@@ -10,7 +10,7 @@ index 9e3e81e..05b46b7 100644
  use crate::builder::{self, BuildMicrovmFromSnapshotError};
  use crate::cpu_config::templates::StaticCpuTemplate;
  #[cfg(target_arch = "x86_64")]
-@@ -859,6 +860,52 @@ pub enum GuestMemoryFromUffdError {
+@@ -870,6 +871,52 @@ pub enum GuestMemoryFromUffdError {
      Connect(#[from] std::io::Error),
      /// Failed to sends file descriptor: {0}
      Send(#[from] vmm_sys_util::errno::Error),
@@ -63,7 +63,7 @@ index 9e3e81e..05b46b7 100644
  }
  
  fn guest_memory_from_uffd(
-@@ -888,6 +935,8 @@ fn guest_memory_from_uffd(
+@@ -899,6 +946,8 @@ fn guest_memory_from_uffd(
      for mem_region in guest_memory.iter() {
          uffd.register(mem_region.as_ptr().cast(), mem_region.size() as _)
              .map_err(GuestMemoryFromUffdError::Register)?;
@@ -72,7 +72,7 @@ index 9e3e81e..05b46b7 100644
      }
  
      send_uffd_handshake(mem_uds_path, &backend_mappings, &uffd)?;
-@@ -979,6 +1028,57 @@ mod tests {
+@@ -990,6 +1039,57 @@ mod tests {
  
      use super::*;
      use crate::Vmm;

@@ -129,6 +129,27 @@ jobs:
           fi
           grep -E 'HAVE_ARCH_USERFAULTFD_WP|USERFAULTFD' "/boot/config-$(uname -r)" || true
 
+  # The patched Firecracker for aarch64-unknown-linux-musl: every patch applies and builds there. The e2e
+  # job builds the x86_64 one (while ARTIFACTS_TAG is unpinned) and runs it; nothing runs this one yet.
+  firecracker-aarch64:
+    name: Firecracker build (aarch64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # rustup, which installs the toolchain Firecracker's rust-toolchain.toml pins.
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Build Firecracker
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends musl-tools libseccomp-dev
+          ./scripts/build-firecracker.sh --state "$RUNNER_TEMP/state"
+          file "$RUNNER_TEMP/state/artifacts/firecracker" | grep -q 'ARM aarch64'
+
   e2e:
     # Shards (scripts/e2e.py --shard): pr (the cases, and the main and recovery scenarios) in four
     # splits side by side, balanced by e2e.py's COST; the scheduled run takes heavy (GiB-scale

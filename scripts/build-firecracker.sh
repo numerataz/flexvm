@@ -20,6 +20,12 @@ source "$root/scripts/versions.sh"
 src=${FC_SRC:-$root/build/firecracker-src}
 stamp=$src/.flexvm-patched
 patches=$(cd "$root/firecracker" && sha256sum -- *.patch)
+# Built for the host's architecture: the kernel headers below are the host's, so there is no cross build.
+case $(uname -m) in
+  x86_64) triple=x86_64-unknown-linux-musl ;;
+  aarch64) triple=aarch64-unknown-linux-musl ;;
+  *) echo "Firecracker builds only on x86_64 and aarch64 hosts, not $(uname -m)" >&2; exit 1 ;;
+esac
 # The checkout is redone when the version, the commit, a patch or this script changes.
 patched=$(printf '%s %s\n%s\n%s\n' "$FC_VERSION" "$FC_COMMIT" "$patches" "$(sha256sum < "$root/scripts/build-firecracker.sh")")
 
@@ -56,23 +62,23 @@ ln -sfn /usr/include/linux "$kh/linux"
 ln -sfn /usr/include/asm-generic "$kh/asm-generic"
 asm=
 multiarch=$(${CC:-cc} -print-multiarch 2>/dev/null || true)
-for path in "/usr/include/$multiarch/asm" /usr/include/asm /usr/include/x86_64-linux-gnu/asm; do
+for path in "/usr/include/$multiarch/asm" /usr/include/asm "/usr/include/$(uname -m)-linux-gnu/asm"; do
   if [ -d "$path" ]; then asm=$path; break; fi
 done
 if [ -z "$asm" ]; then echo 'Cannot find the system asm headers; install the kernel headers.' >&2; exit 1; fi
 ln -sfn "$asm" "$kh/asm"
-export CFLAGS_x86_64_unknown_linux_musl="-idirafter $kh"
+export "CFLAGS_${triple//-/_}=-idirafter $kh"
 
 cd "$src"
 # Where cargo puts the build: the environment overrides Firecracker's own
 # .cargo/config.toml, so the binary is taken from the directory passed, never
 # a stale one left in build/cargo_target.
 target=${CARGO_TARGET_DIR:-${CARGO_BUILD_TARGET_DIR:-build/cargo_target}}
-cargo build --locked --release --target x86_64-unknown-linux-musl --target-dir "$target" -p firecracker
+cargo build --locked --release --target "$triple" --target-dir "$target" -p firecracker
 # Installed to temporary files beside their final paths, then renamed into place: a concurrent start never runs a
 # half-copied binary, and an interrupted install never leaves a short one there. firecracker.sha256 records the build:
 # A build without a release pin accepts the recorded binary.
-built=$target/x86_64-unknown-linux-musl/release/firecracker
+built=$target/$triple/release/firecracker
 out=$state/artifacts
 sudo mkdir -p "$out"
 # fetch.sh holds this same lock while checking and installing Firecracker.
@@ -94,4 +100,4 @@ sudo mv -T "$placing" "$out/firecracker"
 sudo mv -T "$recording" "$out/firecracker.sha256"
 trap - EXIT INT TERM
 exec {lock}<&-
-"$target"/x86_64-unknown-linux-musl/release/firecracker --version
+"$built" --version
