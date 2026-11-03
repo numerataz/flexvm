@@ -1268,12 +1268,15 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   the /32 (its IPv6 on there from the first such hold, with no address), so
   nothing reaches a paused VM's tap; IPv6 packets there are counted as dropped
   for the address in their destination's low 32 bits, not held yet (#1299).
-  The hold's /128 goes when its /32 is switched away (`route_via` moves no
-  /128). A route add puts the /128 in first, so a failure leaves the /32 where
-  it was. Routes to peers (`route_via`, `unroute`) take the `VmAddr` but route the IPv4
-  address only until peers have IPv6 underlays (#1295); an IPv6 delete would
-  have to name its next hop, as IPv6 route deletes ignore the scope that keeps
-  `unroute` off tap routes.
+  The hold's own /128 goes when its /32 is switched away (by this device: one
+  the switch routed via the target stays). A route add puts the /128 in first,
+  so a failure leaves the /32 where it was. A VM a peer runs has its /128
+  routed via that peer's IPv6 underlay (`host::route_hop`, the record's
+  `via6`, rechecked against the peers when put back) beside its /32; a peer
+  with none leaves it to the host's own IPv6 routes. Such a /128 has a
+  protocol of its own (`RTPROT_BOOT`): IPv6 route deletes ignore the scope
+  that keeps `unroute` off tap routes, so it names the protocol instead, and
+  never takes a tap's or the hold device's (`RTPROT_STATIC`).
 - TCP port forwards (`ports.rs`) track blocked readers with `TCP_INFO` acknowledgements:
   a reader can drain its kernel queue before the proxy's socket becomes writable.
   Each direction takes a baseline when it first holds unwritten data, then samples

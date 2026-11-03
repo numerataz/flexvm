@@ -2082,7 +2082,7 @@ mod tests {
             [Ipv4Addr::LOCALHOST.into(), Ipv4Addr::new(127, 42, 3, 4).into(), Ipv4Addr::new(127, 255, 255, 255).into(), Ipv6Addr::LOCALHOST.into()];
         for via in loopback {
             // Works without CAP_NET_ADMIN: no route request is sent.
-            route_via(Ipv4Addr::new(192, 0, 2, 123).into(), via).unwrap();
+            route_via(Ipv4Addr::new(192, 0, 2, 123), via).unwrap();
         }
     }
 

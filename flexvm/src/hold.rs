@@ -303,8 +303,8 @@ impl Holder {
         on.is_ok()
     }
 
-    /// `unhold` once `e`'s /32 was routed elsewhere, and its /128 here with it (`route_via` moves no
-    /// /128 yet, #1295): by this device, so never the one a VM here has taken meanwhile. Under
+    /// `unhold` once `e`'s /32 was routed elsewhere, and its /128 here with it (the switch replaces it
+    /// only via a target with an IPv6 underlay, `host::route_hop`): by this device, so never one via a peer or one a VM here took meanwhile. Under
     /// `routes`, and only while `e` is still the hold, so a newer hold of `ip` keeps its /128.
     fn unhold_switched(&self, ip: Ipv4Addr, e: &Arc<Entry>) {
         let _routes = self.routes.lock().unwrap();

@@ -566,7 +566,7 @@ impl Config {
         }
         if let Some(p) = self.vm_ipv6_prefix {
             w.push(format!(
-                "flexvm: warning: vm_ipv6_prefix {p} is set: VMs' IPv6 addresses are configured in guests and routed to their taps, but reached only through the host a VM runs on: not routed between hosts (#1295), held in migrations (#1299) or answered for on the LAN (#1300)"
+                "flexvm: warning: vm_ipv6_prefix {p} is set: VMs' IPv6 addresses are configured in guests and routed (to peers via their IPv6 underlays), but not held in migrations (#1299) or answered for on the LAN (#1300)"
             ));
         }
         let v6_dns = self.dns.as_ref().map_or(&[][..], Dns::listed).iter().find(|d| d.parse::<std::net::Ipv6Addr>().is_ok());
@@ -2462,18 +2462,19 @@ impl Host {
         Ok(true)
     }
 
-    /// `via` with its IPv6 underlay (the /128's next hop, `route_hop`) only while that is still a
-    /// peer's next hop by the current configuration, as a route message's is taken: else the /32's
-    /// next hop alone. Its main next hop is `route_check`'s.
+    /// `via` with its IPv6 underlay (the /128's next hop, `route_hop`) only while that is still one
+    /// by the current configuration: unicast, and no VM's address (`vm_ipv6_prefix`); else the
+    /// /32's next hop alone. Which peer it is, is the /32's next hop's, which `route_check` rechecks:
+    /// a peer's derived IPv6 underlay, which its route message carried, is in no configuration here.
     fn recheck_via6(&self, ip: Ipv4Addr, via: Hop) -> Hop {
         let Some(v6) = via.via6().filter(|&v6| via.via() != IpAddr::V6(v6)) else { return via };
-        match crate::listen::known_peers(self).and_then(|peers| crate::listen::check_via(v6.into(), &peers)) {
-            Ok(()) => via,
-            Err(e) => {
-                crate::info!("route {ip}: IPv6 next hop left out: {e}");
-                via.v4_only().unwrap_or(via)
-            }
-        }
+        let why = match self.config_now().vm_ipv6_prefix.and_then(|p| p.ipv4_of(v6)) {
+            _ if v6.is_unspecified() || v6.is_multicast() => "not unicast".to_string(),
+            Some(vm) => format!("the address of VM {vm} (vm_ipv6_prefix)"),
+            None => return via,
+        };
+        crate::info!("route {ip}: IPv6 next hop {v6} left out: {why}");
+        via.v4_only().unwrap_or(via)
     }
 
     /// Recheck saved routes against current configuration, without DNS or a wait under the lock.
@@ -7899,7 +7900,10 @@ pub(crate) mod tests {
             w.contains("vm_ipv6_prefix fd00:1::/96 covers fd00:1::a09:7, this host's address: the prefix is VMs' alone, and no vm is given 10.9.0.7"),
             "{w}"
         );
-        assert!(w.contains("VMs' IPv6 addresses are configured in guests and routed to their taps, but reached only through the host a VM runs on"), "{w}");
+        assert!(
+            w.contains("VMs' IPv6 addresses are configured in guests and routed (to peers via their IPv6 underlays), but not held in migrations (#1299)"),
+            "{w}"
+        );
         let w = cfg.warnings_by(|_| Ok(false), Ok(vec![(v6("fd00:2::a09:7"), "address")])).join("\n");
         assert!(!w.contains("covers"), "{w}");
     }
@@ -9313,6 +9317,24 @@ pub(crate) mod tests {
 
     fn owned(taps: Vec<(String, u32, Ident, Option<u64>)>) -> Vec<(String, u32, Ident)> {
         taps.into_iter().map(|(n, i, o, _)| (n, i, o)).collect()
+    }
+
+    /// #1297: a saved route's IPv6 next hop (its /128's) is put back while it is still one, else
+    /// the /32's next hop alone.
+    #[test]
+    fn a_saved_ipv6_next_hop_is_rechecked() {
+        let (_h_dir, mut h) = host("recheck-via6");
+        let (vm, v4) = (ip("10.9.5.1"), ip("192.0.2.7"));
+        let hop = |v6: &str| Hop::new(v4.into(), Some(v6.parse().unwrap())).unwrap();
+        assert_eq!(h.recheck_via6(vm, hop("2001:db8::7")), hop("2001:db8::7"));
+        for bad in ["ff02::1", "::"] {
+            assert_eq!(h.recheck_via6(vm, hop(bad)), Hop::from(v4), "{bad}");
+        }
+        h.cfg.vm_ipv6_prefix = Some(crate::net::Ipv6Prefix::parse("2001:db8::/96").unwrap());
+        std::fs::write(h.state.join("host.json"), serde_json::to_vec(&h.cfg).unwrap()).unwrap();
+        assert_eq!(h.recheck_via6(vm, hop("2001:db8::a09:502")), Hop::from(v4), "a VM's address");
+        let only6 = Hop::new("2001:db8:1::7".parse().unwrap(), None).unwrap();
+        assert_eq!(h.recheck_via6(vm, only6), only6, "an IPv6 /32 next hop is route_check's");
     }
 
     /// #553, #555: until a boot's recovery is marked complete, routes to peers' VMs come back from

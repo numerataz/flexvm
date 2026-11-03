@@ -652,13 +652,14 @@ the warnings.
 ### IPv6 addresses
 
 **Not usable yet.** With `vm_ipv6_prefix` set, flexvm derives and reports
-each VM's IPv6 address, configures it in the guest and routes it to the
-VM's tap, so the VM and its host reach each other over IPv6. Beyond its
-host, a VM's IPv6 address is not yet routed between hosts (#1295), held
-during a migration (#1299) or answered for on the LAN (#1300), so other
-machines need a route to the prefix via the host it runs on, and lose it
-when it migrates. `info` and the listener warn about this for as long as it
-is true. Without the prefix, nothing changes: taps keep IPv6 off.
+each VM's IPv6 address, configures it in the guest, routes it to the VM's
+tap, and routes it on each peer via the host it runs on, as its IPv4 address
+is (via that host's IPv6 underlay: a peer with none leaves it to the host's
+own IPv6 routes). It is not yet held during a migration (#1299): IPv6 packets
+that arrive during the downtime are dropped. Nor is it answered for on the
+LAN (#1300): machines that are not peers need a route to the prefix via a
+host. `info` and the listener warn about this for as long as it is true.
+Without the prefix, nothing changes: taps keep IPv6 off.
 
 On the host, each VM's IPv6 address is a `/128` routed to its tap beside its
 `/32`, with a permanent neighbour entry for the guest's MAC. The tap gets
