@@ -331,6 +331,25 @@ pub(crate) mod tests {
         Arm64::of_probe(regs, &ids, 25_000_000, None, 3, true, "Firecracker v1.17.0 (content a)".into()).unwrap()
     }
 
+    /// Needs /dev/kvm: `cargo test -p flexvm probes_this_host -- --ignored --nocapture`.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore]
+    fn probes_this_host() {
+        let kvm = std::fs::File::open("/dev/kvm").unwrap();
+        let probed = kvm::probe(&kvm, "f".into()).unwrap();
+        println!("{}", serde_json::to_string_pretty(&super::super::Compat::Aarch64(probed.clone())).unwrap());
+        assert!(probed.id_regs.contains_key("MIDR_EL1") && probed.id_regs.contains_key("ID_AA64PFR0_EL1"), "{:?}", probed.id_regs);
+        assert!(probed.regs.contains(&X0) && probed.regs.contains(&ID_AA64PFR0_EL1));
+        assert!(probed.cntfrq_hz > 0 && (probed.gic == 2 || probed.gic == 3));
+        // A second probe finds the same, and the record survives a round trip and checks against itself.
+        assert_eq!(kvm::probe(&kvm, "f".into()).unwrap(), probed);
+        let compat = super::super::Compat::Aarch64(probed);
+        let back: super::super::Compat = serde_json::from_slice(&serde_json::to_vec(&compat).unwrap()).unwrap();
+        assert_eq!(back, compat);
+        compat.check(&back).unwrap();
+    }
+
     #[test]
     fn sys_reg_encodings_match_the_uapi() {
         // ARM64_SYS_REG() values from asm/kvm.h.
