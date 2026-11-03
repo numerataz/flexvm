@@ -1412,7 +1412,7 @@ impl Proc {
         self.set_leaving(true);
         self.kill_vm();
         self.release_hold();
-        self.drop_proxy_ndp(&end);
+        self.drop_proxy_ndp();
         drop(self.standby.lock().unwrap().take());
         // Once its VM is gone, however it leaves (#948).
         self.refund_standby();
@@ -1720,15 +1720,18 @@ impl Proc {
     }
 
     /// The VM's proxy entry goes once it is gone from here (`finish`), however it went: killed, died,
-    /// suspended, owed or never started. Not once moved: its route to its target took it then
-    /// (`host::route_hop`), unless the target shares this network namespace, whose entry it now is.
-    /// Nor while another tap here is routed to its address (`net::proxy_release`): a target sharing
-    /// the namespace that runs it, whatever this process knows of the outcome (`End::Owed`).
-    fn drop_proxy_ndp(&self, end: &End) {
-        let Some(vm) = self.vm.get().filter(|_| !matches!(end, End::Moved(_))) else { return };
+    /// suspended, owed, never started or moved (its route to its target took it already, unless that
+    /// switch failed or was not made). Not while another device here is routed to its address
+    /// (`net::proxy_release`): a target sharing the namespace that runs it, whatever this process
+    /// knows of the outcome (`End::Owed`), whose entry the same one is. Its own tap and hold device,
+    /// which go as it exits, do not count.
+    fn drop_proxy_ndp(&self) {
+        let Some(vm) = self.vm.get() else { return };
         let Some(v6) = vm.addr().v6 else { return };
         let cfg = self.host.config_now();
-        let not: Vec<String> = std::iter::once(vm.tap.clone()).chain(cfg.announce_dev()).collect();
+        // Its hold device's name (`holder`), whether or not one was made.
+        let hold = format!("{}{:x}h", self.host.tap_prefix(), self.ident.pid);
+        let not: Vec<String> = [vm.tap.clone(), hold].into_iter().chain(cfg.announce_dev()).collect();
         let not: Vec<&str> = not.iter().map(String::as_str).collect();
         if let Err(e) = crate::net::proxy_release(v6, cfg.vm_ipv6_prefix, &not) {
             crate::log!("vm {}: {e}", self.name());

@@ -1261,7 +1261,8 @@ pub fn proxy_add(dev: &str, ip: Ipv6Addr, served: impl FnOnce() -> bool) -> Resu
     if !served() {
         return Ok(());
     }
-    proxy_ndp(dev)?;
+    // Warned of by itself; the entry still goes in (a read-only /proc/sys with proxy_ndp set by its admin).
+    let _ = proxy_ndp(dev);
     netlink(RTM_NEWNEIGH, NLM_F_CREATE | NLM_F_REPLACE, &proxy_msg(ip, ifindex(dev)?)).map_err(|e| format!("the proxy entry of {ip} on {dev}: {e}").into())
 }
 
@@ -1407,19 +1408,22 @@ fn dump_part(buf: &[u8], each: &mut impl FnMut(&[u8])) -> Result<bool> {
 }
 
 /// The addresses in `prefix` with a device route in `table` (`/proc/net/ipv6_route`): a /128 that
-/// is up, with no next hop, not a reject route (an unreachable one is loopback's), on a device
+/// is up, with no next hop, not a reject, local or cached route (an unreachable one is loopback's), on a device
 /// other than loopback or those in `not` (the announce device's routes are the LAN's).
 fn dev_routes6(table: &str, prefix: Ipv6Prefix, not: &[&str]) -> std::collections::BTreeSet<Ipv6Addr> {
     const RTF_UP: u32 = 0x1;
     const RTF_GATEWAY: u32 = 0x2;
     const RTF_REJECT: u32 = 0x200;
+    // The local table's (an address of this host's) and the kernel's cached clones: no VM's route.
+    const RTF_CACHE: u32 = 0x0100_0000;
+    const RTF_LOCAL: u32 = 0x8000_0000;
     let route = |l: &str| {
         // Destination, its length, source, its length, next hop, metric, references, use, flags, device.
         let f: Vec<&str> = l.split_whitespace().collect();
         let (dst, hop, flags) =
             (u128::from_str_radix(f.first()?, 16).ok()?, u128::from_str_radix(f.get(4)?, 16).ok()?, u32::from_str_radix(f.get(8)?, 16).ok()?);
         let (ip, dev) = (Ipv6Addr::from(dst), *f.get(9)?);
-        let on_dev = *f.get(1)? == "80" && hop == 0 && flags & RTF_UP != 0 && flags & (RTF_GATEWAY | RTF_REJECT) == 0;
+        let on_dev = *f.get(1)? == "80" && hop == 0 && flags & RTF_UP != 0 && flags & (RTF_GATEWAY | RTF_REJECT | RTF_CACHE | RTF_LOCAL) == 0;
         (on_dev && prefix.ipv4_of(ip).is_some() && dev != "lo" && !not.contains(&dev)).then_some(ip)
     };
     table.lines().filter_map(route).collect()
@@ -2378,6 +2382,8 @@ mod tests {
             line("fd000007000000000000000000000a0d", "80", none, "00000000", "fx0t2"),
             line("fd000007000000000000000000000a0e", "80", none, "00000001", "lo"),
             line("fd000007000000000000000000000a0f", "80", none, "00000001", "eth0"),
+            line("fd000007000000000000000000000a10", "80", none, "80200001", "fx0t5"),
+            line("fd000007000000000000000000000a11", "80", none, "01000001", "fx0t6"),
             // Not a /128, or not a VM's address.
             line("fd000007000000000000000000000000", "60", none, "00000001", "fx0t3"),
             line("fd000008000000000000000000000a09", "80", none, "00000001", "fx0t4"),

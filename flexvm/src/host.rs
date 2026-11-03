@@ -245,7 +245,9 @@ pub fn route_hop(ip: crate::net::VmAddr, hop: Hop) -> Result<()> {
     }
     // Run there, it is not answered for on the LAN here (`net::proxy_add`): the peer is, as it
     // announces it. A failure leaves the entry to a sweep (`gc::sweep`), not the route undone.
-    if let Some(v6) = ip.v6 {
+    // Nor for a peer here by its IPv6 underlay alone (`route_via6` skips it too).
+    let local6 = || hop.via6().is_some_and(|v| crate::net::is_local_ip(v.into()).unwrap_or(false));
+    if let Some(v6) = ip.v6.filter(|_| !local6()) {
         if let Err(e) = crate::net::proxy_remove(v6) {
             crate::log!("route {} via {}: {e}", ip.v4, hop.via());
         }

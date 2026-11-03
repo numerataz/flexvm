@@ -166,11 +166,12 @@ fn sweep_within(host: &Host, wait: Duration) -> Result<()> {
 }
 
 fn network(host: &Host) {
-    proxy_entries(host);
     // Its own nonblocking lock: a peer that is down holds up no local cleanup.
     host.deliver_withdrawals();
     host.retire_migrations();
     host.settle_owed();
+    // Last: after what the steps before let go of.
+    proxy_entries(host);
 }
 
 /// Local sweeps are one at a time (`RUN/.gc.lock`).

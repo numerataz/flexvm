@@ -1394,7 +1394,9 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
     address. Proxy NDP answers only for addresses with a proxy entry
     (NTF_PROXY) on the device, so each VM has one (`net::proxy_add`), added
     by its process as it announces and on every tick while its state is
-    local, and removed by `Proc::finish` (any end but a move), by
+    local, and removed by `Proc::finish` (any end, unless a device here other
+    than its own tap and hold device is routed to it: a target sharing the
+    namespace, `net::proxy_release`), by
     `host::route_hop` (its route to a peer: a migration's switch, a peer's
     announcement, a reinstall; not for a peer sharing the network
     namespace, whose entry it is), and by every sweep (`gc::network`) for an

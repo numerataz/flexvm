@@ -688,7 +688,7 @@ with a proxy entry of their own, so each VM's IPv6 address gets one there
 (`ip -6 neigh show proxy`) while it runs on the host: added as it is
 announced (started, restored, arrived or resumed after an aborted
 migration) and checked every second, and removed when it leaves (killed,
-died, suspended), when it is routed to a peer (the source of a migration,
+died, suspended, moved), when it is routed to a peer (the source of a migration,
 once its route moves to the target; a peer's announcement of it) and by
 every garbage-collection sweep for an address no tap or hold device on the
 host is routed to any longer (a VM process killed outright). The kernel
