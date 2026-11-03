@@ -582,6 +582,7 @@ one of:
 | `route` | a peer's announcement/withdrawal: judge its generation, set or remove the route |
 | `lend` | lend an address of this host's range to a restoring peer, with a new generation |
 | `source` | whether a VM process of that name is a migration source here (a target retires a released record when not) |
+| `caps` | what this build takes beyond an older one: `via6`, an IPv6 next hop in `route` (an older listener answers "unknown op") |
 
 Only connections from the configured peers' addresses are served, by
 host.json as it is now: any other gets `{"ok": false, "error": "IP is not

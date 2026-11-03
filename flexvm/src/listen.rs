@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -735,6 +735,7 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant, lo
                 let token = crate::migrate::host_token(host, false)?;
                 Ok(json!({"gone": id.liveness() == crate::host::Liveness::Gone && !host.owes(&id), "token": token}))
             }),
+        "caps" => Ok(json!({"caps": CAPS})),
         op => Err(format!("unknown op {op:?}").into()),
     };
     let reply = crate::util::reply(&reply);
@@ -1070,7 +1071,8 @@ fn migration(host: &Host, req: &Value, source: impl Fn(&str, Option<IpAddr>) -> 
             let outcome = host.mig_status(mig)?;
             // Read the host identity with the outcome under the same lock.
             let token = crate::migrate::host_token(host, false)?;
-            Ok((outcome, json!({"outcome": outcome, "token": token, "underlay": host.config_now().underlay_known().map(|u| u.to_string())})))
+            let cfg = host.config_now();
+            Ok((outcome, json!({"outcome": outcome, "token": token, "underlay": cfg.underlay_known(), "underlay6": cfg.underlay6_known()})))
         },
     )
 }
@@ -1154,13 +1156,24 @@ fn route(host: &Host, req: &Value, peers: &[IpAddr], sender: &[IpAddr]) -> Resul
     }
     let ip: Ipv4Addr = req["ip"].as_str().ok_or("missing ip")?.parse()?;
     let gen = req["gen"].as_u64().filter(|&g| g > 0).ok_or("route messages carry the address's generation")?;
-    let via: Option<Ipv4Addr> = req["via"].as_str().map(|v| v.parse()).transpose()?;
-    if let Some(via) = via {
+    let via6: Option<Ipv6Addr> = req["via6"].as_str().map(|v| v.parse()).transpose()?;
+    let mut via = req["via"].as_str().map(|v| crate::host::Hop::new(v.parse()?, via6)).transpose()?;
+    if let Some(hop) = via {
         check_vm_ip(host, ip, peers)?;
-        check_via(via, peers)?;
+        check_via(hop.via(), peers)?;
         // Its own: a peer announces where it runs a VM, never that another host does (#914).
-        if !is_peer(sender, IpAddr::V4(via)) {
-            bail!("{ip} via {via}: a peer announces only routes via its own addresses (its peers address, or peer_underlays), not via {via}");
+        let own = |v: IpAddr| match is_peer(sender, v) {
+            true => Ok(()),
+            false => Err(format!("{ip} via {v}: a peer announces only routes via its own addresses (its peers address, or peer_underlays), not via {v}")),
+        };
+        own(hop.via())?;
+        // Its IPv6 underlay beside an IPv4 one, by the same rules; one this host does not know it by
+        // (derived there, and not in peer_underlays here) is left out, and the /32 routed still.
+        if let Some(v6) = hop.via6().map(IpAddr::V6).filter(|&v6| v6 != hop.via()) {
+            if let Err(e) = check_via(v6, peers).map_err(|e| e.to_string()).and_then(|()| own(v6)) {
+                crate::info!("route {ip}: IPv6 next hop left out: {e}");
+                via = hop.v4_only();
+            }
         }
     }
     let rev = match via {
@@ -1188,7 +1201,7 @@ fn route(host: &Host, req: &Value, peers: &[IpAddr], sender: &[IpAddr]) -> Resul
             }
             // Not by another peer, unless it had the VM later: a newer generation, or a newer revision
             // (the VM migrated on to it and ended there before its announcement got here).
-            if let Some(owner) = a.via.filter(|&o| gen == a.seen && !a.withdrawn && withdrawn_rev <= a.rev && !is_peer(sender, IpAddr::V4(o))) {
+            if let Some(owner) = a.hop().filter(|o| gen == a.seen && !a.withdrawn && withdrawn_rev <= a.rev && !o.addrs().any(|o| is_peer(sender, o))) {
                 bail!("{ip} generation {gen} is routed via {owner} at revision {}, not via the asking peer: only that peer, or one with a newer revision, withdraws it", a.rev);
             }
         }
@@ -1201,7 +1214,7 @@ fn route(host: &Host, req: &Value, peers: &[IpAddr], sender: &[IpAddr]) -> Resul
         let local = host.keeps_route(&l, ip, gen)?;
         if !local {
             match via {
-                Some(via) => crate::net::route_via(ip, via)?,
+                Some(via) => crate::host::route_hop(ip, via)?,
                 None => crate::net::unroute(ip),
             }
         }
@@ -1235,11 +1248,33 @@ pub fn check_vm_ip(host: &Host, ip: Ipv4Addr, peers: &[IpAddr]) -> Result<()> {
 /// Callers include the connection address in `peers`; named peers come from strict listener lookup.
 /// A peer's local address (hosts sharing a network namespace, loopback included) is taken:
 /// `net::route_via` installs nothing for it, and a migration's handoff relies on it.
-pub fn check_via(via: Ipv4Addr, peers: &[IpAddr]) -> Result<()> {
-    if !is_peer(peers, IpAddr::V4(via)) || via.is_unspecified() || via.is_broadcast() || via.is_multicast() {
+/// An IPv6 one is never link-local (a next hop there needs an interface) or IPv4-mapped.
+pub fn check_via(via: IpAddr, peers: &[IpAddr]) -> Result<()> {
+    let unicast = match via {
+        IpAddr::V4(v4) => !(v4.is_unspecified() || v4.is_broadcast() || v4.is_multicast()),
+        IpAddr::V6(v6) => !(v6.is_unspecified() || v6.is_multicast() || v6.is_unicast_link_local() || v6.to_ipv4_mapped().is_some()),
+    };
+    if !is_peer(peers, via) || !unicast {
         bail!("{via} is not a peer next hop: not a peer's address, or not unicast");
     }
     Ok(())
+}
+
+/// A capability: this build takes an IPv6 next hop from a peer (a route message's IPv6 `via`, or
+/// its `via6`). Peers ask by `caps` before they send one; an older build answers "unknown op".
+pub const VIA6: &str = "via6";
+
+/// What this build takes from peers beyond what every build does (`caps`).
+const CAPS: &[&str] = &[VIA6];
+
+/// Whether a peer takes `cap`, by its answer to `caps`: an older build's "unknown op" is a no;
+/// any other failure (a peer down) tells nothing, and is given back.
+pub fn takes(answer: Result<Value>, cap: &str) -> Result<bool> {
+    match answer {
+        Ok(r) => Ok(r["caps"].as_array().is_some_and(|caps| caps.iter().any(|c| c == cap))),
+        Err(e) if e.to_string().starts_with("unknown op") => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// The configured peers' addresses for a restore or resume (root's own, see `PEER_CACHE`):
@@ -1325,7 +1360,7 @@ pub(crate) fn routable_by(
         bail!("{ip} is not a vm's address: outside this host's configured VM ranges");
     }
     let peer = is_peer(peers, IpAddr::V4(ip)) || is_peer(&cfg.peer_underlay_addrs(), IpAddr::V4(ip));
-    // A derived underlay is an interface's source address, covered by is_local_addr below.
+    // A derived underlay is an interface's source address, covered by `local` below.
     let listen = cfg.listen.as_deref().and_then(|s| s.parse::<SocketAddr>().ok()).map(|a| a.ip().to_canonical());
     let underlay = cfg.underlay.contains(IpAddr::V4(ip)) || listen == Some(IpAddr::V4(ip));
     let special = ip.is_unspecified() || ip.is_broadcast() || ip.is_multicast() || underlay || gateways.contains(&ip);
@@ -1593,15 +1628,25 @@ mod tests {
     fn next_hops_are_known_peers_and_unicast() {
         let via: Ipv4Addr = "192.0.2.7".parse().unwrap();
         let peers = [IpAddr::V4(via), "::ffff:192.0.2.8".parse().unwrap(), "127.0.0.1".parse().unwrap()];
-        check_via(via, &peers).unwrap();
+        check_via(via.into(), &peers).unwrap();
         check_via("192.0.2.8".parse().unwrap(), &peers).unwrap();
         // Peers sharing this network namespace route via a local address (net::route_via skips it).
         check_via("127.0.0.1".parse().unwrap(), &peers).unwrap();
         assert!(check_via("192.0.2.9".parse().unwrap(), &peers).is_err());
         assert!(check_via("127.0.0.2".parse().unwrap(), &peers).is_err());
         for ip in ["0.0.0.0", "255.255.255.255", "224.0.0.1"] {
-            let ip = ip.parse().unwrap();
-            assert!(check_via(ip, &[IpAddr::V4(ip)]).is_err());
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(check_via(ip, &[ip]).is_err());
+        }
+        // IPv6 ones (#1295): a peer's, ::1 for one sharing this network namespace; never one of
+        // link scope, IPv4-mapped (the IPv4 address's), multicast or unspecified.
+        let v6: IpAddr = "2001:db8::7".parse().unwrap();
+        check_via(v6, &[v6]).unwrap();
+        check_via(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), &[IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)]).unwrap();
+        assert!(check_via("2001:db8::8".parse().unwrap(), &[v6]).is_err());
+        for ip in ["fe80::7", "::ffff:192.0.2.7", "ff02::1", "::"] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(check_via(ip, &[ip]).is_err(), "{ip}");
         }
     }
 
@@ -1681,10 +1726,76 @@ mod tests {
         assert!(host.observe(&l, x, gen, 1, Some("192.0.2.7".parse().unwrap())).unwrap());
         let e = route(&host, &json!({"ip": x.to_string(), "gen": gen, "rev": 1, "via": "192.0.2.8"}), &[b, c], &[c]).unwrap_err().to_string();
         assert!(e.contains("only that host changes its next hop"), "{e}");
-        assert_eq!(host.addr(&l, x).unwrap().via, Some("192.0.2.7".parse().unwrap()));
+        assert_eq!(host.addr(&l, x).unwrap().hop(), Some("192.0.2.7".parse().unwrap()));
         route(&host, &json!({"ip": x.to_string(), "gen": gen, "rev": 1}), &[b, c], &[b]).unwrap();
         let a = host.addr(&l, x).unwrap();
         assert!(a.withdrawn && a.lent.is_none(), "{a:?}");
+    }
+
+    /// #1295: an announcement's next hop may be IPv6 (a peer with only an IPv6 underlay), and one
+    /// with an IPv4 `via` may carry the peer's IPv6 underlay (`via6`), recorded beside it. A `via6`
+    /// this host does not know the peer by is left out; the /32 is routed still.
+    #[test]
+    fn route_takes_ipv6_next_hops() {
+        let root = crate::test_util::TempDir::new("route-via6");
+        let mut host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        host.configure(|c| {
+            c.cluster_ips = Some("10.200.0.0/15".into());
+            Ok(())
+        })
+        .unwrap();
+        // Loopback next hops: a peer sharing this network namespace, so nothing is routed here.
+        let (v4, v6): (IpAddr, IpAddr) = ("127.0.0.1".parse().unwrap(), "::1".parse().unwrap());
+        // Held here, so `route` takes it again at once (as above).
+        let l = host.lock().unwrap();
+        let hop = |ip: &str| host.addr(&l, ip.parse().unwrap()).unwrap().hop();
+        let saved = |ip: &str| serde_json::from_slice::<Value>(&std::fs::read(host.state.join("addrs").join(ip)).unwrap()).unwrap();
+        route(&host, &json!({"ip": "10.201.1.1", "gen": 3, "rev": 0, "via": "::1"}), &[v6], &[v6]).unwrap();
+        assert_eq!(hop("10.201.1.1").map(|h| (h.via(), h.via6())), Some((v6, Some(std::net::Ipv6Addr::LOCALHOST))));
+        assert_eq!(saved("10.201.1.1")["via"], "::1");
+        route(&host, &json!({"ip": "10.201.1.2", "gen": 3, "rev": 0, "via": "127.0.0.1", "via6": "::1"}), &[v4, v6], &[v4, v6]).unwrap();
+        assert_eq!(hop("10.201.1.2"), crate::host::Hop::of(Some(Ipv4Addr::LOCALHOST), Some(std::net::Ipv6Addr::LOCALHOST)));
+        assert_eq!((saved("10.201.1.2")["via"].clone(), saved("10.201.1.2")["via6"].clone()), (json!("127.0.0.1"), json!("::1")));
+        // As an older peer sends it: no `via6`, and none recorded (as an older build writes it).
+        route(&host, &json!({"ip": "10.201.1.3", "gen": 3, "rev": 0, "via": "127.0.0.1"}), &[v4, v6], &[v4, v6]).unwrap();
+        assert_eq!(hop("10.201.1.3"), Some(Ipv4Addr::LOCALHOST.into()));
+        assert!(saved("10.201.1.3").get("via6").is_none());
+        // An IPv6 underlay this host does not know the peer by, or another peer's: left out.
+        for (peers, sender) in [(vec![v4], vec![v4]), (vec![v4, v6], vec![v4])] {
+            route(&host, &json!({"ip": "10.201.1.4", "gen": 3, "rev": 0, "via": "127.0.0.1", "via6": "::1"}), &peers, &sender).unwrap();
+            assert_eq!(hop("10.201.1.4"), Some(Ipv4Addr::LOCALHOST.into()));
+        }
+        // Refused: an IPv6 `via` not the asking peer's, or not a peer's; a `via6` beside it that differs; a bad one.
+        for (req, peers, sender) in [
+            (json!({"via": "::1"}), vec![v4, v6], vec![v4]),
+            (json!({"via": "2001:db8::9"}), vec![v6], vec![v6]),
+            (json!({"via": "fe80::1"}), vec!["fe80::1".parse().unwrap()], vec!["fe80::1".parse().unwrap()]),
+            (json!({"via": "::1", "via6": "2001:db8::9"}), vec![v6], vec![v6]),
+            (json!({"via": "127.0.0.1", "via6": "not an address"}), vec![v4], vec![v4]),
+        ] {
+            let mut req = req;
+            req.as_object_mut().unwrap().extend([("ip".into(), json!("10.201.1.5")), ("gen".into(), json!(3)), ("rev".into(), json!(0))]);
+            assert!(route(&host, &req, &peers, &sender).is_err(), "{req}");
+            assert!(!host.state.join("addrs/10.201.1.5").exists());
+        }
+        // Withdrawn by the peer it is routed via, by its IPv6 address.
+        route(&host, &json!({"ip": "10.201.1.1", "gen": 3}), &[v4, v6], &[v4]).unwrap_err();
+        route(&host, &json!({"ip": "10.201.1.1", "gen": 3}), &[v6], &[v6]).unwrap();
+        assert_eq!(hop("10.201.1.1"), None);
+    }
+
+    /// #1295: peers ask `caps` before sending an IPv6 next hop. An older build answers it "unknown op":
+    /// it takes none. A peer that cannot be asked tells nothing.
+    #[test]
+    fn capabilities_by_the_answer_to_caps() {
+        assert!(CAPS.contains(&VIA6));
+        assert!(takes(Ok(json!({"caps": CAPS})), VIA6).unwrap());
+        assert!(!takes(Ok(json!({"caps": ["other"]})), VIA6).unwrap());
+        assert!(!takes(Ok(json!({})), VIA6).unwrap());
+        // `handle`'s answer to an op it does not know, as an older build gives it.
+        let old = crate::util::answer(Some(crate::util::reply(&Err(format!("unknown op {:?}", "caps").into()))), "peer", "refused");
+        assert!(!takes(old, VIA6).unwrap());
+        assert!(takes(Err("connection refused".into()), VIA6).is_err());
     }
 
     /// A peer's configured underlays (`peer_underlays`) are its next hops, and no VM's address;
@@ -1698,7 +1809,7 @@ mod tests {
         cfg.peer_underlays.insert("192.0.2.9:7070".into(), vec!["198.51.100.9".parse().unwrap()]);
         assert_eq!(cfg.peer_underlay_addrs(), [IpAddr::V4(data), data6]);
         let known = [vec!["192.0.2.7".parse().unwrap()], cfg.peer_underlay_addrs()].concat();
-        check_via(data, &known).unwrap();
+        check_via(data.into(), &known).unwrap();
         assert!(check_via("198.51.100.9".parse().unwrap(), &known).is_err(), "not a configured peer's");
         // The asking peer's own addresses take in its underlays, never another peer's.
         cfg.peers.push("192.0.2.10:7070".into());

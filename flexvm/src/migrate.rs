@@ -7,7 +7,7 @@
 //! target died without every page), and exits only on `released`.
 
 use std::io::{BufReader, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, TcpStream};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpStream};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 
 use crate::bail;
 use crate::hold::{self, Holder};
-use crate::host::{fault, tripped};
+use crate::host::{fault, tripped, Hop};
 use crate::template::Template;
 use crate::uffd::{Origin, Runs, Source, MAX_PRELOAD};
 use crate::util::{ms, recv_json, send_json, By, Error, Phases, Result};
@@ -136,7 +136,7 @@ pub(crate) struct Route {
     to: String,
     target: Value,
     peer: Option<IpAddr>,
-    via: Option<Ipv4Addr>,
+    via: Option<Hop>,
 }
 
 impl Route {
@@ -144,7 +144,7 @@ impl Route {
         Self { to: to.into(), target: target.clone(), peer: conn.and_then(|c| c.peer_addr().ok()).map(|a| a.ip()), via: None }
     }
 
-    fn resolve(&mut self, host: &crate::host::Host) -> Result<Ipv4Addr> {
+    fn resolve(&mut self, host: &crate::host::Host) -> Result<Hop> {
         if let Some(via) = self.via {
             return Ok(via);
         }
@@ -634,6 +634,8 @@ impl Proc {
                 "evict": evict,
                 // This network namespace's, which the target compares with its own: the same, it shares our routes.
                 "netns": crate::net::netns_id(),
+                // What this side takes beyond an older one: an IPv6 underlay in the commit's answer.
+                "caps": [crate::listen::VIA6],
         });
         req.as_object_mut().unwrap().extend(saved.to_request());
         let (conn, prepared) =
@@ -861,7 +863,7 @@ impl Proc {
                 Some((c, Ok(()))) => {
                     // Sharing our routes, the target takes the address over itself, after the held packets.
                     // As the target decided it from our connection (#1028); an older target's, by its underlay.
-                    let handoff = target["shares_routes"].as_bool().unwrap_or_else(|| crate::net::is_local_addr(via).unwrap_or(false));
+                    let handoff = target["shares_routes"].as_bool().unwrap_or_else(|| crate::net::is_local_ip(via.via()).unwrap_or(false));
                     (held, res) = hold::send(h, ip, mig, c, handoff, || self.switch_route(mig, via)).map(|(s, r)| (Some(s), Some(r))).unwrap_or_default()
                 }
                 started => {
@@ -925,7 +927,7 @@ impl Proc {
 
     /// Under the host lock, so a later claim of the address routes after; only while this VM is
     /// still the source of migration `mig`, since an abort resumes it here and keeps its route.
-    fn switch_route(&self, mig: u64, via: Ipv4Addr) -> Result<()> {
+    fn switch_route(&self, mig: u64, via: Hop) -> Result<()> {
         let (ip, gen, l) = (self.vm().ip, self.gen(), self.host.lock()?);
         if *self.vm().state.lock().unwrap() != State::Source(mig)
             || self.host.holder(&l, ip)?.is_some_and(|h| h != self.name())
@@ -936,7 +938,7 @@ impl Proc {
         if fault("route") {
             bail!("injected fault: route_via failed");
         }
-        crate::net::route_via(ip, via)
+        crate::host::route_hop(ip, via)
     }
 
     /// Target side. Without a commit, `finish` gives back what it took.
@@ -1036,8 +1038,10 @@ impl Proc {
             let _ = w.shutdown(std::net::Shutdown::Both);
         } else {
             let _ = answer(json!({"ok": true, "result": {
-                // On the downtime: never a lookup (the process's start made any it needed).
-                "underlay": self.host.config_now().underlay_known().map(|u| u.to_string()),
+                // On the downtime: never a lookup (the process's start made any it needed). An older
+                // source reads only the IPv4 one (`prepare_in` refused it without one).
+                "underlay": self.host.config_now().underlay_known(),
+                "underlay6": self.host.config_now().underlay6_known(),
                 "timings_ms": t,
                 "resume_error": (vm.state() == State::Failed).then_some("resuming failed"),
                 // Whether the source hands the address over to this side's route (`reroute`).
@@ -1238,6 +1242,7 @@ impl Proc {
         };
         peers.push(from);
         crate::listen::check_vm_ip(&self.host, ip, &peers)?;
+        routable_from(&self.host.config_now(), req)?;
         crate::util::check_kvm()?;
         let name = req["name"].as_str().ok_or("missing name")?.to_string();
         let regions = serde_json::from_value::<Vec<_>>(req["regions"].clone()).map_err(|e| format!("bad regions: {e}"))?;
@@ -1502,9 +1507,23 @@ fn target_at(cfg: &crate::host::Config, to: &str, peer: Option<IpAddr>) -> Vec<I
     peer.into_iter().chain(cfg.underlays_of(to).iter().copied()).collect()
 }
 
-/// Check the target before forwarding held packets or changing any route.
-fn target_via(host: &crate::host::Host, target: &Value, to: &str, peer: Option<IpAddr>) -> Result<Ipv4Addr> {
-    let via = target["underlay"].as_str().ok_or("target sent no underlay")?.parse()?;
+/// Whether the source of `req` (a `migrate_in`) can route the VM here, via this host's underlay
+/// (the commit's answer): an older one takes only an IPv4 one, so with only an IPv6 one it is
+/// refused at the prepare, while it runs the VM on.
+fn routable_from(cfg: &crate::host::Config, req: &Value) -> Result<()> {
+    let takes_via6 = req["caps"].as_array().is_some_and(|caps| caps.iter().any(|c| c == crate::listen::VIA6));
+    if let (None, Some(v6), false) = (cfg.underlay_known(), cfg.underlay6_known(), takes_via6) {
+        bail!("this host's underlay is IPv6 only ({v6}), and the source's flexvm is older: it routes only via an IPv4 one; upgrade it");
+    }
+    Ok(())
+}
+
+/// Check the target before forwarding held packets or changing any route. Its underlays: the IPv4
+/// one, an IPv6 one (an older target sends none), or both; one it is not known by is left out,
+/// unless that leaves none.
+fn target_via(host: &crate::host::Host, target: &Value, to: &str, peer: Option<IpAddr>) -> Result<Hop> {
+    let v4: Option<Ipv4Addr> = target["underlay"].as_str().map(str::parse).transpose()?;
+    let v6: Option<Ipv6Addr> = target["underlay6"].as_str().map(str::parse).transpose()?;
     let cfg = host.config_now();
     let cache = crate::listen::Cached::read(&host.run, &cfg.peers);
     let mut peers = cfg.peer_underlay_addrs();
@@ -1521,8 +1540,14 @@ fn target_via(host: &crate::host::Host, target: &Value, to: &str, peer: Option<I
             }
         }
     }
-    crate::listen::check_via(via, &peers)?;
-    Ok(via)
+    let check = |ip: Option<IpAddr>| ip.map(|ip| crate::listen::check_via(ip, &peers));
+    let (c4, c6) = (check(v4.map(IpAddr::V4)), check(v6.map(IpAddr::V6)));
+    let kept = |c: &Option<Result<()>>| matches!(c, Some(Ok(())));
+    match Hop::of(v4.filter(|_| kept(&c4)), v6.filter(|_| kept(&c6))) {
+        Some(hop) => Ok(hop),
+        // Neither: the IPv4 one's refusal, else the IPv6 one's.
+        None => Err(c4.or(c6).map_or_else(|| "target sent no underlay".into(), |c| c.unwrap_err())),
+    }
 }
 
 /// An arrival's (MiB to page in, guest size) from what its source sent: the
@@ -1889,9 +1914,9 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(target_via(&host, &json!({"underlay": "192.0.2.7"}), "192.0.2.99:7070", None).unwrap(), "192.0.2.7".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(target_via(&host, &json!({"underlay": "192.0.2.7"}), "192.0.2.99:7070", None).unwrap(), Hop::from("192.0.2.7".parse::<Ipv4Addr>().unwrap()));
         // A peer sharing this network namespace: the handoff goes by its local underlay.
-        assert_eq!(target_via(&host, &json!({"underlay": "127.0.0.1"}), "192.0.2.99:7070", None).unwrap(), Ipv4Addr::LOCALHOST);
+        assert_eq!(target_via(&host, &json!({"underlay": "127.0.0.1"}), "192.0.2.99:7070", None).unwrap(), Hop::from(Ipv4Addr::LOCALHOST));
         for target in [json!({}), json!({"underlay": "192.0.2.8"}), json!({"underlay": "127.0.0.2"})] {
             assert!(target_via(&host, &target, "192.0.2.99:7070", None).is_err());
         }
@@ -1900,7 +1925,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        assert_eq!(target_via(&host, &json!({"underlay": "192.0.2.7"}), "192.0.2.99:7070", None).unwrap(), "192.0.2.7".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(target_via(&host, &json!({"underlay": "192.0.2.7"}), "192.0.2.99:7070", None).unwrap(), Hop::from("192.0.2.7".parse::<Ipv4Addr>().unwrap()));
         // An available name's cached addresses survive another name's missing entry.
         host.configure(|c| {
             c.peers.push("cached.invalid:7070".into());
@@ -1908,15 +1933,15 @@ mod tests {
         })
         .unwrap();
         crate::util::write_file(&host.run, "peers.json", br#"{"names":{"cached.invalid:7070":["192.0.2.8"]}}"#, false).unwrap();
-        assert_eq!(target_via(&host, &json!({"underlay": "192.0.2.8"}), "192.0.2.99:7070", None).unwrap(), "192.0.2.8".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(target_via(&host, &json!({"underlay": "192.0.2.8"}), "192.0.2.99:7070", None).unwrap(), Hop::from("192.0.2.8".parse::<Ipv4Addr>().unwrap()));
         // Failed destination resolution must not discard cached or explicit underlays.
-        assert_eq!(target_via(&host, &json!({"underlay": "192.0.2.8"}), "bad address", None).unwrap(), "192.0.2.8".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(target_via(&host, &json!({"underlay": "192.0.2.8"}), "bad address", None).unwrap(), Hop::from("192.0.2.8".parse::<Ipv4Addr>().unwrap()));
         host.configure(|c| {
             c.peer_underlays.insert("cached.invalid:7070".into(), vec!["192.0.2.9".parse().unwrap()]);
             Ok(())
         })
         .unwrap();
-        assert_eq!(target_via(&host, &json!({"underlay": "192.0.2.9"}), "bad address", None).unwrap(), "192.0.2.9".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(target_via(&host, &json!({"underlay": "192.0.2.9"}), "bad address", None).unwrap(), Hop::from("192.0.2.9".parse::<Ipv4Addr>().unwrap()));
         assert!(target_via(&host, &json!({"underlay": "192.0.2.10"}), "bad address", None).is_err());
         // The connection authorizes the target even before its name is cached.
         host.configure(|c| {
@@ -1928,12 +1953,63 @@ mod tests {
         let conn = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         assert_eq!(
             target_via(&host, &json!({"underlay": "127.0.0.1"}), "unseen.invalid:7070", Some(conn.peer_addr().unwrap().ip())).unwrap(),
-            Ipv4Addr::LOCALHOST
+            Hop::from(Ipv4Addr::LOCALHOST)
         );
         // Reconciliation has no connection: resolve the destination instead (an address: no resolver to wait on).
-        assert_eq!(target_via(&host, &json!({"underlay": "127.0.0.1"}), "127.0.0.1:7070", None).unwrap(), Ipv4Addr::LOCALHOST);
+        assert_eq!(target_via(&host, &json!({"underlay": "127.0.0.1"}), "127.0.0.1:7070", None).unwrap(), Hop::from(Ipv4Addr::LOCALHOST));
         assert!(target_via(&host, &json!({"underlay": "192.0.2.8"}), "127.0.0.1:7070", Some(conn.peer_addr().unwrap().ip())).is_err());
         assert!(target_via(&host, &json!({"underlay": "224.0.0.1"}), "224.0.0.1:7070", None).is_err());
+    }
+
+    /// #1295: a target's IPv6 underlay (`underlay6`, which an older target never sends) is its /128's
+    /// next hop, and its /32's when it has no IPv4 one; one it is not known by is left out.
+    #[test]
+    fn target_underlays_of_both_families() {
+        let root = crate::test_util::TempDir::new("target-via6");
+        let mut host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+        host.configure(|c| {
+            c.peers = vec!["192.0.2.7:7070".into(), "[2001:db8::7]:7070".into(), "[::1]:7070".into()];
+            Ok(())
+        })
+        .unwrap();
+        let (v4, v6): (Ipv4Addr, Ipv6Addr) = ("192.0.2.7".parse().unwrap(), "2001:db8::7".parse().unwrap());
+        let via = |target: Value| target_via(&host, &target, "192.0.2.99:7070", None);
+        assert_eq!(via(json!({"underlay": "192.0.2.7", "underlay6": "2001:db8::7"})).unwrap(), Hop::of(Some(v4), Some(v6)).unwrap());
+        assert_eq!(via(json!({"underlay": "192.0.2.7", "underlay6": "2001:db8::7"})).unwrap().via(), IpAddr::V4(v4), "the /32 via the IPv4 one");
+        let only6 = via(json!({"underlay": null, "underlay6": "2001:db8::7"})).unwrap();
+        assert_eq!((only6.via(), only6.via6()), (IpAddr::V6(v6), Some(v6)));
+        assert_eq!(via(json!({"underlay6": "::1"})).unwrap().via(), IpAddr::V6(Ipv6Addr::LOCALHOST), "a peer sharing this network namespace");
+        // Not known by one: the other alone; by neither, refused.
+        assert_eq!(via(json!({"underlay": "192.0.2.7", "underlay6": "2001:db8::8"})).unwrap(), Hop::from(v4));
+        assert_eq!(via(json!({"underlay": "192.0.2.8", "underlay6": "2001:db8::7"})).unwrap(), Hop::from(IpAddr::V6(v6)));
+        let e = via(json!({"underlay": "192.0.2.8", "underlay6": "2001:db8::8"})).unwrap_err().to_string();
+        assert!(e.contains("192.0.2.8 is not a peer next hop"), "{e}");
+        for target in
+            [json!({"underlay6": "fe80::7"}), json!({"underlay6": "ff02::1"}), json!({"underlay6": "bad"}), json!({"underlay": null, "underlay6": null})]
+        {
+            assert!(via(target.clone()).is_err(), "{target}");
+        }
+    }
+
+    /// #1295: an older source routes only via an IPv4 underlay, so a target with only an IPv6 one
+    /// refuses it at the prepare; a source that says it takes one (`caps`), or a target with an
+    /// IPv4 one, goes ahead.
+    #[test]
+    fn an_older_source_is_refused_by_a_target_with_only_an_ipv6_underlay() {
+        // A peer elsewhere with only an IPv6 address: no IPv4 underlay is derived.
+        let peers = vec!["[2001:db8::99]:7070".to_string()];
+        let cfg = |u: &str| crate::host::Config { underlay: u.parse().unwrap(), peers: peers.clone(), ..Default::default() };
+        let (old, new) = (json!({"op": "migrate_in"}), json!({"op": "migrate_in", "caps": [crate::listen::VIA6]}));
+        let e = routable_from(&cfg("2001:db8::7"), &old).unwrap_err().to_string();
+        assert!(e.contains("IPv6 only (2001:db8::7)") && e.contains("upgrade it"), "{e}");
+        routable_from(&cfg("2001:db8::7"), &new).unwrap();
+        routable_from(&cfg("192.0.2.7"), &old).unwrap();
+        routable_from(&cfg("192.0.2.7"), &new).unwrap();
+        let both = crate::host::Config {
+            underlay: crate::host::Underlay { v4: Some("192.0.2.7".parse().unwrap()), v6: Some("2001:db8::7".parse().unwrap()) },
+            ..Default::default()
+        };
+        routable_from(&both, &old).unwrap();
     }
 
     #[test]
@@ -1973,7 +2049,7 @@ mod tests {
         // Release still has the unresolved reroute, even if all earlier attempts failed.
         assert!(pending.take_if(|(mig, _)| *mig == 8).is_none());
         let (_, mut route) = pending.take_if(|(mig, _)| *mig == 7).unwrap();
-        assert_eq!(route.resolve(&host).unwrap(), "192.0.2.7".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(route.resolve(&host).unwrap(), Hop::from("192.0.2.7".parse::<Ipv4Addr>().unwrap()));
     }
 
     #[test]
@@ -1986,7 +2062,7 @@ mod tests {
         drop(conn);
         // The connection address survives copying the unresolved route to the retry thread.
         let mut retry = route.clone();
-        assert_eq!(retry.resolve(&host).unwrap(), Ipv4Addr::LOCALHOST);
+        assert_eq!(retry.resolve(&host).unwrap(), Hop::from(Ipv4Addr::LOCALHOST));
         assert!(route.via.is_none());
         assert!(target_via(&host, &route.target, &route.to, None).is_err());
     }
