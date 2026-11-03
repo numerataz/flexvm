@@ -372,12 +372,25 @@ fn refused(verb: &'static str, m: &[u8]) -> Error {
     format!("guest {}: {}", verb.to_lowercase(), refusal(m)).into()
 }
 
-/// Address, nameservers and wall clock; doubles as the readiness check. An agent that predates
-/// lists of nameservers takes the first one.
-pub fn start(uds: &Path, ip: std::net::Ipv4Addr, dns: &[std::net::IpAddr]) -> Result<()> {
-    let dns: String = dns.iter().map(|d| format!(" {d}")).collect();
-    answered("START", Instant::now() + TIMEOUT, |by| match ask(uds, &format!("START {ip} {}{dns}", now()?), by)? {
-        (FRAME_MSG, m) if m == b"ok" => Ok(()),
+/// Address (and IPv6 address, `ip6`), nameservers and wall clock; doubles as the readiness check.
+/// An agent that predates lists of nameservers takes the first one. With `ip6`, it is START6; an
+/// agent that predates that is sent START, with the IPv4 nameservers alone, and the answer is
+/// false (otherwise true): the VM runs without its IPv6 address. Without `ip6`, START leaves the
+/// guest none.
+pub fn start(uds: &Path, ip: std::net::Ipv4Addr, ip6: Option<std::net::Ipv6Addr>, dns: &[std::net::IpAddr]) -> Result<bool> {
+    let words = |v6: bool| dns.iter().filter(|d| v6 || d.is_ipv4()).map(|d| format!(" {d}")).collect::<String>();
+    let by = Instant::now() + TIMEOUT;
+    if let Some(ip6) = ip6 {
+        let dns = words(true);
+        match answered("START6", by, |by| ask(uds, &format!("START6 {ip} {ip6} {}{dns}", now()?), by))? {
+            (FRAME_MSG, m) if m == b"ok" => return Ok(true),
+            (FRAME_MSG, m) if m.starts_with(b"unknown request") => {}
+            (_, m) => return Err(refused("START", &m)),
+        }
+    }
+    let dns = words(false);
+    answered("START", by, |by| match ask(uds, &format!("START {ip} {}{dns}", now()?), by)? {
+        (FRAME_MSG, m) if m == b"ok" => Ok(ip6.is_none()),
         (_, m) => Err(refused("START", &m)),
     })
 }
@@ -824,7 +837,7 @@ mod tests {
                         assert_eq!(parts[1], "10.0.0.2");
                         assert!(parts[2].parse::<f64>().is_ok());
                         // Each nameserver a word of its own (an older agent takes the first), or none.
-                        assert!(matches!(parts[3..], ["1.1.1.1", "2001:db8::53"] | []), "{line}");
+                        assert!(matches!(parts[3..], ["1.1.1.1", "192.0.2.53"] | []), "{line}");
                     }
                     "CLOCK" => assert!(parts[1].parse::<f64>().is_ok()),
                     _ => assert_eq!(parts.len(), 1),
@@ -834,8 +847,8 @@ mod tests {
             }
         });
         let ip = "10.0.0.2".parse().unwrap();
-        start(&path, ip, &["1.1.1.1".parse().unwrap(), "2001:db8::53".parse().unwrap()]).unwrap();
-        let e = start(&path, ip, &[]).unwrap_err();
+        assert!(start(&path, ip, None, &["1.1.1.1".parse().unwrap(), "192.0.2.53".parse().unwrap()]).unwrap());
+        let e = start(&path, ip, None, &[]).unwrap_err();
         assert!(e.to_string().contains("guest start: unknown request START; rebuild the rootfs and its templates"), "{e}");
         assert_eq!(clock(&path, TIMEOUT).unwrap(), -2.5);
         assert!(clock(&path, TIMEOUT).unwrap_err().to_string().contains("guest clock: unknown request CLOCK; rebuild the rootfs and its templates"));
@@ -845,6 +858,42 @@ mod tests {
         }
         assert_eq!(forks(&path).unwrap(), 1);
         assert!(forks(&path).unwrap_err().to_string().contains("guest forks: unknown request FORKS; rebuild the rootfs and its templates"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn start6_falls_back_to_start_for_an_agent_that_predates_it() {
+        let (_dir, path, listener) = agent("start6");
+        // What each agent answers, and the request lines it is sent (the time word dropped).
+        let replies: &[(&[u8], &str)] = &[
+            // A current agent takes START6, nameservers of both families in order.
+            (b"ok", "START6 10.0.0.2 fd00::a00:2 2001:db8::53 1.1.1.1"),
+            // One that predates it is sent START with the IPv4 ones alone, as an older host sends.
+            (br#"unknown request "START6""#, "START6 10.0.0.2 fd00::a00:2 2001:db8::53 1.1.1.1"),
+            (b"ok", "START 10.0.0.2 1.1.1.1"),
+            // Any other refusal of START6 is the start's, not a fallback.
+            (b"error: the guest has no IPv6: No such file or directory (os error 2)", "START6 10.0.0.2 fd00::a00:2 2001:db8::53 1.1.1.1"),
+            // Without an IPv6 address, START, whose agent then has none.
+            (b"ok", "START 10.0.0.2 1.1.1.1"),
+        ];
+        let server = std::thread::spawn(move || {
+            for (reply, expected) in replies {
+                let (mut stream, line) = accept(&listener);
+                let mut parts: Vec<_> = line.split_whitespace().collect();
+                let at = if parts[0] == "START6" { 3 } else { 2 };
+                assert!(parts.remove(at).parse::<f64>().is_ok(), "{line}");
+                assert_eq!(parts.join(" "), *expected);
+                stream.get_mut().write_all(b"OK 1\n").unwrap();
+                write_frame(stream.get_mut(), FRAME_MSG, reply).unwrap();
+            }
+        });
+        let (ip, ip6) = ("10.0.0.2".parse().unwrap(), Some("fd00::a00:2".parse().unwrap()));
+        let dns = ["2001:db8::53".parse().unwrap(), "1.1.1.1".parse().unwrap()];
+        assert!(start(&path, ip, ip6, &dns).unwrap());
+        assert!(!start(&path, ip, ip6, &dns).unwrap());
+        let e = start(&path, ip, ip6, &dns).unwrap_err().to_string();
+        assert!(e.contains("guest start: error: the guest has no IPv6") && !e.contains("rebuild"), "{e}");
+        assert!(start(&path, ip, None, &dns).unwrap());
         server.join().unwrap();
     }
 

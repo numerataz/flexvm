@@ -979,14 +979,25 @@ impl Vm {
         Ok((g, id))
     }
 
-    /// A failure leaves the clock unsure (see `leave`).
-    pub fn guest_net(&self, ip: Ipv4Addr, dns: &[std::net::IpAddr]) -> Result<()> {
+    /// A failure leaves the clock unsure (see `leave`). A template whose agent predates IPv6 runs
+    /// without `ip6`, logged.
+    pub fn guest_net(&self, ip: Ipv4Addr, ip6: Option<std::net::Ipv6Addr>, dns: &[std::net::IpAddr]) -> Result<()> {
         self.running_here()?;
-        let res = crate::guest::start(&self.vsock, ip, dns);
-        if res.is_err() {
-            self.clock_unsure.store(true, Ordering::SeqCst);
+        match crate::guest::start(&self.vsock, ip, ip6, dns) {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                let ip6 = ip6.map_or(String::new(), |a| a.to_string());
+                crate::log!(
+                    "vm {}: its template's flexvm-init predates IPv6, so it runs without its IPv6 address {ip6} and IPv6 nameservers: pull its image again",
+                    self.name
+                );
+                Ok(())
+            }
+            Err(e) => {
+                self.clock_unsure.store(true, Ordering::SeqCst);
+                Err(e)
+            }
         }
-        res
     }
 
     /// Logged, not fatal: the VM runs on with its old hostname.

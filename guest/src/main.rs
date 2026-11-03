@@ -1,6 +1,7 @@
 //! flexvm-init, PID 1 in the guest: sets up a writable overlay on the read-only (DAX) root, then
 //! serves one-line requests on vsock: `PING`, `START <ip> <secs.nanos> [dns...]` (network and
-//! host clock), `CLOCK <secs.nanos>`, `FORKS`, and those in session.rs and app.rs.
+//! host clock), `START6 <ip> <ip6> <secs.nanos> [dns...]` (the same with an IPv6 address; START
+//! leaves the guest with none), `CLOCK <secs.nanos>`, `FORKS`, and those in session.rs and app.rs.
 //! Replies are frames (proto.rs).
 
 use std::collections::HashMap;
@@ -493,7 +494,7 @@ fn serve(statuses: Statuses) -> io::Result<()> {
             }
         };
         // START is on every start's critical path, where a new thread costs ms: quick requests are answered inline.
-        if ["PING", "START ", "CLOCK ", "FORKS", "HOSTNAME "].iter().any(|v| line.starts_with(v)) {
+        if ["PING", "START ", "START6 ", "CLOCK ", "FORKS", "HOSTNAME "].iter().any(|v| line.starts_with(v)) {
             let _ = handle(&stream, &line, &statuses);
             continue;
         }
@@ -597,15 +598,12 @@ fn fail(w: impl Write, e: impl std::fmt::Display) -> io::Result<()> {
 fn handle(out: &File, line: &str, statuses: &Statuses) -> io::Result<()> {
     let line = line.trim_end();
     let (verb, arg) = line.split_once(' ').unwrap_or((line, ""));
-    let mut parts = arg.split_whitespace();
     let reply = match verb {
         "PING" => Ok("pong".to_string()),
         // Acked only once the clock is set, so "ok" means it is.
-        "START" => match (parts.next().map(|ip| ip.parse()), parts.next().and_then(parse_time)) {
-            (Some(Ok(ip)), Some(now)) => {
-                net::configure(ip, &parts.collect::<Vec<_>>()).map_err(|e| e.to_string()).and_then(|()| set_clock(now)).map(|_| "ok".into())
-            }
-            _ => Err(format!("bad start request {arg:?}")),
+        "START" | "START6" => match parse_start(verb == "START6", arg) {
+            Some(s) => net::configure(s.ip, s.ip6, &s.dns).map_err(|e| e.to_string()).and_then(|()| set_clock(s.now)).map(|_| "ok".into()),
+            None => Err(format!("bad start request {arg:?}")),
         },
         "CLOCK" => parse_time(arg.trim()).ok_or_else(|| format!("bad time {arg:?}")).and_then(set_clock).map(|off| format!("ok {off}")),
         "FORKS" => forks().map(|n| format!("ok {n}")).map_err(|e| e.to_string()),
@@ -687,6 +685,26 @@ fn with_hostname(hosts: &str, name: &str) -> String {
         out += &line;
     }
     out
+}
+
+struct Start<'a> {
+    ip: std::net::Ipv4Addr,
+    ip6: Option<std::net::Ipv6Addr>,
+    now: libc::timespec,
+    dns: Vec<&'a str>,
+}
+
+/// START's arguments, or START6's (`ip6`), whose IPv6 address follows the IPv4 one. A host that
+/// predates START6 sends START, as does one whose VMs have no IPv6 address, or whose agent predates it.
+fn parse_start(ip6: bool, arg: &str) -> Option<Start<'_>> {
+    let mut parts = arg.split_whitespace();
+    let ip = parts.next()?.parse().ok()?;
+    let ip6 = match ip6 {
+        true => Some(parts.next()?.parse().ok()?),
+        false => None,
+    };
+    let now = parse_time(parts.next()?)?;
+    Some(Start { ip, ip6, now, dns: parts.collect() })
 }
 
 fn parse_time(s: &str) -> Option<libc::timespec> {
@@ -1020,6 +1038,21 @@ mod tests {
         assert!(!host_peer(&peer, 0));
         peer.svm_cid = 3;
         assert!(!host_peer(&peer, len));
+    }
+
+    #[test]
+    fn start_and_start6_parse() {
+        // An older host's START: no IPv6 address (a previous one is deleted).
+        let s = parse_start(false, "10.0.0.2 12.000000005 192.0.2.53 192.0.2.54").unwrap();
+        assert_eq!((s.ip, s.ip6, s.now.tv_sec, s.dns), ("10.0.0.2".parse().unwrap(), None, 12, vec!["192.0.2.53", "192.0.2.54"]));
+        let s = parse_start(false, "10.0.0.2 12.000000005").unwrap();
+        assert!(s.ip6.is_none() && s.dns.is_empty());
+        let s = parse_start(true, "10.0.0.2 fd00::a00:2 12.000000005 2001:db8::53 192.0.2.53").unwrap();
+        assert_eq!((s.ip6, s.now.tv_nsec, s.dns), (Some("fd00::a00:2".parse().unwrap()), 5, vec!["2001:db8::53", "192.0.2.53"]));
+        let bad = [(false, "10.0.0.2"), (false, "fd00::2 12.000000005"), (true, "10.0.0.2 12.000000005"), (true, "10.0.0.2 10.0.0.3 12.000000005"), (true, "")];
+        for (ip6, bad) in bad {
+            assert!(parse_start(ip6, bad).is_none(), "{bad}");
+        }
     }
 
     #[test]
