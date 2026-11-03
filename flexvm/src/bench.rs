@@ -516,11 +516,12 @@ fn nested_virt(cpuinfo: &str) -> bool {
 
 fn virtual_dmi(vendor: &str, product: &str) -> bool {
     match vendor {
-        "QEMU" | "Xen" | "VMware, Inc." | "innotek GmbH" | "Google" | "Alibaba Cloud" => true,
+        "QEMU" | "Xen" | "VMware, Inc." | "innotek GmbH" | "Google" | "Alibaba Cloud" | "OpenStack Foundation" | "Cloud Hypervisor" => true,
         "Microsoft Corporation" => product == "Virtual Machine",
+        "Apple Inc." => product.contains("Virtualization"),
         // EC2's bare-metal instances have the vendor of its VMs.
         "Amazon EC2" => !product.ends_with(".metal"),
-        _ => product.starts_with("KVM"),
+        _ => ["KVM", "OpenStack", "Parallels", "VirtualBox"].iter().any(|p| product.starts_with(p)),
     }
 }
 
@@ -619,10 +620,19 @@ mod tests {
 
     #[test]
     fn a_hypervisor_is_told_by_its_firmware() {
-        for (vendor, product) in [("QEMU", "KVM Virtual Machine"), ("Amazon EC2", "c7g.large"), ("Microsoft Corporation", "Virtual Machine"), ("", "KVM")] {
+        for (vendor, product) in [
+            ("QEMU", "KVM Virtual Machine"),
+            ("Amazon EC2", "c7g.large"),
+            ("Microsoft Corporation", "Virtual Machine"),
+            ("", "KVM"),
+            ("Apple Inc.", "Apple Virtualization Generic Platform"),
+            ("Red Hat", "OpenStack Compute"),
+        ] {
             assert!(virtual_dmi(vendor, product), "{vendor} {product}");
         }
-        for (vendor, product) in [("Amazon EC2", "c7g.metal"), ("Microsoft Corporation", "Surface Laptop"), ("Ampere", "Mt.Jade"), ("", "")] {
+        for (vendor, product) in
+            [("Amazon EC2", "c7g.metal"), ("Microsoft Corporation", "Surface Laptop"), ("Ampere", "Mt.Jade"), ("Apple Inc.", "MacBookPro18,1"), ("", "")]
+        {
             assert!(!virtual_dmi(vendor, product), "{vendor} {product}");
         }
     }
