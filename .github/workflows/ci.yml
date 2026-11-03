@@ -37,9 +37,15 @@ env:
 jobs:
   check:
     # The release build is the e2e job's: it builds the binary that the tests run.
-    name: fmt, clippy, unit tests
-    runs-on: ubuntu-24.04
+    name: fmt, clippy, unit tests (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -62,7 +68,8 @@ jobs:
       - name: Root unit tests
         run: |
           sudo modprobe tun
-          cargo test -p flexvm -p flexvm-init --config 'target.x86_64-unknown-linux-gnu.runner="sudo -E"' -- --ignored
+          host=$(rustc -vV | sed -n 's/^host: //p')
+          cargo test -p flexvm -p flexvm-init --config "target.$host.runner=\"sudo -E\"" -- --ignored
       # The semver artifacts release (vMAJOR.MINOR.PATCH; what `cargo build` users download) must be built
       # from this checkout's inputs (scripts/pin-artifacts.sh --inputs): a change to them bumps ARTIFACTS_TAG
       # in the same change, or fails here, PR or main. --check also validates the semver tag format.
@@ -101,6 +108,26 @@ jobs:
       - name: lab teardown self-test
         # The lab scripts' process matching and cgroup cleanup (scripts/net-common.sh): rootless, no VM.
         run: ./scripts/net-common-test.sh
+
+  # Whether the aarch64 runner can run VMs at all: the aarch64 end-to-end shards join e2e once flexvm
+  # runs there (#1281). Never fails; it reports.
+  kvm-aarch64:
+    name: KVM probe (aarch64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - name: Probe KVM
+        run: |
+          uname -r; nproc; free -m; getconf PAGESIZE
+          grep -m1 -E 'CPU part|Features' /proc/cpuinfo || true
+          if [ -e /dev/kvm ]; then
+            sudo chmod 0666 /dev/kvm
+            python3 -c 'import fcntl, os; fd = os.open("/dev/kvm", os.O_RDWR); v = fcntl.ioctl(fd, 0xAE00); vm = fcntl.ioctl(fd, 0xAE01, 0); print("KVM API", v, "vm fd", vm)' \
+              && echo "::notice::aarch64 runner has KVM" || echo "::warning::aarch64 runner has /dev/kvm but KVM_CREATE_VM fails"
+          else
+            echo "::warning::aarch64 runner has no /dev/kvm"
+          fi
+          grep -E 'HAVE_ARCH_USERFAULTFD_WP|USERFAULTFD' "/boot/config-$(uname -r)" || true
 
   e2e:
     # Shards (scripts/e2e.py --shard): pr (the cases, and the main and recovery scenarios) in four

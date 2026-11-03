@@ -120,12 +120,13 @@ fn init(root: &Path) {
     for input in ["guest/src", "guest/Cargo.toml", "Cargo.lock", "Cargo.toml"] {
         println!("cargo:rerun-if-changed={}", root.join(input).display());
     }
-    let target = "x86_64-unknown-linux-gnu";
+    // The guest runs on the same architecture as the flexvm binary that embeds it.
+    let target = format!("{}-unknown-linux-gnu", std::env::var("CARGO_CFG_TARGET_ARCH").unwrap());
     let target_dir = out.join("init-target");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut cmd = Command::new(cargo);
     cmd.current_dir(root)
-        .args(["build", "--release", "--locked", "-p", "flexvm-init", "--target", target, "--target-dir"])
+        .args(["build", "--release", "--locked", "-p", "flexvm-init", "--target", &target, "--target-dir"])
         .arg(&target_dir)
         .env("CARGO_ENCODED_RUSTFLAGS", "-Ctarget-feature=+crt-static");
     for var in
@@ -137,7 +138,7 @@ fn init(root: &Path) {
     cmd.stdout(std::io::stderr().as_fd().try_clone_to_owned().expect("stderr"));
     let status = cmd.status().expect("running cargo to build flexvm-init");
     assert!(status.success(), "building flexvm-init failed ({status}); set FLEXVM_INIT to a prebuilt static flexvm-init to skip it");
-    let built = target_dir.join(target).join("release/flexvm-init");
+    let built = target_dir.join(&target).join("release/flexvm-init");
     // Copied, not linked: OUT_DIR's file stays what this build embedded.
     std::fs::copy(&built, &dest).unwrap_or_else(|e| panic!("{}: {e}", built.display()));
 }
