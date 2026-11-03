@@ -1479,8 +1479,8 @@ def nettest_ipv6():
     the hosts listening and peering at IPv6 addresses alone (an IPv6 underlay: the VM's /32 is routed via an
     IPv6 next hop) with vm_ipv6_prefix. The client's TCP ping-pong and 5 kHz UDP stream to the VM's IPv6
     address (proxy NDP) lose nothing across migrations A -> B -> A, and the client's neighbour entry follows
-    the VM (the unsolicited NA). A TCP stall may exceed twice the downtime by 100 ms (STALL_SLACK_MS: a
-    runner's scheduling, beside a downtime of a few tens of ms), still short of a retransmit timeout."""
+    the VM (the unsolicited NA). A TCP stall may exceed twice the downtime by up to 100 ms (STALL_SLACK_MS: a
+    runner's scheduling, beside a downtime of a few tens of ms), never to a retransmit timeout's 200."""
     env = {**ENV, "V6": "1", "FLEXVM": BIN, "STATE": BUILD, "TEMPLATE": args.template, "P": f"fv6{A.port}", "ROUNDS": "1",
            "STALL_SLACK_MS": "100", "WORK": os.path.join(args.log_dir, "nettest-ipv6")}
     p = subprocess.Popen([os.path.join(ROOT, "scripts", "nettest.sh")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -1496,7 +1496,7 @@ def nettest_ipv6():
             os.killpg(p.pid, signal.SIGKILL)
             out, _ = p.communicate()
         out += "\n(timed out after 300 s)"
-    check("nettest V6=1: passes", p.returncode == 0 and out.strip().endswith("PASS"), out[-3000:])
+    check("nettest V6=1: passes", p.returncode == 0 and "PASS" in out.splitlines(), out[-3000:])
 
 
 @case

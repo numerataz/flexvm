@@ -14,9 +14,9 @@
 # for it must name the target within 5 s, which only the target's unsolicited NA does that soon.
 #
 # Fails if a TCP round trip stalls longer than twice the longer migration
-# downtime of its round, plus STALL_SLACK_MS (a lost packet costs a retransmit
-# timeout, >= 200 ms: keep the slack below that), or the UDP stream loses more
-# than MAX_UDP_LOSS datagrams in a round.
+# downtime of its round (a lost packet costs a retransmit timeout, >= 200 ms),
+# plus STALL_SLACK_MS as long as that stays under 190 ms (so a retransmit still
+# fails), or the UDP stream loses more than MAX_UDP_LOSS datagrams in a round.
 # Reordered datagrams are reported, not checked.
 #
 # env: FLEXVM (binary), STATE (whose artifacts and templates to use), P (namespace prefix, default fv5), NET
@@ -331,7 +331,7 @@ log, downtimes, udp, max_loss, rnd, slack = sys.argv[1:]
 stall = float(re.search(r"worst stall ([\d.]+) ms", open(log).read()).group(1))
 downtime = max(float(x) for x in open(downtimes).read().split())
 udp = json.loads(udp)
-ok = stall <= 2 * downtime + float(slack) and udp["lost"] <= int(max_loss)
+ok = stall <= max(2 * downtime, min(2 * downtime + float(slack), 190)) and udp["lost"] <= int(max_loss)
 print(f"round {rnd}: {'ok' if ok else 'FAIL'}: TCP worst stall {stall:.0f} ms (longer downtime {downtime:.0f} ms, slack {slack} ms); "
       f"UDP {udp['sent']} sent, {udp['lost']} lost, {udp['reordered']} reordered")
 if udp["lost"] or udp["reordered"]:

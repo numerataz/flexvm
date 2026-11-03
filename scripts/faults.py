@@ -8696,7 +8696,7 @@ def ipv6_control_plane():
     """#1301: the control plane over IPv6 alone. A and B listen at [::1] and peer at each other's
     [::1] port, with vm_ipv6_prefix: the IPv6 underlay is ::1 (the listen address), peers are told the
     VM's route via it (after `caps`, over IPv6), and a VM migrates there and back (its pages pulled
-    from [::1]), with its md5 intact and TCP connections to both its addresses echoing throughout. Its
+    from [::1]), with its md5 intact and TCP connections to both its addresses echoing after each move. Its
     checkpoint, restored on B once it is gone from A, borrows its address from A over [::1]."""
     own_listeners("ipv6 control plane")
     try:
