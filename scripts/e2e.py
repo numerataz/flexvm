@@ -18,7 +18,8 @@ usage: sudo scripts/e2e.py [--bin FLEXVM] [--state DIR] [--log-dir DIR]
                            [--port-a N] [--net-a A.B.C] [--net-b A.B.C]
                            [--jobs N] [--lanes "PORT:NET-A:NET-B ..."]
                            [--image REF [--image-cache DIR] | --no-image] [--test-image DIR] [--faults "SCENARIO ..."]
-                           [--shard pr|main|recovery|heavy] [--split I/N] [--no-skips] [CASE ...]
+                           [--shard pr|main|recovery|heavy] [--split I/N] [--no-skips]
+                           [--no-kvm | --require-kvm] [CASE ...]
 
 Shards (CI runs pr in four splits side by side, heavy on a schedule):
   pr        main and recovery together;
@@ -30,6 +31,12 @@ Shards (CI runs pr in four splits side by side, heavy on a schedule):
             with --jobs 1.
 A scenario that finds this host lacks what it tests ends SKIP, not PASS; with
 --no-skips (CI) a SKIP fails the run.
+
+Cases and scenarios that need KVM (they run VMs, or use templates, which VMs
+built) are tagged @needs_kvm, here and in scripts/faults.py. Where /dev/kvm is
+missing or unusable (or with --no-kvm), only the untagged ones run, and no
+template is built: CI runs them so on its aarch64 runner, which has no KVM.
+--require-kvm (CI's KVM runners) fails there instead.
 """
 import argparse, contextlib, fcntl, glob, hashlib, ipaddress, json, os, re, select, shutil, signal, socket, struct, subprocess, sys, tempfile, termios, threading, time, traceback
 
@@ -94,6 +101,11 @@ p.add_argument("--shard", choices=SHARDS, default="main",
                help="pr, main: the cases and those scenarios; recovery, heavy: only the faults case, with those scenarios")
 p.add_argument("--split", help="I/N: run only the I-th of N parts of the selection, balanced by COST (CI runs N side by side)")
 p.add_argument("--no-skips", action="store_true", help="a skipped case or scenario fails the run")
+kvm_flags = p.add_mutually_exclusive_group()
+kvm_flags.add_argument("--no-kvm", action="store_true", help="run only the cases and scenarios that need no KVM (those not "
+                       "tagged @needs_kvm), as where /dev/kvm is unusable")
+kvm_flags.add_argument("--require-kvm", action="store_true", help="fail where /dev/kvm is unusable, instead of running only "
+                       "what needs no KVM")
 p.add_argument("--faults", help="scripts/faults.py scenarios to run against the two hosts ('' for none; default: the shard's)")
 # A worker runs its cases on one lane, against templates that are already built.
 p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
@@ -597,6 +609,14 @@ def case(fn):
     return fn
 
 
+def needs_kvm(fn):
+    """Tags a case that needs KVM: it runs a VM, or uses a template (which a VM built). Where /dev/kvm is
+    unusable (or with --no-kvm) the tagged cases are left out and the rest run, as are scripts/faults.py's
+    @needs_kvm scenarios: an untagged one that needs a VM fails there, never passes."""
+    fn.needs_kvm = True
+    return fn
+
+
 def check(label, cond, detail=""):
     print(("  ok   " if cond else "  FAIL ") + label + (f"  [{detail}]" if detail and not cond else ""), flush=True)
     if not cond:
@@ -608,6 +628,7 @@ class Skip(Exception):
 
 
 @case
+@needs_kvm
 def run_exec_ps():
     """run, then exec's stdout, stderr and exit status, and ps; a run without --name."""
     vm = "e2e-exec"
@@ -667,6 +688,7 @@ def run_exec_ps():
 
 
 @case
+@needs_kvm
 def app_lifecycle():
     """A VM follows its app: exits with it (an exited record with -d), --keep, --rm, start reruns, kill -s, -e/--entrypoint."""
     t = args.template
@@ -802,6 +824,7 @@ def app_lifecycle():
 
 
 @case
+@needs_kvm
 def pause_resume():
     """pause stops the guest and resume continues it: same process, clock right."""
     vm = "e2e-pause"
@@ -831,6 +854,7 @@ def pause_resume():
 
 
 @case
+@needs_kvm
 def migrate():
     """live migration A -> B -> A: process, RAM and an open TCP connection survive."""
     vm = "e2e-migrate"
@@ -887,6 +911,7 @@ def moved(src, dst, vm, m, proc):
 
 
 @case
+@needs_kvm
 def migrate_unpulled():
     """migrate to a host that never pulled the image: the source sends the template first, by content id"""
     vm, want = "e2e-unpulled", template_id(A, args.template)
@@ -928,6 +953,7 @@ def migrate_unpulled():
 
 
 @case
+@needs_kvm
 def migrate_other_build():
     """the target pulled another build under the same tag: the source's generation is sent and the target's tag stays"""
     vm, want = "e2e-other-build", template_id(A, args.template)
@@ -950,6 +976,7 @@ def migrate_other_build():
 
 
 @case
+@needs_kvm
 def push_killed():
     """a push whose receiver is killed half way leaves no generation there, and the VM runs on at its source"""
     vm, want = "e2e-push-killed", template_id(A, args.template)
@@ -979,6 +1006,7 @@ def push_killed():
 
 
 @case
+@needs_kvm
 def push_slow_ops():
     """a template push holds no op lock (#824): while it is parked half way, the VM resizes and checkpoints
     without "busy", and the migration goes on once the push does"""
@@ -1021,6 +1049,7 @@ def push_slow_ops():
 
 
 @case
+@needs_kvm
 def migrate_unpulled_pair():
     """two VMs of one template migrate at once to a host without it: it is sent once, both arrive"""
     vms, want = ("e2e-pair-1", "e2e-pair-2"), template_id(A, args.template)
@@ -1044,6 +1073,7 @@ def migrate_unpulled_pair():
 
 
 @case
+@needs_kvm
 def checkpoint_restore():
     """checkpoint --stop and run --checkpoint; a keep-running checkpoint restored on B as a fork."""
     vm = "e2e-ckpt"
@@ -1097,6 +1127,7 @@ def checkpoint_restore():
 
 
 @case
+@needs_kvm
 def checkpoint_store():
     """checkpoint create/ls/rm/prune (#775): named and incremental checkpoints in STATE/checkpoints, restored by name or id."""
     vm, forks = "e2e-store", []
@@ -1213,6 +1244,7 @@ def clear_checkpoints(*hosts):
 
 
 @case
+@needs_kvm
 def checkpoint_save_load():
     """checkpoint save | load (#775) of a chain onto a host that never pulled the image, and its restore there.
     The template arrives by content id, unnamed; a tampered or truncated save is refused, publishing nothing."""
@@ -1269,6 +1301,7 @@ def checkpoint_save_load():
 
 
 @case
+@needs_kvm
 def checkpoint_load_other_build():
     """checkpoint load onto a host with another build under the same tag (#775): its tag stays on its build.
     The restore runs the checkpoint's generation, by content id, with the run settings it was taken with (#825)."""
@@ -1307,6 +1340,7 @@ def checkpoint_load_other_build():
 
 
 @case
+@needs_kvm
 def suspend_resume():
     """stop (suspend) frees the VM's Firecracker; start brings back process and RAM; rm removes a stopped VM."""
     vm = "e2e-suspend"
@@ -1339,6 +1373,7 @@ def suspend_resume():
 
 
 @case
+@needs_kvm
 def kill_releases():
     """kill removes the VM and gives back its Firecracker, tap, route, cgroup and address."""
     vm = "e2e-kill"
@@ -1359,6 +1394,7 @@ def kill_releases():
 
 
 @case
+@needs_kvm
 def port_forward():
     """run -p: TCP (bulk, half-close) and UDP through the VM process's proxy; a clash refused before
     anything starts; kept by stop/start and by an app's exit and start; freed by kill and SIGKILL; not
@@ -1513,6 +1549,7 @@ def port_forward():
 
 
 @case
+@needs_kvm
 def containers():
     """ps -q, --filter and --format; inspect; logs (-f, --tail); wait; restart; rename running, stopped and exited."""
     vm, other, job = "e2e-ctr", "e2e-ctr-other", "e2e-ctr-job"
@@ -1834,6 +1871,7 @@ def size_follows(p, rows, cols, timeout=30):
 
 
 @case
+@needs_kvm
 def interactive():
     """exec -i streams stdin, exec -it a shell on a pty (echo, stty size following resizes, Ctrl-C to its
     sleep, its exit status, the terminal restored, detach keys) through a pause and a checkpoint; run -it,
@@ -2090,6 +2128,7 @@ def tree(root):
 
 
 @case
+@needs_kvm
 def copy():
     """cp: a directory tree into a VM (modes, links as links, owned by root) and back intact, a file onto
     a new name, - for a tar either way, and nothing written outside a destination by a guest's archive."""
@@ -2290,6 +2329,7 @@ def save_layout(stderr):
 
 
 @case
+@needs_kvm
 def image_template():
     """pull: a container image becomes a template whose VMs run its entrypoint."""
     if args.no_image:
@@ -2337,6 +2377,7 @@ def image_template():
 
 
 @case
+@needs_kvm
 def pull_gc():
     """pull: a rebuild deletes the generation it superseded, unless a stopped VM or a checkpoint here (or a stopped VM of a state sharing the templates) still uses it."""
     # A host of its own (no listener), with its own templates: A's and B's are shared, which keeps them all.
@@ -2452,6 +2493,7 @@ def generations_open(pid):
 
 
 @case
+@needs_kvm
 def pull_standby():
     """#921, #943: with no listener and no VM, a rebuild's superseded standby VMs leave, the old generation is
     deleted (none keeps it open through its refill), and the pool comes back from the new one."""
@@ -2527,6 +2569,7 @@ class Docker:
 
 
 @case
+@needs_kvm
 def docker_api():
     """flexvm api: the docker CLI against it, containers as flexvm's VMs."""
     d = Docker(A)
@@ -2621,6 +2664,7 @@ def docker_lifecycle(d):
 
 
 @case
+@needs_kvm
 def restart_policy():
     """run -d --restart: on-failure:N's restarts and their count, always until a stop, and what is refused."""
     t, flaky, steady = args.template, "e2e-rs-flaky", "e2e-rs-always"
@@ -2654,6 +2698,7 @@ def restart_policy():
     A.rm(steady)
 
 
+# Not tagged: its scenarios are, each in scripts/faults.py (`faults_scenarios`), and main selects them.
 @case
 def faults():
     """The selected scripts/faults.py scenarios against the same two hosts."""
@@ -2901,17 +2946,68 @@ BATCH_S = 20
 SELFTEST_SKIP_NAME = "wildcard_listen"
 
 
-def shard_coverage():
-    """(scenarios in faults.py's SCENARIOS that no shard runs, nor UNSHARDED or BENCHMARKS names; shard
-    names that are no scenario). Read from faults.py's source: it cannot be imported without its hosts."""
+def faults_scenarios():
+    """{scenario: whether it needs KVM} of faults.py's SCENARIOS, less its BENCHMARKS: whether its function is
+    tagged @needs_kvm (a wrapped one's, as in no_evict(f), is f's). Read from faults.py's source: it cannot be
+    imported without its hosts."""
     import ast
     tree = ast.parse(open(os.path.join(ROOT, "scripts", "faults.py")).read())
-    dicts = {t.id: {k.arg for k in n.value.keywords} for n in tree.body if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call)
+    tagged = {n.name for n in tree.body if isinstance(n, ast.FunctionDef) and any(getattr(d, "id", None) == "needs_kvm" for d in n.decorator_list)}
+    fn = lambda v: v.id if isinstance(v, ast.Name) else fn(v.args[0]) if isinstance(v, ast.Call) and v.args else None
+    dicts = {t.id: {k.arg: fn(k.value) for k in n.value.keywords} for n in tree.body if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call)
              and getattr(n.value.func, "id", None) == "dict" for t in n.targets if isinstance(t, ast.Name)}
-    scenarios = dicts.get("SCENARIOS", set()) - dicts.get("BENCHMARKS", set())
+    scenarios = {k: v in tagged for k, v in dicts.get("SCENARIOS", {}).items() if k not in dicts.get("BENCHMARKS", {})}
     assert len(scenarios) > 100, f"faults.py's SCENARIOS not found ({len(scenarios)} keys)"
+    return scenarios
+
+
+def shard_coverage():
+    """(scenarios in faults.py's SCENARIOS that no shard runs, nor UNSHARDED or BENCHMARKS names; shard
+    names that are no scenario)."""
+    scenarios = set(faults_scenarios())
     sharded = {x for v in SHARDS.values() for x in v.split()}
     return sorted(scenarios - sharded - set(UNSHARDED)), sorted((sharded | set(UNSHARDED)) - scenarios)
+
+
+def kvm_unusable(dev="/dev/kvm"):
+    """Why this host cannot run VMs, or None if it can: `dev` opens, answers KVM_GET_API_VERSION with 12
+    and makes a VM (KVM_CREATE_VM)."""
+    try:
+        fd = os.open(dev, os.O_RDWR | os.O_CLOEXEC)
+    except OSError as e:
+        return f"{dev}: {e.strerror}"
+    step = "KVM_GET_API_VERSION"
+    try:
+        if (v := fcntl.ioctl(fd, 0xAE00)) != 12:
+            return f"{dev}: KVM_GET_API_VERSION answered {v}, not 12"
+        step = "KVM_CREATE_VM"
+        os.close(fcntl.ioctl(fd, 0xAE01, 0))
+    except OSError as e:
+        return f"{dev}: {step}: {e.strerror}"
+    finally:
+        os.close(fd)
+    return None
+
+
+def without_kvm(cases, scenarios, kvm):
+    """(the cases and the scenarios of a selection that need no KVM; the rest, left out, as "case" and
+    "faults/scenario": the ones tagged @needs_kvm). `kvm`: faults_scenarios(); a scenario not in it needs KVM."""
+    out = [c for c in cases if getattr(CASES[c], "needs_kvm", False)] + [f"faults/{s}" for s in scenarios if kvm.get(s, True)]
+    scenarios = [s for s in scenarios if f"faults/{s}" not in out]
+    # The faults case only runs its scenarios.
+    return [c for c in cases if c not in out and (c != "faults" or scenarios)], scenarios, out
+
+
+def work_items(cases, scenarios, kvm):
+    """(name, templates it needs, cost) of each case, and of each scenario on its own. What needs no KVM needs
+    no template (VMs built them)."""
+    work = [(c, {args.template} if getattr(CASES[c], "needs_kvm", False) and c != "image_template" else set(), COST.get(c, 2))
+            for c in cases if c != "faults"]
+    # Growth (and checkpoint_hotplug, unplug_collapsed and mem_refused_fill, which need room to plug) runs on GROW; fc_prepare needs a second template to mismatch with.
+    work += [(f"faults/{s}", (({args.template, GROW} if s in ("cow_grow", "plug_race", "plug_storm", "checkpoint_hotplug", "unplug_collapsed", "fc_prepare", "mem_refused_fill") else {args.template})
+                              | ({APP} if s in APP_FAULTS else set())) if kvm.get(s, True) else set(),
+              COST.get(f"faults/{s}", 2)) for s in scenarios]
+    return work
 
 
 def lanes():
@@ -2930,12 +3026,22 @@ def main():
     for c in selected:
         assert c in CASES, f"unknown case {c}; have {', '.join(CASES)}"
     scenarios = args.faults.split() if "faults" in selected else []
+    kvm = faults_scenarios()
+    # Without KVM, only what needs none (the self-test checks that selection).
+    why = None if args.selftest else "--no-kvm" if args.no_kvm else kvm_unusable()
+    if why and args.require_kvm:
+        print(f"FAIL KVM is required (--require-kvm): {why}", flush=True)
+        return 1
+    if why:
+        selected, scenarios, out = without_kvm(selected, scenarios, kvm)
+        print(f"without KVM ({why}): leaving out the {len(out)} that need it (@needs_kvm): {' '.join(out)}")
+        print(f"without KVM: running {' '.join([c for c in selected if c != 'faults'] + [f'faults/{s}' for s in scenarios]) or 'nothing'}", flush=True)
+        if not selected:
+            print("FAIL nothing selected runs without KVM", flush=True)
+            return 1
+        args.faults = " ".join(scenarios)
     # (name, templates it needs, cost): the cases, and each scenario on its own.
-    work = [(c, set() if c == "image_template" else {args.template}, COST.get(c, 2)) for c in selected if c != "faults"]
-    # Growth (and checkpoint_hotplug, unplug_collapsed and mem_refused_fill, which need room to plug) runs on GROW; fc_prepare needs a second template to mismatch with.
-    work += [(f"faults/{s}", ({args.template, GROW} if s in ("cow_grow", "plug_race", "plug_storm", "checkpoint_hotplug", "unplug_collapsed", "fc_prepare", "mem_refused_fill") else {args.template})
-              | ({APP} if s in APP_FAULTS else set()),
-              COST.get(f"faults/{s}", 2)) for s in scenarios]
+    work = work_items(selected, scenarios, kvm)
     work.sort(key=lambda w: (-w[2], w[0]))
     if args.split:
         # Longest first, each to the part with the least so far: every split computes the same parts.
@@ -3147,8 +3253,21 @@ def main():
         # CI runs only the shards: a scenario in none of them never runs.
         unsharded, unknown = shard_coverage()
         print(f"selftest: faults.py scenarios in no shard: {unsharded}; shards' names that are no scenario: {unknown}")
+        # Without KVM: of every case and the CI shards' scenarios, exactly the ones tagged @needs_kvm are left out,
+        # some run and none of those needs a template; a /dev/kvm that is missing or no KVM is unusable.
+        every = sorted({x for v in SHARDS.values() for x in v.split()})
+        cases, scens, out = without_kvm(list(CASES), every, kvm)
+        runs = [c for c in cases if c != "faults"] + [f"faults/{s}" for s in scens]
+        tagged = sorted([c for c in CASES if getattr(CASES[c], "needs_kvm", False)] + [f"faults/{s}" for s in every if kvm[s]])
+        selection = bool(sorted(out) == tagged and sorted(runs + out) == sorted([c for c in CASES if c != "faults"] + [f"faults/{s}" for s in every])
+                         and runs and not any(w[1] for w in work_items(cases, scens, kvm)) and ("faults" in cases) == bool(scens)
+                         and without_kvm(["faults"], [s for s in every if kvm[s]], kvm)[0] == [])
+        probe = kvm_unusable("/dev/null"), kvm_unusable(os.path.join(WORK, "no-such-kvm"))
+        print(f"selftest: without KVM, {len(out)} left out, running {runs}: {'as tagged' if selection else 'WRONG'}; "
+              f"unusable KVM: {probe}")
         return 0 if (bad == want and len(summary) == len(scheduled) + len(builders) and not mixed
-                     and sorted(r[0] for r in skipped) == want_skip and not unsharded and not unknown) else 1
+                     and sorted(r[0] for r in skipped) == want_skip and not unsharded and not unknown
+                     and selection and all(probe)) else 1
     return 1 if failed else 0
 
 

@@ -109,51 +109,38 @@ jobs:
         # The lab scripts' process matching and cgroup cleanup (scripts/net-common.sh): rootless, no VM.
         run: ./scripts/net-common-test.sh
 
-  # Whether the aarch64 runner can run VMs at all: the aarch64 end-to-end shards join e2e once flexvm
-  # runs there (#1281). Never fails; it reports.
+  # Whether the aarch64 runner can run VMs: it decides what e2e-aarch64 runs (the KVM shards, or what
+  # needs no KVM). Never fails; it reports.
   kvm-aarch64:
     name: KVM probe (aarch64)
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 5
+    outputs:
+      kvm: ${{ steps.probe.outputs.kvm }}
     steps:
       - name: Probe KVM
+        id: probe
         run: |
           uname -r; nproc; free -m; getconf PAGESIZE
           grep -m1 -E 'CPU part|Features' /proc/cpuinfo || true
-          if [ -e /dev/kvm ]; then
-            sudo chmod 0666 /dev/kvm
-            python3 -c 'import fcntl, os; fd = os.open("/dev/kvm", os.O_RDWR); v = fcntl.ioctl(fd, 0xAE00); vm = fcntl.ioctl(fd, 0xAE01, 0); print("KVM API", v, "vm fd", vm)' \
-              && echo "::notice::aarch64 runner has KVM" || echo "::warning::aarch64 runner has /dev/kvm but KVM_CREATE_VM fails"
-          else
-            echo "::warning::aarch64 runner has no /dev/kvm"
-          fi
           grep -E 'HAVE_ARCH_USERFAULTFD_WP|USERFAULTFD' "/boot/config-$(uname -r)" || true
-
-  # The patched Firecracker for aarch64-unknown-linux-musl: every patch applies and builds there. The e2e
-  # job builds the x86_64 one (while ARTIFACTS_TAG is unpinned) and runs it; nothing runs this one yet.
-  firecracker-aarch64:
-    name: Firecracker build (aarch64)
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      # rustup, which installs the toolchain Firecracker's rust-toolchain.toml pins.
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Build Firecracker
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends musl-tools libseccomp-dev
-          ./scripts/build-firecracker.sh --state "$RUNNER_TEMP/state"
-          file "$RUNNER_TEMP/state/artifacts/firecracker" | grep -q 'ARM aarch64'
+          kvm=false
+          if [ -e /dev/kvm ]; then
+            # As scripts/e2e.py decides (kvm_unusable): KVM_GET_API_VERSION answers 12, and KVM_CREATE_VM works.
+            sudo chmod 0666 /dev/kvm
+            python3 -c 'import fcntl, os; fd = os.open("/dev/kvm", os.O_RDWR); v = fcntl.ioctl(fd, 0xAE00); vm = fcntl.ioctl(fd, 0xAE01, 0); print("KVM API", v, "vm fd", vm); assert v == 12' \
+              && kvm=true && echo "::notice::aarch64 runner has KVM: the aarch64 end-to-end shards run" \
+              || echo "::warning::aarch64 runner has /dev/kvm but KVM_CREATE_VM fails"
+          else
+            echo "::warning::aarch64 runner has no /dev/kvm: aarch64 end-to-end runs only what needs no KVM"
+          fi
+          echo "kvm=$kvm" >> "$GITHUB_OUTPUT"
 
   e2e:
     # Shards (scripts/e2e.py --shard): pr (the cases, and the main and recovery scenarios) in four
     # splits side by side, balanced by e2e.py's COST; the scheduled run takes heavy (GiB-scale
     # guests, long windows) one scenario at a time.
+    # The steps are e2e-aarch64's too: KVM (in env) says whether this job runs VMs.
     name: end-to-end (KVM, ${{ matrix.shard }})
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ matrix.shard == 'heavy' && 150 || 45 }}
@@ -161,18 +148,22 @@ jobs:
       fail-fast: false
       matrix:
         shard: ${{ fromJSON((github.event_name == 'schedule' || inputs.heavy) && '["heavy"]' || '["pr 1/4", "pr 2/4", "pr 3/4", "pr 4/4"]') }}
-    steps:
+    env:
+      KVM: "true"
+    steps: &e2e-steps
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
       - name: Enable KVM
+        if: env.KVM == 'true'
         run: |
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
           ls -l /dev/kvm
-          grep -m1 -o -E 'vmx|svm' /proc/cpuinfo
+          # Hardware virtualization (x86 names it in the CPU flags; on aarch64 KVM_CREATE_VM below tells).
+          if [ "$(uname -m)" = x86_64 ]; then grep -m1 -o -E 'vmx|svm' /proc/cpuinfo; fi
           # KVM_GET_API_VERSION must answer 12, and KVM_CREATE_VM must work.
           python3 -c 'import fcntl, os; fd = os.open("/dev/kvm", os.O_RDWR); v = fcntl.ioctl(fd, 0xAE00); vm = fcntl.ioctl(fd, 0xAE01, 0); print("KVM API", v, "vm fd", vm); assert v == 12'
           nproc; free -m; uname -r
@@ -238,6 +229,8 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends musl-tools libseccomp-dev
           ./scripts/build-firecracker.sh
+          # For this runner's arch (x86_64, or aarch64-unknown-linux-musl on the arm runner).
+          file "$STATE/artifacts/firecracker" | grep -q "$([ "$(uname -m)" = aarch64 ] && echo 'ARM aarch64' || echo 'x86-64')"
       - name: Save Firecracker
         if: steps.keys.outputs.fc-build == 'true' && steps.fc-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -285,6 +278,22 @@ jobs:
         if: steps.test-image-cache.outputs.cache-hit != 'true'
         run: command -v unsquashfs > /dev/null || { sudo apt-get update -q; sudo apt-get install -y -q --no-install-recommends squashfs-tools; }
 
+      # Without KVM no template is pulled from the test image, so e2e.py makes none: it is made here, and
+      # its image checked to be for this arch.
+      - name: Make test image (no KVM)
+        if: env.KVM != 'true'
+        run: |
+          sudo python3 scripts/test-image.py --state "$STATE" /var/lib/flexvm-test-image
+          sudo python3 -c '
+          import json, os, sys
+          d = sys.argv[1]
+          blob = lambda digest: json.load(open(os.path.join(d, "blobs", *digest.split(":"))))
+          config = blob(blob(json.load(open(os.path.join(d, "index.json")))["manifests"][0]["digest"])["config"]["digest"])
+          want = {"x86_64": "amd64", "aarch64": "arm64"}[os.uname().machine]
+          print("test image:", config["os"], config["architecture"])
+          assert (config["os"], config["architecture"]) == ("linux", want), config
+          ' /var/lib/flexvm-test-image
+
       - name: Build flexvm
         run: |
           while [ ! -e "$RUNNER_TEMP/build.status" ]; do sleep 1; done
@@ -296,9 +305,11 @@ jobs:
       # under the image's digest; the month in the key makes a real registry pull at least
       # monthly, and on any cold cache.
       - name: Image cache key
+        if: env.KVM == 'true'
         id: img
-        run: echo "prefix=image-$(echo "$E2E_IMAGE" | tr -c 'A-Za-z0-9.\n-' _)-$(date -u +%Y%m)-" >> "$GITHUB_OUTPUT"
+        run: echo "prefix=image-$(uname -m)-$(echo "$E2E_IMAGE" | tr -c 'A-Za-z0-9.\n-' _)-$(date -u +%Y%m)-" >> "$GITHUB_OUTPUT"
       - name: Restore image
+        if: env.KVM == 'true'
         id: img-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -307,7 +318,8 @@ jobs:
           restore-keys: ${{ steps.img.outputs.prefix }}
 
       # A scenario that finds the runner lacks what it tests (cgroup v2, THP, IPv6, a template's room)
-      # is a SKIP, which fails every shard (--no-skips).
+      # is a SKIP, which fails every shard (--no-skips). A KVM job fails if KVM is unusable after all
+      # (--require-kvm); one without runs only what needs no KVM (--no-kvm: what is not tagged @needs_kvm).
       - name: End-to-end tests
         env:
           SHARD: ${{ matrix.shard }}
@@ -315,7 +327,8 @@ jobs:
           # "pr 2/4": shard pr, its second of four splits.
           set -- $SHARD
           jobs=4; if [ "$1" = heavy ]; then jobs=1; fi
-          sudo python3 -u scripts/e2e.py --shard "$1" ${2:+--split "$2"} --jobs "$jobs" --no-skips --image "$E2E_IMAGE" --image-cache "$RUNNER_TEMP/image-cache" --test-image "/var/lib/flexvm-test-image" --log-dir "$RUNNER_TEMP/e2e-logs"
+          kvm=--require-kvm; if [ "$KVM" != true ]; then kvm=--no-kvm; fi
+          sudo python3 -u scripts/e2e.py --shard "$1" ${2:+--split "$2"} --jobs "$jobs" --no-skips "$kvm" --image "$E2E_IMAGE" --image-cache "$RUNNER_TEMP/image-cache" --test-image "/var/lib/flexvm-test-image" --log-dir "$RUNNER_TEMP/e2e-logs"
       - name: Test image made
         id: test-image-made
         if: always() && steps.test-image-cache.outputs.cache-hit != 'true'
@@ -355,6 +368,23 @@ jobs:
         if: failure() || cancelled()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: e2e-logs-${{ strategy.job-index }}
+          name: e2e-logs-${{ runner.arch }}-${{ strategy.job-index }}
           path: ${{ runner.temp }}/e2e-logs
           if-no-files-found: ignore
+
+  # e2e's steps on the aarch64 runner. With KVM (kvm-aarch64 decides) it runs e2e's shards; without (GitHub's
+  # arm runners have none) everything else, in one job: the release build, the patched Firecracker for
+  # aarch64-unknown-linux-musl (cached as e2e's is), the aarch64 artifacts fetched and checked against their
+  # pins, the test image, and what needs no KVM (e2e.py --no-kvm).
+  e2e-aarch64:
+    name: end-to-end (${{ needs.kvm-aarch64.outputs.kvm == 'true' && 'KVM' || 'no KVM' }}, aarch64, ${{ matrix.shard }})
+    needs: kvm-aarch64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: ${{ matrix.shard == 'heavy' && 150 || 45 }}
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.kvm-aarch64.outputs.kvm != 'true' && '["pr"]' || (github.event_name == 'schedule' || inputs.heavy) && '["heavy"]' || '["pr 1/4", "pr 2/4", "pr 3/4", "pr 4/4"]') }}
+    env:
+      KVM: ${{ needs.kvm-aarch64.outputs.kvm }}
+    steps: *e2e-steps

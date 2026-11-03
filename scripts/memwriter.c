@@ -9,7 +9,7 @@
 // each. Iteration k (from 1) rewrites page p(k) = k*S mod N (S coprime to N,
 // so every page in turn): it first checks the page still holds what the
 // table says it last wrote there, then writes a header (magic, thread, page,
-// k, a random salt from RDRAND, a timestamp) and a body generated from
+// k, a random salt from the CPU (RDRAND, or RNDR on aarch64), a timestamp) and a body generated from
 // (k, salt), then records (k, salt) in the table. Its state after iteration
 // k is a function of k and the salts, all of it in memory or registers.
 //
@@ -17,7 +17,7 @@
 // carries on from there. Any page saved with contents from after the pause
 // (or from before its last write before it) disagrees with the table, or the
 // table with k: the restored writer finds it when it next comes to rewrite
-// that page, before overwriting it (RDRAND makes the restored run write
+// that page, before overwriting it (the CPU's random numbers make the restored run write
 // different contents than the original did after the pause), and a full
 // check finds all of them.
 //
@@ -38,6 +38,12 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __aarch64__
+#include <sys/auxv.h>
+#ifndef HWCAP2_RNG
+#define HWCAP2_RNG (1 << 16)
+#endif
+#endif
 
 #define PG 4096
 #define MAGIC 0x6d656d7772697465ULL
@@ -82,11 +88,37 @@ static uint64_t now_ns(void) {
 	return t.tv_sec * 1000000000ULL + t.tv_nsec;
 }
 
+// One random number from the CPU (0 when it gave none): RDRAND, or RNDR (FEAT_RNG) where aarch64 has it.
+#if defined(__x86_64__)
 __attribute__((target("rdrnd")))
+static int cpu_random(uint64_t *v) {
+	unsigned long long x;
+	int ok = __builtin_ia32_rdrand64_step(&x);
+	*v = x;
+	return ok;
+}
+#elif defined(__aarch64__)
+static int have_rndr;  // set in main, before the threads start
+
+static int cpu_random(uint64_t *v) {
+	int ok;
+	if (!have_rndr) return 0;
+	// RNDR (s3_3_c2_c4_0) sets Z when it has no number to give.
+	__asm__ volatile("mrs %0, s3_3_c2_c4_0\n\tcset %w1, ne" : "=r"(*v), "=r"(ok) : : "cc");
+	return ok;
+}
+#else
+static int cpu_random(uint64_t *v) {
+	(void)v;
+	return 0;
+}
+#endif
+
+// A salt from the CPU, else from the clock: a restored copy reads another time than the original did.
 static uint64_t rdrand(void) {
-	unsigned long long v;
+	uint64_t v;
 	for (int i = 0; i < 16; i++)
-		if (__builtin_ia32_rdrand64_step(&v)) return v;
+		if (cpu_random(&v)) return v;
 	return now_ns() * 0x9E3779B97F4A7C15ULL;
 }
 
@@ -210,6 +242,9 @@ int main(int argc, char **argv) {
 	uint64_t n = strtoull(argv[1], NULL, 10) * 256;
 	nthreads = atoi(argv[2]);
 	const char *status = argv[3];
+#ifdef __aarch64__
+	have_rndr = (getauxval(AT_HWCAP2) & HWCAP2_RNG) != 0;
+#endif
 	sigset_t set;
 	sigemptyset(&set);
 	sigaddset(&set, SIGUSR1);
