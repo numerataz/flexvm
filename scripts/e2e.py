@@ -1379,6 +1379,90 @@ def suspend_resume():
 
 @case
 @needs_kvm
+def ipv6_taps():
+    """vm_ipv6_prefix (#1297): a VM's tap gets IPv6, a /128 route and a permanent neighbour entry beside its
+    /32, and passes IPv6 from that address alone; on a migration they move to the target's tap. Without the
+    prefix, IPv6 stays off on taps. The guest's agent gives it its address (#1308)."""
+    sysctl = lambda tap, key: open(f"/proc/sys/net/ipv6/conf/{tap}/{key}").read().strip()
+    ip6 = lambda *a: subprocess.run(["ip", "-6", *a], capture_output=True, text=True).stdout
+    plain = "e2e-v4tap"
+    ip = A.run(plain)
+    tap = vm_resources(ip)["tap"]
+    check("no prefix: IPv6 off on its tap", sysctl(tap, "disable_ipv6") == "1", sysctl(tap, "disable_ipv6"))
+    prefix = "fd00:e2e::"
+    vm = "e2e-v6tap"
+    for h in (A, B):
+        h.configure(vm_ipv6_prefix=prefix + "/96")
+    try:
+        ip = A.run(vm)
+        v6 = str(ipaddress.IPv6Address(int(ipaddress.IPv6Address(prefix)) | int(ipaddress.IPv4Address(ip))))
+        check("ps: its IPv6 address", A.ps()[vm].get("ipv6") == v6, A.ps()[vm])
+
+        def on_tap(h):
+            # An arrival on a host sharing the network namespace routes its tap once the held packets are in.
+            routed = lambda: (lambda r: r["pid"] and f"dev {r['tap']} " in ip6("route", "show", "exact", f"{v6}/128") + " ")(vm_resources(ip))
+            check(f"{h.label}: both routed to the VM's tap", wait_for(routed, 10), (vm_resources(ip), ip6("route", "show", "exact", f"{v6}/128")))
+            tap = vm_resources(ip)["tap"]
+            conf = tuple(sysctl(tap, k) for k in ("disable_ipv6", "addr_gen_mode", "accept_ra"))
+            check(f"{h.label}: IPv6 on its tap, no address of the kernel's own", conf == ("0", "1", "0"), conf)
+            addrs = ip6("addr", "show", "dev", tap)
+            check(f"{h.label}: the gateway fe80::1 alone", "inet6 fe80::1/64 scope link nodad" in addrs and addrs.count("inet6") == 1, addrs)
+            route = ip6("route", "show", "exact", f"{v6}/128")
+            check(f"{h.label}: its /128 routed to its tap", f"dev {tap} " in route + " ", route)
+            neigh = ip6("neigh", "show", v6, "dev", tap)
+            check(f"{h.label}: a permanent neighbour entry", "lladdr 06:00:ac:10:00:02 PERMANENT" in neigh, neigh)
+            return tap
+
+        on_tap(A)
+        check("IPv6 forwarding on", open("/proc/sys/net/ipv6/conf/all/forwarding").read().strip() == "1")
+        check("the VM from before the prefix keeps IPv6 off", sysctl(tap, "disable_ipv6") == "1")
+        echo_server(A, vm, ip)
+        conn = socket.create_connection((ip, 7000), timeout=10)
+        check("IPv4 as before", echo(conn, b"v4\n"))
+        addrs = must(A, vm, "ip -6 -o addr show dev eth0")
+        check("the guest has its IPv6 address", f"inet6 {v6}/128" in addrs, addrs)
+        must(A, vm, "setsid socat TCP6-LISTEN:7006,fork,reuseaddr EXEC:cat >/dev/null 2>&1 </dev/null &")
+
+        def up():
+            try:
+                with socket.create_connection((v6, 7006), timeout=1) as s:
+                    return echo(s, b"v6\n")
+            except OSError:
+                return False
+        check("the host reaches the guest at its IPv6 address", wait_for(up, 10))
+        rx = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+        rx.bind(("::", 0))
+        rx.settimeout(0.2)
+        port, other = rx.getsockname()[1], v6[:-1] + ("1" if v6[-1] != "1" else "2")
+        must(A, vm, f"ip -6 addr add {other}/128 dev eth0 nodad && for src in {v6} {other}; do for i in 1 2 3; do"
+                    f" echo $src | socat -u - UDP6-SENDTO:[fe80::1%eth0]:{port},bind=[$src]; done; done; ip -6 addr del {other}/128 dev eth0")
+        got, end = set(), time.time() + 1.5
+        while time.time() < end:
+            try:
+                got.add(rx.recvfrom(100)[0].decode().strip())
+            except socket.timeout:
+                pass
+        rx.close()
+        check("IPv6 from its own address gets through, from another is dropped at the tap", got == {v6}, got)
+        A.migrate(vm, B)
+        check("migrated: on B", wait_for(lambda: where(vm) == {B.label: "running"}, 60), where(vm))
+        tap_b = on_tap(B)
+        check("migrated: IPv4 connection survived", echo(conn, b"after\n"))
+        check("migrated: the host reaches the guest at its IPv6 address on B's tap", wait_for(up, 10))
+        conn.close()
+        check("no frame lost on the way to the guest (the host's MLD reports dropped before)",
+              open(f"/sys/class/net/{tap_b}/statistics/tx_dropped").read().strip() == "0")
+        B.kill(vm)
+        check("kill: its /128 route gone", wait_for(lambda: ip6("route", "show", "exact", f"{v6}/128").strip() == "", 10),
+              ip6("route", "show", "exact", f"{v6}/128"))
+    finally:
+        for h in (A, B):
+            h.configure(vm_ipv6_prefix=None)
+    A.kill(plain)
+
+
+@case
+@needs_kvm
 def kill_releases():
     """kill removes the VM and gives back its Firecracker, tap, route, cgroup and address."""
     vm = "e2e-kill"
@@ -2906,7 +2990,7 @@ def worker():
 # runs, as e2e.py's summary prints them): --split balances by these, the long ones start first, and
 # the short ones go in batches of about BATCH_S (each batch is a worker, with hosts of its own).
 # Unlisted ones count as 2 s.
-COST = {"faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "docker_api": 15, "restart_policy": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
+COST = {"faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "ipv6_taps": 10, "docker_api": 15, "restart_policy": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
         "faults/cow_grow": 65, "faults/reconcile_kill": 64, "faults/target_renamed": 40, "faults/plug_race": 45, "faults/guest_hang": 44,
         "faults/exec_pause_grace": 42, "faults/exec_ckpt_stalled": 115, "faults/route_abort": 35, "faults/unplug_collapsed": 30,
         "faults/arrival_grew": 25, "faults/pause_resume": 24, "faults/evict_latency": 25, "faults/mem_high": 25, "faults/target_killed": 25,

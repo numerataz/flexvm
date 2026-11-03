@@ -119,7 +119,7 @@ fn capped<T: de::DeserializeOwned>(raw: &RawValue, max: usize, after: fn(&T, &T)
 
 struct PreparedIn {
     vm: crate::vm::Prepared,
-    ip: Ipv4Addr,
+    ip: crate::net::VmAddr,
     source: Source,
     name: String,
     load_set: Vec<u64>,
@@ -372,7 +372,7 @@ impl Proc {
     /// Releases held packets back to the VM's tap, returning stats and whether the route was attached.
     pub(crate) fn release_to_tap(&self, vm: &Vm, id: u64) -> (Option<hold::Stats>, bool) {
         let Some(h) = self.holder() else { return (None, false) };
-        let (stats, res) = release_into(h, vm.ip, id, vm, Duration::ZERO, |()| crate::net::attach(vm.ip, &vm.tap));
+        let (stats, res) = release_into(h, vm.ip, id, vm, Duration::ZERO, |()| crate::net::attach(vm.addr(), &vm.tap));
         (stats, stats.is_some() && res.is_ok())
     }
 
@@ -945,7 +945,7 @@ impl Proc {
         if fault("route") {
             bail!("injected fault: route_via failed");
         }
-        crate::host::route_hop(ip, via)
+        crate::host::route_hop(self.vm().addr(), via)
     }
 
     /// Target side. Without a commit, `finish` gives back what it took.
@@ -1082,7 +1082,7 @@ impl Proc {
                     // Test fault `hold_route_fail`: this hold's route fails.
                     Some(h) => vm.if_here(|| {
                         crate::fault_result!(tripped("hold_route_fail") => Err("injected fault: routing the address to the hold failed".into());
-                            h.hold(vm.ip, mig))
+                            h.hold(vm.addr(), mig))
                     }),
                     None => vm.route_here().map(|()| false),
                 });
@@ -1309,7 +1309,8 @@ impl Proc {
         let vm = crate::vm::Prepared::with_saved(idle, tpl, || Ok(&saved))?;
         t.mark("pager_start");
         // All of routing the address here but the route itself, which waits for the commit.
-        let ifindex = crate::net::neighbour(ip, &vm.firecracker().tap)?;
+        let addr = self.host.config_now().vm_addr(ip);
+        let ifindex = crate::net::neighbour(addr, &vm.firecracker().tap)?;
         t.mark("neighbour");
         if shared {
             // Ready before the source pauses: it takes the address over from the source's hold.
@@ -1323,7 +1324,7 @@ impl Proc {
             bail!("injected fault: preparing failed");
         }
         going()?;
-        Ok(PreparedIn { vm: vm.unrouted(ifindex), ip, source, name, load_set })
+        Ok(PreparedIn { vm: vm.unrouted(ifindex), ip: addr, source, name, load_set })
     }
 
     /// Every check that can still abort runs before the commit; the host lock
@@ -1385,8 +1386,8 @@ impl Proc {
                 if Instant::now() >= deadline {
                     bail!("the migration ran past its deadline");
                 }
-                if !self.host.current(&l, ip, self.gen())? {
-                    bail!("generation {} of {ip} was withdrawn or superseded meanwhile", self.gen());
+                if !self.host.current(&l, ip.v4, self.gen())? {
+                    bail!("generation {} of {} was withdrawn or superseded meanwhile", self.gen(), ip.v4);
                 }
                 // A failed commit takes the tap, and this route, with it; `finish` puts the peer's back.
                 if !shared {

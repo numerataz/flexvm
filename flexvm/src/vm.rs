@@ -122,6 +122,8 @@ pub struct Vm {
     pub saved: crate::compat::Saved,
     pub dir: PathBuf,
     pub ip: Ipv4Addr,
+    /// Its IPv6 address (`vm_ipv6_prefix`) as it was routed here: its tap's /128 beside the /32.
+    pub ipv6: Option<std::net::Ipv6Addr>,
     pub tap: String,
     ifindex: Option<u32>,
     pub pager: Arc<Pager>,
@@ -621,8 +623,13 @@ impl Vm {
         self.limit.restore();
     }
 
+    /// Its addresses, as its tap is routed (`net::VmAddr`).
+    pub fn addr(&self) -> crate::net::VmAddr {
+        crate::net::VmAddr { v4: self.ip, v6: self.ipv6 }
+    }
+
     pub fn route(&self) -> Result<()> {
-        crate::net::route(self.ip, self.ifindex.map_or_else(|| crate::net::ifindex(&self.tap), Ok)?)
+        crate::net::route(self.addr(), self.ifindex.map_or_else(|| crate::net::ifindex(&self.tap), Ok)?)
     }
 
     /// Routes the address to the tap (its neighbour entry is there: `net::neighbour`)
@@ -661,7 +668,7 @@ impl Vm {
 
     /// Raises its tap and routes its address there; failing, it is left for the next `unpause`.
     fn link_up(&self) -> Result<()> {
-        let res = crate::net::set_link_up(&self.tap, true).and_then(|()| crate::net::attach(self.ip, &self.tap));
+        let res = crate::net::set_link_up(&self.tap, true).and_then(|()| crate::net::attach(self.addr(), &self.tap));
         self.link_down.store(res.is_err(), Ordering::SeqCst);
         res
     }
@@ -1228,14 +1235,15 @@ impl Prepared {
         mem_sizes(&self.pager, &self.template, plugged)
     }
 
-    pub fn into_vm(mut self, name: &str, ip: Ipv4Addr, state: State) -> Arc<Vm> {
+    pub fn into_vm(mut self, name: &str, ip: crate::net::VmAddr, state: State) -> Arc<Vm> {
         let idle = self.fc.take().unwrap();
         Arc::new(Vm {
             name: VmName::new(name),
             template: self.template.clone(),
             saved: self.saved.clone(),
             dir: idle.dir.clone(),
-            ip,
+            ip: ip.v4,
+            ipv6: ip.v6,
             tap: idle.tap.clone(),
             ifindex: self.ifindex,
             pager: self.pager.clone(),
@@ -1306,7 +1314,7 @@ impl Prepared {
         name: &str,
         vmstate: Snapshot,
         seed: Option<(Runs, Origin)>,
-        ip: Ipv4Addr,
+        ip: crate::net::VmAddr,
         hold: bool,
         deadline: Option<Instant>,
         before_retry: impl FnOnce() -> Result<()>,
@@ -1339,7 +1347,7 @@ impl Prepared {
         name: &str,
         vmstate: Snapshot,
         seed: Option<(Runs, Origin)>,
-        ip: Ipv4Addr,
+        ip: crate::net::VmAddr,
         hold: bool,
         clock_realtime: bool,
         deadline: Option<Instant>,

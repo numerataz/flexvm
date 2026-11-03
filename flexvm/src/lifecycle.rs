@@ -494,7 +494,17 @@ impl Proc {
             t.mark("pager_start");
             // Test gate: its Firecracker is up, nothing loaded or paged in yet.
             crate::host::hold("restore_prepared_gate");
-            prepared.load(&self.spawner, name, Snapshot::Bytes(&ck.vmstate), seed, ip, !(hold && fault("restore_no_hold")), None, || Ok(()), t)
+            prepared.load(
+                &self.spawner,
+                name,
+                Snapshot::Bytes(&ck.vmstate),
+                seed,
+                self.host.config_now().vm_addr(ip),
+                !(hold && fault("restore_no_hold")),
+                None,
+                || Ok(()),
+                t,
+            )
         })()
         .map_err(Restore::NotRun)?;
         let dir = ck.dir;

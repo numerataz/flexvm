@@ -232,9 +232,25 @@ impl<'de> Deserialize<'de> for Underlay {
     }
 }
 
-/// Routes `ip`, a VM a peer runs, via that peer: its /32 via `hop.via()`.
-pub fn route_hop(ip: Ipv4Addr, hop: Hop) -> Result<()> {
-    crate::net::route_via(ip, hop.via())
+/// Routes `ip`, a VM a peer runs, via that peer: its /32 via `hop.via()`, and its /128
+/// (`vm_ipv6_prefix`) via the peer's IPv6 underlay (`hop.via6()`). A peer with none (an older one,
+/// or one with no IPv6 underlay) leaves the /128 to this host's own IPv6 routes, and a /128 via
+/// another peer goes.
+pub fn route_hop(ip: crate::net::VmAddr, hop: Hop) -> Result<()> {
+    crate::net::route_via(ip.v4, hop.via())?;
+    // A peer sharing this network namespace: neither is routed (`route_via` skipped the /32), and
+    // its tap's /128 stays, whatever IPv6 underlay it names.
+    if ip.v6.is_some() && crate::net::is_local_ip(hop.via())? {
+        return Ok(());
+    }
+    match (ip.v6, hop.via6()) {
+        (Some(v6), Some(via6)) => crate::net::route_via6(v6, via6),
+        (Some(v6), None) => {
+            crate::net::unroute6(v6);
+            Ok(())
+        }
+        (None, _) => Ok(()),
+    }
 }
 
 /// The next hop toward a VM a peer runs: that peer's underlays, IPv4, IPv6 or both, as it
@@ -555,7 +571,7 @@ impl Config {
         }
         if let Some(p) = self.vm_ipv6_prefix {
             w.push(format!(
-                "flexvm: warning: vm_ipv6_prefix {p} is set: VMs' IPv6 addresses are reported and configured in guests, but not routed yet (#1297): guests' IPv6 traffic, to IPv6 nameservers too, is dropped"
+                "flexvm: warning: vm_ipv6_prefix {p} is set: VMs' IPv6 addresses are configured in guests and routed (to peers via their IPv6 underlays), but not held in migrations (#1299) or answered for on the LAN (#1300)"
             ));
         }
         let v6_dns = self.dns.as_ref().map_or(&[][..], Dns::listed).iter().find(|d| d.parse::<std::net::Ipv6Addr>().is_ok());
@@ -611,6 +627,12 @@ impl Config {
     /// Everything else (allocation, routes, records) stays keyed by `ip`.
     pub fn vm_ipv6(&self, ip: Ipv4Addr) -> Option<std::net::Ipv6Addr> {
         self.vm_ipv6_prefix.map(|p| p.vm(ip))
+    }
+
+    /// The addresses the VM with IPv4 address `ip` is routed by (`net::VmAddr`): `ip`, and its
+    /// IPv6 address if there is a prefix.
+    pub fn vm_addr(&self, ip: Ipv4Addr) -> crate::net::VmAddr {
+        crate::net::VmAddr { v4: ip, v6: self.vm_ipv6(ip) }
     }
 
     /// The nameservers guests are given, in order: `dns`'s IPv4 ones, and with `vm_ipv6_prefix` its IPv6
@@ -2439,9 +2461,25 @@ impl Host {
         if !self.route_allowed(ip, via) {
             return Ok(false);
         }
-        route_hop(ip, via)?;
+        let via = self.recheck_via6(ip, via);
+        route_hop(self.config_now().vm_addr(ip), via)?;
         crate::info!("put back route {ip} via {via} (generation {})", a.seen);
         Ok(true)
+    }
+
+    /// `via` with its IPv6 underlay (the /128's next hop, `route_hop`) only while that is still one
+    /// by the current configuration: unicast, and no VM's address (`vm_ipv6_prefix`); else the
+    /// /32's next hop alone. Which peer it is, is the /32's next hop's, which `route_check` rechecks:
+    /// a peer's derived IPv6 underlay, which its route message carried, is in no configuration here.
+    fn recheck_via6(&self, ip: Ipv4Addr, via: Hop) -> Hop {
+        let Some(v6) = via.via6().filter(|&v6| via.via() != IpAddr::V6(v6)) else { return via };
+        let why = match self.config_now().vm_ipv6_prefix.and_then(|p| p.ipv4_of(v6)) {
+            _ if v6.is_unspecified() || v6.is_multicast() => "not unicast".to_string(),
+            Some(vm) => format!("the address of VM {vm} (vm_ipv6_prefix)"),
+            None => return via,
+        };
+        crate::info!("route {ip}: IPv6 next hop {v6} left out: {why}");
+        via.v4_only().unwrap_or(via)
     }
 
     /// Recheck saved routes against current configuration, without DNS or a wait under the lock.
@@ -3113,7 +3151,7 @@ impl Host {
                         self.retire_leaving(&l, &o, id)?;
                         // A newer generation here keeps its route.
                         if current && self.holder(&l, o.ip)?.is_none() && !self.reinstall(&l, o.ip, None)? {
-                            crate::net::unroute(o.ip);
+                            crate::net::unroute(self.config_now().vm_addr(o.ip));
                         }
                         Ok(())
                     });
@@ -3176,7 +3214,7 @@ impl Host {
             }
         }
         if current && !self.reinstall(&l, ip, None)? {
-            crate::net::unroute(ip);
+            crate::net::unroute(self.config_now().vm_addr(ip));
         }
         for (_, path, _) in &owed {
             crate::util::unlink_durably(path)?;
@@ -4768,7 +4806,7 @@ impl Host {
         self.after_boot_with(boot_id(), route_hop)
     }
 
-    fn after_boot_with(&self, boot: &str, mut route: impl FnMut(Ipv4Addr, Hop) -> Result<()>) -> Result<Option<bool>> {
+    fn after_boot_with(&self, boot: &str, mut route: impl FnMut(crate::net::VmAddr, Hop) -> Result<()>) -> Result<Option<bool>> {
         let ready = || std::fs::read_to_string(self.run.join(".boot-ready")).is_ok_and(|b| b == boot);
         if boot.is_empty() || ready() {
             return Ok(None);
@@ -4808,7 +4846,8 @@ impl Host {
                     continue;
                 }
             }
-            match route(ip, via) {
+            let via = self.recheck_via6(ip, via);
+            match route(self.config_now().vm_addr(ip), via) {
                 Ok(()) => crate::info!("after boot: put back route {ip} via {via} (generation {})", a.seen),
                 Err(e) => {
                     crate::log!("after boot: route {ip} via {via}: {e}; tried again on the next open");
@@ -4970,7 +5009,7 @@ impl Host {
                 self.unpublish(&l, ip, id);
             }
             crate::info!("withdrew {ip} (generation {gen}): vm {name}'s process died without withdrawing it");
-            crate::net::unroute(ip);
+            crate::net::unroute(self.config_now().vm_addr(ip));
             withdrawn.push((name.to_string(), ip, gen));
         }
         // Failed writes and busy names keep boot recovery incomplete. Write failures first:
@@ -5224,14 +5263,8 @@ const REPAIR: &str = "; no dead vm's address is withdrawn here until it is repai
 /// This network namespace's addresses and next hops, IPv4 and IPv6, each once: what no VM here is given.
 fn here() -> Result<Vec<(IpAddr, &'static str)>> {
     let local = crate::net::local_ips()?.into_iter().map(|a| (a, "address"));
-    let gateways = crate::net::gateways(&std::fs::read_to_string("/proc/net/route")?).into_iter().map(|g| (g.into(), "gateway"));
-    // None without IPv6 (`ipv6.disable=1`).
-    let table6 = match std::fs::read_to_string("/proc/net/ipv6_route") {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        t => t?,
-    };
-    let gateways6 = crate::net::gateways6(&table6).into_iter().map(|g| (g.into(), "gateway"));
-    let mut all: Vec<_> = local.chain(gateways).chain(gateways6).collect();
+    let gateways = crate::net::next_hops()?.into_iter().map(|g| (g, "gateway"));
+    let mut all: Vec<_> = local.chain(gateways).collect();
     all.sort();
     all.dedup_by_key(|(ip, _)| *ip);
     Ok(all)
@@ -7829,7 +7862,7 @@ pub(crate) mod tests {
         let (_dir, h) = host("fresh-gateway");
         let cfg = Config { vm_ips: "10.9.0.1-10.9.0.4".into(), ..Config::default() };
         let (gw, local) = (ip("10.9.0.1"), ip("10.9.0.3"));
-        let ok = |ip| crate::listen::routable_by(ip, &cfg, &[], &[gw], |ip| Ok(ip == IpAddr::V4(local)));
+        let ok = |ip| crate::listen::routable_by(ip, &cfg, &[], &[IpAddr::V4(gw)], |ip| Ok(ip == IpAddr::V4(local)));
         let _names = [h.take_name("a", false).unwrap(), h.take_name("b", false).unwrap()];
         let l = h.lock().unwrap();
         for want in [gw, local] {
@@ -7872,7 +7905,10 @@ pub(crate) mod tests {
             w.contains("vm_ipv6_prefix fd00:1::/96 covers fd00:1::a09:7, this host's address: the prefix is VMs' alone, and no vm is given 10.9.0.7"),
             "{w}"
         );
-        assert!(w.contains("VMs' IPv6 addresses are reported and configured in guests, but not routed yet"), "{w}");
+        assert!(
+            w.contains("VMs' IPv6 addresses are configured in guests and routed (to peers via their IPv6 underlays), but not held in migrations (#1299)"),
+            "{w}"
+        );
         let w = cfg.warnings_by(|_| Ok(false), Ok(vec![(v6("fd00:2::a09:7"), "address")])).join("\n");
         assert!(!w.contains("covers"), "{w}");
     }
@@ -9288,6 +9324,24 @@ pub(crate) mod tests {
         taps.into_iter().map(|(n, i, o, _)| (n, i, o)).collect()
     }
 
+    /// #1297: a saved route's IPv6 next hop (its /128's) is put back while it is still one, else
+    /// the /32's next hop alone.
+    #[test]
+    fn a_saved_ipv6_next_hop_is_rechecked() {
+        let (_h_dir, mut h) = host("recheck-via6");
+        let (vm, v4) = (ip("10.9.5.1"), ip("192.0.2.7"));
+        let hop = |v6: &str| Hop::new(v4.into(), Some(v6.parse().unwrap())).unwrap();
+        assert_eq!(h.recheck_via6(vm, hop("2001:db8::7")), hop("2001:db8::7"));
+        for bad in ["ff02::1", "::"] {
+            assert_eq!(h.recheck_via6(vm, hop(bad)), Hop::from(v4), "{bad}");
+        }
+        h.cfg.vm_ipv6_prefix = Some(crate::net::Ipv6Prefix::parse("2001:db8::/96").unwrap());
+        std::fs::write(h.state.join("host.json"), serde_json::to_vec(&h.cfg).unwrap()).unwrap();
+        assert_eq!(h.recheck_via6(vm, hop("2001:db8::a09:502")), Hop::from(v4), "a VM's address");
+        let only6 = Hop::new("2001:db8:1::7".parse().unwrap(), None).unwrap();
+        assert_eq!(h.recheck_via6(vm, only6), only6, "an IPv6 /32 next hop is route_check's");
+    }
+
     /// #553, #555: until a boot's recovery is marked complete, routes to peers' VMs come back from
     /// the records, and the VMs that died with the host are recorded as lost, then withdrawn.
     #[test]
@@ -9310,8 +9364,8 @@ pub(crate) mod tests {
             c.keep();
         }
         let (routes, down) = (std::cell::RefCell::new(Vec::new()), std::cell::Cell::new(true));
-        let route = |ip, via| {
-            routes.borrow_mut().push((ip, via));
+        let route = |ip: crate::net::VmAddr, via| {
+            routes.borrow_mut().push((ip.v4, via));
             if down.get() {
                 bail!("Network is unreachable");
             }
@@ -9352,8 +9406,8 @@ pub(crate) mod tests {
         let (peer, via) = (ip("10.9.5.1"), ip("192.0.2.7"));
         h.put_addr(peer, &Addr { seen: 3, via: Some(via.into()), ..Addr::default() }, true).unwrap();
         let routes = std::cell::RefCell::new(Vec::new());
-        let route = |ip, via| {
-            routes.borrow_mut().push((ip, via));
+        let route = |ip: crate::net::VmAddr, via| {
+            routes.borrow_mut().push((ip.v4, via));
             Ok(())
         };
         // Never a peer's next hop: skipped for good once every peer is known.

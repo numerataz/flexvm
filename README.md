@@ -652,12 +652,33 @@ the warnings.
 ### IPv6 addresses
 
 **Not usable yet.** With `vm_ipv6_prefix` set, flexvm derives and reports
-each VM's IPv6 address and configures it in the guest, but does not yet
-route it (the taps and routes come with #1297). Nothing answers at the
-address from outside the VM, and the guest's IPv6 traffic, to IPv6
-nameservers in `dns` too, is dropped at its tap. `info` and the listener warn about this for as
-long as it is true. Setting the prefix now only lets every host agree on it
-before the data plane lands. Without it, nothing changes.
+each VM's IPv6 address, configures it in the guest, routes it to the VM's
+tap, and routes it on each peer via the host it runs on, as its IPv4 address
+is (via that host's IPv6 underlay: a peer with none leaves it to the host's
+own IPv6 routes). It is not yet held during a migration (#1299): IPv6 packets
+that arrive during the downtime are dropped. Nor is it answered for on the
+LAN (#1300): machines that are not peers need a route to the prefix via a
+host. `info` and the listener warn about this for as long as it is true.
+Without the prefix, nothing changes: taps keep IPv6 off.
+
+On the host, each VM's IPv6 address is a `/128` routed to its tap beside its
+`/32`, with a permanent neighbour entry for the guest's MAC. The tap gets
+IPv6 only once a VM with an IPv6 address has it, with `fe80::1` (no duplicate
+address detection) as the guests' gateway and no address of its own
+otherwise (`addr_gen_mode=1`, `accept_ra=0`). Its ingress filter passes IPv6
+from the VM's address alone (not from the guest's link-local address, so the
+guest needs its pinned gateway entry), and no router solicitations,
+advertisements, redirects or hop-by-hop, routing or destination options
+headers; the host's own IPv6 multicast to the tap (MLD reports) is dropped
+on the way out. While a VM is held for a migration or checkpoint, its `/128`
+goes to the hold device with its `/32`, but IPv6 packets there are dropped
+(counted with the held address's), not held yet (#1299). Every listener
+(with the prefix set) and every VM process that routes an IPv6 address turn
+on IPv6 forwarding (see [Migrate](#migrate) for `accept_ra`). A new prefix
+applies to VMs routed after it (started, restored or arriving); running VMs
+keep the address they were routed by, and routes to peers' VMs under the old
+prefix stay until the host reboots: set the prefix
+before VMs run, and do not change it while they do.
 
 In the guest, flexvm-init gives `eth0` the address as a `/128` and a default
 route via `fe80::1`, the host's tap, whose MAC is pinned by a permanent
@@ -812,6 +833,13 @@ fails, asking for `underlay`.
 Every VM process and listener sets `net.ipv4.ip_forward=1`, and
 `proxy_arp` on the announce device, and never reverts them: the host routes
 between all its interfaces from then on, so check its `FORWARD` policy.
+With `vm_ipv6_prefix`, they also set `net.ipv6.conf.all.forwarding=1` (and
+check `ip6tables`' `FORWARD` policy). An interface that forwards takes router
+advertisements only with `accept_ra=2`, so before turning forwarding on,
+flexvm sets `accept_ra=2` on each interface that had `1` (IPv6 on and not
+forwarding yet) and logs it: an uplink configured by advertisements keeps its
+addresses and default route. Once forwarding is on, `accept_ra` is left to
+you; interfaces made later take the default's.
 
 A host that only runs VMs needs no listener, but see below for what recovers it after a reboot.
 
@@ -1344,4 +1372,5 @@ copy-on-write, packet holds, clocks, Firecracker patches, measurements).
   generation's `meta.json` (whose recorded hashes and file stamps decide what
   is re-hashed). Keep it, and its parents, root-owned and not group- or
   world-writable.
-- `net.ipv4.ip_forward` is turned on host-wide and left on.
+- `net.ipv4.ip_forward` is turned on host-wide and left on, as is
+  `net.ipv6.conf.all.forwarding` with `vm_ipv6_prefix`.

@@ -1,4 +1,5 @@
-//! Host networking: every VM gets a /32 routed to its own tap.
+//! Host networking: every VM gets a /32 routed to its own tap, and with `vm_ipv6_prefix` a
+//! /128 beside it (`VmAddr`).
 //!
 //! All taps share one MAC, as do all guests, so moving a VM between hosts is just moving
 //! its route (plus, with `announce_dev`, a gratuitous ARP for proxy-ARP LAN peers).
@@ -113,6 +114,32 @@ pub const TAP_ADDR: Ipv4Addr = Ipv4Addr::new(169, 254, 1, 2);
 
 /// Room for the packets a migration held, injected all at once (default 1000).
 pub const TAP_QUEUE: u32 = 4096;
+
+/// The guests' IPv6 gateway on every tap (`tap_ipv6`), link-local as a router's is; a guest's
+/// neighbour entry for it is pinned to `GATEWAY_MAC`, as its IPv4 gateway's is.
+pub const TAP_ADDR6: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+
+/// A VM's addresses as its host routes them: its IPv4 address, and with `vm_ipv6_prefix` its IPv6
+/// one (`Config::vm_addr`), which goes wherever the IPv4 one does (the tap's guard, neighbour
+/// entry and route). Without an IPv6 address every helper does just what it does for the IPv4 one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmAddr {
+    pub v4: Ipv4Addr,
+    pub v6: Option<Ipv6Addr>,
+}
+
+impl From<Ipv4Addr> for VmAddr {
+    fn from(v4: Ipv4Addr) -> VmAddr {
+        VmAddr { v4, v6: None }
+    }
+}
+
+impl VmAddr {
+    /// Its IPv4 address, then its IPv6 one if it has one.
+    pub fn each(self) -> impl Iterator<Item = IpAddr> {
+        std::iter::once(IpAddr::V4(self.v4)).chain(self.v6.map(IpAddr::V6))
+    }
+}
 
 /// A tap of exactly `name` (`create_tap_with`).
 #[cfg(test)]
@@ -383,30 +410,78 @@ pub fn ifreq(name: &str) -> Result<libc::ifreq> {
 
 /// Puts the gateway MAC back first: udev (`MACAddressPolicy=persistent`) may have replaced
 /// it, leaving the guest's pinned gateway ARP entry pointing nowhere.
-pub fn attach(ip: Ipv4Addr, tap: &str) -> Result<()> {
+pub fn attach(ip: VmAddr, tap: &str) -> Result<()> {
     route(ip, neighbour(ip, tap)?)
 }
 
 /// Installs the route using the index retained when the caller readied the tap.
-pub fn route(ip: Ipv4Addr, index: u32) -> Result<()> {
+pub fn route(ip: VmAddr, index: u32) -> Result<()> {
     route_dev(true, ip, index)
 }
 
 /// `attach` but the route, which a migration target installs at its commit; returns the
 /// tap's index.
-pub fn neighbour(ip: Ipv4Addr, tap: &str) -> Result<u32> {
+pub fn neighbour(ip: VmAddr, tap: &str) -> Result<u32> {
     let ifindex = ifindex(tap)?;
     if std::fs::read_to_string(format!("/sys/class/net/{tap}/address")).ok().and_then(|s| parse_mac(&s).ok()) != Some(GATEWAY_MAC) {
         set_mac(ifindex, &GATEWAY_MAC)?;
     }
     // Before the neighbour entry and the route: the tap passes only `ip`'s packets once it is `ip`'s.
     guard(ifindex, Some(ip)).map_err(|e| format!("tap {tap}: {e}"))?;
-    // struct ndmsg: family, pad, index, state, flags, type.
-    let mut neigh = [&[libc::AF_INET as u8, 0, 0, 0][..], &ifindex.to_ne_bytes(), &NUD_PERMANENT.to_ne_bytes(), &[0, 0]].concat();
-    attr(&mut neigh, NDA_DST, &ip.octets());
-    attr(&mut neigh, NDA_LLADDR, &GUEST_MAC);
-    netlink(RTM_NEWNEIGH, NLM_F_CREATE | NLM_F_REPLACE, &neigh)?;
+    if ip.v6.is_some() {
+        tap_ipv6(ifindex, tap).map_err(|e| format!("tap {tap}: IPv6 (vm_ipv6_prefix): {e}"))?;
+    }
+    for dst in ip.each() {
+        netlink(RTM_NEWNEIGH, NLM_F_CREATE | NLM_F_REPLACE, &neigh_msg(ifindex, dst))?;
+    }
     Ok(ifindex)
+}
+
+/// A permanent neighbour entry for the guest's address `dst` on the tap at `ifindex`: struct ndmsg
+/// (family, pad, index, state, flags, type), the address and `GUEST_MAC`.
+fn neigh_msg(ifindex: u32, dst: IpAddr) -> Vec<u8> {
+    let (family, dst) = match dst {
+        IpAddr::V4(v4) => (libc::AF_INET, v4.octets().to_vec()),
+        IpAddr::V6(v6) => (libc::AF_INET6, v6.octets().to_vec()),
+    };
+    let mut neigh = [&[family as u8, 0, 0, 0][..], &ifindex.to_ne_bytes(), &NUD_PERMANENT.to_ne_bytes(), &[0, 0]].concat();
+    attr(&mut neigh, NDA_DST, &dst);
+    attr(&mut neigh, NDA_LLADDR, &GUEST_MAC);
+    neigh
+}
+
+/// struct ifaddrmsg's flag for an address with no duplicate address detection (if_addr.h).
+const IFA_F_NODAD: u8 = 0x02;
+
+/// IPv6 on tap `name` (at `ifindex`) once a VM with an IPv6 address has it, before its neighbour
+/// entry and route: off until then (`make_tap`), so off on every tap without `vm_ipv6_prefix`. No
+/// address of the kernel's own (addr_gen_mode 1: no EUI-64 link-local, nor its duplicate address
+/// detection), no router advertisements taken (`guard` drops a guest's anyway), and `TAP_ADDR6`
+/// without duplicate address detection. What kept IPv6 off on taps, the host's MLD reports as it
+/// comes up (and each time the tap does), is dropped on the way out (`multicast_filter`): sent to
+/// a tap no Firecracker reads yet (an arrival's), it would count as a frame lost on its way to the
+/// guest (tx_dropped). Done again on each `neighbour`: the address goes each time the tap goes down.
+fn tap_ipv6(ifindex: u32, name: &str) -> Result<()> {
+    let filter = filter_msg(ifindex, CLSACT_EGRESS, &multicast_filter());
+    netlink(libc::RTM_NEWTFILTER, NLM_F_CREATE | NLM_F_REPLACE, &filter).map_err(|e| format!("its multicast filter (cls_bpf): {e}"))?;
+    for (key, value) in [("addr_gen_mode", "1"), ("accept_ra", "0"), ("autoconf", "0"), ("disable_ipv6", "0")] {
+        conf("ipv6", name, key, value)?;
+    }
+    netlink(RTM_NEWADDR, NLM_F_CREATE | NLM_F_REPLACE, &tap_addr6_msg(ifindex))?;
+    // On already, normally (`flexvm listen`, boot recovery); a VM process finds it off if the
+    // prefix was set since. Without it the guest's IPv6 reaches this host only.
+    if let Err(e) = ipv6_forward() {
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| crate::log!("WARNING: {e}: VMs' IPv6 addresses reach this host only; this is logged once"));
+    }
+    Ok(())
+}
+
+/// `TAP_ADDR6` on the tap at `ifindex`: struct ifaddrmsg (family, prefix length, flags, scope, index).
+fn tap_addr6_msg(ifindex: u32) -> Vec<u8> {
+    let mut addr = [&[libc::AF_INET6 as u8, 64, IFA_F_NODAD, RT_SCOPE_LINK][..], &ifindex.to_ne_bytes()].concat();
+    attr(&mut addr, IFA_ADDRESS, &TAP_ADDR6.octets());
+    addr
 }
 
 const TC_H_ROOT: u32 = 0xffff_ffff;
@@ -435,6 +510,7 @@ fn plug_msg(ifindex: u32, action: i32) -> Vec<u8> {
 const CLSACT_HANDLE: u32 = 0xffff_0000;
 const TC_H_CLSACT: u32 = 0xffff_fff1;
 const CLSACT_INGRESS: u32 = 0xffff_fff2;
+const CLSACT_EGRESS: u32 = 0xffff_fff3;
 const TCA_BPF_OPS_LEN: u16 = 4;
 const TCA_BPF_OPS: u16 = 5;
 const TCA_BPF_FLAGS: u16 = 8;
@@ -444,57 +520,132 @@ const TC_ACT_SHOT: u32 = 2;
 
 /// The guest is untrusted, and the host forwards what it sends (with a loose rp_filter, which
 /// the hold needs: `TAP_ADDR`), so the tap's ingress lets through only IPv4 from `ip` and ARP
-/// naming `ip` as its sender, nothing else (no other source, IPv6, VLAN or other ethertype);
-/// with no `ip`, nothing. ARP is held to the address too: the guest never needs another (its
-/// gateway's entry is pinned, and the host's for it is permanent), and a spoofed sender could
-/// only leave stale neighbour entries. A clsact qdisc (made once, kept by a create of one
-/// already there) holds a classic BPF filter in direct-action mode, which a replace swaps at
-/// once, with no gap; both go with the tap.
-fn guard(ifindex: u32, ip: Option<Ipv4Addr>) -> Result<()> {
+/// naming `ip` as its sender, and with an IPv6 address IPv6 from it, nothing else (no other
+/// source, VLAN or other ethertype); with no `ip`, nothing. ARP is held to the address too: the
+/// guest never needs another (its gateway's entry is pinned, and the host's for it is
+/// permanent), and a spoofed sender could only leave stale neighbour entries; NDP is, for the
+/// same reasons. A clsact qdisc (made once, kept by a create of one already there) holds a
+/// classic BPF filter in direct-action mode, which a replace swaps at once, with no gap; both go
+/// with the tap.
+fn guard(ifindex: u32, ip: Option<VmAddr>) -> Result<()> {
     if ip.is_none() {
         let mut qdisc = tcmsg(ifindex, CLSACT_HANDLE, TC_H_CLSACT, 0);
         attr(&mut qdisc, TCA_KIND, b"clsact\0");
         netlink(libc::RTM_NEWQDISC, NLM_F_CREATE, &qdisc).map_err(|e| format!("its clsact qdisc (sch_ingress): {e}"))?;
     }
+    netlink(libc::RTM_NEWTFILTER, NLM_F_CREATE | NLM_F_REPLACE, &filter_msg(ifindex, CLSACT_INGRESS, &source_filter(ip)))
+        .map_err(|e| format!("its source filter (cls_bpf): {e}").into())
+}
+
+/// `ops` as the one filter at clsact's `parent` hook of the tap at `ifindex`.
+fn filter_msg(ifindex: u32, parent: u32, ops: &[libc::sock_filter]) -> Vec<u8> {
     // Handle 1, priority 1, every protocol (in network order).
-    let mut filter = tcmsg(ifindex, 1, CLSACT_INGRESS, 1 << 16 | u32::from((libc::ETH_P_ALL as u16).to_be()));
+    let mut filter = tcmsg(ifindex, 1, parent, 1 << 16 | u32::from((libc::ETH_P_ALL as u16).to_be()));
     attr(&mut filter, TCA_KIND, b"bpf\0");
-    let ops = source_filter(ip);
     let mut opts = Vec::new();
     attr(&mut opts, TCA_BPF_OPS_LEN, &(ops.len() as u16).to_ne_bytes());
     attr(&mut opts, TCA_BPF_OPS, &ops.iter().flat_map(|op| [&op.code.to_ne_bytes()[..], &[op.jt, op.jf], &op.k.to_ne_bytes()].concat()).collect::<Vec<u8>>());
     attr(&mut opts, TCA_BPF_FLAGS, &TCA_BPF_FLAG_ACT_DIRECT.to_ne_bytes());
     attr(&mut filter, TCA_OPTIONS, &opts);
-    netlink(libc::RTM_NEWTFILTER, NLM_F_CREATE | NLM_F_REPLACE, &filter).map_err(|e| format!("its source filter (cls_bpf): {e}"))?;
-    Ok(())
+    filter
 }
+
+/// ICMPv6 a guest never sends its host: router solicitations and advertisements, and redirects
+/// (each from a link-local source, which `source_filter` drops anyway).
+const ICMPV6_ROUTER: [u32; 3] = [133, 134, 137];
+
+/// Extension headers an ICMPv6 message could follow, unread by `source_filter`, so dropped: hop-by-hop
+/// options, routing and destination options. A guest has no use for them (its MLD reports, behind
+/// hop-by-hop options, come from its link-local address); fragments pass, as NDP is never fragmented.
+const IPV6_HIDING: [u32; 3] = [0, 43, 60];
 
 /// The classic BPF program of `guard`, run on frames from their Ethernet header on; a load
 /// past a frame's end would end it with 0 (pass), so lengths are checked first.
-fn source_filter(ip: Option<Ipv4Addr>) -> Vec<libc::sock_filter> {
+fn source_filter(ip: Option<VmAddr>) -> Vec<libc::sock_filter> {
     let op = |code: u16, jt: u8, jf: u8, k: u32| libc::sock_filter { code, jt, jf, k };
-    let (ld_w, ld_h, ld_len, jeq, jge, ret) = (0x20, 0x28, 0x80, 0x15, 0x35, 0x06);
-    let Some(ip) = ip else { return vec![op(ret, 0, 0, TC_ACT_SHOT)] };
-    let ip = u32::from(ip);
+    let (ld_w, ld_h, ld_b, ld_len, jeq, jge, ret) = (0x20, 0x28, 0x30, 0x80, 0x15, 0x35, 0x06);
+    let Some(VmAddr { v4, v6 }) = ip else { return vec![op(ret, 0, 0, TC_ACT_SHOT)] };
+    let ip = u32::from(v4);
     // SKF_AD_OFF + SKF_AD_VLAN_TAG_PRESENT: the kernel strips a VLAN tag before ingress.
     let vlan = 0xffff_f000 + 48;
-    // Jumps are relative to the next instruction; 13 drops, 14 passes.
+    let Some(v6) = v6 else {
+        // Jumps are relative to the next instruction; 13 drops, 14 passes.
+        return vec![
+            op(ld_w, 0, 0, vlan),       // 0
+            op(jeq, 0, 11, 0),          // 1: tagged: drop
+            op(ld_h, 0, 0, 12),         // 2: ethertype
+            op(jeq, 0, 4, 0x0800),      // 3: not IPv4: 8
+            op(ld_len, 0, 0, 0),        // 4
+            op(jge, 0, 7, 14 + 20),     // 5: Ethernet and an IPv4 header
+            op(ld_w, 0, 0, 14 + 12),    // 6: source
+            op(jeq, 6, 5, ip),          // 7
+            op(jeq, 0, 4, 0x0806),      // 8: not ARP: drop
+            op(ld_len, 0, 0, 0),        // 9
+            op(jge, 0, 2, 14 + 28),     // 10: Ethernet and an Ethernet/IPv4 ARP body
+            op(ld_w, 0, 0, 14 + 14),    // 11: sender protocol address
+            op(jeq, 1, 0, ip),          // 12
+            op(ret, 0, 0, TC_ACT_SHOT), // 13
+            op(ret, 0, 0, TC_ACT_OK),   // 14
+        ];
+    };
+    // The same, then IPv6 from `v6` (its NDP too), but no router's ICMPv6 (`ICMPV6_ROUTER`), nor
+    // an extension header it could hide behind (`IPV6_HIDING`); a fragment's ICMPv6 is never NDP.
+    // Jumps are relative to the next instruction; 35 drops, 36 passes.
+    let word = |i: usize| u32::from_be_bytes(v6.octets()[i * 4..i * 4 + 4].try_into().unwrap());
     vec![
-        op(ld_w, 0, 0, vlan),       // 0
-        op(jeq, 0, 11, 0),          // 1: tagged: drop
-        op(ld_h, 0, 0, 12),         // 2: ethertype
-        op(jeq, 0, 4, 0x0800),      // 3: not IPv4: 8
-        op(ld_len, 0, 0, 0),        // 4
-        op(jge, 0, 7, 14 + 20),     // 5: Ethernet and an IPv4 header
-        op(ld_w, 0, 0, 14 + 12),    // 6: source
-        op(jeq, 6, 5, ip),          // 7
-        op(jeq, 0, 4, 0x0806),      // 8: not ARP: drop
-        op(ld_len, 0, 0, 0),        // 9
-        op(jge, 0, 2, 14 + 28),     // 10: Ethernet and an Ethernet/IPv4 ARP body
-        op(ld_w, 0, 0, 14 + 14),    // 11: sender protocol address
-        op(jeq, 1, 0, ip),          // 12
-        op(ret, 0, 0, TC_ACT_SHOT), // 13
-        op(ret, 0, 0, TC_ACT_OK),   // 14
+        op(ld_w, 0, 0, vlan),            // 0
+        op(jeq, 0, 33, 0),               // 1: tagged: drop
+        op(ld_h, 0, 0, 12),              // 2: ethertype
+        op(jeq, 0, 4, 0x0800),           // 3: not IPv4: 8
+        op(ld_len, 0, 0, 0),             // 4
+        op(jge, 0, 29, 14 + 20),         // 5: Ethernet and an IPv4 header
+        op(ld_w, 0, 0, 14 + 12),         // 6: source
+        op(jeq, 28, 27, ip),             // 7
+        op(jeq, 0, 4, 0x0806),           // 8: not ARP: 13
+        op(ld_len, 0, 0, 0),             // 9
+        op(jge, 0, 24, 14 + 28),         // 10: Ethernet and an Ethernet/IPv4 ARP body
+        op(ld_w, 0, 0, 14 + 14),         // 11: sender protocol address
+        op(jeq, 23, 22, ip),             // 12
+        op(jeq, 0, 21, 0x86dd),          // 13: not IPv6: drop
+        op(ld_len, 0, 0, 0),             // 14
+        op(jge, 0, 19, 14 + 40),         // 15: Ethernet and an IPv6 header
+        op(ld_w, 0, 0, 14 + 8),          // 16: source, a word at a time
+        op(jeq, 0, 17, word(0)),         // 17
+        op(ld_w, 0, 0, 14 + 12),         // 18
+        op(jeq, 0, 15, word(1)),         // 19
+        op(ld_w, 0, 0, 14 + 16),         // 20
+        op(jeq, 0, 13, word(2)),         // 21
+        op(ld_w, 0, 0, 14 + 20),         // 22
+        op(jeq, 0, 11, word(3)),         // 23
+        op(ld_b, 0, 0, 14 + 6),          // 24: next header
+        op(jeq, 3, 0, 58),               // 25: ICMPv6: 29
+        op(jeq, 8, 0, IPV6_HIDING[0]),   // 26
+        op(jeq, 7, 0, IPV6_HIDING[1]),   // 27
+        op(jeq, 6, 7, IPV6_HIDING[2]),   // 28: anything else passes
+        op(ld_len, 0, 0, 0),             // 29
+        op(jge, 0, 4, 14 + 40 + 1),      // 30: and its type
+        op(ld_b, 0, 0, 14 + 40),         // 31
+        op(jeq, 2, 0, ICMPV6_ROUTER[0]), // 32
+        op(jeq, 1, 0, ICMPV6_ROUTER[1]), // 33
+        op(jeq, 0, 1, ICMPV6_ROUTER[2]), // 34
+        op(ret, 0, 0, TC_ACT_SHOT),      // 35
+        op(ret, 0, 0, TC_ACT_OK),        // 36
+    ]
+}
+
+/// The classic BPF program of `tap_ipv6`'s egress filter: the host's IPv6 multicast to a guest
+/// (MLD reports, neighbour solicitations: the host's entry for the guest is permanent) is
+/// dropped, and everything else passes (as a load past a frame's end does).
+fn multicast_filter() -> Vec<libc::sock_filter> {
+    let op = |code: u16, jt: u8, jf: u8, k: u32| libc::sock_filter { code, jt, jf, k };
+    let (ld_h, ld_b, jeq, ret) = (0x28, 0x30, 0x15, 0x06);
+    vec![
+        op(ld_h, 0, 0, 12),         // 0: ethertype
+        op(jeq, 0, 3, 0x86dd),      // 1: not IPv6: pass
+        op(ld_b, 0, 0, 14 + 24),    // 2: the destination's first byte
+        op(jeq, 0, 1, 0xff),        // 3: multicast: drop
+        op(ret, 0, 0, TC_ACT_SHOT), // 4
+        op(ret, 0, 0, TC_ACT_OK),   // 5
     ]
 }
 
@@ -855,27 +1006,95 @@ pub fn gateways6(table: &str) -> Vec<Ipv6Addr> {
     table.lines().filter_map(hop).map(Ipv6Addr::from).collect()
 }
 
-/// A delete names the device, so it removes only that route.
-pub fn route_dev(add: bool, ip: Ipv4Addr, ifindex: u32) -> Result<()> {
-    let mut route = rtmsg(RT_SCOPE_LINK);
-    attr(&mut route, RTA_DST, &ip.octets());
+/// This network namespace's next hops, IPv4 and IPv6 (none of IPv6 where it is off: no
+/// `/proc/net/ipv6_route`).
+pub fn next_hops() -> std::io::Result<Vec<IpAddr>> {
+    let v4 = gateways(&std::fs::read_to_string("/proc/net/route")?).into_iter().map(IpAddr::V4);
+    let v6 = match std::fs::read_to_string("/proc/net/ipv6_route") {
+        Ok(table) => gateways6(&table),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => return Err(e),
+    };
+    Ok(v4.chain(v6.into_iter().map(IpAddr::V6)).collect())
+}
+
+/// A delete names the device, so it removes only that route. Its IPv6 address's /128 goes with
+/// the /32: added first, so a failure leaves the /32 where it was routed; deleted after it, even
+/// when the /32's delete fails.
+pub fn route_dev(add: bool, ip: VmAddr, ifindex: u32) -> Result<()> {
+    if add {
+        let v6 = ip.v6.map_or(Ok(()), |v6| netlink(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE, &dev_route_msg(v6.into(), ifindex)));
+        return v6.and_then(|()| netlink(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE, &dev_route_msg(ip.v4.into(), ifindex)));
+    }
+    ip.each().map(|dst| unroute_dev(dst, ifindex)).fold(Ok(()), Result::and)
+}
+
+/// Deletes `ip`'s route (a /32 or /128) to the device at `ifindex`, and no other.
+pub fn unroute_dev(ip: IpAddr, ifindex: u32) -> Result<()> {
+    netlink(RTM_DELROUTE, 0, &dev_route_msg(ip, ifindex))
+}
+
+/// The route of `ip` (a /32 or /128) to the device at `ifindex`.
+fn dev_route_msg(ip: IpAddr, ifindex: u32) -> Vec<u8> {
+    let (mut route, dst) = match ip {
+        IpAddr::V4(v4) => (rtmsg(RT_SCOPE_LINK), v4.octets().to_vec()),
+        IpAddr::V6(v6) => (rtmsg6(RT_SCOPE_LINK), v6.octets().to_vec()),
+    };
+    attr(&mut route, RTA_DST, &dst);
     attr(&mut route, RTA_OIF, &ifindex.to_ne_bytes());
-    let (kind, flags) = if add { (RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE) } else { (RTM_DELROUTE, 0) };
-    netlink(kind, flags, &route)
+    route
 }
 
 /// Removes `ip`'s route through a gateway (`route_via`'s, whichever peer it names: a migration's
 /// switch to its target is never recorded, and a record can name a newer peer than the route):
 /// universe scope only, so never a tap's or the hold device's (`route_dev`, link scope), which
-/// hosts sharing a network namespace each keep for their own VMs.
-pub fn unroute(ip: Ipv4Addr) {
+/// hosts sharing a network namespace each keep for their own VMs. Its IPv6 address's /128 via a
+/// peer (`route_via6`) goes with it.
+pub fn unroute(ip: VmAddr) {
     let mut route = rtmsg(RT_SCOPE_UNIVERSE);
-    attr(&mut route, RTA_DST, &ip.octets());
+    attr(&mut route, RTA_DST, &ip.v4.octets());
     let _ = netlink(RTM_DELROUTE, 0, &route);
+    if let Some(v6) = ip.v6 {
+        unroute6(v6);
+    }
+}
+
+/// The protocol of a /128 routed via a peer (`route_via6`): IPv6 route deletes go by no scope, so
+/// `unroute6` names it, and takes no tap's or hold device's /128 (`RTPROT_STATIC`, `route_dev`).
+const RTPROT_PEER6: u8 = libc::RTPROT_BOOT;
+
+/// A VM's IPv6 address (`vm_ipv6_prefix`) routed via a peer's IPv6 underlay, as `route_via` routes
+/// its /32: never via a local address (hosts sharing a network namespace).
+pub fn route_via6(ip: Ipv6Addr, via: Ipv6Addr) -> Result<()> {
+    if is_local_ip(via.into())? {
+        return Ok(());
+    }
+    netlink(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE, &via6_msg(ip, Some(via)))
+}
+
+/// Removes `ip`'s /128 via a peer (`route_via6`'s, whichever peer), and no other.
+pub fn unroute6(ip: Ipv6Addr) {
+    let _ = netlink(RTM_DELROUTE, 0, &via6_msg(ip, None));
+}
+
+/// `ip`'s /128 of `RTPROT_PEER6`, via `via` if given.
+fn via6_msg(ip: Ipv6Addr, via: Option<Ipv6Addr>) -> Vec<u8> {
+    let mut route = rtmsg6(RT_SCOPE_UNIVERSE);
+    route[5] = RTPROT_PEER6;
+    attr(&mut route, RTA_DST, &ip.octets());
+    if let Some(via) = via {
+        attr(&mut route, RTA_GATEWAY, &via.octets());
+    }
+    route
 }
 
 fn rtmsg(scope: u8) -> Vec<u8> {
     vec![libc::AF_INET as u8, 32, 0, 0, RT_TABLE_MAIN, RTPROT_STATIC, scope, RTN_UNICAST, 0, 0, 0, 0]
+}
+
+/// `rtmsg` for an IPv6 /128.
+fn rtmsg6(scope: u8) -> Vec<u8> {
+    vec![libc::AF_INET6 as u8, 128, 0, 0, RT_TABLE_MAIN, RTPROT_STATIC, scope, RTN_UNICAST, 0, 0, 0, 0]
 }
 
 fn attr(buf: &mut Vec<u8>, kind: u16, data: &[u8]) {
@@ -1002,6 +1221,40 @@ fn enable_proxy_arp(on: &mut ProxyArp, dev: &str, index: Result<u32>, write: imp
 
 pub fn ip_forward() -> Result<()> {
     enable("/proc/sys/net/ipv4/ip_forward".as_ref()).map_err(|e| format!("ip_forward: {e}").into())
+}
+
+/// IPv6 forwarding (`all`), for VMs' IPv6 addresses (`vm_ipv6_prefix`). An interface that
+/// forwards takes router advertisements only with accept_ra 2, so turning it on would leave each
+/// with 1 (the default) without them: an uplink configured by them (SLAAC, its default route)
+/// would lose that as it expires. Each that takes them now is set to 2 first, and logged; once
+/// forwarding is on (by this or anyone), interfaces' accept_ra is left to their admin.
+pub fn ipv6_forward() -> Result<()> {
+    ipv6_forward_in("/proc/sys/net/ipv6".as_ref()).map_err(|e| format!("IPv6 forwarding: {e}").into())
+}
+
+fn ipv6_forward_in(root: &std::path::Path) -> std::io::Result<()> {
+    let all = root.join("conf/all/forwarding");
+    if std::fs::read_to_string(&all).is_ok_and(|v| v.trim() == "1") {
+        return Ok(());
+    }
+    for dev in std::fs::read_dir(root.join("conf"))? {
+        let dev = dev?;
+        let name = dev.file_name().to_string_lossy().into_owned();
+        let is = |key: &str, value: &str| std::fs::read_to_string(dev.path().join(key)).is_ok_and(|v| v.trim() == value);
+        // Not lo's, nor a device's with IPv6 off (a VM's tap until it has an IPv6 address).
+        if ["all", "default", "lo"].contains(&name.as_str()) || is("disable_ipv6", "1") || !is("accept_ra", "1") || is("forwarding", "1") {
+            continue;
+        }
+        match std::fs::write(dev.path().join("accept_ra"), "2") {
+            Ok(()) => crate::log!("IPv6 forwarding (vm_ipv6_prefix): {name} still takes router advertisements (accept_ra 2)"),
+            // Gone meanwhile (a tap removed).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                crate::log!("WARNING: IPv6 forwarding (vm_ipv6_prefix): {name} stops taking router advertisements: setting its accept_ra to 2 failed: {e}")
+            }
+        }
+    }
+    std::fs::write(all, "1")
 }
 
 /// Sets a boolean sysctl to 1, written only if it is not already: one already on is enough even
@@ -1480,7 +1733,7 @@ mod tests {
         let filters = || String::from_utf8_lossy(&tc(&format!("filter show dev {tap} ingress")).stdout).into_owned();
         assert!(filters().matches("direct-action").count() == 1 && filters().contains("bytecode '1,6 0 0 2'"), "{}", filters());
         for ip in [Ipv4Addr::new(192, 0, 2, 7), Ipv4Addr::new(192, 0, 2, 8)] {
-            neighbour(ip, &tap).unwrap();
+            neighbour(ip.into(), &tap).unwrap();
             let f = filters();
             assert!(f.matches("direct-action").count() == 1 && f.contains(&format!(" {},", u32::from(ip))), "{f}");
         }
@@ -1598,10 +1851,10 @@ mod tests {
         assert!(ends(&w));
     }
 
-    /// `source_filter`'s verdict on `frame` (with a VLAN tag stripped or not), by a classic BPF
-    /// interpreter of the instructions it uses, a load past the end returning 0 as the kernel's.
-    fn verdict(ip: Option<Ipv4Addr>, frame: &[u8], tagged: bool) -> u32 {
-        let prog = source_filter(ip);
+    /// A classic BPF program's verdict on `frame` (with a VLAN tag stripped or not), by an
+    /// interpreter of the instructions `source_filter` and `multicast_filter` use, a load past
+    /// the end returning 0 as the kernel's.
+    fn run(prog: &[libc::sock_filter], frame: &[u8], tagged: bool) -> u32 {
         let (mut a, mut pc) = (0u32, 0usize);
         loop {
             let op = &prog[pc];
@@ -1609,8 +1862,12 @@ mod tests {
             let jump = |taken: bool| if taken { op.jt as usize } else { op.jf as usize };
             match op.code {
                 0x20 if op.k == 0xffff_f030 => a = tagged as u32,
-                0x20 | 0x28 => {
-                    let n = if op.code == 0x20 { 4 } else { 2 };
+                0x20 | 0x28 | 0x30 => {
+                    let n = match op.code {
+                        0x20 => 4,
+                        0x28 => 2,
+                        _ => 1,
+                    };
                     let Some(b) = frame.get(op.k as usize..op.k as usize + n) else { return 0 };
                     a = b.iter().fold(0, |a, &b| a << 8 | u32::from(b));
                 }
@@ -1623,26 +1880,194 @@ mod tests {
         }
     }
 
+    /// `source_filter`'s verdict on `frame`.
+    fn verdict(ip: Option<VmAddr>, frame: &[u8], tagged: bool) -> u32 {
+        run(&source_filter(ip), frame, tagged)
+    }
+
+    /// An Ethernet frame's header, guest to gateway, of type `ty`.
+    fn eth(ty: u16) -> Vec<u8> {
+        [&GATEWAY_MAC[..], &GUEST_MAC, &ty.to_be_bytes()].concat()
+    }
+
+    /// A frame of an IPv6 packet from `src` to `dst`, its next header `next` and `payload` after.
+    fn ipv6(src: Ipv6Addr, dst: Ipv6Addr, next: u8, payload: &[u8]) -> Vec<u8> {
+        [&eth(0x86dd)[..], &[0x60, 0, 0, 0], &(payload.len() as u16).to_be_bytes(), &[next, 64], &src.octets(), &dst.octets(), payload].concat()
+    }
+
+    fn six(s: &str) -> Ipv6Addr {
+        s.parse().unwrap()
+    }
+
     #[test]
     fn taps_pass_only_their_own_address() {
         let (me, other) = (Ipv4Addr::new(10, 9, 0, 2), Ipv4Addr::new(10, 9, 0, 3));
-        let eth = |ty: u16| [&GATEWAY_MAC[..], &GUEST_MAC, &ty.to_be_bytes()].concat();
         let ipv4 = |src: Ipv4Addr| [&eth(0x0800)[..], &[0x45, 0, 0, 28, 0, 0, 0, 0, 64, 17, 0, 0], &src.octets(), &[10, 9, 0, 9], &[0; 8]].concat();
         let arp = |sender: Ipv4Addr| [&eth(0x0806)[..], &[0, 1, 8, 0, 6, 4, 0, 1], &GUEST_MAC, &sender.octets(), &[0; 6], &[169, 254, 1, 1]].concat();
-        let pass = |ip, frame: &[u8]| verdict(ip, frame, false) == TC_ACT_OK;
-        assert!(pass(Some(me), &ipv4(me)));
-        assert!(!pass(Some(me), &ipv4(other)), "another's source");
-        assert!(!pass(Some(other), &ipv4(me)), "an old address, once readdressed");
-        assert!(!pass(Some(me), &ipv4(Ipv4Addr::UNSPECIFIED)), "a DHCP client's");
-        assert!(pass(Some(me), &arp(me)));
-        assert!(!pass(Some(me), &arp(other)), "ARP with another's sender");
-        assert!(!pass(Some(me), &ipv4(me)[..33]), "short of an IPv4 header");
-        assert!(!pass(Some(me), &arp(me)[..41]), "short of an ARP body");
-        assert!(!pass(Some(me), &eth(0x0800)), "an Ethernet header alone");
-        assert!(!pass(Some(me), &[&eth(0x86dd)[..], &[0; 40]].concat()), "IPv6");
-        assert!(!pass(Some(me), &[&eth(0x88cc)[..], &[0; 40]].concat()), "another ethertype");
-        assert!(verdict(Some(me), &ipv4(me), true) == TC_ACT_SHOT, "VLAN tagged");
-        assert!(!pass(None, &ipv4(me)) && !pass(None, &arp(me)), "a tap with no address yet");
+        // IPv4 and ARP go by the IPv4 address alone, with an IPv6 address or without.
+        let with_v6 = |v4: Ipv4Addr| VmAddr { v4, v6: Some(Ipv6Prefix::parse("fd00:7::/96").unwrap().vm(v4)) };
+        for (me, other) in [(VmAddr::from(me), VmAddr::from(other)), (with_v6(me), with_v6(other))] {
+            let pass = |ip: VmAddr, frame: &[u8]| verdict(Some(ip), frame, false) == TC_ACT_OK;
+            let (v4, other4) = (me.v4, other.v4);
+            assert!(pass(me, &ipv4(v4)));
+            assert!(!pass(me, &ipv4(other4)), "another's source");
+            assert!(!pass(other, &ipv4(v4)), "an old address, once readdressed");
+            assert!(!pass(me, &ipv4(Ipv4Addr::UNSPECIFIED)), "a DHCP client's");
+            assert!(pass(me, &arp(v4)));
+            assert!(!pass(me, &arp(other4)), "ARP with another's sender");
+            assert!(!pass(me, &ipv4(v4)[..33]), "short of an IPv4 header");
+            assert!(!pass(me, &arp(v4)[..41]), "short of an ARP body");
+            assert!(!pass(me, &eth(0x0800)), "an Ethernet header alone");
+            assert!(!pass(me, &[&eth(0x88cc)[..], &[0; 40]].concat()), "another ethertype");
+            assert!(verdict(Some(me), &ipv4(v4), true) == TC_ACT_SHOT, "VLAN tagged");
+        }
+        let v6 = Ipv6Prefix::parse("fd00:7::/96").unwrap().vm(me);
+        assert!(verdict(Some(me.into()), &ipv6(v6, six("2001:db8::1"), 17, &[0; 8]), false) == TC_ACT_SHOT, "IPv6, with no IPv6 address");
+        assert!(verdict(Some(me.into()), &[&eth(0x86dd)[..], &[0; 40]].concat(), false) == TC_ACT_SHOT, "IPv6 from ::");
+        assert!(verdict(None, &ipv4(me), false) == TC_ACT_SHOT && verdict(None, &arp(me), false) == TC_ACT_SHOT, "a tap with no address yet");
+    }
+
+    #[test]
+    fn taps_pass_ipv6_only_from_their_own_ipv6_address() {
+        let (v6, other, there) = (six("fd00:7::a09:2"), six("fd00:7::a09:3"), six("2001:db8::1"));
+        let me = VmAddr { v4: Ipv4Addr::new(10, 9, 0, 2), v6: Some(v6) };
+        let pass = |frame: &[u8]| verdict(Some(me), frame, false) == TC_ACT_OK;
+        let udp = [0u8; 8];
+        assert!(pass(&ipv6(v6, there, 17, &udp)));
+        assert!(pass(&ipv6(v6, there, 6, &[0; 20])), "TCP");
+        assert!(pass(&ipv6(v6, there, 59, &[])), "no next header, nothing after the header");
+        // Echo, and NDP from its address (its gateway's entry is pinned, but a guest may still solicit).
+        for ty in [128, 129, 135, 136] {
+            assert!(pass(&ipv6(v6, TAP_ADDR6, 58, &[ty, 0, 0, 0])), "ICMPv6 {ty}");
+        }
+        for ty in ICMPV6_ROUTER {
+            assert!(!pass(&ipv6(v6, six("ff02::2"), 58, &[ty as u8, 0, 0, 0])), "a router's ICMPv6 {ty}");
+        }
+        assert!(!pass(&ipv6(v6, TAP_ADDR6, 58, &[])), "ICMPv6 short of its type");
+        for next in IPV6_HIDING {
+            assert!(!pass(&ipv6(v6, six("ff02::2"), next as u8, &[58, 0, 0, 0, 0, 0, 0, 0, 134, 0, 0, 0])), "a router advertisement behind header {next}");
+        }
+        assert!(pass(&ipv6(v6, there, 44, &[17, 0, 0, 1, 0, 0, 0, 1])), "a fragment");
+        assert!(!pass(&ipv6(other, there, 17, &udp)), "another's source");
+        for i in 0..16 {
+            let mut src = v6.octets();
+            src[i] ^= 1;
+            assert!(!pass(&ipv6(src.into(), there, 17, &udp)), "another source, differing in byte {i}");
+        }
+        assert!(!pass(&ipv6(six("::ffff:10.9.0.2"), there, 17, &udp)), "its IPv4 address, mapped");
+        assert!(!pass(&ipv6(six("fe80::400:acff:fe10:2"), TAP_ADDR6, 58, &[135, 0, 0, 0])), "NDP from a link-local address");
+        let mld = [58, 0, 5, 2, 0, 0, 1, 0, 143, 0, 0, 0];
+        assert!(!pass(&ipv6(Ipv6Addr::UNSPECIFIED, six("ff02::16"), 0, &mld)), "an MLD report from ::");
+        assert!(!pass(&ipv6(v6, there, 17, &udp)[..14 + 39]), "short of an IPv6 header");
+        assert!(!pass(&eth(0x86dd)), "an Ethernet header alone");
+        assert!(verdict(Some(me), &ipv6(v6, there, 17, &udp), true) == TC_ACT_SHOT, "VLAN tagged");
+        let readdressed = VmAddr { v4: Ipv4Addr::new(10, 9, 0, 3), v6: Some(other) };
+        assert!(verdict(Some(readdressed), &ipv6(v6, there, 17, &udp), false) == TC_ACT_SHOT, "an old address, once readdressed");
+        assert!(verdict(None, &ipv6(v6, there, 17, &udp), false) == TC_ACT_SHOT, "a tap with no address yet");
+    }
+
+    #[test]
+    fn taps_drop_the_hosts_ipv6_multicast_on_the_way_out() {
+        let out = |frame: &[u8]| run(&multicast_filter(), frame, false) == TC_ACT_OK;
+        let (v6, there) = (six("fd00:7::a09:2"), six("2001:db8::1"));
+        let mld = [58, 0, 5, 2, 0, 0, 1, 0, 143, 0, 0, 0];
+        assert!(!out(&ipv6(TAP_ADDR6, six("ff02::16"), 0, &mld)), "an MLDv2 report");
+        assert!(!out(&ipv6(TAP_ADDR6, six("ff02::1:ff0a:902"), 58, &[135, 0, 0, 0])), "a neighbour solicitation");
+        assert!(out(&ipv6(there, v6, 17, &[0; 8])), "unicast to the guest");
+        assert!(out(&ipv6(TAP_ADDR6, v6, 58, &[129, 0, 0, 0])), "the gateway's echo reply");
+        assert!(out(&[&eth(0x0800)[..], &[0x45, 0, 0, 20], &[0; 16]].concat()) && out(&eth(0x0806)), "IPv4 and ARP");
+        assert!(out(&eth(0x86dd)), "short: no destination to tell by");
+    }
+
+    /// Without an IPv6 address a tap is guarded, neighboured and routed as it was before
+    /// `vm_ipv6_prefix`: the same filter and messages, and no others.
+    #[test]
+    fn without_an_ipv6_address_a_tap_is_set_up_as_before() {
+        let v4 = Ipv4Addr::new(10, 9, 0, 2);
+        let ip = u32::from(v4);
+        let before: [(u16, u8, u8, u32); 15] = [
+            (0x20, 0, 0, 0xffff_f030),
+            (0x15, 0, 11, 0),
+            (0x28, 0, 0, 12),
+            (0x15, 0, 4, 0x0800),
+            (0x80, 0, 0, 0),
+            (0x35, 0, 7, 34),
+            (0x20, 0, 0, 26),
+            (0x15, 6, 5, ip),
+            (0x15, 0, 4, 0x0806),
+            (0x80, 0, 0, 0),
+            (0x35, 0, 2, 42),
+            (0x20, 0, 0, 28),
+            (0x15, 1, 0, ip),
+            (0x06, 0, 0, TC_ACT_SHOT),
+            (0x06, 0, 0, TC_ACT_OK),
+        ];
+        let ops = |ip| source_filter(ip).iter().map(|op| (op.code, op.jt, op.jf, op.k)).collect::<Vec<_>>();
+        assert_eq!(ops(Some(v4.into())), before);
+        assert_eq!(ops(None), [(0x06, 0, 0, TC_ACT_SHOT)]);
+        assert_eq!(VmAddr::from(v4).each().collect::<Vec<_>>(), [IpAddr::V4(v4)], "one neighbour entry, one route");
+        let mut neigh = [&[libc::AF_INET as u8, 0, 0, 0][..], &7u32.to_ne_bytes(), &NUD_PERMANENT.to_ne_bytes(), &[0, 0]].concat();
+        attr(&mut neigh, NDA_DST, &v4.octets());
+        attr(&mut neigh, NDA_LLADDR, &GUEST_MAC);
+        assert_eq!(neigh_msg(7, v4.into()), neigh);
+        let mut route = vec![libc::AF_INET as u8, 32, 0, 0, RT_TABLE_MAIN, RTPROT_STATIC, RT_SCOPE_LINK, RTN_UNICAST, 0, 0, 0, 0];
+        attr(&mut route, RTA_DST, &v4.octets());
+        attr(&mut route, RTA_OIF, &7u32.to_ne_bytes());
+        assert_eq!(dev_route_msg(v4.into(), 7), route);
+    }
+
+    #[test]
+    fn an_ipv6_address_gets_its_own_neighbour_entry_and_route() {
+        let (v4, v6) = (Ipv4Addr::new(10, 9, 0, 2), six("fd00:7::a09:2"));
+        let both = VmAddr { v4, v6: Some(v6) };
+        assert_eq!(both.each().collect::<Vec<_>>(), [IpAddr::V4(v4), IpAddr::V6(v6)]);
+        let neigh = neigh_msg(7, v6.into());
+        assert_eq!(neigh[..12], [&[libc::AF_INET6 as u8, 0, 0, 0][..], &7u32.to_ne_bytes(), &NUD_PERMANENT.to_ne_bytes(), &[0, 0]].concat());
+        assert_eq!(
+            neigh[12..],
+            [&20u16.to_ne_bytes()[..], &NDA_DST.to_ne_bytes(), &v6.octets(), &10u16.to_ne_bytes(), &NDA_LLADDR.to_ne_bytes(), &GUEST_MAC, &[0, 0]].concat()
+        );
+        let route = dev_route_msg(v6.into(), 7);
+        assert_eq!(route[..12], [libc::AF_INET6 as u8, 128, 0, 0, RT_TABLE_MAIN, RTPROT_STATIC, RT_SCOPE_LINK, RTN_UNICAST, 0, 0, 0, 0]);
+        assert_eq!(
+            route[12..],
+            [&20u16.to_ne_bytes()[..], &RTA_DST.to_ne_bytes(), &v6.octets(), &8u16.to_ne_bytes(), &RTA_OIF.to_ne_bytes(), &7u32.to_ne_bytes()].concat()
+        );
+        // The gateway: link-local, no duplicate address detection.
+        let addr = tap_addr6_msg(7);
+        assert_eq!(addr[..8], [&[libc::AF_INET6 as u8, 64, IFA_F_NODAD, RT_SCOPE_LINK][..], &7u32.to_ne_bytes()].concat());
+        assert_eq!(addr[8..], [&20u16.to_ne_bytes()[..], &IFA_ADDRESS.to_ne_bytes(), &TAP_ADDR6.octets()].concat());
+    }
+
+    /// Forwarding stops interfaces with accept_ra 1 taking router advertisements: those that take
+    /// them are set to 2 first, and no other; once it is on, nothing is touched.
+    #[test]
+    fn ipv6_forwarding_keeps_router_advertisements_coming() {
+        let d = crate::test_util::TempDir::new("ipv6-forward");
+        let conf = |dev: &str, key: &str| d.join(format!("conf/{dev}/{key}"));
+        let set = |dev: &str, keys: &[(&str, &str)]| {
+            std::fs::create_dir_all(d.join(format!("conf/{dev}"))).unwrap();
+            for (k, v) in keys {
+                std::fs::write(conf(dev, k), format!("{v}\n")).unwrap();
+            }
+        };
+        let off = [("disable_ipv6", "0"), ("forwarding", "0")];
+        for dev in ["all", "default", "lo", "eth0"] {
+            set(dev, &[off[0], off[1], ("accept_ra", "1")]);
+        }
+        set("wlan0", &[off[0], off[1], ("accept_ra", "0")]);
+        set("fx0t1", &[("disable_ipv6", "1"), off[1], ("accept_ra", "1")]);
+        set("br0", &[off[0], ("forwarding", "1"), ("accept_ra", "1")]);
+        let ra = |dev: &str| std::fs::read_to_string(conf(dev, "accept_ra")).unwrap().trim().to_string();
+        ipv6_forward_in(&d).unwrap();
+        assert_eq!(std::fs::read_to_string(conf("all", "forwarding")).unwrap().trim(), "1");
+        assert_eq!(ra("eth0"), "2", "took them: still does");
+        for (dev, was) in [("default", "1"), ("lo", "1"), ("wlan0", "0"), ("fx0t1", "1"), ("br0", "1")] {
+            assert_eq!(ra(dev), was, "{dev} is left as it was");
+        }
+        set("eth1", &[off[0], off[1], ("accept_ra", "1")]);
+        ipv6_forward_in(&d).unwrap();
+        assert_eq!(ra("eth1"), "1", "forwarding on already: its admin's");
     }
 
     #[test]
@@ -1744,18 +2169,88 @@ mod tests {
             let index = ifindex("peer0").unwrap();
             let target = Ipv4Addr::new(198, 51, 100, 7);
             let route = || ip(&["-4", "route", "show", "198.51.100.7/32"]);
-            route_dev(true, target, index).unwrap();
-            unroute(target);
+            route_dev(true, target.into(), index).unwrap();
+            unroute(target.into());
             assert!(route().contains("dev peer0"), "a tap route survives a withdrawal");
             route_via(target, Ipv4Addr::new(192, 0, 2, 2).into()).unwrap();
-            unroute(target);
+            unroute(target.into());
             assert!(route().is_empty(), "a route via any peer goes");
             // Via an IPv6 next hop (RTA_VIA, Linux 5.2+), and withdrawn the same way (#1295).
             ip(&["-6", "addr", "add", "2001:db8::3/64", "dev", "peer0", "nodad"]);
             route_via(target, "2001:db8::2".parse().unwrap()).unwrap();
             assert!(route().contains("via inet6 2001:db8::2 dev peer0"), "{}", route());
-            unroute(target);
+            unroute(target.into());
             assert!(route().is_empty(), "a route via an IPv6 peer goes");
+            // A VM's /128 via a peer goes with its /32, a tap's (`route_dev`) stays (#1297).
+            let v6: Ipv6Addr = "fd00:7::c633:6407".parse().unwrap();
+            let route6 = || ip(&["-6", "route", "show", "fd00:7::c633:6407/128"]);
+            let both = VmAddr { v4: target, v6: Some(v6) };
+            route_dev(true, both, index).unwrap();
+            unroute(both);
+            assert!(route6().contains("dev peer0") && !route6().contains("via"), "a tap's /128 survives a withdrawal: {}", route6());
+            route_via6(v6, "2001:db8::2".parse().unwrap()).unwrap();
+            assert!(route6().contains("via 2001:db8::2 dev peer0"), "{}", route6());
+            unroute(both);
+            assert!(route6().is_empty(), "a /128 via a peer goes: {}", route6());
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// Needs CAP_SYS_ADMIN and CAP_NET_ADMIN, and iproute2; no VM. In a private netns: a tap has
+    /// IPv6 off until an address with an IPv6 one is its, then the /128's neighbour entry, route
+    /// and gateway beside the /32's, back after the tap goes down and up, and gone with the route.
+    #[test]
+    #[ignore]
+    fn a_taps_ipv6_comes_with_an_ipv6_address() {
+        std::thread::spawn(|| {
+            assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0, "{}", std::io::Error::last_os_error());
+            let ip = |args: &[&str]| {
+                let out = std::process::Command::new("ip").args(args).output().unwrap();
+                assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+                String::from_utf8(out.stdout).unwrap()
+            };
+            let tap = "tw6t0";
+            create_tap(tap, "test").unwrap();
+            let index = ifindex(tap).unwrap();
+            let sysctl = |key: &str| std::fs::read_to_string(format!("/proc/sys/net/ipv6/conf/{tap}/{key}")).unwrap().trim().to_string();
+            let v4 = Ipv4Addr::new(10, 9, 0, 2);
+            let v6 = six("fd00:7::a09:2");
+            attach(v4.into(), tap).unwrap();
+            assert_eq!(sysctl("disable_ipv6"), "1", "no IPv6 address: IPv6 stays off");
+            assert!(ip(&["-6", "route", "show", "table", "all", "dev", tap]).is_empty());
+            let both = VmAddr { v4, v6: Some(v6) };
+            attach(both, tap).unwrap();
+            let check = || {
+                assert_eq!((sysctl("disable_ipv6"), sysctl("addr_gen_mode"), sysctl("accept_ra")), ("0".into(), "1".into(), "0".into()));
+                let addrs = ip(&["-6", "addr", "show", "dev", tap]);
+                assert!(addrs.contains("inet6 fe80::1/64 scope link nodad") && addrs.matches("inet6").count() == 1, "{addrs}");
+                let neigh = ip(&["-6", "neigh", "show", "dev", tap]);
+                assert!(neigh.contains(&format!("{v6} lladdr {} PERMANENT", mac_string(&GUEST_MAC))), "{neigh}");
+                assert!(ip(&["-6", "route", "show", &format!("{v6}/128")]).contains(&format!("dev {tap}")));
+                assert!(ip(&["-4", "route", "show", "10.9.0.2/32"]).contains(&format!("dev {tap}")));
+            };
+            check();
+            assert_eq!(std::fs::read_to_string("/proc/sys/net/ipv6/conf/all/forwarding").unwrap().trim(), "1");
+            let tc = std::process::Command::new("tc").args(["filter", "show", "dev", tap, "egress"]).output().unwrap();
+            assert!(String::from_utf8_lossy(&tc.stdout).contains("direct-action"), "the multicast filter");
+            set_link_up(tap, false).unwrap();
+            set_link_up(tap, true).unwrap();
+            attach(both, tap).unwrap();
+            check();
+            // Held, both go to the hold device, and come back with an attach.
+            let hold = crate::hold::Holder::new("tw6h").unwrap().unwrap();
+            hold.hold(both, 1).unwrap();
+            assert_eq!(std::fs::read_to_string("/proc/sys/net/ipv6/conf/tw6h/disable_ipv6").unwrap().trim(), "0");
+            assert!(ip(&["-6", "route", "show", &format!("{v6}/128")]).contains("dev tw6h"));
+            assert!(ip(&["-4", "route", "show", "10.9.0.2/32"]).contains("dev tw6h"));
+            hold.forget(v4, 1);
+            assert!(ip(&["-6", "route", "show", "dev", "tw6h"]).is_empty() && ip(&["-4", "route", "show", "dev", "tw6h"]).is_empty());
+            attach(both, tap).unwrap();
+            check();
+            route_dev(false, both, index).unwrap();
+            assert!(ip(&["-6", "route", "show", &format!("{v6}/128")]).is_empty() && ip(&["-4", "route", "show", "10.9.0.2/32"]).is_empty());
+            delete_tap(tap);
         })
         .join()
         .unwrap();

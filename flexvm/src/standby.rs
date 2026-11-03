@@ -1138,7 +1138,8 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     t.mark("claim_ip");
     // Prepare the paused tap outside the host lock; a withdrawal can still win before fence.
     let tap = p.standby.lock().unwrap().as_ref().ok_or_else(|| not_run("standby vm gone".into(), true))?.firecracker().tap.clone();
-    let index = crate::net::neighbour(claim.ip, &tap).map_err(|e| {
+    let addr = host.config_now().vm_addr(claim.ip);
+    let index = crate::net::neighbour(addr, &tap).map_err(|e| {
         // As a failed attach in resume: discard this prepared VM and let the claimer retry.
         p.standby.lock().unwrap().take();
         not_run(format!("resuming a standby vm failed: {e}").into(), true)
@@ -1148,7 +1149,7 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
     t.mark("neighbour");
     let still = host.fence(claim.ip, claim.gen).map_err(|e| not_run(e, want.is_none()))?;
     let paused = p.standby.lock().unwrap().take().ok_or_else(|| not_run("standby vm gone".into(), true))?;
-    let vm = resume(paused, name, claim.ip, index, fault("resume_kill"), &mut t).map_err(|(e, ran)| {
+    let vm = resume(paused, name, addr, index, fault("resume_kill"), &mut t).map_err(|(e, ran)| {
         let e = format!("resuming a standby vm failed{}: {e}", if ran { ", and it may have run" } else { "" }).into();
         if ran {
             (e, false)
@@ -1412,7 +1413,7 @@ fn load(idle: Firecracker, template: Arc<Template>, stopping: impl Fn() -> bool)
 
 /// On failure the flag says whether the guest may have run for `name` (the
 /// resume may have reached Firecracker).
-fn resume(p: Prepared, name: &str, ip: Ipv4Addr, index: u32, kill: bool, t: &mut Phases) -> std::result::Result<Arc<Vm>, (Error, bool)> {
+fn resume(p: Prepared, name: &str, ip: crate::net::VmAddr, index: u32, kill: bool, t: &mut Phases) -> std::result::Result<Arc<Vm>, (Error, bool)> {
     t.mark("fence");
     crate::net::route_dev(true, ip, index).map_err(|e| (e, false))?;
     t.mark("route");
