@@ -149,10 +149,25 @@ impl Proc {
         Ok(())
     }
 
+    /// Refuses a checkpoint that needs write tracking (one that keeps the VM running, or an incremental one: a delta
+    /// builds on a checkpoint the VM ran on after, which only tracking leaves) on a host whose kernel lacks uffd-wp.
+    /// Before anything is waited on, reserved or paused, the VM running on. Test fault `uffd_wp_missing`: as if the
+    /// kernel lacked it.
+    pub fn can_track(&self, stop: bool, incremental: bool) -> Result<()> {
+        if (!stop || incremental) && (!crate::uffd::wp_supported() || fault("uffd_wp_missing")) {
+            bail!(
+                "vm {}: this host's kernel lacks userfaultfd write protection (uffd-wp), which a checkpoint that keeps the vm running, and an incremental one, need: take a full one with --stop (arm64 kernels have uffd-wp from Linux 6.10)",
+                self.name()
+            );
+        }
+        Ok(())
+    }
+
     /// Into flexvm's store (`checkpoint::store`), as `name` if given. With `stop` the VM stays
     /// paused for the caller to destroy.
     pub fn checkpoint(&self, _op: &Op, name: Option<&str>, stop: bool, incremental: bool) -> Result<Value> {
         let vm = self.vm();
+        self.can_track(stop, incremental)?;
         let mut t = Phases::new();
         let state = &self.host.state;
         // Shared until it is named: a removal waits, so the parent of a delta stays.

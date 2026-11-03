@@ -2071,6 +2071,8 @@ impl Proc {
             "pages" => return self.pages(&req, fds, slot),
             "checkpoint" => self.op_within().and_then(|op| {
                 let stop = req["stop"] == true;
+                // Before an arrival is settled for a --stop.
+                self.can_track(stop, req["incremental"] == true)?;
                 if stop {
                     self.settle_arrival(&op, crate::lifecycle::DRAIN_WAIT)?;
                 }

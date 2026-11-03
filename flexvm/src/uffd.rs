@@ -18,7 +18,8 @@
 //! paused Firecracker with process_vm_readv when this host is a migration source.
 //!
 //! Write tracking: once a VM has been checkpointed while running, its memory is
-//! also registered for write-protect faults (no UFFDIO_API feature needed), and
+//! also registered for write-protect faults (no UFFDIO_API feature to request, but
+//! the kernel must have uffd-wp: `wp_supported`), and
 //! every populated page is protected at each checkpoint's pause. Write faults,
 //! installs and discards mark pages dirty, so the next checkpoint can save only
 //! those, and a running VM's checkpoint saves pages before the guest overwrites
@@ -65,7 +66,7 @@ pub use hot::Held;
 pub(crate) use pages::zeroed_atomics;
 pub use pages::{Pages, BASE, DISCARDED, INFLIGHT, PRESENT, REMOTE, ZERO};
 pub use server::{admit, serve_pages};
-pub use wp::Frozen;
+pub use wp::{wp_supported, Frozen};
 
 pub const MAX_PRELOAD: usize = 4096;
 
