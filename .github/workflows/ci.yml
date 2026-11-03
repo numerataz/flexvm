@@ -136,27 +136,6 @@ jobs:
           fi
           echo "kvm=$kvm" >> "$GITHUB_OUTPUT"
 
-  # The patched Firecracker for aarch64-unknown-linux-musl: every patch applies and builds there. The e2e
-  # job builds the x86_64 one (while ARTIFACTS_TAG is unpinned) and runs it; nothing runs this one yet.
-  firecracker-aarch64:
-    name: Firecracker build (aarch64)
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      # rustup, which installs the toolchain Firecracker's rust-toolchain.toml pins.
-      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-      - name: Build Firecracker
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends musl-tools libseccomp-dev
-          ./scripts/build-firecracker.sh --state "$RUNNER_TEMP/state"
-          file "$RUNNER_TEMP/state/artifacts/firecracker" | grep -q 'ARM aarch64'
-
   e2e:
     # Shards (scripts/e2e.py --shard): pr (the cases, and the main and recovery scenarios) in four
     # splits side by side, balanced by e2e.py's COST; the scheduled run takes heavy (GiB-scale
@@ -212,7 +191,6 @@ jobs:
       # (runner image; Firecracker's toolchain is
       # pinned by its commit, FC_COMMIT in scripts/versions.sh, part of the Firecracker cache key).
       - name: Cache keys
-        if: env.KVM == 'true'
         id: keys
         run: |
           ./scripts/fetch.sh --urls > urls.txt
@@ -251,6 +229,8 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends musl-tools libseccomp-dev
           ./scripts/build-firecracker.sh
+          # For this runner's arch (x86_64, or aarch64-unknown-linux-musl on the arm runner).
+          file "$STATE/artifacts/firecracker" | grep -q "$([ "$(uname -m)" = aarch64 ] && echo 'ARM aarch64' || echo 'x86-64')"
       - name: Save Firecracker
         if: steps.keys.outputs.fc-build == 'true' && steps.fc-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -263,7 +243,6 @@ jobs:
       # Guest kernel and the test image's base root filesystem (fetch.sh keeps the patched Firecracker built above, its
       # record checking, over the stock one; once the release is pinned, it downloads the release's).
       - name: Restore downloads
-        if: env.KVM == 'true'
         id: dl-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -272,13 +251,12 @@ jobs:
             ${{ env.STATE }}/artifacts/base.squashfs
           key: downloads-${{ steps.keys.outputs.downloads }}-${{ hashFiles('scripts/fetch.sh', 'scripts/versions.sh', 'scripts/checksums.sha256') }}
       - name: Fetch kernel and base rootfs
-        if: env.KVM == 'true'
         run: |
           ./scripts/fetch.sh
           echo "base=$(sha256sum "$STATE/artifacts/base.squashfs" | cut -c1-16)" >> "$GITHUB_OUTPUT"
         id: fetch
       - name: Save downloads
-        if: env.KVM == 'true' && steps.dl-cache.outputs.cache-hit != 'true'
+        if: steps.dl-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
@@ -289,18 +267,32 @@ jobs:
       # The test image (scripts/test-image.py: the base root filesystem as an OCI layout), which
       # e2e.py pulls its templates from; it makes it when the cache has none. flexvm embeds flexvm-init.
       - name: Restore test image
-        if: env.KVM == 'true'
         id: test-image-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: /var/lib/flexvm-test-image
           key: test-image-base${{ steps.fetch.outputs.base }}-${{ hashFiles('scripts/test-image.py') }}
       - name: Own test image
-        if: env.KVM == 'true'
         run: sudo chown -R root:root /var/lib/flexvm-test-image
       - name: squashfs-tools
-        if: env.KVM == 'true' && steps.test-image-cache.outputs.cache-hit != 'true'
+        if: steps.test-image-cache.outputs.cache-hit != 'true'
         run: command -v unsquashfs > /dev/null || { sudo apt-get update -q; sudo apt-get install -y -q --no-install-recommends squashfs-tools; }
+
+      # Without KVM no template is pulled from the test image, so e2e.py makes none: it is made here, and
+      # its image checked to be for this arch.
+      - name: Make test image (no KVM)
+        if: env.KVM != 'true'
+        run: |
+          sudo python3 scripts/test-image.py --state "$STATE" /var/lib/flexvm-test-image
+          sudo python3 -c '
+          import json, os, sys
+          d = sys.argv[1]
+          blob = lambda digest: json.load(open(os.path.join(d, "blobs", *digest.split(":"))))
+          config = blob(blob(json.load(open(os.path.join(d, "index.json")))["manifests"][0]["digest"])["config"]["digest"])
+          want = {"x86_64": "amd64", "aarch64": "arm64"}[os.uname().machine]
+          print("test image:", config["os"], config["architecture"])
+          assert (config["os"], config["architecture"]) == ("linux", want), config
+          ' /var/lib/flexvm-test-image
 
       - name: Build flexvm
         run: |
@@ -381,7 +373,9 @@ jobs:
           if-no-files-found: ignore
 
   # e2e's steps on the aarch64 runner. With KVM (kvm-aarch64 decides) it runs e2e's shards; without (GitHub's
-  # arm runners have none), the release build and what needs no KVM: e2e.py --no-kvm, one job (it is small).
+  # arm runners have none) everything else, in one job: the release build, the patched Firecracker for
+  # aarch64-unknown-linux-musl (cached as e2e's is), the aarch64 artifacts fetched and checked against their
+  # pins, the test image, and what needs no KVM (e2e.py --no-kvm).
   e2e-aarch64:
     name: end-to-end (${{ needs.kvm-aarch64.outputs.kvm == 'true' && 'KVM' || 'no KVM' }}, aarch64, ${{ matrix.shard }})
     needs: kvm-aarch64
