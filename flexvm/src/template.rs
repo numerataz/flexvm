@@ -904,7 +904,7 @@ fn record_working_set(host: &crate::host::Host, paths: &Paths, dir: &Path, tap: 
         admission.start(&mut fc, tpl.meta.mem_mib + tpl.meta.plugged_mib)?;
         let p = crate::vm::Prepared::new(fc, tpl.clone())?;
         // Like VM restores: stepping the clock touches pages of its own. Loaded paused.
-        p.firecracker().load_snapshot(&tpl.vmstate(), &tpl, tap, Some(true), crate::fc::API_TIMEOUT)?;
+        p.firecracker().load_snapshot(&tpl.vmstate(), &tpl, tap, Some(crate::vm::CLOCK_REALTIME), crate::fc::API_TIMEOUT)?;
         p.pager.wait_ready(Duration::from_secs(5))?;
         // As for a restore: memory mapped behind the pager's back would be recorded from zeroes (#949).
         p.pager.check_foreign(Duration::from_secs(10))?;
@@ -2559,7 +2559,7 @@ pub(crate) mod tests {
             let dir = crate::test_util::TempDir::new("template");
             let paths = Paths { firecracker: dir.join("firecracker"), kernel: dir.join("kernel"), templates: dir.clone(), images: dir.join("images") };
             let mut meta = Meta {
-                compatibility: crate::compat::Compat {
+                compatibility: crate::compat::Compat::X86_64(crate::compat::X86 {
                     cpu: String::new(),
                     tsc_khz: 2_000_000,
                     tsc_control: false,
@@ -2567,7 +2567,7 @@ pub(crate) mod tests {
                     firecracker: String::new(),
                     features: BTreeMap::new(),
                     xsave: BTreeMap::new(),
-                },
+                }),
                 vcpus: 2,
                 mem_mib: 256,
                 max_mib: 1024,
@@ -2715,7 +2715,7 @@ pub(crate) mod tests {
         assert!(got.check_vouched(None, "a v0.1.0 source").is_err() && got.check_vouched(Some(&tpl.digests().unwrap()), "it").is_ok());
         let (_other, elsewhere_paths) = elsewhere(&f);
         let mut meta = tpl.meta.clone();
-        meta.compatibility.cpu = "another".into();
+        meta.compatibility.x86_mut().cpu = "another".into();
         let forged = [
             &(serde_json::to_vec(&meta).unwrap().len() as u64).to_le_bytes()[..],
             &serde_json::to_vec(&meta).unwrap(),
@@ -3446,11 +3446,11 @@ pub(crate) mod tests {
         assert_eq!(up_to_date(&f.paths, "t", size, &rootfs, &img), Some(meta.id.clone()));
         let gen = Template::resolve(&f.paths, "t").unwrap();
         let mut incompatible = meta.clone();
-        incompatible.compatibility.cpu = "changed microcode".into();
+        incompatible.compatibility.x86_mut().cpu = "changed microcode".into();
         f.write_meta(&incompatible, &gen);
         assert!(up_to_date(&f.paths, "t", size, &rootfs, &img).is_none());
         incompatible = meta.clone();
-        incompatible.compatibility.tsc_khz /= 2;
+        incompatible.compatibility.x86_mut().tsc_khz /= 2;
         f.write_meta(&incompatible, &gen);
         assert!(up_to_date(&f.paths, "t", size, &rootfs, &img).is_none());
         f.write_meta(&meta, &gen);

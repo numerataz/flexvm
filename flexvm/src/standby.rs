@@ -1385,7 +1385,7 @@ fn load(idle: Firecracker, template: Arc<Template>, stopping: impl Fn() -> bool)
     check_stop()?;
     p.pager.learn_load_set();
     let fc = p.firecracker();
-    fc.load_snapshot(&p.template().vmstate(), &p.template(), &p.firecracker().tap, Some(true), LOAD_TIMEOUT)?;
+    fc.load_snapshot(&p.template().vmstate(), &p.template(), &p.firecracker().tap, Some(crate::vm::CLOCK_REALTIME), LOAD_TIMEOUT)?;
     check_stop()?;
     // Only an API pause stops the devices writing guest memory.
     fc.pause(API_TIMEOUT)?;

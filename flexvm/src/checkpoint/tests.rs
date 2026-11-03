@@ -52,6 +52,20 @@ fn link(dir: &Path, parent: Option<Parent>, edit: impl FnOnce(&mut Manifest)) ->
     sum(&body)
 }
 
+fn saved_msrs(m: &mut Manifest) -> &mut std::collections::BTreeSet<u32> {
+    match &mut m.saved {
+        crate::compat::Saved::X86_64 { msrs, .. } => msrs,
+        crate::compat::Saved::Aarch64 { .. } => unreachable!(),
+    }
+}
+
+fn saved_tsc_khz(m: &mut Manifest) -> &mut u32 {
+    match &mut m.saved {
+        crate::compat::Saved::X86_64 { tsc_khz, .. } => tsc_khz,
+        crate::compat::Saved::Aarch64 { .. } => unreachable!(),
+    }
+}
+
 /// `dir/ck0` and `n - 1` deltas over it, each `ck{i}` over `ck{i-1}`; returns their ids, newest first.
 fn chain(dir: &Path, n: usize) -> Vec<String> {
     let (mut parent, mut ids) = (None, Vec::new());
@@ -70,19 +84,19 @@ fn saved_host_msrs_survive_manifest_roundtrip_and_are_checked() {
     let mut host = tpl.meta.compatibility.clone();
     // Template host A has only TSC; host B added TSX_CTRL and XSS before saving.
     let a: std::collections::BTreeSet<u32> = [0x10].into();
-    host.msrs = a.clone();
+    host.x86_mut().msrs = a.clone();
     let b = [0x10, 0x122, 0xda0].into();
-    link(&dir, None, |m| m.saved_msrs = b);
+    link(&dir, None, |m| *saved_msrs(m) = b);
     let ck = Checkpoint::open(&dir).unwrap();
     let error = ck.manifest.check_compatibility(&tpl, &host).unwrap_err().to_string();
     assert!(error.contains("saved MSRs 0x122, 0xda0"), "{error}");
-    host.msrs = [0x10, 0x122, 0xda0, 0x3b].into();
+    host.x86_mut().msrs = [0x10, 0x122, 0xda0, 0x3b].into();
     ck.manifest.check_compatibility(&tpl, &host).unwrap();
 
     // Only the newest VM state is loaded; ancestor manifests supply memory only.
     let child = dir.join("child");
-    link(&child, Some(Parent { path: dir.to_path_buf(), id: ck.id }), |m| m.saved_msrs = a.clone());
-    host.msrs = a;
+    link(&child, Some(Parent { path: dir.to_path_buf(), id: ck.id }), |m| *saved_msrs(m) = a.clone());
+    host.x86_mut().msrs = a;
     Checkpoint::open(&child).unwrap().manifest.check_compatibility(&tpl, &host).unwrap();
 }
 
@@ -91,17 +105,18 @@ fn saved_tsc_survives_roundtrip_and_checks_only_newest_vmstate() {
     let dir = tmp("saved-tsc");
     let tpl = template(&dir, &[None; 256]);
     let mut host = tpl.meta.compatibility.clone();
-    host.tsc_khz = 2_000_400;
+    host.x86_mut().tsc_khz = 2_000_400;
     tpl.meta.compatibility.check(&host).unwrap();
-    link(&dir.join("ck"), None, |m| m.saved_tsc_khz = 1_999_600);
-    let ck = Checkpoint::open(&dir.join("ck")).unwrap();
-    assert_eq!(ck.manifest.saved_tsc_khz, 1_999_600);
+    link(&dir.join("ck"), None, |m| *saved_tsc_khz(m) = 1_999_600);
+    let mut ck = Checkpoint::open(&dir.join("ck")).unwrap();
+    assert_eq!(*saved_tsc_khz(&mut ck.manifest), 1_999_600);
     assert!(ck.manifest.check_compatibility(&tpl, &host).unwrap_err().to_string().contains("TSC rate differs"));
-    host.tsc_control = true;
-    assert_eq!(ck.manifest.check_compatibility(&tpl, &host).unwrap(), 1_999_600);
-    host.tsc_control = false;
+    host.x86_mut().tsc_control = true;
+    assert_eq!(ck.manifest.check_compatibility(&tpl, &host).unwrap(), crate::compat::Saved::X86_64 { tsc_khz: 1_999_600, msrs: Default::default() });
+    host.x86_mut().tsc_control = false;
     let child = dir.join("child");
-    link(&child, Some(Parent { path: dir.join("ck"), id: ck.id }), |m| m.saved_tsc_khz = host.tsc_khz);
+    let rate = host.x86_mut().tsc_khz;
+    link(&child, Some(Parent { path: dir.join("ck"), id: ck.id }), |m| *saved_tsc_khz(m) = rate);
     Checkpoint::open(&child).unwrap().manifest.check_compatibility(&tpl, &host).unwrap();
 }
 
@@ -109,7 +124,7 @@ fn saved_tsc_survives_roundtrip_and_checks_only_newest_vmstate() {
 fn zero_saved_tsc_rate_cannot_be_restored() {
     let dir = tmp("zero-saved-tsc");
     let tpl = template(&dir, &[None; 256]);
-    link(&dir, None, |m| m.saved_tsc_khz = 0);
+    link(&dir, None, |m| *saved_tsc_khz(m) = 0);
     let ck = Checkpoint::open(&dir).unwrap();
     let error = ck.manifest.check_compatibility(&tpl, &tpl.meta.compatibility).unwrap_err().to_string();
     assert!(error.contains("checkpoint or suspended VM") && error.contains("TSC rate") && error.contains("cannot be restored"), "{error}");

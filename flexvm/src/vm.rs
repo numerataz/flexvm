@@ -34,6 +34,9 @@ fn paused(name: &str) -> String {
     format!("{} once flexvm unpause {name} resumes it", crate::guest::TRY_AGAIN)
 }
 const NO_REALTIME: &str = "clock_realtime requested but not present in the snapshot state";
+/// Firecracker on aarch64 refuses `clock_realtime` (it adjusts kvmclock, which arm64 has not). Neither
+/// arch's guest needs it: the agent steps its clock after every load.
+pub const CLOCK_REALTIME: bool = cfg!(target_arch = "x86_64");
 
 /// The vmstate a VM is restored from.
 #[derive(Clone, Copy)]
@@ -114,8 +117,9 @@ impl serde::Serialize for VmName {
 pub struct Vm {
     pub name: VmName,
     pub template: Arc<Template>,
-    /// Effective rate Firecracker loaded (host default when it skipped scaling).
-    pub tsc_khz: u32,
+    /// What its VM state carries as Firecracker loaded it: on x86_64 the effective TSC rate
+    /// (host default when it skipped scaling).
+    pub saved: crate::compat::Saved,
     pub dir: PathBuf,
     pub ip: Ipv4Addr,
     pub tap: String,
@@ -1161,29 +1165,25 @@ pub struct Prepared {
     fc: Option<Firecracker>,
     pub pager: Arc<Pager>,
     template: Arc<Template>,
-    tsc_khz: u32,
+    /// As `check_saved` returned it, which a retry on this host loads again.
+    saved: crate::compat::Saved,
     /// Ready the neighbour while loading; the caller installs the route under its fence.
     neighbour: bool,
-    saved_msrs: std::collections::BTreeSet<u32>,
     ifindex: Option<u32>,
 }
 
 impl Prepared {
     pub fn new(fc: Firecracker, template: Arc<Template>) -> Result<Self> {
-        Self::with_saved_tsc(fc, template.clone(), || Ok((template.meta.compatibility.tsc_khz, &template.meta.compatibility.msrs)))
+        let saved = template.meta.compatibility.saved();
+        Self::with_saved(fc, template.clone(), || Ok(&saved))
     }
 
     /// Read saved CPU records after probing the host, preserving preflight error ordering.
-    pub fn with_saved_tsc<'a>(
-        fc: Firecracker,
-        template: Arc<Template>,
-        saved: impl FnOnce() -> Result<(u32, &'a std::collections::BTreeSet<u32>)>,
-    ) -> Result<Self> {
+    pub fn with_saved<'a>(fc: Firecracker, template: Arc<Template>, saved: impl FnOnce() -> Result<&'a crate::compat::Saved>) -> Result<Self> {
         let host = crate::compat::local(fc.pid())?;
-        let (saved_khz, msrs) = saved()?;
-        let tsc_khz = template.meta.compatibility.check_saved(&host, saved_khz, msrs)?;
+        let saved = template.meta.compatibility.check_saved(&host, saved()?)?;
         let pager = Pager::start(&fc.sockets.uffd, template.clone(), None)?;
-        let p = Prepared { fc: Some(fc), pager, template, tsc_khz, neighbour: true, saved_msrs: msrs.clone(), ifindex: None };
+        let p = Prepared { fc: Some(fc), pager, template, saved, neighbour: true, ifindex: None };
         p.pager.set_pid(p.firecracker().pid())?;
         Ok(p)
     }
@@ -1214,7 +1214,7 @@ impl Prepared {
         Arc::new(Vm {
             name: VmName::new(name),
             template: self.template.clone(),
-            tsc_khz: self.tsc_khz,
+            saved: self.saved.clone(),
             dir: idle.dir.clone(),
             ip,
             tap: idle.tap.clone(),
@@ -1293,9 +1293,8 @@ impl Prepared {
         before_retry: impl FnOnce() -> Result<()>,
         t: &mut Phases,
     ) -> Result<(Arc<Vm>, Duration)> {
-        let msrs = self.saved_msrs.clone();
-        let (tpl, neighbour, tsc_khz) = (self.template.clone(), self.neighbour, self.tsc_khz);
-        let (e, realtime) = match self.load_once(name, vmstate, seed.clone(), ip, hold, true, deadline, t) {
+        let (tpl, neighbour, saved) = (self.template.clone(), self.neighbour, self.saved.clone());
+        let (e, realtime) = match self.load_once(name, vmstate, seed.clone(), ip, hold, CLOCK_REALTIME, deadline, t) {
             Ok(r) => return Ok(r),
             Err((e, None)) => return Err(e),
             Err((e, Some(realtime))) => (e, realtime),
@@ -1304,7 +1303,7 @@ impl Prepared {
         before_retry()?;
         // Retrying the same state on this host preserves its effective rate.
         let fc = spawner.take(deadline)?;
-        let mut fresh = Prepared::with_saved_tsc(fc, tpl, || Ok((tsc_khz, &msrs)))?;
+        let mut fresh = Prepared::with_saved(fc, tpl, || Ok(&saved))?;
         t.mark("pager_start");
         fresh.neighbour = neighbour;
         if !neighbour {

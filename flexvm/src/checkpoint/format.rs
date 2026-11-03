@@ -5,10 +5,7 @@ use crate::{
     util::{Result, PAGE_SIZE},
 };
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    net::Ipv4Addr,
-};
+use std::{collections::BTreeMap, net::Ipv4Addr};
 
 pub const FORMAT: u64 = 2;
 pub const FORMAT_INCREMENTAL: u64 = 3;
@@ -33,10 +30,10 @@ pub struct Manifest {
     pub ip: Ipv4Addr,
     pub template: String,
     pub template_id: String,
-    /// MSRs selected by Firecracker on the host saving this VM state, not its template.
-    pub saved_msrs: BTreeSet<u32>,
-    /// Effective vCPU rate in this VM state, which can differ from its template's.
-    pub saved_tsc_khz: u32,
+    /// What Firecracker saved on the host saving this VM state, not its template's: on x86_64
+    /// `saved_msrs` and `saved_tsc_khz`, its effective vCPU rate; tagged `saved_regs` on aarch64.
+    #[serde(flatten)]
+    pub saved: crate::compat::Saved,
     pub vcpus: u32,
     pub mem_mib: u64,
     pub max_mib: u64,
@@ -62,16 +59,15 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    pub fn saved_cpu(&self) -> Result<(u32, &BTreeSet<u32>)> {
-        ensure!(self.saved_tsc_khz != 0, "this checkpoint or suspended VM has a zero effective vCPU TSC rate and cannot be restored");
-        Ok((self.saved_tsc_khz, &self.saved_msrs))
+    pub fn saved_cpu(&self) -> Result<&crate::compat::Saved> {
+        let zero = matches!(self.saved, crate::compat::Saved::X86_64 { tsc_khz: 0, .. });
+        ensure!(!zero, "this checkpoint or suspended VM has a zero effective vCPU TSC rate and cannot be restored");
+        Ok(&self.saved)
     }
 
     #[cfg(test)]
-    pub fn check_compatibility(&self, template: &Template, host: &crate::compat::Compat) -> Result<u32> {
-        let (rate, msrs) = self.saved_cpu()?;
-        template.meta.compatibility.check_saved(host, rate, msrs)?;
-        Ok(rate)
+    pub fn check_compatibility(&self, template: &Template, host: &crate::compat::Compat) -> Result<crate::compat::Saved> {
+        template.meta.compatibility.check_saved(host, self.saved_cpu()?)
     }
 }
 

@@ -489,7 +489,7 @@ impl Proc {
         let (vm, restore) = (|| -> Result<_> {
             let seed = Some((ck.runs, Origin::File(ck.file)));
             let fc = self.spawner.take(None)?;
-            let prepared = crate::vm::Prepared::with_saved_tsc(fc, tpl, || m.saved_cpu())?;
+            let prepared = crate::vm::Prepared::with_saved(fc, tpl, || m.saved_cpu())?;
             t.mark("pager_start");
             // Test gate: its Firecracker is up, nothing loaded or paged in yet.
             crate::host::hold("restore_prepared_gate");
