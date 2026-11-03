@@ -152,7 +152,8 @@ impl Forwarder {
         Ok(Self { stop, bound, workers: Vec::new(), ports: bound_ports })
     }
 
-    /// Proxies to the VM at `vm`, once its address is known.
+    /// Proxies to the VM at `vm`, once its address is known. Its IPv4 address, also with `vm_ipv6_prefix`:
+    /// every guest has one, and a guest's [::] socket takes IPv4 too unless it is IPV6_V6ONLY (README).
     pub fn serve(&mut self, vm: Ipv4Addr) -> Result<()> {
         for (fds, protocol, port) in self.bound.drain(..) {
             let (stop, target) = (self.stop.clone(), SocketAddrV4::new(vm, port));

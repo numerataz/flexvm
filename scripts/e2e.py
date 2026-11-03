@@ -72,7 +72,7 @@ FAULTS = ("basic route route_abort route_abandoned lost_ack unknown refused page
           "ckpt_failed_stop ckpt_no_wp ckpt_rearm prepare_fail fc_prepare forged_vmstate slow_preload bad_preload pull_enomem ckpt_packet_hold ipv6_packet_hold "
           "abort_superseded signals suspend_gen standby standby_vm_ips restore_ip_peer loan_start_retry spoof_filter killed_migrated "
           "incoming_killed start_killed claim_killed standby_stalled standby_refill_race standby_lock_timeout standby_stop_claim standby_claim_signal standby_concurrent_claims standby_claim_caps standby_lost_cgroup standby_claim_setup_fail fc_died fc_died_starting cow_grow plug_race plug_storm suspend_debris revoked_publication "
-          "same_host_order same_host_slow_route same_host_flood same_host_late_handover same_host_hold_route_fail same_host_qdisc_backlog same_host_backlog same_host_long_hold same_host_bulk_tcp ckpt_backlog ckpt_paused_backlog rx_stall arrival_abort_route arrival_killed_route handoff_superseded delayed_announce delayed_announce_handoff handoff_onward handoff_rename announce_arp_timer prepare_fail_announce reconcile_announce reconcile_kill target_renamed mem_high mem_high_migrate mem_high_evict mem_refused_headroom mem_refused_fill "
+          "same_host_order same_host_slow_route same_host_flood same_host_late_handover same_host_hold_route_fail same_host_qdisc_backlog same_host_backlog same_host_long_hold same_host_bulk_tcp same_host_order6 same_host_bulk_tcp6 ckpt_backlog ckpt_paused_backlog rx_stall arrival_abort_route arrival_killed_route handoff_superseded delayed_announce delayed_announce_handoff handoff_onward handoff_rename announce_arp_timer prepare_fail_announce reconcile_announce reconcile_kill target_renamed mem_high mem_high_migrate mem_high_evict mem_refused_headroom mem_refused_fill "
           "sigkill_restart listen_trickle suspend_cmd suspend_slow_cmd suspend_overlap fc_died_busy pause_cmd_start suspend_died evict_latency evict_skips_cmd cmd_flag "
           "refused_admission arrival_grew arrival_grew_admitted meminfo_unreadable checkpoint_hotplug log_cap gc_debris arrival_log template_tap pidns_names pidns_control pidns_standby arrival_overtaken "
           "leave_fail capture_fail abort_gen_fail commit_fail commit_fail_routed proxy_ndp_routed abort_stay_fail prepare_disconnect prepare_trickle arrival_flood unlend_retry bad_app_log resume_slow_guest resume_readdress_fail resume_unpause_fail abort_link_fail resume_unsettled resume_pull_lock page_conns page_refusals suspend_unaddressed resume_fence_fails "
@@ -84,7 +84,7 @@ FAULTS = ("basic route route_abort route_abandoned lost_ack unknown refused page
 # The ones that restart the listeners (faults.py starts its own for them: LISTENER_FAULTS), the
 # terminal's, and the ones bound by timeouts (a guest that never answers; a pager that fails or
 # never gets its pages, gated deterministically).
-LISTENER_FAULTS = {"suspend_resume", "target_killed", "unit_restart", "wildcard_listen", "route_via6", "peer_by_name", "peer_moved",
+LISTENER_FAULTS = {"suspend_resume", "target_killed", "unit_restart", "wildcard_listen", "route_via6", "ipv6_control_plane", "peer_by_name", "peer_moved",
                    "peer_unresolvable", "late_withdrawal", "resume_listener_restart", "arrival_cap_restart", "reboot", "connect_after_pull"}
 RECOVERY_FAULTS = " ".join(sorted(LISTENER_FAULTS)) + " terminal guest_hang uffd_err fetch_tail_enomem fetch_enomem_stuck cow_wp_race"
 # GiB-scale guests (pages_dead, source_killed_basic, which runs source_killed, pull_died, kill_source,
@@ -1382,7 +1382,8 @@ def suspend_resume():
 def ipv6_taps():
     """vm_ipv6_prefix (#1297): a VM's tap gets IPv6, a /128 route and a permanent neighbour entry beside its
     /32, and passes IPv6 from that address alone; on a migration they move to the target's tap. Without the
-    prefix, IPv6 stays off on taps. The guest's agent gives it its address (#1308)."""
+    prefix, IPv6 stays off on taps. The guest's agent gives it its address (#1308). Port forwards, on
+    127.0.0.1 and [::1], reach a guest app listening on [::] (dual-stack) at the VM's IPv4 address (#1301)."""
     sysctl = lambda tap, key: open(f"/proc/sys/net/ipv6/conf/{tap}/{key}").read().strip()
     ip6 = lambda *a: subprocess.run(["ip", "-6", *a], capture_output=True, text=True).stdout
     plain = "e2e-v4tap"
@@ -1390,11 +1391,11 @@ def ipv6_taps():
     tap = vm_resources(ip)["tap"]
     check("no prefix: IPv6 off on its tap", sysctl(tap, "disable_ipv6") == "1", sysctl(tap, "disable_ipv6"))
     prefix = "fd00:e2e::"
-    vm = "e2e-v6tap"
+    vm, hp = "e2e-v6tap", A.port + 20010
     for h in (A, B):
         h.configure(vm_ipv6_prefix=prefix + "/96")
     try:
-        ip = A.run(vm)
+        ip = A.run_json(vm, extra=["-p", f"127.0.0.1:{hp}:7006", "-p", f"[::1]:{hp}:7006"])["ip"]
         v6 = str(ipaddress.IPv6Address(int(ipaddress.IPv6Address(prefix)) | int(ipaddress.IPv4Address(ip))))
         check("ps: its IPv6 address", A.ps()[vm].get("ipv6") == v6, A.ps()[vm])
 
@@ -1430,6 +1431,16 @@ def ipv6_taps():
             except OSError:
                 return False
         check("the host reaches the guest at its IPv6 address", wait_for(up, 10))
+
+        def forwarded(at):
+            try:
+                with socket.create_connection((at, hp), timeout=2) as s:
+                    return echo(s, b"fwd\n")
+            except OSError:
+                return False
+        # The forward connects to the guest's IPv4 address, which a [::] socket without IPV6_V6ONLY takes too.
+        check("a forward on 127.0.0.1 reaches the app on [::]", forwarded("127.0.0.1"))
+        check("a forward on [::1] too", forwarded("::1"))
         rx = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
         rx.bind(("::", 0))
         rx.settimeout(0.2)
@@ -1459,6 +1470,34 @@ def ipv6_taps():
         for h in (A, B):
             h.configure(vm_ipv6_prefix=None)
     A.kill(plain)
+
+
+@case
+@needs_kvm
+def nettest_ipv6():
+    """scripts/nettest.sh with V6=1 (#1301): two hosts and a LAN client, each in a network namespace of its own,
+    the hosts listening and peering at IPv6 addresses alone (an IPv6 underlay: the VM's /32 is routed via an
+    IPv6 next hop) with vm_ipv6_prefix. The client's TCP ping-pong and 5 kHz UDP stream to the VM's IPv6
+    address (proxy NDP) lose nothing across migrations A -> B -> A, and the client's neighbour entry follows
+    the VM (the unsolicited NA). A TCP stall may last up to 190 ms however short the downtime (STALL_SLACK_MS):
+    CI saw 113-181 ms beside 30-46 ms downtimes with nothing lost, while a lost segment of the one-segment
+    ping-pong costs at least 200 ms (the minimum retransmit timeout, and a loss probe's delayed-ACK allowance)."""
+    env = {**ENV, "V6": "1", "FLEXVM": BIN, "STATE": BUILD, "TEMPLATE": args.template, "P": f"fv6{A.port}", "ROUNDS": "1",
+           "STALL_SLACK_MS": "190", "WORK": os.path.join(args.log_dir, "nettest-ipv6")}
+    p = subprocess.Popen([os.path.join(ROOT, "scripts", "nettest.sh")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                         env=env, start_new_session=True)
+    try:
+        out, _ = p.communicate(timeout=300)
+    except subprocess.TimeoutExpired:
+        # SIGTERM, so its EXIT trap removes its namespaces, processes and directories; SIGKILL only if that hangs.
+        os.killpg(p.pid, signal.SIGTERM)
+        try:
+            out, _ = p.communicate(timeout=60)
+        except subprocess.TimeoutExpired:
+            os.killpg(p.pid, signal.SIGKILL)
+            out, _ = p.communicate()
+        out += "\n(timed out after 300 s)"
+    check("nettest V6=1: passes", p.returncode == 0 and "PASS" in out.splitlines(), out[-3000:])
 
 
 @case
@@ -2990,7 +3029,7 @@ def worker():
 # runs, as e2e.py's summary prints them): --split balances by these, the long ones start first, and
 # the short ones go in batches of about BATCH_S (each batch is a worker, with hosts of its own).
 # Unlisted ones count as 2 s.
-COST = {"faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "ipv6_taps": 10, "docker_api": 15, "restart_policy": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
+COST = {"faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "ipv6_taps": 10, "nettest_ipv6": 30, "docker_api": 15, "restart_policy": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
         "faults/cow_grow": 65, "faults/reconcile_kill": 64, "faults/target_renamed": 40, "faults/plug_race": 45, "faults/guest_hang": 44,
         "faults/exec_pause_grace": 42, "faults/exec_ckpt_stalled": 115, "faults/route_abort": 35, "faults/unplug_collapsed": 30,
         "faults/arrival_grew": 25, "faults/pause_resume": 24, "faults/evict_latency": 25, "faults/mem_high": 25, "faults/target_killed": 25,
@@ -3019,7 +3058,8 @@ COST = {"faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containe
         "faults/route": 4, "faults/same_host_backlog": 4, "faults/same_host_bulk_tcp": 4, "faults/same_host_flood": 4,
         "faults/same_host_slow_route": 4, "faults/slow_preload": 4, "faults/suspend_killed": 4,
         "faults/suspend_slow_cmd": 4, "faults/unlend_retry": 4, "faults/ckpt_ancestor_corrupt": 3,
-        "faults/ckpt_packet_hold": 3, "faults/ipv6_packet_hold": 4, "faults/same_host_order": 3, "faults/suspend_died": 3,
+        "faults/ckpt_packet_hold": 3, "faults/ipv6_packet_hold": 4,
+        "faults/same_host_order6": 3, "faults/same_host_bulk_tcp6": 4, "faults/ipv6_control_plane": 12, "faults/same_host_order": 3, "faults/suspend_died": 3,
         # From local runs (about half a CI runner's time), doubled.
         "faults/same_host_long_hold": 34, "faults/rmi_suspend": 22, "faults/standby_refill_mark": 18, "faults/standby_relief_no_vm": 17, "faults/back_to_back": 14,
         "faults/resume_migrating": 11, "faults/standby_claim_orphan_migrating": 9, "faults/standby_claim_orphan": 7,
