@@ -1019,18 +1019,19 @@ pub fn next_hops() -> std::io::Result<Vec<IpAddr>> {
 }
 
 /// A delete names the device, so it removes only that route. Its IPv6 address's /128 goes with
-/// the /32 (tried even when the /32's delete fails).
+/// the /32: added first, so a failure leaves the /32 where it was routed; deleted after it, even
+/// when the /32's delete fails.
 pub fn route_dev(add: bool, ip: VmAddr, ifindex: u32) -> Result<()> {
-    let (kind, flags) = if add { (RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE) } else { (RTM_DELROUTE, 0) };
-    let mut res = Ok(());
-    for dst in ip.each() {
-        let done = netlink(kind, flags, &dev_route_msg(dst, ifindex));
-        if add && done.is_err() {
-            return done;
-        }
-        res = res.and(done);
+    if add {
+        let v6 = ip.v6.map_or(Ok(()), |v6| netlink(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE, &dev_route_msg(v6.into(), ifindex)));
+        return v6.and_then(|()| netlink(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE, &dev_route_msg(ip.v4.into(), ifindex)));
     }
-    res
+    ip.each().map(|dst| unroute_dev(dst, ifindex)).fold(Ok(()), Result::and)
+}
+
+/// Deletes `ip`'s route (a /32 or /128) to the device at `ifindex`, and no other.
+pub fn unroute_dev(ip: IpAddr, ifindex: u32) -> Result<()> {
+    netlink(RTM_DELROUTE, 0, &dev_route_msg(ip, ifindex))
 }
 
 /// The route of `ip` (a /32 or /128) to the device at `ifindex`.
@@ -1246,6 +1247,8 @@ fn ipv6_forward_in(root: &std::path::Path) -> std::io::Result<()> {
         }
         match std::fs::write(dev.path().join("accept_ra"), "2") {
             Ok(()) => crate::log!("IPv6 forwarding (vm_ipv6_prefix): {name} still takes router advertisements (accept_ra 2)"),
+            // Gone meanwhile (a tap removed).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
                 crate::log!("WARNING: IPv6 forwarding (vm_ipv6_prefix): {name} stops taking router advertisements: setting its accept_ra to 2 failed: {e}")
             }
@@ -2233,6 +2236,16 @@ mod tests {
             assert!(String::from_utf8_lossy(&tc.stdout).contains("direct-action"), "the multicast filter");
             set_link_up(tap, false).unwrap();
             set_link_up(tap, true).unwrap();
+            attach(both, tap).unwrap();
+            check();
+            // Held, both go to the hold device, and come back with an attach.
+            let hold = crate::hold::Holder::new("tw6h").unwrap().unwrap();
+            hold.hold(both, 1).unwrap();
+            assert_eq!(std::fs::read_to_string("/proc/sys/net/ipv6/conf/tw6h/disable_ipv6").unwrap().trim(), "0");
+            assert!(ip(&["-6", "route", "show", &format!("{v6}/128")]).contains("dev tw6h"));
+            assert!(ip(&["-4", "route", "show", "10.9.0.2/32"]).contains("dev tw6h"));
+            hold.forget(v4, 1);
+            assert!(ip(&["-6", "route", "show", "dev", "tw6h"]).is_empty() && ip(&["-4", "route", "show", "dev", "tw6h"]).is_empty());
             attach(both, tap).unwrap();
             check();
             route_dev(false, both, index).unwrap();

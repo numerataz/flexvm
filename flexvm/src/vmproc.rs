@@ -1318,7 +1318,7 @@ impl Proc {
 
     /// Whether the address is held.
     pub fn hold_addr(&self, vm: &Vm, id: u64, what: &str) -> bool {
-        match self.holder().map(|h| h.hold(vm.ip, id)) {
+        match self.holder().map(|h| h.hold(vm.addr(), id)) {
             Some(Ok(())) => true,
             Some(Err(e)) => {
                 crate::log!("vm {}: not holding packets during {what}: {e}", vm.name);

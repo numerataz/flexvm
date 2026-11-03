@@ -1399,6 +1399,9 @@ def ipv6_taps():
         check("ps: its IPv6 address", A.ps()[vm].get("ipv6") == v6, A.ps()[vm])
 
         def on_tap(h):
+            # An arrival on a host sharing the network namespace routes its tap once the held packets are in.
+            routed = lambda: (lambda r: r["pid"] and f"dev {r['tap']} " in ip6("route", "show", "exact", f"{v6}/128") + " ")(vm_resources(ip))
+            check(f"{h.label}: both routed to the VM's tap", wait_for(routed, 10), (vm_resources(ip), ip6("route", "show", "exact", f"{v6}/128")))
             tap = vm_resources(ip)["tap"]
             conf = tuple(sysctl(tap, k) for k in ("disable_ipv6", "addr_gen_mode", "accept_ra"))
             check(f"{h.label}: IPv6 on its tap, no address of the kernel's own", conf == ("0", "1", "0"), conf)

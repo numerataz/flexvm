@@ -1264,8 +1264,13 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   when the tap goes down). IPv6 was off because the host's MLD reports, sent as a
   tap comes up before any Firecracker reads it, count as a frame lost on the way
   to the guest (`tx_dropped`): a clsact egress filter drops the host's IPv6
-  multicast to the tap instead. The hold device holds the /32 alone (#1299), and
-  routes to peers (`route_via`, `unroute`) take the `VmAddr` but route the IPv4
+  multicast to the tap instead. A hold takes the /128 to the hold device with
+  the /32 (its IPv6 on there from the first such hold, with no address), so
+  nothing reaches a paused VM's tap; IPv6 packets there are counted as dropped
+  for the address in their destination's low 32 bits, not held yet (#1299).
+  The hold's /128 goes when its /32 is switched away (`route_via` moves no
+  /128). A route add puts the /128 in first, so a failure leaves the /32 where
+  it was. Routes to peers (`route_via`, `unroute`) take the `VmAddr` but route the IPv4
   address only until peers have IPv6 underlays (#1295); an IPv6 delete would
   have to name its next hop, as IPv6 route deletes ignore the scope that keeps
   `unroute` off tap routes.

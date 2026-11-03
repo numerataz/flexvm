@@ -1082,7 +1082,7 @@ impl Proc {
                     // Test fault `hold_route_fail`: this hold's route fails.
                     Some(h) => vm.if_here(|| {
                         crate::fault_result!(tripped("hold_route_fail") => Err("injected fault: routing the address to the hold failed".into());
-                            h.hold(vm.ip, mig))
+                            h.hold(vm.addr(), mig))
                     }),
                     None => vm.route_here().map(|()| false),
                 });

@@ -80,6 +80,8 @@ pub struct Holder {
     reading: AtomicBool,
     /// Held while an address's TUN route is added or deleted.
     routes: Mutex<()>,
+    /// IPv6 is on on the device (`Holder::ipv6`), off until an address with an IPv6 one is held.
+    ipv6: AtomicBool,
     /// Held while a packet is read off the device and queued.
     rx: Mutex<()>,
     /// Addresses let go of. A sender that looked the route up before the switch can still
@@ -121,6 +123,8 @@ impl Gone {
 
 struct Entry {
     mig: u64,
+    /// The IPv6 address (`vm_ipv6_prefix`) whose /128 is routed here with the /32.
+    v6: Option<std::net::Ipv6Addr>,
     q: Mutex<Queue>,
 }
 
@@ -237,6 +241,7 @@ impl Holder {
             held: Mutex::default(),
             reading: AtomicBool::new(false),
             routes: Mutex::new(()),
+            ipv6: AtomicBool::new(false),
             rx: Mutex::new(()),
             gone: Mutex::default(),
             stragglers: Mutex::default(),
@@ -247,23 +252,25 @@ impl Holder {
         Ok(Some(h))
     }
 
-    pub fn hold(&self, ip: Ipv4Addr, mig: u64) -> Result<()> {
+    /// Its IPv6 address's /128 (`vm_ipv6_prefix`) comes here with the /32, so nothing reaches the
+    /// VM's tap meanwhile, but its packets are only counted as dropped, not held yet (#1299).
+    pub fn hold(&self, addr: crate::net::VmAddr, mig: u64) -> Result<()> {
+        let ip = addr.v4;
         let (pending, routed) = {
             let _routes = self.routes.lock().unwrap();
-            {
-                let mut held = self.held.lock().unwrap();
-                if held.contains_key(&ip) {
-                    bail!("already holding {ip}");
-                }
-                held.insert(ip, Arc::new(Entry { mig, q: Mutex::default() }));
+            if self.held.lock().unwrap().contains_key(&ip) {
+                bail!("already holding {ip}");
             }
-            // The /32 alone: a VM's IPv6 address (`vm_ipv6_prefix`) is not held yet (#1299); its /128
-            // stays on the VM's tap meanwhile.
-            let routed = crate::net::route_dev(true, ip.into(), self.ifindex);
+            let v6 = addr.v6.filter(|_| self.ipv6());
+            self.held.lock().unwrap().insert(ip, Arc::new(Entry { mig, v6, q: Mutex::default() }));
+            let addr = crate::net::VmAddr { v4: ip, v6 };
+            let routed = crate::net::route_dev(true, addr, self.ifindex);
             let pending = match &routed {
                 Ok(()) => self.gone.lock().unwrap().remove(&ip),
-                // Not held after all: its stragglers are still counted.
+                // Not held after all: its stragglers are still counted. Whatever of its routes got here
+                // goes (by this device: never another's).
                 Err(_) => {
+                    let _ = crate::net::route_dev(false, addr, self.ifindex);
                     self.discard_hold(ip);
                     None
                 }
@@ -275,6 +282,33 @@ impl Holder {
             report(ip, &self.dev, &g);
         }
         routed
+    }
+
+    /// IPv6 on the device, the first time an address with an IPv6 address is held: off until then
+    /// (`new`), so off without `vm_ipv6_prefix`. No address of its own (addr_gen_mode 1), nor router
+    /// advertisements taken; what the host sends it meanwhile (MLD reports) the reader passes by.
+    /// Failing that (IPv6 off on the host), only /32s are held, and that is logged once.
+    fn ipv6(&self) -> bool {
+        if self.ipv6.load(Ordering::SeqCst) {
+            return true;
+        }
+        let on = [("addr_gen_mode", "1"), ("accept_ra", "0"), ("disable_ipv6", "0")].iter().try_for_each(|(k, v)| crate::net::conf("ipv6", &self.dev, k, v));
+        match &on {
+            Ok(()) => self.ipv6.store(true, Ordering::SeqCst),
+            Err(e) => {
+                static LOGGED: std::sync::Once = std::sync::Once::new();
+                LOGGED.call_once(|| crate::log!("hold device {}: {e}: VMs' IPv6 addresses stay on their taps while held; this is logged once", self.dev));
+            }
+        }
+        on.is_ok()
+    }
+
+    /// The hold's /128 of `e`, once its /32 was routed elsewhere (`route_via` routes no /128 yet,
+    /// #1295): by this device, so never the one a VM here has taken meanwhile.
+    fn unroute6(&self, e: &Entry) {
+        if let Some(v6) = e.v6 {
+            let _ = crate::net::unroute_dev(v6.into(), self.ifindex);
+        }
     }
 
     /// Under `routes`; `rx` keeps the reader from queuing after removal.
@@ -383,7 +417,10 @@ impl Holder {
             }
         }
         match switched {
-            Switch::Switched => self.unhold(ip, &e, true),
+            Switch::Switched => {
+                self.unhold(ip, &e, true);
+                self.unroute6(&e);
+            }
             Switch::Refused => self.unhold(ip, &e, false),
             // Left to the TUN, the address would be dropped here until the caller's retry.
             Switch::Lost(_) => self.unroute(ip, &e),
@@ -460,6 +497,7 @@ impl Holder {
         }
         if switched.is_ok() {
             self.unhold(ip, &e, true);
+            self.unroute6(&e);
         }
         // After `unhold`: a packet read since is a straggler, re-sent, not discarded below.
         give(&mut o);
@@ -551,7 +589,7 @@ impl Holder {
         let _routes = self.routes.lock().unwrap();
         if self.entry(ip).is_some_and(|x| Arc::ptr_eq(&x, e)) {
             self.unhold(ip, e, false);
-            let _ = crate::net::route_dev(false, ip.into(), self.ifindex);
+            let _ = crate::net::route_dev(false, crate::net::VmAddr { v4: ip, v6: e.v6 }, self.ifindex);
         }
     }
 
@@ -661,7 +699,11 @@ impl Holder {
         // resend recomputes the header checksum).
         // Refused, it is counted as dropped for the address it was sent to, if it has one.
         let Some((h, p)) = buf[..n as usize].split_at_mut_checked(VNET_HDR) else { return Ok(true) };
-        let ip = (p.len() >= 20).then(|| Ipv4Addr::new(p[16], p[17], p[18], p[19]));
+        let ip = match p.first().map(|b| b >> 4) {
+            // IPv6 (a held /128, `vm_ipv6_prefix`): counted for the address in its destination's low 32 bits.
+            Some(6) if p.len() >= 40 => Some(Ipv4Addr::new(p[36], p[37], p[38], p[39])),
+            _ => (p.len() >= 20).then(|| Ipv4Addr::new(p[16], p[17], p[18], p[19])),
+        };
         let Some(ip) = ip.filter(|_| accept(h, 0, p)) else {
             if let Some(ip) = ip {
                 self.refused(ip);
@@ -1256,7 +1298,7 @@ mod tests {
         for sent in [1, 128, 256] {
             let packets: VecDeque<_> = (0..300).map(|i: usize| vec![i as u8; i + 1]).collect();
             let bytes = packets.iter().map(Vec::len).sum();
-            let e = Entry { mig: 1, q: Mutex::new(Queue { packets: packets.clone(), bytes, ..Queue::default() }) };
+            let e = Entry { mig: 1, v6: None, q: Mutex::new(Queue { packets: packets.clone(), bytes, ..Queue::default() }) };
             let (mut stats, mut delivered) = (Stats::default(), Vec::new());
             h.hand_over(
                 &e,
@@ -1496,6 +1538,7 @@ mod tests {
             held,
             reading: AtomicBool::new(false),
             routes: Mutex::new(()),
+            ipv6: AtomicBool::new(false),
             rx: Mutex::new(()),
             gone,
             stragglers: Mutex::default(),
@@ -1563,7 +1606,7 @@ mod tests {
         // The hold device's reads too: the kernel leaves completion to it.
         let (h, w) = paired();
         let dst = Ipv4Addr::new(10, 9, 0, 8);
-        h.held.lock().unwrap().insert(dst, Arc::new(Entry { mig: 1, q: Mutex::default() }));
+        h.held.lock().unwrap().insert(dst, Arc::new(Entry { mig: 1, v6: None, q: Mutex::default() }));
         let mut buf = vec![0u8; VNET_HDR + MAX_FRAME];
         for (csum, queued) in [((13, 0), 0), ((21, 6), 0), ((20, 16), 0), ((20, 6), 1)] {
             let f = [&vnet_hdr(1, 0, csum)[..], &p].concat();
@@ -1628,7 +1671,7 @@ mod tests {
         let ip = Ipv4Addr::new(10, 9, 0, 8);
         let data = vec![7u8; 16000];
         let backlog = |h: &Holder, mss: u16| {
-            h.held.lock().unwrap().insert(ip, Arc::new(Entry { mig: 1, q: Mutex::default() }));
+            h.held.lock().unwrap().insert(ip, Arc::new(Entry { mig: 1, v6: None, q: Mutex::default() }));
             let f = tso_frame(&data, mss, (14 + 20, 16));
             h.hold_first(ip, 1, |each| (0..crate::net::TAP_QUEUE).for_each(|_| each(&f)));
             let e = h.entry(ip).unwrap();
@@ -1665,7 +1708,7 @@ mod tests {
         // Held first, in their order, ahead of what was held.
         let h = holder(std::fs::File::open("/dev/null").unwrap().into());
         let q = Queue { packets: VecDeque::from([b"held".to_vec()]), bytes: 4, ..Queue::default() };
-        h.held.lock().unwrap().insert(Ipv4Addr::new(10, 9, 0, 8), Arc::new(Entry { mig: 1, q: Mutex::new(q) }));
+        h.held.lock().unwrap().insert(Ipv4Addr::new(10, 9, 0, 8), Arc::new(Entry { mig: 1, v6: None, q: Mutex::new(q) }));
         h.hold_first(Ipv4Addr::new(10, 9, 0, 8), 1, feed(&[tso((14 + 20, 16))]));
         assert_eq!(h.entry(Ipv4Addr::new(10, 9, 0, 8)).unwrap().q.lock().unwrap().packets, [&segs[..], &[b"held".to_vec()]].concat());
         // Its checksum asked for anywhere but TCP's own field, as for one packet: dropped.
@@ -1679,7 +1722,7 @@ mod tests {
         let ip = Ipv4Addr::new(10, 9, 0, 8);
         let (first, second, held) = (udp_to(ip), [&udp_to(ip)[..28], b"!"].concat(), b"held".to_vec());
         let q = Queue { packets: VecDeque::from([held.clone()]), bytes: 4, ..Queue::default() };
-        h.held.lock().unwrap().insert(ip, Arc::new(Entry { mig: 1, q: Mutex::new(q) }));
+        h.held.lock().unwrap().insert(ip, Arc::new(Entry { mig: 1, v6: None, q: Mutex::new(q) }));
         let frames = [tap_frame(&first, 0, 0, (0, 0), 0), tap_frame(&second, 0, 1, (0, 0), 0), tap_frame(&second, 0, 0, (0, 0), 0)];
         h.hold_first(ip, 2, feed(&frames));
         assert_eq!(h.entry(ip).unwrap().q.lock().unwrap().packets.len(), 1, "another migration's hold");
@@ -1713,7 +1756,7 @@ mod tests {
     fn failed_release_and_forget_count_late_drops_once() {
         let h = holder(std::fs::File::open("/dev/null").unwrap().into());
         let ip = Ipv4Addr::new(10, 100, 254, 9);
-        let e = Arc::new(Entry { mig: 1, q: Mutex::new(Queue { dropped: 2, ..Queue::default() }) });
+        let e = Arc::new(Entry { mig: 1, v6: None, q: Mutex::new(Queue { dropped: 2, ..Queue::default() }) });
         h.held.lock().unwrap().insert(ip, e.clone());
         let (mut stats, result) = h.release_local(ip, 1, &mut |_| true, || Err("route failed".into()), Duration::ZERO).unwrap();
         assert!(result.is_err());
@@ -1734,10 +1777,11 @@ mod tests {
     fn duplicate_hold_preserves_queue_and_owner() {
         let h = holder(std::fs::File::open("/dev/null").unwrap().into());
         let ip = Ipv4Addr::new(10, 100, 254, 9);
-        let e = Arc::new(Entry { mig: 1, q: Mutex::new(Queue { packets: VecDeque::from([vec![0; 20]]), bytes: 20, dropped: 4, ..Queue::default() }) });
+        let e =
+            Arc::new(Entry { mig: 1, v6: None, q: Mutex::new(Queue { packets: VecDeque::from([vec![0; 20]]), bytes: 20, dropped: 4, ..Queue::default() }) });
         h.held.lock().unwrap().insert(ip, e.clone());
         for mig in [1, 2] {
-            assert!(h.hold(ip, mig).unwrap_err().to_string().contains("already holding"));
+            assert!(h.hold(ip.into(), mig).unwrap_err().to_string().contains("already holding"));
             assert!(Arc::ptr_eq(&h.entry(ip).unwrap(), &e));
             let q = e.q.lock().unwrap();
             assert_eq!((q.packets.len(), q.bytes, q.dropped), (1, 20, 4));
@@ -1754,6 +1798,7 @@ mod tests {
             }
             let e = Arc::new(Entry {
                 mig: 1,
+                v6: None,
                 q: Mutex::new(Queue { packets: VecDeque::from([vec![0; 20], vec![0; 20]]), bytes: 40, dropped: 4, ..Queue::default() }),
             });
             h.held.lock().unwrap().insert(ip, e.clone());
@@ -1793,7 +1838,7 @@ mod tests {
         let (r, w) = (fds[0], fds[1]);
         let h = holder(unsafe { OwnedFd::from_raw_fd(r) });
         let dst = Ipv4Addr::new(10, 9, 0, 8);
-        h.held.lock().unwrap().insert(dst, Arc::new(Entry { mig: 1, q: Mutex::default() }));
+        h.held.lock().unwrap().insert(dst, Arc::new(Entry { mig: 1, v6: None, q: Mutex::default() }));
         let p = udp_to(dst);
         let queued = || h.entry(dst).unwrap().q.lock().unwrap().packets.len();
         let write = |p: &[u8]| {
@@ -1817,6 +1862,43 @@ mod tests {
         write(&forged);
         h.read_one(&mut buf);
         assert_eq!(h.gone.lock().unwrap()[&dst].dropped, 1, "a let-go address counts it too");
+        unsafe { libc::close(w) };
+    }
+
+    /// IPv6 to a held /128 (`vm_ipv6_prefix`) is counted as dropped for its IPv4 address, the low
+    /// 32 bits of its destination (not held yet, #1299), and never queued, re-sent or counted for
+    /// whatever its source's bytes read as; the host's multicast is passed by.
+    #[test]
+    fn ipv6_to_a_held_address_is_counted_for_it() {
+        let mut fds = [0 as libc::c_int; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (r, w) = (fds[0], fds[1]);
+        let h = holder(unsafe { OwnedFd::from_raw_fd(r) });
+        let (dst, decoy) = (Ipv4Addr::new(10, 9, 0, 8), Ipv4Addr::new(0, 0, 0, 1));
+        for ip in [dst, decoy] {
+            h.held.lock().unwrap().insert(ip, Arc::new(Entry { mig: 1, v6: None, q: Mutex::default() }));
+        }
+        let ipv6 = |src: &str, to: &str| {
+            let (src, to) = (src.parse::<std::net::Ipv6Addr>().unwrap(), to.parse::<std::net::Ipv6Addr>().unwrap());
+            [&[0x60, 0, 0, 0, 0, 8, 17, 64][..], &src.octets(), &to.octets(), &[0; 8]].concat()
+        };
+        let write = |p: &[u8]| {
+            let f = [&vnet_hdr(0, 0, (0, 0))[..], p].concat();
+            assert_eq!(unsafe { libc::write(w, f.as_ptr().cast(), f.len()) }, f.len() as isize)
+        };
+        let mut buf = vec![0u8; 2048];
+        // Its source's bytes 8..12 (where an IPv4 destination would be) read as `decoy`.
+        write(&ipv6("2001:db8:0:1:0:0:0:1", "fd00:7::a09:8"));
+        h.read_one(&mut buf);
+        write(&ipv6("fe80::1", "ff02::16"));
+        h.read_one(&mut buf);
+        let q = |ip| {
+            h.entry(ip).map(|e| {
+                let q = e.q.lock().unwrap();
+                (q.packets.len(), q.dropped)
+            })
+        };
+        assert_eq!((q(dst), q(decoy)), (Some((0, 1)), Some((0, 0))));
         unsafe { libc::close(w) };
     }
 
@@ -1860,7 +1942,7 @@ mod tests {
             let (h, w) = paired();
             let ip = Ipv4Addr::new(10, 9, 0, 8);
             let q = Queue { packets: VecDeque::from(vec![udp_to(ip); 3]), bytes: 3 * 29, ..Queue::default() };
-            h.held.lock().unwrap().insert(ip, Arc::new(Entry { mig: 1, q: Mutex::new(q) }));
+            h.held.lock().unwrap().insert(ip, Arc::new(Entry { mig: 1, v6: None, q: Mutex::new(q) }));
             // More than a pass: refused, the device is read until it is empty, not one pass of it.
             let late = [&vnet_hdr(0, 0, (0, 0))[..], &udp_to(ip)].concat();
             let buf = 4i32 << 20;
@@ -1916,7 +1998,7 @@ mod tests {
             });
             let dropped: Vec<u64> = (0..10)
                 .map(|mig| {
-                    h.held.lock().unwrap().insert(ip, Arc::new(Entry { mig, q: Mutex::default() }));
+                    h.held.lock().unwrap().insert(ip, Arc::new(Entry { mig, v6: None, q: Mutex::default() }));
                     let (stats, switched) = h.release_local(ip, mig, &mut |_| true, || Ok(()), Duration::ZERO).unwrap();
                     switched.unwrap();
                     stats.dropped
@@ -2237,9 +2319,9 @@ mod tests {
         let (a, b) =
             (Holder::new(&format!("tsa{:x}h", std::process::id())).unwrap().unwrap(), Holder::new(&format!("tsb{:x}h", std::process::id())).unwrap().unwrap());
         let (_address, ip) = root_address();
-        a.hold(ip, 1).unwrap();
+        a.hold(ip.into(), 1).unwrap();
         let mut none = |_: &[u8]| true;
-        let (_, switched) = a.release_local(ip, 1, &mut none, || b.hold(ip, 2), Duration::ZERO).unwrap();
+        let (_, switched) = a.release_local(ip, 1, &mut none, || b.hold(ip.into(), 2), Duration::ZERO).unwrap();
         switched.unwrap();
         let s = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
         let dev = a.dev.as_bytes();
