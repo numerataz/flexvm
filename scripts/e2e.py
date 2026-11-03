@@ -1704,7 +1704,7 @@ def containers():
     out, err = e.communicate(timeout=120)
     check("rename: a separate exec client reattaches under the new name", e.returncode == 0 and out == "exec-done\n", (e.returncode, out, err[-500:]))
     # How many run (`must`: an exec that fails raises, never reads as none).
-    sleeping = lambda n: int(must(A, n, "for p in /proc/[0-9]*; do tr '\\0' ' ' < $p/cmdline; echo; done | grep -cx 'sleep 4321 ' || :"))
+    sleeping = lambda n: int(must(A, n, "for p in /proc/[0-9]*; do tr '\\0' ' ' < $p/cmdline; echo; done 2>/dev/null | grep -cx 'sleep 4321 ' || :"))
     e = subprocess.Popen(cli + [moved, "sleep", "4321"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=ENV)
     try:
         check("exec: its command runs", wait_for(lambda: sleeping(moved) == 1, 30))

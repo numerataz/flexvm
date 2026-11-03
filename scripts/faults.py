@@ -1613,7 +1613,7 @@ def exec_background():
     stalled = raw_exec(stalled_id, "head -c 100000000 /dev/zero")
     stalled_at = time.time()
     # Processes whose command line starts with `cmd` (the ^ keeps grep from counting itself).
-    count = lambda cmd: sh(A, n, f"for f in /proc/[0-9]*/cmdline; do tr '\\0' ' ' <$f; echo; done | grep -c '^{cmd} ' || :")
+    count = lambda cmd: sh(A, n, f"for f in /proc/[0-9]*/cmdline; do tr '\\0' ' ' <$f; echo; done 2>/dev/null | grep -c '^{cmd} ' || :")
     t = time.time()
     r = sh(A, n, "echo started; sleep 1000 &")
     took = time.time() - t
@@ -4901,13 +4901,17 @@ def signals():
 def busy_guest(host, name):
     """Floods the network (UDP to the gateway) and churns memory (freed
     pages go back through balloon free page reporting) in the background.
+    The flood's socket is unconnected (UDP-SENDTO): a connected one takes an
+    ICMP error back (the gateway is no host's address, and a host that
+    forwards what the guest sends there may answer one) as its next send
+    failing, and socat exits on it. Its errors go to /tmp/flood.err.
     The churn file takes at most half of what the guest has available (200
     MiB at most): tmpfs cannot be reclaimed, so more would have the guest's
     OOM killer take the guest's own processes, or panic it, on a template
     without hot-plugged memory (#189)."""
     # The kernel log starts empty, so guest_healthy counts only what this run logs, not the template's.
-    code, out = sh(host, name, "dmesg -c >/dev/null; (while :; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done | socat -u - UDP:169.254.1.1:9) "
-                   ">/dev/null 2>&1 < /dev/null & "
+    code, out = sh(host, name, "dmesg -c >/dev/null; (while :; do echo xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx; done | "
+                   "socat -u - UDP-SENDTO:169.254.1.1:9 2>/tmp/flood.err) >/dev/null 2>&1 < /dev/null & "
                    "c=$(awk '/MemAvailable/ { m = int($2 / 2048); print (m < 200 ? m : 200) }' /proc/meminfo); "
                    "(while :; do head -c ${c}M /dev/zero > /dev/shm/churn; rm -f /dev/shm/churn; done) "
                    ">/dev/null 2>&1 < /dev/null & echo ok")
@@ -4916,8 +4920,13 @@ def busy_guest(host, name):
 
 def flood_state(host, name):
     """The guest's account of `busy_guest`'s flood, for a failed check: whether its socat still runs
-    (one that exited stops the flood; a send stuck on eth0 does not), and eth0's transmit counters."""
-    return sh(host, name, "echo socat: $(for f in /proc/[0-9]*/cmdline; do tr '\\0' ' ' <$f; echo; done | grep -c '^socat -u - UDP:169.254.1.1:9 '); "
+    (one that exited stops the flood; a send stuck on eth0 does not) and what it said, the ICMP
+    destination-unreachable messages the guest took, and eth0's transmit counters."""
+    # A process that exits while it is listed has no cmdline to read by then: not counted, and not an error.
+    return sh(host, name, "echo socat: $(for f in /proc/[0-9]*/cmdline; do tr '\\0' ' ' <$f; echo; done 2>/dev/null | grep -c '^socat -u - UDP-SENDTO:169.254.1.1:9 '); "
+              "echo socat said: $(cat /tmp/flood.err); "
+              "echo ICMP destination unreachable taken: $(awk '/^Icmp:/ { if (!h) { for (i = 1; i <= NF; i++) k[i] = $i; h = 1 } "
+              "else for (i = 1; i <= NF; i++) if (k[i] == \"InDestUnreachs\") print $i }' /proc/net/snmp); "
               "cd /sys/class/net/eth0/statistics && echo eth0 tx packets, dropped, errors: $(cat tx_packets tx_dropped tx_errors)")
 
 
