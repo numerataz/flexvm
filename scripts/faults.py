@@ -271,7 +271,7 @@ def host_config(host):
         return {}
 
 
-HOST_KEYS = {"listen", "peers", "peer_underlays", "vm_ips", "cluster_ips", "underlay", "announce_dev", "dns", "reserve_mib", "evict_mib"}
+HOST_KEYS = {"listen", "peers", "peer_underlays", "vm_ips", "cluster_ips", "underlay", "announce_dev", "dns", "reserve_mib", "evict_mib", "vm_ipv6_prefix"}
 
 
 def configure(host, **keys):
@@ -6839,6 +6839,108 @@ def ckpt_packet_hold():
         rm_ckpt(p)
 
 
+@needs_kvm
+def ipv6_packet_hold():
+    """#1299: with vm_ipv6_prefix, packets for a VM's IPv6 address that arrive while it is paused are
+    held and handed to it as IPv4 ones are: a 1 kHz UDP sequence stream to its IPv6 address across a
+    keep-running checkpoint and migrations to B and back arrives whole, and a TCP connection over IPv6
+    keeps echoing throughout and loses nothing (any retransmit a duplicate, as in ckpt_packet_hold)."""
+    n, prefix = "ft-v6-hold", "fd00:f17::"
+    path = ckpt_path(n)
+    for h in (A, B):
+        configure(h, vm_ipv6_prefix=prefix + "/96")
+    stop, threads = threading.Event(), []
+    try:
+        ok(run(A, n))
+        ip = vm_ip(A, n)
+        v6 = str(ipaddress.IPv6Address(int(ipaddress.IPv6Address(prefix)) | int(ipaddress.IPv4Address(ip))))
+        check("v6 hold: its IPv6 address", vms(A)[n].get("ipv6") == v6, vms(A)[n])
+        code, out = sh(A, n, "echo 16777216 > /proc/sys/net/core/rmem_max; "
+                       "setsid socat -u UDP6-RECV:9000,rcvbuf=16777216 OPEN:/tmp/udp,creat,append >/dev/null 2>&1 < /dev/null & "
+                       "setsid socat TCP6-LISTEN:7000,fork,reuseaddr EXEC:cat >/dev/null 2>&1 < /dev/null & "
+                       "for i in $(seq 200); do grep -qs ':2328 ' /proc/net/udp6 && grep -qs ':1B58 ' /proc/net/tcp6 && exit 0; sleep 0.05; done; exit 1")
+        assert code == 0, f"socat did not bind its IPv6 ports in the guest: {out}"
+
+        def connect():
+            try:
+                return socket.create_connection((v6, 7000), timeout=1)
+            except OSError:
+                return None
+        conn = wait_for(connect, 10)
+        check("v6 hold: the host reaches the guest at its IPv6 address", conn, v6)
+        assert conn, f"no TCP connection to {v6}"
+        conn.settimeout(10)
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        guest0 = guest_tcp_counters(A, n)
+        sent, errors, echoes, phase = [0], [], [0] * 4, [0]
+        progress = threading.Lock()
+
+        def stream():
+            try:
+                with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as s:
+                    while not stop.is_set():
+                        s.sendto(b"%08d\n" % sent[0], (v6, 9000))
+                        sent[0] += 1
+                        time.sleep(0.001)
+            except Exception as e:
+                errors.append(("stream", repr(e)))
+
+        def pingpong():
+            try:
+                while not stop.is_set():
+                    if not echo(conn, b"x" * 32):
+                        raise RuntimeError("incomplete or incorrect echo")
+                    with progress:
+                        echoes[phase[0]] += 1
+                    time.sleep(0.002)
+            except Exception as e:
+                errors.append(("pingpong", repr(e)))
+
+        threads = [start_thread(target=stream, daemon=True), start_thread(target=pingpong, daemon=True)]
+        wait_for(lambda: echoes[0] > 0 or errors, 15)
+        time.sleep(0.5)
+        r = checkpoint(A, n, path)
+        held = [(r.get("result") or {}).get("held_packets") or r.get("error")]
+        for i, (src, dst) in enumerate(((A, B), (B, A))):
+            with progress:
+                phase[0] = i + 1
+            wait_for(lambda: echoes[i + 1] > 0 or errors, 15)
+            time.sleep(0.5)
+            r = migrate(src, n, dst)
+            held.append((r.get("result") or {}).get("held") or r.get("error"))
+            assert_released(dst, n, src)
+        with progress:
+            phase[0] = 3
+        wait_for(lambda: echoes[3] > 0 or errors, 15)
+        stop.set()
+        for t in threads:
+            t.join(15)
+        check("v6 hold: workers exited without errors", not any(t.is_alive() for t in threads) and not errors, errors)
+        retrans, dsacks = tcp_retrans(conn)
+        conn.close()
+        check("v6 hold: checkpointed, migrated there and back, running on A", where(n) == {A: "running"}, where(n))
+        # A pause of a few ms can see no datagram of a 1 kHz stream, so only some must hold one.
+        check("v6 hold: packets held and all injected",
+              all(isinstance(h, dict) and h.get("injected") == h.get("packets") and h.get("dropped") == 0 and h.get("dropped_target") == 0 for h in held)
+              and any(isinstance(h, dict) and h.get("packets") for h in held), held)
+        udp_received(A, n, sent[0])
+        code, out = sh(A, n, "sort -u /tmp/udp | wc -l")
+        got = int(out) if code == 0 and out.strip().isdigit() else -1
+        check("v6 hold: no udp datagram lost", got == sent[0], f"sent {sent[0]}, received {got}")
+        guest = [b - a for a, b in zip(guest0, guest_tcp_counters(A, n))]
+        check("v6 hold: tcp echoed throughout, no segment lost (any retransmit a duplicate)",
+              all(echoes) and retrans <= dsacks and guest[0] <= guest[1],
+              f"echoes before and after each move {echoes}; retransmits {retrans} (duplicates {dsacks}), the guest's {guest[0]} (duplicates {guest[1]})")
+    finally:
+        stop.set()
+        for t in threads:
+            t.join(15)
+        cleanup(n)
+        rm_ckpt(path)
+        for h in (A, B):
+            configure(h, vm_ipv6_prefix=None)
+
+
 _stallprobe = None
 
 
@@ -12842,7 +12944,7 @@ SCENARIOS = dict(
     ckpt_failed_stop=ckpt_failed_stop, ckpt_no_wp=ckpt_no_wp, ckpt_rearm=ckpt_rearm,
     leave_fail=leave_fail, capture_fail=capture_fail, abort_gen_fail=abort_gen_fail, commit_fail=commit_fail, commit_fail_routed=commit_fail_routed, abort_stay_fail=abort_stay_fail,
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail, arrival_flood=arrival_flood, arrival_cap_restart=arrival_cap_restart,
-    fc_prepare=fc_prepare, forged_vmstate=forged_vmstate, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ckpt_stall=ckpt_stall, standby=standby, standby_vm_ips=standby_vm_ips,
+    fc_prepare=fc_prepare, forged_vmstate=forged_vmstate, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ipv6_packet_hold=ipv6_packet_hold, ckpt_stall=ckpt_stall, standby=standby, standby_vm_ips=standby_vm_ips,
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, suspend_unaddressed=suspend_unaddressed, resume_fence_fails=resume_fence_fails, kill_source=kill_source,
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, route_via6=route_via6, peer_by_name=peer_by_name, peer_moved=peer_moved, peer_unresolvable=peer_unresolvable, page_refusals=page_refusals,
     forged_peer=forged_peer, forged_pages=forged_pages, restore_ip_peer=restore_ip_peer, loan_start_retry=loan_start_retry, spoof_filter=spoof_filter, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,

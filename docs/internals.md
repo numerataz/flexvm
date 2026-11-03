@@ -743,8 +743,9 @@ through, so the checkpoint is exactly the memory at the pause.
   lost 59 datagrams (7–11 per pause) before, none now
   (`scripts/faults.py ckpt_packet_hold`). Packets already routed to the hold
   device can still reach it after release (#292). For 30 seconds after the
-  route moves on, these stragglers are re-sent through a raw IP socket to
-  the address's current route, with TTL reduced by one to prevent loops.
+  route moves on, these stragglers are re-sent through a raw IP socket (an
+  IPv6 one for the VM's /128) to the address's current route, with TTL (hop
+  limit) reduced by one to prevent loops.
   They can arrive behind newer traffic. An expired TTL, no raw socket, a
   send failure (including exceeding the new route's MTU), or a fragment
   with IP ID zero counts as a drop; packets after a release that did not
@@ -1266,8 +1267,19 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   to the guest (`tx_dropped`): a clsact egress filter drops the host's IPv6
   multicast to the tap instead. A hold takes the /128 to the hold device with
   the /32 (its IPv6 on there from the first such hold, with no address), so
-  nothing reaches a paused VM's tap; IPv6 packets there are counted as dropped
-  for the address in their destination's low 32 bits, not held yet (#1299).
+  nothing reaches a paused VM's tap. IPv6 packets there are held for the
+  address in their destination's low 32 bits, but only if that destination
+  is the hold's own /128 (another prefix's address or the host's multicast is
+  no one's). The rules are at least as strict as IPv4's: only TCP, UDP or
+  ICMPv6 (not neighbour discovery) directly after the fixed header, a payload
+  length that covers the whole packet, and checksum completion only in a TCP
+  or UDP packet's own field with `csum_start` 40 (`hold::accept6`). An
+  extension header (a fragment's too) is refused and counted as dropped.
+  Frames left on the tap are taken too, a TCPv6 TSO frame (gso_type 4) cut
+  into its segments as a TCPv4 one is. The target injects only what `valid`
+  takes for the VM's own /128, each frame with its packet's ethertype.
+  Stragglers are re-sent by an IPv6 raw socket (`IPPROTO_RAW`, so the
+  packet's own header), with the hop limit reduced by one.
   The hold's own /128 goes when its /32 is switched away (by this device: one
   the switch routed via the target stays). A route add puts the /128 in first,
   so a failure leaves the /32 where it was. A VM a peer runs has its /128

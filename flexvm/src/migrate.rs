@@ -1125,7 +1125,15 @@ impl Proc {
             crate::host::gate("handoff_gate");
             if hold::wait_start(&mut r, (fence + HOLD_FENCE).min(deadline)) {
                 let running = vm.state() == State::Running;
-                vm.tap_drops_reported(hold::receive(&mut r, vm.ip, &vm.tap, running, &revoked, (Instant::now() + HELD_STREAM).min(deadline), &mut take_over));
+                vm.tap_drops_reported(hold::receive(
+                    &mut r,
+                    vm.addr(),
+                    &vm.tap,
+                    running,
+                    &revoked,
+                    (Instant::now() + HELD_STREAM).min(deadline),
+                    &mut take_over,
+                ));
             } else {
                 crate::log!("vm {}: no held packets from the source after {} ms", vm.name, ms(fence.elapsed()));
             }
@@ -1633,7 +1641,8 @@ pub fn release_into(h: &Holder, ip: Ipv4Addr, mig: u64, vm: &Vm, linger: Duratio
             return (Some(h.forget(ip, mig)), Err(e));
         }
     };
-    let Some((mut stats, switched)) = h.release_local(ip, mig, &mut |p| hold::valid(p, ip) && inj.send(p), || switch(()), linger) else {
+    let addr = crate::net::VmAddr { v4: ip, ..vm.addr() };
+    let Some((mut stats, switched)) = h.release_local(ip, mig, &mut |p| hold::valid(p, addr) && inj.send(p), || switch(()), linger) else {
         return (None, Ok(()));
     };
     if let Err(e) = &switched {

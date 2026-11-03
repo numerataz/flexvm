@@ -571,7 +571,7 @@ impl Config {
         }
         if let Some(p) = self.vm_ipv6_prefix {
             w.push(format!(
-                "flexvm: warning: vm_ipv6_prefix {p} is set: VMs' IPv6 addresses are configured in guests and routed (to peers via their IPv6 underlays), but not held in migrations (#1299) or answered for on the LAN (#1300)"
+                "flexvm: warning: vm_ipv6_prefix {p} is set: VMs' IPv6 addresses are configured in guests, routed (to peers via their IPv6 underlays) and held in migrations, but not answered for on the LAN (#1300)"
             ));
         }
         let v6_dns = self.dns.as_ref().map_or(&[][..], Dns::listed).iter().find(|d| d.parse::<std::net::Ipv6Addr>().is_ok());
@@ -7906,7 +7906,7 @@ pub(crate) mod tests {
             "{w}"
         );
         assert!(
-            w.contains("VMs' IPv6 addresses are configured in guests and routed (to peers via their IPv6 underlays), but not held in migrations (#1299)"),
+            w.contains("VMs' IPv6 addresses are configured in guests, routed (to peers via their IPv6 underlays) and held in migrations, but not answered for on the LAN (#1300)"),
             "{w}"
         );
         let w = cfg.warnings_by(|_| Ok(false), Ok(vec![(v6("fd00:2::a09:7"), "address")])).join("\n");

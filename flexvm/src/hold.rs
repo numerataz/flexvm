@@ -1,13 +1,14 @@
 //! Holds packets for a paused VM and delivers them once it runs again, instead of letting
 //! them hit a downed tap (TCP peers would wait out a retransmit timeout).
 //!
-//! `hold` routes the VM's /32 to this process's TUN device; `release` hands the queue to a
-//! sink and switches the route. A migration streams them to the target (`send`), which
-//! injects them out of the VM's tap and announces the VM only after, so they come first.
+//! `hold` routes the VM's /32 (and its /128, `vm_ipv6_prefix`) to this process's TUN device;
+//! `release` hands the queue to a sink and switches the route. A migration streams them to the
+//! target (`send`), which injects them out of the VM's tap and announces the VM only after, so
+//! they come first.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufReader, Read, Write};
-use std::net::{Ipv4Addr, TcpStream};
+use std::net::{Ipv4Addr, Ipv6Addr, TcpStream};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -94,6 +95,10 @@ pub struct Holder {
     stragglers: Mutex<Stragglers>,
     /// A raw socket (IPPROTO_RAW: the packet's own header) the kernel routes re-sent packets by.
     resend: Option<OwnedFd>,
+    /// Its IPv6 counterpart (IPPROTO_RAW implies IPV6_HDRINCL), for IPv6 stragglers.
+    resend6: Option<OwnedFd>,
+    /// Why there is no `resend6`, logged once IPv6 is on on the device.
+    no_resend6: Option<String>,
 }
 
 #[derive(Default)]
@@ -113,18 +118,21 @@ struct Gone {
     resent: u64,
     dropped: u64,
     reported: Option<Instant>,
+    /// The hold's IPv6 address (`Entry::v6`): the only one whose stragglers are this address's.
+    v6: Option<Ipv6Addr>,
 }
 
 impl Gone {
     fn new(moved: bool) -> Gone {
-        Gone { at: Instant::now(), moved, resent: 0, dropped: 0, reported: None }
+        Gone { at: Instant::now(), moved, resent: 0, dropped: 0, reported: None, v6: None }
     }
 }
 
 struct Entry {
     mig: u64,
-    /// The IPv6 address (`vm_ipv6_prefix`) whose /128 is routed here with the /32.
-    v6: Option<std::net::Ipv6Addr>,
+    /// The IPv6 address (`vm_ipv6_prefix`) whose /128 is routed here with the /32: the only one
+    /// whose packets are held for it (`ours`).
+    v6: Option<Ipv6Addr>,
     q: Mutex<Queue>,
 }
 
@@ -234,6 +242,12 @@ impl Holder {
                 None
             }
         };
+        // Logged only once IPv6 is on on the device (`ipv6`): a host without IPv6 has none.
+        let resend6 = match unsafe { libc::socket(libc::AF_INET6, libc::SOCK_RAW | libc::SOCK_CLOEXEC, libc::IPPROTO_RAW) } {
+            fd if fd >= 0 => Ok(unsafe { OwnedFd::from_raw_fd(fd) }),
+            _ => Err(std::io::Error::last_os_error()),
+        };
+        let no_resend6 = resend6.as_ref().err().map(ToString::to_string);
         let h = Arc::new(Holder {
             dev,
             ifindex,
@@ -246,14 +260,16 @@ impl Holder {
             gone: Mutex::default(),
             stragglers: Mutex::default(),
             resend,
+            resend6: resend6.ok(),
+            no_resend6,
         });
         let reader = h.clone();
         std::thread::Builder::new().name("hold".into()).spawn(move || reader.read_loop())?;
         Ok(Some(h))
     }
 
-    /// Its IPv6 address's /128 (`vm_ipv6_prefix`) comes here with the /32, so nothing reaches the
-    /// VM's tap meanwhile, but its packets are only counted as dropped, not held yet (#1299).
+    /// Its IPv6 address's /128 (`vm_ipv6_prefix`) comes here with the /32, and its packets are held
+    /// with the IPv4 ones, in the order they came.
     pub fn hold(&self, addr: crate::net::VmAddr, mig: u64) -> Result<()> {
         let ip = addr.v4;
         let (pending, routed) = {
@@ -286,7 +302,8 @@ impl Holder {
 
     /// IPv6 on the device, the first time an address with an IPv6 address is held: off until then
     /// (`new`), so off without `vm_ipv6_prefix`. No address of its own (addr_gen_mode 1), nor router
-    /// advertisements taken; what the host sends it meanwhile (MLD reports) the reader passes by.
+    /// advertisements taken; what the host sends it meanwhile (MLD reports) the reader passes by
+    /// (`dest`: no held address's).
     /// Failing that (IPv6 off on the host), only /32s are held, and that is logged once.
     fn ipv6(&self) -> bool {
         if self.ipv6.load(Ordering::SeqCst) {
@@ -294,7 +311,13 @@ impl Holder {
         }
         let on = [("addr_gen_mode", "1"), ("accept_ra", "0"), ("disable_ipv6", "0")].iter().try_for_each(|(k, v)| crate::net::conf("ipv6", &self.dev, k, v));
         match &on {
-            Ok(()) => self.ipv6.store(true, Ordering::SeqCst),
+            Ok(()) => {
+                if !self.ipv6.swap(true, Ordering::SeqCst) {
+                    if let Some(e) = &self.no_resend6 {
+                        crate::log!("hold device {}: no IPv6 raw socket ({e}); IPv6 packets reaching it after a release are dropped", self.dev);
+                    }
+                }
+            }
             Err(e) => {
                 static LOGGED: std::sync::Once = std::sync::Once::new();
                 LOGGED.call_once(|| crate::log!("hold device {}: {e}: VMs' IPv6 addresses stay on their taps while held; this is logged once", self.dev));
@@ -322,12 +345,12 @@ impl Holder {
             let dropped = e.q.lock().unwrap().discard();
             if dropped > 0 {
                 let mut gone = self.gone.lock().unwrap();
-                gone.entry(ip).or_insert(Gone::new(false)).dropped += dropped;
+                gone.entry(ip).or_insert(Gone { v6: e.v6, ..Gone::new(false) }).dropped += dropped;
             }
         }
     }
 
-    /// The IPv4 packets in the frames `take` hands over, oldest first (`from_tap`, within `CAP`
+    /// The IP packets in the frames `take` hands over, oldest first (`from_tap`, within `CAP`
     /// with what is held; the rest counted as dropped), go ahead of what is held for `ip`: routed
     /// to the VM's tap before the hold, they reached it too late for its guest to take before
     /// the pause (#379). Each frame is cut as it comes, so a backlog is never all in memory.
@@ -372,7 +395,7 @@ impl Holder {
             held.remove(&ip);
             let mut gone = self.gone.lock().unwrap();
             gone.retain(|_, g| g.at.elapsed() < GONE_FOR || g.resent + g.dropped > 0);
-            gone.insert(ip, Gone::new(moved));
+            gone.insert(ip, Gone { v6: e.v6, ..Gone::new(moved) });
         }
     }
 
@@ -696,21 +719,16 @@ impl Holder {
         // its own IP source, after the tap's ingress filter passed the original. The device
         // leaves completion to us (`open_tun`): `accept` does it only at a TCP or UDP checksum
         // field, so no forged source is queued, nor re-sent by `straggler` (whose IPPROTO_RAW
-        // resend recomputes the header checksum).
+        // resend recomputes the header checksum; IPv6 has none, and `accept6` writes nowhere
+        // in its fixed header either).
         // Refused, it is counted as dropped for the address it was sent to, if it has one.
         let Some((h, p)) = buf[..n as usize].split_at_mut_checked(VNET_HDR) else { return Ok(true) };
-        let ip = match p.first().map(|b| b >> 4) {
-            // IPv6 (a held /128, `vm_ipv6_prefix`): counted for the address in its destination's low 32 bits.
-            Some(6) if p.len() >= 40 => Some(Ipv4Addr::new(p[36], p[37], p[38], p[39])),
-            _ => (p.len() >= 20).then(|| Ipv4Addr::new(p[16], p[17], p[18], p[19])),
-        };
-        let Some(ip) = ip.filter(|_| accept(h, 0, p)) else {
-            if let Some(ip) = ip {
-                self.refused(ip);
-            }
+        let Some((ip, to6)) = dest(p) else { return Ok(true) };
+        if !accept_ip(h, 0, p) {
+            self.refused(ip, to6);
             return Ok(true);
-        };
-        let drain = match self.entry(ip) {
+        }
+        let drain = match self.entry(ip).filter(|e| ours(e.v6, to6)) {
             Some(e) => {
                 let mut q = e.q.lock().unwrap();
                 if q.bytes + p.len() > CAP && !q.switched {
@@ -730,13 +748,13 @@ impl Holder {
         Ok(true)
     }
 
-    /// A packet for `ip` that `accept` refused: dropped where `ip`'s packets are counted, held or
-    /// let go of (then reported as a straggler). Under `rx`.
-    fn refused(&self, ip: Ipv4Addr) {
-        match self.entry(ip) {
+    /// A packet for `ip` (IPv6: `to6`) that `accept` refused: dropped where `ip`'s packets are
+    /// counted, held or let go of (then reported as a straggler). Under `rx`.
+    fn refused(&self, ip: Ipv4Addr, to6: Option<Ipv6Addr>) {
+        match self.entry(ip).filter(|e| ours(e.v6, to6)) {
             Some(e) => e.q.lock().unwrap().dropped += 1,
             None => {
-                if let Some(g) = self.gone.lock().unwrap().get_mut(&ip).filter(|g| g.at.elapsed() < GONE_FOR) {
+                if let Some(g) = self.gone.lock().unwrap().get_mut(&ip).filter(|g| g.at.elapsed() < GONE_FOR && ours(g.v6, to6)) {
                     g.dropped += 1;
                 }
             }
@@ -745,23 +763,29 @@ impl Holder {
 
     /// A packet for `ip` read after it was let go of: re-sent if the address moved on, else
     /// counted (and logged by `report_stragglers`, not here: this runs under `rx`). Its TTL
-    /// goes down by one, so a route that still leads here cannot loop it. Limits, each counted
-    /// as dropped: a fragment with IP ID 0 (the kernel would give it a new ID, so it would no
-    /// longer reassemble with its siblings), and a packet larger than the new route's MTU
-    /// (EMSGSIZE). A re-sent packet can arrive after newer ones that took the new route (and
-    /// behind what a plugged tap holds): late rather than lost.
+    /// (IPv6: hop limit) goes down by one, so a route that still leads here cannot loop it.
+    /// Limits, each counted as dropped: a fragment with IP ID 0 (the kernel would give it a new
+    /// ID, so it would no longer reassemble with its siblings; no IPv6 fragment gets this far,
+    /// `accept6`), and a packet larger than the new route's MTU (EMSGSIZE). A re-sent packet can
+    /// arrive after newer ones that took the new route (and behind what a plugged tap holds):
+    /// late rather than lost. An `accept`ed packet; an IPv6 one only for the hold's own /128.
     /// Queues under `rx`; true gives this reader the drain, after it drops `rx`.
     fn straggler(&self, ip: Ipv4Addr, p: &mut [u8]) -> bool {
+        let to6 = dest(p).and_then(|(_, to6)| to6);
         let mut gone = self.gone.lock().unwrap();
-        let Some(g) = gone.get_mut(&ip).filter(|g| g.at.elapsed() < GONE_FOR) else { return false };
-        let fragment = u16::from_be_bytes([p[6], p[7]]) & 0x3fff != 0;
+        let Some(g) = gone.get_mut(&ip).filter(|g| g.at.elapsed() < GONE_FOR && ours(g.v6, to6)) else { return false };
+        let (hops, resend) = match to6 {
+            Some(_) => (7, &self.resend6),
+            None => (8, &self.resend),
+        };
+        let fragment = to6.is_none() && u16::from_be_bytes([p[6], p[7]]) & 0x3fff != 0;
         let zero_id = p[4] == 0 && p[5] == 0;
         let mut q = self.stragglers.lock().unwrap();
-        if !g.moved || (fragment && zero_id) || p[8] <= 1 || self.resend.is_none() || q.bytes + p.len() > CAP {
+        if !g.moved || (fragment && zero_id) || p[hops] <= 1 || resend.is_none() || q.bytes + p.len() > CAP {
             g.dropped += 1;
             return false;
         }
-        p[8] -= 1;
+        p[hops] -= 1;
         q.bytes += p.len();
         q.packets.push_back((ip, Gone { resent: 1, dropped: 0, ..*g }, p.to_vec()));
         !std::mem::replace(&mut q.draining, true)
@@ -811,7 +835,15 @@ impl Holder {
         }
     }
 
+    /// IPv6 (its destination, `dest`) by `resend6`: the kernel adds no header, nor checksums it.
     fn resend(&self, ip: Ipv4Addr, p: &[u8]) -> bool {
+        if let Some((_, Some(to6))) = dest(p) {
+            return self.resend6.as_ref().is_some_and(|fd| {
+                let to = sockaddr6(to6);
+                let size = std::mem::size_of::<libc::sockaddr_in6>() as u32;
+                unsafe { libc::sendto(fd.as_raw_fd(), p.as_ptr().cast(), p.len(), libc::MSG_DONTWAIT, (&to as *const libc::sockaddr_in6).cast(), size) >= 0 }
+            });
+        }
         self.resend.as_ref().is_some_and(|fd| {
             // The kernel fills the header checksum in.
             let mut to: libc::sockaddr_in = unsafe { std::mem::zeroed() };
@@ -821,6 +853,34 @@ impl Holder {
             unsafe { libc::sendto(fd.as_raw_fd(), p.as_ptr().cast(), p.len(), libc::MSG_DONTWAIT, (&to as *const libc::sockaddr_in).cast(), size) >= 0 }
         })
     }
+}
+
+/// The address a packet off the hold device is for: an IPv4 one's destination, or the IPv4
+/// address in an IPv6 one's low 32 bits (`vm_ipv6_prefix`) with that destination, which must be
+/// the hold's own (`ours`). None if too short for its header.
+fn dest(p: &[u8]) -> Option<(Ipv4Addr, Option<Ipv6Addr>)> {
+    match p.first()? >> 4 {
+        6 => {
+            let to: [u8; 16] = p.get(24..40)?.try_into().ok()?;
+            Some((Ipv4Addr::new(to[12], to[13], to[14], to[15]), Some(to.into())))
+        }
+        _ => (p.len() >= 20).then(|| Ipv4Addr::new(p[16], p[17], p[18], p[19])).map(|ip| (ip, None)),
+    }
+}
+
+/// Whether a packet for `to6` (None: IPv4) is for the hold (or let-go address) whose IPv6 address
+/// is `v6`: an IPv6 one only for exactly that /128, never another whose low 32 bits are the same
+/// (another prefix's, the host's own multicast).
+fn ours(v6: Option<Ipv6Addr>, to6: Option<Ipv6Addr>) -> bool {
+    to6.is_none() || to6 == v6
+}
+
+fn sockaddr6(to: Ipv6Addr) -> libc::sockaddr_in6 {
+    // Port 0: the socket's own protocol (IPPROTO_RAW, the packet's header).
+    let mut a: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+    a.sin6_family = libc::AF_INET6 as u16;
+    a.sin6_addr.s6_addr = to.octets();
+    a
 }
 
 /// Whether `p`'s IPv4 header checksum is valid (the one's-complement sum over the header,
@@ -840,26 +900,42 @@ fn sum16(b: &[u8]) -> u16 {
     sum as u16
 }
 
-/// The IPv4 packets in a frame read off a tap (a 12-byte virtio-net header, then Ethernet),
-/// each `accept`ed: one, or a TCP GSO frame's segments (Firecracker turns TSO on for a guest
-/// that takes it, as Linux does: a bulk download's frames are mostly these, #411), cut as
-/// `tcp_gso_segment` would. None for anything else (UDP GSO, IPv6, a `gso_size` under
-/// `MIN_MSS`); Err(how many) if they would take more than `room` bytes.
+/// The IP packets in a frame read off a tap (a 12-byte virtio-net header, then Ethernet),
+/// each `accept`ed (IPv6: `accept6`): one, or a TCP GSO frame's segments (Firecracker turns TSO
+/// on for a guest that takes it, as Linux does: a bulk download's frames are mostly these,
+/// #411), cut as `tcp_gso_segment` would. None for anything else (UDP GSO, ARP, a `gso_size`
+/// under `MIN_MSS`); Err(how many) if they would take more than `room` bytes.
 fn from_tap(f: &[u8], room: usize) -> Option<std::result::Result<Vec<Vec<u8>>, u64>> {
     let (h, eth) = (f.get(..12)?, f.get(12..)?);
-    let mut p = eth.get(14..14 + usize::from(u16::from_be_bytes([*eth.get(16)?, *eth.get(17)?])))?.to_vec();
+    let v6 = eth.get(12..14)? == [0x86, 0xdd];
+    let len = match v6 {
+        false => usize::from(u16::from_be_bytes([*eth.get(16)?, *eth.get(17)?])),
+        true => 40 + usize::from(u16::from_be_bytes([*eth.get(18)?, *eth.get(19)?])),
+    };
+    let mut p = eth.get(14..14 + len)?.to_vec();
+    if !v6 && eth[12..14] != [8, 0] {
+        return None;
+    }
+    let accept = if v6 { accept6 } else { accept };
     // `h` as for one packet: what each segment must pass, and the whole frame first.
     let one = [&[h[0], 0][..], &h[2..]].concat();
-    match (eth[12..14] == [8, 0], h[1] & 0x7f) {
-        (true, 0) => return (h[1] == 0 && accept(h, 14, &mut p)).then(|| if p.len() <= room { Ok(vec![p]) } else { Err(1) }),
+    match (v6, h[1] & 0x7f) {
+        // An IPv6 packet may be 40 bytes longer than an IPv4 one: never more than a frame (`valid`).
+        (_, 0) => return (h[1] == 0 && (!v6 || p.len() <= MAX_FRAME) && accept(h, 14, &mut p)).then(|| if p.len() <= room { Ok(vec![p]) } else { Err(1) }),
         // TCPv4 (0x80: ECN), its checksum left to the device: only in TCP's own field.
-        (true, 1) if p.get(9) == Some(&6) && h[0] & 1 != 0 && accept(&one, 14, &mut p.clone()) => {}
+        (false, 1) if p.get(9) == Some(&6) && h[0] & 1 != 0 && accept(&one, 14, &mut p.clone()) => {}
+        // TCPv6, right after the fixed header (`accept6`), likewise.
+        (true, 4) if p.get(6) == Some(&6) && h[0] & 1 != 0 && accept(&one, 14, &mut p.clone()) => {}
         _ => return None,
     }
-    let (ihl, mss) = (usize::from(p[0] & 0xf) * 4, usize::from(u16::from_le_bytes([h[4], h[5]])));
+    let (ihl, mss) = (if v6 { 40 } else { usize::from(p[0] & 0xf) * 4 }, usize::from(u16::from_le_bytes([h[4], h[5]])));
     let thl = usize::from(*p.get(ihl + 12)? >> 4) * 4;
     let (head, body) = p.split_at_checked(ihl + thl)?;
     if mss < MIN_MSS || thl < 20 || body.is_empty() {
+        return None;
+    }
+    // Nor a segment of more than a frame (whose length would not fit its own fields).
+    if v6 && head.len() + mss.min(body.len()) > MAX_FRAME {
         return None;
     }
     let (id, seq, n) = (u16::from_be_bytes([p[4], p[5]]), u32::from_be_bytes(p[ihl + 4..ihl + 8].try_into().ok()?), body.len().div_ceil(mss));
@@ -870,16 +946,24 @@ fn from_tap(f: &[u8], room: usize) -> Option<std::result::Result<Vec<Vec<u8>>, u
     let segment = |(i, data): (usize, &[u8])| {
         let mut s = [head, data].concat();
         let len = s.len() as u16;
-        s[2..4].copy_from_slice(&len.to_be_bytes());
-        s[4..6].copy_from_slice(&id.wrapping_add(i as u16).to_be_bytes());
-        s[10..12].fill(0);
-        let sum = !sum16(&s[..ihl]);
-        s[10..12].copy_from_slice(&sum.to_be_bytes());
+        if v6 {
+            // Its payload length; no ID (an IPv6 one is in a fragment header), no header checksum.
+            s[4..6].copy_from_slice(&(len - 40).to_be_bytes());
+        } else {
+            s[2..4].copy_from_slice(&len.to_be_bytes());
+            s[4..6].copy_from_slice(&id.wrapping_add(i as u16).to_be_bytes());
+            s[10..12].fill(0);
+            let sum = !sum16(&s[..ihl]);
+            s[10..12].copy_from_slice(&sum.to_be_bytes());
+        }
         s[ihl + 4..ihl + 8].copy_from_slice(&seq.wrapping_add((i * mss) as u32).to_be_bytes());
         // FIN and PSH on the last segment only, CWR on the first.
         s[ihl + 13] &= !(if i + 1 < n { 0x09 } else { 0 } | if i > 0 { 0x80 } else { 0 });
         // The pseudo-header's sum where the checksum goes, for `accept` to complete.
-        let pseudo = sum16(&[&s[12..20], &[0, 6], &(len - ihl as u16).to_be_bytes()].concat());
+        let pseudo = match v6 {
+            false => sum16(&[&s[12..20], &[0, 6], &(len - ihl as u16).to_be_bytes()].concat()),
+            true => sum16(&[&s[8..40], &[0, 0], &(len - 40).to_be_bytes(), &[0, 0, 0, 6]].concat()),
+        };
         s[ihl + 16..ihl + 18].copy_from_slice(&pseudo.to_be_bytes());
         accept(&one, 14, &mut s).then_some(s)
     };
@@ -916,6 +1000,49 @@ fn accept(h: &[u8], eth: usize, p: &mut [u8]) -> bool {
     ipv4_header_csum_ok(p)
 }
 
+/// Whether IPv6 packet `p` is whole (its payload length all the rest of it) and what follows its
+/// fixed header may be held, injected or re-sent: TCP or UDP (Some: where in it its checksum is),
+/// or ICMPv6 but neighbour discovery (None), which is the link's own, never routed. No extension
+/// header: hop-by-hop or destination options and routing headers are what the tap's guard keeps
+/// a guest from sending too, and a fragment header would hide what follows it.
+fn upper6(p: &[u8]) -> Option<Option<usize>> {
+    if p.len() < 40 || p[0] >> 4 != 6 || usize::from(u16::from_be_bytes([p[4], p[5]])) + 40 != p.len() {
+        return None;
+    }
+    match p[6] {
+        6 => Some(Some(16)),
+        17 => Some(Some(6)),
+        // Router solicitations and advertisements, neighbour solicitations and advertisements, redirects.
+        58 => p.get(40).filter(|t| !(133..=137).contains(*t)).map(|_| None),
+        _ => None,
+    }
+}
+
+/// `accept` for an IPv6 packet (`upper6`). A checksum left to the device is completed only in a
+/// TCP or UDP packet's own field, `csum_start` right after the fixed header (none in it is
+/// checksummed, so nothing else would catch a write there). Not GSO.
+fn accept6(h: &[u8], eth: usize, p: &mut [u8]) -> bool {
+    let Some(field) = upper6(p).filter(|_| h[1] == 0) else { return false };
+    if h[0] & 1 != 0 {
+        let Some(field) = field else { return false };
+        let (start, off) = (usize::from(u16::from_le_bytes([h[6], h[7]])), usize::from(u16::from_le_bytes([h[8], h[9]])));
+        if start != eth + 40 || off != field || p.len() < 40 + field + 2 {
+            return false;
+        }
+        let sum = !sum16(&p[40..]);
+        p[40 + field..40 + field + 2].copy_from_slice(&(if sum == 0 { 0xffff } else { sum }).to_be_bytes());
+    }
+    true
+}
+
+/// `accept` or `accept6`, by `p`'s version.
+fn accept_ip(h: &[u8], eth: usize, p: &mut [u8]) -> bool {
+    match p.first().map(|b| b >> 4) {
+        Some(6) => accept6(h, eth, p),
+        _ => accept(h, eth, p),
+    }
+}
+
 /// Logs `g`'s straggler counts, if any ("dropped N" is what loss accounting reads).
 fn report(ip: Ipv4Addr, dev: &str, g: &Gone) {
     let after = format!("{dev} after it let go of the address ({} ms ago)", g.at.elapsed().as_millis());
@@ -946,7 +1073,8 @@ pub struct Injector {
     fd: OwnedFd,
     tap: String,
     ifindex: u32,
-    header: [u8; 14],
+    /// The frames' MACs; the ethertype is each packet's (`ethertype`).
+    header: [u8; 12],
     tx_dropped: u64,
     /// Sends a full tap refused (`ENOBUFS`), each also in its `tx_dropped`: tried again, or
     /// counted by the caller as dropped, never in `dropped` (#1245).
@@ -994,10 +1122,9 @@ impl Injector {
         unsafe {
             libc::setsockopt(fd.as_raw_fd(), SOL_PACKET, PACKET_QDISC_BYPASS, (&one as *const libc::c_int).cast(), std::mem::size_of::<libc::c_int>() as u32)
         };
-        let mut header = [0u8; 14];
+        let mut header = [0u8; 12];
         header[..6].copy_from_slice(&crate::net::GUEST_MAC);
         header[6..12].copy_from_slice(&crate::net::GATEWAY_MAC);
-        header[12..].copy_from_slice(&[0x08, 0x00]);
         Ok(Injector {
             fd,
             tap: tap.into(),
@@ -1010,14 +1137,16 @@ impl Injector {
     }
 
     pub fn send(&self, packet: &[u8]) -> bool {
+        let ethertype = ethertype(packet);
+        let header: [u8; 14] = std::array::from_fn(|i| if i < 12 { self.header[i] } else { ethertype.to_be_bytes()[i - 12] });
         let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
         addr.sll_family = libc::AF_PACKET as u16;
         addr.sll_ifindex = self.ifindex as i32;
-        addr.sll_protocol = 0x0800u16.to_be();
+        addr.sll_protocol = ethertype.to_be();
         addr.sll_halen = 6;
         addr.sll_addr[..6].copy_from_slice(&self.header[..6]);
         let mut iov = [
-            libc::iovec { iov_base: self.header.as_ptr().cast_mut().cast(), iov_len: self.header.len() },
+            libc::iovec { iov_base: header.as_ptr().cast_mut().cast(), iov_len: header.len() },
             libc::iovec { iov_base: packet.as_ptr().cast_mut().cast(), iov_len: packet.len() },
         ];
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
@@ -1025,7 +1154,7 @@ impl Injector {
         msg.msg_namelen = std::mem::size_of_val(&addr) as u32;
         msg.msg_iov = iov.as_mut_ptr();
         msg.msg_iovlen = iov.len();
-        let len = (self.header.len() + packet.len()) as isize;
+        let len = (header.len() + packet.len()) as isize;
         // A tap queues only so many frames (its txqueuelen) for its guest to take: a hold's backlog
         // can be more, injected faster than a guest takes them. Refused, the frame waits for the
         // guest to make room, while it takes any within `TAP_STALL`, within `TAP_BUDGET` (#1245).
@@ -1057,6 +1186,14 @@ impl Injector {
     /// The sends the full tap refused, each in its `tx_dropped` (`Vm::tap_drops_reported`).
     pub fn refused(&self) -> u64 {
         self.refused.load(Ordering::Relaxed)
+    }
+}
+
+/// An injected packet's ethertype: IPv6 by its version, else IPv4 (all else `valid` refuses).
+fn ethertype(packet: &[u8]) -> u16 {
+    match packet.first().map(|b| b >> 4) {
+        Some(6) => 0x86dd,
+        _ => 0x0800,
     }
 }
 
@@ -1098,7 +1235,7 @@ pub fn wait_start(r: &mut BufReader<By<TcpStream>>, deadline: Instant) -> bool {
 /// whether or not the stream ended, and the rest (`Injector::dropped`) once it reported them.
 pub fn receive(
     r: &mut BufReader<By<TcpStream>>,
-    ip: Ipv4Addr,
+    addr: crate::net::VmAddr,
     tap: &str,
     running: bool,
     revoked: &Mutex<bool>,
@@ -1133,7 +1270,7 @@ pub fn receive(
         if len > MAX_FRAME || read_by(r, &mut buf[..len], deadline).is_err() {
             break false;
         }
-        match !*revoked.lock().unwrap() && valid(&buf[..len], ip) && inj.send(&buf[..len]) {
+        match !*revoked.lock().unwrap() && valid(&buf[..len], addr) && inj.send(&buf[..len]) {
             true => injected += 1,
             false => dropped += 1,
         }
@@ -1156,8 +1293,14 @@ pub fn receive(
     replied
 }
 
-/// A whole IPv4 packet for `ip`: all a guest is ever handed.
-pub fn valid(p: &[u8], ip: Ipv4Addr) -> bool {
+/// A whole IPv4 packet for `addr`'s IPv4 address, or a whole IPv6 one of at most `MAX_FRAME` for
+/// its IPv6 address that `upper6` takes: all a guest is ever handed.
+pub fn valid(p: &[u8], addr: crate::net::VmAddr) -> bool {
+    if p.first().is_some_and(|b| b >> 4 == 6) {
+        // At most a frame, as an IPv4 packet is by its own length: a longer one would break the stream.
+        return addr.v6.is_some_and(|v6| p.len() <= MAX_FRAME && upper6(p).is_some() && p[24..40] == v6.octets());
+    }
+    let ip = addr.v4;
     let ihl = (p.first().copied().unwrap_or(0) & 15) as usize * 4;
     p.len() >= 20 && p[0] >> 4 == 4 && ihl >= 20 && ihl <= p.len() && u16::from_be_bytes([p[2], p[3]]) as usize == p.len() && p[16..20] == ip.octets()
 }
@@ -1514,16 +1657,20 @@ mod tests {
             fd: stream.into(),
             tap: String::new(),
             ifindex: 0,
-            header: [7; 14],
+            header: [7; 12],
             tx_dropped: 0,
             refused: AtomicU64::new(0),
             wait: Mutex::new(Wait::new(false)),
         };
-        for packet in [b"".as_slice(), b"payload", &[42; 1500]] {
+        // Each frame's ethertype is its packet's: IPv6 by its version, anything else IPv4.
+        let v6 = udp6_to(V6);
+        for (packet, ethertype) in
+            [(b"".as_slice(), [8, 0]), (b"payload", [8, 0]), (&[42; 1500], [8, 0]), (&udp_to(Ipv4Addr::new(10, 9, 0, 8)), [8, 0]), (&v6, [0x86, 0xdd])]
+        {
             assert!(injector.send(packet));
             let mut frame = vec![0; 14 + packet.len()];
             peer.read_exact(&mut frame).unwrap();
-            assert_eq!(&frame[..14], &injector.header);
+            assert_eq!((&frame[..12], &frame[12..14]), (&injector.header[..], &ethertype[..]));
             assert_eq!(&frame[14..], packet);
         }
     }
@@ -1543,6 +1690,8 @@ mod tests {
             gone,
             stragglers: Mutex::default(),
             resend: None,
+            resend6: None,
+            no_resend6: None,
         }
     }
 
@@ -1563,10 +1712,35 @@ mod tests {
         p
     }
 
+    /// The IPv6 address of a held VM in the tests (10.9.0.8 under fd00:7::/96).
+    const V6: Ipv6Addr = Ipv6Addr::new(0xfd00, 7, 0, 0, 0, 0, 0x0a09, 8);
+
+    /// `udp_to` over IPv6: 2001:db8::2 -> `dst`, its checksum unset.
+    fn udp6_to(dst: Ipv6Addr) -> Vec<u8> {
+        let src = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+        [&[0x60, 0, 0, 0, 0, 9, 17, 64][..], &src.octets(), &dst.octets(), &[0x30, 0x39, 0xd4, 0x31, 0, 9, 0, 0, 0]].concat()
+    }
+
+    /// The sum of an IPv6 packet's pseudo-header and its upper-layer packet: 0xffff if the
+    /// latter's checksum verifies.
+    fn sum6(p: &[u8]) -> u16 {
+        let len = (p.len() as u32 - 40).to_be_bytes();
+        sum16(&[&p[8..40], &len, &[0, 0, 0, p[6]], &p[40..]].concat())
+    }
+
     /// `p` as a tap frame: virtio-net header (`flags`, `gso_type`, csum start and offset from
-    /// the Ethernet header), Ethernet header, and `pad` bytes after it.
+    /// the Ethernet header), Ethernet header (IPv4), and `pad` bytes after it.
     fn tap_frame(p: &[u8], flags: u8, gso: u8, csum: (u16, u16), pad: usize) -> Vec<u8> {
-        [&vnet_hdr(flags, gso, csum)[..], &[0, 0], &[2; 12], &[8, 0], p, &vec![0; pad]].concat()
+        tap_frame_of([8, 0], p, flags, gso, csum, pad)
+    }
+
+    /// `tap_frame` with an IPv6 Ethernet header.
+    fn tap_frame6(p: &[u8], flags: u8, gso: u8, csum: (u16, u16), pad: usize) -> Vec<u8> {
+        tap_frame_of([0x86, 0xdd], p, flags, gso, csum, pad)
+    }
+
+    fn tap_frame_of(ethertype: [u8; 2], p: &[u8], flags: u8, gso: u8, csum: (u16, u16), pad: usize) -> Vec<u8> {
+        [&vnet_hdr(flags, gso, csum)[..], &[0, 0], &[2; 12], &ethertype, p, &vec![0; pad]].concat()
     }
 
     /// A struct virtio_net_hdr: `flags`, `gso_type`, csum start and offset.
@@ -1696,7 +1870,7 @@ mod tests {
         assert_eq!(segs.iter().map(Vec::len).collect::<Vec<_>>(), [40 + 1448, 40 + 1448, 40 + 604]);
         let mut joined = Vec::new();
         for (i, s) in segs.iter().enumerate() {
-            assert!(ipv4_header_csum_ok(s) && valid(s, Ipv4Addr::new(10, 9, 0, 8)), "segment {i}");
+            assert!(ipv4_header_csum_ok(s) && valid(s, Ipv4Addr::new(10, 9, 0, 8).into()), "segment {i}");
             assert_eq!((&s[12..16], u16::from_be_bytes([s[4], s[5]])), (&[10, 9, 0, 2][..], 0x1234 + i as u16));
             assert_eq!(u32::from_be_bytes(s[24..28].try_into().unwrap()), 1000 + 1448 * i as u32);
             assert_eq!(s[33], if i == 2 { 0x19 } else { 0x10 }, "FIN and PSH on the last only");
@@ -1865,41 +2039,230 @@ mod tests {
         unsafe { libc::close(w) };
     }
 
-    /// IPv6 to a held /128 (`vm_ipv6_prefix`) is counted as dropped for its IPv4 address, the low
-    /// 32 bits of its destination (not held yet, #1299), and never queued, re-sent or counted for
-    /// whatever its source's bytes read as; the host's multicast is passed by.
+    /// IPv6 to a held /128 (`vm_ipv6_prefix`) is held for its IPv4 address, the low 32 bits of its
+    /// destination, with its checksum completed as an IPv4 one's is. Never queued, re-sent or
+    /// counted for another /128 with those low bits, nor for whatever its source's bytes read as;
+    /// the host's multicast is passed by. One `accept6` refuses is counted as dropped.
     #[test]
-    fn ipv6_to_a_held_address_is_counted_for_it() {
-        let mut fds = [0 as libc::c_int; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        let (r, w) = (fds[0], fds[1]);
-        let h = holder(unsafe { OwnedFd::from_raw_fd(r) });
+    fn ipv6_to_a_held_address_is_held_for_it() {
+        let (h, w) = paired();
         let (dst, decoy) = (Ipv4Addr::new(10, 9, 0, 8), Ipv4Addr::new(0, 0, 0, 1));
-        for ip in [dst, decoy] {
-            h.held.lock().unwrap().insert(ip, Arc::new(Entry { mig: 1, v6: None, q: Mutex::default() }));
-        }
+        h.held.lock().unwrap().insert(dst, Arc::new(Entry { mig: 1, v6: Some(V6), q: Mutex::default() }));
+        h.held.lock().unwrap().insert(decoy, Arc::new(Entry { mig: 1, v6: Some("fd00:7::1".parse().unwrap()), q: Mutex::default() }));
         let ipv6 = |src: &str, to: &str| {
-            let (src, to) = (src.parse::<std::net::Ipv6Addr>().unwrap(), to.parse::<std::net::Ipv6Addr>().unwrap());
+            let (src, to) = (src.parse::<Ipv6Addr>().unwrap(), to.parse::<Ipv6Addr>().unwrap());
             [&[0x60, 0, 0, 0, 0, 8, 17, 64][..], &src.octets(), &to.octets(), &[0; 8]].concat()
         };
-        let write = |p: &[u8]| {
-            let f = [&vnet_hdr(0, 0, (0, 0))[..], p].concat();
-            assert_eq!(unsafe { libc::write(w, f.as_ptr().cast(), f.len()) }, f.len() as isize)
-        };
         let mut buf = vec![0u8; 2048];
-        // Its source's bytes 8..12 (where an IPv4 destination would be) read as `decoy`.
-        write(&ipv6("2001:db8:0:1:0:0:0:1", "fd00:7::a09:8"));
-        h.read_one(&mut buf);
-        write(&ipv6("fe80::1", "ff02::16"));
-        h.read_one(&mut buf);
-        let q = |ip| {
-            h.entry(ip).map(|e| {
-                let q = e.q.lock().unwrap();
-                (q.packets.len(), q.dropped)
-            })
+        let mut write = |flags: u8, gso: u8, csum: (u16, u16), p: &[u8]| {
+            let f = [&vnet_hdr(flags, gso, csum)[..], p].concat();
+            assert_eq!(unsafe { libc::write(w.as_raw_fd(), f.as_ptr().cast(), f.len()) }, f.len() as isize);
+            h.read_one(&mut buf);
         };
-        assert_eq!((q(dst), q(decoy)), (Some((0, 1)), Some((0, 0))));
-        unsafe { libc::close(w) };
+        let q = |ip| {
+            let e = h.entry(ip).unwrap();
+            let q = e.q.lock().unwrap();
+            (q.packets.clone(), q.dropped)
+        };
+        // Its source's bytes 8..12 (where an IPv4 destination would be) read as `decoy`.
+        let held = ipv6("2001:db8:0:1:0:0:0:1", "fd00:7::a09:8");
+        write(0, 0, (0, 0), &held);
+        // Another prefix's address with the same low 32 bits, and the host's multicast: no one's.
+        write(0, 0, (0, 0), &ipv6("2001:db8::2", "fd00:8::a09:8"));
+        write(0, 0, (0, 0), &ipv6("fe80::1", "ff02::16"));
+        assert_eq!((q(dst), q(decoy)), ((VecDeque::from([held.clone()]), 0), (VecDeque::new(), 0)));
+        // Its UDP checksum left to the device: completed in UDP's own field only, 40 bytes in.
+        let mut p = udp6_to(V6);
+        let pseudo = sum16(&[&p[8..40], &[0, 0, 0, 9, 0, 0, 0, 17]].concat());
+        p[46..48].copy_from_slice(&pseudo.to_be_bytes());
+        for csum in [(20, 6), (41, 6), (40, 16), (24, 0)] {
+            write(1, 0, csum, &p);
+        }
+        assert_eq!(q(dst).1, 4, "completion anywhere but UDP's field is refused");
+        write(1, 0, (40, 6), &p);
+        let got = q(dst).0.pop_back().unwrap();
+        assert_eq!((&got[..46], &got[48..], sum6(&got)), (&p[..46], &p[48..], 0xffff), "the UDP checksum verifies");
+        // Refused, and counted for it: an extension header (hop-by-hop, here), ICMPv6 left to the
+        // device, neighbour discovery, a payload length that is not all of it, GSO.
+        let mut hop = udp6_to(V6);
+        hop[6] = 0;
+        let mut icmp = udp6_to(V6);
+        (icmp[6], icmp[40]) = (58, 128);
+        let mut nd = icmp.clone();
+        nd[40] = 135;
+        let mut short = udp6_to(V6);
+        short[5] = 8;
+        let before = q(dst);
+        for (flags, gso, csum, p) in [(0, 0, (0, 0), &hop), (1, 0, (40, 2), &icmp), (0, 0, (0, 0), &nd), (0, 0, (0, 0), &short), (0, 4, (0, 0), &p)] {
+            write(flags, gso, csum, p);
+        }
+        assert_eq!(q(dst), (before.0.clone(), before.1 + 5));
+        write(0, 0, (0, 0), &icmp);
+        assert_eq!(q(dst).0.len(), before.0.len() + 1, "an echo request is held");
+        // Without an IPv6 address the hold takes none.
+        h.held.lock().unwrap().insert(dst, Arc::new(Entry { mig: 2, v6: None, q: Mutex::default() }));
+        write(0, 0, (0, 0), &held);
+        assert_eq!(q(dst), (VecDeque::new(), 0));
+    }
+
+    #[test]
+    fn only_whole_packets_for_the_vm_are_valid() {
+        let (v4, other) = (Ipv4Addr::new(10, 9, 0, 8), Ipv4Addr::new(10, 9, 0, 9));
+        let both = crate::net::VmAddr { v4, v6: Some(V6) };
+        // IPv4 as before, whether or not it has an IPv6 address.
+        for addr in [v4.into(), both] {
+            assert!(valid(&udp_to(v4), addr) && !valid(&udp_to(other), addr) && !valid(&udp_to(v4)[..28], addr));
+        }
+        let p = udp6_to(V6);
+        assert!(valid(&p, both));
+        assert!(!valid(&p, v4.into()), "no IPv6 address: none");
+        assert!(!valid(&p, crate::net::VmAddr { v4, v6: Some("fd00:8::a09:8".parse().unwrap()) }), "another's");
+        assert!(!valid(&p[..48], both) && !valid(&[&p[..], &[0]].concat(), both), "not its payload length");
+        assert!(!valid(&p[..39], both), "truncated");
+        let mut big = [&p[..], &vec![0; MAX_FRAME - p.len()]].concat();
+        big[4..6].copy_from_slice(&((MAX_FRAME - 40) as u16).to_be_bytes());
+        assert!(valid(&big, both), "a frame's worth");
+        big.push(0);
+        big[4..6].copy_from_slice(&((MAX_FRAME - 39) as u16).to_be_bytes());
+        assert!(!valid(&big, both) && cut(&tap_frame6(&big, 0, 0, (0, 0), 0)).is_none(), "more than a frame");
+        for (next, ok) in [(6, true), (17, true), (0, false), (43, false), (44, false), (60, false), (50, false), (59, false)] {
+            let mut q = p.clone();
+            q[6] = next;
+            assert_eq!(valid(&q, both), ok, "next header {next}");
+        }
+        for (kind, ok) in [(128, true), (129, true), (1, true), (2, true), (133, false), (134, false), (135, false), (136, false), (137, false)] {
+            let mut q = p.clone();
+            (q[6], q[40]) = (58, kind);
+            assert_eq!(valid(&q, both), ok, "ICMPv6 type {kind}");
+        }
+    }
+
+    #[test]
+    fn ipv6_tap_frames_become_packets() {
+        let mut p = udp6_to(V6);
+        let pseudo = sum16(&[&p[8..40], &[0, 0, 0, 9, 0, 0, 0, 17]].concat());
+        p[46..48].copy_from_slice(&pseudo.to_be_bytes());
+        let got = cut(&tap_frame6(&p, 1, 0, (14 + 40, 6), 3)).unwrap().remove(0);
+        assert_eq!((got.len(), sum6(&got)), (49, 0xffff), "padding left off, its UDP checksum completed");
+        assert_eq!(cut(&tap_frame6(&p, 0, 0, (0, 0), 0)).unwrap(), [p.clone()], "a complete one is as it was");
+        assert_eq!(cut(&tap_frame6(&p, 1, 0, (14 + 20, 6), 0)), None, "IPv4's offset");
+        assert_eq!(cut(&tap_frame6(&p, 1, 0, (14 + 40, 16), 0)), None, "TCP's field in a UDP packet");
+        assert_eq!(cut(&tap_frame6(&p, 1, 5, (14 + 40, 6), 0)), None, "UDP GSO");
+        assert_eq!(cut(&tap_frame6(&p[..40], 0, 0, (0, 0), 0)), None, "truncated");
+        // Its ethertype and version must agree.
+        assert_eq!(cut(&tap_frame(&p, 0, 0, (0, 0), 0)), None, "IPv6 in an IPv4 frame");
+        assert_eq!(cut(&tap_frame6(&udp_to(Ipv4Addr::new(10, 9, 0, 8)), 0, 0, (0, 0), 0)), None, "IPv4 in an IPv6 frame");
+        let mut hop = p.clone();
+        hop[6] = 0;
+        assert_eq!(cut(&tap_frame6(&hop, 0, 0, (0, 0), 0)), None, "an extension header");
+    }
+
+    /// `tso_frame` over IPv6 (gso_type 4), 2001:db8::2 -> `V6`, with CWR and ECE set too.
+    fn tso6_frame(data: &[u8], mss: u16, csum: (u16, u16)) -> Vec<u8> {
+        let tcp = [&[0x30, 0x39, 0x1f, 0x40][..], &1000u32.to_be_bytes(), &[0, 0, 0, 1], &[0x50, 0xd9, 0xff, 0xff, 0, 0, 0, 0]].concat();
+        let src = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+        let mut p = [&[0x60, 0, 0, 0, 0, 0, 6, 64][..], &src.octets(), &V6.octets(), &tcp, data].concat();
+        let len = (p.len() - 40) as u16;
+        p[4..6].copy_from_slice(&len.to_be_bytes());
+        // As `tcp_v6_gso_csum_prep` leaves it: the pseudo-header's sum with a length of 0.
+        let pseudo = sum16(&[&p[8..40], &[0, 0, 0, 0, 0, 0, 0, 6]].concat());
+        p[56..58].copy_from_slice(&pseudo.to_be_bytes());
+        let mut f = tap_frame6(&p, 1, 4, csum, 0);
+        f[2..4].copy_from_slice(&74u16.to_le_bytes());
+        f[4..6].copy_from_slice(&mss.to_le_bytes());
+        f
+    }
+
+    #[test]
+    fn a_tcpv6_tso_frame_is_cut_into_its_segments() {
+        let data: Vec<u8> = (0..3500u32).map(|i| i as u8).collect();
+        let tso = |csum: (u16, u16)| tso6_frame(&data, 1428, csum);
+        let segs = cut(&tso((14 + 40, 16))).unwrap();
+        assert_eq!(segs.iter().map(Vec::len).collect::<Vec<_>>(), [60 + 1428, 60 + 1428, 60 + 644]);
+        let mut joined = Vec::new();
+        let both = crate::net::VmAddr { v4: Ipv4Addr::new(10, 9, 0, 8), v6: Some(V6) };
+        for (i, s) in segs.iter().enumerate() {
+            assert!(valid(s, both), "segment {i}");
+            assert_eq!(&s[..4], &[0x60, 0, 0, 0], "its traffic class and flow label as they were");
+            assert_eq!((usize::from(u16::from_be_bytes([s[4], s[5]])), s[6], s[7]), (s.len() - 40, 6, 64));
+            assert_eq!(u32::from_be_bytes(s[44..48].try_into().unwrap()), 1000 + 1428 * i as u32);
+            // ECE on each; CWR on the first only, FIN and PSH on the last only.
+            assert_eq!(s[53], [0xd0, 0x50, 0x59][i], "segment {i}'s flags");
+            assert_eq!(sum6(s), 0xffff, "segment {i}'s TCP checksum verifies");
+            joined.extend_from_slice(&s[60..]);
+        }
+        assert_eq!(joined, data);
+        // ECN: gso_type 0x84 is cut the same.
+        let mut ecn = tso((14 + 40, 16));
+        ecn[1] = 0x84;
+        assert_eq!(cut(&ecn).unwrap(), segs);
+        // Held first, in their order, ahead of what was held.
+        let h = holder(std::fs::File::open("/dev/null").unwrap().into());
+        let q = Queue { packets: VecDeque::from([b"held".to_vec()]), bytes: 4, ..Queue::default() };
+        h.held.lock().unwrap().insert(both.v4, Arc::new(Entry { mig: 1, v6: Some(V6), q: Mutex::new(q) }));
+        h.hold_first(both.v4, 1, feed(&[tso((14 + 40, 16))]));
+        assert_eq!(h.entry(both.v4).unwrap().q.lock().unwrap().packets, [&segs[..], &[b"held".to_vec()]].concat());
+        // Its checksum asked for anywhere but TCP's own field, as for one packet: dropped.
+        assert_eq!(cut(&tso((14 + 20, 16))), None, "IPv4's offset");
+        assert_eq!(cut(&tso((14 + 40, 6))), None, "UDP's field");
+        let mut v4 = tso((14 + 40, 16));
+        v4[1] = 1;
+        assert_eq!(cut(&v4), None, "TCPv4 GSO of an IPv6 frame");
+        let mut hop = tso((14 + 40, 16));
+        hop[12 + 14 + 6] = 0;
+        assert_eq!(cut(&hop), None, "an extension header");
+        let mut tiny = tso((14 + 40, 16));
+        tiny[4..6].copy_from_slice(&(MIN_MSS as u16 - 1).to_le_bytes());
+        assert_eq!(cut(&tiny), None, "under MIN_MSS");
+        assert_eq!(from_tap(&tso((14 + 40, 16)), 1000), Some(Err(3)), "over the room left: counted, not made");
+        // A jumbo segment (a payload of 65,500 with a gso_size of 65,535) would be more than a frame.
+        let big = vec![7u8; 65500];
+        let jumbo = |mss: u16| tso6_frame(&big, mss, (14 + 40, 16));
+        assert_eq!(cut(&jumbo(65535)), None, "more than a frame");
+        let segs = cut(&jumbo(65535 - 60)).unwrap();
+        assert!(segs.len() == 2 && segs[0].len() == MAX_FRAME && segs.iter().all(|s| valid(s, both) && sum6(s) == 0xffff));
+    }
+
+    /// An IPv6 straggler to a let-go /128 that moved on is re-sent by `resend6`, to its own
+    /// destination, its hop limit down by one; with a hop limit of 1, no IPv6 raw socket, or for
+    /// another /128 with the same low 32 bits it is not. IPv4 ones still need `resend`.
+    #[test]
+    fn ipv6_stragglers_are_re_sent_by_their_own_socket() {
+        let (mut h, _w) = paired();
+        let ip = Ipv4Addr::new(10, 9, 0, 8);
+        h.gone.lock().unwrap().insert(ip, Gone { v6: Some(V6), ..Gone::new(true) });
+        let counts = |h: &Holder| h.gone.lock().unwrap().get(&ip).map(|g| (g.resent, g.dropped)).unwrap();
+        {
+            let _rx = h.rx.lock().unwrap();
+            assert!(!h.straggler(ip, &mut udp6_to(V6)), "no IPv6 raw socket");
+        }
+        assert_eq!(counts(&h), (0, 1));
+        h.resend6 = Some(h.tun.try_clone().unwrap());
+        let _rx = h.rx.lock().unwrap();
+        assert!(!h.straggler(ip, &mut udp_to(ip)), "nor does it re-send IPv4");
+        assert_eq!(counts(&h), (0, 2));
+        let mut last = udp6_to(V6);
+        last[7] = 1;
+        assert!(!h.straggler(ip, &mut last), "its hop limit spent");
+        assert!(!h.straggler(ip, &mut udp6_to("fd00:8::a09:8".parse().unwrap())), "another's, not counted");
+        assert_eq!(counts(&h), (0, 3));
+        let mut p = udp6_to(V6);
+        assert!(h.straggler(ip, &mut p));
+        drop(_rx);
+        assert_eq!(p[7], 63);
+        let mut sent = Vec::new();
+        h.drain_stragglers(|to, p| {
+            sent.push((to, p.to_vec()));
+            true
+        });
+        assert_eq!(sent, [(ip, p.clone())]);
+        assert_eq!(counts(&h), (1, 3));
+        // `resend` sends it to its own destination, not to the IPv4 address.
+        let to = sockaddr6(V6);
+        assert_eq!((i32::from(to.sin6_family), to.sin6_port, to.sin6_addr.s6_addr, to.sin6_flowinfo, to.sin6_scope_id), (libc::AF_INET6, 0, V6.octets(), 0, 0));
+        assert_eq!(dest(&p), Some((ip, Some(V6))));
+        assert_eq!(dest(&udp_to(ip)), Some((ip, None)));
+        assert_eq!(dest(&p[..39]), None);
     }
 
     /// A fake handoff target on `l`: confirms each `SYNC`, answers `SWITCH` with `switch_ack`,
@@ -2164,7 +2527,7 @@ mod tests {
             let target = s.spawn(|| {
                 let mut r = BufReader::new(By { s: srv, at: Instant::now() });
                 assert!(wait_start(&mut r, Instant::now() + ACCEPT_WAIT));
-                receive(&mut r, ip, &t.name, true, &Mutex::new(false), Instant::now() + crate::migrate::HELD_STREAM, &mut || true)
+                receive(&mut r, ip.into(), &t.name, true, &Mutex::new(false), Instant::now() + crate::migrate::HELD_STREAM, &mut || true)
             });
             // As `send` streams, on the production waits.
             let start = Instant::now();
@@ -2302,7 +2665,7 @@ mod tests {
         });
         let mut r = BufReader::new(By { s: srv, at: Instant::now() + Duration::from_secs(10) });
         assert!(wait_start(&mut r, Instant::now() + Duration::from_secs(10)));
-        let accounted = receive(&mut r, ip, tap, true, &Mutex::new(false), Instant::now() + Duration::from_secs(10), &mut || true);
+        let accounted = receive(&mut r, ip.into(), tap, true, &Mutex::new(false), Instant::now() + Duration::from_secs(10), &mut || true);
         sender.join().unwrap();
         let counted = tap_tx_dropped(tap).unwrap() - before;
         assert!(counted > 0 && accounted == counted, "accounted {accounted} of the tap's {counted}");
@@ -2354,5 +2717,45 @@ mod tests {
             a.drain_stragglers(|ip, p| a.resend(ip, p));
         }
         assert_eq!(counts(&a), (before.0 + 1, before.1 + 1));
+    }
+
+    /// Needs root: `sudo cargo test -- --ignored`. `stragglers_follow_the_address` for an IPv6
+    /// address (`vm_ipv6_prefix`): held with its /32, its /128 goes to the hold device, and a
+    /// straggler for it is re-sent by the IPv6 raw socket to where it went, which holds it.
+    #[test]
+    #[ignore]
+    fn ipv6_stragglers_follow_the_address() {
+        let _root = crate::test_util::root_net_lock();
+        let (a, b) =
+            (Holder::new(&format!("t6a{:x}h", std::process::id())).unwrap().unwrap(), Holder::new(&format!("t6b{:x}h", std::process::id())).unwrap().unwrap());
+        let (_address, ip) = root_address();
+        let v6 = Ipv6Addr::from((0xfd00_0e2e_u128 << 96) | u128::from(u32::from(ip)));
+        let addr = crate::net::VmAddr { v4: ip, v6: Some(v6) };
+        a.hold(addr, 1).unwrap();
+        assert_eq!(a.entry(ip).unwrap().v6, Some(v6), "IPv6 on on the hold device: {}", a.dev);
+        let mut none = |_: &[u8]| true;
+        let (_, switched) = a.release_local(ip, 1, &mut none, || b.hold(addr, 2), Duration::ZERO).unwrap();
+        switched.unwrap();
+        assert!(a.resend6.is_some());
+        // As the reader takes one off the device after the switch.
+        let mut p = [&udp6_to(v6)[..], b"late"].concat();
+        p[5] += 4;
+        {
+            let _rx = a.rx.lock().unwrap();
+            assert!(a.straggler(ip, &mut p));
+        }
+        a.drain_stragglers(|ip, p| a.resend(ip, p));
+        crate::test_util::wait_until("b to queue the straggler", || !b.entry(ip).unwrap().q.lock().unwrap().packets.is_empty());
+        let mut got = Vec::new();
+        let mut sink = |p: &[u8]| {
+            got.push(p.to_vec());
+            true
+        };
+        let (stats, _) = b.release_local(ip, 2, &mut sink, || Ok(()), Duration::ZERO).unwrap();
+        b.forget(ip, 2);
+        let _ = crate::net::route_dev(false, addr, b.ifindex);
+        assert_eq!((stats.packets, stats.dropped), (1, 0));
+        assert_eq!(got, [p.clone()]);
+        assert!(got[0].ends_with(b"late") && got[0][7] == 63, "{got:?}");
     }
 }

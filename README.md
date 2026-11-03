@@ -655,9 +655,9 @@ the warnings.
 each VM's IPv6 address, configures it in the guest, routes it to the VM's
 tap, and routes it on each peer via the host it runs on, as its IPv4 address
 is (via that host's IPv6 underlay: a peer with none leaves it to the host's
-own IPv6 routes). It is not yet held during a migration (#1299): IPv6 packets
-that arrive during the downtime are dropped. Nor is it answered for on the
-LAN (#1300): machines that are not peers need a route to the prefix via a
+own IPv6 routes), and holds its IPv6 packets during a migration's or
+checkpoint's pause as it holds the IPv4 ones. It is not yet answered for on
+the LAN (#1300): machines that are not peers need a route to the prefix via a
 host. `info` and the listener warn about this for as long as it is true.
 Without the prefix, nothing changes: taps keep IPv6 off.
 
@@ -671,8 +671,10 @@ guest needs its pinned gateway entry), and no router solicitations,
 advertisements, redirects or hop-by-hop, routing or destination options
 headers; the host's own IPv6 multicast to the tap (MLD reports) is dropped
 on the way out. While a VM is held for a migration or checkpoint, its `/128`
-goes to the hold device with its `/32`, but IPv6 packets there are dropped
-(counted with the held address's), not held yet (#1299). Every listener
+goes to the hold device with its `/32`, and its packets are held and injected
+with the IPv4 ones. Only TCP, UDP and ICMPv6 (but neighbour discovery) directly
+after the fixed header are held; packets with extension headers, fragments
+among them, are dropped and counted. Every listener
 (with the prefix set) and every VM process that routes an IPv6 address turn
 on IPv6 forwarding (see [Migrate](#migrate) for `accept_ra`). A new prefix
 applies to VMs routed after it (started, restored or arriving); running VMs
