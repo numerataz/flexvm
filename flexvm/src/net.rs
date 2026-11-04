@@ -459,9 +459,9 @@ const IFA_F_NODAD: u8 = 0x02;
 /// address of the kernel's own (addr_gen_mode 1: no EUI-64 link-local, nor its duplicate address
 /// detection), no router advertisements taken (`guard` drops a guest's anyway), and `TAP_ADDR6`
 /// without duplicate address detection. What kept IPv6 off on taps, the host's MLD reports as it
-/// comes up (and each time the tap does), is dropped on the way out (`multicast_filter`): sent to
-/// a tap no Firecracker reads yet (an arrival's), it would count as a frame lost on its way to the
-/// guest (tx_dropped). Done again on each `neighbour`: the address goes each time the tap goes down.
+/// comes up (and each time the tap does), is dropped on the way out (`multicast_filter`, which
+/// passes neighbour solicitations): sent to a tap no Firecracker reads yet (an arrival's), it
+/// would count as a frame lost on its way to the guest (tx_dropped). Done again on each `neighbour`: the address goes each time the tap goes down.
 fn tap_ipv6(ifindex: u32, name: &str) -> Result<()> {
     let filter = filter_msg(ifindex, CLSACT_EGRESS, &multicast_filter());
     netlink(libc::RTM_NEWTFILTER, NLM_F_CREATE | NLM_F_REPLACE, &filter).map_err(|e| format!("its multicast filter (cls_bpf): {e}"))?;
@@ -635,18 +635,26 @@ fn source_filter(ip: Option<VmAddr>) -> Vec<libc::sock_filter> {
 }
 
 /// The classic BPF program of `tap_ipv6`'s egress filter: the host's IPv6 multicast to a guest
-/// (MLD reports, neighbour solicitations: the host's entry for the guest is permanent) is
-/// dropped, and everything else passes (as a load past a frame's end does).
+/// (its MLD reports) is dropped, but for neighbour solicitations; everything else passes (as a
+/// load past a frame's end does). The host's entry for the guest is permanent, but a change of
+/// the tap's MAC (udev's, and `restore_mac` putting the gateway's back) flushes it, permanent or
+/// not: the host then resolves the guest's address again, as it re-ARPs for the IPv4 one, and
+/// with its solicitation dropped it never would, its IPv6 to the guest lost until the next
+/// `neighbour` (#1316). The guest answers from the solicited address, which `guard` passes.
 fn multicast_filter() -> Vec<libc::sock_filter> {
     let op = |code: u16, jt: u8, jf: u8, k: u32| libc::sock_filter { code, jt, jf, k };
     let (ld_h, ld_b, jeq, ret) = (0x28, 0x30, 0x15, 0x06);
     vec![
         op(ld_h, 0, 0, 12),         // 0: ethertype
-        op(jeq, 0, 3, 0x86dd),      // 1: not IPv6: pass
+        op(jeq, 0, 7, 0x86dd),      // 1: not IPv6: pass
         op(ld_b, 0, 0, 14 + 24),    // 2: the destination's first byte
-        op(jeq, 0, 1, 0xff),        // 3: multicast: drop
-        op(ret, 0, 0, TC_ACT_SHOT), // 4
-        op(ret, 0, 0, TC_ACT_OK),   // 5
+        op(jeq, 0, 5, 0xff),        // 3: not multicast: pass
+        op(ld_b, 0, 0, 14 + 6),     // 4: next header
+        op(jeq, 0, 2, 58),          // 5: not ICMPv6 (an MLD report's hop-by-hop options): drop
+        op(ld_b, 0, 0, 14 + 40),    // 6: its type
+        op(jeq, 1, 0, 135),         // 7: a neighbour solicitation: pass
+        op(ret, 0, 0, TC_ACT_SHOT), // 8
+        op(ret, 0, 0, TC_ACT_OK),   // 9
     ]
 }
 
@@ -2246,7 +2254,9 @@ mod tests {
         let (v6, there) = (six("fd00:7::a09:2"), six("2001:db8::1"));
         let mld = [58, 0, 5, 2, 0, 0, 1, 0, 143, 0, 0, 0];
         assert!(!out(&ipv6(TAP_ADDR6, six("ff02::16"), 0, &mld)), "an MLDv2 report");
-        assert!(!out(&ipv6(TAP_ADDR6, six("ff02::1:ff0a:902"), 58, &[135, 0, 0, 0])), "a neighbour solicitation");
+        assert!(!out(&ipv6(TAP_ADDR6, six("ff02::16"), 58, &mld[8..])), "an MLDv2 report with no hop-by-hop options");
+        // The host resolving the guest's address again once a MAC change flushed its entry (#1316).
+        assert!(out(&ipv6(TAP_ADDR6, six("ff02::1:ff0a:902"), 58, &[135, 0, 0, 0])), "a neighbour solicitation");
         assert!(out(&ipv6(there, v6, 17, &[0; 8])), "unicast to the guest");
         assert!(out(&ipv6(TAP_ADDR6, v6, 58, &[129, 0, 0, 0])), "the gateway's echo reply");
         assert!(out(&[&eth(0x0800)[..], &[0x45, 0, 0, 20], &[0; 16]].concat()) && out(&eth(0x0806)), "IPv4 and ARP");

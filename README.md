@@ -678,11 +678,14 @@ from the VM's address alone (not from the guest's link-local address, so the
 guest needs its pinned gateway entry), and no router solicitations,
 advertisements, redirects or hop-by-hop, routing or destination options
 headers; the host's own IPv6 multicast to the tap (MLD reports) is dropped
-on the way out. While a VM is held for a migration or checkpoint, its `/128`
-goes to the hold device with its `/32`, and its packets are held and injected
-with the IPv4 ones. Only TCP, UDP and ICMPv6 (but neighbour discovery) directly
-after the fixed header are held; packets with extension headers, fragments
-among them, are dropped and counted. Every listener
+on the way out, but for its neighbour solicitations: a change of the tap's MAC
+(udev's) flushes the permanent entry, and the host then resolves the guest's
+address again as it re-ARPs for the IPv4 one. While a VM is held for a
+migration or checkpoint, its `/128` goes to the hold device with its `/32`,
+and its packets are held and injected with the IPv4 ones. Only TCP, UDP and
+ICMPv6 (but neighbour discovery) directly after the fixed header are held;
+packets with extension headers, fragments among them, are dropped and
+counted. Every listener
 (with the prefix set) and every VM process that routes an IPv6 address turn
 on IPv6 forwarding (see [Migrate](#migrate) for `accept_ra`). A new prefix
 applies to VMs routed after it (started, restored or arriving); running VMs
