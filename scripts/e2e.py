@@ -1482,22 +1482,24 @@ def nettest_ipv6():
     the VM (the unsolicited NA). A TCP stall may last up to 190 ms however short the downtime (STALL_SLACK_MS):
     CI saw 113-181 ms beside 30-46 ms downtimes with nothing lost, while a lost segment of the one-segment
     ping-pong costs at least 200 ms (the minimum retransmit timeout, and a loss probe's delayed-ACK allowance)."""
-    env = {**ENV, "V6": "1", "FLEXVM": BIN, "STATE": BUILD, "TEMPLATE": args.template, "P": f"fv6{A.port}", "ROUNDS": "1",
-           "STALL_SLACK_MS": "190", "WORK": os.path.join(args.log_dir, "nettest-ipv6")}
-    p = subprocess.Popen([os.path.join(ROOT, "scripts", "nettest.sh")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                         env=env, start_new_session=True)
-    try:
-        out, _ = p.communicate(timeout=300)
-    except subprocess.TimeoutExpired:
-        # SIGTERM, so its EXIT trap removes its namespaces, processes and directories; SIGKILL only if that hangs.
-        os.killpg(p.pid, signal.SIGTERM)
+    for v6 in ("0", "1", "0", "1", "0", "1"):
+        env = {**ENV, "V6": v6, "FLEXVM": BIN, "STATE": BUILD, "TEMPLATE": args.template, "P": f"fv6{A.port}", "ROUNDS": "1",
+               "STALL_SLACK_MS": "190", "WORK": os.path.join(args.log_dir, "nettest-ipv6")}
+        p = subprocess.Popen([os.path.join(ROOT, "scripts", "nettest.sh")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                             env=env, start_new_session=True)
         try:
-            out, _ = p.communicate(timeout=60)
+            out, _ = p.communicate(timeout=300)
         except subprocess.TimeoutExpired:
-            os.killpg(p.pid, signal.SIGKILL)
-            out, _ = p.communicate()
-        out += "\n(timed out after 300 s)"
-    check("nettest V6=1: passes", p.returncode == 0 and "PASS" in out.splitlines(), out[-3000:])
+            # SIGTERM, so its EXIT trap removes its namespaces, processes and directories; SIGKILL only if that hangs.
+            os.killpg(p.pid, signal.SIGTERM)
+            try:
+                out, _ = p.communicate(timeout=60)
+            except subprocess.TimeoutExpired:
+                os.killpg(p.pid, signal.SIGKILL)
+                out, _ = p.communicate()
+            out += "\n(timed out after 300 s)"
+        print(f'EXP nettest V6={v6}:\n' + out[-6000:], flush=True)
+        check(f"nettest V6={v6}: passes", p.returncode == 0 and "PASS" in out.splitlines(), out[-3000:])
 
 
 @case

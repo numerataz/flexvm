@@ -289,6 +289,7 @@ migrate() {
     local res
     res=$(cli "$1" "$2" migrate "$name" "$3") || die "migrate to $3 failed"
     python3 -c 'import json,sys; r=json.load(sys.stdin); print("  migrate downtime %s ms, rerouted %s ms, held %s" % (r["downtime_ms"], r["rerouted_ms"], r.get("held")))' <<< "$res" >&2
+    python3 -c 'import json,sys; r=json.load(sys.stdin); print("  src %s\n  tgt %s" % (json.dumps(r["timings_ms"]), json.dumps(r["target_timings_ms"])))' <<< "$res" >&2
     python3 -c 'import json,sys; print(json.load(sys.stdin)["downtime_ms"])' <<< "$res" >> "$work/downtime-$round"
     wait_for running "$4" "$5"
     wait_for absent "$1" "$2"
