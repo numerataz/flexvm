@@ -1266,7 +1266,11 @@ connects; a failed bind fails the start. A claim's timings split `neighbour`
   when the tap goes down). IPv6 was off because the host's MLD reports, sent as a
   tap comes up before any Firecracker reads it, count as a frame lost on the way
   to the guest (`tx_dropped`): a clsact egress filter drops the host's IPv6
-  multicast to the tap instead. A hold takes the /128 to the hold device with
+  multicast to the tap instead, but for neighbour solicitations. A MAC change on
+  the tap (udev's late write, then the gateway's put back) flushes its neighbour
+  entries, permanent ones too: IPv4 re-ARPs, and IPv6 resolves the guest's
+  address again by them, which the filter once dropped, losing all IPv6 to the
+  guest until its next `neighbour` (#1316). A hold takes the /128 to the hold device with
   the /32 (its IPv6 on there from the first such hold, with no address), so
   nothing reaches a paused VM's tap. IPv6 packets there are held for the
   address in their destination's low 32 bits, but only if that destination

@@ -3000,6 +3000,30 @@ def same_host_order6():
         udp_across_migrations("same host order v6", "ft-same-host6", v6=True)
 
 
+@needs_kvm
+def ipv6_tap_mac_change():
+    """#1316: a change of a running VM's tap MAC, as udev's late write (`MACAddressPolicy=persistent`, #841) and
+    the gateway's put back make, flushes the tap's neighbour entries, the permanent ones too. The host then
+    resolves the guest's addresses again: by ARP for the IPv4 one, and by neighbour solicitation, which the
+    tap's egress filter passes, for the IPv6 one. Dropped, as it once was, the guest took no IPv6 from this host
+    until it next migrated."""
+    n = "ft-v6-mac"
+    with ipv6_prefix():
+        try:
+            ok(run(A, n))
+            v4, v6, tap = vm_ip(A, n), vm_ipv6(A, n), vms(A)[n]["tap"]
+            ping = lambda family, ip: subprocess.run(["ping", f"-{family}", "-c1", "-W1", ip], capture_output=True).returncode == 0
+            check("v6 mac change: the guest answers at both addresses", wait_for(lambda: ping(4, v4) and ping(6, v6), 10), (v4, v6))
+            neigh = lambda: subprocess.run(["ip", "neigh", "show", "dev", tap], capture_output=True, text=True).stdout
+            for mac in ("02:00:00:13:16:01", "06:00:a9:fe:01:01"):
+                subprocess.run(["ip", "link", "set", tap, "address", mac], check=True)
+            check("v6 mac change: its neighbour entries flushed", "PERMANENT" not in neigh(), neigh())
+            check("v6 mac change: the guest answers at its IPv6 address again", wait_for(lambda: ping(6, v6), 5), neigh())
+            check("v6 mac change: and at its IPv4 one", wait_for(lambda: ping(4, v4), 5), neigh())
+        finally:
+            kill(A, n)
+
+
 # The IPv6 scenarios' vm_ipv6_prefix. Lanes side by side share it: their VMs' IPv4 addresses, so their IPv6 ones, differ.
 V6_PREFIX = "fd00:f17::"
 
@@ -3016,17 +3040,6 @@ def ipv6_prefix(prefix=V6_PREFIX):
             configure(h, vm_ipv6_prefix=None)
 
 
-def reachable6(label, v6, timeout=10):
-    """Waits until the guest answers a ping at `v6`, as ipv6_packet_hold and e2e's ipv6_taps wait to connect
-    first: a VM just started may not take IPv6 from this host at once (printed: how long it took). That is
-    #1316 (same_host_order6 once lost every datagram before its first migration, none reaching the guest's
-    eth0): this wait works around it, and goes once it is fixed."""
-    t = time.monotonic()
-    up = wait_for(lambda: subprocess.run(["ping", "-6", "-c1", "-W1", v6], capture_output=True).returncode == 0, timeout)
-    print(f"{label}: {v6} answered a ping after {time.monotonic() - t:.2f} s" if up else f"{label}: {v6} answered no ping in {timeout} s", flush=True)
-    assert up, f"{v6} unreachable"
-
-
 def vm_ipv6(host, name):
     """`name`'s IPv6 address on `host` (`ps`), asserted to be there."""
     v6 = vms(host)[name].get("ipv6")
@@ -3040,8 +3053,6 @@ def bulk_tcp(label, n, v6=False):
         clear_log(h, n)
     ok(run(A, n))
     ip = vm_ipv6(A, n) if v6 else vm_ip(A, n)
-    if v6:
-        reachable6(label, ip)
     # A sink: the guest takes all it is sent and answers nothing.
     code, out = sh(A, n, f"setsid socat -u TCP{'6' if v6 else ''}-LISTEN:7001,reuseaddr OPEN:/dev/null >/dev/null 2>&1 < /dev/null &")
     assert code == 0, out
@@ -3252,8 +3263,6 @@ def udp_across_migrations(label, n, target_fault=None, burst=1, source_fault=Non
     ok(run(A, n))
     ip = vm_ipv6(A, n) if v6 else vm_ip(A, n)
     udp_receiver(A, n, v6)
-    if v6:
-        reachable6(label, ip)
     held, at, took, logs, arrivals, windows = [], [], [], [], [], []
     hops = ((A, B), (B, A), (A, B))
     with udp_stream(ip, burst) as (sent, stalled):
@@ -8721,7 +8730,6 @@ def ipv6_control_plane():
             clear_log(h, n)
         m = setup(n)
         v4, v6 = vm_ip(A, n), vm_ipv6(A, n)
-        reachable6("ipv6 control plane", v6)
         code, out = sh(A, n, "setsid socat TCP6-LISTEN:7000,ipv6only=0,fork,reuseaddr EXEC:cat >/dev/null 2>&1 < /dev/null & "
                              "for i in $(seq 200); do grep -qs ':1B58 ' /proc/net/tcp6 && exit 0; sleep 0.05; done; exit 1")
         assert code == 0, f"socat did not listen in the guest: {out}"
@@ -13244,7 +13252,7 @@ SCENARIOS = dict(
     ckpt_failed_stop=ckpt_failed_stop, ckpt_no_wp=ckpt_no_wp, ckpt_rearm=ckpt_rearm,
     leave_fail=leave_fail, capture_fail=capture_fail, abort_gen_fail=abort_gen_fail, commit_fail=commit_fail, commit_fail_routed=commit_fail_routed, proxy_ndp_routed=proxy_ndp_routed, abort_stay_fail=abort_stay_fail,
     prepare_disconnect=prepare_disconnect, prepare_trickle=prepare_trickle, prepare_fail=prepare_fail, arrival_flood=arrival_flood, arrival_cap_restart=arrival_cap_restart,
-    fc_prepare=fc_prepare, forged_vmstate=forged_vmstate, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ipv6_packet_hold=ipv6_packet_hold, same_host_order6=same_host_order6, same_host_bulk_tcp6=same_host_bulk_tcp6, ipv6_control_plane=ipv6_control_plane, ckpt_stall=ckpt_stall, standby=standby, standby_vm_ips=standby_vm_ips,
+    fc_prepare=fc_prepare, forged_vmstate=forged_vmstate, slow_preload=slow_preload, bad_preload=bad_preload, ckpt_packet_hold=ckpt_packet_hold, ipv6_packet_hold=ipv6_packet_hold, same_host_order6=same_host_order6, same_host_bulk_tcp6=same_host_bulk_tcp6, ipv6_tap_mac_change=ipv6_tap_mac_change, ipv6_control_plane=ipv6_control_plane, ckpt_stall=ckpt_stall, standby=standby, standby_vm_ips=standby_vm_ips,
     suspend_disk_freed=suspend_disk_freed, resume_mark_fails=resume_mark_fails, suspend_unaddressed=suspend_unaddressed, resume_fence_fails=resume_fence_fails, kill_source=kill_source,
     kill_refused_checkpoint=no_evict(kill_refused_checkpoint), wildcard_listen=wildcard_listen, route_via6=route_via6, peer_by_name=peer_by_name, peer_moved=peer_moved, peer_unresolvable=peer_unresolvable, page_refusals=page_refusals,
     forged_peer=forged_peer, forged_pages=forged_pages, restore_ip_peer=restore_ip_peer, loan_start_retry=loan_start_retry, spoof_filter=spoof_filter, late_withdrawal=late_withdrawal, unlend_retry=unlend_retry,
