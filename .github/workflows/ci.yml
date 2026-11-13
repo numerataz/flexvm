@@ -143,9 +143,16 @@ jobs:
           key: software-kernel-${{ matrix.arch }}-${{ hashFiles('scripts/build-kernel.sh', 'scripts/fetch.sh', 'scripts/versions.sh', 'scripts/checksums.sha256', 'kernel/config/*', 'kernel/features*.config', 'kernel/source.env') }}
       - name: Fetch or build the reviewed kernel
         run: ./scripts/fetch.sh --kernel --state "$RUNNER_TEMP/software-state"
+      - name: Fetch the unchanged ARM hypervisor
+        if: matrix.arch == 'aarch64'
+        run: ./scripts/fetch.sh --state "$RUNNER_TEMP/software-state"
       - name: Boot with KVM masked
         run: |
-          sudo python3 scripts/compat/software-boot.py --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-boot" ${{ matrix.extra }}
+          extra=()
+          if [ '${{ matrix.arch }}' = aarch64 ]; then
+            extra=(--guest-firecracker "$RUNNER_TEMP/software-state/artifacts/firecracker")
+          fi
+          sudo python3 scripts/compat/software-boot.py --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-boot" ${{ matrix.extra }} "${extra[@]}"
           cat "$RUNNER_TEMP/software-boot/report.json"
       - name: Save software kernel
         if: success() && steps.software-kernel.outputs.cache-hit != 'true'
@@ -164,6 +171,7 @@ jobs:
             ${{ runner.temp }}/software-boot/files.strace
             ${{ runner.temp }}/software-boot/compile.log
             ${{ runner.temp }}/software-boot/kvm-compile.log
+            ${{ runner.temp }}/software-boot/inner-compile.log
           if-no-files-found: ignore
 
   # Whether the aarch64 runner can run VMs: it decides what e2e-aarch64 runs (the KVM shards, or what
