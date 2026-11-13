@@ -1,9 +1,12 @@
 // KVM ABI reference checks. The same binary will test FlexVM's compatibility provider.
-// cc -std=c11 -O2 -Wall -Wextra -Werror -static kvm-abi.c -o kvm-abi
+// cc -std=c11 -O2 -Wall -Wextra -Werror -static -pthread kvm-abi.c -o kvm-abi
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/kvm.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <time.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -119,6 +122,45 @@ static void output(struct machine *m, uint8_t expected) {
     REQUIRE(*((uint8_t *)m->run + m->run->io.data_offset) == expected);
 }
 
+static void *live_cpu(void *opaque) {
+    output(opaque, 'R');
+    return NULL;
+}
+
+static void concurrent_ram(int kvm, const struct kvm_cpuid2 *cpuid) {
+    struct machine m = create(kvm, cpuid, 0);
+    // Publish ready, wait for the caller's release flag WITHOUT an IO exit, then
+    // perform atomic increments concurrently with the caller before reporting IO.
+    const uint8_t code[] = {
+        0xbb, 0x00, 0x20,
+        0x66, 0xc7, 0x47, 0x04, 0x01, 0x00, 0x00, 0x00,
+        0x66, 0x83, 0x7f, 0x08, 0x01, 0x75, 0xf9,
+        0xb9, 0xff, 0xff, 0xf0, 0x66, 0xff, 0x07, 0xe2, 0xfa,
+        0xba, 0xf8, 0x03, 0xb0, 'R', 0xee, 0xf4,
+    };
+    memcpy(m.ram + CODE_ADDR, code, sizeof(code));
+    _Atomic uint32_t *words = (_Atomic uint32_t *)(m.ram + DATA_ADDR);
+    REQUIRE(atomic_is_lock_free(&words[0]));
+    for (unsigned i = 0; i < 3; i++) atomic_init(&words[i], 0);
+    pthread_t worker;
+    REQUIRE(pthread_create(&worker, NULL, live_cpu, &m) == 0);
+    struct timespec start, now;
+    REQUIRE(clock_gettime(CLOCK_MONOTONIC, &start) == 0);
+    while (atomic_load(&words[1]) != 1) {
+        REQUIRE(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+        REQUIRE(now.tv_sec - start.tv_sec < 10);
+        struct timespec pause = {.tv_nsec = 1000000};
+        nanosleep(&pause, NULL);
+    }
+    atomic_store(&words[2], 1);
+    for (unsigned i = 0; i < 65535; i++) atomic_fetch_add(&words[0], 1);
+    REQUIRE(pthread_join(worker, NULL) == 0);
+    run(&m, KVM_EXIT_HLT);
+    REQUIRE(atomic_load(&words[0]) == 2 * 65535);
+    destroy(&m);
+    pass("live shared RAM handshake and atomic updates without VM-exit synchronization");
+}
+
 int main(int argc, char **argv) {
     REQUIRE(argc <= 2);
     signal(SIGALRM, expired);
@@ -218,6 +260,7 @@ int main(int argc, char **argv) {
     pass("vCPU descriptor keeps VM alive after VM descriptor closes");
     destroy(&a);
     destroy(&b);
+    concurrent_ram(kvm, cpuid);
     REQUIRE(close(kvm) == 0);
     free(cpuid);
     printf("PASS: %u KVM ABI reference checks\n", passed);

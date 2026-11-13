@@ -115,7 +115,7 @@ class SoftwareCheck(unittest.TestCase):
             sources.append('kvm-abi.c')
         for source in sources:
             with self.subTest(source=source):
-                subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', '-static',
+                subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', '-static', '-pthread',
                                 str(ROOT / source), '-o', str(self.root / source.removesuffix('.c'))],
                                check=True, capture_output=True, timeout=60)
 

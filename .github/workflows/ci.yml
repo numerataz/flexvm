@@ -223,7 +223,7 @@ jobs:
       - name: KVM ABI reference execution
         if: runner.arch == 'X64' && (matrix.shard == 'pr 1/4' || matrix.shard == 'heavy')
         run: |
-          cc -std=c11 -O2 -Wall -Wextra -Werror -static scripts/compat/kvm-abi.c -o "$RUNNER_TEMP/kvm-abi"
+          cc -std=c11 -O2 -Wall -Wextra -Werror -static -pthread scripts/compat/kvm-abi.c -o "$RUNNER_TEMP/kvm-abi"
           "$RUNNER_TEMP/kvm-abi"
 
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09

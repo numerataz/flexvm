@@ -168,7 +168,7 @@ to access that device. Independent x86_64/aarch64 GitHub Actions jobs retain the
 machine-readable report, guest console and syscall trace.
 
 ```sh
-cc -std=c11 -O2 -Wall -Wextra -Werror -static scripts/compat/kvm-abi.c -o /tmp/kvm-abi
+cc -std=c11 -O2 -Wall -Wextra -Werror -static -pthread scripts/compat/kvm-abi.c -o /tmp/kvm-abi
 /tmp/kvm-abi /dev/kvm
 sudo python3 scripts/compat/software-boot.py \
   --kernel /var/lib/flexvm/artifacts/vmlinux --output /tmp/software-boot
