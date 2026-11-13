@@ -177,3 +177,12 @@ sudo python3 scripts/compat/software-boot.py \
 The software boot check is not a FlexVM software backend or a KVM API
 implementation. Those remain required work; a successful TCG boot alone does
 not satisfy unchanged-client compatibility or the FlexVM lifecycle contract.
+
+On ARM64, `software-boot.py --guest-kvm` also enables emulated EL2 and GICv3,
+then runs a static program using the normal guest Linux KVM API. It creates a
+VM/vCPU, maps caller-owned RAM, sets ARM core registers, executes instructions,
+checks an MMIO write exit, and requires a PSCI shutdown event. Host KVM stays
+masked and the host trace must still show no KVM access. This experiment tests
+the ordinary guest KVM implementation under CPU emulation; it does not yet
+establish unchanged QEMU/Firecracker compatibility, nested lifecycle behavior,
+or an integrated FlexVM software backend.

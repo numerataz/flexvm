@@ -113,6 +113,8 @@ class SoftwareCheck(unittest.TestCase):
         sources = ['software-init.c']
         if platform.machine() == 'x86_64':
             sources.append('kvm-abi.c')
+        elif platform.machine() == 'aarch64':
+            sources.append('kvm-arm.c')
         for source in sources:
             with self.subTest(source=source):
                 subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', '-static', '-pthread',

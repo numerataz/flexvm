@@ -28,7 +28,7 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def initramfs(init):
+def initramfs(init, kvm=None):
     """Small uncompressed newc archive; no root-owned mknod or cpio executable needed."""
     archive = bytearray()
 
@@ -43,6 +43,9 @@ def initramfs(init):
     add("dev", 0o040755)
     add("dev/console", 0o020600, major=5, minor=1)
     add("init", 0o100755, init)
+    if kvm is not None:
+        add("dev/kvm", 0o020600, major=10, minor=232)
+        add("kvm-abi", 0o100755, kvm)
     add("TRAILER!!!", 0)
     return archive
 
@@ -69,6 +72,7 @@ def main():
     parser.add_argument("--kernel", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cc", default="cc")
+    parser.add_argument("--guest-kvm", action="store_true", help="require ARM KVM execution inside software-emulated EL2")
     parser.add_argument("--timeout", type=int, default=90)
     args = parser.parse_args()
     if os.geteuid() != 0:
@@ -76,6 +80,8 @@ def main():
     arch = platform.machine()
     if arch not in ("x86_64", "aarch64"):
         parser.error(f"unsupported native architecture: {arch}")
+    if args.guest_kvm and arch != "aarch64":
+        parser.error("guest KVM execution currently targets ARM64 EL2")
     if args.timeout < 1:
         parser.error("timeout must be positive")
     kernel = args.kernel.resolve(strict=True)
@@ -85,7 +91,8 @@ def main():
     if report_path.exists():
         parser.error("output already has a report; use a new directory")
     report = {"schema_version": 1, "status": "running", "arch": arch, "accelerator": "tcg",
-              "kernel_sha256": digest(kernel), "scope": "execution-engine boot only"}
+              "kernel_sha256": digest(kernel),
+              "scope": "software guest KVM ABI execution" if args.guest_kvm else "execution-engine boot only"}
     started = time.monotonic()
 
     def interrupted(number, _frame):
@@ -97,7 +104,13 @@ def main():
         run([args.cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static",
              str(ROOT / "software-init.c"), "-o", str(init)], 60, out / "compile.log")
         archive = out / "initramfs.cpio"
-        archive.write_bytes(initramfs(init.read_bytes()))
+        nested = None
+        if args.guest_kvm:
+            test = out / "kvm-abi"
+            run([args.cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static",
+                 str(ROOT / "kvm-arm.c"), "-o", str(test)], 60, out / "kvm-compile.log")
+            nested = test.read_bytes()
+        archive.write_bytes(initramfs(init.read_bytes(), nested))
         blocked = out / "unusable-kvm"
         blocked.touch(mode=0o600)
         qemu = "qemu-system-" + arch
@@ -109,6 +122,8 @@ def main():
                       "-chardev", "stdio,id=console,signal=off",
                       "-device", "virtio-serial-device,id=serial",
                       "-device", "virtconsole,chardev=console,bus=serial.0"]
+        if args.guest_kvm:
+            machine += ",virtualization=on,gic-version=3"
         cmd = [qemu, "-machine", machine, "-accel", "tcg,thread=multi", "-cpu", "max",
                "-m", "256", "-smp", "1", *serial, "-no-reboot", "-nic", "none",
                "-kernel", str(kernel), "-initrd", str(archive),
@@ -123,11 +138,13 @@ def main():
         log = (out / "guest.log").read_text(errors="replace")
         expected = ["FLEXVM_SOFTWARE_GUEST_BOOTED", "FLEXVM_SOFTWARE_GUEST_COMPLETE"]
         expected += [f"FLEXVM_SOFTWARE_GUEST_TICK {i}" for i in range(3)]
+        if args.guest_kvm:
+            expected.append("FLEXVM_SOFTWARE_GUEST_KVM_PASSED")
         if any(marker not in log for marker in expected):
             raise RuntimeError("guest did not finish its boot/timer/shutdown checks; see guest.log")
         if '"/dev/kvm"' in trace.read_text(errors="replace"):
             raise RuntimeError("software execution attempted to access /dev/kvm; see files.strace")
-        report.update(status="passed", guest_init_sha256=digest(init), kvm_access=False)
+        report.update(status="passed", guest_init_sha256=digest(init), kvm_access=False, guest_kvm=args.guest_kvm)
     except Interrupted as exc:
         report.update(status="interrupted", error=str(exc), signal=exc.number)
     except Exception as exc:

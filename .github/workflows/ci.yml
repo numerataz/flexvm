@@ -123,8 +123,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: x86_64, runner: ubuntu-24.04, qemu: qemu-system-x86 }
-          - { arch: aarch64, runner: ubuntu-24.04-arm, qemu: qemu-system-arm }
+          - { arch: x86_64, runner: ubuntu-24.04, qemu: qemu-system-x86, extra: "" }
+          - { arch: aarch64, runner: ubuntu-24.04-arm, qemu: qemu-system-arm, extra: "--guest-kvm" }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -145,7 +145,7 @@ jobs:
         run: ./scripts/fetch.sh --kernel --state "$RUNNER_TEMP/software-state"
       - name: Boot with KVM masked
         run: |
-          sudo python3 scripts/compat/software-boot.py --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-boot"
+          sudo python3 scripts/compat/software-boot.py --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-boot" ${{ matrix.extra }}
           cat "$RUNNER_TEMP/software-boot/report.json"
       - name: Save software kernel
         if: success() && steps.software-kernel.outputs.cache-hit != 'true'
@@ -163,6 +163,7 @@ jobs:
             ${{ runner.temp }}/software-boot/guest.log
             ${{ runner.temp }}/software-boot/files.strace
             ${{ runner.temp }}/software-boot/compile.log
+            ${{ runner.temp }}/software-boot/kvm-compile.log
           if-no-files-found: ignore
 
   # Whether the aarch64 runner can run VMs: it decides what e2e-aarch64 runs (the KVM shards, or what
