@@ -9,7 +9,7 @@ use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -176,6 +176,19 @@ fn setup_root() -> io::Result<()> {
     mount("proc", "/proc", "proc", 0, "")?;
     mount("sysfs", "/sys", "sysfs", 0, "")?;
     mount("devtmpfs", "/dev", "devtmpfs", 0, "")?;
+    // App mode has no udev. Apply the usual FUSE/TUN access rules so ordinary
+    // guest users can create their own mounts/network devices in user namespaces.
+    // These are guest kernel devices; their operations still check capabilities.
+    for (path, minor) in [("/dev/fuse", 229), ("/dev/net/tun", 200)] {
+        match std::fs::symlink_metadata(path) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {} // Older/custom kernels.
+            Err(e) => return Err(e),
+            Ok(meta) if meta.file_type().is_char_device() && meta.rdev() == libc::makedev(10, minor) => {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
+            }
+            Ok(_) => return Err(io::Error::other(format!("unexpected device at {path}"))),
+        }
+    }
     // Use the template's memory ceiling, not its small boot RAM. size=0 is unlimited but
     // statfs reports zero capacity/free blocks, which makes package managers refuse downloads.
     let tmpfs = tmpfs_options(&std::fs::read_to_string("/proc/cmdline")?)?;
