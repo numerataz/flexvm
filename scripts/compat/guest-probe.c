@@ -85,7 +85,12 @@ static int cgroup(void) {
     int result = 0;
     for (unsigned i = 0; i < sizeof(files)/sizeof(*files); i++) {
         snprintf(path, sizeof(path), "%s/%s", dir, files[i]);
-        if ((result = write_file(path, values[i]))) break;
+        if ((result = write_file(path, values[i]))) {
+            // A writable cgroup2 hierarchy without activated parent controllers is a
+            // configuration gap, not evidence that the kernel lacks those controllers.
+            if (result == ENOENT) result = EAGAIN;
+            break;
+        }
     }
     if (rmdir(dir) && !result) result = error();
     return result;
@@ -193,10 +198,11 @@ static int netfilter(unsigned subsystem, unsigned command) {
         struct pollfd ready = {.fd = fd, .events = POLLIN};
         if (poll(&ready, 1, 1000) <= 0) result = ETIMEDOUT;
         else {
-            char buf[8192]; ssize_t n = recv(fd, buf, sizeof(buf), 0);
+            union { struct nlmsghdr header; char bytes[8192]; } buf;
+            ssize_t n = recv(fd, buf.bytes, sizeof(buf.bytes), 0);
             if (n < (ssize_t)sizeof(struct nlmsghdr)) result = n < 0 ? error() : EPROTO;
             else {
-                struct nlmsghdr *msg = (void *)buf;
+                struct nlmsghdr *msg = &buf.header;
                 if (msg->nlmsg_type == NLMSG_ERROR) {
                     if (n < (ssize_t)NLMSG_LENGTH(sizeof(struct nlmsgerr))) result = EPROTO;
                     else result = -((struct nlmsgerr *)NLMSG_DATA(msg))->error;
@@ -253,6 +259,15 @@ static void json_string(const char *s) {
     }
     putchar('"');
 }
+static const char *probe_status(int e, const char *name) {
+    if (!e) return "supported";
+    if (e == EPERM || e == EACCES) return "denied";
+    if (e == EAGAIN && !strcmp(name, "cgroup.delegation")) return "unconfigured";
+    if (e == ENOENT) return "missing";
+    if (e == ENOSYS || e == ENODEV || e == EOPNOTSUPP || e == EPROTONOSUPPORT || e == ENOPROTOOPT)
+        return "unsupported";
+    return "error";
+}
 int main(int argc, char **argv) {
     if (argc > 2) { fprintf(stderr, "usage: guest-probe [PROBE]\n"); return 64; }
     unsigned count = 0;
@@ -268,10 +283,12 @@ int main(int argc, char **argv) {
         int e = isolated(probes[i].run);
         if (emitted++) putchar(',');
         printf("{\"name\":"); json_string(probes[i].name);
-        const char *status = !e ? "supported" : (e == EPERM || e == EACCES) ? "denied" :
-            e == ENOENT ? "missing" : (e == ENOSYS || e == ENODEV || e == EOPNOTSUPP || e == EPROTONOSUPPORT || e == ENOPROTOOPT) ? "unsupported" : "error";
+        const char *status = probe_status(e, probes[i].name);
         printf(",\"status\":"); json_string(status); printf(",\"errno\":%d,\"detail\":", e);
-        json_string(e ? strerror(e) : "probe succeeded"); putchar('}');
+        const char *detail = e ? strerror(e) : "probe succeeded";
+        if (e == EAGAIN && !strcmp(probes[i].name, "cgroup.delegation"))
+            detail = "parent cgroup controllers are not activated/delegated";
+        json_string(detail); putchar('}');
     }
     puts("]}"); return 0;
 }

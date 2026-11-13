@@ -30,6 +30,20 @@ verb = args[0]
 if verb == 'pull':
     if os.environ.get('FAIL_PULL'): sys.exit(17)
     state['image'] = args[args.index('--tag') + 1]
+elif verb == 'cp' and os.environ.get('FAIL_COPY'):
+    sys.exit(19)
+elif verb == 'checkpoint':
+    if args[1] == 'create':
+        if os.environ.get('FAIL_CP_BEFORE_CREATE'): sys.exit(20)
+        state.setdefault('checkpoints', []).append(args[3])
+        if os.environ.get('FAIL_CP_AFTER_CREATE'):
+            state_path.write_text(json.dumps(state))
+            sys.exit(21)
+    elif args[1] == 'ls':
+        name = args[-1].split('=', 1)[1]
+        print('\n'.join(n for n in state.get('checkpoints', []) if n == name))
+    elif args[1] == 'rm':
+        state['checkpoints'].remove(args[2])
 elif verb == 'run':
     state['name'] = args[args.index('--name') + 1]
     state['active'] = True
@@ -40,7 +54,7 @@ elif verb == 'rm':
     state['active'] = False
 elif verb == 'rmi':
     state['image'] = None
-elif verb == 'exec' and any(a.startswith('/tmp/flexvm-probe-') for a in args) and args[2] != 'rm':
+elif verb == 'exec' and any(a.startswith('/tmp/flexvm-probe-') for a in args) and 'if [ -e' not in ' '.join(args):
     if os.environ.get('DELAY_PROBE'): time.sleep(30)
     print(json.dumps({'schema_version': 1, 'probes': [
         {'name': 'kernel.memfd', 'status': 'supported', 'errno': 0},
@@ -94,7 +108,7 @@ class Harness(unittest.TestCase):
         result = self.run_suite('--vm', 'existing')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(set(c[0] for c in self.calls()) & {'pull', 'run', 'stop', 'rm', 'rmi', 'checkpoint'})
-        self.assertEqual(self.calls()[-1][0:3], ['exec', 'existing', 'rm'])
+        self.assertEqual(self.calls()[-1][0:5], ['exec', '-u', '0', 'existing', 'sh'])
 
     def test_invalid_borrowed_lifecycle_is_rejected_before_any_command(self):
         result = self.run_suite('--vm', 'existing', '--phases', 'run,suspend')
@@ -105,6 +119,34 @@ class Harness(unittest.TestCase):
         result = self.run_suite(FAIL_PULL='1')
         self.assertEqual(result.returncode, 1)
         self.assertEqual([c[0] for c in self.calls()], ['pull', 'logs'])
+
+    def test_borrowed_cleanup_before_copy_preserves_interruption(self):
+        args = compat.parse_args(['--vm', 'existing', '--bin', str(self.fake), '--output', str(self.root)])
+        suite = compat.Suite(args, self.root)
+        suite.report['status'] = 'interrupted'
+        suite.cleanup()
+        self.assertEqual(suite.report['status'], 'interrupted')
+        self.assertEqual(suite.report['cleanup_errors'], [])
+        self.assertFalse(self.trace.exists())
+
+    def test_borrowed_copy_failure_conditionally_cleans_only_its_helper(self):
+        result = self.run_suite('--vm', 'existing', FAIL_COPY='1')
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.report()['cleanup_errors'], [])
+        self.assertEqual(self.calls()[-1][0:5], ['exec', '-u', '0', 'existing', 'sh'])
+
+    def test_published_checkpoint_is_cleaned_if_creation_reports_failure(self):
+        result = self.run_suite('--phases', 'run,checkpoint', FAIL_CP_AFTER_CREATE='1')
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.report()['cleanup_errors'], [])
+        self.assertTrue(any(c[:2] == ['checkpoint', 'rm'] for c in self.calls()))
+        self.assertEqual(json.loads((self.root / 'state').read_text())['checkpoints'], [])
+
+    def test_unpublished_checkpoint_is_not_removed_if_creation_fails(self):
+        result = self.run_suite('--phases', 'run,checkpoint', FAIL_CP_BEFORE_CREATE='1')
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.report()['cleanup_errors'], [])
+        self.assertFalse(any(c[:2] == ['checkpoint', 'rm'] for c in self.calls()))
 
     def test_cleanup_failure_fails_the_run(self):
         result = self.run_suite(FAIL_RM='1')
@@ -117,7 +159,7 @@ class Harness(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual([p['phase'] for p in self.report()['phases']], ['run', 'suspend', 'checkpoint'])
         calls = self.calls()
-        final = [c[0:2] for c in calls[-3:]]
+        final = [c[0:2] for c in calls if c[0] in ('rm', 'rmi') or c[:2] == ['checkpoint', 'rm']][-3:]
         self.assertEqual(final[0], ['rm', '-f'])
         self.assertEqual(final[1], ['checkpoint', 'rm'])
         self.assertEqual(final[2][0], 'rmi')

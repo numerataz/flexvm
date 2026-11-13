@@ -53,8 +53,8 @@ This copies/removes its own temporary probe file and runs bounded child probes;
 it does not rebuild, stop or destroy the existing VM. Tests use private namespaces
 and remove their temporary cgroup/filesystem resources.
 
-An inventory records each probe's `supported`, `denied`, `missing`, `unsupported`
-or `error` status and errno. A missing device is reported as missing, not assumed
+An inventory records each probe's `supported`, `denied`, `missing`, `unconfigured`,
+`unsupported` or `error` status and errno. A missing device is reported as missing, not assumed
 to prove that a kernel feature is disabled. The overall inventory can succeed
 with unavailable optional features. `--require PROBE` makes such a result fail;
 required baseline namespace capabilities also fail instead of becoming skips.

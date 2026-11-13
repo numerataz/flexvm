@@ -71,7 +71,7 @@ class Suite:
         self.host = self.source
         self.name = args.vm or "compat-" + uuid.uuid4().hex
         self.image = self.name + "-image"
-        self.started = self.pulled = False
+        self.started = self.pulled = self.probe_attempted = False
         self.checkpoints = []
         self.nonce = uuid.uuid4().hex
         self.probe = "/tmp/flexvm-probe-" + self.nonce
@@ -91,6 +91,7 @@ class Suite:
             self.started = True
             self.source.call("run", "-d", "--name", self.name,
                              "--entrypoint", '["sleep","infinity"]', self.image)
+        self.probe_attempted = True
         self.source.call("cp", str(probe), f"{self.name}:{self.probe}")
         if "namespaces" in self.args.cases:
             # Mounts are shared with later execs. A live process and its starttime must survive too.
@@ -145,8 +146,8 @@ class Suite:
         elif phase == "checkpoint":
             name = "compat-" + uuid.uuid4().hex
             # A stopped checkpoint requires no host userfaultfd write-protection support.
-            self.host.call("checkpoint", "create", self.name, name, "--stop", timeout=300)
             self.checkpoints.append((self.host, name))
+            self.host.call("checkpoint", "create", self.name, name, "--stop", timeout=300)
             self.host.call("rm", self.name)
             self.host.call("run", "-d", "--checkpoint", name, "--name", self.name, timeout=300)
         elif phase == "migration":
@@ -170,14 +171,16 @@ class Suite:
                         host.call("rm", "-f", self.name, timeout=60)
                 except Exception as exc:
                     self.report["cleanup_errors"].append(str(exc))
-        elif self.args.vm:
+        elif self.args.vm and self.probe_attempted:
             try:
-                self.exec("rm", self.probe, timeout=30)
+                self.host.call("exec", "-u", "0", self.name, "sh", "-ec",
+                               'if [ -e "$1" ] || [ -L "$1" ]; then rm -- "$1"; fi', "sh", self.probe, timeout=30)
             except Exception as exc:
                 self.report["cleanup_errors"].append(str(exc))
         for host, name in reversed(self.checkpoints):
             try:
-                host.call("checkpoint", "rm", name, timeout=60)
+                if host.call("checkpoint", "ls", "-q", "--filter", f"name={name}", timeout=30).strip():
+                    host.call("checkpoint", "rm", name, timeout=60)
             except Exception as exc:
                 self.report["cleanup_errors"].append(str(exc))
         if self.pulled:
@@ -185,7 +188,7 @@ class Suite:
                 self.source.call("rmi", self.image, timeout=60)
             except Exception as exc:
                 self.report["cleanup_errors"].append(str(exc))
-        if self.report["cleanup_errors"]:
+        if self.report["cleanup_errors"] and self.report["status"] != "interrupted":
             self.report["status"] = "failed"
         self.save()
 
