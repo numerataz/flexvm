@@ -2093,9 +2093,11 @@ fn generations(templates: &Path) -> Result<Vec<String>> {
     Ok(ids)
 }
 
-/// `describe` of generation `id`, if there is one here (`inspect`).
-pub fn describe_id(paths: &Paths, id: &str) -> Option<Value> {
-    Template::generation(paths, id).map(|dir| describe(None, id, &dir))
+/// A generation's metadata, if it is here.
+pub fn meta(paths: &Paths, id: &str) -> Option<Meta> {
+    let id = id.strip_prefix("sha256:").unwrap_or(id);
+    let dir = Template::generation(paths, id)?;
+    serde_json::from_slice(&std::fs::read(dir.join("meta.json")).ok()?).ok()
 }
 
 fn describe(name: Option<&str>, id: &str, dir: &Path) -> Value {
