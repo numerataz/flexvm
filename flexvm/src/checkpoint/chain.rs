@@ -57,7 +57,7 @@ pub(super) fn read_at(dir: RawFd, name: &str, max: u64) -> io::Result<(File, Vec
     if st.st_mode & libc::S_IFMT != libc::S_IFREG {
         return Err(io::Error::other("not a regular file"));
     }
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity((st.st_size.max(0) as u64).min(max) as usize);
     io::Read::take(&f, max).read_to_end(&mut bytes)?;
     Ok((f, bytes))
 }

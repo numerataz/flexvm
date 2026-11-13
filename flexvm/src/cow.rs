@@ -221,6 +221,9 @@ impl Cow {
 
     /// `n` pages of `first..end` were saved (their states set already).
     fn saved(&self, first: usize, end: usize, n: usize) {
+        if n == 0 {
+            return;
+        }
         self.left.fetch_sub(n, Ordering::SeqCst);
         *self.progress.0.lock().unwrap() += n as u64;
         self.progress.1.notify_all();
@@ -468,8 +471,11 @@ impl GuestPages for CowPages<'_> {
                 return Err(e);
             }
         }
-        (0..n).filter(|&k| mine[k]).for_each(|k| cow.set(page + k, CLEAN));
-        cow.saved(page, page + n, mine.iter().filter(|&&m| m).count());
+        let claimed = mine.iter().filter(|&&m| m).count();
+        if claimed > 0 {
+            (0..n).filter(|&k| mine[k]).for_each(|k| cow.set(page + k, CLEAN));
+            cow.saved(page, page + n, claimed);
+        }
         // Slots of rescued copies taken here, reused once copied (on every return).
         let mut done = Done(&cow.slots, Vec::new());
         // The rest were copied during the pause, or a fault saved them first (or is saving them right now).
@@ -1292,5 +1298,30 @@ mod tests {
             assert!(cow.drain());
         });
         assert_eq!(cow.left(), 0);
+    }
+
+    #[test]
+    fn saved_zero_is_noop() {
+        let cow = Cow::new(4, &vec![(0, 4, REMOTE)]);
+        assert_eq!(cow.left(), 4);
+        let progress_before = *cow.progress.0.lock().unwrap();
+        cow.saved(0, 4, 0);
+        assert_eq!(cow.left(), 4);
+        assert_eq!(*cow.progress.0.lock().unwrap(), progress_before);
+    }
+
+    #[test]
+    fn read_skips_saved_when_all_pages_already_held_or_rescued() {
+        let n = 2;
+        let live = Live { pages: StdMutex::new(vec![0xee; n * PAGE_SIZE]) };
+        let cow = Cow::new(n, &vec![(0, n as u64, REMOTE)]);
+        cow.hold(Arc::new(Held::of(&[(0, 0xaa), (1, 0xbb)])));
+        let progress_before = *cow.progress.0.lock().unwrap();
+        let pages = CowPages { guest: &live, cow: &cow, slow: || Duration::ZERO };
+        let mut buf = vec![0u8; n * PAGE_SIZE];
+        pages.read(0, &mut buf).unwrap();
+        assert_eq!(*cow.progress.0.lock().unwrap(), progress_before);
+        assert!(buf[..PAGE_SIZE].iter().all(|&b| b == 0xaa));
+        assert!(buf[PAGE_SIZE..].iter().all(|&b| b == 0xbb));
     }
 }

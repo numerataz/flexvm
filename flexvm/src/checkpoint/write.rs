@@ -264,7 +264,7 @@ pub(super) fn write_pages(
             let (first, n) = units[k];
             let bytes = &mut buf.bytes()[..n * PAGE_SIZE];
             src.read(first, bytes)?;
-            let mut unit = Unit { first, kinds: Vec::with_capacity(n), sums: Vec::new(), at: 0 };
+            let mut unit = Unit { first, kinds: Vec::with_capacity(n), sums: Vec::with_capacity(n), at: 0 };
             iov.clear();
             // Whole pages of this one allocation, not reused until `write` returns.
             for (i, page) in bytes.chunks(PAGE_SIZE).enumerate() {
