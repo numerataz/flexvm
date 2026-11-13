@@ -359,7 +359,7 @@ impl Pages {
     pub fn claim(&self, first: usize, max: usize, from: u8, ok: impl Fn(usize) -> bool) -> usize {
         let mut n = 0;
         while n < max && first + n < self.states.len() && ok(first + n) {
-            if from == BASE {
+            if from == BASE && (n == 0 || (first + n) % CHUNK == 0) {
                 self.touch(first + n);
             }
             if self.states[first + n].compare_exchange(from, INFLIGHT, Ordering::SeqCst, Ordering::SeqCst).is_err() {
@@ -801,5 +801,15 @@ mod tests {
             });
             assert!(pages.dirty_bits(true).bits.iter().all(|&bits| bits == u64::MAX));
         }
+    }
+
+    #[test]
+    fn claim_touches_chunks_across_boundaries() {
+        let pages = Pages::new(CHUNK * 2);
+        assert!(!pages.touched(0));
+        assert!(!pages.touched(CHUNK));
+        assert_eq!(pages.claim(CHUNK - 5, 10, BASE, |_| true), 10);
+        assert!(pages.touched(0));
+        assert!(pages.touched(CHUNK));
     }
 }
