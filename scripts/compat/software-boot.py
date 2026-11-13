@@ -17,6 +17,12 @@ import time
 ROOT = Path(__file__).resolve().parent
 
 
+class Interrupted(Exception):
+    def __init__(self, number):
+        self.number = number
+        super().__init__(f"received signal {number}")
+
+
 def digest(path):
     with path.open("rb") as stream:
         return hashlib.file_digest(stream, "sha256").hexdigest()
@@ -81,6 +87,11 @@ def main():
     report = {"schema_version": 1, "status": "running", "arch": arch, "accelerator": "tcg",
               "kernel_sha256": digest(kernel), "scope": "execution-engine boot only"}
     started = time.monotonic()
+
+    def interrupted(number, _frame):
+        raise Interrupted(number)
+
+    previous = {number: signal.signal(number, interrupted) for number in (signal.SIGINT, signal.SIGTERM)}
     try:
         init = out / "init"
         run([args.cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static",
@@ -110,12 +121,18 @@ def main():
         if '"/dev/kvm"' in trace.read_text(errors="replace"):
             raise RuntimeError("software execution attempted to access /dev/kvm; see files.strace")
         report.update(status="passed", guest_init_sha256=digest(init), kvm_access=False)
+    except Interrupted as exc:
+        report.update(status="interrupted", error=str(exc), signal=exc.number)
     except Exception as exc:
         report.update(status="failed", error=str(exc))
     finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
         report["elapsed_s"] = round(time.monotonic() - started, 3)
         report_path.write_text(json.dumps(report, indent=2) + "\n")
     print(f"{report['status'].upper()}: {report_path}")
+    if report["status"] == "interrupted":
+        return 128 + report["signal"]
     return 0 if report["status"] == "passed" else 1
 
 
