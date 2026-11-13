@@ -36,6 +36,8 @@ pub const BOOT_ARGS: &str = "console=ttyS0 quiet keep_bootcon panic=1 pci=off \
     rootflags=dax init=/sbin/flexvm-init psi=1 \
     memhp_default_state=online memory_hotplug.online_policy=auto-movable memory_hotplug.auto_movable_ratio=2000";
 
+const TMPFS_MEMORY_ARG: &str = "flexvm.tmpfs_mib=";
+
 /// Restores pay per KVM memslot and untouched memory is free, so slots are big.
 pub const SLOT_MIB: u64 = 1024;
 pub const STEP_MIB: u64 = 128;
@@ -123,6 +125,7 @@ pub fn recipe() -> String {
         h.word(w);
     }
     h.update(BOOT_ARGS.as_bytes());
+    h.update(TMPFS_MEMORY_ARG.as_bytes());
     h.update(ROOTFS.as_bytes());
     h.update(env!("CARGO_PKG_VERSION").as_bytes());
     h.finish()
@@ -1955,7 +1958,7 @@ fn build(host: &crate::host::Host, paths: &Paths, dir: &Path, name: &str, size: 
     let metrics = run.join("metrics.json");
     File::create(&metrics)?;
     fc.put("/metrics", json!({"metrics_path": metrics}))?;
-    fc.put("/boot-source", json!({"kernel_image_path": kernel_source, "boot_args": BOOT_ARGS}))?;
+    fc.put("/boot-source", json!({"kernel_image_path": kernel_source, "boot_args": format!("{BOOT_ARGS} {TMPFS_MEMORY_ARG}{}", mem_mib + hotplug)}))?;
     fc.put("/machine-config", json!({"vcpu_count": vcpus, "mem_size_mib": mem_mib}))?;
     fc.link_rootfs(&rootfs)?;
     fc.put("/pmem/root", json!({"id": "root", "path_on_host": ROOTFS, "root_device": true, "read_only": true}))?;

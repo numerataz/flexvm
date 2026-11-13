@@ -24,7 +24,10 @@ Image `VOLUME` directories are writable for the lifetime of each VM. Empty
 ones are mounted as tmpfs with the image directory's ownership, mode and
 xattrs; populated ones keep their contents on the root overlay. Their writes
 travel with checkpoints, suspend and migration. They are not named host
-volumes and are discarded when the VM is destroyed.
+volumes and are discarded when the VM is destroyed. RAM-backed filesystems
+report a capacity derived from the template's memory ceiling, so package
+managers see free space. This reserves no memory: pages are allocated on use
+and remain subject to the VM's memory controls.
 
 ## Docker inside a VM
 
