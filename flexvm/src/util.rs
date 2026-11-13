@@ -749,6 +749,9 @@ impl<S: Timed> Timed for &mut S {
 
 impl<S: Timed> Timed for io::BufReader<S> {
     fn read_timeout(&self, t: Duration) -> io::Result<()> {
+        if !self.buffer().is_empty() {
+            return Ok(());
+        }
         self.get_ref().read_timeout(t)
     }
     fn write_timeout(&self, t: Duration) -> io::Result<()> {
@@ -2292,6 +2295,50 @@ mod tests {
         let (mut x, mut yz) = ([0u8; 1], [0u8; 2]);
         assert_eq!(by.read_vectored(&mut [io::IoSliceMut::new(&mut x), io::IoSliceMut::new(&mut yz)]).unwrap(), 3);
         assert_eq!((&x, &yz), (b"x", b"yz"));
+    }
+
+    #[test]
+    fn buffered_reads_skip_read_timeout_until_empty() {
+        struct MockStream(std::io::Cursor<Vec<u8>>, std::sync::atomic::AtomicUsize);
+        impl Read for MockStream {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.0.read(buf)
+            }
+        }
+        impl Timed for MockStream {
+            fn read_timeout(&self, _: Duration) -> io::Result<()> {
+                self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+            fn write_timeout(&self, _: Duration) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mock = MockStream(std::io::Cursor::new(b"hello world".to_vec()), std::sync::atomic::AtomicUsize::new(0));
+        let mut by = By { s: io::BufReader::new(mock), at: Instant::now() + Duration::from_secs(5) };
+
+        // Buffer is initially empty: first read refills BufReader and calls read_timeout.
+        let mut b1 = [0u8; 1];
+        by.read_exact(&mut b1).unwrap();
+        assert_eq!(&b1, b"h");
+        assert_eq!(by.s.get_ref().1.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Subsequent reads hit the buffered data in BufReader: read_timeout must NOT be called.
+        let mut b2 = [0u8; 4];
+        by.read_exact(&mut b2).unwrap();
+        assert_eq!(&b2, b"ello");
+        assert_eq!(by.s.get_ref().1.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let mut b3 = [0u8; 6];
+        by.read_exact(&mut b3).unwrap();
+        assert_eq!(&b3, b" world");
+        assert_eq!(by.s.get_ref().1.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // Buffer is now empty: next read triggers inner read and calls read_timeout again.
+        let mut b4 = [0u8; 1];
+        assert_eq!(by.read(&mut b4).unwrap(), 0);
+        assert_eq!(by.s.get_ref().1.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
