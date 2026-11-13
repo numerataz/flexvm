@@ -243,12 +243,19 @@ impl At {
         Ok(open_at(self.dir.as_raw_fd(), &self.name, flags)?.into())
     }
 
-    /// Sets an xattr on the entry itself through an O_PATH fd, so device
-    /// nodes and FIFOs are never opened and symlinks never followed.
-    fn set_xattr(&self, key: &str, value: &[u8]) -> Result<()> {
-        let fd = open_at(self.dir.as_raw_fd(), &self.name, libc::O_PATH | libc::O_NOFOLLOW)?;
+    /// Sets an xattr on the entry itself. When an open descriptor is provided (for regular files),
+    /// sets it directly via `fsetxattr` to avoid reopening and procfs resolution.
+    /// Otherwise uses an O_PATH fd so device nodes and FIFOs are never opened and symlinks never followed.
+    fn set_xattr(&self, key: &str, value: &[u8], fd: Option<RawFd>) -> Result<()> {
         let key = CString::new(key).map_err(|_| "NUL in xattr name")?;
-        check(unsafe { libc::setxattr(proc_path(&fd).as_ptr(), key.as_ptr(), value.as_ptr().cast(), value.len(), 0) }, "setxattr", Path::new(""))
+        let res = match fd {
+            Some(fd) => unsafe { libc::fsetxattr(fd, key.as_ptr(), value.as_ptr().cast(), value.len(), 0) },
+            None => {
+                let fd = open_at(self.dir.as_raw_fd(), &self.name, libc::O_PATH | libc::O_NOFOLLOW)?;
+                unsafe { libc::setxattr(proc_path(&fd).as_ptr(), key.as_ptr(), value.as_ptr().cast(), value.len(), 0) }
+            }
+        };
+        check(res, "setxattr", Path::new(""))
     }
 }
 
@@ -586,6 +593,8 @@ impl Root {
                 // No bigger than the file: most are small, and a 256 KiB buffer each would be an mmap.
                 let mut file = self.create(|| Ok(BufWriter::with_capacity((e.size() as usize).min(256 << 10), at.create()?)))?;
                 io::copy(e, &mut file).and_then(|_| file.flush()).map_err(|err| format!("write {rel:?}: {err}"))?;
+                Self::file_metadata(&at, &h, &m, rel, file.get_ref().as_raw_fd())?;
+                return Ok(at);
             }
             T::Symlink => {
                 let target = m.link.as_ref().ok_or("symlink without target")?;
@@ -617,20 +626,35 @@ impl Root {
             }
             other => bail!("unsupported tar entry type {other:?} at {rel:?}"),
         }
-        Self::metadata(&at, &h, &m, rel)?;
+        Self::metadata(&at, &h, &m, rel, None)?;
         Ok(at)
     }
 
-    fn metadata(at: &At, h: &tar::Header, m: &Meta, rel: &Path) -> Result<()> {
+    fn file_metadata(at: &At, h: &tar::Header, m: &Meta, rel: &Path, fd: RawFd) -> Result<()> {
+        Self::metadata(at, h, m, rel, Some(fd))
+    }
+
+    fn metadata(at: &At, h: &tar::Header, m: &Meta, rel: &Path, fd: Option<RawFd>) -> Result<()> {
         let (dfd, name) = (at.dir.as_raw_fd(), at.name.as_ptr());
         let kind = h.entry_type();
         let nofollow = libc::AT_SYMLINK_NOFOLLOW;
-        check(unsafe { libc::fchownat(dfd, name, m.uid, m.gid, nofollow) }, "chown", rel)?;
+        let mode = (h.mode()? & 0o7777) as libc::mode_t;
+        match fd {
+            Some(fd) => {
+                check(unsafe { libc::fchown(fd, m.uid, m.gid) }, "chown", rel)?;
+                check(unsafe { libc::fchmod(fd, mode) }, "chmod", rel)?;
+            }
+            None => {
+                check(unsafe { libc::fchownat(dfd, name, m.uid, m.gid, nofollow) }, "chown", rel)?;
+                if kind != tar::EntryType::Symlink {
+                    // After chown, which clears setuid/setgid bits.
+                    check(unsafe { libc::fchmodat(dfd, name, mode, 0) }, "chmod", rel)?;
+                }
+            }
+        }
         if kind != tar::EntryType::Symlink {
-            // After chown, which clears setuid/setgid bits.
-            check(unsafe { libc::fchmodat(dfd, name, h.mode()? & 0o7777, 0) }, "chmod", rel)?;
             for (key, value) in &m.xattrs {
-                if let Err(e) = at.set_xattr(key, value) {
+                if let Err(e) = at.set_xattr(key, value, fd) {
                     // Capabilities and ACLs decide who may run or read what; other xattrs are best-effort.
                     if key == "security.capability" || key.starts_with("system.posix_acl_") {
                         bail!("xattr {key} on {rel:?}: {e}");
@@ -640,14 +664,17 @@ impl Root {
             }
         }
         let ts = [libc::timespec { tv_sec: h.mtime().unwrap_or(0) as i64, tv_nsec: 0 }; 2];
-        check(unsafe { libc::utimensat(dfd, name, ts.as_ptr(), nofollow) }, "utimensat", rel)
+        match fd {
+            Some(fd) => check(unsafe { libc::futimens(fd, ts.as_ptr()) }, "futimens", rel),
+            None => check(unsafe { libc::utimensat(dfd, name, ts.as_ptr(), nofollow) }, "utimensat", rel),
+        }
     }
 
     /// Child creation (including injected files) changes the root's mtime.
     pub fn restore_root_metadata(&self) -> Result<()> {
         if let Some((h, m)) = &self.root_meta {
             let at = At { dir: self.resolve(Path::new(""))?, name: c".".to_owned() };
-            Self::metadata(&at, h, m, Path::new("/"))?;
+            Self::metadata(&at, h, m, Path::new("/"), None)?;
         }
         Ok(())
     }
@@ -1440,5 +1467,38 @@ pub(super) mod tests {
         assert_eq!(root.read("etc/passwd"), None);
         assert_eq!(root.read("etc/group"), Some(b"g".to_vec()));
         assert_eq!(root.read("etc"), None);
+    }
+
+    #[test]
+    fn file_metadata_sets_mode_mtime_and_xattrs() {
+        use std::os::unix::fs::MetadataExt;
+        let s = Sandbox::new("meta");
+        let mut b = tar::Builder::new(Vec::new());
+        b.append_pax_extensions([("SCHILY.xattr.user.test", b"hello xattr".as_slice())]).unwrap();
+        let mut h = tar::Header::new_gnu();
+        h.set_mode(0o4755);
+        h.set_mtime(12345678);
+        h.set_size(11);
+        h.set_uid(unsafe { libc::getuid() } as u64);
+        h.set_gid(unsafe { libc::getgid() } as u64);
+        h.set_entry_type(tar::EntryType::Regular);
+        h.set_cksum();
+        b.append_data(&mut h, "regular.txt", b"hello world".as_slice()).unwrap();
+        let bytes = b.into_inner().unwrap();
+
+        s.open().apply_layer(bytes.as_slice()).unwrap();
+
+        let path = s.root.join("regular.txt");
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert_eq!(meta.mode() & 0o7777, 0o4755);
+        assert_eq!(meta.mtime(), 12345678);
+        assert_eq!(std::fs::read(&path).unwrap(), b"hello world");
+
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let c_key = CString::new("user.test").unwrap();
+        let mut buf = vec![0u8; 64];
+        let n = unsafe { libc::getxattr(c_path.as_ptr(), c_key.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
+        assert_eq!(n, 11);
+        assert_eq!(&buf[..11], b"hello xattr");
     }
 }
