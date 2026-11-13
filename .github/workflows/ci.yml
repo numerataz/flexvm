@@ -98,7 +98,9 @@ jobs:
               ;;
           esac
       - name: Compatibility harness tests
-        run: python3 scripts/compat/test_harness.py
+        run: |
+          python3 scripts/compat/test_harness.py
+          python3 scripts/compat/test_software.py
       - name: e2e scheduler self-test
         # Fake templates and workers, one of which cannot be spawned: its cases must fail.
         run: python3 scripts/e2e.py --selftest --log-dir "$RUNNER_TEMP/e2e-selftest"
@@ -110,6 +112,58 @@ jobs:
       - name: lab teardown self-test
         # The lab scripts' process matching and cgroup cleanup (scripts/net-common.sh): rootless, no VM.
         run: ./scripts/net-common-test.sh
+
+  # Independent of hardware availability: boot an actual Linux guest through
+  # software CPU emulation with /dev/kvm unusable in a private mount namespace.
+  software-execution:
+    name: software execution without KVM (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04, qemu: qemu-system-x86 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm, qemu: qemu-system-arm }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends ${{ matrix.qemu }} strace build-essential flex bison bc libelf-dev libssl-dev dwarves xz-utils
+      - name: Software state directory
+        run: sudo install -d -o "$(id -u)" -g "$(id -g)" "$RUNNER_TEMP/software-state/artifacts"
+      - name: Cache kernel
+        id: software-kernel
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/software-state/artifacts
+          key: software-kernel-${{ matrix.arch }}-${{ hashFiles('scripts/build-kernel.sh', 'scripts/fetch.sh', 'scripts/versions.sh', 'scripts/checksums.sha256', 'kernel/config/*', 'kernel/features*.config', 'kernel/source.env') }}
+      - name: Fetch or build the reviewed kernel
+        run: ./scripts/fetch.sh --kernel --state "$RUNNER_TEMP/software-state"
+      - name: Boot with KVM masked
+        run: |
+          sudo python3 scripts/compat/software-boot.py --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-boot"
+          cat "$RUNNER_TEMP/software-boot/report.json"
+      - name: Save software kernel
+        if: success() && steps.software-kernel.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/software-state/artifacts
+          key: ${{ steps.software-kernel.outputs.cache-primary-key }}
+      - name: Upload software execution evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: software-execution-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/software-boot/report.json
+            ${{ runner.temp }}/software-boot/guest.log
+            ${{ runner.temp }}/software-boot/files.strace
+            ${{ runner.temp }}/software-boot/compile.log
+          if-no-files-found: ignore
 
   # Whether the aarch64 runner can run VMs: it decides what e2e-aarch64 runs (the KVM shards, or what
   # needs no KVM). Never fails; it reports.
@@ -169,6 +223,12 @@ jobs:
           # KVM_GET_API_VERSION must answer 12, and KVM_CREATE_VM must work.
           python3 -c 'import fcntl, os; fd = os.open("/dev/kvm", os.O_RDWR); v = fcntl.ioctl(fd, 0xAE00); vm = fcntl.ioctl(fd, 0xAE01, 0); print("KVM API", v, "vm fd", vm); assert v == 12'
           nproc; free -m; uname -r
+
+      - name: KVM ABI reference execution
+        if: runner.arch == 'X64' && (matrix.shard == 'pr 1/4' || matrix.shard == 'heavy')
+        run: |
+          cc -std=c11 -O2 -Wall -Wextra -Werror -static -pthread scripts/compat/kvm-abi.c -o "$RUNNER_TEMP/kvm-abi"
+          "$RUNNER_TEMP/kvm-abi"
 
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
         with:

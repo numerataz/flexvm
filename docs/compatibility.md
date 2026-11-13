@@ -144,3 +144,36 @@ nested KVM lifecycle support remains open in #1327. Rootless Docker, standalone
 containerd/builders, Kubernetes, system containers, distro init and durable disks
 still require their own acceptance results. These development results do not
 establish support for every architecture or workload.
+
+## KVM ABI and software execution checks
+
+The architecture requirement is tracked in #1358 and #1327: host KVM is optional,
+and existing programs using the KVM interface must work unchanged. The current
+Firecracker backend still requires working KVM; the following checks establish
+reference behavior and an execution-engine baseline for the replacement work.
+
+`scripts/compat/kvm-abi.c` executes an x86 guest directly through the KVM ABI.
+It checks real IO exits and the shared run page, coherent caller-owned RAM,
+isolated VM descriptors, register save/restore, memory slot replacement/removal,
+ioeventfd delivery/deassignment, and vCPU lifetime after its VM descriptor is
+closed. The same static binary accepts a device path so it can later test the
+FlexVM-compatible provider unchanged. Missing required capabilities or an
+unusable device fail the test. GitHub Actions runs it against real KVM in the
+first x86 integration shard.
+
+`scripts/compat/software-boot.py` boots a real native Linux kernel with QEMU TCG,
+a tiny static guest init, timer checks and clean poweroff. It masks `/dev/kvm`
+inside a private mount namespace and traces file operations to reject attempts
+to access that device. Independent x86_64/aarch64 GitHub Actions jobs retain the
+machine-readable report, guest console and syscall trace.
+
+```sh
+cc -std=c11 -O2 -Wall -Wextra -Werror -static -pthread scripts/compat/kvm-abi.c -o /tmp/kvm-abi
+/tmp/kvm-abi /dev/kvm
+sudo python3 scripts/compat/software-boot.py \
+  --kernel /var/lib/flexvm/artifacts/vmlinux --output /tmp/software-boot
+```
+
+The software boot check is not a FlexVM software backend or a KVM API
+implementation. Those remain required work; a successful TCG boot alone does
+not satisfy unchanged-client compatibility or the FlexVM lifecycle contract.
