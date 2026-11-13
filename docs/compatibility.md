@@ -193,3 +193,19 @@ Firecracker artifact, with its normal seccomp filter enabled; the report records
 the executable's SHA256. Host KVM remains inaccessible throughout. This establishes
 an unchanged hypervisor execution case, not nested lifecycle support, performance
 guarantees, or an integrated FlexVM software backend.
+
+`--checkpoint` adds a cold restore while the inner Linux guest is running.
+The runner stops the outer emulator after inner tick 0, saves its complete
+machine state, exits the source emulator, and restores into a fresh process.
+Ticks 1 and 2 must come from the restored VM, with no repeated outer/inner boot
+marker, followed by clean inner and outer shutdown. Both emulator processes
+keep host KVM masked and traced. The report includes the migration result and
+snapshot size; temporary machine RAM is removed after the test. ARM CI runs
+this case with the Cortex-A72 CPU profile, which supports ordinary Linux KVM.
+
+The `max` CPU profile passed nested boot but stalled on cold restore with
+QEMU 10.2.1; a plain outer guest also stalled when restored during a timer
+sleep. Cortex-A72 continued the live inner guest across the same sequence.
+These results establish a tested software CPU profile, not support for every
+emulated CPU feature, migration between engines/CPU profiles, or FlexVM's
+existing snapshot format.
