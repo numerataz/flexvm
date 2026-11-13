@@ -1214,6 +1214,12 @@ Overrides follow `docker run`: `--entrypoint`, `--cmd`, `--env K[=V]`
 with the same userland state (RNG seeds, keys), so use it only for apps that
 hold no secrets at startup. Details: [docs/images.md](docs/images.md).
 
+## Docker inside a VM
+
+The official `docker:27-dind` image can run Docker inside a FlexVM guest,
+including `overlay2` storage and bridge networking. See
+[Docker inside a VM](docs/images.md#docker-inside-a-vm) for setup and the smoke test.
+
 ## Docker API
 
 `flexvm api` serves the Docker Engine API (v1.47; clients negotiate down to

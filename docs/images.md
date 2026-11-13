@@ -20,6 +20,46 @@ value, or is left out if unset; an empty key is refused), `--workdir`,
 `--user name|uid[:group|gid]`. An image left with no entrypoint and no
 command has no app: its VMs idle (`--warm` refuses it).
 
+Image `VOLUME` directories are writable for the lifetime of each VM. Empty
+ones are mounted as tmpfs with the image directory's ownership, mode and
+xattrs; populated ones keep their contents on the root overlay. Their writes
+travel with checkpoints, suspend and migration. They are not named host
+volumes and are discarded when the VM is destroyed.
+
+## Docker inside a VM
+
+With the current guest init, the official DinD image runs its normal
+entrypoint, uses `overlay2` on its empty `/var/lib/docker` volume, and creates
+containers with Docker's default bridge network:
+
+```sh
+sudo flexvm pull docker:27-dind
+sudo flexvm run -d --name docker docker:27-dind
+# Wait until the daemon is ready (certificate generation can take a few seconds).
+sudo flexvm exec docker docker info
+sudo flexvm exec docker docker run --rm hello-world
+sudo flexvm exec docker docker run --rm alpine:3.21 wget -qO- http://example.com
+```
+
+Repull the image after upgrading flexvm: existing templates embed their old
+guest init. The DinD entrypoint selects legacy iptables on the stock guest
+kernel. Keep its default TLS configuration when accessing Docker over TCP;
+`flexvm exec` uses its Unix socket. The host must provide guest DNS and
+outbound routing or NAT, as for any VM that accesses the internet.
+
+The daemon and its containers share the VM's memory ceiling. Container
+cgroups are created under the guest's delegated memory group, while the agent
+stays outside it to service memory growth. Docker data remains in guest RAM
+and consumes the same memory budget as other guest writes. Populated image
+volumes retain the overlay backing store; an existing Docker data directory
+may require a compatible storage driver.
+
+`scripts/test-docker.sh` runs the registry-backed smoke test, including bridge
+DNS/HTTP, container resource limits, builds, volumes, and suspend/resume. It
+uses a temporary VM name and destroys that VM on exit.
+
+## Image handling
+
 Images are untrusted input processed as root. Documents and blobs fetched by
 digest are checked against it; a manifest fetched by tag has no expected
 digest to check, so its digest is computed from the response. Layers are

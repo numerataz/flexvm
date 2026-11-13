@@ -715,6 +715,68 @@ def guest_cgroup_namespace():
 
 @case
 @needs_kvm
+def image_volumes():
+    """Empty declared volumes use tmpfs; populated volumes preserve image contents and metadata."""
+    import io, tarfile
+    layout = os.path.join(WORK, "volume-image")
+    blobs = os.path.join(layout, "blobs", "sha256")
+    os.makedirs(blobs)
+    source = os.path.join(args.test_image, "blobs", "sha256")
+    for name in os.listdir(source):
+        os.link(os.path.join(source, name), os.path.join(blobs, name))
+
+    def read(desc):
+        return json.load(open(os.path.join(blobs, desc["digest"].split(":")[1])))
+
+    def blob(data, media):
+        digest = hashlib.sha256(data).hexdigest()
+        with open(os.path.join(blobs, digest), "wb") as f:
+            f.write(data)
+        return {"digest": "sha256:" + digest, "size": len(data), "mediaType": media}
+
+    manifest = read(json.load(open(os.path.join(args.test_image, "index.json")))["manifests"][0])
+    config = read(manifest["config"])
+    layer = io.BytesIO()
+    with tarfile.open(fileobj=layer, mode="w") as tar:
+        for path in ("empty-volume", "seeded-volume"):
+            entry = tarfile.TarInfo(path)
+            entry.type, entry.mode, entry.uid, entry.gid = tarfile.DIRTYPE, 0o2770, 123, 456
+            tar.addfile(entry)
+        entry = tarfile.TarInfo("seeded-volume/seed")
+        entry.size = 5
+        tar.addfile(entry, io.BytesIO(b"seed\n"))
+        entry = tarfile.TarInfo("seeded-volume/link")
+        entry.type, entry.linkname = tarfile.LNKTYPE, "seeded-volume/seed"
+        tar.addfile(entry)
+    layer = blob(layer.getvalue(), "application/vnd.oci.image.layer.v1.tar")
+    manifest["layers"].append(layer)
+    config["rootfs"]["diff_ids"].append(layer["digest"])
+    config["config"]["Volumes"] = {"/empty-volume": {}, "/seeded-volume": {}, "/etc": {}}
+    manifest["config"] = blob(json.dumps(config).encode(), manifest["config"]["mediaType"])
+    desc = blob(json.dumps(manifest).encode(), "application/vnd.oci.image.manifest.v1+json")
+    with open(os.path.join(layout, "index.json"), "w") as f:
+        json.dump({"schemaVersion": 2, "manifests": [desc]}, f)
+    with open(os.path.join(layout, "oci-layout"), "w") as f:
+        json.dump({"imageLayoutVersion": "1.0.0"}, f)
+    name, vm = args.template + "-volumes", "e2e-volumes"
+    flexvm("pull", layout, "--tag", name, "--vcpus", "2", "--max", "2048", timeout=600)
+    A.run(vm, template=name)
+    check("empty volume uses tmpfs", must(A, vm, "stat -f -c %T /empty-volume") == "tmpfs")
+    check("empty volume keeps owner and mode", must(A, vm, "stat -c '%u %g %a' /empty-volume") == "123 456 2770")
+    check("seeded volume keeps contents", must(A, vm, "cat /seeded-volume/seed /seeded-volume/link") == "seed\nseed")
+    check("seeded volume keeps hard links", must(A, vm, "stat -c %i /seeded-volume/seed") == must(A, vm, "stat -c %i /seeded-volume/link"))
+    check("populated /etc stays visible", "root:" in must(A, vm, "cat /etc/passwd"))
+    must(A, vm, "echo saved >/empty-volume/marker")
+    A.suspend(vm)
+    A.cli("start", vm)
+    A.pid(vm)
+    check("volume survives suspend", must(A, vm, "cat /empty-volume/marker") == "saved")
+    A.kill(vm)
+    shutil.rmtree(layout)
+
+
+@case
+@needs_kvm
 def app_lifecycle():
     """A VM follows its app: exits with it (an exited record with -d), --keep, --rm, start reruns, kill -s, -e/--entrypoint."""
     t = args.template

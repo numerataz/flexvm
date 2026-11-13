@@ -212,7 +212,29 @@ fn setup_root() -> io::Result<()> {
     unsafe { libc::sethostname(c"flexvm".as_ptr(), 6) };
     std::env::set_var("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
     std::env::set_var("HOME", "/root");
+    match app::volumes() {
+        Ok(paths) => {
+            for path in paths {
+                mount_empty_volume(path)?;
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
     Ok(())
+}
+
+/// Empty image volumes get a native tmpfs backing store. In particular, Docker's overlay2
+/// cannot put its upper/work directories on our overlay root. Populated volumes stay on the
+/// root overlay so their image contents, hard links and xattrs are preserved without copying.
+fn mount_empty_volume(path: &str) -> io::Result<()> {
+    if std::fs::read_dir(path)?.next().transpose()?.is_some() {
+        return Ok(());
+    }
+    let original = File::open(path)?;
+    mount("tmpfs", path, "tmpfs", 0, "size=0,nr_inodes=0")?;
+    // Keep the old inode open across the mount so metadata is read from the image directory.
+    copy_root_metadata(&format!("/proc/self/fd/{}", original.as_raw_fd()), path)
 }
 
 /// Reaps every child (orphans too, as PID 1), recording the exit codes `spawn` registered.

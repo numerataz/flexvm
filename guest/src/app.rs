@@ -36,6 +36,11 @@ pub fn init() {
     LazyLock::force(&CONFIG);
 }
 
+/// Declared image volumes, captured before the app can change its configuration file.
+pub fn volumes() -> io::Result<&'static [String]> {
+    Ok(&config()?.volumes)
+}
+
 fn config() -> io::Result<&'static Conf> {
     CONFIG.as_ref().map_err(|e| io::Error::new(e.kind(), e.to_string()))
 }
@@ -124,6 +129,7 @@ pub(crate) struct Conf {
     uid: u32,
     gid: u32,
     groups: Vec<u32>,
+    volumes: Vec<String>,
     /// A run's `-i` and `-t`.
     stdin: bool,
     tty: bool,
@@ -143,7 +149,7 @@ fn unescape(s: &str) -> String {
 }
 
 fn parse_conf(text: &str) -> io::Result<Conf> {
-    let mut c = Conf { argv: vec![], env: vec![], cwd: "/".into(), uid: 0, gid: 0, groups: vec![], stdin: false, tty: false };
+    let mut c = Conf { argv: vec![], env: vec![], cwd: "/".into(), uid: 0, gid: 0, groups: vec![], volumes: vec![], stdin: false, tty: false };
     let num = |v: &str| v.trim().parse::<u32>().map_err(|_| io::Error::other(format!("{CONF}: bad id {v:?}")));
     // Only LF delimits records; str::lines() also removes a value's trailing CR.
     for line in text.split('\n') {
@@ -156,6 +162,7 @@ fn parse_conf(text: &str) -> io::Result<Conf> {
                 c.env.push((k.into(), v.into()));
             }
             "cwd" => c.cwd = unescape(v),
+            "volume" => c.volumes.push(unescape(v)),
             "uid" => c.uid = num(v)?,
             "gid" => c.gid = num(v)?,
             "groups" => c.groups = v.split_whitespace().map(num).collect::<io::Result<_>>()?,
@@ -698,6 +705,12 @@ fn logs(mut out: impl Write, mut offset: u64, follow: bool) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn volume_paths_follow_conf_escaping() {
+        let conf = parse_conf("volume /data\nvolume /odd\\nvolume\n").unwrap();
+        assert_eq!(conf.volumes, ["/data", "/odd\nvolume"]);
+    }
 
     #[test]
     fn stdio_chown_skips_null_and_already_owned_fds() {

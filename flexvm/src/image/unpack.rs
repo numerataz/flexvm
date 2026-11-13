@@ -662,6 +662,11 @@ impl Root {
         Ok(at)
     }
 
+    /// A declared volume follows its final symlink inside the image root, and must be a directory.
+    pub fn ensure_volume(&mut self, rel: &str) -> Result<()> {
+        self.mkdir_p(Path::new(rel), 0).map(drop)
+    }
+
     /// An injected config directory must not retain an image user's ownership or write access.
     pub fn secure_dir(&mut self, rel: &str, mode: u32) -> Result<()> {
         let at = self.ensure_dir(rel, mode)?;
