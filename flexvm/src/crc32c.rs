@@ -74,12 +74,14 @@ pub fn page(p: &[u8]) -> (u32, bool) {
     #[cfg(target_arch = "x86_64")]
     if std::arch::is_x86_feature_detected!("sse4.2") {
         // SAFETY: the CPU has SSE4.2.
-        return unsafe { hw::page(p, shift_tables()) };
+        let (c, zero) = unsafe { hw::page(!0, p, shift_tables()) };
+        return (!c, zero);
     }
     #[cfg(target_arch = "aarch64")]
     if std::arch::is_aarch64_feature_detected!("crc") {
         // SAFETY: the CPU has the CRC extension.
-        return unsafe { hw::page(p, shift_tables()) };
+        let (c, zero) = unsafe { hw::page(!0, p, shift_tables()) };
+        return (!c, zero);
     }
     let zero = p.chunks_exact(8).fold(0u64, |a, w| a | u64::from_ne_bytes(w.try_into().unwrap())) == 0;
     (crc32c(p), zero)
@@ -92,7 +94,15 @@ mod hw {
     use super::{shift, STREAM};
 
     #[target_feature(enable = "sse4.2")]
-    pub(super) unsafe fn update(c: u32, bytes: &[u8]) -> u32 {
+    pub(super) unsafe fn update(mut c: u32, bytes: &[u8]) -> u32 {
+        let mut pages = bytes.chunks_exact(4096);
+        if bytes.len() >= 4096 {
+            let t = super::shift_tables();
+            for p in &mut pages {
+                c = page(c, p, t).0;
+            }
+        }
+        let bytes = pages.remainder();
         let mut c = c as u64;
         let mut words = bytes.chunks_exact(8);
         for w in &mut words {
@@ -106,12 +116,12 @@ mod hw {
     }
 
     #[target_feature(enable = "sse4.2")]
-    pub(super) unsafe fn page(p: &[u8], t: &[[u32; 256]; 4]) -> (u32, bool) {
+    pub(super) unsafe fn page(init: u32, p: &[u8], t: &[[u32; 256]; 4]) -> (u32, bool) {
         let word = |w: &[u8]| u64::from_le_bytes(w.try_into().unwrap());
         let (streams, rest) = p.split_at(3 * STREAM);
         let (s0, s12) = streams.split_at(STREAM);
         let (s1, s2) = s12.split_at(STREAM);
-        let (mut a, mut b, mut c, mut or) = (!0u32 as u64, 0u64, 0u64, 0u64);
+        let (mut a, mut b, mut c, mut or) = (init as u64, 0u64, 0u64, 0u64);
         // Fixed-size chunks: no bounds checks in the loop.
         for ((x, y), z) in s0.chunks_exact(8).zip(s1.chunks_exact(8)).zip(s2.chunks_exact(8)) {
             let (x, y, z) = (word(x), word(y), word(z));
@@ -127,7 +137,7 @@ mod hw {
             r = _mm_crc32_u64(r, x);
             or |= x;
         }
-        (!(r as u32), or == 0)
+        (r as u32, or == 0)
     }
 }
 
@@ -139,6 +149,14 @@ mod hw {
 
     #[target_feature(enable = "crc")]
     pub(super) unsafe fn update(mut c: u32, bytes: &[u8]) -> u32 {
+        let mut pages = bytes.chunks_exact(4096);
+        if bytes.len() >= 4096 {
+            let t = super::shift_tables();
+            for p in &mut pages {
+                c = page(c, p, t).0;
+            }
+        }
+        let bytes = pages.remainder();
         let mut words = bytes.chunks_exact(8);
         for w in &mut words {
             c = __crc32cd(c, u64::from_le_bytes(w.try_into().unwrap()));
@@ -155,12 +173,12 @@ mod hw {
     }
 
     #[target_feature(enable = "crc")]
-    pub(super) unsafe fn page(p: &[u8], t: &[[u32; 256]; 4]) -> (u32, bool) {
+    pub(super) unsafe fn page(init: u32, p: &[u8], t: &[[u32; 256]; 4]) -> (u32, bool) {
         let word = |w: &[u8]| u64::from_le_bytes(w.try_into().unwrap());
         let (streams, rest) = p.split_at(3 * STREAM);
         let (s0, s12) = streams.split_at(STREAM);
         let (s1, s2) = s12.split_at(STREAM);
-        let (mut a, mut b, mut c, mut or) = (!0u32, 0u32, 0u32, 0u64);
+        let (mut a, mut b, mut c, mut or) = (init, 0u32, 0u32, 0u64);
         // Fixed-size chunks: no bounds checks in the loop.
         for ((x, y), z) in s0.chunks_exact(8).zip(s1.chunks_exact(8)).zip(s2.chunks_exact(8)) {
             let (x, y, z) = (word(x), word(y), word(z));
@@ -176,7 +194,7 @@ mod hw {
             r = __crc32cd(r, x);
             or |= x;
         }
-        (!r, or == 0)
+        (r, or == 0)
     }
 }
 
@@ -233,6 +251,23 @@ mod tests {
             }
             let p = &buf[off..off + PAGE_SIZE];
             assert_eq!(page(p), (!update_sw(!0, p), false), "offset {off}");
+        }
+    }
+
+    #[test]
+    fn multi_page_matches_sw() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let buf: Vec<u8> = (0..16384)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect();
+        for len in [4096, 4097, 8192, 12345, 16384] {
+            let b = &buf[..len];
+            assert_eq!(crc32c(b), !update_sw(!0, b), "length {len}");
         }
     }
 }
