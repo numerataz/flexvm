@@ -488,16 +488,29 @@ impl Peers {
     /// and the addresses that may claim it (`Host::start_loan`): those of every peer `from`
     /// is one of (`sender`), as an address two peers share cannot tell them apart.
     fn borrower(&self, cfg: &crate::host::Config, from: IpAddr) -> (String, Vec<IpAddr>) {
-        let name = {
-            let r = self.0.resolved.read().unwrap();
-            cfg.peers.iter().find(|n| Self::matching_addrs(&r, cfg, n, from).is_some()).cloned()
-        };
-        (name.unwrap_or_else(|| from.to_canonical().to_string()), self.sender(cfg, from))
+        let r = self.0.resolved.read().unwrap();
+        let mut name = None;
+        let mut out = vec![from];
+        for n in &cfg.peers {
+            if let Some(addrs) = Self::matching_addrs(&r, cfg, n, from) {
+                if name.is_none() {
+                    name = Some(n.clone());
+                }
+                out.extend(addrs);
+                out.extend(cfg.underlays_of(n));
+            }
+        }
+        (name.unwrap_or_else(|| from.to_canonical().to_string()), out)
     }
 
     fn matching_addrs(r: &HashMap<String, Vec<IpAddr>>, cfg: &crate::host::Config, name: &str, from: IpAddr) -> Option<Vec<IpAddr>> {
-        let addrs = name.parse::<SocketAddr>().map_or_else(|_| r.get(name).cloned().unwrap_or_default(), |a| vec![a.ip()]);
-        (is_peer(&addrs, from) || cfg.underlays_of(name).contains(&from.to_canonical())).then_some(addrs)
+        if let Ok(a) = name.parse::<SocketAddr>() {
+            let matched = is_peer(&[a.ip()], from) || cfg.underlays_of(name).contains(&from.to_canonical());
+            return matched.then(|| vec![a.ip()]);
+        }
+        let addrs = r.get(name).map_or(&[][..], Vec::as_slice);
+        let matched = is_peer(addrs, from) || cfg.underlays_of(name).contains(&from.to_canonical());
+        matched.then(|| addrs.to_vec())
     }
 
     /// The addresses of `names`; a name not resolved yet is looked up.
@@ -513,7 +526,9 @@ impl Peers {
             }
         }
         drop(r);
-        self.refresh(missing);
+        if !missing.is_empty() {
+            self.refresh(missing);
+        }
         addrs
     }
 
@@ -524,7 +539,7 @@ impl Peers {
         loop {
             // Starts a lookup of a name with none; then addresses and lookups under way read
             // together, so one that publishes meanwhile is either in the addresses or waited for.
-            self.addrs(names);
+            let mut missing = Vec::new();
             let (addrs, pending) = {
                 let (r, l) = (self.0.resolved.read().unwrap(), self.0.lookups.lock().unwrap());
                 let mut addrs = Vec::new();
@@ -532,15 +547,24 @@ impl Peers {
                 for n in names {
                     match n.parse::<SocketAddr>() {
                         Ok(a) => addrs.push(a.ip()),
-                        Err(_) => {
-                            addrs.extend(r.get(n).into_iter().flatten());
-                            pending |= r.get(n).is_none_or(Vec::is_empty) && l.get(n) == Some(&None);
-                        }
+                        Err(_) => match r.get(n) {
+                            Some(a) => {
+                                addrs.extend(a);
+                                pending |= a.is_empty() && l.get(n) == Some(&None);
+                            }
+                            None => match l.get(n) {
+                                Some(&None) => pending = true,
+                                Some(&Some(t)) if t.elapsed() < LOOKUP_EVERY => {}
+                                _ => missing.push(n),
+                            },
+                        },
                     }
                 }
                 (addrs, pending)
             };
-            if !pending {
+            if !missing.is_empty() {
+                self.refresh(missing);
+            } else if !pending {
                 return Ok(addrs);
             }
             if Instant::now() >= by {
@@ -704,7 +728,7 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant, lo
             let from = conn.peer_addr()?.ip();
             // Names resolved first; one still being looked up only leaves its addresses out.
             let _ = peers.all_addrs(&cfg.peers, Instant::now() + ADMIT_WAIT);
-            let (sender, (name, _)) = (peers.sender(&cfg, from), peers.borrower(&cfg, from));
+            let (name, sender) = peers.borrower(&cfg, from);
             // The peer it came from by any of its addresses (a record from before they were kept has
             // none), or the one its source named itself as: it may have resolved elsewhere since.
             migration(
@@ -1376,7 +1400,8 @@ pub(crate) fn routable_by(
     if !cfg.cluster()?.contains(ip) {
         bail!("{ip} is not a vm's address: outside this host's configured VM ranges");
     }
-    let peer = is_peer(peers, IpAddr::V4(ip)) || is_peer(&cfg.peer_underlay_addrs(), IpAddr::V4(ip));
+    let peer_underlays = cfg.peer_underlay_addrs();
+    let peer = is_peer(peers, IpAddr::V4(ip)) || is_peer(&peer_underlays, IpAddr::V4(ip));
     // A derived underlay is an interface's source address, covered by `local` below.
     let listen = cfg.listen.as_deref().and_then(|s| s.parse::<SocketAddr>().ok()).map(|a| a.ip().to_canonical());
     let underlay = cfg.underlay.contains(IpAddr::V4(ip)) || listen == Some(IpAddr::V4(ip));
@@ -1386,7 +1411,7 @@ pub(crate) fn routable_by(
     }
     // Its IPv6 address, the same on every host (`vm_ipv6_prefix`), is never one either.
     if let Some(v6) = cfg.vm_ipv6(ip).map(IpAddr::V6) {
-        if is_peer(peers, v6) || is_peer(&cfg.peer_underlay_addrs(), v6) || gateways.contains(&v6) || local(v6)? {
+        if is_peer(peers, v6) || is_peer(&peer_underlays, v6) || gateways.contains(&v6) || local(v6)? {
             bail!("{ip} is not a vm's address: its IPv6 address {v6} is a local, peer or gateway address");
         }
     }
@@ -2800,5 +2825,38 @@ mod tests {
         let Ok(l) = TcpListener::bind("[::]:0") else { return };
         let sysctl = std::fs::read_to_string("/proc/sys/net/ipv6/bindv6only").unwrap_or_default();
         assert_eq!(v6only(&l), sysctl.trim() == "1");
+    }
+
+    #[test]
+    fn borrower_and_routable_by_underlays_match() {
+        let mut cfg = crate::host::Config {
+            peers: vec!["10.98.0.1:7000".into(), "peer.example:7000".into()],
+            underlay: "10.97.0.1".parse().unwrap(),
+            vm_ipv6_prefix: crate::net::Ipv6Prefix::parse("fd00:7::/96").ok(),
+            ..Default::default()
+        };
+        cfg.peer_underlays.insert("peer.example:7000".into(), vec!["10.97.0.2".parse().unwrap()]);
+        let p = Peers::default();
+        p.0.resolved.write().unwrap().insert("peer.example:7000".into(), vec!["10.94.0.1".parse().unwrap()]);
+        p.0.lookups.lock().unwrap().insert("peer.example:7000".into(), Some(Instant::now()));
+
+        let from: IpAddr = "10.94.0.1".parse().unwrap();
+        let (name, sender) = p.borrower(&cfg, from);
+        assert_eq!(name, "peer.example:7000");
+        assert!(is_peer(&sender, "10.94.0.1".parse().unwrap()));
+        assert!(is_peer(&sender, "10.97.0.2".parse().unwrap()));
+
+        let unknown_from: IpAddr = "10.99.0.99".parse().unwrap();
+        let (uname, usender) = p.borrower(&cfg, unknown_from);
+        assert_eq!(uname, "10.99.0.99");
+        assert_eq!(usender, vec![unknown_from]);
+
+        let ip = "10.200.0.7".parse().unwrap();
+        let peers = vec!["10.98.0.1".parse().unwrap(), "10.94.0.1".parse().unwrap()];
+        let gateways = vec!["10.96.0.1".parse().unwrap()];
+        assert!(routable_by(ip, &cfg, &peers, &gateways, |_| Ok(false)).is_ok());
+
+        // Underlay address itself is refused by routable_by
+        assert!(routable_by("10.97.0.2".parse().unwrap(), &cfg, &peers, &gateways, |_| Ok(false)).is_err());
     }
 }
