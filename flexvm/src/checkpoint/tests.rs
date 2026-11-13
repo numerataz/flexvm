@@ -16,7 +16,7 @@ use std::{
     fs,
     io::Write,
     os::fd::{AsRawFd, FromRawFd},
-    os::unix::fs::FileExt,
+    os::unix::{ffi::OsStrExt, fs::FileExt},
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -412,6 +412,29 @@ fn page_sync_and_pagemap_errors_leave_staging_unpublished() {
         assert!(stat_at(s.ck.as_raw_fd(), c"manifest.json").is_none());
         assert!(!dest.exists());
     }
+}
+
+#[test]
+fn read_at_pre_sizes_capacity_and_clamps_to_max() {
+    let dir = tmp("read-at-test");
+    let dfd = open_dir_at(libc::AT_FDCWD, &std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap()).unwrap();
+    // Empty file
+    fs::write(dir.join("empty"), b"").unwrap();
+    let (_, bytes) = read_at(dfd.as_raw_fd(), "empty", 100).unwrap();
+    assert_eq!(bytes.capacity(), 0);
+    assert_eq!(bytes, b"");
+
+    // Normal file smaller than max
+    fs::write(dir.join("small"), b"hello world").unwrap();
+    let (_, bytes) = read_at(dfd.as_raw_fd(), "small", 100).unwrap();
+    assert_eq!(bytes.capacity(), 11);
+    assert_eq!(bytes, b"hello world");
+
+    // File larger than max
+    fs::write(dir.join("large"), b"1234567890abcdef").unwrap();
+    let (_, bytes) = read_at(dfd.as_raw_fd(), "large", 10).unwrap();
+    assert_eq!(bytes.capacity(), 10);
+    assert_eq!(bytes, b"1234567890");
 }
 
 #[test]

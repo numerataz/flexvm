@@ -604,7 +604,9 @@ fn matching(dir: &Path, files: &[(&'static str, Option<Vec<u8>>)]) -> Option<Pin
         match (open_at(pinned.dir.as_raw_fd(), name), sha) {
             (Ok(mut f), Some(sha)) if regular(&f) => {
                 let mut hash = Sha256::new();
-                io::copy(&mut f, &mut hash).ok()?;
+                // 1 MiB buffer reduces read syscalls 128x over io::copy's default 8 KiB stack buffer
+                // when hashing multi-gigabyte page files while holding or preparing the store lock.
+                io::copy(&mut io::BufReader::with_capacity(1 << 20, &mut f), &mut hash).ok()?;
                 if hash.finalize().as_slice() != sha {
                     return None;
                 }
@@ -1600,6 +1602,20 @@ mod tests {
         let mut q = Pinned::open(&dir).unwrap();
         q.compare("gone", None);
         assert!(!q.equal);
+    }
+
+    #[test]
+    fn matching_hashes_large_files_in_buffered_chunks() {
+        let dir = crate::test_util::TempDir::new("matching-large");
+        let data = vec![0x42u8; (2 << 20) + (128 << 10)]; // 2 MiB + 128 KiB
+        fs::write(dir.join("pages"), &data).unwrap();
+        let sha = Sha256::digest(&data).to_vec();
+        let files: Vec<(&str, Option<Vec<u8>>)> = vec![("pages", Some(sha))];
+        let p = matching(&dir, &files);
+        assert!(p.is_some(), "matching must succeed across multiple 1 MiB buffer chunks");
+
+        let bad_files: Vec<(&str, Option<Vec<u8>>)> = vec![("pages", Some(vec![0u8; 32]))];
+        assert!(matching(&dir, &bad_files).is_none(), "mismatched hash must fail");
     }
 
     #[test]
