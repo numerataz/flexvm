@@ -176,8 +176,10 @@ fn setup_root() -> io::Result<()> {
     mount("proc", "/proc", "proc", 0, "")?;
     mount("sysfs", "/sys", "sysfs", 0, "")?;
     mount("devtmpfs", "/dev", "devtmpfs", 0, "")?;
-    // tmpfs sizes to half of RAM at mount time and memory is hotplugged later: leave it unbounded.
-    mount("tmpfs", "/run", "tmpfs", 0, "mode=755,size=0")?;
+    // Use the template's memory ceiling, not its small boot RAM. size=0 is unlimited but
+    // statfs reports zero capacity/free blocks, which makes package managers refuse downloads.
+    let tmpfs = tmpfs_options(&std::fs::read_to_string("/proc/cmdline")?)?;
+    mount("tmpfs", "/run", "tmpfs", 0, &format!("mode=755,{tmpfs}"))?;
     for d in ["/run/ovl/upper", "/run/ovl/work", "/run/root"] {
         std::fs::create_dir_all(d)?;
     }
@@ -204,7 +206,7 @@ fn setup_root() -> io::Result<()> {
     std::fs::create_dir_all("/dev/pts")?;
     mount("devpts", "/dev/pts", "devpts", 0, "")?;
     std::fs::create_dir_all("/dev/shm")?;
-    mount("tmpfs", "/dev/shm", "tmpfs", 0, "size=0")?;
+    mount("tmpfs", "/dev/shm", "tmpfs", 0, &tmpfs)?;
     // devtmpfs lacks these; images log to /dev/stdout (nginx) and the like.
     for (link, target) in [("fd", "/proc/self/fd"), ("stdin", "/proc/self/fd/0"), ("stdout", "/proc/self/fd/1"), ("stderr", "/proc/self/fd/2")] {
         let _ = std::os::unix::fs::symlink(target, format!("/dev/{link}"));
@@ -215,7 +217,7 @@ fn setup_root() -> io::Result<()> {
     match app::volumes() {
         Ok(paths) => {
             for path in paths {
-                mount_empty_volume(path)?;
+                mount_empty_volume(path, &tmpfs)?;
             }
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -224,15 +226,32 @@ fn setup_root() -> io::Result<()> {
     Ok(())
 }
 
+/// Capacity is metadata: tmpfs allocates pages/inodes only as they are used. A generous inode
+/// budget avoids both the boot-RAM default and the zero free-inode count of nr_inodes=0.
+fn tmpfs_options(cmdline: &str) -> io::Result<String> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid or duplicate flexvm.tmpfs_mib boot argument");
+    let mut ceiling = None;
+    for value in cmdline.split_whitespace().filter_map(|s| s.strip_prefix("flexvm.tmpfs_mib=")) {
+        if ceiling.is_some() {
+            return Err(invalid());
+        }
+        ceiling = Some(value.parse::<u64>().ok().filter(|&v| v > 0).ok_or_else(invalid)?);
+    }
+    // Compatibility with a new --init supplied to an older host: its old unbounded behavior,
+    // bounded above the Firecracker memory window rather than by boot RAM.
+    let bytes = ceiling.unwrap_or(2 << 20).checked_mul(1 << 20).ok_or_else(invalid)?;
+    Ok(format!("size={bytes},nr_inodes={}", bytes >> 10))
+}
+
 /// Empty image volumes get a native tmpfs backing store. In particular, Docker's overlay2
 /// cannot put its upper/work directories on our overlay root. Populated volumes stay on the
 /// root overlay so their image contents, hard links and xattrs are preserved without copying.
-fn mount_empty_volume(path: &str) -> io::Result<()> {
+fn mount_empty_volume(path: &str, options: &str) -> io::Result<()> {
     if std::fs::read_dir(path)?.next().transpose()?.is_some() {
         return Ok(());
     }
     let original = File::open(path)?;
-    mount("tmpfs", path, "tmpfs", 0, "size=0,nr_inodes=0")?;
+    mount("tmpfs", path, "tmpfs", 0, options)?;
     // Keep the old inode open across the mount so metadata is read from the image directory.
     copy_root_metadata(&format!("/proc/self/fd/{}", original.as_raw_fd()), path)
 }
@@ -792,6 +811,16 @@ fn request_line(r: &mut impl BufRead) -> io::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tmpfs_capacity_uses_the_memory_ceiling_and_rejects_bad_arguments() {
+        assert_eq!(super::tmpfs_options("quiet flexvm.tmpfs_mib=4096 root=/dev/pmem0").unwrap(), "size=4294967296,nr_inodes=4194304");
+        assert_eq!(super::tmpfs_options("quiet").unwrap(), "size=2199023255552,nr_inodes=2147483648");
+        for bad in ["0", "", "-1", "4g", "18446744073709551615"] {
+            assert!(super::tmpfs_options(&format!("flexvm.tmpfs_mib={bad}")).is_err(), "{bad:?}");
+        }
+        assert!(super::tmpfs_options("flexvm.tmpfs_mib=4096 flexvm.tmpfs_mib=8192").is_err());
+    }
+
     #[test]
     fn root_group_access_is_removed_only_for_a_known_uncopied_acl() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
