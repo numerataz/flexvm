@@ -101,9 +101,16 @@ def main():
         blocked = out / "unusable-kvm"
         blocked.touch(mode=0o600)
         qemu = "qemu-system-" + arch
-        machine, cpu, console = ("q35", "max", "ttyS0") if arch == "x86_64" else ("virt", "max", "ttyAMA0")
-        cmd = [qemu, "-machine", machine, "-accel", "tcg,thread=multi", "-cpu", cpu,
-               "-m", "256", "-smp", "1", "-nographic", "-no-reboot", "-nic", "none",
+        machine, console = ("q35", "ttyS0") if arch == "x86_64" else ("virt", "hvc0")
+        serial = ["-nographic"]
+        if arch == "aarch64":
+            # The reviewed Firecracker ARM kernel has virtio-console, not PL011.
+            serial = ["-display", "none", "-monitor", "none", "-serial", "none",
+                      "-chardev", "stdio,id=console,signal=off",
+                      "-device", "virtio-serial-device,id=serial",
+                      "-device", "virtconsole,chardev=console,bus=serial.0"]
+        cmd = [qemu, "-machine", machine, "-accel", "tcg,thread=multi", "-cpu", "max",
+               "-m", "256", "-smp", "1", *serial, "-no-reboot", "-nic", "none",
                "-kernel", str(kernel), "-initrd", str(archive),
                "-append", f"console={console} quiet panic=1 rdinit=/init"]
         trace = out / "files.strace"

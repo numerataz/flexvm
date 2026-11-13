@@ -98,7 +98,9 @@ jobs:
               ;;
           esac
       - name: Compatibility harness tests
-        run: python3 scripts/compat/test_harness.py
+        run: |
+          python3 scripts/compat/test_harness.py
+          python3 scripts/compat/test_software.py
       - name: e2e scheduler self-test
         # Fake templates and workers, one of which cannot be spawned: its cases must fail.
         run: python3 scripts/e2e.py --selftest --log-dir "$RUNNER_TEMP/e2e-selftest"
@@ -131,12 +133,14 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends ${{ matrix.qemu }} strace build-essential flex bison bc libelf-dev libssl-dev dwarves xz-utils
+      - name: Software state directory
+        run: sudo install -d -o "$(id -u)" -g "$(id -g)" "$RUNNER_TEMP/software-state/artifacts"
       - name: Cache kernel
         id: software-kernel
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/software-state/artifacts
-          key: software-kernel-${{ matrix.arch }}-${{ hashFiles('scripts/build-kernel.sh', 'scripts/versions.sh', 'scripts/checksums.sha256', 'kernel/config/*', 'kernel/features*.config', 'kernel/source.env') }}
+          key: software-kernel-${{ matrix.arch }}-${{ hashFiles('scripts/build-kernel.sh', 'scripts/fetch.sh', 'scripts/versions.sh', 'scripts/checksums.sha256', 'kernel/config/*', 'kernel/features*.config', 'kernel/source.env') }}
       - name: Fetch or build the reviewed kernel
         run: ./scripts/fetch.sh --kernel --state "$RUNNER_TEMP/software-state"
       - name: Boot with KVM masked
