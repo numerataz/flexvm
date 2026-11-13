@@ -754,19 +754,19 @@ impl Filters {
     }
 
     pub fn matches(&self, v: &Value) -> bool {
-        let s = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+        let s = |k: &str| v[k].as_str().unwrap_or_default();
         let image = v["template"].as_str().map(template::image_of).unwrap_or_default();
         self.0.iter().all(|(k, vs)| {
             vs.iter().any(|want| match k.as_str() {
                 // A part of the name, as docker's.
                 "name" => s("name").contains(want.as_str()),
                 // `stopped`: any state no process runs.
-                "status" => s("state") == *want || (want == "stopped" && crate::stopped(v)),
+                "status" => s("state") == want || (want == "stopped" && crate::stopped(v)),
                 "image" => {
                     let want_image = template::name_of(want).map(|n| template::image_of(&n));
-                    image == *want || s("template") == *want || want_image.is_ok_and(|w| w == image)
+                    image == *want || s("template") == want || want_image.is_ok_and(|w| w == image)
                 }
-                "ip" => s("ip") == *want || want.parse::<std::net::Ipv6Addr>().is_ok_and(|w| s("ipv6").parse() == Ok(w)),
+                "ip" => s("ip") == want || want.parse::<std::net::Ipv6Addr>().is_ok_and(|w| s("ipv6").parse() == Ok(w)),
                 _ => false,
             })
         })
@@ -924,7 +924,7 @@ fn align(text: &str) -> String {
         for (i, c) in r.iter().enumerate() {
             out.push_str(c);
             if i < last {
-                out.push_str(&" ".repeat(widths[i] - c.chars().count() + 3));
+                out.extend(std::iter::repeat_n(' ', widths[i] - c.chars().count() + 3));
             }
         }
         out.push('\n');
@@ -1486,6 +1486,13 @@ mod tests {
         assert_eq!(Format::parse("{{json .}}").unwrap().render(&vms[1..]).unwrap(), "{\"error\":\"died\",\"name\":\"db\",\"state\":\"failed\"}\n");
         assert!(Format::parse("{{.Nope}}").is_err());
         assert!(Format::parse("{{.Name").is_err());
+    }
+
+    #[test]
+    fn table_align() {
+        let input = "CONTAINER ID\tIMAGE\tCOMMAND\tSTATUS\nabc123\tnginx:latest\t/docker-entrypoint.sh\tUp 2 hours\n1\tbusybox\tsh\tExited (0)";
+        let expected = "CONTAINER ID   IMAGE          COMMAND                 STATUS\nabc123         nginx:latest   /docker-entrypoint.sh   Up 2 hours\n1              busybox        sh                      Exited (0)\n";
+        assert_eq!(align(input), expected);
     }
 
     fn host(tag: &str) -> (TempDir, Host) {
