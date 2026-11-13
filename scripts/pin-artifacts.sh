@@ -47,13 +47,16 @@ RELEASE_WINDOW_HOURS=24
 # build-firecracker.sh and fetch.sh); and the kernel.
 inputs() {
   local arch=${1:-$ARCH} kernel
-  kernel=$(pinned "$(ci_url "$arch")/$KERNEL") || return 1
+  # shellcheck source=../kernel/source.env
+  source "$root/kernel/source.env"
+  kernel=$(pinned "$LINUX_SOURCE_URL") || return 1
   # Each failure returns explicitly: callers test this in conditions, where errexit is off.
   printf 'firecracker %s %s\n' "$FC_VERSION" "$arch" || return 1
   printf 'commit %s\n' "$FC_COMMIT" || return 1
   (cd "$root/firecracker" && sha256sum -- *.patch) || return 1
   (cd "$root" && sha256sum .github/workflows/release.yml scripts/release-assets.sh scripts/build-firecracker.sh scripts/fetch.sh scripts/versions.sh) || return 1
-  printf 'vmlinux %s %s\n' "$kernel" "$KERNEL"
+  (cd "$root" && sha256sum scripts/build-kernel.sh kernel/source.env kernel/features.config "kernel/features-$arch.config" "kernel/config/$arch.config") || return 1
+  printf 'linux-source %s %s\n' "$kernel" "$LINUX_VERSION"
 }
 
 # Every architecture's inputs, each after a line naming it: a whole release's, as pending compares them. With
@@ -105,7 +108,7 @@ pending() (
   if [ "$status" = 0 ]; then
     in_history "$tagged" || return 1
     tree=$(mktemp -d)
-    if ! { git -C "$root" archive "$tagged" .github scripts firecracker | tar -x -C "$tree"; } ||
+    if ! { git -C "$root" archive "$tagged" .github scripts firecracker kernel | tar -x -C "$tree"; } ||
       ! theirs=$(all_inputs "$tree/scripts/pin-artifacts.sh"); then
       echo "cannot tell what $ARTIFACTS_TAG at $tagged is built from" >&2
       return 1
@@ -212,12 +215,8 @@ for arch in "${ARCHES[@]}"; do
     inputs "$arch" | diff - "$listed" >&2 || true
     exit 1
   fi
-  # The kernel is re-hosted, not built: it must be the pinned upstream one.
-  kernel=$(ci_url "$arch")/$KERNEL
-  if [ "$(sha256sum < "$work/$(asset vmlinux "$arch")" | cut -d' ' -f1)" != "$(pinned "$kernel")" ]; then
-    echo "$ARTIFACTS_URL/$(asset vmlinux "$arch") is not the pinned $kernel" >&2
-    exit 1
-  fi
+  # The compiled kernel's content is authenticated by the release attestation above;
+  # its reviewed source archive/configuration/build recipe are checked in inputs.txt.
   # What Firecracker is, from the attested inputs (never by running it).
   head -1 "$listed"
 done

@@ -199,7 +199,7 @@ jobs:
           for f in vmlinux base.squashfs; do
             url=$(awk -v f="$f" '$1 == f {print $2}' urls.txt)
             # A flexvm release's assets never change (and are pinned): no ETag needed.
-            case $url in https://github.com/*/releases/download/*) continue ;; esac
+            case $url in https://github.com/*/releases/download/*|build:*) continue ;; esac
             etag=$(curl -sfI "$url" | tr -d '\r' | awk 'tolower($1) == "etag:" {print $2}')
             test -n "$etag"
             echo "$f-etag $etag" >> urls.txt
@@ -254,6 +254,10 @@ jobs:
           key: downloads-${{ steps.keys.outputs.downloads }}-${{ hashFiles('scripts/fetch.sh', 'scripts/versions.sh', 'scripts/checksums.sha256') }}
       - name: Fetch kernel and base rootfs
         run: |
+          if ./scripts/fetch.sh --urls | grep -q '^vmlinux build:'; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q --no-install-recommends build-essential flex bison bc libelf-dev libssl-dev dwarves xz-utils
+          fi
           ./scripts/fetch.sh
           echo "base=$(sha256sum "$STATE/artifacts/base.squashfs" | cut -c1-16)" >> "$GITHUB_OUTPUT"
         id: fetch

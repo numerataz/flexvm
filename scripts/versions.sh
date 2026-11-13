@@ -4,9 +4,8 @@ FC_VERSION=${FC_VERSION:-v1.17.0}
 # The commit FC_VERSION's tag names (`git ls-remote` its refs/tags/FC_VERSION^{}): build-firecracker.sh refuses a
 # checkout of any other, so a moved tag never changes what is built. Overriding FC_VERSION needs this too.
 FC_COMMIT=${FC_COMMIT:-95f868c8e345b1cc8faccd1a3c910b4989dc3f58}
-# The guest kernel, from Firecracker's CI bucket.
+# Firecracker's CI base rootfs for tests (guest kernel source/config live in kernel/).
 CI_VERSION=${CI_VERSION:-v1.15}
-KERNEL=${KERNEL:-vmlinux-6.1.155}
 # The architecture artifacts are fetched or built for: this host's, unless overridden. A release carries each of
 # ARCHES.
 ARCHES=(x86_64 aarch64)
@@ -28,7 +27,7 @@ CI=$(ci_url)
 # --inputs: Firecracker's version, commit and patches, the build recipe, the kernel) bumps this in the same change;
 # see RELEASING in README.md. Tags use vMAJOR.MINOR.PATCH (artifacts-5 was the last artifacts-N; v0.1.0 was the first source release).
 # A release's assets never change.
-ARTIFACTS_TAG=${ARTIFACTS_TAG:-v0.3.0}
+ARTIFACTS_TAG=${ARTIFACTS_TAG:-v0.4.0}
 ARTIFACTS_URL=https://github.com/numerataz/flexvm/releases/download/$ARTIFACTS_TAG
 
 # A release asset's name for an architecture (default ARCH): firecracker, vmlinux or inputs.txt. x86_64's

@@ -1,6 +1,6 @@
 name: Release artifacts
 
-# Pushing a semver tag (vMAJOR.MINOR.PATCH) builds the patched Firecracker and re-hosts the pinned guest kernel, for
+# Pushing a semver tag (vMAJOR.MINOR.PATCH) builds the patched Firecracker and the source-pinned guest kernel, for
 # x86_64 and aarch64 each natively on a runner of its own, as the release flexvm downloads from on first use
 # (x86_64's assets are firecracker, vmlinux and inputs.txt; aarch64's end in -aarch64: asset in scripts/versions.sh).
 # The tag must be ARTIFACTS_TAG in scripts/versions.sh at the tagged commit. Afterwards, scripts/pin-artifacts.sh

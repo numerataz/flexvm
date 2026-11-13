@@ -20,10 +20,10 @@ mkdir -p "$out"
 
 # Firecracker builds with the toolchain its own rust-toolchain.toml (at FC_COMMIT) pins; rustup installs it.
 sudo apt-get update -q
-sudo apt-get install -y -q --no-install-recommends musl-tools libseccomp-dev
+sudo apt-get install -y -q --no-install-recommends musl-tools libseccomp-dev build-essential flex bison bc libelf-dev libssl-dev dwarves xz-utils
 "$root/scripts/build-firecracker.sh" --state "$state"
-# The kernel is re-hosted, not built: the pinned upstream one.
-"$root/scripts/fetch.sh" --state "$state" --kernel
+# Build the guest kernel from the reviewed source/configuration.
+"$root/scripts/build-kernel.sh" --state "$state"
 
 firecracker=$(asset firecracker) vmlinux=$(asset vmlinux) inputs=$(asset inputs.txt) sums=SHA256SUMS-$ARCH
 install -m 755 "$state/artifacts/firecracker" "$out/$firecracker"
