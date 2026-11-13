@@ -121,6 +121,7 @@ struct App {
     workdir: String,
     user: String,
     ports: Vec<u16>,
+    volumes: Vec<String>,
 }
 
 fn strings(v: &Value) -> Vec<String> {
@@ -157,12 +158,19 @@ fn app_config(config: &Value, o: &Options) -> Result<App> {
         .filter(|&p| p != 0)
         .collect();
     ports.sort();
+    let volumes: Vec<String> = c["Volumes"].as_object().into_iter().flatten().map(|(path, _)| path.clone()).collect();
+    for path in &volumes {
+        if !path.starts_with('/') || path.trim_matches('/').is_empty() || path.contains('\0') || path.split('/').any(|p| matches!(p, "." | "..")) {
+            bail!("invalid image volume path {path:?}: expected an absolute directory path other than /");
+        }
+    }
     Ok(App {
         argv,
         env,
         workdir: o.workdir.clone().or_else(|| c["WorkingDir"].as_str().map(String::from)).filter(|w| !w.is_empty()).unwrap_or("/".into()),
         user: o.user.clone().or_else(|| c["User"].as_str().map(String::from)).unwrap_or_default(),
         ports,
+        volumes,
     })
 }
 
@@ -195,9 +203,9 @@ pub fn prepare(cache: &Path, init: Option<&Path>, o: &Options) -> Result<(PathBu
         Some(init) => std::fs::read(init).map_err(|e| format!("flexvm-init at {init:?}: {e}"))?,
         None => crate::artifacts::INIT.to_vec(),
     };
-    // Rebuild older cached images that lost the image root's metadata.
+    // Rebuild older cached images without declared volume directories/configuration.
     let key = json!({
-        "v": 4, "config": img.config_digest, "diff_ids": img.diff_ids,
+        "v": 5, "config": img.config_digest, "diff_ids": img.diff_ids,
         "init": sha256_hex(&init_bytes), "options": o,
     });
     let key = sha256_hex(key.to_string().as_bytes());
@@ -1017,6 +1025,9 @@ fn inject(root: &mut Root, app: &App, init: &[u8]) -> Result<String> {
     if !workdir.is_empty() {
         root.ensure_dir(workdir, 0o755)?;
     }
+    for path in &app.volumes {
+        root.ensure_volume(path.trim_start_matches('/'))?;
+    }
     let (uid, gid, home, groups) = resolve_user(root, &app.user)?;
     let mut env = app.env.clone();
     for (k, v) in [("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"), ("HOME", &home)] {
@@ -1027,6 +1038,9 @@ fn inject(root: &mut Root, app: &App, init: &[u8]) -> Result<String> {
     let mut conf: String = app.argv.iter().map(|a| format!("arg {}\n", escape(a))).chain(env.iter().map(|e| format!("env {}\n", escape(e)))).collect();
     conf += &format!("cwd {}\nuid {uid}\ngid {gid}\n", escape(&app.workdir));
     conf += &format!("groups {}\n", groups.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(" "));
+    for path in &app.volumes {
+        conf += &format!("volume {}\n", escape(path));
+    }
     root.secure_dir("etc/flexvm", 0o755)?;
     root.write_file("etc/flexvm/app.conf", conf.as_bytes(), 0o644)?;
     Ok(conf)
@@ -2053,6 +2067,23 @@ mod tests {
     }
 
     #[test]
+    fn image_volumes_are_directories_and_conf_paths_are_escaped() {
+        let app = app_config(&json!({"config": {"Volumes": {"/data": {}, "/odd\nvolume": {}}}}), &Options::default()).unwrap();
+        assert_eq!(app.volumes, ["/data", "/odd\nvolume"]);
+        let dir = tmpdir("volume-conf");
+        let mut root = Root::open(&dir, Limits::default()).unwrap();
+        let conf = inject(&mut root, &app, b"init").unwrap();
+        assert!(dir.join("data").is_dir());
+        assert!(conf.contains("volume /odd\\nvolume\n"));
+        std::fs::remove_dir(dir.join("data")).unwrap();
+        std::fs::write(dir.join("data"), b"file").unwrap();
+        assert!(inject(&mut root, &app, b"init").is_err());
+        for path in ["", "/", "relative", "/data/../etc", "/data/.", "/data\0"] {
+            assert!(app_config(&json!({"config": {"Volumes": {path: {}}}}), &Options::default()).is_err(), "{path:?}");
+        }
+    }
+
+    #[test]
     fn exposed_port_zero_is_skipped() {
         for port in ["0", "0/tcp", "0/udp", "bad/tcp", "70000"] {
             let config = json!({"config": {"ExposedPorts": {port: {}, "80/tcp": {}}}});
@@ -2380,7 +2411,7 @@ mod tests {
         std::fs::write(&init, b"init").unwrap();
         let o = Options { image, ..Options::default() };
         let config_value: Value = serde_json::from_str(&config).unwrap();
-        let key = json!({"v": 4, "config": cd, "diff_ids": config_value["rootfs"]["diff_ids"], "init": sha256_hex(b"init"), "options": o});
+        let key = json!({"v": 5, "config": cd, "diff_ids": config_value["rootfs"]["diff_ids"], "init": sha256_hex(b"init"), "options": o});
         let key = sha256_hex(key.to_string().as_bytes());
         let cached = d.join("rootfs").join(format!("{}.ext4", &key[7..]));
         cached_rootfs(&cached, build("cached"), sync_dir).unwrap();
