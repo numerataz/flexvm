@@ -762,7 +762,7 @@ def image_volumes():
     flexvm("pull", layout, "--tag", name, "--vcpus", "2", "--max", "2048", timeout=600)
     A.run(vm, template=name)
     check("empty volume uses tmpfs", must(A, vm, "stat -f -c %T /empty-volume") == "tmpfs")
-    capacity = must(A, vm, "python3 -c 'import os; print([(p, os.statvfs(p).f_blocks, os.statvfs(p).f_bavail, os.statvfs(p).f_ffree) for p in (\"/\", \"/dev/shm\", \"/empty-volume\")])'")
+    capacity = must(A, vm, 'python3 -c \'import os; print([(p, os.statvfs(p).f_blocks, os.statvfs(p).f_bavail, os.statvfs(p).f_ffree) for p in ("/", "/dev/shm", "/empty-volume")])\'')
     import ast
     check("RAM-backed filesystems report capacity and free blocks/inodes beyond boot RAM",
           all(blocks * 4096 > 384 << 20 and free > 0 and inodes > 0 for _, blocks, free, inodes in ast.literal_eval(capacity)), capacity)
