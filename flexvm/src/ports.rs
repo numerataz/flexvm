@@ -356,6 +356,11 @@ impl Direction {
                 }
                 self.done = true;
             }
+        } else if self.start > 0 {
+            // Reclaim drained space: keeps POLLIN enabled on the source under partial writes.
+            self.bytes.copy_within(self.start..self.end, 0);
+            self.end -= self.start;
+            self.start = 0;
         }
         moved
     }
@@ -773,13 +778,17 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd, cap: u
                 };
                 #[cfg(test)]
                 tests::tick_clock();
-                if !clients.contains_key(&peer) {
+                if let Some((s, at, _)) = clients.get_mut(&peer) {
+                    let _ = s.send(&buf[..n]);
+                    *at = idle_now();
+                } else {
                     // Half the expiry protects recent traffic while letting new clients through.
                     // Admitted (in place of the victim, if any) only once its socket is ready.
                     let admit = if clients.len() < cap { Some(None) } else { udp_idle(&clients, idle_now(), idle / 2).map(Some) };
                     if let Some(victim) = admit {
                         if let Ok(s) = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)) {
                             if s.connect(target).and_then(|()| s.set_nonblocking(true)).is_ok() {
+                                let _ = s.send(&buf[..n]);
                                 if let Some(v) = victim {
                                     clients.remove(&v);
                                 }
@@ -788,10 +797,6 @@ fn udp(listeners: Vec<UdpSocket>, target: SocketAddrV4, stop: BorrowedFd, cap: u
                             }
                         }
                     }
-                }
-                if let Some((s, at, _)) = clients.get_mut(&peer) {
-                    let _ = s.send(&buf[..n]);
-                    *at = idle_now();
                 }
                 #[cfg(test)]
                 tests::udp_processed(peer.0);
@@ -1520,6 +1525,57 @@ mod tests {
         ] {
             assert_eq!(specs(a, b).unwrap().len(), 2);
         }
+    }
+
+    #[test]
+    fn pump_compacts_partial_writes_to_reopen_read_window() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut source = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (from, _) = listener.accept().unwrap();
+        from.set_nonblocking(true).unwrap();
+
+        let listener2 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port2 = listener2.local_addr().unwrap().port();
+        let mut sink = small_window(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port2)));
+        let (to, _) = listener2.accept().unwrap();
+        to.set_nonblocking(true).unwrap();
+        let size: libc::c_int = 4096;
+        assert_eq!(
+            unsafe { libc::setsockopt(to.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, (&size as *const libc::c_int).cast(), size_of_val(&size) as _) },
+            0
+        );
+
+        let data = vec![0x22; BUFFER];
+        source.write_all(&data).unwrap();
+        wait_until("source data arrives", || {
+            let mut available: libc::c_int = 0;
+            assert_eq!(unsafe { libc::ioctl(from.as_raw_fd(), libc::FIONREAD, &mut available) }, 0);
+            available as usize == BUFFER
+        });
+
+        let mut direction = Direction::default();
+        let mut reverse = Direction::default();
+        assert!(direction.pump(&from, &to, &mut reverse));
+
+        // Under backpressure, only part of the buffer was written: compaction resets start to 0
+        // and shrinks end below BUFFER, keeping POLLIN active so the source can keep sending.
+        assert_eq!(direction.start, 0);
+        assert!(direction.end > 0 && direction.end < BUFFER);
+        assert_ne!(direction.events(&reverse) & libc::POLLIN, 0);
+
+        // Drain the rest through sink and verify data integrity.
+        let mut received = Vec::new();
+        let mut chunk = vec![0u8; 4096];
+        while received.len() < BUFFER {
+            direction.pump(&from, &to, &mut reverse);
+            match sink.read(&mut chunk) {
+                Ok(n) if n > 0 => received.extend_from_slice(&chunk[..n]),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => thread::yield_now(),
+                Err(e) => panic!("read error: {e}"),
+                _ => break,
+            }
+        }
+        assert_eq!(received, data);
     }
 
     #[test]
