@@ -30,8 +30,9 @@ class Pins(unittest.TestCase):
         self.source_pin = f'{"c" * 64} {self.source_url}\n'
         self.checksums.write_text(self.source_pin)
         # x86_64 unless a test says otherwise, whatever this host is.
-        self.env = dict(os.environ, ARTIFACTS_TAG='v0.2.1', FC_VERSION='v1.17.0', CI_VERSION='v1.15', KERNEL='vmlinux-6.1.155',
+        self.env = dict(os.environ, ARTIFACTS_TAG='v0.2.1', FC_VERSION='v1.17.0', CI_VERSION='v1.15',
                         ARCH='x86_64')
+        self.env.pop('KERNEL', None)
         self.url = 'https://github.com/numerataz/flexvm/releases/download/v0.2.1'
         self.kernel = self.source_url
         self.digest = 'a' * 64
@@ -85,6 +86,34 @@ class Pins(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(f'firecracker {self.url}/{firecracker}\n', result.stdout)
                 self.assertIn(f'vmlinux {self.url}/{vmlinux}\n', result.stdout)
+
+    def test_pinned_kernel_download_and_corruption_recovery(self):
+        payload = self.root / 'kernel-payload'
+        payload.write_bytes(b'fixture kernel')
+        digest = hashlib.sha256(payload.read_bytes()).hexdigest()
+        self.checksums.write_text(f'{digest} {self.url}/vmlinux\n')
+        commands = self.root / 'bin'
+        commands.mkdir()
+        for name, body in {'sudo': 'exec "$@"', 'curl': 'cp "$TEST_PAYLOAD" "$3"'}.items():
+            script = commands / name
+            script.write_text('#!/usr/bin/env bash\nset -eu\n' + body + '\n')
+            script.chmod(0o755)
+        self.env.update(PATH=f'{commands}:{os.environ["PATH"]}', TEST_PAYLOAD=str(payload))
+        state = self.root / 'state'
+        for corrupt in (False, True):
+            if corrupt:
+                (state / 'artifacts/vmlinux').write_bytes(b'corrupted cached kernel')
+            result = self.run_script('fetch.sh', '--state', str(state), '--kernel')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((state / 'artifacts/vmlinux').read_bytes(), payload.read_bytes())
+            self.assertTrue((state / 'artifacts/vmlinux.sha256').read_text().startswith(digest))
+        # A substituted download never replaces even a corrupted existing file.
+        (state / 'artifacts/vmlinux').write_bytes(b'old file')
+        payload.write_bytes(b'unverified replacement')
+        result = self.run_script('fetch.sh', '--state', str(state), '--kernel')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('SHA256 mismatch', result.stderr)
+        self.assertEqual((state / 'artifacts/vmlinux').read_bytes(), b'old file')
 
     def test_kernel_identity_binds_recipe_and_source(self):
         first = self.run_script('build-kernel.sh', '--key')

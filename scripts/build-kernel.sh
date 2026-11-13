@@ -105,7 +105,7 @@ else
   magic=$(od -An -tx1 -j56 -N4 "$image" | tr -d ' \n')
   if [ "$magic" != 41524d64 ]; then echo "invalid arm64 kernel Image magic: $magic" >&2; exit 1; fi
 fi
-placing=recording=
+placing= recording=
 trap 'sudo rm -f -- "$placing" "$recording"' EXIT
 placing=$(sudo mktemp -p "$out" .vmlinux.XXXXXX)
 recording=$(sudo mktemp -p "$out" .vmlinux.sha256.XXXXXX)
@@ -114,6 +114,6 @@ printf '%s  built by scripts/build-kernel.sh %s\n' "$(sudo sha256sum "$placing" 
 sudo chmod 644 "$recording"
 sudo mv -T "$placing" "$out/vmlinux"
 sudo mv -T "$recording" "$out/vmlinux.sha256"
-placing=recording=
+placing= recording=
 trap - EXIT
 file "$out/vmlinux"

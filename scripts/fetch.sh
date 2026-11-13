@@ -150,7 +150,7 @@ fi
 if [[ $KERNEL_URL == build:* ]]; then
   "$root/scripts/build-kernel.sh" --state "$state"
 elif ! fetched vmlinux "$KERNEL_URL"; then
-  echo "fetching $KERNEL from $KERNEL_URL"
+  echo "fetching vmlinux from $KERNEL_URL"
   download vmlinux "$KERNEL_URL"
   place 644 "$work/vmlinux" vmlinux "$KERNEL_URL"
 else
