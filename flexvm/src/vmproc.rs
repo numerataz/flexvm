@@ -197,6 +197,8 @@ fn read_side_gone(client: &UnixStream) -> bool {
 /// and so does another client taking the session over. False: it can no longer read, so acknowledges nothing.
 fn drained(client: &UnixStream, wait: &Wait) -> Result<bool> {
     let (mut since, mut left) = (Instant::now(), libc::c_int::MAX);
+    let mut wait_ms = 1;
+    let mut watch_in = true;
     loop {
         let mut unread: libc::c_int = 0;
         if unsafe { libc::ioctl(client.as_raw_fd(), libc::TIOCOUTQ as _, &mut unread) } < 0 {
@@ -211,9 +213,15 @@ fn drained(client: &UnixStream, wait: &Wait) -> Result<bool> {
         if since.elapsed() >= wait.stall && (wait.pressed)() {
             bail!("the client read nothing for {} s", since.elapsed().as_secs());
         }
-        // No event for it: looked at again shortly, hangups reported meanwhile.
-        let mut pfd = libc::pollfd { fd: client.as_raw_fd(), events: 0, revents: 0 };
-        crate::util::eintr(|| unsafe { libc::poll(&mut pfd, 1, 20) })?;
+        // Wakes on POLLIN as soon as the client acknowledges SESSION_DONE upon reading the exit frame;
+        // if input is already unread while output remains, stops watching POLLIN to avoid busy-spinning.
+        let events = if watch_in { libc::POLLIN } else { 0 };
+        let mut pfd = libc::pollfd { fd: client.as_raw_fd(), events, revents: 0 };
+        crate::util::eintr(|| unsafe { libc::poll(&mut pfd, 1, wait_ms) })?;
+        wait_ms = (wait_ms * 2).min(20);
+        if pfd.revents & libc::POLLIN != 0 {
+            watch_in = false;
+        }
         if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
             return Ok(true);
         }
@@ -6593,6 +6601,50 @@ mod session_relay_tests {
         replaced.store(true, Ordering::SeqCst);
         let err = worker.join_within().unwrap().unwrap_err();
         assert!(err.contains("another client"), "{err}");
+    }
+
+    /// When the peer drains the exit frame and writes SESSION_DONE, `drained` wakes up
+    /// promptly via POLLIN rather than waiting for the poll timeout (#1344).
+    #[test]
+    fn drained_wakes_promptly_on_session_done() {
+        let (relay, mut client) = UnixStream::pair().unwrap();
+        (&relay).write_all(b"exit_frame_bytes").unwrap();
+        let reader = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(2));
+            let mut buf = [0u8; 32];
+            let n = client.read(&mut buf).unwrap();
+            assert!(n > 0);
+            client.write_all(&[guest::SESSION_DONE]).unwrap();
+            client
+        });
+        let wait = idle();
+        let start = Instant::now();
+        assert!(drained(&relay, &wait).unwrap());
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_millis(15), "drained took {elapsed:?}, expected < 15ms");
+        let _client = reader.join_within().unwrap();
+    }
+
+    /// If unread input is already present while output remains in flight, `drained` stops
+    /// watching POLLIN after the first wake to avoid busy-spinning (#1344).
+    #[test]
+    fn drained_does_not_spin_on_preexisting_input() {
+        let (relay, mut client) = UnixStream::pair().unwrap();
+        (&relay).write_all(b"exit_frame_bytes").unwrap();
+        client.write_all(b"stray_input").unwrap();
+        let reader = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(5));
+            let mut buf = [0u8; 32];
+            let n = client.read(&mut buf).unwrap();
+            assert!(n > 0);
+            client
+        });
+        let wait = idle();
+        let start = Instant::now();
+        assert!(drained(&relay, &wait).unwrap());
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_millis(4), "drained finished too early: {elapsed:?}");
+        let _client = reader.join_within().unwrap();
     }
 
     /// A relay with no guest connection left to watch (a cut found the exit among what it still held) yet
