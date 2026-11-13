@@ -21,18 +21,37 @@ case $step in
 prepare)
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
-    apt-get install -y -qq --no-install-recommends ca-certificates podman uidmap fuse-overlayfs slirp4netns curl crun netavark aardvark-dns
+    apt-get install -y -qq --no-install-recommends ca-certificates podman uidmap fuse-overlayfs slirp4netns curl crun netavark aardvark-dns iptables
     mkdir -p "$base" /etc/containers
     # The guest root itself is overlayfs. FUSE supplies an ordinary supported
     # overlay backing for both runtimes without falling back to the vfs driver.
     cat > /etc/containers/storage.conf <<'EOF'
 [storage]
 driver = "overlay"
+runroot = "/run/containers/storage"
+graphroot = "/var/lib/containers/storage"
 [storage.options.overlay]
 mount_program = "/usr/bin/fuse-overlayfs"
 EOF
+    cat > /etc/containers/containers.conf <<'EOF'
+[network]
+network_backend = "netavark"
+[engine]
+cgroup_manager = "cgroupfs"
+events_logger = "file"
+EOF
     useradd -m -s /bin/sh "$user"
     uid=$(id -u "$user")
+    mkdir -p "/home/$user/.config/containers"
+    cat > "/home/$user/.config/containers/storage.conf" <<EOF
+[storage]
+driver = "overlay"
+runroot = "/run/user/$uid/containers"
+graphroot = "/home/$user/.local/share/containers/storage"
+[storage.options.overlay]
+mount_program = "/usr/bin/fuse-overlayfs"
+EOF
+    chown -R "$user:$user" "/home/$user/.config"
     grep -q "^$user:" /etc/subuid
     grep -q "^$user:" /etc/subgid
     install -d -m 700 -o "$user" -g "$user" "/run/user/$uid"
@@ -70,11 +89,12 @@ EOF
         mkdir "$context"
         printf 'FROM %s\nRUN echo build-ok >/built\nCMD ["cat", "/built"]\n' "$image" > "$context/Containerfile"
         if [ "$mode" = rootless ]; then chown -R "$user:$user" "$context"; chmod 755 "$base"; fi
-        pod build --cgroup-parent="$parent" -t localhost/flexvm-compat "$context"
+        pod build --cgroup-parent="$parent/compat-build" -t localhost/flexvm-compat "$context"
         test "$(pod run --rm --cgroup-parent="$parent" localhost/flexvm-compat)" = build-ok
         pod run -d --name compat-server --network compat-net --cgroup-parent="$parent" -p "$port:8080" -v compat-data:/data "$image" sh -ec '
             mkdir /www; cp /data/marker /www/index.html; exec httpd -f -p 8080 -h /www
         '
+        test "$(curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 "http://127.0.0.1:$port")" = "$nonce"
         test "$(pod run --rm --network compat-net --cgroup-parent="$parent" "$image" wget -qO- http://compat-server:8080)" = "$nonce"
         pod exec compat-server cat /proc/1/stat > "$base/process-$mode"
         echo "$mode prepared"

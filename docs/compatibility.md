@@ -97,7 +97,7 @@ with `--vm`, which protects existing guests from workload setup changes.
 The Podman case uses stock Ubuntu packages, FUSE overlay storage, subordinate
 UID/GID mappings, and an explicitly delegated cgroup-v2 subtree for a rootless
 session. It tests rootful and rootless image pulls, builds, real CPU/memory/PID
-limits, outbound DNS/HTTP, named volumes, a live container process, and published
+limits, outbound DNS/HTTP, custom bridge DNS, bind mounts, named volumes, a live container process, and published
 ports through each phase:
 
 ```sh
@@ -121,3 +121,26 @@ work, not advertised as supported. Root filesystem capacity reporting and
 non-root setuid-helper policy also need fixes for ordinary package managers
 and rootless runtimes. Future reports must name the tested build and workload
 before promoting a workstream's support status.
+
+## Verified development results
+
+On an x86_64 GCE n2-standard-8 host with nested virtualization enabled, the
+expanded 6.1.155-flexvm kernel and guest privilege/device fixes passed all 23
+capability probes. Docker 27's existing smoke case also passed with native
+overlay2, bridge networking, limits, builds, volumes and suspend/resume.
+
+The Podman case passed `run,suspend,checkpoint,migration` with Ubuntu 24.04
+packages: Podman 4.9.3, crun 1.14.1, fuse-overlayfs 1.13, slirp4netns 1.2.1,
+netavark 1.4.0 and aardvark-dns 1.4.0. Both rootful and rootless containers
+preserved their process identity, mounted volume contents and published ports.
+The script specifies complete storage paths, the netavark backend, required
+iptables packages, delegated rootless controllers, and a separate leaf cgroup
+for Buildah's build process. None of the checks disable cgroup enforcement or
+silently switch storage/networking to a reduced mode.
+
+QEMU 8.2.2 with forced KVM acceleration booted an inner Linux guest and advanced
+its serial counter. Outer suspend/resume failed the subsequent guest exec check;
+nested KVM lifecycle support remains open in #1327. Rootless Docker, standalone
+containerd/builders, Kubernetes, system containers, distro init and durable disks
+still require their own acceptance results. These development results do not
+establish support for every architecture or workload.
