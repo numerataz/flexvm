@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Downloads Firecracker, a guest kernel and a base rootfs into STATE/artifacts. Once scripts/checksums.sha256
 # pins the flexvm artifacts release (scripts/versions.sh), Firecracker (patched) and the kernel come from it;
-# until then, the kernel comes from Firecracker's CI bucket and Firecracker is the stock release. All are for ARCH
+# until then, the kernel is built from reviewed source/configuration and Firecracker is the stock release. All are for ARCH
 # (this host's; scripts/versions.sh). flexvm itself
 # downloads the release's on first use; this is for fetching ahead (an offline host, say: --state a directory
 # to copy over).
@@ -36,11 +36,12 @@ else
   [ "$?" = 2 ] || exit 1
   FC_URL=https://github.com/firecracker-microvm/firecracker/releases/download/$FC_VERSION/firecracker-$FC_VERSION-$ARCH.tgz
 fi
-KERNEL_URL=$CI/$KERNEL
+KERNEL_URL=
 if pinned "$ARTIFACTS_URL/$(asset vmlinux)" > /dev/null; then
   KERNEL_URL=$ARTIFACTS_URL/$(asset vmlinux)
 else
   [ "$?" = 2 ] || exit 1
+  KERNEL_URL=$("$root/scripts/build-kernel.sh" --key)
 fi
 
 # --urls: print what would be fetched, as `NAME URL` lines (CI keys its caches on them).
@@ -146,7 +147,9 @@ if [ -z "$only_kernel" ]; then
   exec {lock}<&-
 fi
 
-if ! fetched vmlinux "$KERNEL_URL"; then
+if [[ $KERNEL_URL == build:* ]]; then
+  "$root/scripts/build-kernel.sh" --state "$state"
+elif ! fetched vmlinux "$KERNEL_URL"; then
   echo "fetching $KERNEL from $KERNEL_URL"
   download vmlinux "$KERNEL_URL"
   place 644 "$work/vmlinux" vmlinux "$KERNEL_URL"

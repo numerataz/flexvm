@@ -38,3 +38,6 @@ b18486ae40a99c8d78a999bc7cb79e4198e4641a50f22a653488772021a94a69 https://github.
 b2ed22d2e45e76aff9d35cb85fbf210c58bc36538128e978375df441da3aed4d https://github.com/numerataz/flexvm/releases/download/v0.3.0/firecracker-aarch64
 e3544b10603acbf3db492cb52e000d22ba202cb4b63b9add027565683e11c591 https://github.com/numerataz/flexvm/releases/download/v0.3.0/vmlinux-aarch64
 c1877e001287661c4007ab792afdcdd6cd595cd555cc192b7fefcde071f4490f https://github.com/numerataz/flexvm/releases/download/v0.3.0/inputs-aarch64.txt
+
+# Guest kernel source archive, verified before unpacking/building.
+c29387aeee085fbcbd91236224b9df805063bac43615e75cea2c6b29604a5c73 https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.1.155.tar.xz

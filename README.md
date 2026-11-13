@@ -109,6 +109,25 @@ pulled again.
 flexvm runs as root (KVM, userfaultfd, routes, cgroups); commands below
 assume that.
 
+The guest kernel is built from the SHA256-pinned Linux source in
+`kernel/source.env`, the reviewed Firecracker base configurations in
+`kernel/config/`, and the explicit settings in `kernel/features*.config`.
+Required container facilities are built in, including FUSE, TUN/TAP, nftables,
+connection tracking, network overlays, BPF/BTF, and KVM where the CPU exposes
+virtualization. Enabling KVM in the kernel alone does not expose nested CPU
+features or make nested VM state safe to checkpoint.
+
+For a development checkout whose release is pending, `scripts/fetch.sh` builds
+this kernel locally. Install `build-essential flex bison bc libelf-dev
+libssl-dev dwarves xz-utils`, then run `sudo ./scripts/build-kernel.sh` (or pass
+`--state DIR`). Builds are native on x86_64 and aarch64. `--key` prints the
+source/configuration/recipe identity without building or downloading anything.
+The release pipeline builds the same kernel on each architecture and attests
+the resulting assets; users of a pinned release download those assets.
+All required drivers are built in because OCI images do not provide a matching
+`/lib/modules` tree. Loading additional modules requires supplying modules built
+for this exact kernel; FlexVM does not install a distro's kernel modules.
+
 ### Releasing the artifacts
 
 Releases use semver tags `vMAJOR.MINOR.PATCH`: `artifacts-5` was the last
