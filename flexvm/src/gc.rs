@@ -251,37 +251,38 @@ fn log_name(file: &str) -> Option<&str> {
 /// In `RUN/vms`: a dead arrival's log; the logs of a name with nothing left
 /// here, once quiet; old `.moved` markers.
 fn vm_files(host: &Host) {
-    let files = || std::fs::read_dir(host.run.join("vms")).into_iter().flatten().flatten().filter_map(|e| Some((e.file_name().into_string().ok()?, e.path())));
+    let files: Vec<_> =
+        std::fs::read_dir(host.run.join("vms")).into_iter().flatten().flatten().filter_map(|e| Some((e.file_name().into_string().ok()?, e.path()))).collect();
     // Markers first: a log is kept for its VM's.
-    for (file, path) in files() {
+    for (file, path) in &files {
         let Some(name) = file.strip_suffix(".moved").filter(|_| !file.starts_with('.')) else { continue };
-        if unwritten_for(&path).is_some_and(|a| a > MOVED_TTL) && host.holder_gone(name) {
-            let _ = std::fs::remove_file(&path);
+        if unwritten_for(path).is_some_and(|a| a > MOVED_TTL) && host.holder_gone(name) {
+            let _ = std::fs::remove_file(path);
         }
     }
     // A start opens and marks its log holding this lock shared; busy logs wait for the next sweep.
     let logs = host.logs_lock(libc::LOCK_EX | libc::LOCK_NB).ok();
-    for (file, path) in files() {
+    for (file, path) in &files {
         if file.starts_with(ARRIVAL_LOG) && file.ends_with(".log") {
             // Its lock is made first, so one missing is an arrival's that ended.
-            let lock = crate::host::locks(&host.run.join("vms")).join(&file);
-            if unwritten_for(&path).is_some_and(|a| a > ARRIVAL_GRACE) && lock_free(&lock, libc::LOCK_EX) {
-                let _ = std::fs::remove_file(&path);
+            let lock = crate::host::locks(&host.run.join("vms")).join(file);
+            if unwritten_for(path).is_some_and(|a| a > ARRIVAL_GRACE) && lock_free(&lock, libc::LOCK_EX) {
+                let _ = std::fs::remove_file(path);
                 let _ = std::fs::remove_file(&lock);
             }
             continue;
         }
         // A retired lifetime's that a writer added to as it went (`Host::retire_logs`): no name's.
         if file.starts_with('.') && file.contains(".logs.") && file.ends_with(".gone") {
-            let _ = std::fs::remove_dir_all(&path);
+            let _ = std::fs::remove_dir_all(path);
             continue;
         }
-        let Some(name) = log_name(&file) else { continue };
+        let Some(name) = log_name(file) else { continue };
         // Logs' age is their log's (or their directory's, with none); a link's, its own with none.
         let lifetime = file.ends_with(".logs");
         let age = match lifetime {
-            true => unwritten_for(&path.join("log")).or_else(|| unwritten_for(&path)),
-            false => unwritten_for(&path).or_else(|| std::time::SystemTime::now().duration_since(std::fs::symlink_metadata(&path).ok()?.modified().ok()?).ok()),
+            true => unwritten_for(&path.join("log")).or_else(|| unwritten_for(path)),
+            false => unwritten_for(path).or_else(|| std::time::SystemTime::now().duration_since(std::fs::symlink_metadata(path).ok()?.modified().ok()?).ok()),
         };
         if logs.is_none() || age.is_none_or(|a| a <= ORPHAN_LOG_TTL) {
             continue;
@@ -292,14 +293,14 @@ fn vm_files(host: &Host) {
         if orphan && lifetime {
             let _ = host.retire_logs(name);
         } else if orphan {
-            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(path);
         }
     }
     // Exit statuses (`flexvm wait`) of a name with nothing else left, its logs gone too.
-    for (file, path) in files() {
+    for (file, path) in &files {
         let Some(name) = file.strip_suffix(".exit").filter(|n| !n.starts_with('.')) else { continue };
-        if crate::containers::stale_exit(host, name, &path, ORPHAN_LOG_TTL) {
-            let _ = std::fs::remove_file(&path);
+        if crate::containers::stale_exit(host, name, path, ORPHAN_LOG_TTL) {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -319,8 +320,7 @@ fn orphan_log_locks(dir: &Path) {
         let name = entry.file_name();
         let Some(name) = name.to_str().filter(|n| n.ends_with(".log") && (!n.starts_with('.') || n.starts_with(ARRIVAL_LOG))) else { continue };
         let log = dir.join(name);
-        let Ok(lock) = crate::host::lock_path(&entry.path(), libc::LOCK_EX | libc::LOCK_NB) else { continue };
-        let Ok(_held) = Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { continue };
+        let Ok(_held) = crate::host::lock_path(&entry.path(), libc::LOCK_EX | libc::LOCK_NB).map(Flock) else { continue };
         if matches!(log.try_exists(), Ok(false)) && matches!(log.with_extension("log.1").try_exists(), Ok(false)) {
             let _ = std::fs::remove_file(entry.path());
         }
@@ -349,8 +349,7 @@ fn standby_pool(host: &Host, dir: &Path) {
         if !matches!(e.file_name().to_str(), Some("publish" | "refill" | "standby.log")) {
             return;
         }
-        let Ok(f) = crate::host::lock_path(&e.path(), libc::LOCK_EX | libc::LOCK_NB) else { return };
-        let Ok(f) = Flock::new(f, libc::LOCK_EX | libc::LOCK_NB) else { return };
+        let Ok(f) = crate::host::lock_path(&e.path(), libc::LOCK_EX | libc::LOCK_NB).map(Flock) else { return };
         held.push(f);
     }
     let Ok(entries) = std::fs::read_dir(dir) else { return };
@@ -893,5 +892,19 @@ mod tests {
         assert!(!dead.exists() && fresh.exists() && live.exists(), "arrivals");
         assert!(!moved.exists() && recent_moved.exists(), "markers");
         assert!(!orphan.exists() && !orphan_prev.exists() && kept_by_moved.exists() && quiet.exists() && failed_log.exists(), "logs");
+    }
+
+    #[test]
+    fn stale_exit_and_orphan_log_collected_in_single_sweep() {
+        let d = dir("stale-exit");
+        let host = Host::open(&d.join("state"), &d.join("run")).unwrap();
+        let old = SystemTime::now() - ORPHAN_LOG_TTL - Duration::from_secs(60);
+        let log = host.run.join("vms/demo.log");
+        let exit = host.run.join("vms/demo.exit");
+        File::create(&log).unwrap().set_modified(old).unwrap();
+        File::create(&exit).unwrap().set_modified(old).unwrap();
+        vm_files(&host);
+        assert!(!log.exists(), "orphan log removed in pass 2");
+        assert!(!exit.exists(), "stale exit removed in pass 3 in the same sweep");
     }
 }

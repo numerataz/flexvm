@@ -3804,7 +3804,7 @@ impl Drop for Locked {
 /// An exclusive flock, let go of when dropped. Unlocked, not only closed: a
 /// child another thread forks meanwhile shares the open file until it execs,
 /// and the lock would be held that long.
-pub struct Flock(File);
+pub struct Flock(pub File);
 
 impl Flock {
     pub fn new(f: File, how: i32) -> std::io::Result<Flock> {
