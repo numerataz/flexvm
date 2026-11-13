@@ -73,7 +73,13 @@ export KBUILD_BUILD_USER=flexvm KBUILD_BUILD_HOST=builder KBUILD_BUILD_VERSION=1
 export SOURCE_DATE_EPOCH
 export KBUILD_BUILD_TIMESTAMP
 KBUILD_BUILD_TIMESTAMP=$(date -u -d "@$SOURCE_DATE_EPOCH" '+%a %b %d %T UTC %Y')
-make -C "$src" olddefconfig
+# CI uses KVM=true/false to select tests; Linux uses KVM as a source directory.
+# Linux also calls the aarch64 architecture arm64. Do not leak runner variables
+# into kbuild's architecture/source-path decisions.
+unset KVM
+kernel_arch=x86
+if [ "$ARCH" = aarch64 ]; then kernel_arch=arm64; fi
+make -C "$src" ARCH="$kernel_arch" olddefconfig
 for fragment in "$root/kernel/features.config" "$root/kernel/features-$ARCH.config"; do
   while IFS= read -r line; do
     [[ $line == CONFIG_*=* ]] || continue
@@ -86,7 +92,7 @@ for fragment in "$root/kernel/features.config" "$root/kernel/features-$ARCH.conf
 done
 image=$build/vmlinux
 if [ "$ARCH" = x86_64 ]; then
-  make -C "$src" -j"${JOBS:-$(nproc)}" vmlinux
+  make -C "$src" ARCH="$kernel_arch" -j"${JOBS:-$(nproc)}" vmlinux
   # DWARF generates kernel BTF; keep BTF but strip DWARF from the shipped ELF.
   objcopy --strip-debug "$src/vmlinux" "$image"
   machine=$(od -An -tx1 -j18 -N2 "$image" | tr -d ' \n')
@@ -94,7 +100,7 @@ if [ "$ARCH" = x86_64 ]; then
 else
   # Firecracker's arm64 loader accepts the Linux Image boot format, not vmlinux ELF.
   # The release asset keeps the historical name vmlinux-aarch64.
-  make -C "$src" -j"${JOBS:-$(nproc)}" Image
+  make -C "$src" ARCH="$kernel_arch" -j"${JOBS:-$(nproc)}" Image
   cp "$src/arch/arm64/boot/Image" "$image"
   magic=$(od -An -tx1 -j56 -N4 "$image" | tr -d ' \n')
   if [ "$magic" != 41524d64 ]; then echo "invalid arm64 kernel Image magic: $magic" >&2; exit 1; fi
