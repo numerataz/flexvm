@@ -184,7 +184,8 @@ impl Hash {
 }
 
 fn zero(page: &[u8]) -> bool {
-    page.iter().fold(0, |a, &b| a | b) == 0
+    let mut chunks = page.chunks_exact(8);
+    chunks.all(|w| u64::from_ne_bytes(w.try_into().unwrap()) == 0) && chunks.remainder().iter().all(|&b| b == 0)
 }
 
 /// Length plus non-zero pages, so sparse and dense copies of the same bytes match.
@@ -232,12 +233,10 @@ impl Hashing {
 
     fn hash_page(fnv: &mut Hash, sha: &mut sha2::Sha256, n: u64, p: &[u8]) {
         use sha2::Digest;
-        if !zero(p) {
-            fnv.word(n);
-            fnv.update(p);
-            sha.update(n.to_le_bytes());
-            sha.update(p);
-        }
+        fnv.word(n);
+        fnv.update(p);
+        sha.update(n.to_le_bytes());
+        sha.update(p);
     }
 
     /// `bytes` at `off`, at or past every offset written before.
@@ -257,7 +256,9 @@ impl Hashing {
 
     fn flush(&mut self) {
         if let Some(n) = self.page.take() {
-            Self::hash_page(&mut self.fnv, &mut self.sha, n, &self.buf[..]);
+            if !zero(&self.buf[..]) {
+                Self::hash_page(&mut self.fnv, &mut self.sha, n, &self.buf[..]);
+            }
             self.buf.fill(0);
         }
     }
@@ -2547,9 +2548,40 @@ pub(crate) mod tests {
         for (n, bytes) in bytes.chunks(PAGE_SIZE).enumerate() {
             let mut page = [0; PAGE_SIZE];
             page[..bytes.len()].copy_from_slice(bytes);
-            want.page(n as u64, &page);
+            if !zero(&page) {
+                want.page(n as u64, &page);
+            }
         }
         assert_eq!(hash.finish(), want.finish());
+    }
+
+    #[test]
+    fn zero_detects_all_zero_and_non_zero_pages() {
+        let mut page = [0u8; PAGE_SIZE];
+        assert!(zero(&page));
+        assert!(zero(&[]));
+        assert!(zero(&[0; 3]));
+        assert!(zero(&[0; 8]));
+        assert!(zero(&[0; 13]));
+
+        // Non-zero byte at first position
+        page[0] = 1;
+        assert!(!zero(&page));
+        page[0] = 0;
+
+        // Non-zero byte in middle
+        page[2048] = 42;
+        assert!(!zero(&page));
+        page[2048] = 0;
+
+        // Non-zero byte at last position
+        page[PAGE_SIZE - 1] = 0x80;
+        assert!(!zero(&page));
+        page[PAGE_SIZE - 1] = 0;
+
+        // Tail remainder bytes
+        assert!(!zero(&[0, 0, 0, 0, 0, 0, 0, 0, 1]));
+        assert!(!zero(&[1, 0, 0]));
     }
 
     #[test]
