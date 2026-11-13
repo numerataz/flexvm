@@ -73,7 +73,7 @@ Builds are bounded: `--max-download-mib`
 `--max-entries` (1,000,000, applied both to tar entries read and to files and
 directories created, implicit parents included), plus 4 MiB per manifest or config and 1 MiB per
 tar entry's metadata (PAX records and GNU long names together, one of each).
-Readiness commands run as the app does (same user and restrictions) in a
+Readiness commands use the app's user and environment in a
 cgroup of their own that is killed and checked empty when the check ends; a
 failed cleanup fails the check. Non-root checks need cgroup2 with
 `cgroup.kill` and fail closed without it. Root checks are trusted (root in
@@ -188,10 +188,13 @@ the guest can leave any cgroup); without cgroup2 their session is killed.
   runs argv directly, so it needs only the requested executable; explicitly
   use `sh -c` for shell syntax. `/dev/stdout` and
   friends exist, so images that log to them work. With a non-root `--user`
-  (or image `User`), the app runs with `no_new_privs` and no capabilities in
-  its bounding set, so setuid binaries and file capabilities in the image do
-  not work for it (and cannot make it root again); flexvm-init is not
-  dumpable, so such an app cannot ptrace or read it. That does not stop an
+  (or image `User`), the app and exec commands use normal Linux credential
+  semantics: setuid binaries and file capabilities follow the guest's own
+  permissions and policy. This lets helpers such as `newuidmap` work for
+  rootless containers. Non-root readiness checks retain `no_new_privs` and
+  an empty capability bounding set so they cannot escape their check cgroup
+  through privileged helpers. flexvm-init is not dumpable, so an ordinary
+  unprivileged app cannot ptrace or read it. That does not stop an
   app running as root with `CAP_SYS_PTRACE`, which can reach flexvm-init
   anyway (root in the guest owns the guest).
 - **When the app starts.** By default at `run`: the snapshot is an idle booted

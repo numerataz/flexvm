@@ -7,8 +7,8 @@
 //! (for `APPIN`), `tty` gives it a pty. `LOGS` frames are the app's stdout and stderr (a pty's output is
 //! stdout) and FRAME_NOTE, flexvm-init's lines. `APPIN` (input.rs) feeds client `stream`'s input frames to
 //! the app's stdin, answering `ok <taken> <tty 0|1>` (or `closed <tty>`), then FRAME_ACK as it takes
-//! them; a newer `APPIN` takes over. `SIGNAL` goes to the app's process alone, as docker kill's does. A non-root app runs with no_new_privs and an empty bounding set, so setuid binaries and file
-//! capabilities cannot take it back to root.
+//! them; a newer `APPIN` takes over. `SIGNAL` goes to the app's process alone, as docker kill's does.
+//! Apps use normal guest credentials; non-root readiness checks additionally prohibit privilege gains.
 
 use std::ffi::CString;
 use std::fs::File;
@@ -370,7 +370,7 @@ fn exec_conf(mut c: Conf, e: &crate::proto::Exec, passwd: &str, group: &str) -> 
     Ok(c)
 }
 
-/// Runs a readiness command as the app would (`ok`, `exit <code>` or `timeout`) in its own cgroup, killed,
+/// Runs a readiness command as the app user (`ok`, `exit <code>` or `timeout`) in its own cgroup, killed,
 /// checked empty and removed at the end; failed cleanup is an error, never `ok`. A non-root check fails
 /// closed without that cgroup; a root check is trusted, and without cgroup2 its session is killed instead.
 fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
@@ -391,6 +391,9 @@ fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
         None => mem::work_procs().into_iter().for_each(|work| mem::enter(&mut cmd, work, false)),
     }
     crate::runtime::enter(&mut cmd);
+    if c.uid != 0 {
+        confine_check(&mut cmd);
+    }
     credentials(&mut cmd, c, true);
     let (child, _, token) = spawn_watched(&mut cmd, statuses, false).map_err(|e| io::Error::new(e.kind(), format!("cannot run /bin/sh: {e}")))?;
     let pid = child.id() as i32;
@@ -543,8 +546,9 @@ fn chown_stdio(fd: RawFd, uid: u32, gid: u32) -> io::Result<()> {
     crate::os(unsafe { libc::fchown(fd, uid, gid) }).map(drop)
 }
 
-/// A session of its own if `own_session`, the app's credentials and, if non-root, no capabilities and
-/// no_new_privs; done by hand because CommandExt::uid would clear the supplementary groups.
+/// A session of its own if `own_session`, then normal guest credentials. setuid drops the
+/// effective/permitted capabilities naturally, but the bounding set and setuid/file-capability
+/// behavior are retained as in an ordinary Linux login. CommandExt::uid would clear groups.
 pub(crate) fn credentials(cmd: &mut Command, c: &Conf, own_session: bool) {
     let (uid, gid, groups) = (c.uid, c.gid, c.groups.clone());
     unsafe {
@@ -556,18 +560,24 @@ pub(crate) fn credentials(cmd: &mut Command, c: &Conf, own_session: bool) {
                 for fd in 0..=2 {
                     chown_stdio(fd, uid, gid)?;
                 }
-                // No way back to root: drop the bounding set (EINVAL: past the kernel's last capability).
-                for cap in 0..64 {
-                    if libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) != 0 && *libc::__errno_location() != libc::EINVAL {
-                        return Err(io::Error::last_os_error());
-                    }
+            }
+            let ok = libc::setgroups(groups.len(), groups.as_ptr()) == 0 && libc::setgid(gid) == 0 && libc::setuid(uid) == 0;
+            ok.then_some(()).ok_or_else(io::Error::last_os_error)
+        });
+    }
+}
+
+/// Non-root readiness checks must stay in the check cgroup even if the image has privileged
+/// helpers. Apply before credentials are dropped; ordinary app/exec processes retain Linux policy.
+fn confine_check(cmd: &mut Command) {
+    unsafe {
+        cmd.pre_exec(|| {
+            for cap in 0..64 {
+                if libc::prctl(libc::PR_CAPBSET_DROP, cap, 0, 0, 0) != 0 && *libc::__errno_location() != libc::EINVAL {
+                    return Err(io::Error::last_os_error());
                 }
             }
-            let ok = libc::setgroups(groups.len(), groups.as_ptr()) == 0
-                && libc::setgid(gid) == 0
-                && libc::setuid(uid) == 0
-                && (uid == 0 || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == 0);
-            ok.then_some(()).ok_or_else(io::Error::last_os_error)
+            crate::os(libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)).map(drop)
         });
     }
 }
@@ -732,6 +742,61 @@ mod tests {
         chown_stdio(file.as_raw_fd(), 12345, 12345).unwrap();
         assert_eq!((before.uid(), before.gid()), (file.metadata().unwrap().uid(), file.metadata().unwrap().gid()));
         assert_eq!(chown_stdio(-1, 101, 101).unwrap_err().raw_os_error(), Some(libc::EBADF));
+    }
+
+    #[test]
+    #[ignore = "requires root to create a setuid helper and change credentials"]
+    fn guest_setuid_helpers_work_but_nonroot_checks_cannot_gain_privileges() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "FLEXVM_SETUID_HELPER_TEST";
+        if let Ok(expected) = std::env::var(CHILD) {
+            assert_eq!(unsafe { libc::getuid() }, 65534);
+            assert_eq!(unsafe { libc::geteuid() }, expected.parse::<u32>().unwrap());
+            let status = std::fs::read_to_string("/proc/self/status").unwrap();
+            let nnp = status.lines().find(|s| s.starts_with("NoNewPrivs:")).unwrap().split_whitespace().last().unwrap();
+            assert_eq!(nnp, if expected == "0" { "0" } else { "1" });
+            return;
+        }
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        const NAMESPACE: &str = "FLEXVM_SETUID_TEST_MOUNTNS";
+        if std::env::var_os(NAMESPACE).is_none() {
+            let mut cmd = Command::new(std::env::current_exe().unwrap());
+            cmd.args(["--ignored", "--exact", "app::tests::guest_setuid_helpers_work_but_nonroot_checks_cannot_gain_privileges"]).env(NAMESPACE, "1");
+            unsafe {
+                cmd.pre_exec(|| {
+                    crate::os(libc::unshare(libc::CLONE_NEWNS))?;
+                    crate::os(libc::mount(std::ptr::null(), c"/".as_ptr(), std::ptr::null(), libc::MS_REC | libc::MS_PRIVATE, std::ptr::null())).map(drop)
+                });
+            }
+            assert!(cmd.status().unwrap().success());
+            return;
+        }
+        let dir = crate::test_util::TempDir::new("setuid-helper");
+        // /tmp is often nosuid. Use our own suid-capable tmpfs in a private mount namespace.
+        crate::mount("tmpfs", dir.to_str().unwrap(), "tmpfs", 0, "mode=755,size=128m").unwrap();
+        struct Unmount(std::ffi::CString);
+        impl Drop for Unmount {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::umount2(self.0.as_ptr(), libc::MNT_DETACH);
+                }
+            }
+        }
+        let _unmount = Unmount(std::ffi::CString::new(dir.to_str().unwrap()).unwrap());
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let helper = dir.join("helper");
+        std::fs::copy(std::env::current_exe().unwrap(), &helper).unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o4755)).unwrap();
+        for confined in [false, true] {
+            let mut cmd = Command::new(&helper);
+            cmd.args(["--ignored", "--exact", "app::tests::guest_setuid_helpers_work_but_nonroot_checks_cannot_gain_privileges"])
+                .env(CHILD, if confined { "65534" } else { "0" });
+            if confined {
+                confine_check(&mut cmd);
+            }
+            credentials(&mut cmd, &parse_conf("uid 65534\ngid 65534").unwrap(), false);
+            assert!(cmd.status().unwrap().success(), "confined={confined}");
+        }
     }
 
     #[test]
