@@ -195,8 +195,10 @@ an unchanged hypervisor execution case, not nested lifecycle support, performanc
 guarantees, or an integrated FlexVM software backend.
 
 `--checkpoint` adds a cold restore while the inner Linux guest is running.
-The runner stops the outer emulator after inner tick 0, saves its complete
-machine state, exits the source emulator, and restores into a fresh process.
+The inner guest waits for console input after tick 0, so the host can stop the
+outer emulator without racing a timer. The runner saves its complete machine
+state, exits the source emulator, restores into a fresh process, then sends
+the release token through the restored console devices.
 Ticks 1 and 2 must come from the restored VM, with no repeated outer/inner boot
 marker, followed by clean inner and outer shutdown. Both emulator processes
 keep host KVM masked and traced. The report includes the migration result and

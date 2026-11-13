@@ -14,6 +14,7 @@ import platform
 import signal
 import socket
 import subprocess
+import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parent
@@ -59,10 +60,10 @@ def initramfs(init, kvm=None, files=None):
     return archive
 
 
-def run(argv, timeout, log, *, during=None, pass_fds=()):
+def run(argv, timeout, log, *, during=None, pass_fds=(), input_pipe=False):
     deadline = time.monotonic() + timeout
     with log.open("wb") as output:
-        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=output,
+        proc = subprocess.Popen(argv, stdin=subprocess.PIPE if input_pipe else subprocess.DEVNULL, stdout=output,
                                 stderr=subprocess.STDOUT, start_new_session=True, pass_fds=pass_fds)
         try:
             if during:
@@ -75,6 +76,9 @@ def run(argv, timeout, log, *, during=None, pass_fds=()):
                 pass
             proc.wait()
             raise
+        finally:
+            if proc.stdin:
+                proc.stdin.close()
     if result:
         raise RuntimeError(f"command exited {result}: {argv[0]}; see {log}")
 
@@ -95,7 +99,7 @@ class QMP:
                     if proc.poll() is not None:
                         raise RuntimeError("emulator exited before QMP connected")
                     time.sleep(.02)
-            self.stream = self.socket.makefile("rwb", buffering=0)
+            self.stream = self.socket.makefile("rb", buffering=0)
             if "QMP" not in self.reply():
                 raise RuntimeError("missing QMP greeting")
             self.ask("qmp_capabilities")
@@ -123,13 +127,15 @@ class QMP:
 
     def ask(self, command, arguments=None):
         self.socket.settimeout(self.remaining())
-        self.stream.write(json.dumps({"execute": command, "arguments": arguments or {}}).encode() + b"\n")
+        self.socket.sendall(json.dumps({"execute": command, "arguments": arguments or {}}).encode() + b"\n")
         return self.reply().get("return")
 
     def send_fd(self, fd):
         self.socket.settimeout(self.remaining())
-        self.socket.sendmsg([b'{"execute":"getfd","arguments":{"fdname":"snapshot"}}\n'],
-                            [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [fd]))])
+        command = b'{"execute":"getfd","arguments":{"fdname":"snapshot"}}\n'
+        sent = self.socket.sendmsg([command], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [fd]))])
+        if sent < len(command):
+            self.socket.sendall(command[sent:])
         self.reply()
 
     def close(self):
@@ -142,15 +148,18 @@ def checkpoint_run(cmd, isolated, out, timeout):
     """Stop during inner sleep, retire the source, then restore into a fresh QEMU."""
     source_log = out / "guest.log"
     snapshot = out / "checkpoint"
-    source_qmp = out / "source.qmp"
-    target_qmp = out / "target.qmp"
+    # UNIX socket names have a much smaller limit than ordinary output paths.
+    runtime = tempfile.TemporaryDirectory(prefix="flexvm-qmp-", dir="/tmp")
+    source_qmp = Path(runtime.name) / "source"
+    target_qmp = Path(runtime.name) / "target"
+    deadline = time.monotonic() + timeout
     evidence = {}
 
     def save(proc, deadline):
         qmp = QMP(source_qmp, proc, deadline)
         try:
             evidence["qemu_version"] = qmp.ask("query-version")
-            while "FLEXVM_SOFTWARE_INNER_TICK 0" not in source_log.read_text(errors="replace"):
+            while "FLEXVM_SOFTWARE_INNER_WAITING\n" not in source_log.read_text(errors="replace"):
                 qmp.remaining()
                 if proc.poll() is not None:
                     raise RuntimeError("source exited before inner progress")
@@ -187,29 +196,37 @@ def checkpoint_run(cmd, isolated, out, timeout):
                 raise RuntimeError(f"unexpected restored run state: {state}")
             evidence["restored_state"] = state
             qmp.ask("cont")
+            proc.stdin.write(b"C\n")
+            proc.stdin.flush()
         finally:
             qmp.close()
 
     try:
         run(isolated(cmd + ["-qmp", f"unix:{source_qmp},server=on,wait=off"], out / "files.strace"),
-            timeout, source_log, during=save)
+            max(0, deadline - time.monotonic()), source_log, during=save)
         with snapshot.open("rb") as stream:
             run(isolated(cmd + ["-qmp", f"unix:{target_qmp},server=on,wait=off",
                                 "-incoming", f"fd:{stream.fileno()}"], out / "restored.strace"),
-                timeout, out / "restored.log", during=restore, pass_fds=(stream.fileno(),))
+                max(0, deadline - time.monotonic()), out / "restored.log", during=restore,
+                pass_fds=(stream.fileno(),), input_pipe=True)
         source = source_log.read_text(errors="replace")
         target = (out / "restored.log").read_text(errors="replace")
-        if "FLEXVM_SOFTWARE_INNER_COMPLETE" in source:
-            raise RuntimeError("inner guest completed before snapshot")
+        if "FLEXVM_SOFTWARE_INNER_TICK 1" in source:
+            raise RuntimeError("inner guest advanced before restore released its input gate")
         if "FLEXVM_SOFTWARE_GUEST_BOOTED" in target or "FLEXVM_SOFTWARE_INNER_BOOTED" in target:
             raise RuntimeError("restored VM booted again instead of continuing")
         if "FLEXVM_SOFTWARE_INNER_TICK 1" not in target or "FLEXVM_SOFTWARE_INNER_TICK 2" not in target:
             raise RuntimeError("restored inner guest did not advance both remaining timer ticks")
+        for marker in ("FLEXVM_SOFTWARE_INNER_COMPLETE", "FLEXVM_SOFTWARE_GUEST_FIRECRACKER_PASSED",
+                       "FLEXVM_SOFTWARE_GUEST_COMPLETE"):
+            if marker in source or marker not in target:
+                raise RuntimeError(f"expected completion only after restore: {marker}")
         evidence.update(status="passed", snapshot_bytes=snapshot.stat().st_size)
-        return source + target, evidence
+        return source + "\n" + target, evidence
     finally:
         # The stream is test data; retain logs/reports, not hundreds of MiB of RAM.
         snapshot.unlink(missing_ok=True)
+        runtime.cleanup()
 
 
 def main():
@@ -278,8 +295,9 @@ def main():
                                       "boot_args": "console=ttyS0 quiet panic=1 rdinit=/init"},
                       "machine-config": {"vcpu_count": 1, "mem_size_mib": 128},
                       "drives": [], "network-interfaces": []}
+            gate = {"checkpoint-gate": b""} if args.checkpoint else None
             files = {"firecracker": firecracker.read_bytes(), "inner-kernel": kernel.read_bytes(),
-                     "inner-initramfs.cpio": initramfs(inner.read_bytes()),
+                     "inner-initramfs.cpio": initramfs(inner.read_bytes(), files=gate),
                      "firecracker.json": json.dumps(config).encode()}
         archive.write_bytes(initramfs(init.read_bytes(), nested, files))
         blocked = out / "unusable-kvm"
