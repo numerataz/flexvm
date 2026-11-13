@@ -21,7 +21,7 @@ case $step in
 prepare)
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
-    apt-get install -y -qq --no-install-recommends ca-certificates podman uidmap fuse-overlayfs slirp4netns curl crun
+    apt-get install -y -qq --no-install-recommends ca-certificates podman uidmap fuse-overlayfs slirp4netns curl crun netavark aardvark-dns
     mkdir -p "$base" /etc/containers
     # The guest root itself is overlayfs. FUSE supplies an ordinary supported
     # overlay backing for both runtimes without falling back to the vfs driver.
@@ -51,6 +51,12 @@ EOF
         parent=/libpod_parent
         port=18081
         if [ "$mode" = rootless ]; then parent=/$user; port=18082; fi
+        pod network create compat-net
+        bind=$base/bind-$mode
+        mkdir "$bind"
+        if [ "$mode" = rootless ]; then chown "$user:$user" "$bind"; chmod 755 "$base"; fi
+        pod run --rm --cgroup-parent="$parent" -v "$bind:/bind" "$image" sh -ec 'echo "$1" >/bind/marker' sh "$nonce"
+        test "$(cat "$bind/marker")" = "$nonce"
         pod volume create compat-data
         pod run --rm --cgroup-parent="$parent" -v compat-data:/data "$image" sh -ec 'echo "$1" >/data/marker' sh "$nonce"
         # Verify real controller enforcement, DNS and outbound HTTP.
@@ -66,9 +72,10 @@ EOF
         if [ "$mode" = rootless ]; then chown -R "$user:$user" "$context"; chmod 755 "$base"; fi
         pod build --cgroup-parent="$parent" -t localhost/flexvm-compat "$context"
         test "$(pod run --rm --cgroup-parent="$parent" localhost/flexvm-compat)" = build-ok
-        pod run -d --name compat-server --cgroup-parent="$parent" -p "$port:8080" -v compat-data:/data "$image" sh -ec '
+        pod run -d --name compat-server --network compat-net --cgroup-parent="$parent" -p "$port:8080" -v compat-data:/data "$image" sh -ec '
             mkdir /www; cp /data/marker /www/index.html; exec httpd -f -p 8080 -h /www
         '
+        test "$(pod run --rm --network compat-net --cgroup-parent="$parent" "$image" wget -qO- http://compat-server:8080)" = "$nonce"
         pod exec compat-server cat /proc/1/stat > "$base/process-$mode"
         echo "$mode prepared"
     done
@@ -79,6 +86,7 @@ verify)
         port=18081
         if [ "$mode" = rootless ]; then port=18082; fi
         test "$(pod exec compat-server cat /data/marker)" = "$nonce"
+        test "$(cat "$base/bind-$mode/marker")" = "$nonce"
         # Compare PID and starttime, allowing CPU counters/state to change.
         before=$(awk '{print $1, $22}' "$base/process-$mode")
         after=$(pod exec compat-server cat /proc/1/stat | awk '{print $1, $22}')
