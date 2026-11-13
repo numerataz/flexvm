@@ -392,7 +392,8 @@ fn host_epoch() -> Result<u64> {
 }
 
 /// Establish the process's VM-wide epoch fence, then cache the supported attachment form, by `at`.
-/// The invalid-offset capability probes never attach a session.
+/// Guests supporting FENCE also support AttachForm::Epoch, skipping capability probes (#1338).
+/// For older guests, invalid-offset capability probes never attach a session.
 fn fenced(vm: &Vm, at: Instant) -> Result<guest::AttachForm> {
     use guest::AttachForm;
     let _guard = vm.attach_fence.lock().unwrap();
@@ -408,8 +409,10 @@ fn fenced(vm: &Vm, at: Instant) -> Result<guest::AttachForm> {
         vm.untrack_exec(id);
         reply?.ok_or_else(|| "agent closed the fence request".into())
     };
-    establish_fence(ask, host_epoch()?)?;
-    let form = probe_form(&|line| probed(Some(ask(line)?)))?;
+    let form = match establish_fence(ask, host_epoch()?)? {
+        true => AttachForm::Epoch,
+        false => probe_form(&|line| probed(Some(ask(line)?)))?,
+    };
     vm.fenced.store(form as u8, Ordering::SeqCst);
     Ok(form)
 }
@@ -417,19 +420,20 @@ fn fenced(vm: &Vm, at: Instant) -> Result<guest::AttachForm> {
 /// Read the snapshot's generation, then advance it before sending any attachment.
 /// A delayed update from the previous process has an older number, even if it runs last. One accepted
 /// before the checkpoint can still take the generation this process read: read it again and go past it.
-fn establish_fence(ask: impl Fn(&str) -> Result<(u8, Vec<u8>)>, epoch: u64) -> Result<()> {
+/// Returns whether the guest agent supports the FENCE command (false for older guests retaining the existing attach protocol).
+fn establish_fence(ask: impl Fn(&str) -> Result<(u8, Vec<u8>)>, epoch: u64) -> Result<bool> {
     const TRIES: usize = 3;
     for tries in 1.. {
         let (kind, reply) = ask("FENCE")?;
         let reply = String::from_utf8(reply)?;
         if tries == 1 && kind == guest::FRAME_MSG && reply == "unknown request \"FENCE\"" {
-            return Ok(()); // Older guests retain their existing attach protocol.
+            return Ok(false); // Older guests retain their existing attach protocol.
         }
         let generation = if kind == guest::FRAME_MSG { reply.strip_prefix("ok ").and_then(|n| n.parse::<u64>().ok()) } else { None };
         let generation = generation.ok_or_else(|| format!("reading attachment fence: {reply}"))?.checked_add(1).ok_or("attachment fence exhausted")?;
         let (kind, reply) = ask(&format!("FENCE {generation} {epoch}"))?;
         if kind == guest::FRAME_MSG && reply == format!("ok {generation}").as_bytes() {
-            return Ok(());
+            return Ok(true);
         }
         if tries < TRIES && kind == guest::FRAME_MSG && reply == format!("error: {}", guest::ATTACHED_SINCE).as_bytes() {
             continue;
@@ -6776,7 +6780,7 @@ mod session_relay_tests {
             let reply = if line == "FENCE" { "ok 41" } else { "ok 42" };
             Ok((guest::FRAME_MSG, reply.as_bytes().to_vec()))
         };
-        establish_fence(ask, 200).unwrap();
+        assert!(establish_fence(ask, 200).unwrap());
         assert_eq!(*lines.lock().unwrap(), ["FENCE", "FENCE 42 200"]);
         // No attach form fallback is allowed for a malformed reply.
         for reply in ["ok 41", "unknown request \"FENCE\"", "ok", ""] {
@@ -6816,7 +6820,7 @@ mod session_relay_tests {
             }
             Ok((guest::FRAME_MSG, b"ok 43".to_vec()))
         };
-        establish_fence(ask, 200).unwrap();
+        assert!(establish_fence(ask, 200).unwrap());
         assert_eq!(*lines.lock().unwrap(), ["FENCE", "FENCE 42 200", "FENCE", "FENCE 43 200"]);
         let asks = AtomicUsize::new(0);
         let refused = |line: &str| {
@@ -6830,7 +6834,7 @@ mod session_relay_tests {
     #[test]
     fn older_agents_skip_the_attachment_fence() {
         let asks = AtomicUsize::new(0);
-        establish_fence(
+        assert!(!establish_fence(
             |line| {
                 asks.fetch_add(1, Ordering::SeqCst);
                 assert_eq!(line, "FENCE");
@@ -6838,7 +6842,7 @@ mod session_relay_tests {
             },
             200,
         )
-        .unwrap();
+        .unwrap());
         assert_eq!(asks.load(Ordering::SeqCst), 1);
     }
 

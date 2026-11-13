@@ -536,8 +536,9 @@ fn serve(statuses: Statuses) -> io::Result<()> {
             }
         };
         // START is on every start's critical path, where a new thread costs ms: quick requests are answered inline.
-        if ["PING", "START ", "START6 ", "CLOCK ", "FORKS", "HOSTNAME "].iter().any(|v| line.starts_with(v)) {
-            let _ = handle(&stream, &line, &statuses);
+        // Non-blocking session control verbs (FENCE, SESSIONS, CLOSE, RELEASE) also run inline without a thread (#1338).
+        if ["PING", "START ", "START6 ", "CLOCK ", "FORKS", "HOSTNAME ", "FENCE", "SESSIONS", "CLOSE ", "RELEASE "].iter().any(|v| line.starts_with(v)) {
+            let _ = handle(&stream, &line, &statuses, &sessions);
             continue;
         }
         let (statuses, sessions) = (statuses.clone(), sessions.clone());
@@ -555,7 +556,7 @@ fn serve(statuses: Statuses) -> io::Result<()> {
                 Some("SESSION" | "ARGV" | "ATTACH" | "REJOIN" | "CLOSE" | "RELEASE") => {}
                 // Its input may have come with the request, read ahead into `r`.
                 Some("APPIN") => return drop(app::appin(line.trim_end().split_once(' ').map_or("", |(_, a)| a), &stream, r.buffer())),
-                _ => return drop(handle(&stream, &line, &statuses)),
+                _ => return drop(handle(&stream, &line, &statuses, &sessions)),
             }
             // A session's command arrives a round trip later, which a guest faulting in memory can stretch past a second.
             let body = match session::parse(&line) {
@@ -637,7 +638,7 @@ fn fail(w: impl Write, e: impl std::fmt::Display) -> io::Result<()> {
     msg(w, format!("error: {e}"))
 }
 
-fn handle(out: &File, line: &str, statuses: &Statuses) -> io::Result<()> {
+fn handle(out: &File, line: &str, statuses: &Statuses, sessions: &session::Sessions) -> io::Result<()> {
     let line = line.trim_end();
     let (verb, arg) = line.split_once(' ').unwrap_or((line, ""));
     let reply = match verb {
@@ -650,6 +651,9 @@ fn handle(out: &File, line: &str, statuses: &Statuses) -> io::Result<()> {
         "CLOCK" => parse_time(arg.trim()).ok_or_else(|| format!("bad time {arg:?}")).and_then(set_clock).map(|off| format!("ok {off}")),
         "FORKS" => forks().map(|n| format!("ok {n}")).map_err(|e| e.to_string()),
         "HOSTNAME" => set_hostname(arg.trim()).map(|()| "ok".into()).map_err(|e| e.to_string()),
+        "SESSIONS" => Ok(session::counts(sessions)),
+        "FENCE" => return session::fence(line, sessions).map_or_else(|e| fail(out, e), |m| msg(out, m)),
+        "CLOSE" | "RELEASE" => return session::handle(out, &[], None, line, sessions, statuses),
         v if app::VERBS.contains(&v) => return app::handle(v, arg, out, statuses),
         _ => return msg(out, format!("unknown request {verb:?}")),
     };
@@ -1114,6 +1118,35 @@ mod tests {
         for bad in ["12", "12.5", "12.1000000000", "x.000000000", "12.-00000001"] {
             assert!(parse_time(bad).is_none(), "{bad}");
         }
+    }
+
+    #[test]
+    fn inline_session_verbs_are_handled() {
+        let (mut r, w) = std::os::unix::net::UnixStream::pair().unwrap();
+        let out = File::from(OwnedFd::from(w));
+        let statuses = Statuses::default();
+        let sessions = session::Sessions::default();
+
+        let mut call = |req: &str| {
+            super::handle(&out, req, &statuses, &sessions).unwrap();
+            let mut hdr = [0; 5];
+            r.read_exact(&mut hdr).unwrap();
+            let len = u32::from_le_bytes(hdr[1..].try_into().unwrap()) as usize;
+            let mut body = vec![0; len];
+            r.read_exact(&mut body).unwrap();
+            (hdr[0], String::from_utf8(body).unwrap())
+        };
+
+        // FENCE (read and advance)
+        assert_eq!(call("FENCE"), (FRAME_MSG, "ok 0".to_string()));
+        assert_eq!(call("FENCE 1 200"), (FRAME_MSG, "ok 1".to_string()));
+
+        // SESSIONS
+        assert_eq!(call("SESSIONS"), (FRAME_MSG, "ok 0 0".to_string()));
+
+        // Non-blocking CLOSE and RELEASE (#1338)
+        assert_eq!(call("CLOSE non-existent"), (FRAME_MSG, "closed".to_string()));
+        assert_eq!(call("RELEASE non-existent 0 0"), (FRAME_MSG, "closed".to_string()));
     }
 }
 
