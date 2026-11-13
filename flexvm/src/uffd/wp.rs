@@ -201,7 +201,8 @@ impl Pager {
     /// one was missing, so zero, at the pause). `may_fail`: test fault `ckpt_rescue_fail` may fail it (not a fault's
     /// retry).
     fn rescue(&self, cow: &Cow, first: usize, end: usize, may_fail: bool) -> io::Result<Option<usize>> {
-        let map = |claimed: &[usize]| self.rescue_fail(cow, claimed, may_fail).and_then(|()| self.pagemap(first, end - first));
+        let map =
+            |claimed: &[usize]| self.rescue_fail(cow, claimed, may_fail).and_then(|()| self.pagemap(claimed[0], claimed[claimed.len() - 1] + 1 - claimed[0]));
         rescue_block(cow, first, end, map, |p, local| self.read_at((p * PAGE_SIZE) as u64, local))
     }
 
@@ -649,7 +650,7 @@ fn rescue_block(
             return Err(e);
         }
     };
-    let filled = map(&claimed).and_then(|map| fill_slots(&claimed, &slots, |p| map[p - first] & (PM_PRESENT | PM_SWAP) != 0, read));
+    let filled = map(&claimed).and_then(|map| fill_slots(&claimed, &slots, |p| map[p - claimed[0]] & (PM_PRESENT | PM_SWAP) != 0, read));
     if let Err(e) = filled {
         cow.stats.rescue_failures.fetch_add(1, Ordering::Relaxed);
         cow.give_slots(slots);
@@ -815,6 +816,17 @@ mod tests {
         // Another fault on the block saves nothing again; the block's end is the next one's start.
         assert_eq!(rescue_block(&cow, 0, 16, |_| panic!("nothing to read"), |_, _| panic!()).unwrap(), Some(0));
         assert_eq!(rescue_block(&cow, 16, 18, |_| Ok(vec![PM_PRESENT; 2]), guest_read(&mem)).unwrap(), Some(2));
+        // Sparse rescue only reads pagemap for the claimed span (e.g. 20..22 within 0..64 block).
+        let cow_sparse = Cow::new(64, &vec![(0, 64, crate::uffd::REMOTE)]);
+        (0..20).chain(22..64).for_each(|p| assert!(cow_sparse.claim(p, PENDING, CLEAN)));
+        let mem_sparse = guest_mem(64);
+        let sparse_map = |c: &[usize]| {
+            assert_eq!(c, &[20, 21]);
+            Ok(vec![PM_PRESENT; c.len()])
+        };
+        assert_eq!(rescue_block(&cow_sparse, 0, 64, sparse_map, guest_read(&mem_sparse)).unwrap(), Some(2));
+        assert_eq!(cow_sparse.state(20), RESCUED);
+        assert_eq!(cow_sparse.state(21), RESCUED);
         // A failed read gives its pages and slots back.
         let fail = |_: usize, _: &[libc::iovec]| Err(io::Error::other("gone"));
         assert!(rescue_block(&cow, 18, 24, |_| Ok(vec![PM_PRESENT; 6]), fail).is_err());
