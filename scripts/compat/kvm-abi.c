@@ -165,8 +165,21 @@ int main(int argc, char **argv) {
     REQUIRE(ioctl(a.cpu, KVM_SET_REGS, &saved) == 0);
     pass("vCPU register state round trip");
 
+    uint8_t *replacement = memory(0x71);
+    struct kvm_userspace_memory_region changed_slot = {
+        .slot = 0, .guest_phys_addr = 0, .memory_size = RAM_SIZE,
+        .userspace_addr = (uintptr_t)replacement,
+    };
+    errno = 0;
+    REQUIRE(ioctl(a.vm, KVM_SET_USER_MEMORY_REGION, &changed_slot) == -1 && errno == EINVAL);
+    // A rejected change must leave the previous mapping intact.
+    reset_cpu(&a);
+    output(&a, 0x51);
+    run(&a, KVM_EXIT_HLT);
+    REQUIRE(a.ram[DATA_ADDR] == 0x52);
     uint8_t *old = a.ram;
-    a.ram = memory(0x71);
+    region(&a, old, 0);
+    a.ram = replacement;
     region(&a, a.ram, RAM_SIZE);
     REQUIRE(munmap(old, RAM_SIZE) == 0);
     reset_cpu(&a);
@@ -175,7 +188,7 @@ int main(int argc, char **argv) {
     REQUIRE(a.ram[DATA_ADDR] == 0x72);
     region(&a, a.ram, 0);
     region(&a, a.ram, RAM_SIZE);
-    pass("memory slot replacement and removal/re-registration");
+    pass("rejected in-place address change and explicit memory slot re-registration");
 
     int event = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     REQUIRE(event >= 0);
