@@ -54,6 +54,13 @@ elif verb == 'rm':
     state['active'] = False
 elif verb == 'rmi':
     state['image'] = None
+elif verb == 'exec' and '-s' in args:
+    script = sys.stdin.read()
+    step = args[args.index('--') + 1]
+    state.setdefault('workload_steps', []).append(step)
+    state_path.write_text(json.dumps(state))
+    if os.environ.get('FAIL_WORKLOAD') == step: sys.exit(22)
+    print('workload-' + step)
 elif verb == 'exec' and any(a.startswith('/tmp/flexvm-probe-') for a in args) and 'if [ -e' not in ' '.join(args):
     if os.environ.get('DELAY_PROBE'): time.sleep(30)
     print(json.dumps({'schema_version': 1, 'probes': [
@@ -103,6 +110,30 @@ class Harness(unittest.TestCase):
         self.assertEqual(self.report()['phases'][0]['status'], 'failed')
         self.assertIn('virtualization.kvm', self.report()['error'])
         self.assertIn('rmi', [c[0] for c in self.calls()])
+
+    def test_workload_runs_setup_once_and_verifies_after_each_lifecycle(self):
+        workload = self.root / 'workload script.sh'
+        workload.write_text('set -eu\necho "$1"\n')
+        result = self.run_suite('--workload', str(workload), '--phases', 'run,suspend,checkpoint')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = json.loads((self.root / 'state').read_text())
+        self.assertEqual(state['workload_steps'], ['prepare', 'verify', 'verify', 'verify'])
+        self.assertEqual(self.report()['workload']['name'], workload.name)
+        self.assertEqual(len(self.report()['workload']['sha256']), 64)
+        self.assertTrue(all(p['workload'] == 'workload-verify\n' for p in self.report()['phases']))
+
+    def test_workload_failure_cleans_owned_vm_and_preserves_failed_phase(self):
+        workload = self.root / 'workload.sh'
+        workload.write_text('exit 1\n')
+        result = self.run_suite('--workload', str(workload), FAIL_WORKLOAD='verify')
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.report()['phases'][0]['status'], 'failed')
+        self.assertFalse(json.loads((self.root / 'state').read_text())['active'])
+
+    def test_borrowed_workload_rejected_before_any_guest_changes(self):
+        result = self.run_suite('--vm', 'existing', '--workload', str(self.root / 'absent'))
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse(self.trace.exists())
 
     def test_borrowed_vm_is_not_stopped_removed_or_rebuilt(self):
         result = self.run_suite('--vm', 'existing')
