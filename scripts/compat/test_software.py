@@ -4,10 +4,13 @@ import json
 import os
 from pathlib import Path
 import platform
+import runpy
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -116,6 +119,54 @@ class SoftwareCheck(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(self.report()['status'], 'failed')
         self.assert_child_stopped()
+
+    def test_checkpoint_qmp_timeout_stops_emulator_descendants(self):
+        firecracker = self.root / 'firecracker'
+        firecracker.write_bytes(b'unit test hypervisor fixture')
+        argv = self.argv + ['--guest-kvm', '--guest-firecracker', str(firecracker), '--checkpoint', '--timeout', '1']
+        result = subprocess.run(argv, env=dict(self.env, TEST_ARCH='aarch64', MODE='hang'),
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(self.report()['status'], 'failed')
+        self.assertIn('timed out', self.report()['error'])
+        self.assert_child_stopped()
+        self.assertFalse((self.output / 'checkpoint').exists())
+
+    def test_qmp_skips_events_and_rejects_command_errors(self):
+        qmp_class = runpy.run_path(str(ROOT / 'software-boot.py'))['QMP']
+        path = self.root / 'qmp'
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(server.close)
+        server.bind(str(path))
+        server.listen(1)
+        errors = []
+
+        def serve():
+            try:
+                server.settimeout(3)
+                conn, _ = server.accept()
+                with conn, conn.makefile('rwb', buffering=0) as stream:
+                    conn.settimeout(3)
+                    stream.write(b'{"QMP": {}}\n')
+                    self.assertEqual(json.loads(stream.readline())['execute'], 'qmp_capabilities')
+                    stream.write(b'{"event":"STOP"}\n{"return":{}}\n')
+                    self.assertEqual(json.loads(stream.readline())['execute'], 'query-status')
+                    stream.write(b'{"error":{"desc":"intentional rejection"}}\n')
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=serve, daemon=True)
+        worker.start()
+        qmp = qmp_class(path, None, time.monotonic() + 3)
+        try:
+            with self.assertRaisesRegex(RuntimeError, 'intentional rejection'):
+                qmp.ask('query-status')
+        finally:
+            qmp.close()
+            worker.join(timeout=4)
+        self.assertFalse(worker.is_alive())
+        if errors:
+            raise errors[0]
 
     def test_sigterm_stops_descendants_and_records_interruption(self):
         proc = subprocess.Popen(self.argv, env=dict(self.env, MODE='hang'), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

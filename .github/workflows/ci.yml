@@ -124,7 +124,7 @@ jobs:
       matrix:
         include:
           - { arch: x86_64, runner: ubuntu-24.04, qemu: qemu-system-x86, extra: "" }
-          - { arch: aarch64, runner: ubuntu-24.04-arm, qemu: qemu-system-arm, extra: "--guest-kvm" }
+          - { arch: aarch64, runner: ubuntu-24.04-arm, qemu: qemu-system-arm, extra: "--guest-kvm --checkpoint" }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -169,6 +169,8 @@ jobs:
             ${{ runner.temp }}/software-boot/report.json
             ${{ runner.temp }}/software-boot/guest.log
             ${{ runner.temp }}/software-boot/files.strace
+            ${{ runner.temp }}/software-boot/restored.log
+            ${{ runner.temp }}/software-boot/restored.strace
             ${{ runner.temp }}/software-boot/compile.log
             ${{ runner.temp }}/software-boot/kvm-compile.log
             ${{ runner.temp }}/software-boot/inner-compile.log
