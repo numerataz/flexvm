@@ -1,10 +1,10 @@
 //! Client for flexvm-init's vsock protocol, through Firecracker's vsock UDS.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bail;
@@ -67,10 +67,10 @@ pub fn handshake<S: Read + Write>(s: S, line: &str) -> Result<BufReader<S>> {
 }
 
 /// Vsock sockets of Firecrackers that died: calls on them fail at once, never retried.
-static ABANDONED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+static ABANDONED: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Mutex::default);
 
 pub fn abandon(uds: &Path) {
-    ABANDONED.lock().unwrap().push(uds.to_path_buf());
+    ABANDONED.lock().unwrap().insert(uds.to_path_buf());
 }
 
 /// All I/O by `deadline`; nothing is sent once it has passed. Test faults: `guest_drop`,
@@ -85,7 +85,7 @@ fn ask_watched(uds: &Path, line: &str, deadline: Instant, watch: impl FnOnce(&Un
     if left.is_zero() {
         return Err(std::io::Error::new(ErrorKind::TimedOut, format!("no time left for {line:?}")).into());
     }
-    if ABANDONED.lock().unwrap().iter().any(|p| p == uds) {
+    if ABANDONED.lock().unwrap().contains(uds) {
         bail!("its firecracker exited");
     }
     let s = crate::util::connect_unix(uds, left)?;
@@ -1016,5 +1016,20 @@ mod tests {
         assert!(read_frame(&mut &wire[..3]).is_err());
         assert!(read_frame(&mut &b""[..]).unwrap().is_none());
         assert!(read_frame(&mut &[1, 255, 255, 255, 255][..]).is_err());
+    }
+
+    #[test]
+    fn abandon_deduplicates_and_looks_up_in_o1() {
+        let dir = crate::test_util::TempDir::new("abandon-set");
+        let sock1 = dir.join("a.sock");
+        let sock2 = dir.join("b.sock");
+        let absent = dir.join("absent.sock");
+        abandon(&sock1);
+        abandon(&sock1);
+        abandon(&sock2);
+        let abandoned = ABANDONED.lock().unwrap();
+        assert!(abandoned.contains(&sock1));
+        assert!(abandoned.contains(&sock2));
+        assert!(!abandoned.contains(&absent));
     }
 }

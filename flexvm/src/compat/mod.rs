@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
@@ -252,10 +252,19 @@ fn node(m: &std::fs::Metadata) -> (u64, u64) {
 
 impl HostKey {
     fn local(firecracker: Stamp) -> Result<Self> {
-        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
-        if boot_id.trim().is_empty() {
-            bail!("empty boot id");
-        }
+        static PROCESS_KEY: OnceLock<(String, Stamp)> = OnceLock::new();
+        let (boot_id, flexvm) = match PROCESS_KEY.get() {
+            Some((b, f)) => (b.clone(), f.clone()),
+            None => {
+                let b = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+                if b.trim().is_empty() {
+                    bail!("empty boot id");
+                }
+                let f = Stamp::of(&std::fs::metadata("/proc/self/exe")?);
+                let _ = PROCESS_KEY.set((b.clone(), f.clone()));
+                (b, f)
+            }
+        };
         let mut modules = vec![None; KVM_MODULES.len()];
         for (slot, name) in modules.iter_mut().zip(KVM_MODULES) {
             match std::fs::metadata(format!("/sys/module/{name}")) {
@@ -264,7 +273,6 @@ impl HostKey {
                 Err(e) => return Err(e.into()),
             }
         }
-        let flexvm = Stamp::of(&std::fs::metadata("/proc/self/exe")?);
         // A late microcode load changes what the CPU reports; a host that shows no revision (a guest,
         // a non-x86 CPU) keeps an empty, still stable, key rather than probing every time.
         let mut microcode: Vec<_> = std::fs::read_to_string("/proc/cpuinfo")?
@@ -636,5 +644,17 @@ mod tests {
         std::fs::create_dir(root.join("firecracker.json")).unwrap();
         assert_eq!(firecracker_id(&binary, Some(&root)).unwrap(), changed);
         assert_eq!(std::fs::read_to_string(calls).unwrap().lines().count(), 5);
+    }
+
+    #[test]
+    fn host_key_local_is_consistent_and_caches_process_key() {
+        let root = crate::test_util::TempDir::new("host-key-local");
+        let binary = root.join("fc");
+        std::fs::write(&binary, b"firecracker").unwrap();
+        let stamp = Stamp::of(&std::fs::metadata(&binary).unwrap());
+        let a = HostKey::local(stamp.clone()).unwrap();
+        let b = HostKey::local(stamp).unwrap();
+        assert_eq!(a, b);
+        assert!(!a.boot_id.is_empty());
     }
 }
