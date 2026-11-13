@@ -22,6 +22,7 @@ mod mem;
 mod net;
 #[allow(dead_code)]
 mod proto;
+mod runtime;
 mod session;
 mod tar;
 mod user;

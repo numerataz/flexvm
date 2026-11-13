@@ -42,7 +42,13 @@ not wait on the host:
   free (a quarter of the guest, at least 1 GiB). Commands and the image app
   go in `/vm/work` and readiness checks in their own groups under `/vm`;
   flexvm-init itself stays outside, so the throttle never slows the thread
-  that lifts it. Crossing the mark wakes the agent (a `memory.events`
+  that lifts it. The app, execs and readiness checks share a mount and cgroup
+  namespace rooted at `/vm`: they see `/work`, the memory mark at
+  `/sys/fs/cgroup/memory.high`, and no kernel threads or PID 1 in the root
+  cgroup. Available controllers are delegated there, so a nested container
+  runtime's root-level cgroups remain under the same memory mark. PID 1
+  keeps the original cgroup mount and namespace.
+  Crossing the mark wakes the agent (a `memory.events`
   notification, no timer), which sends `MEM <available KiB> <total KiB>` to
   the host on vsock port 53. The VM process resizes at once instead of waiting
   for its next tick.

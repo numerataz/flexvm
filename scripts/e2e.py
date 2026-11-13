@@ -694,6 +694,27 @@ def run_exec_ps():
 
 @case
 @needs_kvm
+def guest_cgroup_namespace():
+    """App and exec share a delegated cgroup/mount view under the guest's memory mark."""
+    vm = "e2e-cgroup"
+    A.run(vm)
+    check("exec is below the delegated root", must(A, vm, "cat /proc/self/cgroup").strip() == "0::/work")
+    check("delegated root has no processes to move", must(A, vm, "cat /sys/fs/cgroup/cgroup.procs").strip() == "")
+    controllers = set(must(A, vm, "cat /sys/fs/cgroup/cgroup.controllers").split())
+    enabled = set(must(A, vm, "cat /sys/fs/cgroup/cgroup.subtree_control").split())
+    check("controllers delegated", {"memory", "cpu", "pids"} <= controllers and controllers == enabled, (controllers, enabled))
+    check("memory mark visible at delegated root", int(must(A, vm, "cat /sys/fs/cgroup/memory.high")) > 0)
+    # Root-level runtime cgroups must remain below the memory mark, and a later exec sees mounts
+    # made by an earlier one (the app and exec must not each get a private mount namespace).
+    must(A, vm, "mkdir /sys/fs/cgroup/nested-test; mkdir /tmp/cgroup-mount; mount -t tmpfs -o size=1m tmpfs /tmp/cgroup-mount; echo shared >/tmp/cgroup-mount/marker")
+    check("nested cgroup inherits memory controller", "memory.max" in must(A, vm, "ls /sys/fs/cgroup/nested-test"))
+    check("mount shared with later exec", must(A, vm, "cat /tmp/cgroup-mount/marker") == "shared")
+    must(A, vm, "umount /tmp/cgroup-mount; rmdir /sys/fs/cgroup/nested-test")
+    A.kill(vm)
+
+
+@case
+@needs_kvm
 def app_lifecycle():
     """A VM follows its app: exits with it (an exited record with -d), --keep, --rm, start reruns, kill -s, -e/--entrypoint."""
     t = args.template

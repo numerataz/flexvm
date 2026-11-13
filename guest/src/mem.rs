@@ -64,8 +64,10 @@ pub fn enter(cmd: &mut Command, procs: CString, required: bool) {
 fn setup() -> io::Result<(File, OwnedFd, High)> {
     std::fs::create_dir_all(CGROUP_ROOT)?;
     crate::mount("cgroup2", CGROUP_ROOT, "cgroup2", 0, "")?;
-    std::fs::write(format!("{CGROUP_ROOT}/cgroup.subtree_control"), "+memory")?;
+    enable_controllers(CGROUP_ROOT)?;
     std::fs::create_dir_all(WORK)?;
+    crate::runtime::prepare()?;
+    enable_controllers(CGROUP)?;
     let uev = uevents()?;
     let total = meminfo().map(|(total, _)| total);
     if let Some(total) = total {
@@ -73,6 +75,14 @@ fn setup() -> io::Result<(File, OwnedFd, High)> {
     }
     let high = High::new(total, write_high);
     Ok((File::open(format!("{CGROUP}/memory.events"))?, uev, high))
+}
+
+/// Delegate the available controllers through /vm. Nested runtimes create sibling cgroups under
+/// it, keeping their containers under memory.high rather than at the guest hierarchy's root.
+fn enable_controllers(dir: &str) -> io::Result<()> {
+    let controllers = std::fs::read_to_string(format!("{dir}/cgroup.controllers"))?;
+    let enabled = controllers.split_whitespace().map(|c| format!("+{c}")).collect::<Vec<_>>().join(" ");
+    std::fs::write(format!("{dir}/cgroup.subtree_control"), enabled)
 }
 
 fn meminfo() -> Option<(u64, u64)> {

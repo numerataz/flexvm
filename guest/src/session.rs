@@ -762,6 +762,7 @@ fn open_attempt<'a>(
             if let Some(work) = crate::mem::work_procs() {
                 crate::mem::enter(&mut cmd, work, false);
             }
+            crate::runtime::enter(&mut cmd);
             // After entering the cgroup, which needs root.
             if let Some(c) = &exec {
                 crate::app::credentials(&mut cmd, c, false);
