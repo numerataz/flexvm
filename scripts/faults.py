@@ -7694,7 +7694,7 @@ def mem_refused_headroom():
 
 def guest_mem(host, name):
     """The guest's view: (MemTotal MiB, /vm memory.high MiB or None, the fill's pid alive, OOM kills in its kernel log)."""
-    code, out = sh(host, name, "awk '/MemTotal/{print $2}' /proc/meminfo; cat /sys/fs/cgroup/vm/memory.high; "
+    code, out = sh(host, name, "awk '/MemTotal/{print $2}' /proc/meminfo; cat /sys/fs/cgroup/memory.high; "
                                "kill -0 $(cat /tmp/hog.pid) 2>/dev/null && echo alive || echo dead; dmesg | grep -c -i 'killed process'; true")
     if code != 0 or len(out.split()) != 4:
         return None
