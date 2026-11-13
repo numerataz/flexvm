@@ -2,9 +2,23 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <sys/mount.h>
 #include <sys/reboot.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+static int execute(const char *program, char *const argv[]) {
+    pid_t child = fork();
+    if (child < 0) return -1;
+    if (child == 0) {
+        execv(program, argv);
+        _exit(127);
+    }
+    int status = 0;
+    pid_t waited;
+    do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+    return waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+}
 
 int main(void) {
     int console = open("/dev/console", O_RDWR);
@@ -18,18 +32,20 @@ int main(void) {
         sleep(1);
     }
     if (access("/kvm-abi", F_OK) == 0) {
-        pid_t child = fork();
-        if (child == 0) {
-            execl("/kvm-abi", "/kvm-abi", (char *)NULL);
-            _exit(127);
-        }
-        int status = 0;
-        pid_t waited;
-        do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
-        if (child < 0 || waited != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        char *const argv[] = {"/kvm-abi", NULL};
+        if (execute(argv[0], argv) < 0) {
             puts("FLEXVM_SOFTWARE_GUEST_KVM_FAILED");
             for (;;) pause();
         }
+    }
+    if (access("/firecracker", F_OK) == 0) {
+        char *const argv[] = {"/firecracker", "--no-api", "--config-file", "/firecracker.json", NULL};
+        if (mount("proc", "/proc", "proc", 0, NULL) < 0 ||
+            mount("sysfs", "/sys", "sysfs", 0, NULL) < 0 || execute(argv[0], argv) < 0) {
+            puts("FLEXVM_SOFTWARE_GUEST_FIRECRACKER_FAILED");
+            for (;;) pause();
+        }
+        puts("FLEXVM_SOFTWARE_GUEST_FIRECRACKER_PASSED");
     }
     puts("FLEXVM_SOFTWARE_GUEST_COMPLETE");
     if (reboot(RB_POWER_OFF) < 0) {

@@ -183,6 +183,13 @@ then runs a static program using the normal guest Linux KVM API. It creates a
 VM/vCPU, maps caller-owned RAM, sets ARM core registers, executes instructions,
 checks an MMIO write exit, and requires a PSCI shutdown event. Host KVM stays
 masked and the host trace must still show no KVM access. This experiment tests
-the ordinary guest KVM implementation under CPU emulation; it does not yet
-establish unchanged QEMU/Firecracker compatibility, nested lifecycle behavior,
-or an integrated FlexVM software backend.
+the ordinary guest KVM implementation under CPU emulation.
+
+Adding `--guest-firecracker PATH` runs that unchanged ARM Firecracker executable
+inside the software-backed guest. It boots a second Linux kernel with its own
+static init, requires independent timer progress, and checks clean inner guest
+poweroff and hypervisor exit. ARM GitHub Actions uses the pinned published
+Firecracker artifact, with its normal seccomp filter enabled; the report records
+the executable's SHA256. Host KVM remains inaccessible throughout. This establishes
+an unchanged hypervisor execution case, not nested lifecycle support, performance
+guarantees, or an integrated FlexVM software backend.

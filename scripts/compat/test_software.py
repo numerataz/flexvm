@@ -29,10 +29,17 @@ if os.environ.get('MODE') == 'hang':
 print('FLEXVM_SOFTWARE_GUEST_BOOTED')
 for i in range(3): print('FLEXVM_SOFTWARE_GUEST_TICK', i)
 print('FLEXVM_SOFTWARE_GUEST_COMPLETE')
+if os.environ.get('MODE') == 'nested':
+    print('FLEXVM_SOFTWARE_GUEST_KVM_PASSED')
+    print('FLEXVM_SOFTWARE_GUEST_FIRECRACKER_PASSED')
+    print('FLEXVM_SOFTWARE_INNER_BOOTED')
+    for i in range(3): print('FLEXVM_SOFTWARE_INNER_TICK', i)
+    print('FLEXVM_SOFTWARE_INNER_COMPLETE')
 '''
-HELPER = '''import runpy, sys
+HELPER = '''import os, platform, runpy, sys
 from unittest.mock import patch
 script = sys.argv.pop(1)
+platform.machine = lambda: os.environ['TEST_ARCH']
 with patch('os.geteuid', return_value=0):
     runpy.run_path(script, run_name='__main__')
 '''
@@ -53,7 +60,8 @@ class SoftwareCheck(unittest.TestCase):
         self.kernel.write_bytes(b'unit test kernel fixture')
         self.output = self.root / 'output'
         self.child_pid = self.root / 'child.pid'
-        self.env = dict(os.environ, PATH=f'{commands}:{os.environ["PATH"]}', CHILD_PID=str(self.child_pid))
+        self.env = dict(os.environ, PATH=f'{commands}:{os.environ["PATH"]}', CHILD_PID=str(self.child_pid),
+                        TEST_ARCH=platform.machine())
         self.argv = [sys.executable, '-c', HELPER, str(ROOT / 'software-boot.py'),
                      '--kernel', str(self.kernel), '--output', str(self.output)]
 
@@ -85,6 +93,23 @@ class SoftwareCheck(unittest.TestCase):
         self.assertEqual(self.report()['status'], 'failed')
         self.assertIn('access /dev/kvm', self.report()['error'])
 
+    def test_nested_hypervisor_requires_inner_progress_and_records_binary(self):
+        firecracker = self.root / 'firecracker'
+        firecracker.write_bytes(b'unit test hypervisor fixture')
+        argv = self.argv + ['--guest-kvm', '--guest-firecracker', str(firecracker)]
+        result = subprocess.run(argv, env=dict(self.env, TEST_ARCH='aarch64', MODE='nested'),
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.report()['scope'], 'software guest hypervisor execution')
+        self.assertTrue(self.report()['guest_firecracker'])
+        self.assertIn('firecracker_sha256', self.report())
+        self.output = self.root / 'missing-inner'
+        argv[argv.index('--output') + 1] = str(self.output)
+        result = subprocess.run(argv, env=dict(self.env, TEST_ARCH='aarch64'),
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(self.report()['status'], 'failed')
+
     def test_timeout_stops_descendants_and_preserves_failed_report(self):
         result = subprocess.run(self.argv + ['--timeout', '1'], env=dict(self.env, MODE='hang'),
                                 capture_output=True, text=True, timeout=10)
@@ -110,7 +135,7 @@ class SoftwareCheck(unittest.TestCase):
             proc.communicate()
 
     def test_c_checks_compile_with_strict_warnings(self):
-        sources = ['software-init.c']
+        sources = ['software-init.c', 'nested-init.c']
         if platform.machine() == 'x86_64':
             sources.append('kvm-abi.c')
         elif platform.machine() == 'aarch64':

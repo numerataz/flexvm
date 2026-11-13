@@ -28,7 +28,7 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def initramfs(init, kvm=None):
+def initramfs(init, kvm=None, files=None):
     """Small uncompressed newc archive; no root-owned mknod or cpio executable needed."""
     archive = bytearray()
 
@@ -46,6 +46,13 @@ def initramfs(init, kvm=None):
     if kvm is not None:
         add("dev/kvm", 0o020600, major=10, minor=232)
         add("kvm-abi", 0o100755, kvm)
+    if files:
+        for directory in ("proc", "sys", "tmp"):
+            add(directory, 0o040755)
+        for name, minor in (("null", 3), ("zero", 5), ("urandom", 9)):
+            add("dev/" + name, 0o020600, major=1, minor=minor)
+        for name, data in files.items():
+            add(name, 0o100755 if name == "firecracker" else 0o100600, data)
     add("TRAILER!!!", 0)
     return archive
 
@@ -73,6 +80,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cc", default="cc")
     parser.add_argument("--guest-kvm", action="store_true", help="require ARM KVM execution inside software-emulated EL2")
+    parser.add_argument("--guest-firecracker", type=Path, help="also boot an inner Linux VM with this unchanged ARM Firecracker binary (requires --guest-kvm)")
     parser.add_argument("--timeout", type=int, default=90)
     args = parser.parse_args()
     if os.geteuid() != 0:
@@ -82,9 +90,12 @@ def main():
         parser.error(f"unsupported native architecture: {arch}")
     if args.guest_kvm and arch != "aarch64":
         parser.error("guest KVM execution currently targets ARM64 EL2")
+    if args.guest_firecracker and not args.guest_kvm:
+        parser.error("--guest-firecracker requires --guest-kvm")
     if args.timeout < 1:
         parser.error("timeout must be positive")
     kernel = args.kernel.resolve(strict=True)
+    firecracker = args.guest_firecracker.resolve(strict=True) if args.guest_firecracker else None
     out = args.output.resolve()
     out.mkdir(parents=True, exist_ok=True)
     report_path = out / "report.json"
@@ -93,6 +104,8 @@ def main():
     report = {"schema_version": 1, "status": "running", "arch": arch, "accelerator": "tcg",
               "kernel_sha256": digest(kernel),
               "scope": "software guest KVM ABI execution" if args.guest_kvm else "execution-engine boot only"}
+    if firecracker:
+        report.update(scope="software guest hypervisor execution", firecracker_sha256=digest(firecracker))
     started = time.monotonic()
 
     def interrupted(number, _frame):
@@ -110,7 +123,20 @@ def main():
             run([args.cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static",
                  str(ROOT / "kvm-arm.c"), "-o", str(test)], 60, out / "kvm-compile.log")
             nested = test.read_bytes()
-        archive.write_bytes(initramfs(init.read_bytes(), nested))
+        files = None
+        if firecracker:
+            inner = out / "inner-init"
+            run([args.cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static",
+                 str(ROOT / "nested-init.c"), "-o", str(inner)], 60, out / "inner-compile.log")
+            config = {"boot-source": {"kernel_image_path": "/inner-kernel",
+                                      "initrd_path": "/inner-initramfs.cpio",
+                                      "boot_args": "console=ttyS0 quiet panic=1 rdinit=/init"},
+                      "machine-config": {"vcpu_count": 1, "mem_size_mib": 128},
+                      "drives": [], "network-interfaces": []}
+            files = {"firecracker": firecracker.read_bytes(), "inner-kernel": kernel.read_bytes(),
+                     "inner-initramfs.cpio": initramfs(inner.read_bytes()),
+                     "firecracker.json": json.dumps(config).encode()}
+        archive.write_bytes(initramfs(init.read_bytes(), nested, files))
         blocked = out / "unusable-kvm"
         blocked.touch(mode=0o600)
         qemu = "qemu-system-" + arch
@@ -125,7 +151,7 @@ def main():
         if args.guest_kvm:
             machine += ",virtualization=on,gic-version=3"
         cmd = [qemu, "-machine", machine, "-accel", "tcg,thread=multi", "-cpu", "max",
-               "-m", "256", "-smp", "1", *serial, "-no-reboot", "-nic", "none",
+               "-m", "512" if firecracker else "256", "-smp", "1", *serial, "-no-reboot", "-nic", "none",
                "-kernel", str(kernel), "-initrd", str(archive),
                "-append", f"console={console} quiet panic=1 rdinit=/init"]
         trace = out / "files.strace"
@@ -140,11 +166,17 @@ def main():
         expected += [f"FLEXVM_SOFTWARE_GUEST_TICK {i}" for i in range(3)]
         if args.guest_kvm:
             expected.append("FLEXVM_SOFTWARE_GUEST_KVM_PASSED")
+        if firecracker:
+            expected += ["FLEXVM_SOFTWARE_INNER_BOOTED", "FLEXVM_SOFTWARE_INNER_COMPLETE",
+                         "FLEXVM_SOFTWARE_GUEST_FIRECRACKER_PASSED"]
+            expected += [f"FLEXVM_SOFTWARE_INNER_TICK {i}" for i in range(3)]
         if any(marker not in log for marker in expected):
             raise RuntimeError("guest did not finish its boot/timer/shutdown checks; see guest.log")
         if '"/dev/kvm"' in trace.read_text(errors="replace"):
             raise RuntimeError("software execution attempted to access /dev/kvm; see files.strace")
         report.update(status="passed", guest_init_sha256=digest(init), kvm_access=False, guest_kvm=args.guest_kvm)
+        if firecracker:
+            report.update(guest_firecracker=True, inner_init_sha256=digest(inner))
     except Interrupted as exc:
         report.update(status="interrupted", error=str(exc), signal=exc.number)
     except Exception as exc:
