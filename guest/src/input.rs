@@ -165,6 +165,7 @@ pub(crate) fn feed(
     current: &dyn Fn() -> bool,
     taken: &mut dyn FnMut(u64) -> io::Result<()>,
 ) -> io::Result<Fed> {
+    let mut body = vec![0; MAX_INPUT + 8];
     loop {
         let mut kind = [0];
         if conn.read(&mut kind)? == 0 || !current() {
@@ -179,8 +180,8 @@ pub(crate) fn feed(
         if len > MAX_INPUT + 8 {
             return Err(io::Error::other(format!("input frame of {len} bytes")));
         }
-        let mut body = vec![0; len];
-        conn.read_exact(&mut body)?;
+        let body = &mut body[..len];
+        conn.read_exact(body)?;
         let offset = || body.get(..8).map(|b| u64::from_le_bytes(b.try_into().unwrap())).ok_or_else(|| io::Error::other("short input frame"));
         match kind[0] {
             IN_DATA => taken(stdin.write(stream, offset()?, &body[8..], current)?)?,
@@ -410,5 +411,38 @@ mod tests {
         assert!(child.wait().unwrap().success());
         let out = String::from_utf8_lossy(&out);
         assert!(out.contains("33 101") && out.contains("typed\r\n") && out.contains("got:typed"), "{out:?}");
+    }
+
+    #[test]
+    fn feed_streams_64mb() {
+        const TOTAL: usize = 64 * 1024 * 1024;
+        let (mut r, w) = pipe();
+        let stdin = Stdin::new(w, None).unwrap();
+        let drain = std::thread::spawn(move || {
+            let mut sink = std::io::sink();
+            std::io::copy(&mut r, &mut sink).unwrap();
+        });
+        let (mut client_rx, mut client_tx) = pipe();
+        let sender = std::thread::spawn(move || {
+            let chunk = vec![0x42u8; MAX_INPUT];
+            let mut sent = 0;
+            while sent < TOTAL {
+                let to_send = (TOTAL - sent).min(MAX_INPUT);
+                let f = data(sent as u64, &chunk[..to_send]);
+                client_tx.write_all(&f).unwrap();
+                sent += to_send;
+            }
+            client_tx.write_all(&frame(IN_EOF, &[&(TOTAL as u64).to_le_bytes()])).unwrap();
+        });
+        let mut acknowledged = 0;
+        feed(&mut client_rx, &stdin, 0, &|| true, &mut |ack| {
+            acknowledged = ack;
+            Ok(())
+        })
+        .unwrap();
+        sender.join().unwrap();
+        drop(stdin);
+        drain.join().unwrap();
+        assert_eq!(acknowledged, TOTAL as u64);
     }
 }
