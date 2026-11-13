@@ -84,6 +84,33 @@ does not require userfaultfd write protection. Workload-specific tests must
 add assertions for their own container/process state, traffic and data; passing
 the baseline is not a substitute for those tests.
 
+## Container workload cases
+
+`--workload PATH` runs a guest shell script in an isolated VM. The runner sends
+it `prepare NONCE run` once, then `verify NONCE PHASE` after each requested
+lifecycle transition. Preparation can install packages and start persistent
+workloads; verification must assert their live state. A script failure fails the
+suite and still removes the owned VM/checkpoints/template. The report records
+the script name, SHA256 and output. Scripts run as guest root and are rejected
+with `--vm`, which protects existing guests from workload setup changes.
+
+The Podman case uses stock Ubuntu packages, FUSE overlay storage, subordinate
+UID/GID mappings, and an explicitly delegated cgroup-v2 subtree for a rootless
+session. It tests rootful and rootless image pulls, builds, real CPU/memory/PID
+limits, outbound DNS/HTTP, named volumes, a live container process, and published
+ports through each phase:
+
+```sh
+sudo scripts/compat.py --memory-mib 16384 \
+  --workload scripts/compat/workloads/podman.sh \
+  --phases run,suspend,checkpoint --output /tmp/compat-podman
+```
+
+Use the migration options above to include migration. This case requires the
+expanded guest kernel with FUSE, TUN and container networking enabled. Its
+presence here is an executable acceptance case; support status depends on the
+recorded results for the tested build and runtime versions.
+
 ## Initial audit
 
 The pinned 6.1.155 guest kernel passed the basic namespace, cgroup, overlay,

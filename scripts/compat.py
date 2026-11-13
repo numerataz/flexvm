@@ -8,6 +8,7 @@ Migration requires a configured peer on this machine: --migration-to HOST:PORT
 --to-state STATE [--to-run RUN]. Its artifacts/templates must match the source.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -77,8 +78,17 @@ class Suite:
         self.probe = "/tmp/flexvm-probe-" + self.nonce
         self.marker = "/tmp/flexvm-state-" + self.nonce
         self.process = None
+        self.workload = args.workload.read_text() if args.workload else None
         self.report = {"schema_version": 1, "vm": self.name, "image": None if args.vm else args.image,
                        "status": "running", "phases": [], "cleanup_errors": []}
+
+        if self.workload is not None:
+            self.report["workload"] = {"name": args.workload.name,
+                                       "sha256": hashlib.sha256(self.workload.encode()).hexdigest()}
+
+    def workload_step(self, step, phase="run"):
+        return self.host.call("exec", "-i", self.name, "sh", "-s", "--", step, self.nonce, phase,
+                              stdin=self.workload, timeout=900 if step == "prepare" else 180)
 
     def exec(self, *argv, **kw):
         return self.host.call("exec", self.name, *argv, **kw)
@@ -93,6 +103,9 @@ class Suite:
                              "--entrypoint", '["sleep","infinity"]', self.image)
         self.probe_attempted = True
         self.source.call("cp", str(probe), f"{self.name}:{self.probe}")
+        if self.workload is not None:
+            self.report["workload"]["prepare"] = self.workload_step("prepare")
+            self.save()
         if "namespaces" in self.args.cases:
             # Mounts are shared with later execs. A live process and its starttime must survive too.
             self.exec("sh", "-ec", 'mkdir "$1"; mount -t tmpfs -o size=1m tmpfs "$1"; printf %s "$2" >"$1/marker"',
@@ -132,6 +145,8 @@ class Suite:
                 # The command is a fixed 'sleep', so /proc/PID/stat's comm contains no spaces.
                 if (state[0], state[21]) != (self.process[0], self.process[21]):
                     raise Failure("live process identity changed")
+            if self.workload is not None:
+                result["workload"] = self.workload_step("verify", phase)
             result["status"] = "passed"
         except BaseException as exc:
             result.update(status="failed", error=str(exc))
@@ -199,6 +214,7 @@ def parse_args(argv=None):
     p.add_argument("--state", default=os.environ.get("FLEXVM_STATE_DIR"))
     p.add_argument("--run")
     p.add_argument("--image", default="ubuntu:24.04")
+    p.add_argument("--workload", type=Path, help="guest shell script: prepare/verify NONCE PHASE; runs only in an owned VM")
     p.add_argument("--vm", help="probe an existing VM without changing its lifecycle")
     p.add_argument("--case", dest="cases", action="append", choices=("capabilities", "namespaces"))
     p.add_argument("--require", action="append", default=[], metavar="PROBE", help="fail unless this probe succeeds")
@@ -216,6 +232,8 @@ def parse_args(argv=None):
     args.cases = args.cases or (["capabilities"] if args.vm else ["capabilities", "namespaces"])
     if not args.phases or args.phases[0] != "run" or len(set(args.phases)) != len(args.phases) or set(args.phases) - {"run", "suspend", "checkpoint", "migration"}:
         p.error("phases must start with run and contain each supported phase at most once")
+    if args.vm and args.workload:
+        p.error("--workload requires an isolated owned VM")
     if args.vm and (args.phases != ["run"] or "namespaces" in args.cases):
         p.error("--vm supports read-only capability cases in the run phase only")
     if "migration" in args.phases and (not args.migration_to or not args.to_state):
