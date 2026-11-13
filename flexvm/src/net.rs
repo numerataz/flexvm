@@ -1494,9 +1494,19 @@ pub fn unsolicited_na(dev: &str, ip: Ipv6Addr) -> Result<()> {
     send_na(ifindex, &mac, ip)
 }
 
-fn send_na(ifindex: u32, mac: &[u8; 6], ip: Ipv6Addr) -> Result<()> {
-    // Protocol 0: it sends, and hooks nothing to receive.
+/// Kept open: closing an AF_PACKET socket calls synchronize_net() in packet_release (~25 ms RCU barrier),
+/// which otherwise stalls unsolicited_na behind gratuitous_arp.
+fn packet_socket() -> Result<&'static OwnedFd> {
+    static FD: std::sync::OnceLock<OwnedFd> = std::sync::OnceLock::new();
+    if let Some(fd) = FD.get() {
+        return Ok(fd);
+    }
     let fd = socket(libc::AF_PACKET, libc::SOCK_RAW, 0, "packet socket")?;
+    Ok(FD.get_or_init(|| fd))
+}
+
+fn send_na(ifindex: u32, mac: &[u8; 6], ip: Ipv6Addr) -> Result<()> {
+    let fd = packet_socket()?;
     let frame = na_frame(mac, ip);
     let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
     addr.sll_family = libc::AF_PACKET as u16;
@@ -1504,7 +1514,7 @@ fn send_na(ifindex: u32, mac: &[u8; 6], ip: Ipv6Addr) -> Result<()> {
     addr.sll_ifindex = ifindex as i32;
     addr.sll_halen = 6;
     addr.sll_addr[..6].copy_from_slice(&frame[..6]);
-    crate::syscall_check!(send_to(&fd, &frame, &addr) < 0, "send unsolicited neighbour advertisement");
+    crate::syscall_check!(send_to(fd, &frame, &addr) < 0, "send unsolicited neighbour advertisement");
     Ok(())
 }
 
@@ -1548,26 +1558,22 @@ fn icmpv6_checksum(src: Ipv6Addr, dst: Ipv6Addr, msg: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+fn arp_frame(mac: &[u8; 6], ip: Ipv4Addr) -> Vec<u8> {
+    [&[0xff; 6][..], mac, &[0x08, 0x06, 0x00, 0x01, 0x08, 0x00, 6, 4, 0x00, 0x01], mac, &ip.octets(), &[0; 6], &ip.octets()].concat()
+}
+
 pub fn gratuitous_arp(dev: &str, ip: Ipv4Addr) -> Result<()> {
     let ifindex = ifindex(dev)?;
     let mac = parse_mac(&std::fs::read_to_string(format!("/sys/class/net/{dev}/address"))?)?;
-    let fd = socket(libc::AF_PACKET, libc::SOCK_RAW, 0x0806u16.to_be() as i32, "packet socket")?;
-    let mut frame = Vec::with_capacity(42);
-    frame.extend_from_slice(&[0xff; 6]);
-    frame.extend_from_slice(&mac);
-    frame.extend_from_slice(&[0x08, 0x06]); // ARP
-    frame.extend_from_slice(&[0x00, 0x01, 0x08, 0x00, 6, 4, 0x00, 0x01]); // ethernet/ipv4, request
-    frame.extend_from_slice(&mac);
-    frame.extend_from_slice(&ip.octets());
-    frame.extend_from_slice(&[0; 6]);
-    frame.extend_from_slice(&ip.octets());
+    let fd = packet_socket()?;
+    let frame = arp_frame(&mac, ip);
     let mut addr: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
     addr.sll_family = libc::AF_PACKET as u16;
     addr.sll_protocol = (libc::ETH_P_ARP as u16).to_be();
     addr.sll_ifindex = ifindex as i32;
     addr.sll_halen = 6;
     addr.sll_addr[..6].copy_from_slice(&[0xff; 6]);
-    crate::syscall_check!(send_to(&fd, &frame, &addr) < 0, "send gratuitous arp");
+    crate::syscall_check!(send_to(fd, &frame, &addr) < 0, "send gratuitous arp");
     Ok(())
 }
 
@@ -2441,6 +2447,27 @@ mod tests {
         assert_ne!(icmpv6_checksum(target, ALL_NODES, &bad), 0);
         // An odd length pads with a zero byte (RFC 1071).
         assert_eq!(icmpv6_checksum(target, ALL_NODES, &[1]), icmpv6_checksum(target, ALL_NODES, &[1, 0]).wrapping_add(1), "one length apart");
+    }
+
+    /// The gratuitous ARP frame's bytes, field by field.
+    #[test]
+    fn a_gratuitous_arp_request() {
+        let mac = [0x02, 0x42, 0xac, 0x11, 0x00, 0x02];
+        let ip = Ipv4Addr::new(192, 168, 1, 100);
+        let f = arp_frame(&mac, ip);
+        assert_eq!(f.len(), 42);
+        assert_eq!(f[..6], [0xff; 6], "Ethernet dst broadcast");
+        assert_eq!(f[6..12], mac, "Ethernet src mac");
+        assert_eq!(f[12..14], [0x08, 0x06], "EtherType 0x0806");
+        assert_eq!(f[14..16], [0x00, 0x01], "hardware type Ethernet");
+        assert_eq!(f[16..18], [0x08, 0x00], "protocol type IPv4");
+        assert_eq!(f[18], 6, "hardware size");
+        assert_eq!(f[19], 4, "protocol size");
+        assert_eq!(f[20..22], [0x00, 0x01], "ARP request op 1");
+        assert_eq!(f[22..28], mac, "sender MAC");
+        assert_eq!(f[28..32], ip.octets(), "sender IP");
+        assert_eq!(f[32..38], [0; 6], "target MAC");
+        assert_eq!(f[38..42], ip.octets(), "target IP");
     }
 
     /// Forwarding stops interfaces with accept_ra 1 taking router advertisements: those that take
