@@ -81,12 +81,23 @@ pub fn state(v: &Value) -> State {
     st
 }
 
+static BOOT_CLOCK: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+
+pub(crate) fn parse_btime(stat: &str) -> Option<u64> {
+    stat.lines().find_map(|l| l.strip_prefix("btime ")?.trim().parse::<u64>().ok())
+}
+
 /// Seconds since the epoch of the start of the process that runs the VM (`Ident::start`, in clock ticks
 /// since boot), if it is running.
 fn started(v: &Value) -> Option<u64> {
     let ticks = v["start"].as_u64().filter(|&t| t > 0)?;
-    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
-    let btime = std::fs::read_to_string("/proc/stat").ok()?.lines().find_map(|l| l.strip_prefix("btime ")?.trim().parse::<u64>().ok())?;
+    let &(btime, hz) = BOOT_CLOCK
+        .get_or_init(|| {
+            let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+            let btime = std::fs::read_to_string("/proc/stat").ok().as_deref().and_then(parse_btime)?;
+            Some((btime, hz))
+        })
+        .as_ref()?;
     Some(btime + ticks / hz)
 }
 
@@ -170,17 +181,20 @@ impl Detail {
         let record: Option<super::create::Record> = serde_json::from_value(vm["docker"].clone()).ok();
         let created = vm["state"] == "created";
         // A created container has no VM yet: what it will run is its record's.
-        let described = match (&record, created) {
+        let (described, meta) = match (&record, created) {
             (Some(r), true) => {
                 let ports: Vec<crate::ports::Port> = r.run.windows(2).filter(|w| w[0] == "--publish").filter_map(|w| w[1].parse().ok()).collect();
                 let id = if r.generation.is_empty() { images::linked(api, &r.template) } else { Some(r.generation.clone()) };
-                json!({"name": name, "state": "created", "config": {"image": r.image, "template": r.template, "template_id": id, "ports": ports, "run": {}}})
+                let meta = id.as_deref().and_then(|id| images::meta(api, id));
+                (
+                    json!({"name": name, "state": "created", "config": {"image": r.image, "template": r.template, "template_id": id, "ports": ports, "run": {}}}),
+                    meta,
+                )
             }
-            _ => crate::containers::described(&api.host, &api.paths, &name, vm.clone()),
+            _ => crate::containers::described_meta(&api.host, &api.paths, &name, vm.clone()),
         };
         let config = described["config"].clone();
         let image_id = config["template_id"].as_str().or(vm["template_id"].as_str()).unwrap_or_default().to_string();
-        let meta = images::meta(api, &image_id);
         let image_config = meta.as_ref().and_then(|m| images::config(api, m));
         let argv: Vec<String> = meta.as_ref().and_then(|m| m.image.as_ref()).map(|i| i.argv.clone()).unwrap_or_default();
         let run = &config["run"];
@@ -473,10 +487,16 @@ pub async fn list(api: &Arc<Api>, q: Query) -> Reply {
     for (_, value) in filters.iter().filter(|(k, _)| k == "name") {
         validate_name(value)?;
     }
-    let details = api.blocking(|api| Ok(super::create::merge(api).iter().map(|v| Detail::read(api, v)).collect::<Vec<_>>())).await?;
+    let status_filtered = filters.iter().any(|(k, _)| k == "status" || k == "exited");
+    let details = api
+        .blocking(move |api| {
+            let vms = super::create::merge(api);
+            Ok(vms.iter().filter(|v| all || status_filtered || state(v).running).map(|v| Detail::read(api, v)).collect::<Vec<_>>())
+        })
+        .await?;
     let mut out = Vec::new();
     for d in &details {
-        let mut keep = all || d.state.running || filters.iter().any(|(k, _)| k == "status" || k == "exited");
+        let mut keep = all || d.state.running || status_filtered;
         // Values of one key: any of them; keys: each of them.
         let mut keys: Vec<&str> = filters.iter().map(|(k, _)| k.as_str()).collect();
         keys.dedup();
@@ -1088,5 +1108,45 @@ mod tests {
     #[test]
     fn frames_are_dockers() {
         assert_eq!(&frame(2, b"hi")[..], &[2, 0, 0, 0, 0, 0, 0, 2, b'h', b'i']);
+    }
+
+    #[test]
+    fn parses_btime_from_proc_stat() {
+        let stat = "cpu  123 456\nbtime 1712345678\nprocesses 9999\n";
+        assert_eq!(parse_btime(stat), Some(1712345678));
+        assert_eq!(parse_btime("cpu 1 2 3\n"), None);
+        assert_eq!(parse_btime("btime not_a_num\n"), None);
+        assert_eq!(parse_btime(""), None);
+    }
+
+    #[tokio::test]
+    async fn list_filters_stopped_containers_unless_all_or_status_filtered() {
+        use http_body_util::BodyExt;
+        let (_d, api) = fixture();
+        let rec = crate::app::Exited::new(0, "image".into(), None, Default::default(), Default::default(), 1);
+        std::fs::write(api.host.vms("stopped", "exited").unwrap(), serde_json::to_vec(&rec).unwrap()).unwrap();
+
+        // Default list (not all, no status filter) excludes stopped VM
+        let req = Request::builder().uri("/containers/json").body(()).unwrap();
+        let response = list(&api, Query::of(&req)).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let rows: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 0);
+
+        // List with all=1 includes stopped VM
+        let req = Request::builder().uri("/containers/json?all=1").body(()).unwrap();
+        let response = list(&api, Query::of(&req)).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let rows: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["Names"][0], "/stopped");
+
+        // List with status=exited filter includes stopped VM
+        let req = Request::builder().uri("/containers/json?filters=%7B%22status%22:%5B%22exited%22%5D%7D").body(()).unwrap();
+        let response = list(&api, Query::of(&req)).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let rows: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 1);
+        assert_eq!(rows[0]["Names"][0], "/stopped");
     }
 }

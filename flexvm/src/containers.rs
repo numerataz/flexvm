@@ -380,7 +380,11 @@ pub fn inspect(host: &Host, paths: &template::Paths, names: &[String]) -> Result
     }
 }
 
-pub(crate) fn described(host: &Host, paths: &template::Paths, name: &str, mut v: Value) -> Value {
+pub(crate) fn described(host: &Host, paths: &template::Paths, name: &str, v: Value) -> Value {
+    described_meta(host, paths, name, v).0
+}
+
+pub(crate) fn described_meta(host: &Host, paths: &template::Paths, name: &str, mut v: Value) -> (Value, Option<template::Meta>) {
     let running = !crate::stopped(&v);
     let path = |ext: &str| host.vms(name, ext).ok().map(|p| p.display().to_string());
     let mut config = json!({
@@ -416,13 +420,17 @@ pub(crate) fn described(host: &Host, paths: &template::Paths, name: &str, mut v:
         config["cpus"] = json!(e.resources.cpus);
         v["exit_code"] = json!(e.status);
     }
+    let mut meta = None;
     if let Some(id) = config["template_id"].as_str() {
-        if let Some(i) = template::describe_id(paths, id) {
-            for k in ["source", "digest", "app", "warm", "mem_mib"] {
-                if !i[k].is_null() {
-                    config[k] = i[k].clone();
-                }
+        if let Some(m) = template::meta(paths, id) {
+            config["mem_mib"] = json!(m.mem_mib);
+            if let Some(i) = &m.image {
+                config["source"] = json!(i.source);
+                config["digest"] = json!(i.digest);
+                config["app"] = json!(i.argv);
+                config["warm"] = json!(i.warm);
             }
+            meta = Some(m);
         }
     }
     // Its `-p` ports as its run settings keep them (`RunSpec`), else those bound now.
@@ -435,7 +443,7 @@ pub(crate) fn described(host: &Host, paths: &template::Paths, name: &str, mut v:
         }
     }
     v["config"] = config;
-    v
+    (v, meta)
 }
 
 /// `rename OLD NEW`: a running VM's process renames itself (`Proc::rename`); a stopped one is

@@ -4,12 +4,11 @@ use crate::image::registry::{blob_path, sha256_hex};
 use serde_json::Value;
 
 use super::Api;
-use crate::template::{Meta, Template};
+use crate::template::Meta;
 
 /// A generation's metadata, if it is here.
 pub fn meta(api: &Api, id: &str) -> Option<Meta> {
-    let dir = Template::generation(&api.paths, id)?;
-    serde_json::from_slice(&std::fs::read(dir.join("meta.json")).ok()?).ok()
+    crate::template::meta(&api.paths, id)
 }
 
 /// The generation the template `name` links to now.
