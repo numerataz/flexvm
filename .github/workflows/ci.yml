@@ -158,7 +158,11 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: software-execution-${{ matrix.arch }}
-          path: ${{ runner.temp }}/software-boot
+          path: |
+            ${{ runner.temp }}/software-boot/report.json
+            ${{ runner.temp }}/software-boot/guest.log
+            ${{ runner.temp }}/software-boot/files.strace
+            ${{ runner.temp }}/software-boot/compile.log
           if-no-files-found: ignore
 
   # Whether the aarch64 runner can run VMs: it decides what e2e-aarch64 runs (the KVM shards, or what
