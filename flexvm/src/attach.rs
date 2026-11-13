@@ -156,31 +156,38 @@ impl Feed {
                 Ok(n) => n,
                 Err(_) => 0,
             };
-            let (mut out, mut detach) = (Vec::with_capacity(n + 1), false);
-            for &b in &buf[..n] {
-                if keys && held {
-                    held = false;
-                    if b == DETACH_KEYS[1] {
-                        detach = true;
-                        break;
+            let (mut out, mut detach) = (Vec::new(), false);
+            if keys {
+                out.reserve(n + 1);
+                for &b in &buf[..n] {
+                    if held {
+                        held = false;
+                        if b == DETACH_KEYS[1] {
+                            detach = true;
+                            break;
+                        }
+                        out.push(DETACH_KEYS[0]);
                     }
+                    if b == DETACH_KEYS[0] {
+                        held = true;
+                        continue;
+                    }
+                    out.push(b);
+                }
+                // A Ctrl-P held at the end goes as it is.
+                if n == 0 && held {
                     out.push(DETACH_KEYS[0]);
                 }
-                if keys && b == DETACH_KEYS[0] {
-                    held = true;
-                    continue;
-                }
-                out.push(b);
-            }
-            // A Ctrl-P held at the end goes as it is.
-            if n == 0 && held {
-                out.push(DETACH_KEYS[0]);
             }
             let mut st = self.cv.wait_while(self.st.lock().unwrap(), |s| s.buf.len() >= MAX_UNACKED && !s.cancelled).unwrap();
             if st.cancelled {
                 return;
             }
-            st.buf.extend(out);
+            if keys {
+                st.buf.extend(out);
+            } else {
+                st.buf.extend(&buf[..n]);
+            }
             (st.eof, st.detached) = (n == 0, detach);
             drop(st);
             self.cv.notify_all();
@@ -259,8 +266,9 @@ impl Feed {
                         break (frame(IN_RESIZE, &[&rows.to_le_bytes(), &cols.to_le_bytes()]), false);
                     } else if sent < end {
                         let from = (sent - st.acked) as usize;
-                        let chunk: Vec<u8> = st.buf.range(from..(from + MAX_INPUT).min(st.buf.len())).copied().collect();
-                        let f = frame(IN_DATA, &[&sent.to_le_bytes(), &chunk]);
+                        let buf = st.buf.make_contiguous();
+                        let chunk = &buf[from..(from + MAX_INPUT).min(buf.len())];
+                        let f = frame(IN_DATA, &[&sent.to_le_bytes(), chunk]);
                         sent += chunk.len() as u64;
                         break (f, false);
                     } else if st.eof && !eof_sent {
@@ -476,11 +484,13 @@ fn gone(vm: &Pinned) -> Result<i32> {
 /// Whether the VM ended (its process gone), waiting a moment for one that is ending.
 fn ended(vm: &Pinned) -> bool {
     let until = Instant::now() + Duration::from_secs(2);
+    let mut wait = Duration::from_millis(1);
     while vm.alive() {
         if Instant::now() >= until {
             return false;
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(wait);
+        wait = (wait * 2).min(Duration::from_millis(50));
     }
     true
 }
@@ -1167,5 +1177,59 @@ mod tests {
         }
         assert!(vm_path("web:").is_err());
         assert!(vm_path("bad name:/x").is_err());
+    }
+
+    #[test]
+    fn feed_streams_64mb() {
+        const TOTAL: usize = 64 * 1024 * 1024;
+        let feed = Feed::start(Some(Box::new(std::io::repeat(0x5a).take(TOTAL as u64))), false, false, || ()).unwrap();
+        let (conn, mut peer) = UnixStream::pair().unwrap();
+        let _w = feed.serve(conn).unwrap();
+        let mut received = 0usize;
+        let mut buf = vec![0u8; MAX_INPUT + 8];
+        loop {
+            let mut kind = [0u8; 1];
+            if peer.read_exact(&mut kind).is_err() {
+                break;
+            }
+            let mut len_bytes = [0u8; 4];
+            peer.read_exact(&mut len_bytes).unwrap();
+            let len = u32::from_le_bytes(len_bytes) as usize;
+            peer.read_exact(&mut buf[..len]).unwrap();
+            match kind[0] {
+                IN_DATA => {
+                    let off = u64::from_le_bytes(buf[..8].try_into().unwrap());
+                    let chunk_len = len - 8;
+                    received = off as usize + chunk_len;
+                    feed.ack(received as u64);
+                }
+                IN_EOF => break,
+                k => panic!("unexpected frame {k}"),
+            }
+        }
+        assert_eq!(received, TOTAL);
+    }
+
+    #[test]
+    fn ended_exponential_backoff_detects_exit_promptly() {
+        use std::os::fd::AsRawFd;
+
+        let root = crate::test_util::TempDir::new("ended-backoff");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let vm = Pinned { host: host.clone(), name: "fast-exit".into(), pin: Arc::default() };
+        let lock_path = host.vms("fast-exit", "lock").unwrap();
+        std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+        let file = std::fs::File::create(&lock_path).unwrap();
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+        assert!(vm.alive());
+        let start = Instant::now();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(5));
+            drop(file);
+        });
+        assert!(ended(&vm));
+        let elapsed = start.elapsed();
+        // With 1ms doubling backoff, a 5ms exit completes in ~7-15ms, well under the old 50ms flat sleep.
+        assert!(elapsed < Duration::from_millis(35), "ended took {elapsed:?}");
     }
 }
