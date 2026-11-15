@@ -2263,9 +2263,13 @@ fn software(args: &Args, src: &str) -> Result<i32> {
     let machine = config.boot(&rootfs, processes)?;
     machine.exec(meta.argv, |kind, bytes| {
         if kind == guest::FRAME_STDERR {
-            std::io::stderr().lock().write_all(bytes)?;
+            let mut out = std::io::stderr().lock();
+            out.write_all(bytes)?;
+            out.flush()?;
         } else {
-            std::io::stdout().lock().write_all(bytes)?;
+            let mut out = std::io::stdout().lock();
+            out.write_all(bytes)?;
+            out.flush()?;
         }
         Ok(())
     })
