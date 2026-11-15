@@ -482,7 +482,7 @@ const NAMES: usize = usize::MAX;
 
 /// Each command's words (itself included) at most, and its flags besides `GLOBAL`.
 const COMMANDS: &[(&str, usize, &[&str])] = &[
-    ("software", 2, &["kernel", "qemu", "vsock-backend", "mem", "vcpus", "timeout"]),
+    ("software", 2, &["kernel", "qemu", "control", "vsock-backend", "mem", "vcpus", "timeout"]),
     (
         "run",
         2,
@@ -2233,7 +2233,16 @@ fn image_options(args: &Args, src: &str) -> Result<image::Options> {
 /// with engine processes owned by this foreground command. Persistent VM records
 /// and migration wait for the software state/device contract.
 fn software(args: &Args, src: &str) -> Result<i32> {
+    let control = match args.get("control").unwrap_or("vsock") {
+        "vsock" => qemu::Control::Vsock,
+        "serial" => qemu::Control::Serial,
+        other => bail!("unsupported software control transport {other:?}: use vsock or serial"),
+    };
+    if control == qemu::Control::Serial && args.get("vsock-backend").is_some() {
+        bail!("--vsock-backend requires --control vsock");
+    }
     let config = qemu::Config {
+        control,
         kernel: PathBuf::from(args.get("kernel").ok_or("software needs --kernel FILE (with virtio PCI on x86_64)")?),
         qemu: args.get("qemu").map(String::from).unwrap_or_else(|| format!("qemu-system-{}", std::env::consts::ARCH)),
         vsock_backend: args.get("vsock-backend").unwrap_or("vhost-device-vsock").into(),

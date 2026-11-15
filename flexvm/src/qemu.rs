@@ -16,7 +16,18 @@ use crate::socket::{SocketRoot, Sockets};
 use crate::util::{By, Result};
 use crate::{bail, guest, template, util};
 
+#[path = "../../guest/src/control.rs"]
+#[allow(dead_code)]
+mod control;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Control {
+    Vsock,
+    Serial,
+}
+
 pub struct Config {
+    pub control: Control,
     pub kernel: PathBuf,
     pub qemu: String,
     pub vsock_backend: String,
@@ -117,6 +128,7 @@ pub struct Machine {
     processes: Arc<Processes>,
     sockets: Sockets,
     logs: PathBuf,
+    control: Option<control::Client>,
 }
 
 /// A dead emulator must end an exec even if its device backend still holds the
@@ -142,6 +154,7 @@ impl<R: Read> Read for Watched<'_, R> {
 impl Drop for Machine {
     fn drop(&mut self) {
         self.processes.stop();
+        self.control.take();
         let _ = fs::remove_dir_all(&self.logs);
     }
 }
@@ -172,19 +185,21 @@ impl Config {
         let sockets = root.allocate()?;
         let logs = root.dir.join("logs");
         fs::create_dir(&logs)?;
-        let mut machine = Machine { processes, sockets, logs };
+        let mut machine = Machine { processes, sockets, logs, control: None };
         let result = (|| -> Result<()> {
             let vhost = machine.sockets.uffd.clone();
-            let mut backend = Command::new(&self.vsock_backend);
-            backend.args(["--guest-cid", "3", "--socket"]).arg(&vhost).arg("--uds-path").arg(&machine.sockets.vsock);
-            // Each VM owns a backend, and no sibling forwarding group is shared.
-            backend.arg("--groups").arg(util::random_hex(16)?);
-            machine.processes.spawn(&mut backend, &machine.logs.join("vsock.log"))?;
             let deadline = Instant::now() + self.boot_timeout;
-            while !vhost.exists() {
-                machine.processes.alive()?;
-                remaining(deadline)?;
-                std::thread::sleep(Duration::from_millis(10));
+            if self.control == Control::Vsock {
+                let mut backend = Command::new(&self.vsock_backend);
+                backend.args(["--guest-cid", "3", "--socket"]).arg(&vhost).arg("--uds-path").arg(&machine.sockets.vsock);
+                // Each VM owns a backend, and no sibling forwarding group is shared.
+                backend.arg("--groups").arg(util::random_hex(16)?);
+                machine.processes.spawn(&mut backend, &machine.logs.join("vsock.log"))?;
+                while !vhost.exists() {
+                    machine.processes.alive()?;
+                    remaining(deadline)?;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
             }
             let arch = std::env::consts::ARCH;
             let (board, cpu, console, block, vsock, nic) = match arch {
@@ -200,9 +215,11 @@ impl Config {
             cmd.args(["-object", &json!({"qom-type":"memory-backend-memfd", "id":"ram", "size":u64::from(self.mem_mib)<<20, "share":true}).to_string()]);
             cmd.args(["-display", "none", "-monitor", "none", "-serial", "stdio", "-no-reboot"]);
             cmd.args(["-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"]);
-            cmd.arg("-kernel")
-                .arg(&kernel)
-                .args(["-append", &format!("console={console} quiet panic=1 root=/dev/vda ro init=/sbin/flexvm-init flexvm.tmpfs_mib={}", self.mem_mib)]);
+            let control_arg = if self.control == Control::Serial { " flexvm.control=serial" } else { "" };
+            cmd.arg("-kernel").arg(&kernel).args([
+                "-append",
+                &format!("console={console} quiet panic=1 root=/dev/vda ro init=/sbin/flexvm-init flexvm.tmpfs_mib={}{}", self.mem_mib, control_arg),
+            ]);
             cmd.args([
                 "-blockdev",
                 &json!({"driver":"raw", "node-name":"root", "read-only":true, "file":{"driver":"file", "filename":rootfs}}).to_string(),
@@ -210,7 +227,14 @@ impl Config {
                 &format!("{block},drive=root"),
             ]);
             // Private short socket paths contain no keyval separators.
-            cmd.args(["-chardev", &format!("socket,id=vsock,path={}", vhost.display()), "-device", &format!("{vsock},chardev=vsock")]);
+            if self.control == Control::Vsock {
+                cmd.args(["-chardev", &format!("socket,id=vsock,path={}", vhost.display()), "-device", &format!("{vsock},chardev=vsock")]);
+            } else {
+                let device = if arch == "x86_64" { "virtio-serial-pci" } else { "virtio-serial-device" };
+                cmd.args(["-device", &format!("{device},id=controlbus")]);
+                cmd.args(["-chardev", &format!("socket,id=control,path={},server=on,wait=off", machine.sockets.vsock.display())]);
+                cmd.args(["-device", &format!("virtserialport,bus=controlbus.0,chardev=control,name={}", control::PORT_NAME)]);
+            }
             // Match the agent's existing static gateway and /32 configuration.
             cmd.args([
                 "-netdev",
@@ -231,10 +255,15 @@ impl Config {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
                     Err(e) => return Err(e.into()),
                 };
-                if String::from_utf8_lossy(&bytes).contains("flexvm-init: ready") {
+                let marker = if self.control == Control::Serial { "flexvm-init: serial control ready" } else { "flexvm-init: ready" };
+                if String::from_utf8_lossy(&bytes).contains(marker) {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(10));
+            }
+            if self.control == Control::Serial {
+                let stream = util::connect_unix(&machine.sockets.vsock, remaining(deadline)?)?;
+                machine.control = Some(control::Client::connect(stream)?);
             }
             let mut last = String::new();
             loop {
@@ -283,13 +312,18 @@ impl Machine {
     /// Wait for its OK before writing the agent command; Firecracker keeps its
     /// existing pipelined handshake and does not pay this extra round trip.
     fn request(&self, line: &str, deadline: Instant) -> Result<BufReader<std::os::unix::net::UnixStream>> {
-        let stream = util::connect_unix(&self.sockets.vsock, remaining(deadline)?)?;
+        let stream = match &self.control {
+            Some(control) => control.open(deadline)?,
+            None => util::connect_unix(&self.sockets.vsock, remaining(deadline)?)?,
+        };
         let mut r = BufReader::with_capacity(1, stream);
-        By { s: r.get_mut(), at: deadline }.write_all(b"CONNECT 52\n")?;
-        let mut ok = String::new();
-        By { s: &mut r, at: deadline }.take(64).read_line(&mut ok)?;
-        if !ok.starts_with("OK ") || !ok.ends_with('\n') {
-            bail!("userspace vsock connect refused: {ok:?}");
+        if self.control.is_none() {
+            By { s: r.get_mut(), at: deadline }.write_all(b"CONNECT 52\n")?;
+            let mut ok = String::new();
+            By { s: &mut r, at: deadline }.take(64).read_line(&mut ok)?;
+            if !ok.starts_with("OK ") || !ok.ends_with('\n') {
+                bail!("userspace vsock connect refused: {ok:?}");
+            }
         }
         By { s: r.get_mut(), at: deadline }.write_all(format!("{line}\n").as_bytes())?;
         Ok(r)
@@ -372,7 +406,7 @@ mod tests {
         let sockets = root.allocate().unwrap();
         let logs = root.dir.join("logs");
         fs::create_dir(&logs).unwrap();
-        Machine { processes: Arc::new(Processes::default()), sockets, logs }
+        Machine { processes: Arc::new(Processes::default()), sockets, logs, control: None }
     }
 
     #[test]

@@ -17,6 +17,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod app;
+#[allow(dead_code)]
+mod control;
 mod input;
 mod mem;
 mod net;
@@ -506,10 +508,6 @@ fn vsock_socket() -> io::Result<OwnedFd> {
 }
 
 fn serve(statuses: Statuses) -> io::Result<()> {
-    let fd = vsock_socket()?;
-    let addr = vsock_addr(libc::VMADDR_CID_ANY, proto::PORT);
-    os(unsafe { libc::bind(fd.as_raw_fd(), (&addr as *const libc::sockaddr_vm).cast(), std::mem::size_of_val(&addr) as _) })?;
-    os(unsafe { libc::listen(fd.as_raw_fd(), 64) })?;
     let sessions = session::Sessions::default();
     let (swept, statuses_) = (sessions.clone(), statuses.clone());
     session::start_clock();
@@ -517,6 +515,13 @@ fn serve(statuses: Statuses) -> io::Result<()> {
         thread::sleep(session::sweep_every());
         session::cleanup(&swept, &statuses_);
     });
+    if std::fs::read_to_string("/proc/cmdline")?.split_whitespace().any(|arg| arg == "flexvm.control=serial") {
+        return serve_serial(statuses, sessions);
+    }
+    let fd = vsock_socket()?;
+    let addr = vsock_addr(libc::VMADDR_CID_ANY, proto::PORT);
+    os(unsafe { libc::bind(fd.as_raw_fd(), (&addr as *const libc::sockaddr_vm).cast(), std::mem::size_of_val(&addr) as _) })?;
+    os(unsafe { libc::listen(fd.as_raw_fd(), 64) })?;
     let mut backoff = Duration::ZERO;
     loop {
         let mut peer: libc::sockaddr_vm = unsafe { std::mem::zeroed() };
@@ -538,59 +543,109 @@ fn serve(statuses: Statuses) -> io::Result<()> {
         if !host_peer(&peer, peer_len) {
             continue;
         }
-        // The host sends its request with the connection; don't let a silent one stall accepting.
-        sock_timeout(conn, libc::SO_RCVTIMEO, Some(Duration::from_secs(1)));
-        let Ok(mut r) = stream.try_clone().map(BufReader::new) else { continue };
-        let line = match request_line(&mut r) {
-            Ok(line) => line,
-            Err(e) => {
-                let _ = fail(&stream, e);
-                continue;
-            }
-        };
-        // START is on every start's critical path, where a new thread costs ms: quick requests are answered inline.
-        // Non-blocking session control verbs (FENCE, SESSIONS, CLOSE, RELEASE) also run inline without a thread (#1338).
-        if ["PING", "START ", "START6 ", "CLOCK ", "FORKS", "HOSTNAME ", "FENCE", "SESSIONS", "CLOSE ", "RELEASE "].iter().any(|v| line.starts_with(v)) {
-            let _ = handle(&stream, &line, &statuses, &sessions);
-            continue;
-        }
-        let (statuses, sessions) = (statuses.clone(), sessions.clone());
-        let at = Instant::now() + BODY_TIMEOUT;
-        // Out of threads: drop this connection (closing it) rather than abort PID 1.
-        let _ = thread::Builder::new().spawn(move || {
-            match line.split_whitespace().next() {
-                Some("SESSIONS") => return drop(msg(&stream, session::counts(&sessions))),
-                Some("FENCE") => {
-                    return drop(match session::fence(&line, &sessions) {
-                        Ok(reply) => msg(&stream, reply),
-                        Err(e) => fail(&stream, e),
-                    })
-                }
-                Some("SESSION" | "ARGV" | "ATTACH" | "REJOIN" | "CLOSE" | "RELEASE") => {}
-                // Its input may have come with the request, read ahead into `r`.
-                Some("APPIN") => return drop(app::appin(line.trim_end().split_once(' ').map_or("", |(_, a)| a), &stream, r.buffer())),
-                _ => return drop(handle(&stream, &line, &statuses, &sessions)),
-            }
-            // A session's command arrives a round trip later, which a guest faulting in memory can stretch past a second.
-            let body = match session::parse(&line) {
-                Ok(session::Request::Start { len, .. }) => match BodyReader::admit() {
-                    Some(_reader) => read_body(&mut r, conn, len, at),
-                    None => Err(io::Error::other(busy())),
-                },
-                _ => Ok(Vec::new()),
-            };
-            // After the command, input an interactive session's client sent at once (read ahead into `r`) is its feeder's.
-            let body = body.map(|mut body| {
-                body.extend_from_slice(r.buffer());
-                body
-            });
-            // Kept by the session, so that a later ATTACH can shut this one down.
-            let _ = match body.and_then(|body| Ok((body, stream.try_clone()?))) {
-                Ok((body, conn)) => session::handle(&stream, &body, Some(conn), &line, &sessions, &statuses),
-                Err(e) => fail(&stream, e),
-            };
-        });
+        accept_request(stream, &statuses, &sessions);
     }
+}
+
+fn serve_serial(statuses: Statuses, sessions: session::Sessions) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let (incoming, requests) = std::sync::mpsc::sync_channel(64);
+    // One dispatcher preserves quick-request ordering, just like the vsock
+    // accept loop. Session bodies/attachments still run concurrently.
+    thread::Builder::new().name("serial-requests".into()).spawn(move || {
+        for stream in requests {
+            accept_request(File::from(OwnedFd::from(stream)), &statuses, &sessions);
+        }
+    })?;
+    let until = Instant::now() + Duration::from_secs(30);
+    let path = loop {
+        let mut found = None;
+        if let Ok(ports) = std::fs::read_dir("/sys/class/virtio-ports") {
+            for port in ports {
+                let port = port?;
+                if std::fs::read_to_string(port.path().join("name")).is_ok_and(|name| name.trim() == control::PORT_NAME) {
+                    found = Some(std::path::Path::new("/dev").join(port.file_name()));
+                    break;
+                }
+            }
+        }
+        if let Some(path) = found {
+            break path;
+        }
+        if Instant::now() >= until {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "missing FlexVM virtio-serial port"));
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let meta = std::fs::symlink_metadata(&path)?;
+    if !meta.file_type().is_char_device() || meta.uid() != 0 {
+        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "unexpected serial control device"));
+    }
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    loop {
+        let port = File::options().read(true).write(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(&path)?;
+        log("serial control ready");
+        if let Err(e) = control::serve(port, incoming.clone()) {
+            log(&format!("serial control disconnected: {e}"));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn accept_request(stream: File, statuses: &Statuses, sessions: &session::Sessions) {
+    let conn = stream.as_raw_fd();
+    // The host sends its request with the connection; don't let a silent one stall accepting.
+    sock_timeout(conn, libc::SO_RCVTIMEO, Some(Duration::from_secs(1)));
+    let Ok(mut r) = stream.try_clone().map(BufReader::new) else { return };
+    let line = match request_line(&mut r) {
+        Ok(line) => line,
+        Err(e) => {
+            let _ = fail(&stream, e);
+            return;
+        }
+    };
+    // START is on every start's critical path, where a new thread costs ms: quick requests are answered inline.
+    // Non-blocking session control verbs (FENCE, SESSIONS, CLOSE, RELEASE) also run inline without a thread (#1338).
+    if ["PING", "START ", "START6 ", "CLOCK ", "FORKS", "HOSTNAME ", "FENCE", "SESSIONS", "CLOSE ", "RELEASE "].iter().any(|v| line.starts_with(v)) {
+        let _ = handle(&stream, &line, statuses, sessions);
+        return;
+    }
+    let (statuses, sessions) = (statuses.clone(), sessions.clone());
+    let at = Instant::now() + BODY_TIMEOUT;
+    // Out of threads: drop this connection (closing it) rather than abort PID 1.
+    let _ = thread::Builder::new().spawn(move || {
+        match line.split_whitespace().next() {
+            Some("SESSIONS") => return drop(msg(&stream, session::counts(&sessions))),
+            Some("FENCE") => {
+                return drop(match session::fence(&line, &sessions) {
+                    Ok(reply) => msg(&stream, reply),
+                    Err(e) => fail(&stream, e),
+                })
+            }
+            Some("SESSION" | "ARGV" | "ATTACH" | "REJOIN" | "CLOSE" | "RELEASE") => {}
+            // Its input may have come with the request, read ahead into `r`.
+            Some("APPIN") => return drop(app::appin(line.trim_end().split_once(' ').map_or("", |(_, a)| a), &stream, r.buffer())),
+            _ => return drop(handle(&stream, &line, &statuses, &sessions)),
+        }
+        // A session's command arrives a round trip later, which a guest faulting in memory can stretch past a second.
+        let body = match session::parse(&line) {
+            Ok(session::Request::Start { len, .. }) => match BodyReader::admit() {
+                Some(_reader) => read_body(&mut r, conn, len, at),
+                None => Err(io::Error::other(busy())),
+            },
+            _ => Ok(Vec::new()),
+        };
+        // After the command, input an interactive session's client sent at once (read ahead into `r`) is its feeder's.
+        let body = body.map(|mut body| {
+            body.extend_from_slice(r.buffer());
+            body
+        });
+        // Kept by the session, so that a later ATTACH can shut this one down.
+        let _ = match body.and_then(|body| Ok((body, stream.try_clone()?))) {
+            Ok((body, conn)) => session::handle(&stream, &body, Some(conn), &line, &sessions, &statuses),
+            Err(e) => fail(&stream, e),
+        };
+    });
 }
 
 /// Sets a socket's SO_RCVTIMEO or SO_SNDTIMEO; None: none, its reads (writes) wait however long it takes.
