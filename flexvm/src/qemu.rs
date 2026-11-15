@@ -130,7 +130,7 @@ impl<R: Read> Read for Watched<'_, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
             match self.reader.read(buf) {
-                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted) => {
                     self.processes.alive().map_err(|e| std::io::Error::other(e.to_string()))?;
                 }
                 result => return result,
@@ -418,13 +418,24 @@ mod tests {
 
     #[test]
     fn dead_engine_ends_exec_even_when_backend_holds_its_socket_open() {
+        struct InterruptedOnce(std::os::unix::net::UnixStream, bool);
+        impl Read for InterruptedOnce {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.1 {
+                    self.1 = true;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                self.0.read(buf)
+            }
+        }
         let machine = machine();
         machine.processes.spawn(Command::new("false").arg("ignored"), &machine.logs.join("qemu.log")).unwrap();
         let (stream, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
         stream.set_read_timeout(Some(Duration::from_millis(25))).unwrap();
-        let mut watched = Watched { reader: stream, processes: &machine.processes };
+        let mut watched = Watched { reader: InterruptedOnce(stream, false), processes: &machine.processes };
         let started = Instant::now();
-        assert!(watched.read(&mut [0]).unwrap_err().to_string().contains("exited"));
+        let error = watched.read(&mut [0]).unwrap_err();
+        assert!(error.to_string().contains("exited"), "{error:?}");
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 }
