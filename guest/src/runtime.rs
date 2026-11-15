@@ -75,7 +75,8 @@ fn enter_in(cmd: &mut Command, ns: &Namespaces) -> io::Result<()> {
     // Command applies its cwd before pre_exec, but setns(CLONE_NEWNS) resets
     // pwd/root to the new namespace's root. Resolve the requested path again
     // after entering, so it also sees mounts made by the app in that namespace.
-    let cwd = cmd.get_current_dir().map(|p| CString::new(p.as_os_str().as_bytes())).transpose()?;
+    let cwd = cmd.get_current_dir().map(std::path::absolute).transpose()?;
+    let cwd = cwd.map(|p| CString::new(p.as_os_str().as_bytes())).transpose()?;
     unsafe {
         cmd.pre_exec(move || {
             os(libc::setns(cgroup, libc::CLONE_NEWCGROUP))?;
@@ -99,11 +100,14 @@ mod tests {
         let ns = Namespaces { mount: File::open("/proc/self/ns/mnt").unwrap(), cgroup: File::open("/proc/self/ns/cgroup").unwrap() };
         let cwd = std::env::current_dir().unwrap();
         assert_ne!(cwd, std::path::Path::new("/"));
-        let mut cmd = Command::new("/bin/pwd");
-        cmd.current_dir(&cwd);
-        enter_in(&mut cmd, &ns).unwrap();
-        let output = cmd.output().unwrap();
-        assert!(output.status.success(), "{output:?}");
-        assert_eq!(output.stdout, [cwd.as_os_str().as_bytes(), b"\n"].concat());
+        for requested in [cwd.as_path(), std::path::Path::new("guest")] {
+            let expected = std::path::absolute(requested).unwrap();
+            let mut cmd = Command::new("/bin/pwd");
+            cmd.current_dir(requested);
+            enter_in(&mut cmd, &ns).unwrap();
+            let output = cmd.output().unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(output.stdout, [expected.as_os_str().as_bytes(), b"\n"].concat());
+        }
     }
 }
