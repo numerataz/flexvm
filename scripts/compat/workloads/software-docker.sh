@@ -47,4 +47,9 @@ docker run --rm --memory=64m --cpus=.5 --pids-limit=64 -v software-data:/data -v
 '
 test "$(cat /tmp/flexvm-bind/marker)" = software-bind
 test "$(docker run --rm -v software-data:/data "$image" cat /data/marker)" = software-docker
+mkdir /tmp/build-context
+printf 'FROM %s\nRUN printf buildkit-ok >/built\nCMD ["/bin/cat", "/built"]\n' "$image" > /tmp/build-context/Dockerfile
+DOCKER_BUILDKIT=1 docker build --no-cache --progress=plain -t flexvm-software-build /tmp/build-context
+test "$(docker run --rm flexvm-software-build)" = buildkit-ok
+echo FLEXVM_SOFTWARE_BUILDKIT_PASSED
 echo FLEXVM_SOFTWARE_DOCKER_PASSED

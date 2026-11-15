@@ -150,10 +150,12 @@ def main():
                           '--state', state.name, '--mem', '2048', '--vcpus', '2',
                           'docker.io/library/docker:27.5.1-dind', '/bin/sh', '-ec', workload.read_text()]
             HELPERS['run'](isolated(docker_cmd, docker_trace), args.timeout, docker_log)
-            if 'FLEXVM_SOFTWARE_DOCKER_PASSED' not in docker_log.read_text(errors='replace').splitlines():
-                raise RuntimeError('missing Docker success marker; see docker.log')
+            lines = docker_log.read_text(errors='replace').splitlines()
+            for marker in ('FLEXVM_SOFTWARE_DOCKER_PASSED', 'FLEXVM_SOFTWARE_BUILDKIT_PASSED'):
+                if marker not in lines:
+                    raise RuntimeError(f'missing {marker}; see docker.log')
             traced += docker_trace.read_text(errors='replace')
-            report.update(docker='passed', docker_storage_driver='vfs')
+            report.update(docker='passed', docker_storage_driver='vfs', docker_buildkit='passed')
         if any(f'"{dev}"' in traced for dev in ('/dev/kvm', '/dev/vhost-vsock')):
             raise RuntimeError('software execution accessed a host virtualization device; see files.strace')
         report.update(status='passed', kvm_access=False, vhost_vsock_access=False,
