@@ -215,7 +215,13 @@ pub fn transient(m: &str) -> bool {
     m.contains(TRY_AGAIN)
 }
 
-fn session_on<S: Read + Write>(action: &str, id: &str, offset: u64, cmd: &str, open: impl FnOnce(&str) -> Result<BufReader<S>>) -> Result<BufReader<S>> {
+pub(crate) fn session_on<S: Read + Write>(
+    action: &str,
+    id: &str,
+    offset: u64,
+    cmd: &str,
+    open: impl FnOnce(&str) -> Result<BufReader<S>>,
+) -> Result<BufReader<S>> {
     if !valid_session_id(id) {
         bail!("bad session id");
     }

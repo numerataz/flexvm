@@ -211,3 +211,47 @@ sleep. Cortex-A72 continued the live inner guest across the same sequence.
 These results establish a tested software CPU profile, not support for every
 emulated CPU feature, migration between engines/CPU profiles, or FlexVM's
 existing snapshot format.
+
+## Experimental software backend
+
+`flexvm software` cold-boots an OCI image with QEMU TCG, the real FlexVM guest
+agent, and a userspace virtio-vsock device. It requires neither host `/dev/kvm`
+nor `/dev/vhost-vsock`. The foreground command owns both engine processes and
+removes them when the guest command exits, startup fails, or it is interrupted.
+Image preparation currently requires root, as with the existing image builder.
+
+Install QEMU with its seccomp and userspace networking support, and the reviewed
+userspace vsock tool:
+
+```sh
+cargo install vhost-device-vsock --version 0.3.0 --locked
+sudo flexvm software --kernel /var/lib/flexvm/artifacts/vmlinux \
+  --vsock-backend "$HOME/.cargo/bin/vhost-device-vsock" \
+  public.ecr.aws/docker/library/busybox:1.36 /bin/echo hello
+```
+
+The kernel needs virtio PCI on x86_64; ARM uses virtio MMIO and the PL011 console.
+These transports are included in the v0.5.1 kernel recipe, along with PCI MSI
+interrupt support. `--kernel` is explicit because a Firecracker template's saved machine state cannot be loaded by QEMU.
+`--qemu PATH` selects the executable; `--mem MIB` (default 512) and `--vcpus N`
+(default 1) select fixed guest resources. `--timeout SECS` bounds boot, not the
+lifetime of the guest command. Image `--env`, `--workdir`, `--user`, `--entrypoint`
+and `--cmd` options apply, and the command returns its guest exit status.
+Networking uses QEMU's userspace stack with no TAP device, and fresh vsock
+backends have private Unix sockets and independent CID spaces.
+
+This is an initial foreground execution path. It does not create the persistent
+VM records used by `ps`, `exec`, background/restart policies or the Docker API.
+Elastic memory, persistent lifecycle operations, checkpoint and migration still
+need integration. QEMU's vhost-user-vsock frontend currently blocks migration;
+its device state/reset contract must be implemented and tested before it can
+replace the existing Firecracker lifecycle path. ARM exposes emulated EL2 for
+the guest Linux KVM driver; x86 TCG does not yet provide the required VMX/SVM
+interface for unchanged nested KVM clients. These remain tracked in #1358/#1327.
+
+The native x86/ARM CI acceptance case masks both host virtualization devices,
+traces the complete process tree, pulls BusyBox, boots the real agent, and checks
+literal argv, environment, workdir, non-root UID/GID, writable overlay state,
+stdout/stderr and exit status 7. A second workload verifies that signaling only
+the owner ends both engines and removes their private sockets. Reports record the executable/kernel/backend
+identities and retain the console and syscall trace.
