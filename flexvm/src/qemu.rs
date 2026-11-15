@@ -221,6 +221,21 @@ impl Config {
             cmd.args(["-qmp", &format!("unix:{},server=on,wait=off", machine.sockets.api.display())]);
             machine.processes.spawn(&mut cmd, &machine.logs.join("qemu.log"))?;
             crate::info!("software: waiting for guest agent");
+            // The userspace device accepts host connections before the guest's
+            // queues are initialized. Do not send requests into that boot window.
+            loop {
+                machine.processes.alive()?;
+                remaining(deadline)?;
+                let bytes = match fs::read(machine.logs.join("qemu.log")) {
+                    Ok(bytes) => bytes,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                    Err(e) => return Err(e.into()),
+                };
+                if String::from_utf8_lossy(&bytes).contains("flexvm-init: ready") {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
             let mut last = String::new();
             loop {
                 machine.processes.alive()?;

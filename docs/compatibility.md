@@ -231,8 +231,8 @@ sudo flexvm software --kernel /var/lib/flexvm/artifacts/vmlinux \
 ```
 
 The kernel needs virtio PCI on x86_64; ARM uses virtio MMIO and the PL011 console.
-These transports are included in the v0.5.1 kernel recipe (with PCI MSI interrupts). `--kernel` is explicit
-because a Firecracker template's saved machine state cannot be loaded by QEMU.
+These transports are included in the v0.5.1 kernel recipe, along with PCI MSI
+interrupt support. `--kernel` is explicit because a Firecracker template's saved machine state cannot be loaded by QEMU.
 `--qemu PATH` selects the executable; `--mem MIB` (default 512) and `--vcpus N`
 (default 1) select fixed guest resources. `--timeout SECS` bounds boot, not the
 lifetime of the guest command. Image `--env`, `--workdir`, `--user`, `--entrypoint`
