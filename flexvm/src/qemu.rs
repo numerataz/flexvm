@@ -37,7 +37,11 @@ struct Process {
 
 impl Drop for Process {
     fn drop(&mut self) {
-        if self.child.try_wait().is_ok_and(|status| status.is_none()) {
+        let exited = match self.child.try_wait() {
+            Ok(status) => status.is_some(),
+            Err(e) => e.raw_os_error() == Some(libc::ECHILD),
+        };
+        if !exited {
             let _ = self.child.kill();
         }
         let _ = self.child.wait();

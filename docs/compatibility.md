@@ -252,5 +252,6 @@ interface for unchanged nested KVM clients. These remain tracked in #1358/#1327.
 The native x86/ARM CI acceptance case masks both host virtualization devices,
 traces the complete process tree, pulls BusyBox, boots the real agent, and checks
 literal argv, environment, workdir, non-root UID/GID, writable overlay state,
-stdout/stderr and exit status 7. Reports record the executable/kernel/backend
+stdout/stderr and exit status 7. A second workload verifies that signaling only
+the owner ends both engines and removes their private sockets. Reports record the executable/kernel/backend
 identities and retain the console and syscall trace.

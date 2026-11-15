@@ -154,6 +154,12 @@ jobs:
           fi
           sudo python3 scripts/compat/software-boot.py --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-boot" ${{ matrix.extra }} "${extra[@]}"
           cat "$RUNNER_TEMP/software-boot/report.json"
+      - name: Save software kernel
+        if: success() && steps.software-kernel.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/software-state/artifacts
+          key: ${{ steps.software-kernel.outputs.cache-primary-key }}
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -173,12 +179,6 @@ jobs:
         run: |
           sudo python3 scripts/compat/software-agent.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --vsock-backend "$RUNNER_TEMP/software-vsock/bin/vhost-device-vsock" --output "$RUNNER_TEMP/software-agent"
           cat "$RUNNER_TEMP/software-agent/report.json"
-      - name: Save software kernel
-        if: success() && steps.software-kernel.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ runner.temp }}/software-state/artifacts
-          key: ${{ steps.software-kernel.outputs.cache-primary-key }}
       - name: Upload software execution evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
