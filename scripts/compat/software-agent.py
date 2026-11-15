@@ -111,7 +111,7 @@ def main():
 for port in /sys/class/virtio-ports/*; do
  if test "$(cat "$port/name")" = org.flexvm.control; then
   dev=/dev/$(basename "$port")
-  test ! -r "$dev" && test ! -w "$dev" || exit 23
+  test -c "$dev" && test ! -r "$dev" && test ! -w "$dev" || exit 23
   found=1
  fi
 done
