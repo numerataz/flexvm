@@ -54,6 +54,7 @@ def main():
     parser.add_argument('--vsock-backend', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--timeout', type=int, default=300)
+    parser.add_argument('--docker', action='store_true', help='also verify nested Docker, cgroups, storage and networking')
     args = parser.parse_args()
     if os.geteuid() != 0:
         parser.error('run as root to mask host devices in a private mount namespace')
@@ -141,6 +142,18 @@ def main():
         if any(path.exists() for path in runtime):
             raise RuntimeError('private sockets survived owner cancellation')
         traced = trace.read_text(errors='replace') + cancel_trace.read_text(errors='replace')
+        if args.docker:
+            docker_trace = out / 'docker-files.strace'
+            docker_log = out / 'docker.log'
+            workload = Path(__file__).with_name('workloads') / 'software-docker.sh'
+            docker_cmd = [str(binary), 'software', '--kernel', str(kernel), '--vsock-backend', str(backend),
+                          '--state', state.name, '--mem', '2048', '--vcpus', '2',
+                          'docker.io/library/docker:27.5.1-dind', '/bin/sh', '-ec', workload.read_text()]
+            HELPERS['run'](isolated(docker_cmd, docker_trace), args.timeout, docker_log)
+            if 'FLEXVM_SOFTWARE_DOCKER_PASSED' not in docker_log.read_text(errors='replace').splitlines():
+                raise RuntimeError('missing Docker success marker; see docker.log')
+            traced += docker_trace.read_text(errors='replace')
+            report.update(docker='passed', docker_storage_driver='vfs')
         if any(f'"{dev}"' in traced for dev in ('/dev/kvm', '/dev/vhost-vsock')):
             raise RuntimeError('software execution accessed a host virtualization device; see files.strace')
         report.update(status='passed', kvm_access=False, vhost_vsock_access=False,
