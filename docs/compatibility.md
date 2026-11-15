@@ -270,3 +270,18 @@ device-masked and traced. This establishes basic container operation under TCG;
 it does not establish rootless Docker, overlay storage, persistent VM lifecycle
 or a performance guarantee. Docker console output and its syscall trace are
 retained beside the agent report.
+
+`--control serial` selects an additional guest-management path over QEMU's
+virtio-serial device. It does not start a userspace vsock backend, and rejects
+`--vsock-backend`. The agent keeps the dedicated guest device root-only. A
+Yamux connection provides bounded, flow-controlled concurrent streams; local
+socket bridges retain request deadlines, half-close behavior and full-close
+cancellation. Each stream is acknowledged after admission to the ordered guest
+dispatcher, before its socket is exposed to the caller. Native x86/ARM CI runs
+the full agent/Docker/BuildKit acceptance case through both control paths and
+checks that user 1001 cannot read or write the serial management device.
+
+This removes the vhost-user-vsock device from that execution profile. It is a
+prerequisite for software checkpoint integration, not a claim that persistent
+VM records, checkpoint/restore or migration are implemented. Vsock remains the
+default while the serial path's lifecycle behavior is established.
