@@ -261,7 +261,11 @@ image through the same software backend. Native x86/ARM CI includes this case. I
 starts a real Docker daemon with the `vfs` storage driver and cgroup v2, imports
 a small BusyBox image from the guest runtime, and checks memory/CPU/PID controller
 settings, outbound HTTP, a bind mount and a
-named volume read by a second container. The complete host process tree remains
+named volume read by a second container. It also requires BuildKit to execute an
+uncached Dockerfile `RUN`, export an image and run that image with its expected
+output, using the imported base image without another registry pull. This covers
+Docker's bundled BuildKit; standalone/rootless BuildKit and containerd/CRI remain
+separate acceptance cases. The complete host process tree remains
 device-masked and traced. This establishes basic container operation under TCG;
 it does not establish rootless Docker, overlay storage, persistent VM lifecycle
 or a performance guarantee. Docker console output and its syscall trace are
