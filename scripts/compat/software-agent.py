@@ -7,6 +7,7 @@ from pathlib import Path
 import platform
 import runpy
 import signal
+import tempfile
 import time
 
 HELPERS = runpy.run_path(str(Path(__file__).with_name('software-boot.py')))
@@ -74,7 +75,11 @@ def main():
         raise HELPERS['Interrupted'](number)
 
     previous = {number: signal.signal(number, interrupted) for number in (signal.SIGINT, signal.SIGTERM)}
+    state = None
     try:
+        # Image staging requires trusted root-owned ancestors. GitHub's report
+        # directory is runner-owned, so keep ephemeral VM state under /var/lib.
+        state = tempfile.TemporaryDirectory(prefix='flexvm-software-test-', dir='/var/lib')
         mask = out / 'unusable-device'
         mask.touch(mode=0o600)
         trace = out / 'files.strace'
@@ -91,7 +96,7 @@ def main():
  echo FLEXVM_SOFTWARE_AGENT_STDERR >&2
  exit 7'''
         cmd = [str(binary), 'software', '--kernel', str(kernel), '--vsock-backend', str(backend),
-               '--state', str(out / 'state'), '--user', '1001:1001', '--workdir', '/tmp',
+               '--state', state.name, '--user', '1001:1001', '--workdir', '/tmp',
                '--env', 'FLEXVM_CHECK=software-value', '--timeout', '90',
                'public.ecr.aws/docker/library/busybox:1.36', '/bin/sh', '-c', check,
                'software-check', 'literal spaces $HOME *']
@@ -126,7 +131,7 @@ def main():
             os.kill(owner, signal.SIGTERM)
 
         cancel_cmd = [str(binary), 'software', '--kernel', str(kernel), '--vsock-backend', str(backend),
-                      '--state', str(out / 'state'), 'public.ecr.aws/docker/library/busybox:1.36',
+                      '--state', state.name, 'public.ecr.aws/docker/library/busybox:1.36',
                       '/bin/sh', '-c', 'echo FLEXVM_SOFTWARE_CANCEL_READY; sleep 600']
         wrapped = ['sh', '-c', '"$@"; status=$?; test "$status" -eq 143 || exit 1', 'sh', *cancel_cmd]
         cancel_trace = out / 'cancel-files.strace'
@@ -145,6 +150,8 @@ def main():
     except Exception as exc:
         report.update(status='failed', error=str(exc))
     finally:
+        if state is not None:
+            state.cleanup()
         for number, handler in previous.items():
             signal.signal(number, handler)
         report['elapsed_s'] = round(time.monotonic() - started, 3)
