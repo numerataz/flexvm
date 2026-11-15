@@ -196,6 +196,8 @@ jobs:
             ${{ runner.temp }}/software-agent/report.json
             ${{ runner.temp }}/software-agent/guest.log
             ${{ runner.temp }}/software-agent/files.strace
+            ${{ runner.temp }}/software-agent/cancel.log
+            ${{ runner.temp }}/software-agent/cancel-files.strace
           if-no-files-found: ignore
 
   # Whether the aarch64 runner can run VMs: it decides what e2e-aarch64 runs (the KVM shards, or what
