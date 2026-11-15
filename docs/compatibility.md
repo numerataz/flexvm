@@ -258,8 +258,9 @@ identities and retain the console and syscall trace.
 
 Add `--docker` to `scripts/compat/software-agent.py` to boot a stock Docker-in-Docker
 image through the same software backend. Native x86/ARM CI includes this case. It
-starts a real Docker daemon with the `vfs` storage driver and cgroup v2, pulls
-BusyBox, checks memory/CPU/PID controller settings, outbound HTTP, a bind mount and a
+starts a real Docker daemon with the `vfs` storage driver and cgroup v2, imports
+a small BusyBox image from the guest runtime, and checks memory/CPU/PID controller
+settings, outbound HTTP, a bind mount and a
 named volume read by a second container. The complete host process tree remains
 device-masked and traced. This establishes basic container operation under TCG;
 it does not establish rootless Docker, overlay storage, persistent VM lifecycle

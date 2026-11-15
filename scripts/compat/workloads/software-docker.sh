@@ -23,8 +23,19 @@ done
 docker info
 test "$(docker info --format '{{.Driver}}')" = vfs
 test "$(docker info --format '{{.CgroupVersion}}')" = 2
-image=public.ecr.aws/docker/library/busybox:1.36
-docker pull "$image"
+# Import the guest's BusyBox and musl runtime instead of depending on a second
+# registry pull from inside the VM (public registries can rate-limit CI).
+root=/tmp/container-root
+mkdir -p "$root/bin" "$root/lib"
+cp /bin/busybox "$root/bin/"
+for library in /lib/ld-musl-*.so.1 /lib/libc.musl-*.so.1; do
+    if [ -e "$library" ]; then cp -L "$library" "$root/lib/"; fi
+done
+test -f "$root"/lib/ld-musl-*.so.1
+for applet in sh cat wget; do ln -s busybox "$root/bin/$applet"; done
+image=flexvm-software-base:local
+tar -C "$root" -cf /tmp/software-base.tar .
+docker import /tmp/software-base.tar "$image"
 docker volume create software-data
 docker run --rm --memory=64m --cpus=.5 --pids-limit=64 -v software-data:/data -v /tmp/flexvm-bind:/bind "$image" sh -ec '
  test "$(cat /sys/fs/cgroup/memory.max)" = 67108864
