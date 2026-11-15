@@ -203,7 +203,10 @@ impl Config {
             }
             let arch = std::env::consts::ARCH;
             let (board, cpu, console, block, vsock, nic) = match arch {
-                "x86_64" => ("q35", "max", "ttyS0", "virtio-blk-pci", "vhost-user-vsock-pci", "virtio-net-pci"),
+                // TCG implements AMD SVM: the ordinary guest Linux KVM driver
+                // supplies the ABI without a host KVM device. Enforce support
+                // instead of silently losing guest virtualization capabilities.
+                "x86_64" => ("q35", "max,svm=on,enforce=on", "ttyS0", "virtio-blk-pci", "vhost-user-vsock-pci", "virtio-net-pci"),
                 "aarch64" => {
                     ("virt,virtualization=on,gic-version=3", "cortex-a72", "ttyAMA0", "virtio-blk-device", "vhost-user-vsock-device", "virtio-net-device")
                 }

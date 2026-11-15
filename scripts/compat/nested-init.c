@@ -28,7 +28,14 @@ int main(void) {
         sleep(1);
     }
     puts("FLEXVM_SOFTWARE_INNER_COMPLETE");
-    if (reboot(RB_POWER_OFF) < 0) {
+    // Firecracker's x86 machine has no ACPI power-off device. Its supported
+    // i8042 reset request exits the VMM; ARM uses PSCI system power-off.
+#if defined(__x86_64__)
+    int stop = RB_AUTOBOOT;
+#else
+    int stop = RB_POWER_OFF;
+#endif
+    if (reboot(stop) < 0) {
         perror("inner power off");
         for (;;) pause();
     }

@@ -245,9 +245,11 @@ VM records used by `ps`, `exec`, background/restart policies or the Docker API.
 Elastic memory, persistent lifecycle operations, checkpoint and migration still
 need integration. QEMU's vhost-user-vsock frontend currently blocks migration;
 its device state/reset contract must be implemented and tested before it can
-replace the existing Firecracker lifecycle path. ARM exposes emulated EL2 for
-the guest Linux KVM driver; x86 TCG does not yet provide the required VMX/SVM
-interface for unchanged nested KVM clients. These remain tracked in #1358/#1327.
+replace the existing Firecracker lifecycle path. ARM exposes emulated EL2, and
+x86 TCG exposes AMD SVM, for the ordinary guest Linux KVM drivers. Intel VMX is
+not the x86 software profile. The previous statement that TCG lacked both VMX
+and SVM was incorrect. Hierarchical lifecycle integration and optional
+parent-level child scheduling remain tracked in #1358/#1327.
 
 The native x86/ARM CI acceptance case masks both host virtualization devices,
 traces the complete process tree, pulls BusyBox, boots the real agent, and checks
@@ -285,3 +287,14 @@ This removes the vhost-user-vsock device from that execution profile. It is a
 prerequisite for software checkpoint integration, not a claim that persistent
 VM records, checkpoint/restore or migration are implemented. Vsock remains the
 default while the serial path's lifecycle behavior is established.
+
+`scripts/compat/software-kvm.py` runs real KVM clients inside an ordinary OCI
+image using the software CLI and serial agent transport. On x86 it runs all nine
+KVM ABI reference checks, including coherent/concurrent caller RAM, ioeventfd,
+descriptor lifetime and vCPU state. ARM runs its architecture-specific KVM probe.
+The same VM then runs an unchanged, pinned Firecracker binary, which boots an
+inner Linux guest, runs independent timer ticks and exits successfully. ARM uses
+PSCI power-off; x86 requests i8042 reset because Firecracker has no ACPI power-off
+device. This is client boot/execution acceptance, not software checkpoint or
+migration acceptance. Native x86/ARM CI masks both host virtualization devices,
+traces the entire host process tree and retains a digest-bearing report and logs.
