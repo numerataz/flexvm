@@ -24,6 +24,7 @@ mod management;
 mod migrate;
 mod net;
 mod ports;
+mod qemu;
 mod restart;
 mod socket;
 mod standby;
@@ -76,6 +77,10 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
       --checkpoint NAME|ID           start it from a stored checkpoint instead of IMAGE (its name and
                                      address unless --name and --ip IP|auto), or from a checkpoint
                                      directory (a path, with a '/'); --paused holds it until unpause
+  flexvm software --kernel FILE [OPTIONS] IMAGE [CMD...]
+                                     experimental foreground QEMU TCG execution without host KVM;
+                                     --qemu PATH, --vsock-backend PATH, --mem MIB, --vcpus N,
+                                     --timeout SECS (boot only); image env/workdir/user options apply
   flexvm ps [-a] [-q] [--json] [-f, --filter KEY=VALUE]... [--format FORMAT]
                                      list running VMs (-a: stopped ones too; -q: names only);
                                      --filter name=PART|status=STATE|image=IMAGE|ip=IP (a key again:
@@ -321,7 +326,7 @@ impl Args {
                     if cmd.is_none() {
                         bail!("-- must follow the command");
                     }
-                    if matches!(cmd, Some("run" | "exec")) {
+                    if matches!(cmd, Some("run" | "exec" | "software")) {
                         // `run -- IMAGE` and `exec -- NAME`: the first word is still IMAGE or NAME,
                         // and as without the `--`, a `--` right after it is dropped.
                         let mut words = it.by_ref().peekable();
@@ -369,7 +374,7 @@ impl Args {
                 None => {
                     a.positional.push(arg);
                     // `exec NAME CMD` and `run IMAGE CMD`: the rest is the command's (a `--` first is dropped).
-                    if a.positional.len() == 2 && matches!(a.positional[0].as_str(), "exec" | "run") {
+                    if a.positional.len() == 2 && matches!(a.positional[0].as_str(), "exec" | "run" | "software") {
                         let mut cmd = it.by_ref().peekable();
                         // Kept in child_args, so the VM process drops the same one.
                         if let Some(dashdash) = cmd.next_if_eq("--") {
@@ -433,7 +438,7 @@ fn main() {
         _ => false,
     };
     util::set_verbose(args.has("verbose") || logged);
-    let vm = matches!(args.positional.first().map(String::as_str), Some("run" | "start" | "exec"));
+    let vm = matches!(args.positional.first().map(String::as_str), Some("run" | "start" | "exec" | "software"));
     // Here, not in `real_main`, which unit tests run on any host; after the arguments, whose errors come first.
     let host_fits = || if reads_only(&args) { Ok(()) } else { check_applies(&args).and_then(|()| util::check_page_size()) };
     let result = error.map_or_else(|| host_fits().and_then(|()| real_main(&args)), Err);
@@ -477,6 +482,7 @@ const NAMES: usize = usize::MAX;
 
 /// Each command's words (itself included) at most, and its flags besides `GLOBAL`.
 const COMMANDS: &[(&str, usize, &[&str])] = &[
+    ("software", 2, &["kernel", "qemu", "vsock-backend", "mem", "vcpus", "timeout"]),
     (
         "run",
         2,
@@ -563,7 +569,7 @@ fn check_applies(args: &Args) -> Result<()> {
         bail!("--paused applies to run --checkpoint");
     } else if !internal && first.is_none() {
         match cmd.as_str() {
-            "run" | "pull" | "rmi" => bail!("{cmd} needs IMAGE"),
+            "run" | "pull" | "rmi" | "software" => bail!("{cmd} needs IMAGE"),
             "exec" | "attach" | "stop" | "start" | "pause" | "unpause" | "kill" | "rm" | "migrate" | "logs" | "inspect" | "wait" | "restart" => {
                 bail!("{cmd} needs NAME")
             }
@@ -619,12 +625,22 @@ fn check_applies(args: &Args) -> Result<()> {
         }
         _ => {}
     }
-    let image = cmd == "pull";
+    let image = matches!(cmd.as_str(), "pull" | "software");
     if let Some((f, _)) = args.flags.iter().find(|(f, _)| ![GLOBAL, flags, if image { IMAGE_FLAGS } else { &[] }].concat().contains(&f.as_str())) {
         bail!("--{f} does not apply to {cmd} (see flexvm --help)");
     }
     if let Some(extra) = args.positional.get(most) {
         bail!("{cmd} does not take {extra:?} (see flexvm --help)");
+    }
+    if cmd == "software" {
+        for flag in ["warm", "ready-port", "ready-cmd", "ready-timeout"] {
+            if args.has(flag) {
+                bail!("--{flag} does not apply to software execution");
+            }
+        }
+        if !args.rest.is_empty() && args.has("cmd") {
+            bail!("software takes CMD or --cmd, not both");
+        }
     }
     if let Some(empty) = args.names().iter().find(|n| n.is_empty()) {
         bail!("{cmd} takes no empty word {empty:?}");
@@ -717,6 +733,7 @@ fn real_main(args: &Args) -> Result<()> {
             restart::due(&host, name, |n| start(&host, args, n))
         }
         Some("pull") => pull(args, name),
+        Some("software") => util::exit(software(args, name)?),
         Some("images") => images(&open_host(args)?, &paths(args)?, args),
         Some("tag") => print(template::tag(&paths(args)?, name, arg2.ok_or("tag needs SRC DST")?)?),
         Some("image" | "system") => management::system(args, name),
@@ -2212,6 +2229,48 @@ fn image_options(args: &Args, src: &str) -> Result<image::Options> {
     })
 }
 
+/// First software execution slice: reuse OCI preparation and the real agent,
+/// with engine processes owned by this foreground command. Persistent VM records
+/// and migration wait for the software state/device contract.
+fn software(args: &Args, src: &str) -> Result<i32> {
+    let config = qemu::Config {
+        kernel: PathBuf::from(args.get("kernel").ok_or("software needs --kernel FILE (with virtio PCI on x86_64)")?),
+        qemu: args.get("qemu").map(String::from).unwrap_or_else(|| format!("qemu-system-{}", std::env::consts::ARCH)),
+        vsock_backend: args.get("vsock-backend").unwrap_or("vhost-device-vsock").into(),
+        mem_mib: args.parse_or("mem", 512)?,
+        vcpus: args.parse_or("vcpus", 1)?,
+        boot_timeout: Duration::from_secs(args.parse_or("timeout", 90)?),
+    };
+    config.validate()?;
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("software image preparation currently requires root");
+    }
+    let processes = std::sync::Arc::new(qemu::Processes::default());
+    let stopping = processes.clone();
+    util::on_signal(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP], move |sig| {
+        template::interrupt(sig);
+        stopping.stop();
+    });
+    let mut opts = image_options(args, src)?;
+    if !args.rest.is_empty() {
+        opts.cmd = Some(args.rest.clone());
+    }
+    let init = args.get("init").map(PathBuf::from);
+    let (rootfs, meta, _reserved, _cache_lock) = image::prepare(&state(args)?.join("images"), init.as_deref(), &opts)?;
+    if meta.argv.is_empty() {
+        bail!("software execution needs an image command or CMD");
+    }
+    let machine = config.boot(&rootfs, processes)?;
+    machine.exec(meta.argv, |kind, bytes| {
+        if kind == guest::FRAME_STDERR {
+            std::io::stderr().lock().write_all(bytes)?;
+        } else {
+            std::io::stdout().lock().write_all(bytes)?;
+        }
+        Ok(())
+    })
+}
+
 /// A command's session in the guest: its id, whether the guest took it, and
 /// how much of its output was written out (a reattach goes on from there).
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -2891,6 +2950,19 @@ mod exec_tests {
         // Between the two: an x86_64 size an aarch64 host refuses.
         assert_eq!(size(X86_64, 260097, Some(260097), 16 << 10), Ok((260097, 260097)));
         assert_eq!(size(Aarch64, 260097, Some(260097), 16 << 10), Err(boot_refusal(260097, Aarch64)));
+    }
+
+    #[test]
+    fn software_keeps_literal_command_argv_and_rejects_unimplemented_lifecycle_flags() {
+        let args = parse(&["software", "--kernel", "/kernel", "--env", "K=value", "image", "/bin/echo", "literal $HOME *", "--detach"]);
+        check_applies(&args).unwrap();
+        assert_eq!(args.rest, ["/bin/echo", "literal $HOME *", "--detach"]);
+        for flag in ["--detach", "--keep", "--paused", "--warm"] {
+            let args = parse(&["software", flag, "image"]);
+            assert!(check_applies(&args).is_err(), "{flag}");
+        }
+        let args = parse(&["software", "--cmd", "true", "image", "false"]);
+        assert!(check_applies(&args).unwrap_err().to_string().contains("not both"));
     }
 
     #[test]

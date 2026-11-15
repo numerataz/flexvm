@@ -154,6 +154,25 @@ jobs:
           fi
           sudo python3 scripts/compat/software-boot.py --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-boot" ${{ matrix.extra }} "${extra[@]}"
           cat "$RUNNER_TEMP/software-boot/report.json"
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Cache userspace vsock tool
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/software-vsock
+          key: software-vsock-0.3.0-${{ matrix.arch }}-ubuntu24-rust188
+      - name: Build software execution tools
+        run: |
+          if [ ! -x "$RUNNER_TEMP/software-vsock/bin/vhost-device-vsock" ]; then
+            cargo install vhost-device-vsock --version 0.3.0 --locked --root "$RUNNER_TEMP/software-vsock" --target-dir "$RUNNER_TEMP/vsock-build"
+          fi
+          cargo build --release -p flexvm
+      - name: Real OCI image and guest agent without host virtualization devices
+        run: |
+          sudo python3 scripts/compat/software-agent.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --vsock-backend "$RUNNER_TEMP/software-vsock/bin/vhost-device-vsock" --output "$RUNNER_TEMP/software-agent"
+          cat "$RUNNER_TEMP/software-agent/report.json"
       - name: Save software kernel
         if: success() && steps.software-kernel.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -174,6 +193,9 @@ jobs:
             ${{ runner.temp }}/software-boot/compile.log
             ${{ runner.temp }}/software-boot/kvm-compile.log
             ${{ runner.temp }}/software-boot/inner-compile.log
+            ${{ runner.temp }}/software-agent/report.json
+            ${{ runner.temp }}/software-agent/guest.log
+            ${{ runner.temp }}/software-agent/files.strace
           if-no-files-found: ignore
 
   # Whether the aarch64 runner can run VMs: it decides what e2e-aarch64 runs (the KVM shards, or what
