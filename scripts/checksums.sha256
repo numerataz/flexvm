@@ -47,3 +47,9 @@ f916fdec9af33ba68d7245f1114e9f6762bfc11aecc4961ec21692f82d51ac28 https://github.
 b2ed22d2e45e76aff9d35cb85fbf210c58bc36538128e978375df441da3aed4d https://github.com/numerataz/flexvm/releases/download/v0.4.0/firecracker-aarch64
 0b4fcd5c8ed6bd7efa15b2448b74041dff5b691c43caceb5e6f6d6d7348c7a18 https://github.com/numerataz/flexvm/releases/download/v0.4.0/vmlinux-aarch64
 179c4f498b1791ac6c37445a34162f6e0e7287b3a0e132b7a1af52d8d5fbf754 https://github.com/numerataz/flexvm/releases/download/v0.4.0/inputs-aarch64.txt
+f916fdec9af33ba68d7245f1114e9f6762bfc11aecc4961ec21692f82d51ac28 https://github.com/numerataz/flexvm/releases/download/v0.5.1/firecracker
+2ee9bf9a67d9caecff9916c3eb490b82b54359d4fed6f67b29d7b3b7e5bd2f7d https://github.com/numerataz/flexvm/releases/download/v0.5.1/vmlinux
+b59cc595cb2df13983588e359759eb6fe20a4b3260c89262bc78858e5b519860 https://github.com/numerataz/flexvm/releases/download/v0.5.1/inputs.txt
+b2ed22d2e45e76aff9d35cb85fbf210c58bc36538128e978375df441da3aed4d https://github.com/numerataz/flexvm/releases/download/v0.5.1/firecracker-aarch64
+6909ee34e09a9eef8df0287c6ec0d6532ee935ae058b181ecaa26040b74d0b82 https://github.com/numerataz/flexvm/releases/download/v0.5.1/vmlinux-aarch64
+57b9dc137fdb145f18411104c3b8bb1d7f7fda609382e26520fb8894a02cde70 https://github.com/numerataz/flexvm/releases/download/v0.5.1/inputs-aarch64.txt
