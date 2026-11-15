@@ -100,7 +100,7 @@ mod tests {
         let ns = Namespaces { mount: File::open("/proc/self/ns/mnt").unwrap(), cgroup: File::open("/proc/self/ns/cgroup").unwrap() };
         let cwd = std::env::current_dir().unwrap();
         assert_ne!(cwd, std::path::Path::new("/"));
-        for requested in [cwd.as_path(), std::path::Path::new("guest")] {
+        for requested in [cwd.as_path(), std::path::Path::new(".")] {
             let expected = std::path::absolute(requested).unwrap();
             let mut cmd = Command::new("/bin/pwd");
             cmd.current_dir(requested);
