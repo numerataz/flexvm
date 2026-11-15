@@ -177,7 +177,7 @@ jobs:
           cargo build --release -p flexvm
       - name: Real OCI image and guest agent without host virtualization devices
         run: |
-          sudo python3 scripts/compat/software-agent.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --vsock-backend "$RUNNER_TEMP/software-vsock/bin/vhost-device-vsock" --output "$RUNNER_TEMP/software-agent"
+          sudo python3 scripts/compat/software-agent.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --vsock-backend "$RUNNER_TEMP/software-vsock/bin/vhost-device-vsock" --output "$RUNNER_TEMP/software-agent" --docker --timeout 600
           cat "$RUNNER_TEMP/software-agent/report.json"
       - name: Upload software execution evidence
         if: always()
@@ -198,6 +198,8 @@ jobs:
             ${{ runner.temp }}/software-agent/files.strace
             ${{ runner.temp }}/software-agent/cancel.log
             ${{ runner.temp }}/software-agent/cancel-files.strace
+            ${{ runner.temp }}/software-agent/docker.log
+            ${{ runner.temp }}/software-agent/docker-files.strace
           if-no-files-found: ignore
 
   # Whether the aarch64 runner can run VMs: it decides what e2e-aarch64 runs (the KVM shards, or what
