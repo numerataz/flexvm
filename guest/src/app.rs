@@ -390,7 +390,7 @@ fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
         Some(g) => mem::enter(&mut cmd, g.procs.clone(), true),
         None => mem::work_procs().into_iter().for_each(|work| mem::enter(&mut cmd, work, false)),
     }
-    crate::runtime::enter(&mut cmd);
+    crate::runtime::enter(&mut cmd)?;
     if c.uid != 0 {
         confine_check(&mut cmd);
     }
@@ -601,7 +601,7 @@ fn start(settings: &str, statuses: &Statuses) -> io::Result<String> {
     if let Some(work) = mem::work_procs() {
         mem::enter(&mut cmd, work, true);
     }
-    crate::runtime::enter(&mut cmd);
+    crate::runtime::enter(&mut cmd)?;
     // A pty's session is its own already.
     credentials(&mut cmd, c, pty.is_none());
     let (pid, _) = launch(&mut app, &mut cmd, statuses, pty.map(|(master, _)| master)).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", c.argv[0])))?;

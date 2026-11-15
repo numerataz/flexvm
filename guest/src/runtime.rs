@@ -1,9 +1,11 @@
 //! The app and execs share a mount/cgroup namespace rooted at the throttled /vm group.
 //! PID 1 keeps the original mounts and stays outside that group, so it can lift memory.high.
 
+use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
@@ -63,14 +65,45 @@ fn prepare_child() -> io::Result<()> {
 
 /// After entering the child's work/check cgroup, before dropping its credentials. Execs join the
 /// same mount namespace as the app, so mounts made by the app are visible to later commands.
-pub fn enter(cmd: &mut Command) {
-    let Some(ns) = NAMESPACES.get() else { return };
+pub fn enter(cmd: &mut Command) -> io::Result<()> {
+    let Some(ns) = NAMESPACES.get() else { return Ok(()) };
+    enter_in(cmd, ns)
+}
+
+fn enter_in(cmd: &mut Command, ns: &Namespaces) -> io::Result<()> {
     let (mount, cgroup) = (ns.mount.as_raw_fd(), ns.cgroup.as_raw_fd());
+    // Command applies its cwd before pre_exec, but setns(CLONE_NEWNS) resets
+    // pwd/root to the new namespace's root. Resolve the requested path again
+    // after entering, so it also sees mounts made by the app in that namespace.
+    let cwd = cmd.get_current_dir().map(|p| CString::new(p.as_os_str().as_bytes())).transpose()?;
     unsafe {
         cmd.pre_exec(move || {
             os(libc::setns(cgroup, libc::CLONE_NEWCGROUP))?;
             os(libc::setns(mount, libc::CLONE_NEWNS))?;
+            if let Some(cwd) = &cwd {
+                os(libc::chdir(cwd.as_ptr()))?;
+            }
             Ok(())
         });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires root to enter mount/cgroup namespaces"]
+    fn requested_workdir_survives_real_mount_namespace_entry() {
+        let ns = Namespaces { mount: File::open("/proc/self/ns/mnt").unwrap(), cgroup: File::open("/proc/self/ns/cgroup").unwrap() };
+        let cwd = std::env::current_dir().unwrap();
+        assert_ne!(cwd, std::path::Path::new("/"));
+        let mut cmd = Command::new("/bin/pwd");
+        cmd.current_dir(&cwd);
+        enter_in(&mut cmd, &ns).unwrap();
+        let output = cmd.output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(output.stdout, [cwd.as_os_str().as_bytes(), b"\n"].concat());
     }
 }
