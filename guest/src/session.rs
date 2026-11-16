@@ -540,6 +540,13 @@ pub fn fence(line: &str, sessions: &Sessions) -> io::Result<String> {
     }
 }
 
+/// Serial foreground owners have no established fence yet. Persistent owners
+/// establish a nonzero fence before using barriers or restoring attachments.
+pub fn fence_matches(sessions: &Sessions, generation: u64, epoch: u64) -> bool {
+    let fence = sessions.lock().unwrap().fence;
+    fence == (generation, Some(epoch)) || (fence == (0, None) && generation == 0 && epoch == 0)
+}
+
 /// `SESSIONS`' reply: how many sessions are live, and how many of those are exited and unacknowledged.
 pub fn counts(sessions: &Sessions) -> String {
     let table = sessions.lock().unwrap();
@@ -558,7 +565,19 @@ pub fn cleanup(sessions: &Sessions, statuses: &Statuses) {
 /// Request errors become a message frame; write errors just end the stream (a frame may be cut short).
 /// `conn` duplicates `w`'s connection so a later attachment can shut it down. `body` is the command, then
 /// whatever came after the request already (an interactive session's first input).
-pub fn handle(mut w: impl Write, body: &[u8], conn: Option<File>, line: &str, sessions: &Sessions, statuses: &Statuses) -> io::Result<()> {
+pub fn handle(w: impl Write, body: &[u8], conn: Option<File>, line: &str, sessions: &Sessions, statuses: &Statuses) -> io::Result<()> {
+    handle_admitted(w, body, conn, line, sessions, statuses, None)
+}
+
+pub fn handle_admitted(
+    mut w: impl Write,
+    body: &[u8],
+    conn: Option<File>,
+    line: &str,
+    sessions: &Sessions,
+    statuses: &Statuses,
+    permit: Option<crate::barrier::Permit>,
+) -> io::Result<()> {
     let reader = conn.as_ref().and_then(|c| c.try_clone().ok());
     // Its feeder holds the connection open: shut down once this attachment ends, it ends too.
     let _closer = reader.as_ref().and_then(|r| r.try_clone().ok()).map(Closer);
@@ -569,6 +588,7 @@ pub fn handle(mut w: impl Write, body: &[u8], conn: Option<File>, line: &str, se
                 (ring.detached, ring.input.clone())
             };
             if detached {
+                drop(permit);
                 // An interactive one's client detached it: told so again, should that answer have been lost.
                 return msg(&mut w, id).and_then(|()| if input.is_some() { msg(&mut w, "detached") } else { Ok(()) });
             }
@@ -581,6 +601,7 @@ pub fn handle(mut w: impl Write, body: &[u8], conn: Option<File>, line: &str, se
                 };
                 let _ = thread::Builder::new().spawn(move || take_input(&mut (&pending[..]).chain(reader), &fed, &input, me));
             }
+            drop(permit);
             let result = msg(&mut w, id).and_then(|_| drain(&mut w, &output, offset, me));
             if matches!(result, Ok(true)) {
                 sessions.lock().unwrap().delivered(&output, me);
@@ -603,8 +624,14 @@ pub fn handle(mut w: impl Write, body: &[u8], conn: Option<File>, line: &str, se
             output.1.notify_all();
             result.map(|_| ())
         }
-        Ok(None) => msg(&mut w, "closed"),
-        Err(e) => fail(&mut w, e),
+        Ok(None) => {
+            drop(permit);
+            msg(&mut w, "closed")
+        }
+        Err(e) => {
+            drop(permit);
+            fail(&mut w, e)
+        }
     }
 }
 
@@ -1267,6 +1294,25 @@ mod tests {
 
     fn acked(frames: &[(u8, Vec<u8>)]) -> Option<u64> {
         frames.iter().rev().find(|(k, _)| *k == FRAME_ACK).map(|(_, b)| u64::from_le_bytes(b[..].try_into().unwrap()))
+    }
+
+    #[test]
+    fn running_output_attachment_does_not_hold_request_admission() {
+        let (sessions, statuses) = (Sessions::default(), statuses());
+        let output = live(&mut sessions.lock().unwrap(), "s", Output::default());
+        let gate = Arc::new(crate::barrier::Gate::default());
+        let permit = gate.enter().unwrap();
+        let (conn, mut peer) = UnixStream::pair().unwrap();
+        let dup = File::from(OwnedFd::from(conn.try_clone().unwrap()));
+        let (s2, st2) = (sessions.clone(), statuses.clone());
+        let running = thread::spawn(move || {
+            handle_admitted(conn, b"", Some(dup), "ATTACH s 0", &s2, &st2, Some(permit)).unwrap();
+        });
+        let frames = read_frames(&mut peer, |frames| frames.iter().any(|(kind, _)| *kind == FRAME_MSG));
+        assert!(frames.contains(&(FRAME_MSG, b"s".to_vec())));
+        gate.quiesce(1, 1, Instant::now()).unwrap();
+        assert!(!running.is_finished());
+        detach_and_join(&output, running);
     }
 
     #[test]
