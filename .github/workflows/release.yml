@@ -95,10 +95,10 @@ jobs:
         working-directory: ${{ runner.temp }}/assets
         run: |
           ls -l
-          [ "$(LC_ALL=C ls | tr '\n' ' ')" = "SHA256SUMS-aarch64 SHA256SUMS-x86_64 firecracker firecracker-aarch64 inputs-aarch64.txt inputs.txt vmlinux vmlinux-aarch64 " ]
+          [ "$(LC_ALL=C ls | tr '\n' ' ')" = "SHA256SUMS-aarch64 SHA256SUMS-x86_64 firecracker firecracker-aarch64 inputs-aarch64.txt inputs.txt kernel-modules-aarch64.tar.gz kernel-modules.tar.gz kernel-sdk-aarch64.tar.gz kernel-sdk.tar.gz vmlinux vmlinux-aarch64 " ]
           sha256sum --check --strict SHA256SUMS-x86_64 SHA256SUMS-aarch64
-          [ "$(cut -d' ' -f3 SHA256SUMS-x86_64 | sort | tr '\n' ' ')" = "firecracker inputs.txt vmlinux " ]
-          [ "$(cut -d' ' -f3 SHA256SUMS-aarch64 | sort | tr '\n' ' ')" = "firecracker-aarch64 inputs-aarch64.txt vmlinux-aarch64 " ]
+          [ "$(cut -d' ' -f3 SHA256SUMS-x86_64 | sort | tr '\n' ' ')" = "firecracker inputs.txt kernel-modules.tar.gz kernel-sdk.tar.gz vmlinux " ]
+          [ "$(cut -d' ' -f3 SHA256SUMS-aarch64 | sort | tr '\n' ' ')" = "firecracker-aarch64 inputs-aarch64.txt kernel-modules-aarch64.tar.gz kernel-sdk-aarch64.tar.gz vmlinux-aarch64 " ]
           cat SHA256SUMS-x86_64 SHA256SUMS-aarch64 > SHA256SUMS
 
       - name: Attest build provenance
@@ -108,9 +108,13 @@ jobs:
             ${{ runner.temp }}/assets/firecracker
             ${{ runner.temp }}/assets/vmlinux
             ${{ runner.temp }}/assets/inputs.txt
+            ${{ runner.temp }}/assets/kernel-modules.tar.gz
+            ${{ runner.temp }}/assets/kernel-sdk.tar.gz
             ${{ runner.temp }}/assets/firecracker-aarch64
             ${{ runner.temp }}/assets/vmlinux-aarch64
             ${{ runner.temp }}/assets/inputs-aarch64.txt
+            ${{ runner.temp }}/assets/kernel-modules-aarch64.tar.gz
+            ${{ runner.temp }}/assets/kernel-sdk-aarch64.tar.gz
 
       - name: Publish
         env:
@@ -127,5 +131,5 @@ jobs:
             echo '```'
           } > "$RUNNER_TEMP/notes.md"
           gh release create "$TAG" --verify-tag --title "$TAG" --notes-file "$RUNNER_TEMP/notes.md" \
-            "$out/firecracker" "$out/vmlinux" "$out/inputs.txt" \
-            "$out/firecracker-aarch64" "$out/vmlinux-aarch64" "$out/inputs-aarch64.txt" "$out/SHA256SUMS"
+            "$out/firecracker" "$out/vmlinux" "$out/kernel-modules.tar.gz" "$out/kernel-sdk.tar.gz" "$out/inputs.txt" \
+            "$out/firecracker-aarch64" "$out/vmlinux-aarch64" "$out/kernel-modules-aarch64.tar.gz" "$out/kernel-sdk-aarch64.tar.gz" "$out/inputs-aarch64.txt" "$out/SHA256SUMS"

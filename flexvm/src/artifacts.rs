@@ -46,6 +46,32 @@ pub const FIRECRACKER: Asset = Asset {
 pub const KERNEL: Asset =
     Asset { name: "vmlinux", release_name: env!("FLEXVM_ASSET_VMLINUX"), sha256: option_env!("FLEXVM_PIN_VMLINUX"), mode: 0o644, by_hand: "scripts/fetch.sh" };
 
+pub const MODULES: Asset = Asset {
+    name: "kernel-modules.tar.gz",
+    release_name: env!("FLEXVM_ASSET_MODULES"),
+    sha256: option_env!("FLEXVM_PIN_MODULES"),
+    mode: 0o644,
+    by_hand: "scripts/build-kernel.sh",
+};
+pub const KERNEL_SDK: Asset = Asset {
+    name: "kernel-sdk.tar.gz",
+    release_name: env!("FLEXVM_ASSET_KERNEL_SDK"),
+    sha256: option_env!("FLEXVM_PIN_KERNEL_SDK"),
+    mode: 0o644,
+    by_hand: "scripts/build-kernel.sh",
+};
+
+impl Asset {
+    /// Check the descriptor's measured content, after path-based fetching. A
+    /// concurrent atomic replacement cannot substitute another release's file.
+    pub fn check_digest(&self, sha256: &str) -> Result<()> {
+        if !cfg!(test) && self.sha256.is_some_and(|pin| pin != sha256) {
+            bail!("opened {} does not match this build's release pin", self.name);
+        }
+        Ok(())
+    }
+}
+
 /// The release the assets come from; `FLEXVM_ARTIFACTS_URL` names a mirror holding the same files (they are checked
 /// against the same pins).
 fn base() -> String {
@@ -53,7 +79,7 @@ fn base() -> String {
 }
 
 /// The largest asset accepted, and the size its transfer deadline is reckoned for.
-const MAX_SIZE: u64 = 256 << 20;
+const MAX_SIZE: u64 = 512 << 20;
 /// A download's part left this long is a killed download's.
 const STALE_PART: Duration = Duration::from_secs(3600);
 
