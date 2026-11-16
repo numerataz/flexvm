@@ -1148,7 +1148,8 @@ mod tests {
         let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
         let name = host.take_name("vm", false).unwrap();
         let verified = open(&path, &profile).unwrap();
-        let prepared = verified.prepare(&name, &verified.manifest.host_id).unwrap();
+        let local_host = verified.manifest.host_id.clone();
+        let prepared = verified.prepare(&name, &local_host).unwrap();
         let temporary = path.join(format!("{RECORD_PREFIX}{}", "b".repeat(32)));
         fs::write(&temporary, b"interrupted journal write").unwrap();
         drop(verified);
@@ -1164,7 +1165,7 @@ mod tests {
         assert!(!temporary.exists());
         assert_eq!(fs::read(path.join("manifest.json")).unwrap(), manifest);
         assert_eq!(fs::read(path.join("STARTED")).unwrap(), grant);
-        assert!(open(&path, &profile).unwrap().prepare(&name, &host_id(&host.state).unwrap()).is_err());
+        assert!(open(&path, &profile).unwrap().prepare(&name, &local_host).err().unwrap().to_string().contains("already granted"));
     }
 
     #[test]
@@ -1185,6 +1186,15 @@ mod tests {
         assert!(hidden.join("kernel").exists(), "engine still uses the hidden inputs");
         let dir = private_directory(&hidden).unwrap();
         let mut grant: Grant = record(&dir, "STARTED").unwrap();
+        write_record(&dir, "STARTED", b"partial grant", true).unwrap();
+        sweep(&root).unwrap();
+        assert!(hidden.exists(), "unreadable execution identity must be preserved");
+        let engine = grant.engine.clone();
+        grant.engine.pid = 0; // pidfd_open(EINVAL): not proof of death.
+        write_record(&dir, "STARTED", &serde_json::to_vec(&grant).unwrap(), true).unwrap();
+        sweep(&root).unwrap();
+        assert!(hidden.exists(), "an indeterminate engine must be preserved");
+        grant.engine = engine;
         grant.engine.start += 1; // A reused PID is not the recorded engine.
         write_record(&dir, "STARTED", &serde_json::to_vec(&grant).unwrap(), true).unwrap();
         sweep(&root).unwrap();
