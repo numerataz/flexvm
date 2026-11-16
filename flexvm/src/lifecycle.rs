@@ -1113,6 +1113,9 @@ pub(crate) fn read_spec(dir: &Path) -> Result<crate::app::RunSpec> {
 
 /// Who suspended the checkpoint in `dir` (`OWNER`): None from before it was kept, or unreadable.
 pub fn read_owner(dir: &Path) -> Option<crate::host::Ident> {
+    if crate::software_state::identifies(dir) {
+        return crate::software_state::owner(dir).ok();
+    }
     serde_json::from_slice(&std::fs::read(dir.join(OWNER)).ok()?).ok()
 }
 
@@ -1215,6 +1218,9 @@ pub fn describe_suspended(host: &Host, name: &str) -> Option<Value> {
         return None;
     }
     let dir = host.suspended(name).ok()?;
+    if crate::software_state::identifies(&dir) {
+        return Some(crate::software_state::describe(&dir, name).unwrap_or_else(|error| json!({"name":name,"state":"quarantined","error":error.to_string()})));
+    }
     let m = match read_manifest(&dir) {
         Ok(m) => m,
         Err(e) => return Some(json!({"name": name, "state": "suspended", "error": e.to_string()})),

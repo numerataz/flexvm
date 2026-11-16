@@ -92,31 +92,61 @@ fn runtime() -> io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_current_thread().enable_all().build()
 }
 
-/// Before the host connects, a virtio port reports EOF; do not mistake that for a session
-/// ending. Once bytes have arrived, EOF ends this entire multiplexed session.
+/// Virtio RX can arrive before the deferred host-open control message. Confirm
+/// the live peer through current poll state or successful TX before treating EOF
+/// as the end of a connection; received bytes alone are insufficient.
 struct Serial {
     fd: tokio::io::unix::AsyncFd<File>,
-    started: bool,
+    connected: bool,
+    retry: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl Serial {
+    fn new(fd: tokio::io::unix::AsyncFd<File>) -> Self {
+        Self { fd, connected: false, retry: Box::pin(tokio::time::sleep(Duration::from_millis(10))) }
+    }
+
+    fn confirm_connection(&mut self) -> io::Result<()> {
+        if !self.connected && !hung_up(self.fd.as_raw_fd())? {
+            self.connected = true;
+        }
+        Ok(())
+    }
+
+    fn wait<T>(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<T>> {
+        // Tokio retains closed readiness permanently, but virtio-serial HUP
+        // means a reconnectable host peer. Its nonblocking I/O can still return
+        // EAGAIN. Yield and arrange a retry instead of spinning on cached HUP.
+        if self.retry.as_mut().poll(cx).is_ready() {
+            self.retry.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(10));
+            let _ = self.retry.as_mut().poll(cx);
+        }
+        Poll::Pending
+    }
 }
 
 impl AsyncRead for Serial {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let this = self.get_mut();
+        this.confirm_connection()?;
         loop {
             let mut ready = std::task::ready!(this.fd.poll_read_ready_mut(cx))?;
             match ready.try_io(|fd| fd.get_mut().read(buf.initialize_unfilled())) {
-                Ok(Ok(0)) if !this.started => {
+                Ok(Ok(0)) if !this.connected => {
                     ready.clear_ready();
-                    return Poll::Pending;
+                    drop(ready);
+                    return this.wait(cx);
                 }
                 Ok(Ok(n)) => {
-                    this.started |= n != 0;
                     buf.advance(n);
                     return Poll::Ready(Ok(()));
                 }
                 Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Ok(Err(e)) => return Poll::Ready(Err(e)),
-                Err(_) => continue,
+                Err(_) => {
+                    drop(ready);
+                    return this.wait(cx);
+                }
             }
         }
     }
@@ -125,12 +155,25 @@ impl AsyncRead for Serial {
 impl AsyncWrite for Serial {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         let this = self.get_mut();
+        this.confirm_connection()?;
         loop {
             let mut ready = std::task::ready!(this.fd.poll_write_ready_mut(cx))?;
             match ready.try_io(|fd| fd.get_mut().write(buf)) {
                 Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Ok(result) => return Poll::Ready(result),
-                Err(_) => continue,
+                Ok(Ok(n)) => {
+                    this.connected |= n != 0;
+                    return Poll::Ready(Ok(n));
+                }
+                Ok(Err(error)) => return Poll::Ready(Err(error)),
+                Err(_) => {
+                    drop(ready);
+                    // A disconnected virtio port reports HUP while writes
+                    // return EAGAIN. End an established parser so it can reset.
+                    if this.connected && hung_up(this.fd.as_raw_fd())? {
+                        return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+                    }
+                    return this.wait(cx);
+                }
             }
         }
     }
@@ -153,7 +196,7 @@ pub fn serve(port: File, incoming: SyncSender<UnixStream>) -> io::Result<()> {
         // File owns the descriptor; it is never replaced or closed separately
         // while registered with the reactor.
         let fd = unsafe { tokio::io::unix::AsyncFd::register(port)? };
-        let io = Serial { fd, started: false };
+        let io = Serial::new(fd);
         let (_alive, stop) = watch::channel(false);
         drive(io, None, Some(incoming), stop).await
     })
@@ -183,7 +226,13 @@ where
         // Both operations must be polled: creating streams alone does not drive
         // Yamux's I/O, window updates or the existing stream bridges.
         let event = tokio::select! {
-            _ = stop.changed() => return Ok(()),
+            _ = stop.changed() => {
+                // A device disconnect is not reliably surfaced as EOF by every
+                // virtio-serial implementation. Explicitly terminate the old
+                // parser on the wire before closing the host character device.
+                let _ = tokio::time::timeout(Duration::from_secs(1), poll_fn(|cx| connection.poll_close(cx))).await;
+                return Ok(());
+            },
             event = poll_fn(|cx| {
                 if pending.is_none() {
                     if let Some(requests) = &mut requests {
@@ -411,7 +460,7 @@ async fn forward(io: &mut tokio::net::UnixStream, stream: &mut Channel, side: Si
     }
 }
 
-fn hung_up(fd: std::os::fd::RawFd) -> io::Result<bool> {
+pub(crate) fn hung_up(fd: std::os::fd::RawFd) -> io::Result<bool> {
     let mut poll = libc::pollfd { fd, events: 0, revents: 0 };
     loop {
         if unsafe { libc::poll(&mut poll, 1, 0) } >= 0 {
@@ -499,6 +548,8 @@ mod tests {
     use super::*;
     use std::net::Shutdown;
     use std::os::fd::OwnedFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
     use std::time::Duration;
 
     fn pair() -> (Client, mpsc::Receiver<UnixStream>, mpsc::Receiver<io::Result<()>>) {
@@ -525,6 +576,128 @@ mod tests {
         guest.read_exact(&mut first).unwrap();
         assert_eq!(&first, b"x");
         (host, guest)
+    }
+
+    struct Fifo(std::path::PathBuf);
+
+    impl Fifo {
+        fn new() -> (Self, File) {
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "flexvm-serial-reconnect-{}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            let reader = File::options().read(true).custom_flags(libc::O_NONBLOCK).open(&path).unwrap();
+            (Self(path), reader)
+        }
+
+        fn writer(&self) -> File {
+            File::options().write(true).custom_flags(libc::O_NONBLOCK).open(&self.0).unwrap()
+        }
+    }
+
+    impl Drop for Fifo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn serial_reconnect_does_not_spin_on_cached_hangup_readiness() {
+        let (fifo, reader) = Fifo::new();
+        drop(fifo.writer());
+        runtime().unwrap().block_on(async {
+            let fd = unsafe { tokio::io::unix::AsyncFd::register(reader).unwrap() };
+            // Cache HUP, then reconnect the FIFO. The descriptor is unchanged,
+            // but reads now return EAGAIN: the same transition as virtio-serial.
+            fd.readable().await.unwrap().clear_ready();
+            let mut writer = fifo.writer();
+            let writing = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                writer.write_all(b"x")?;
+                Ok::<_, io::Error>(writer)
+            });
+            let mut serial = Serial::new(fd);
+            let mut bytes = [0];
+            fn cpu_time() -> u64 {
+                let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) }, 0);
+                time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
+            }
+            let before = cpu_time();
+            let result = tokio::time::timeout(Duration::from_millis(30), serial.read(&mut bytes)).await;
+            let cpu_ns = cpu_time() - before;
+            let writer = writing.join().unwrap().unwrap();
+            assert!(cpu_ns < 10_000_000, "idle serial read burned {cpu_ns} ns of thread CPU in a 30 ms wait");
+            // A heavily descheduled test thread may see data before polling
+            // its expired timer. Either outcome must retain the byte exactly once.
+            match result {
+                Err(_) => assert_eq!(serial.read(&mut bytes).await.unwrap(), 1),
+                Ok(read) => assert_eq!(read.unwrap(), 1),
+            }
+            assert_eq!(&bytes, b"x");
+            drop(writer);
+            assert_eq!(serial.read(&mut bytes).await.unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn buffered_rx_does_not_confirm_a_reconnected_peer() {
+        let (fifo, reader) = Fifo::new();
+        let mut first = fifo.writer();
+        first.write_all(b"x").unwrap();
+        drop(first);
+        runtime().unwrap().block_on(async {
+            let fd = unsafe { tokio::io::unix::AsyncFd::register(reader).unwrap() };
+            let mut serial = Serial::new(fd);
+            let mut bytes = [0];
+            assert_eq!(serial.read(&mut bytes).await.unwrap(), 1);
+            assert_eq!(&bytes, b"x");
+            // Data arrived before the kernel's open state, modeled by buffered
+            // FIFO data plus HUP. A later writer represents the deferred open.
+            let path = fifo.0.clone();
+            let writing = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                let mut writer = File::options().write(true).custom_flags(libc::O_NONBLOCK).open(path)?;
+                writer.write_all(b"y")?;
+                Ok::<_, io::Error>(writer)
+            });
+            let result = tokio::time::timeout(Duration::from_millis(30), serial.read(&mut bytes)).await;
+            let writer = writing.join().unwrap().unwrap();
+            match result {
+                Err(_) => assert_eq!(serial.read(&mut bytes).await.unwrap(), 1),
+                Ok(read) => assert_eq!(read.unwrap(), 1, "buffered RX incorrectly turned pre-open EOF into disconnect"),
+            }
+            assert_eq!(&bytes, b"y");
+            drop(writer);
+            assert_eq!(serial.read(&mut bytes).await.unwrap(), 0);
+        });
+    }
+
+    #[test]
+    fn client_shutdown_sends_goaway_before_device_disconnect() {
+        let (host, mut device) = UnixStream::pair().unwrap();
+        device.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let client = Client::connect(host).unwrap();
+        drop(client);
+        let mut saw_goaway = false;
+        for _ in 0..8 {
+            let mut header = [0; 12];
+            device.read_exact(&mut header).unwrap();
+            if header[1] == 3 {
+                assert_eq!(header, [0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+                saw_goaway = true;
+                break;
+            }
+            // Yamux may have queued its initial keepalive before cancellation.
+            assert_eq!(header[1], 2, "unexpected non-ping frame before shutdown");
+        }
+        assert!(saw_goaway, "transport closed without a protocol shutdown");
+        assert_eq!(device.read(&mut [0]).unwrap(), 0);
     }
 
     #[test]

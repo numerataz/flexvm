@@ -7,6 +7,11 @@
 
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
+    if (argc == 2 && strcmp(argv[1], "flood") == 0) {
+        char bytes[8192];
+        memset(bytes, 'x', sizeof(bytes));
+        for (;;) if (fwrite(bytes, 1, sizeof(bytes), stdout) != sizeof(bytes)) return 1;
+    }
     if (argc == 1) {
         puts("OWNER_WORKLOAD_STARTED");
         while (access("/tmp/owner-finish", F_OK) != 0) usleep(10000);

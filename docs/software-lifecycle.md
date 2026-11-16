@@ -1,9 +1,28 @@
 # Software VM lifecycle implementation contract
 
 This is the implementation plan for #1358 and the lifecycle portion of #1327.
-The existing `flexvm software` command owns a foreground QEMU TCG VM. Persistent
-records, restore, migration, elastic memory and hierarchy ownership remain work
-to implement. Engine boot/checkpoint experiments establish prerequisites only.
+The `flexvm software --name` command owns a QEMU TCG VM through the normal
+registry and management socket. Local `stop` and `start` now capture and restore
+its RAM, devices, guest processes and foreground session through a fresh engine.
+The snapshot includes verified engine, kernel, root filesystem and x86 firmware
+copies, and a durable local ownership journal prevents implicit replay after a
+restore has been granted CPU authority. A failed restore after that grant remains
+quarantined; it is never silently restarted from the older state.
+
+This is a local lifecycle milestone, not completion of this contract. Software
+snapshots currently use private user networking: open host network connections
+are not preserved. Cross-host migration, persistent disk transfer, routed network
+continuity, elastic memory, hierarchy ownership and explicit quarantine recovery
+remain work to implement. Unknown or older guest agents cannot checkpoint; a
+current serial agent must acknowledge its request and transport barriers.
+
+`scripts/compat/software-lifecycle.py` exercises two normal CLI stop/start cycles
+with both host virtualization devices masked. It checks PID/start-time, a random
+volatile RAM canary, advancing counters, a single workload boot, contiguous
+foreground output, retired engine cleanup and rejection of a corrupted kernel. It also injects a
+parent-directory fsync error after checkpoint replacement, explicitly rolls back
+the paused source and checks that a new capture succeeds without losing its
+verified inputs.
 
 ## Execution and state identity
 

@@ -1336,7 +1336,7 @@ impl Host {
     /// discard, removed by the next holder of the name.
     pub fn is_suspended(&self, name: &str) -> bool {
         let Ok(dir) = self.suspended(name) else { return false };
-        dir.join("manifest.json").is_file() && !dir.join("STARTED").exists() && !dir.join("DISCARDED").exists()
+        dir.join("manifest.json").is_file() && (!dir.join("STARTED").exists() || crate::software_state::identifies(&dir)) && !dir.join("DISCARDED").exists()
     }
 
     /// The template content ids VMs here use as far as their records say: registered VMs, every
@@ -5554,6 +5554,12 @@ pub fn recorded_template_users(state: &Path, place: &str) -> std::collections::B
     for entry in crate::checkpoint::entries(&state.join("suspended")) {
         match entry {
             Ok(d) if !d.file_name().is_some_and(|n| n.as_encoded_bytes().starts_with(b".")) && !d.join("STARTED").exists() && !d.join("DISCARDED").exists() => {
+                if crate::software_state::identifies(&d) {
+                    if let Err(error) = crate::software_state::metadata(&d) {
+                        unreadable.push(error.to_string());
+                    }
+                    continue;
+                }
                 match crate::checkpoint::record(&d) {
                     Some(Ok(m)) => drop(ids.insert(m.template_id)),
                     Some(Err(err)) => unreadable.push(err.to_string()),

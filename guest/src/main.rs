@@ -552,6 +552,7 @@ fn serve_serial(statuses: Statuses, sessions: session::Sessions) -> io::Result<(
     use std::os::unix::fs::OpenOptionsExt;
     let (incoming, requests) = std::sync::mpsc::sync_channel(64);
     let admission = Arc::new(barrier::Gate::default());
+    let reset_admission = admission.clone();
     // One dispatcher preserves quick-request ordering, just like the vsock
     // accept loop. Session bodies/attachments still run concurrently.
     thread::Builder::new().name("serial-requests".into()).spawn(move || {
@@ -586,10 +587,23 @@ fn serve_serial(statuses: Statuses, sessions: session::Sessions) -> io::Result<(
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     loop {
         let port = File::options().read(true).write(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(&path)?;
-        log("serial control ready");
+        let peer = port.try_clone()?;
+        if let Some((generation, sequence)) = reset_admission.drained_identity() {
+            log(&format!("serial control ready barrier {generation} {sequence}"));
+        } else {
+            log("serial control ready");
+        }
         if let Err(e) = control::serve(port, incoming.clone()) {
             log(&format!("serial control disconnected: {e}"));
         }
+        // GoAway can finish the parser before the host closes its character
+        // device. Keep the old port open until the real disconnect is observed,
+        // then close its last descriptor to discard queued old-connection bytes.
+        // Only the next fresh port may acknowledge a snapshot reset boundary.
+        while !control::hung_up(peer.as_raw_fd())? {
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(peer);
         thread::sleep(Duration::from_millis(100));
     }
 }
@@ -610,7 +624,7 @@ fn accept_request(stream: File, statuses: &Statuses, sessions: &session::Session
     if let Some(gate) = admission.filter(|_| verb == "BARRIER") {
         let deadline = Instant::now() + BODY_TIMEOUT;
         let prepared = (|| {
-            if line.trim_end() == "BARRIER 1 PROBE" {
+            if matches!(line.trim_end(), "BARRIER 1 PROBE" | "BARRIER 1 TRANSPORT") {
                 return Ok(false);
             }
             let (operation, generation, epoch, rest) = barrier_fields(&line)?;
@@ -716,6 +730,9 @@ fn barrier_fields(line: &str) -> io::Result<(&str, u64, u64, &str)> {
 fn barrier_request(out: &File, line: &str, gate: &barrier::Gate, statuses: &Statuses, sessions: &session::Sessions, deadline: Instant) -> io::Result<()> {
     if line.trim_end() == "BARRIER 1 PROBE" {
         return msg(out, "ok BARRIER 1");
+    }
+    if line.trim_end() == "BARRIER 1 TRANSPORT" {
+        return msg(out, "ok BARRIER 1 TRANSPORT 1");
     }
     let (operation, generation, epoch, rest) = barrier_fields(line)?;
     if !session::fence_matches(sessions, generation, epoch) {
@@ -1308,6 +1325,7 @@ mod tests {
             barrier_request(&out, line, &gate, &statuses, &sessions, Instant::now() + Duration::from_secs(2)).map(|()| frame(reader))
         };
         assert_eq!(call(&mut peer, "BARRIER 1 PROBE").unwrap(), "ok BARRIER 1");
+        assert_eq!(call(&mut peer, "BARRIER 1 TRANSPORT").unwrap(), "ok BARRIER 1 TRANSPORT 1");
         assert!(call(&mut peer, "QUIESCE").is_err());
         assert!(call(&mut peer, "BARRIER 2 PROBE").is_err());
         session::fence("FENCE 1 42", &sessions).unwrap();

@@ -69,7 +69,9 @@ jobs:
         run: |
           sudo modprobe tun
           host=$(rustc -vV | sed -n 's/^host: //p')
-          cargo test -p flexvm -p flexvm-init --config "target.$host.runner=\"sudo -E\"" -- --ignored
+          # The native QEMU/OCI restore proof requires explicit external artifacts;
+          # software-lifecycle.py exercises that real path in the software jobs.
+          cargo test -p flexvm -p flexvm-init --config "target.$host.runner=\"sudo -E\"" -- --ignored --skip qemu::tests::real_agent_cold_restore_preserves_process_ram_and_sessions
       # The semver artifacts release (vMAJOR.MINOR.PATCH; what `cargo build` users download) must be built
       # from this checkout's inputs (scripts/pin-artifacts.sh --inputs): a change to them bumps ARTIFACTS_TAG
       # in the same change, or fails here, PR or main. --check also validates the semver tag format.
@@ -196,8 +198,10 @@ jobs:
           cat "$RUNNER_TEMP/software-serial/report.json"
       - name: Named software VM ownership without virtualization devices
         run: |
-          sudo python3 scripts/compat/software-owner.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-owner" --timeout 300
+          sudo python3 scripts/compat/software-owner.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-owner" --timeout 300 --pause-cycles 32
           cat "$RUNNER_TEMP/software-owner/report.json"
+          sudo python3 scripts/compat/software-lifecycle.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-lifecycle" --timeout 600
+          cat "$RUNNER_TEMP/software-lifecycle/report.json"
       - name: Unchanged KVM clients inside software FlexVM
         run: |
           sudo python3 scripts/compat/software-kvm.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --firecracker "$RUNNER_TEMP/software-state/artifacts/firecracker" --output "$RUNNER_TEMP/software-kvm"
@@ -229,6 +233,9 @@ jobs:
             ${{ runner.temp }}/software-owner/*.json
             ${{ runner.temp }}/software-owner/*.log
             ${{ runner.temp }}/software-owner/*.strace
+            ${{ runner.temp }}/software-lifecycle/*.json
+            ${{ runner.temp }}/software-lifecycle/*.log
+            ${{ runner.temp }}/software-lifecycle/*.strace
             ${{ runner.temp }}/software-kvm/*.json
             ${{ runner.temp }}/software-kvm/*.log
             ${{ runner.temp }}/software-kvm/*.strace
