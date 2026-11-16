@@ -19,7 +19,10 @@ current serial agent must acknowledge its request and transport barriers.
 `scripts/compat/software-lifecycle.py` exercises two normal CLI stop/start cycles
 with both host virtualization devices masked. It checks PID/start-time, a random
 volatile RAM canary, advancing counters, a single workload boot, contiguous
-foreground output, retired engine cleanup and rejection of a corrupted kernel.
+foreground output, retired engine cleanup and rejection of a corrupted kernel. It also injects a
+parent-directory fsync error after checkpoint replacement, explicitly rolls back
+the paused source and checks that a new capture succeeds without losing its
+verified inputs.
 
 ## Execution and state identity
 

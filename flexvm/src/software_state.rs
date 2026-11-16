@@ -470,6 +470,7 @@ pub struct Consumed {
     directory: File,
     grant: Grant,
     manifest: Manifest,
+    replaced: std::sync::Mutex<Vec<(File, PathBuf)>>,
 }
 
 impl Verified {
@@ -530,7 +531,29 @@ impl Prepared<'_> {
             engine,
         };
         write_record(&self.directory, "STARTED", &serde_json::to_vec(&grant)?, false)?;
-        Ok(Consumed { directory: self.directory, grant, manifest: self.manifest })
+        Ok(Consumed { directory: self.directory, grant, manifest: self.manifest, replaced: std::sync::Mutex::new(Vec::new()) })
+    }
+}
+
+impl Drop for Consumed {
+    fn drop(&mut self) {
+        // The live engine still uses verified files from its consumed bundle.
+        // Keep them linked through rollback; unlinking changes their metadata
+        // and would invalidate subsequent captures from the same owner.
+        if self.grant.owner != crate::host::Ident::me() || !matches!(crate::host::PidFd::open(&self.grant.engine), Ok(None)) {
+            return;
+        }
+        let Ok(pinned) = self.directory.metadata() else { return };
+        for (parent, name) in self.replaced.get_mut().unwrap().drain(..) {
+            let path = crate::host::fd_path(parent.as_raw_fd()).join(name);
+            if private_directory(&path)
+                .and_then(|dir| Ok(dir.metadata()?))
+                .is_ok_and(|selected| (selected.dev(), selected.ino()) == (pinned.dev(), pinned.ino()))
+            {
+                let _ = fs::remove_dir_all(path);
+                let _ = parent.sync_all();
+            }
+        }
     }
 }
 
@@ -700,6 +723,7 @@ impl Staging {
         file.set_permissions(fs::Permissions::from_mode(0o400))?;
         file.sync_all()?;
         util::sync_dir(&self.path)?;
+        let cleanup_parent = previous.map(|_| self.parent.try_clone()).transpose()?;
         if previous.is_some() {
             let (from, to) = (util::cpath(&self.path)?, util::cpath(&target)?);
             if unsafe { libc::renameat2(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), libc::RENAME_EXCHANGE) } < 0 {
@@ -709,10 +733,12 @@ impl Staging {
             bail!("software checkpoint destination already exists");
         }
         self.committed = true;
-        self.parent.sync_all()?;
-        if previous.is_some() {
-            let _ = fs::remove_dir_all(&self.path);
+        if let (Some(previous), Some(parent)) = (previous, cleanup_parent) {
+            // Register before parent fsync, whose failure must still permit
+            // safe source rollback and a later capture using these same inputs.
+            previous.replaced.lock().unwrap().push((parent, PathBuf::from(self.path.file_name().ok_or("software staging has no name")?)));
         }
+        self.parent.sync_all()?;
         Ok(Published { directory, manifest })
     }
 }
@@ -856,12 +882,28 @@ mod tests {
         let mut staging = Staging::new(&root).unwrap();
         staging.state.write_all(b"next-state").unwrap();
         staging.replace(&path, &inputs, next, &consumed).unwrap();
+        assert_eq!(record::<Grant>(&consumed.directory, "STARTED").unwrap().generation, 8, "consumed input bundle must stay linked until the engine exits");
+        verified.inputs.kernel.unchanged().unwrap();
         let new = open(&path, &profile).unwrap();
         assert_eq!(new.manifest.snapshot_id, "11111111111111111111111111111111");
         assert_eq!(new.manifest.owner_generation, 8);
         assert!(!path.join("STARTED").exists());
         assert!(!path.join("RETIRED").exists());
         assert!(new.prepare(&name, &new.manifest.host_id).is_err(), "the new source has not retired yet");
+        // A publication can succeed before retirement fails. Rollback must
+        // invalidate that new snapshot, and a later capture can fill the empty
+        // slot without trying to exchange the now-removed consumed bundle.
+        discard_attempt(&path, &new.manifest.snapshot_id).unwrap();
+        remove_discarded(&path, &new.manifest.vm_id).unwrap();
+        assert!(!path.exists());
+        let mut retry = new.manifest.clone();
+        retry.snapshot_id = "22222222222222222222222222222222".into();
+        let mut staging = Staging::new(&root).unwrap();
+        staging.state.write_all(b"retry-state").unwrap();
+        staging.commit(&path, &inputs, retry).unwrap();
+        let retried = open(&path, &profile).unwrap();
+        assert_eq!(retried.manifest.snapshot_id, "22222222222222222222222222222222");
+        assert!(retried.prepare(&name, &retried.manifest.host_id).is_err(), "retry did not retire the live source");
     }
 
     #[test]

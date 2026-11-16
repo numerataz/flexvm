@@ -34,8 +34,11 @@ def exercise(args):
         return next((e for e in json.loads(cli('ps', '--json')) if e['name'] == 'state-test'), None)
 
     def launch(*words):
+        env = os.environ.copy()
+        env['LD_PRELOAD'] = str(args.output / 'fail-parent-sync.so')
+        env['FLEXVM_TEST_FAIL_PARENT_SYNC'] = str(args.output / 'fail-parent-sync')
         with (args.output / 'workload.log').open('ab') as out, (args.output / f'owner-{len(owners)}.log').open('wb') as err:
-            proc = subprocess.Popen([*base, *words], stdout=out, stderr=err)
+            proc = subprocess.Popen([*base, *words], stdout=out, stderr=err, env=env)
         owners.append(proc)
         while time.monotonic() < deadline:
             if proc.poll() is not None:
@@ -66,11 +69,25 @@ def exercise(args):
         for cycle in range(2):
             before = observation()
             if cycle == 1:
+                # Fail the parent directory fsync after the replacement rename.
+                # Roll back explicitly, then capture again from the same engine.
+                marker = args.output / 'fail-parent-sync'
+                marker.touch()
+                refused = subprocess.run([*base, 'stop', 'state-test'], capture_output=True, text=True, timeout=60)
+                if refused.returncode == 0 or marker.exists() or live()['state'] != 'paused':
+                    raise RuntimeError(f'publication fault was not fenced: {refused}')
+                cli('unpause', 'state-test')
+                rolled_back = observation()
+                if rolled_back[:3] != first[:3] or rolled_back[3] < before[3]:
+                    raise RuntimeError('publication rollback lost source identity')
+                evidence['publication_rollback'] = {'error': refused.stderr, 'source': rolled_back}
                 cli('pause', 'state-test')
             cli('stop', 'state-test')
             if owner.wait(timeout=10) != 0:
                 raise RuntimeError('suspend owner failed')
             engine_gone(entry['backend']['process'])
+            if list((args.state / 'state' / 'suspended').glob('.software-stage-*')):
+                raise RuntimeError('retired owner left a replaced checkpoint bundle')
             stopped = next(e for e in json.loads(cli('ps', '-a', '--json')) if e['name'] == 'state-test')
             if stopped['state'] != 'suspended' or stopped['backend']['kind'] != 'qemu-tcg':
                 raise RuntimeError(f'wrong suspended identity: {stopped}')
@@ -166,6 +183,9 @@ def main():
         probe = args.output / 'state-probe'
         HELPERS['run']([args.cc, '-O2', '-Wall', '-Wextra', '-Werror', '-static', str(ROOT / 'state-probe.c'), '-o', str(probe)],
                        60, args.output / 'compile.log')
+        HELPERS['run']([args.cc, '-O2', '-Wall', '-Wextra', '-Werror', '-shared', '-fPIC',
+                        str(ROOT / 'fail-parent-sync.c'), '-ldl', '-o', str(args.output / 'fail-parent-sync.so')],
+                       60, args.output / 'compile-fault.log')
         IMAGE(args.output / 'image.tar', 'amd64' if platform.machine() == 'x86_64' else 'arm64', {
             'state-probe': (probe.read_bytes(), 0o755), 'etc/passwd': (b'root:x:0:0:root:/root:/bin/sh\n', 0o644),
             'etc/group': (b'root:x:0:\n', 0o644)}, ['/state-probe'])

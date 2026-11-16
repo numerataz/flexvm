@@ -183,7 +183,13 @@ where
         // Both operations must be polled: creating streams alone does not drive
         // Yamux's I/O, window updates or the existing stream bridges.
         let event = tokio::select! {
-            _ = stop.changed() => return Ok(()),
+            _ = stop.changed() => {
+                // A device disconnect is not reliably surfaced as EOF by every
+                // virtio-serial implementation. Explicitly terminate the old
+                // parser on the wire before closing the host character device.
+                let _ = tokio::time::timeout(Duration::from_secs(1), poll_fn(|cx| connection.poll_close(cx))).await;
+                return Ok(());
+            },
             event = poll_fn(|cx| {
                 if pending.is_none() {
                     if let Some(requests) = &mut requests {
@@ -525,6 +531,28 @@ mod tests {
         guest.read_exact(&mut first).unwrap();
         assert_eq!(&first, b"x");
         (host, guest)
+    }
+
+    #[test]
+    fn client_shutdown_sends_goaway_before_device_disconnect() {
+        let (host, mut device) = UnixStream::pair().unwrap();
+        device.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let client = Client::connect(host).unwrap();
+        drop(client);
+        let mut saw_goaway = false;
+        for _ in 0..8 {
+            let mut header = [0; 12];
+            device.read_exact(&mut header).unwrap();
+            if header[1] == 3 {
+                assert_eq!(header, [0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+                saw_goaway = true;
+                break;
+            }
+            // Yamux may have queued its initial keepalive before cancellation.
+            assert_eq!(header[1], 2, "unexpected non-ping frame before shutdown");
+        }
+        assert!(saw_goaway, "transport closed without a protocol shutdown");
+        assert_eq!(device.read(&mut [0]).unwrap(), 0);
     }
 
     #[test]

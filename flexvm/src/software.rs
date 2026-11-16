@@ -358,7 +358,12 @@ impl Owner {
                 },
                 image: self.image.clone(),
             };
-            let published = self.machine.checkpoint(staging, &checkpoint, manifest, self.consumed.as_ref(), Instant::now() + Duration::from_secs(600))?;
+            // Rollback may discard a newly published replacement, removing the
+            // old consumed bundle as well. The next attempt must use no-replace
+            // publication when that slot is empty, rather than exchange a stale
+            // consumed directory. No-replace still refuses any concurrent entry.
+            let previous = self.consumed.as_ref().filter(|_| checkpoint.exists());
+            let published = self.machine.checkpoint(staging, &checkpoint, manifest, previous, Instant::now() + Duration::from_secs(600))?;
             self.machine.retire(&published)?;
             self.suspended.store(true, Ordering::SeqCst);
             self.ended.store(true, Ordering::SeqCst);
