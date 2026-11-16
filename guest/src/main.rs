@@ -17,6 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod app;
+mod barrier;
 #[allow(dead_code)]
 mod control;
 mod input;
@@ -543,18 +544,19 @@ fn serve(statuses: Statuses) -> io::Result<()> {
         if !host_peer(&peer, peer_len) {
             continue;
         }
-        accept_request(stream, &statuses, &sessions);
+        accept_request(stream, &statuses, &sessions, None);
     }
 }
 
 fn serve_serial(statuses: Statuses, sessions: session::Sessions) -> io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let (incoming, requests) = std::sync::mpsc::sync_channel(64);
+    let admission = Arc::new(barrier::Gate::default());
     // One dispatcher preserves quick-request ordering, just like the vsock
     // accept loop. Session bodies/attachments still run concurrently.
     thread::Builder::new().name("serial-requests".into()).spawn(move || {
         for stream in requests {
-            accept_request(File::from(OwnedFd::from(stream)), &statuses, &sessions);
+            accept_request(File::from(OwnedFd::from(stream)), &statuses, &sessions, Some(&admission));
         }
     })?;
     let until = Instant::now() + Duration::from_secs(30);
@@ -592,7 +594,7 @@ fn serve_serial(statuses: Statuses, sessions: session::Sessions) -> io::Result<(
     }
 }
 
-fn accept_request(stream: File, statuses: &Statuses, sessions: &session::Sessions) {
+fn accept_request(stream: File, statuses: &Statuses, sessions: &session::Sessions, admission: Option<&Arc<barrier::Gate>>) {
     let conn = stream.as_raw_fd();
     // The host sends its request with the connection; don't let a silent one stall accepting.
     sock_timeout(conn, libc::SO_RCVTIMEO, Some(Duration::from_secs(1)));
@@ -603,6 +605,57 @@ fn accept_request(stream: File, statuses: &Statuses, sessions: &session::Session
             let _ = fail(&stream, e);
             return;
         }
+    };
+    let verb = line.split_whitespace().next().unwrap_or("");
+    if let Some(gate) = admission.filter(|_| verb == "BARRIER") {
+        let deadline = Instant::now() + BODY_TIMEOUT;
+        let prepared = (|| {
+            if line.trim_end() == "BARRIER 1 PROBE" {
+                return Ok(false);
+            }
+            let (operation, generation, epoch, rest) = barrier_fields(&line)?;
+            if operation != "QUIESCE" {
+                return Ok(false);
+            }
+            if !session::fence_matches(sessions, generation, epoch) {
+                return Err(io::Error::other("request barrier host fence does not match"));
+            }
+            gate.begin(generation, barrier_number(rest)?)?;
+            Ok(true)
+        })();
+        match prepared {
+            Ok(true) => {
+                // Close admission inline, then wait without blocking FENCE,
+                // PING or a cancellation's RESUME on the only dispatcher.
+                let waiter = stream.try_clone().and_then(|out| {
+                    let (gate, statuses, sessions) = (gate.clone(), statuses.clone(), sessions.clone());
+                    thread::Builder::new().spawn(move || {
+                        if let Err(e) = barrier_request(&out, &line, &gate, &statuses, &sessions, deadline) {
+                            let _ = fail(&out, e);
+                        }
+                    })
+                });
+                if let Err(e) = waiter {
+                    let _ = fail(&stream, e);
+                }
+            }
+            Ok(false) => {
+                if let Err(e) = barrier_request(&stream, &line, gate, statuses, sessions, deadline) {
+                    let _ = fail(&stream, e);
+                }
+            }
+            Err(e) => {
+                let _ = fail(&stream, e);
+            }
+        }
+        return;
+    }
+    let permit = match admission.filter(|_| !matches!(verb, "PING" | "FORKS" | "SESSIONS" | "APPSTATUS" | "LOGS" | "FENCE")) {
+        Some(gate) => match gate.enter() {
+            Ok(permit) => Some(permit),
+            Err(e) => return drop(fail(&stream, e)),
+        },
+        None => None,
     };
     // START is on every start's critical path, where a new thread costs ms: quick requests are answered inline.
     // Non-blocking session control verbs (FENCE, SESSIONS, CLOSE, RELEASE) also run inline without a thread (#1338).
@@ -624,7 +677,7 @@ fn accept_request(stream: File, statuses: &Statuses, sessions: &session::Session
             }
             Some("SESSION" | "ARGV" | "ATTACH" | "REJOIN" | "CLOSE" | "RELEASE") => {}
             // Its input may have come with the request, read ahead into `r`.
-            Some("APPIN") => return drop(app::appin(line.trim_end().split_once(' ').map_or("", |(_, a)| a), &stream, r.buffer())),
+            Some("APPIN") => return drop(app::appin_admitted(line.trim_end().split_once(' ').map_or("", |(_, a)| a), &stream, r.buffer(), permit)),
             _ => return drop(handle(&stream, &line, &statuses, &sessions)),
         }
         // A session's command arrives a round trip later, which a guest faulting in memory can stretch past a second.
@@ -642,10 +695,57 @@ fn accept_request(stream: File, statuses: &Statuses, sessions: &session::Session
         });
         // Kept by the session, so that a later ATTACH can shut this one down.
         let _ = match body.and_then(|body| Ok((body, stream.try_clone()?))) {
-            Ok((body, conn)) => session::handle(&stream, &body, Some(conn), &line, &sessions, &statuses),
+            Ok((body, conn)) => session::handle_admitted(&stream, &body, Some(conn), &line, &sessions, &statuses, permit),
             Err(e) => fail(&stream, e),
         };
     });
+}
+
+fn barrier_number(text: &str) -> io::Result<u64> {
+    text.parse().map_err(|_| io::Error::other("bad barrier number"))
+}
+
+fn barrier_fields(line: &str) -> io::Result<(&str, u64, u64, &str)> {
+    let fields: Vec<_> = line.trim_end().splitn(6, ' ').collect();
+    let ["BARRIER", "1", operation, generation, epoch, rest] = fields.as_slice() else {
+        return Err(io::Error::other("bad BARRIER 1 request"));
+    };
+    Ok((operation, barrier_number(generation)?, barrier_number(epoch)?, rest))
+}
+
+fn barrier_request(out: &File, line: &str, gate: &barrier::Gate, statuses: &Statuses, sessions: &session::Sessions, deadline: Instant) -> io::Result<()> {
+    if line.trim_end() == "BARRIER 1 PROBE" {
+        return msg(out, "ok BARRIER 1");
+    }
+    let (operation, generation, epoch, rest) = barrier_fields(line)?;
+    if !session::fence_matches(sessions, generation, epoch) {
+        return Err(io::Error::other("request barrier host fence does not match"));
+    }
+    match operation {
+        "QUIESCE" => {
+            let sequence = barrier_number(rest)?;
+            gate.quiesce(generation, sequence, deadline)?;
+            if !session::fence_matches(sessions, generation, epoch) {
+                return Err(io::Error::other("request barrier host fence changed while draining"));
+            }
+            msg(out, format!("ok BARRIER 1 QUIESCED {generation} {sequence}"))
+        }
+        "RESUME" => {
+            let ids: Vec<_> = rest.split_whitespace().collect();
+            let [saved_generation, sequence] = ids.as_slice() else { return Err(io::Error::other("bad barrier identity")) };
+            let (saved_generation, sequence) = (barrier_number(saved_generation)?, barrier_number(sequence)?);
+            gate.resume(generation, saved_generation, sequence)?;
+            msg(out, format!("ok BARRIER 1 RESUMED {saved_generation} {sequence}"))
+        }
+        "MAINT" => {
+            gate.maintenance()?;
+            if !matches!(rest.split_whitespace().next(), Some("CLOCK" | "START" | "START6" | "HOSTNAME")) {
+                return Err(io::Error::other("unsupported barrier maintenance request"));
+            }
+            handle(out, rest, statuses, sessions)
+        }
+        _ => Err(io::Error::other("bad BARRIER 1 operation")),
+    }
 }
 
 /// Sets a socket's SO_RCVTIMEO or SO_SNDTIMEO; None: none, its reads (writes) wait however long it takes.
@@ -1186,6 +1286,102 @@ mod tests {
         for bad in ["12", "12.5", "12.1000000000", "x.000000000", "12.-00000001"] {
             assert!(parse_time(bad).is_none(), "{bad}");
         }
+    }
+
+    #[test]
+    fn serial_barriers_require_current_fence_and_cannot_ack_legacy_quiesce() {
+        use std::os::unix::net::UnixStream;
+        let (mut peer, writer) = UnixStream::pair().unwrap();
+        let out = File::from(OwnedFd::from(writer));
+        let gate = Arc::new(barrier::Gate::default());
+        let statuses = Statuses::default();
+        let sessions = session::Sessions::default();
+        let frame = |reader: &mut UnixStream| {
+            let mut header = [0; 5];
+            reader.read_exact(&mut header).unwrap();
+            assert_eq!(header[0], FRAME_MSG);
+            let mut body = vec![0; u32::from_le_bytes(header[1..].try_into().unwrap()) as usize];
+            reader.read_exact(&mut body).unwrap();
+            String::from_utf8(body).unwrap()
+        };
+        let call = |reader: &mut UnixStream, line: &str| {
+            barrier_request(&out, line, &gate, &statuses, &sessions, Instant::now() + Duration::from_secs(2)).map(|()| frame(reader))
+        };
+        assert_eq!(call(&mut peer, "BARRIER 1 PROBE").unwrap(), "ok BARRIER 1");
+        assert!(call(&mut peer, "QUIESCE").is_err());
+        assert!(call(&mut peer, "BARRIER 2 PROBE").is_err());
+        session::fence("FENCE 1 42", &sessions).unwrap();
+        assert!(call(&mut peer, "BARRIER 1 QUIESCE 0 0 1").is_err());
+        assert_eq!(call(&mut peer, "BARRIER 1 QUIESCE 1 42 1").unwrap(), "ok BARRIER 1 QUIESCED 1 1");
+        // The invalid hostname is harmless even if admission regresses; it must
+        // be refused by the barrier before reaching the hostname parser.
+        peer.write_all(b"HOSTNAME !\n").unwrap();
+        accept_request(out.try_clone().unwrap(), &statuses, &sessions, Some(&gate));
+        assert!(frame(&mut peer).contains("admission is quiesced"));
+        assert!(call(&mut peer, "BARRIER 1 MAINT 1 42 PING").is_err());
+        assert!(call(&mut peer, "BARRIER 1 MAINT 1 42 CLOCK invalid").unwrap().contains("bad time"));
+        session::fence("FENCE 2 84", &sessions).unwrap();
+        assert!(call(&mut peer, "BARRIER 1 RESUME 1 42 1 1").is_err());
+        assert_eq!(call(&mut peer, "BARRIER 1 RESUME 2 84 1 1").unwrap(), "ok BARRIER 1 RESUMED 1 1");
+        gate.enter().unwrap();
+    }
+
+    #[test]
+    fn a_draining_serial_barrier_allows_ping_and_explicit_abort() {
+        use std::os::unix::net::UnixStream;
+        let gate = Arc::new(barrier::Gate::default());
+        let permit = gate.enter().unwrap();
+        let statuses = Statuses::default();
+        let sessions = session::Sessions::default();
+        let dispatch = |line: &[u8]| {
+            let (mut peer, writer) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            peer.write_all(line).unwrap();
+            accept_request(File::from(OwnedFd::from(writer)), &statuses, &sessions, Some(&gate));
+            peer
+        };
+        let frame = |reader: &mut UnixStream| {
+            let mut header = [0; 5];
+            reader.read_exact(&mut header).unwrap();
+            let mut body = vec![0; u32::from_le_bytes(header[1..].try_into().unwrap()) as usize];
+            reader.read_exact(&mut body).unwrap();
+            String::from_utf8(body).unwrap()
+        };
+        let mut waiting = dispatch(b"BARRIER 1 QUIESCE 0 0 1\n");
+        assert!(gate.enter().is_err());
+        assert_eq!(frame(&mut dispatch(b"PING\n")), "pong");
+        assert_eq!(frame(&mut dispatch(b"BARRIER 1 RESUME 0 0 0 1\n")), "ok BARRIER 1 RESUMED 0 1");
+        assert!(frame(&mut waiting).starts_with("error:"));
+        drop(permit);
+        let permit = gate.enter().unwrap();
+        let mut waiting = dispatch(b"BARRIER 1 QUIESCE 0 0 2\n");
+        assert_eq!(frame(&mut dispatch(b"FENCE 1 42\n")), "ok 1");
+        assert!(frame(&mut dispatch(b"BARRIER 1 RESUME 1 42 0 2\n")).contains("active requests"));
+        drop(permit);
+        assert!(frame(&mut waiting).contains("fence"));
+        assert!(gate.enter().is_err());
+        assert_eq!(frame(&mut dispatch(b"BARRIER 1 RESUME 1 42 0 2\n")), "ok BARRIER 1 RESUMED 0 2");
+        gate.enter().unwrap();
+    }
+
+    #[test]
+    fn a_partial_serial_command_body_remains_in_the_barrier_until_rejected() {
+        let (mut peer, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let gate = Arc::new(barrier::Gate::default());
+        let statuses = Statuses::default();
+        let sessions = session::Sessions::default();
+        peer.write_all(b"ARGV pending 1\n").unwrap();
+        accept_request(File::from(OwnedFd::from(writer)), &statuses, &sessions, Some(&gate));
+        assert_eq!(gate.quiesce(0, 1, Instant::now()).unwrap_err().kind(), io::ErrorKind::TimedOut);
+        peer.write_all(b"!").unwrap();
+        let mut header = [0; 5];
+        peer.read_exact(&mut header).unwrap();
+        let mut body = vec![0; u32::from_le_bytes(header[1..].try_into().unwrap()) as usize];
+        peer.read_exact(&mut body).unwrap();
+        assert!(String::from_utf8(body).unwrap().starts_with("error:"));
+        gate.quiesce(0, 1, Instant::now() + Duration::from_secs(2)).unwrap();
+        assert!(gate.enter().is_err());
     }
 
     #[test]

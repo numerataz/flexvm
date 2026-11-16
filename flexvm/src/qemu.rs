@@ -284,10 +284,17 @@ impl Config {
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
+            let barrier = self.control == Control::Serial && machine.message("BARRIER 1 PROBE", deadline)? == b"ok BARRIER 1";
+            if barrier && machine.message("BARRIER 1 QUIESCE 0 0 1", deadline)? != b"ok BARRIER 1 QUIESCED 0 1" {
+                bail!("software guest did not quiesce request admission");
+            }
             crate::info!("software: agent ready, checking pause/resume");
             // Verify actual machine pause/resume, not host SIGSTOP/SIGCONT.
             machine.switch("stop", deadline)?;
             machine.switch("cont", deadline)?;
+            if barrier && machine.message("BARRIER 1 RESUME 0 0 0 1", deadline)? != b"ok BARRIER 1 RESUMED 0 1" {
+                bail!("software guest did not resume request admission");
+            }
             crate::info!("software: configuring guest network and clock");
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
             let line = format!("START 169.254.1.2 {}.{:09} 169.254.1.3", now.as_secs(), now.subsec_nanos());

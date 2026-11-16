@@ -318,3 +318,20 @@ verifies nested SVM state continuity in the execution engine. It does not yet
 provide checkpoint/restore through the production `flexvm software` lifecycle;
 that integration remains tracked in #1358. Both source and target process trees
 mask and trace host KVM and vhost-vsock, and panic or duplicate markers fail.
+
+The serial guest agent supports a separate `BARRIER 1` request-admission protocol.
+QUIESCE closes admission before waiting for accepted request setup and command
+bodies to finish. Long-running commands and output/input attachments release
+admission after setup. The dispatcher remains available for PING, FENCE and an
+explicit RESUME while a barrier drains. Timeouts leave admission closed; resume
+requires the exact saved generation/sequence and the current host fence. A new
+owner cannot resume a barrier with request setup still active.
+
+Cold boot probes this capability and, when present, holds admission closed across
+its existing QMP pause/resume check. Agents without the capability retain the
+foreground path. The initial unfenced owner uses generation/epoch zero;
+persistent owners must establish a nonzero FENCE first. Fenced MAINT requests
+allow clock, network and hostname setup while public admission remains closed.
+The old unversioned QUIESCE remains a filesystem sync/cache operation and cannot
+acknowledge this barrier. General mutator deduplication, persistent owner records,
+checkpoint artifacts and migration still require the lifecycle work in #1358.

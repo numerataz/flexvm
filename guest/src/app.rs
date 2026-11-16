@@ -251,8 +251,27 @@ pub(crate) fn appin(arg: &str, out: &File, pending: &[u8]) -> io::Result<()> {
     appin_on(&APP, arg, out, pending, || (), |text| msg(out, text))
 }
 
+pub(crate) fn appin_admitted(arg: &str, out: &File, pending: &[u8], permit: Option<crate::barrier::Permit>) -> io::Result<()> {
+    if permit.is_none() {
+        return appin(arg, out, pending);
+    }
+    appin_on_admitted(&APP, arg, out, pending, || (), |text| msg(out, text), permit)
+}
+
 /// `appin` on `apps`; `claimed` runs once its slot is claimed, before its hello (a test's app exits there).
 fn appin_on(apps: &Mutex<App>, arg: &str, out: &File, pending: &[u8], claimed: impl FnOnce(), hello: impl FnOnce(&str) -> io::Result<()>) -> io::Result<()> {
+    appin_on_admitted(apps, arg, out, pending, claimed, hello, None)
+}
+
+fn appin_on_admitted(
+    apps: &Mutex<App>,
+    arg: &str,
+    out: &File,
+    pending: &[u8],
+    claimed: impl FnOnce(),
+    hello: impl FnOnce(&str) -> io::Result<()>,
+    permit: Option<crate::barrier::Permit>,
+) -> io::Result<()> {
     crate::sock_timeout(out.as_raw_fd(), libc::SO_SNDTIMEO, Some(Duration::from_secs(5)));
     let stream = arg.trim().parse::<u64>().map_err(|_| io::Error::other(format!("bad stream {arg:?}")))?;
     // Claimed with no connection, which the app's end (`app_ended`) would shut down with no hello sent: the client
@@ -316,6 +335,7 @@ fn appin_on(apps: &Mutex<App>, arg: &str, out: &File, pending: &[u8], claimed: i
             }
         }
     }
+    drop(permit);
     crate::sock_timeout(out.as_raw_fd(), libc::SO_RCVTIMEO, None);
     let current = || {
         let app = apps.lock().unwrap();

@@ -18,7 +18,8 @@ A software snapshot must record:
 - Kernel and immutable root filesystem content digests, guest control protocol
   version, boot arguments, and root filesystem format.
 - VM identity, snapshot identity, transfer identity, owner generation and guest
-  attachment epoch; guest address, network identity and persistent disk identities.
+  attachment epoch and saved request-barrier generation/sequence; guest address,
+  network identity and persistent disk identities.
 - Digest and length of every state, memory and disk artifact, plus the manifest
   format version. Paths supplied by a manifest cannot select arbitrary host files.
 
