@@ -2437,6 +2437,11 @@ def podman_test_egress():
     if args.worker or args.selftest or args.no_kvm or os.geteuid() != 0 or "podman" not in (args.cases or CASES) or kvm_unusable():
         yield
         return
+    selected = args.cases or list(CASES)
+    scenarios = args.faults.split() if "faults" in selected else []
+    if not any(item[0] == "podman" for item in selected_work(selected, scenarios, faults_scenarios(), args.split)):
+        yield
+        return
     dns = ENV.get("FLEXVM_TEST_DNS", "").split()
     if not dns:
         for path in ("/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"):
@@ -2454,10 +2459,11 @@ def podman_test_egress():
     device = route["dev"]
     comment = f"fvci-podman-{os.getpid()}-{time.time_ns()}"
     previous_dns = ENV.get("FLEXVM_TEST_DNS")
-    previous_term = signal.signal(signal.SIGTERM, signal.default_int_handler)
-    ENV["FLEXVM_TEST_DNS"] = " ".join(dns)
+    previous_term = signal.getsignal(signal.SIGTERM)
     rules = contextlib.ExitStack()
     try:
+        signal.signal(signal.SIGTERM, signal.default_int_handler)
+        ENV["FLEXVM_TEST_DNS"] = " ".join(dns)
         for network in sorted({f"{net}.0/24" for _, a, b in lanes() for net in (a, b)}):
             for table, chain, match in (
                 ("nat", "POSTROUTING", ["-s", network, "-o", device, "-j", "MASQUERADE"]),
@@ -2470,9 +2476,16 @@ def podman_test_egress():
         print(f"Podman test egress: {device}, DNS {' '.join(dns)} (temporary {comment})", flush=True)
         yield
     finally:
+        original_error = sys.exc_info()[1]
         blocked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
         try:
-            rules.close()
+            # ExitStack attempts every deletion even when one callback fails.
+            try:
+                rules.close()
+            except Exception as cleanup_error:
+                if original_error is not None:
+                    raise cleanup_error from original_error
+                raise
         finally:
             if previous_dns is None:
                 ENV.pop("FLEXVM_TEST_DNS", None)
@@ -3401,6 +3414,20 @@ def lanes():
     return [(args.port_a + 2 * i, bump(args.net_a, i), bump(args.net_b, i)) for i in range(max(1, args.jobs))]
 
 
+def selected_work(selected, scenarios, kvm, split=None):
+    """The exact scheduled selection, shared with coordinator resource setup."""
+    work = work_items(selected, scenarios, kvm)
+    work.sort(key=lambda w: (-w[2], w[0]))
+    if split:
+        i, n = map(int, split.split("/"))
+        assert 1 <= i <= n, f"--split {split}: want I/N with 1 <= I <= N"
+        parts = [[] for _ in range(n)]
+        for item in work:
+            min(parts, key=lambda part: sum(value[2] for value in part)).append(item)
+        work = parts[i - 1]
+    return work
+
+
 def main():
     assert args.selftest or os.geteuid() == 0, "run as root"
     if args.worker:
@@ -3423,17 +3450,7 @@ def main():
             print("FAIL nothing selected runs without KVM", flush=True)
             return 1
         args.faults = " ".join(scenarios)
-    # (name, templates it needs, cost): the cases, and each scenario on its own.
-    work = work_items(selected, scenarios, kvm)
-    work.sort(key=lambda w: (-w[2], w[0]))
-    if args.split:
-        # Longest first, each to the part with the least so far: every split computes the same parts.
-        i, n = map(int, args.split.split("/"))
-        assert 1 <= i <= n, f"--split {args.split}: want I/N with 1 <= I <= N"
-        parts = [[] for _ in range(n)]
-        for w in work:
-            min(parts, key=lambda p: sum(x[2] for x in p)).append(w)
-        work = parts[i - 1]
+    work = selected_work(selected, scenarios, kvm, args.split)
     needed = set().union(*(w[1] for w in work))
     scheduled = list(work)
     lock, out_lock = threading.Condition(), threading.Lock()
@@ -3625,6 +3642,8 @@ def main():
     print(f"{len([r for r in summary if r[1] == 'PASS'])} passed, {len(skipped)} skipped{' (failures: --no-skips)' if skipped and args.no_skips else ''}, {len([r for r in summary if r[1] == 'FAIL'])} failed "
           f"in {time.time() - started:.0f} s ({sum(r[2] for r in summary):.0f} s of work in {len(lanes())} lanes)")
     if args.selftest:
+        podman_splits = [any(item[0] == "podman" for item in selected_work(list(CASES), scenarios, kvm, f"{i}/4")) for i in range(1, 5)]
+        assert sum(podman_splits) == 1, f"Podman egress must belong to exactly one split: {podman_splits}"
         # The second batch could not be spawned: exactly its cases and scenarios fail, the rest pass.
         bad = sorted(r[0] for r in failed)
         want = sorted(spawned[1][0] + [f"faults/{x}" for x in spawned[1][1]]) if len(spawned) > 1 else ["(no second batch)"]
