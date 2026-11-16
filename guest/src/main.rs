@@ -202,7 +202,9 @@ fn setup_root() -> io::Result<()> {
     if let Err(e) = copy_root_metadata("/", "/run/ovl/upper") {
         log(&format!("root metadata: {e}"));
     }
-    mount("overlay", "/run/root", "overlay", 0, "lowerdir=/,upperdir=/run/ovl/upper,workdir=/run/ovl/work")?;
+    // The read-only image and upper tmpfs have different devices. Stable directory
+    // inode numbers keep tar/scanners from mistaking cache eviction for a rename.
+    mount("overlay", "/run/root", "overlay", 0, "lowerdir=/,upperdir=/run/ovl/upper,workdir=/run/ovl/work,xino=on")?;
     for d in ["/proc", "/sys", "/dev"] {
         mount(d, &format!("/run/root{d}"), "", libc::MS_MOVE, "")?;
     }

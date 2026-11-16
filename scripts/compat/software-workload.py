@@ -31,6 +31,7 @@ def exercise(args):
     auth.mkdir(mode=0o700)
     environment['DOCKER_CONFIG'] = str(auth)
     workload = args.workload.read_text()
+    inode_probe = (ROOT / "root-inodes.sh").read_text()
     nonce = uuid.uuid4().hex
     owner = None
     evidence = {'status': 'running', 'phases': []}
@@ -88,10 +89,11 @@ def exercise(args):
         missing = [name for name in sorted(required) if probes.get(name, {}).get('status') != 'supported']
         if capabilities.get('schema_version') != 1 or missing:
             raise RuntimeError(f'guest capabilities failed: {missing}; {capabilities}')
+        inode_identity = cli('exec', '-i', NAME, '/bin/sh', '-s', '--', 'verify', nonce, input=inode_probe)
         output = step('verify', phase)
         seen = advancing(before)
         evidence['phases'].append({'phase': phase, 'status': 'passed', 'capabilities': capabilities,
-                                   'workload': output, 'process': seen})
+                                   'workload': output, 'process': seen, 'inode_identity': inode_identity})
         (args.output / 'owner.json').write_text(json.dumps(evidence, indent=2) + '\n')
         return seen
 
@@ -114,6 +116,7 @@ def exercise(args):
         before = observation()
         evidence['initial_process'] = before
         (args.output / 'owner.json').write_text(json.dumps(evidence, indent=2) + '\n')
+        evidence['root_filesystem'] = cli('exec', '-i', NAME, '/bin/sh', '-s', '--', 'prepare', nonce, input=inode_probe)
         evidence['prepare'] = step('prepare', 'run')
         before = verify('run', before)
         cli('pause', NAME)

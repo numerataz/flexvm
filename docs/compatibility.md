@@ -483,3 +483,13 @@ checks loaded state through suspend/start, checkpoint/restore and migration in
 both directions. Modules requiring hardware that the selected engine does not
 provide still need that device to be implemented; matching build inputs alone
 do not establish device support.
+
+
+The guest root overlay enables `xino=on` to retain directory device/inode identity
+when dentries/inodes are evicted or lower directories are copied up. Isolated
+workload runners verify this before package/archive setup and after every VM
+lifecycle phase. They drop caches only inside their owned guest, never on the
+host or an existing `--vm` target, and retain the observed identities in reports.
+The regression checks untouched lower `/usr/local/bin` and `/usr/local/sbin`
+directories before copying them up, so it catches transient overlay inode numbers
+rather than only testing already writable directories.
