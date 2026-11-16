@@ -2432,14 +2432,14 @@ def kernel_modules():
 
 
 @contextlib.contextmanager
-def podman_test_egress():
+def workload_test_egress():
     """The coordinator owns temporary egress rules, even if a worker is killed."""
-    if args.worker or args.selftest or args.no_kvm or os.geteuid() != 0 or "podman" not in (args.cases or CASES) or kvm_unusable():
+    if args.worker or args.selftest or args.no_kvm or os.geteuid() != 0 or not {"podman", "namespace_sandboxes"}.intersection(args.cases or CASES) or kvm_unusable():
         yield
         return
     selected = args.cases or list(CASES)
     scenarios = args.faults.split() if "faults" in selected else []
-    if not any(item[0] == "podman" for item in selected_work(selected, scenarios, faults_scenarios(), args.split)):
+    if not any(item[0] in ("podman", "namespace_sandboxes") for item in selected_work(selected, scenarios, faults_scenarios(), args.split)):
         yield
         return
     dns = ENV.get("FLEXVM_TEST_DNS", "").split()
@@ -2453,7 +2453,7 @@ def podman_test_egress():
                    if ":" not in value and not ipaddress.IPv4Address(value).is_loopback and not ipaddress.IPv4Address(value).is_unspecified]
             if dns:
                 break
-    assert dns, "Podman egress needs reachable IPv4 DNS (FLEXVM_TEST_DNS)"
+    assert dns, "Workload egress needs reachable IPv4 DNS (FLEXVM_TEST_DNS)"
     dns = [str(ipaddress.IPv4Address(value)) for value in dns[:3]]
     route = json.loads(subprocess.check_output(["ip", "-j", "-4", "route", "get", "1.1.1.1"], text=True, timeout=10))[0]
     device = route["dev"]
@@ -2473,7 +2473,7 @@ def podman_test_egress():
                 rule = ["-m", "comment", "--comment", comment, *match]
                 subprocess.run(["iptables", "-w", "10", "-t", table, "-I", chain, *rule], check=True, timeout=20)
                 rules.callback(subprocess.run, ["iptables", "-w", "10", "-t", table, "-D", chain, *rule], check=True, timeout=20)
-        print(f"Podman test egress: {device}, DNS {' '.join(dns)} (temporary {comment})", flush=True)
+        print(f"Workload test egress: {device}, DNS {' '.join(dns)} (temporary {comment})", flush=True)
         yield
     finally:
         original_error = sys.exc_info()[1]
@@ -2499,7 +2499,18 @@ def podman_test_egress():
 @needs_kvm
 def podman():
     """rootful/rootless Podman builds, networking, limits and live containers across VM lifecycle."""
-    output = os.path.join(args.log_dir, "podman-compat")
+    compat_workload("podman")
+
+
+@case
+@needs_kvm
+def namespace_sandboxes():
+    """bubblewrap, util-linux namespaces and gVisor systrap isolation through VM lifecycle."""
+    compat_workload("namespace-sandboxes")
+
+
+def compat_workload(workload):
+    output = os.path.join(args.log_dir, workload + "-compat")
     previous_dns = [(host, json.load(open(os.path.join(host.state_dir, "host.json"))).get("dns")) for host in (A, B)]
     try:
         for host, _ in previous_dns:
@@ -2507,7 +2518,7 @@ def podman():
         subprocess.run([
             "python3", os.path.join(ROOT, "scripts/compat.py"), "--bin", BIN,
             "--state", A.state_dir, "--run", A.run_dir, "--image", "public.ecr.aws/docker/library/ubuntu@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8",
-            "--workload", os.path.join(ROOT, "scripts/compat/workloads/podman.sh"),
+            "--workload", os.path.join(ROOT, f"scripts/compat/workloads/{workload}.sh"),
             "--phases", "run,suspend,checkpoint,migration", "--migration-to", B.addr,
             "--to-state", B.state_dir, "--to-run", B.run_dir,
             "--vcpus", "2", "--memory-mib", "2048", "--require", "storage.fuse",
@@ -2517,7 +2528,7 @@ def podman():
         for host, dns in previous_dns:
             host.configure(dns=dns)
     report = json.load(open(os.path.join(output, "report.json")))
-    check("rootful/rootless Podman lifecycle", report["status"] == "passed" and
+    check(f"{workload} lifecycle", report["status"] == "passed" and
           [(phase["phase"], phase["status"]) for phase in report["phases"]] ==
           [(phase, "passed") for phase in ("run", "suspend", "checkpoint", "migration")], report)
 
@@ -3296,7 +3307,7 @@ def worker():
 # runs, as e2e.py's summary prints them): --split balances by these, the long ones start first, and
 # the short ones go in batches of about BATCH_S (each batch is a worker, with hosts of its own).
 # Unlisted ones count as 2 s.
-COST = {"podman": 180, "faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "ipv6_taps": 10, "nettest_ipv6": 30, "docker_api": 15, "restart_policy": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
+COST = {"namespace_sandboxes": 180, "podman": 180, "faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "ipv6_taps": 10, "nettest_ipv6": 30, "docker_api": 15, "restart_policy": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
         "faults/cow_grow": 65, "faults/reconcile_kill": 64, "faults/target_renamed": 40, "faults/plug_race": 45, "faults/guest_hang": 44,
         "faults/exec_pause_grace": 42, "faults/exec_ckpt_stalled": 115, "faults/route_abort": 35, "faults/unplug_collapsed": 30,
         "faults/arrival_grew": 25, "faults/pause_resume": 24, "faults/evict_latency": 25, "faults/mem_high": 25, "faults/target_killed": 25,
@@ -3642,8 +3653,9 @@ def main():
     print(f"{len([r for r in summary if r[1] == 'PASS'])} passed, {len(skipped)} skipped{' (failures: --no-skips)' if skipped and args.no_skips else ''}, {len([r for r in summary if r[1] == 'FAIL'])} failed "
           f"in {time.time() - started:.0f} s ({sum(r[2] for r in summary):.0f} s of work in {len(lanes())} lanes)")
     if args.selftest:
-        podman_splits = [any(item[0] == "podman" for item in selected_work(list(CASES), scenarios, kvm, f"{i}/4")) for i in range(1, 5)]
-        assert sum(podman_splits) == 1, f"Podman egress must belong to exactly one split: {podman_splits}"
+        for egress_case in ("podman", "namespace_sandboxes"):
+            assigned = [any(item[0] == egress_case for item in selected_work(list(CASES), scenarios, kvm, f"{i}/4")) for i in range(1, 5)]
+            assert sum(assigned) == 1, f"{egress_case} egress must belong to exactly one split: {assigned}"
         # The second batch could not be spawned: exactly its cases and scenarios fail, the rest pass.
         bad = sorted(r[0] for r in failed)
         want = sorted(spawned[1][0] + [f"faults/{x}" for x in spawned[1][1]]) if len(spawned) > 1 else ["(no second batch)"]
@@ -3675,7 +3687,7 @@ def main():
 
 if __name__ == "__main__":
     try:
-        with podman_test_egress():
+        with workload_test_egress():
             code = main()
     finally:
         forget_states(TEMPLATES, WORK)

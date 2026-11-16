@@ -591,6 +591,14 @@ jobs:
           sudo dmesg | tail -200 > "$RUNNER_TEMP/e2e-logs/dmesg.txt" || true
           # The background release build's output, also when "Build flexvm" never ran.
           cp "$RUNNER_TEMP/build.log" "$RUNNER_TEMP/e2e-logs/build.log" || true
+      - name: Upload compatibility reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: compatibility-${{ runner.arch }}-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/e2e-logs/**/*-compat/report.json
+          if-no-files-found: ignore
+
       - name: Upload logs
         if: failure() || cancelled()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
