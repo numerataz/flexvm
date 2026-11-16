@@ -335,3 +335,21 @@ allow clock, network and hostname setup while public admission remains closed.
 The old unversioned QUIESCE remains a filesystem sync/cache operation and cannot
 acknowledge this barrier. General mutator deduplication, persistent owner records,
 checkpoint artifacts and migration still require the lifecycle work in #1358.
+
+`flexvm software --name NAME` publishes the foreground VM through the ordinary
+name lock and owner control socket. `ps`, `inspect`, argv exec (including guest
+credentials, environment and cwd), pause/unpause, `wait` and `kill` use the normal
+CLI. Records explicitly identify QEMU TCG and its real process identity and image;
+software VMs have no Firecracker template or PID. The VM still ends with its
+initial command. Background/restart policy and checkpoint/migration are pending;
+`stop` refuses unsupported suspend rather than destroying the VM as if it had
+saved state. A direct SIGTERM is also refused, while SIGINT destroys the owner.
+
+Named software VMs use serial control and fixed RAM. The initial admission policy
+holds a full RAM grant for the VM's lifetime. This is conservative: resident RAM
+already reduces MemAvailable, so it may leave extra headroom and reduce packing
+density. Elastic memory and accurate shared admission accounting remain work in
+#1358. Their address is private to the userspace network, not a routed host address.
+The owner and actual engine have distinct verified identities; a hard owner death
+terminates the engine through its parent-death signal. Recovery/garbage collection
+of private runtime paths after an abrupt death remains part of lifecycle integration.

@@ -27,6 +27,7 @@ mod ports;
 mod qemu;
 mod restart;
 mod socket;
+mod software;
 mod standby;
 mod template;
 mod uffd;
@@ -482,7 +483,7 @@ const NAMES: usize = usize::MAX;
 
 /// Each command's words (itself included) at most, and its flags besides `GLOBAL`.
 const COMMANDS: &[(&str, usize, &[&str])] = &[
-    ("software", 2, &["kernel", "qemu", "control", "vsock-backend", "mem", "vcpus", "timeout"]),
+    ("software", 2, &["name", "kernel", "qemu", "control", "vsock-backend", "mem", "vcpus", "timeout"]),
     (
         "run",
         2,
@@ -1598,7 +1599,12 @@ const STOP_WAIT: Duration = Duration::from_secs(600);
 fn stop(host: &Host, name: &str) -> Result<String> {
     host::check_name(name)?;
     // The instance signalled: its exit status tells an app that exited first (`--rm` or attached VMs leave no exited record).
-    let mut vm = match Tracked::signal(host, name, libc::SIGTERM, &|_| Ok(()))? {
+    let mut vm = match Tracked::signal(host, name, libc::SIGTERM, &|entry| {
+        if !entry.backend.is_firecracker() {
+            bail!("software VM suspend is not implemented yet; flexvm kill destroys it");
+        }
+        Ok(())
+    })? {
         Some(vm) => vm,
         // A stopped VM's checkpoint, not debris (a consumed or discarded one) under its name.
         // An exited one whose restart policy would run it again is not (docker's stop ends a restart loop).
@@ -1902,6 +1908,9 @@ fn vms(host: &Host) -> Vec<Value> {
     // Derived where shown, never recorded: its IPv4 address under `vm_ipv6_prefix` (#1296).
     let cfg = host.config_now();
     for v in &mut vms {
+        if v["backend"]["kind"] == "qemu-tcg" {
+            continue;
+        }
         if let Some(v6) = v["ip"].as_str().and_then(|ip| ip.parse().ok()).and_then(|ip| cfg.vm_ipv6(ip)) {
             v["ipv6"] = json!(v6.to_string());
         }
@@ -2230,16 +2239,28 @@ fn image_options(args: &Args, src: &str) -> Result<image::Options> {
 }
 
 /// First software execution slice: reuse OCI preparation and the real agent,
-/// with engine processes owned by this foreground command. Persistent VM records
-/// and migration wait for the software state/device contract.
+/// with engine processes owned by this foreground command. Named VMs also expose
+/// live management; durable state and migration wait for the software state/device contract.
 fn software(args: &Args, src: &str) -> Result<i32> {
-    let control = match args.get("control").unwrap_or("vsock") {
+    if args.get("name").is_some() {
+        // A shell's background SIGINT/SIGQUIT disposition must not disable the
+        // normal management kill operation on a named VM.
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+            libc::signal(libc::SIGQUIT, libc::SIG_DFL);
+        }
+        util::block_signals(&[libc::SIGTSTP, libc::SIGCONT, libc::SIGTERM]);
+    }
+    let control = match args.get("control").unwrap_or(if args.get("name").is_some() { "serial" } else { "vsock" }) {
         "vsock" => qemu::Control::Vsock,
         "serial" => qemu::Control::Serial,
         other => bail!("unsupported software control transport {other:?}: use vsock or serial"),
     };
     if control == qemu::Control::Serial && args.get("vsock-backend").is_some() {
         bail!("--vsock-backend requires --control vsock");
+    }
+    if args.get("name").is_some() && control != qemu::Control::Serial {
+        bail!("named software VMs require --control serial");
     }
     let config = qemu::Config {
         control,
@@ -2256,7 +2277,8 @@ fn software(args: &Args, src: &str) -> Result<i32> {
     }
     let processes = std::sync::Arc::new(qemu::Processes::default());
     let stopping = processes.clone();
-    util::on_signal(&[libc::SIGINT, libc::SIGTERM, libc::SIGHUP], move |sig| {
+    let signals: &[i32] = if args.get("name").is_some() { &[libc::SIGINT, libc::SIGQUIT, libc::SIGHUP] } else { &[libc::SIGINT, libc::SIGTERM, libc::SIGHUP] };
+    util::on_signal(signals, move |sig| {
         template::interrupt(sig);
         stopping.stop();
     });
@@ -2269,7 +2291,20 @@ fn software(args: &Args, src: &str) -> Result<i32> {
     if meta.argv.is_empty() {
         bail!("software execution needs an image command or CMD");
     }
-    let machine = config.boot(&rootfs, processes)?;
+    let named = args
+        .get("name")
+        .map(|name| -> Result<_> {
+            let host = open_host(args)?;
+            let lock = host.take_name(name, false)?;
+            Ok((host, lock))
+        })
+        .transpose()?;
+    let _reservation = named.as_ref().map(|(host, _)| software::Reservation::new(host, config.mem_mib, Instant::now() + config.boot_timeout)).transpose()?;
+    let machine = config.boot(&rootfs, processes.clone())?;
+    if let Some((host, lock)) = named {
+        return software::run(host, lock, machine, processes, &config, &meta);
+    }
+
     machine.exec(meta.argv, |kind, bytes| {
         if kind == guest::FRAME_STDERR {
             let mut out = std::io::stderr().lock();

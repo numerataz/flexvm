@@ -84,6 +84,11 @@ impl Processes {
                 if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
+                // Job-control signals belong to the foreground owner. Its
+                // engines are controlled through QMP and explicit cancellation.
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
                 if libc::getppid() != parent {
                     return Err(std::io::Error::other("software VM owner exited before spawn"));
                 }
@@ -115,7 +120,13 @@ impl Processes {
         Ok(())
     }
 
-    fn alive(&self) -> Result<()> {
+    pub fn engine_ident(&self) -> Result<crate::host::Ident> {
+        let children = self.0.lock().unwrap();
+        let child = children.last().ok_or("software engine is not running")?;
+        crate::host::Ident::of(child.child.id()).ok_or_else(|| "cannot identify software engine process".into())
+    }
+
+    pub fn alive(&self) -> Result<()> {
         template::interrupted()?;
         for process in self.0.lock().unwrap().iter_mut() {
             if let Some(status) = process.child.try_wait()? {
@@ -396,7 +407,7 @@ impl Machine {
     /// vhost-device-vsock 0.3 reads ahead and discards bytes after CONNECT.
     /// Wait for its OK before writing the agent command; Firecracker keeps its
     /// existing pipelined handshake and does not pay this extra round trip.
-    fn request(&self, line: &str, deadline: Instant) -> Result<BufReader<std::os::unix::net::UnixStream>> {
+    pub fn request(&self, line: &str, deadline: Instant) -> Result<BufReader<std::os::unix::net::UnixStream>> {
         let stream = match &self.control {
             Some(control) => control.open(deadline)?,
             None => util::connect_unix(&self.sockets.vsock, remaining(deadline)?)?,
@@ -414,7 +425,7 @@ impl Machine {
         Ok(r)
     }
 
-    fn message(&self, line: &str, deadline: Instant) -> Result<Vec<u8>> {
+    pub fn message(&self, line: &str, deadline: Instant) -> Result<Vec<u8>> {
         let mut r = self.request(line, deadline)?;
         match guest::read_frame(&mut By { s: &mut r, at: deadline })? {
             Some((guest::FRAME_MSG, m)) => Ok(m),
@@ -422,7 +433,7 @@ impl Machine {
         }
     }
 
-    fn switch(&mut self, command: &str, deadline: Instant) -> Result<()> {
+    pub fn switch(&self, command: &str, deadline: Instant) -> Result<()> {
         let mut qmp = Qmp::connect(&self.sockets.api, deadline)?;
         qmp.command(command, json!({}), &[])?;
         let state = qmp.command("query-status", json!({}), &[])?;
@@ -433,15 +444,31 @@ impl Machine {
         Ok(())
     }
 
-    pub fn exec(&self, argv: Vec<String>, out: impl FnMut(u8, &[u8]) -> Result<()>) -> Result<i32> {
+    pub fn start_exec(&self, argv: Vec<String>) -> Result<(String, BufReader<UnixStream>)> {
         let body = guest::Exec { argv, ..Default::default() }.encode()?;
         guest::fits(&body)?;
         let id = util::random_hex(16)?;
         let deadline = Instant::now() + guest::TIMEOUT;
-        let r = guest::session_on("argv", &id, 0, &body, |line| self.request(line, deadline))?;
-        guest::untimed(&r)?;
-        r.get_ref().set_read_timeout(Some(Duration::from_millis(250)))?;
-        guest::exec_output(&mut Watched { reader: r, processes: &self.processes }, &id, out)
+        let reader = guest::session_on("argv", &id, 0, &body, |line| self.request(line, deadline))?;
+        guest::untimed(&reader)?;
+        reader.get_ref().set_read_timeout(Some(Duration::from_millis(250)))?;
+        Ok((id, reader))
+    }
+
+    pub fn exec_started(&self, reader: &mut BufReader<UnixStream>, id: &str) -> Result<()> {
+        match guest::read_frame(&mut Watched { reader, processes: &self.processes })? {
+            Some((guest::FRAME_MSG, body)) if body == id.as_bytes() => Ok(()),
+            other => bail!("software command was not accepted: {other:?}"),
+        }
+    }
+
+    pub fn finish_exec(&self, reader: &mut BufReader<UnixStream>, id: &str, out: impl FnMut(u8, &[u8]) -> Result<()>) -> Result<i32> {
+        guest::exec_output(&mut Watched { reader, processes: &self.processes }, id, out)
+    }
+
+    pub fn exec(&self, argv: Vec<String>, out: impl FnMut(u8, &[u8]) -> Result<()>) -> Result<i32> {
+        let (id, mut reader) = self.start_exec(argv)?;
+        self.finish_exec(&mut reader, &id, out)
     }
 
     fn diagnostics(&self) -> String {

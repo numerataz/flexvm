@@ -400,6 +400,14 @@ pub(crate) fn described_meta(host: &Host, paths: &template::Paths, name: &str, m
         "socket": if running { json!(path("sock")) } else { Value::Null },
         "checkpoint": host.is_suspended(name).then(|| host.suspended(name).ok()).flatten(),
     });
+    if v["backend"]["kind"] == "qemu-tcg" {
+        config["image"] = v["backend"]["image"].clone();
+        config["digest"] = v["backend"]["digest"].clone();
+        config["app"] = v["backend"]["argv"].clone();
+        config["backend"] = v["backend"].clone();
+        config["template"] = Value::Null;
+        config["template_id"] = Value::Null;
+    }
     if let Some(v6) = v.get("ipv6") {
         config["ipv6"] = v6.clone();
     }
@@ -889,7 +897,7 @@ pub fn field(v: &Value, name: &str) -> String {
 fn field_in(v: &Value, name: &str, fields: Fields) -> String {
     let key = fields.iter().find(|(n, _)| *n == name).map_or(name, |(_, k)| k);
     match key {
-        "image" => v["template"].as_str().map(template::image_of).unwrap_or_default(),
+        "image" => v["backend"]["image"].as_str().map(str::to_owned).or_else(|| v["template"].as_str().map(template::image_of)).unwrap_or_default(),
         // The --cpus cap, else its vCPUs.
         "cpus" if v["cpus"].is_null() => field(v, "VCPUs"),
         "starved" => if v["starved"] == true { "yes" } else { "" }.into(),
