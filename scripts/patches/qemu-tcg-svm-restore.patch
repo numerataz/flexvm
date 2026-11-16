@@ -6,12 +6,8 @@ QEMU 10.2.1 already serializes TCG SVM NPT and interrupt-control state.
 
 --- a/target/i386/machine.c
 +++ b/target/i386/machine.c
-@@ -355,7 +355,7 @@
-     env->hflags |= (env->segs[R_SS].flags >> DESC_DPL_SHIFT) & HF_CPL_MASK;
- 
+@@ -357,3 +357,3 @@
  #ifdef CONFIG_KVM
 -    if ((env->hflags & HF_GUEST_MASK) &&
 +    if (kvm_enabled() && (env->hflags & HF_GUEST_MASK) &&
          (!env->nested_state ||
-         !(env->nested_state->flags & KVM_STATE_NESTED_GUEST_MODE))) {
-         error_report("vCPU set in guest-mode inconsistent with "
