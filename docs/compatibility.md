@@ -128,6 +128,33 @@ This case requires a KVM host and the expanded guest kernel with FUSE, TUN and
 container networking enabled. Rootless Docker and service-managed user sessions
 remain separate acceptance work in #1322/#1328.
 
+## Standalone runtime acceptance
+
+The `containerd` E2E case runs unchanged upstream nerdctl-full v2.4.2 binaries
+(containerd, runc, CNI plugins and standalone BuildKit) in the pinned Ubuntu guest.
+Both native archives are checked against pinned upstream SHA-256 sums. It selects
+containerd's native snapshotter and configures its transfer service explicitly for
+that snapshotter, supporting the guest's overlay-backed root without an automatic
+storage-driver fallback. CRI plugins are outside this direct runtime case.
+
+The workload verifies CNI bridge DNS, outbound HTTP, published ports, bind and
+named volumes, and exact memory/CPU/PID controller limits. A live container keeps
+a random cookie and advancing counter; the container and both daemons must retain
+their PID/start times across run, suspend/resume, checkpoint rollback and migration.
+Each phase forces a fresh standalone BuildKit `RUN` using a changing build ARG
+and secret/cache mounts, imports and executes the OCI output, checks that the
+secret mount is absent, and requires the persistent build-cache counter to advance.
+
+```sh
+sudo scripts/e2e.py --jobs 1 --no-image --faults '' containerd
+```
+
+Native x86/ARM software CI also runs this same workload with host KVM and
+vhost-vsock masked and the process tree traced. That backend checks run,
+pause/unpause and stop/start with a fresh emulator owner, retaining the guest
+and workload process state. It uses the same hardware-free workload runner
+as Podman and the namespace sandboxes.
+
 ## Namespace sandbox acceptance
 
 The `namespace_sandboxes` E2E case installs ordinary Ubuntu packages for chroot,
@@ -208,7 +235,7 @@ silently switch storage/networking to a reduced mode.
 
 QEMU 8.2.2 with forced KVM acceleration booted an inner Linux guest and advanced
 its serial counter. Outer suspend/resume failed the subsequent guest exec check;
-nested KVM lifecycle support remains open in #1327. Rootless Docker, standalone
+nested KVM lifecycle support remains open in #1327. Rootless Docker, rootless
 containerd/builders, Kubernetes, system containers, distro init and durable disks
 still require their own acceptance results. These development results do not
 establish support for every architecture or workload.
@@ -342,8 +369,9 @@ settings, outbound HTTP, a bind mount and a
 named volume read by a second container. It also requires BuildKit to execute an
 uncached Dockerfile `RUN`, export an image and run that image with its expected
 output, using the imported base image without another registry pull. This covers
-Docker's bundled BuildKit; standalone/rootless BuildKit and containerd/CRI remain
-separate acceptance cases. The complete host process tree remains
+Docker's bundled BuildKit; the direct workload below covers standalone
+containerd/BuildKit. Rootless builders and CRI remain separate acceptance cases.
+The complete host process tree remains
 device-masked and traced. This establishes basic container operation under TCG;
 it does not establish rootless Docker, overlay storage, persistent VM lifecycle
 or a performance guarantee. Docker console output and its syscall trace are
