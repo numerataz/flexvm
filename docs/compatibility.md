@@ -154,6 +154,31 @@ machine-readable compatibility reports on success and failure. For configured
 hosts, `scripts/compat.py --workload scripts/compat/workloads/namespace-sandboxes.sh`
 also runs the workload with its ordinary source/peer lifecycle options.
 
+## Ordinary workloads without host KVM
+
+`scripts/compat/software-workload.py` runs the same guest workload scripts using
+named software FlexVM and serial control. Both host virtualization devices are
+masked before tracing. The harness streams native static probes through `exec`
+stdin, exercises prepare/verify, pause/unpause and stop/start, and requires a
+fresh emulator process after restoration. A separate foreground canary must keep
+its PID/start time, random RAM identity, fresh timer/counter progress and exactly
+once output. Workload-specific checks continue to run inside the guest.
+
+```sh
+sudo scripts/compat/software-workload.py --bin target/release/flexvm \
+  --kernel /var/lib/flexvm/artifacts/vmlinux \
+  --workload scripts/compat/workloads/namespace-sandboxes.sh \
+  --require storage.fuse --output /tmp/software-sandboxes
+```
+
+Use `workloads/podman.sh` for the rootful/rootless container case. CI runs both
+scripts natively on x86_64 and aarch64 with TCG, a 2 GiB guest and bounded host
+resources. Reports retain binary/kernel/CPU-engine/workload/probe identities,
+compiler/runtime versions, capability inventories, live state and fresh-owner
+identities. Host KVM, vhost-vsock or module-loader access fails the test. These
+checks cover the software backend's supported local lifecycle; software
+checkpoint publication and cross-host migration remain tracked in #1358.
+
 ## Initial audit
 
 The pinned 6.1.155 guest kernel passed the basic namespace, cgroup, overlay,
