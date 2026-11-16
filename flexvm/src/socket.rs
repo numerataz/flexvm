@@ -366,14 +366,28 @@ pub fn sweep_software(owner: Option<&crate::host::Ident>) -> Result<()> {
     sweep_software_in(&bases(), owner)
 }
 
+/// Background sweeps skip contention; explicit fencing waits briefly for another
+/// collector/creator, without letting a stuck process hold up recovery forever.
+fn software_base_lock(file: File, wait: Option<std::time::Duration>) -> io::Result<Option<crate::host::Flock>> {
+    let deadline = wait.map(|wait| std::time::Instant::now() + wait);
+    loop {
+        match crate::host::flock(&file, libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(()) => return Ok(Some(crate::host::Flock(file))),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => match deadline {
+                None => return Ok(None),
+                Some(deadline) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Some(_) => return Err(error),
+            },
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn sweep_software_in(bases: &[PathBuf], selected: Option<&crate::host::Ident>) -> Result<()> {
     for base in bases.iter().filter(|base| private(base).is_ok()) {
         let base_file = File::open(base)?;
-        let _sweeping = match crate::host::Flock::new(base_file, libc::LOCK_EX | libc::LOCK_NB) {
-            Ok(lock) => lock,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock && selected.is_none() => continue,
-            Err(error) => return Err(error.into()),
-        };
+        let wait = selected.map(|_| std::time::Duration::from_secs(5));
+        let Some(_sweeping) = software_base_lock(base_file, wait)? else { continue };
         for entry in fs::read_dir(base)? {
             let entry = entry?;
             let recognized = entry
@@ -552,6 +566,35 @@ mod tests {
         let mut selected = crate::host::Ident::me();
         selected.start += 1;
         assert!(sweep_software_in(&bases, Some(&selected)).is_err(), "unknown ownership cannot authorize name reuse");
+    }
+
+    #[test]
+    fn targeted_software_reaping_waits_for_a_busy_base_but_has_a_deadline() {
+        let temp = crate::test_util::TempDir::new("qwait");
+        let bases = [temp.join("s")];
+        let mut root = SocketRoot::software_in(&bases).unwrap();
+        let owner = dead_software_owner(&root);
+        let path = root.dir.clone();
+        drop(Arc::get_mut(&mut root).unwrap().software_lease.take());
+        let busy = crate::host::Flock::new(File::open(&bases[0]).unwrap(), libc::LOCK_EX).unwrap();
+        assert!(software_base_lock(File::open(&bases[0]).unwrap(), None).unwrap().is_none(), "periodic sweeps stay nonblocking");
+        let before = std::time::Instant::now();
+        let error = software_base_lock(File::open(&bases[0]).unwrap(), Some(std::time::Duration::from_millis(20))).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(before.elapsed() >= std::time::Duration::from_millis(20));
+        let (ready, started) = std::sync::mpsc::channel();
+        let (done, result) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            ready.send(()).unwrap();
+            done.send(sweep_software_in(&bases, Some(&owner)).map_err(|error| error.to_string())).unwrap();
+        });
+        started.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert!(result.recv_timeout(std::time::Duration::from_millis(100)).is_err(), "targeted fencing returned during unrelated contention");
+        assert!(path.exists());
+        drop(busy);
+        result.recv_timeout(std::time::Duration::from_secs(5)).unwrap().unwrap();
+        worker.join().unwrap();
+        assert!(!path.exists(), "targeted fencing must collect after the base lock is released");
     }
 
     #[test]

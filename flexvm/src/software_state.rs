@@ -1270,8 +1270,11 @@ mod tests {
         let manifest = fs::read(path.join("manifest.json")).unwrap();
         let grant = fs::read(path.join("STARTED")).unwrap();
         drop(consumed);
-        sweep(&root).unwrap();
-        assert!(!temporary.exists());
+        // Parallel test forks can briefly retain CLOEXEC directory leases.
+        crate::test_util::wait_until("released bundle journal collection", || {
+            sweep(&root).unwrap();
+            !temporary.exists()
+        });
         assert_eq!(fs::read(path.join("manifest.json")).unwrap(), manifest);
         assert_eq!(fs::read(path.join("STARTED")).unwrap(), grant);
         assert!(open(&path, &profile).unwrap().prepare(&name, &local_host).err().unwrap().to_string().contains("already granted"));
@@ -1306,8 +1309,10 @@ mod tests {
         grant.engine = engine;
         grant.engine.start += 1; // A reused PID is not the recorded engine.
         write_record(&dir, "STARTED", &serde_json::to_vec(&grant).unwrap(), true).unwrap();
-        sweep(&root).unwrap();
-        assert!(!hidden.exists());
+        crate::test_util::wait_until("retired exchanged input collection", || {
+            sweep(&root).unwrap();
+            !hidden.exists()
+        });
     }
 
     #[test]
