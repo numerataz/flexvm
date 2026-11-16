@@ -13,7 +13,8 @@ versioned format and never enter the Firecracker pager or snapshot loader.
 A software snapshot must record:
 
 - Architecture, exact engine binary digest and QMP version, board and CPU profile,
-  vCPU count, RAM layout/size, and the ordered device configuration.
+  vCPU count, RAM layout/size, firmware/DTB digests and the ordered device
+  configuration, including CPU feature flags, EL2 and GIC options.
 - Kernel and immutable root filesystem content digests, guest control protocol
   version, boot arguments, and root filesystem format.
 - VM identity, snapshot identity, transfer identity, owner generation and guest
@@ -21,10 +22,14 @@ A software snapshot must record:
 - Digest and length of every state, memory and disk artifact, plus the manifest
   format version. Paths supplied by a manifest cannot select arbitrary host files.
 
-Initially require an exact engine/profile match for restore. Validate the entire
+The minimum engine version applies to new boots. Initially require an exact
+engine/profile match for restore. Validate the entire
 manifest and referenced artifacts before starting the destination engine. Reject
 unknown formats, missing artifacts, changed content and incompatible profiles with
-specific errors. No implicit conversion between engines or architectures.
+specific errors. Open artifacts without following symlinks, verify their open
+descriptors, and pass those same descriptors to the engine. Verification followed
+by reopening a pathname is insufficient. Staging and published artifacts must be
+owned by the host and inaccessible for writes by guests or other principals. No implicit conversion between engines or architectures.
 
 The x86 profile keeps SVM and NPT enabled and requires QEMU 9.2 or newer for real
 mode nested page walks. The tested engine is 10.2.1. ARM uses Cortex-A72 with EL2;
@@ -36,27 +41,42 @@ A VM owner serializes start, pause, resume, checkpoint, transfer and destruction
 under one operation lock. Track engine process identity through owned child
 handles; a PID alone is insufficient. Owner exit terminates and reaps owned
 engines and closes the private control endpoints. Recover abandoned records
-without treating an unrelated reused PID as the VM.
+without treating an unrelated reused PID as the VM. Persist the host boot ID,
+owner PID/start time, VM nonce and private endpoint identity. Verify these during
+recovery; use pidfds while the live owner holds the processes.
 
 Use virtio-serial for migratable software control. Disconnecting its host client
 is necessary but does not by itself prove guest requests have drained. Introduce
 an acknowledged guest quiescence barrier covering the serial dispatcher and
-accepted requests. Stop admission, resolve or cancel outstanding operations,
+accepted requests. This requires a new, versioned QUIESCE/ACK/RESUME agent
+protocol; reject agents without it for checkpoint operations. Its barrier covers
+incomplete Yamux bodies and accepted asynchronous request setup. It does not wait
+for user processes or long-lived output attachments to finish. Stop admission,
+resolve or cancel outstanding operations,
 acknowledge the barrier, then pause CPUs. Preserve guest processes and session
 output across the checkpoint; a disconnected attachment does not terminate them.
+Use persisted request identities for mutating operations, reusing session IDs for
+command creation, and retain their acceptance/results across restore. An accepted
+operation with side effects cannot be blindly retried as a fresh request. A
+barrier timeout fails checkpointing rather than saving an ambiguous request.
 
 On restore establish a fresh control connection and the guest's existing
 `FENCE generation epoch` protocol before attaching sessions. Keep monotonic
 claim numbers and stream offsets. Old owners and delayed old requests must fail
 without changing guest state or duplicating command execution. Management and
-Docker API calls must use the same owner and lifecycle state machine.
+Docker API calls must use the same owner and lifecycle state machine: route
+requests through its admission gate and return the existing retryable checkpoint
+or paused response while admission is closed.
 
 ## Checkpoint and restore
 
 1. Acquire the operation lock, close admission and acknowledge guest quiescence.
 2. Pause through QMP and verify the actual engine state. Account for device and
    network operations that were already in flight.
-3. Export QEMU state and RAM through an owned descriptor with `getfd`/`migrate`.
+3. Drain pending block I/O through the engine block layer, flush the backing
+   stores, and capture writable disk snapshots at the same paused device boundary.
+   Failure to establish that boundary fails the checkpoint. Export QEMU state and
+   RAM through an owned descriptor with `getfd`/`migrate`.
    Bound every command and transfer by a deadline; require migration completion.
    Include immutable root references and writable disk contents in the snapshot.
 4. Write artifacts into a private staging directory, synchronize their contents,
@@ -65,14 +85,34 @@ Docker API calls must use the same owner and lifecycle state machine.
 5. For suspend, retire and reap the source engine before publishing it as stopped.
    For a retained source, explicitly leave migration state through a supported
    engine transition and verify pause or resume; failure leaves the VM fenced
-   and visibly failed.
+   and visibly failed. Source resume is forbidden after destination write or CPU
+   ownership has been granted.
 6. Restore in a fresh process, load all state while paused and verify completion.
    Reconnect and fence control, reconcile network/clock state, then publish the
    destination ownership and resume. Rollback cannot leave both copies running.
 
+Use durable transfer journals on both hosts, without requiring shared storage.
+The source first records its irrevocable retired generation, stops and reaps its
+engine, then issues a retirement receipt bound to the transfer and generation.
+The destination requires that receipt and commits its journal before resuming.
+Recovery never automatically resumes an ambiguously transferred source; it
+remains fenced until the journal protocol resolves ownership. Retry receipts
+idempotently, and retain the source tombstone across owner/host restarts. Test
+every crash window, including retirement recorded before the source exits, and
+destination commit before its acknowledgment reaches the source.
+
+After load, use the guest agent to step CLOCK_REALTIME from the current host time.
+Do not reset CLOCK_MONOTONIC through the agent. Preserve the engine virtual clock
+and device timers through migration, and test nondecreasing monotonic time and
+nested timer progress across pause/restore. Clock or fencing setup failure keeps
+the destination paused.
+
 Begin with eager, complete RAM state. Reserve and account for its full committed
 memory. Elastic memory and demand paging require their own engine integration;
-fixed RAM must not be reported as elastic or charged only for initial RSS.
+fixed RAM must not be reported as elastic or charged only for initial RSS. Guest
+KVM child memory already lives in its parent RAM reservation and is charged
+there. A parent-managed sibling engine needs its own reservation against the
+same hierarchy budget; do not double-charge guest-resident child RAM.
 
 ## Storage and networking
 
@@ -83,8 +123,11 @@ write ownership before granting the destination write access. Test interrupted
 transfers, retries and recovery after either owner crashes. Shared storage cannot
 become an undocumented prerequisite.
 
-Persistent lifecycle networking must retain the VM's routed address and integrate
-with the existing TAP/route/hold transfer machinery. The foreground userspace
+Persistent lifecycle networking must retain the VM's routed address and MAC.
+The VM owner creates the TAP through the existing network machinery and passes
+its owned descriptor to QEMU using a TAP netdev with an explicit inheritance
+whitelist. Keep TAP, route and held-packet ownership in the common owner rather
+than in an engine-specific record. The foreground userspace
 network stack has no established cross-host connection continuity contract.
 Require TCP and UDP continuity tests before advertising migration for that mode;
 changing the guest address or silently dropping connections is insufficient.
@@ -107,6 +150,8 @@ changing the guest address or silently dropping connections is insufficient.
   hierarchy, and stale parent/child owners cannot regain authority after migration.
 - Repeat the applicable lifecycle tests with optional hardware acceleration.
   Software-path success cannot substitute for nested hardware state verification.
+  Use the authorized GCE environment for hardware tests where GitHub runners do
+  not expose the required nested acceleration; record the exact host capabilities.
 
 Close #1358/#1327 only after their complete acceptance criteria pass. Narrow
 milestones and engine experiments must leave those issues open.
