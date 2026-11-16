@@ -61,7 +61,9 @@ operation with side effects cannot be blindly retried as a fresh request. A
 barrier timeout fails checkpointing rather than saving an ambiguous request.
 After ACK, the dispatcher refuses new work until an idempotent RESUME for the
 same barrier identity. Bound the deduplication table; reject expired identities
-as expired rather than executing them anew. Retire entries only after explicit
+as expired rather than executing them anew. Protocol deadlines and retention
+use monotonic time or host-issued counters, never guest realtime. Retire entries
+only after explicit
 result acknowledgment and after their generation can no longer attach.
 
 On restore establish a fresh control connection and the guest's existing
@@ -102,8 +104,13 @@ Retain the committed source snapshot until the destination durably commits and
 retains a verified recovery copy. Before retirement, a failed transfer may resume
 the source; disks remain frozen between capture and resolution. After retirement,
 that generation can never resume. Recover from retained artifacts under a fresh
-generation only after the destination has durably aborted/retired or otherwise
-been fenced. An unresolved destination outcome never permits unilateral resume.
+generation only after the destination acknowledges a durable abort/retirement
+record that permanently rejects the old transfer receipt. No acknowledgment means
+the source remains fenced, even after a timeout. There is no timeout-based
+operator override in the initial implementation. Each owner durably records the
+highest generation seen; recovery chooses a generation above those acknowledged
+by both hosts, and every resume checks that record and any aborted transfer IDs.
+An unresolved destination outcome never permits unilateral resume.
 
 Authenticate receipts using explicitly configured trusted host signing keys;
 unsigned or unknown-host receipts cannot authorize restore. Bind the VM, source
@@ -139,7 +146,11 @@ resource error without a partial load; every later failure releases reservations
 ## Storage and networking
 
 Transfer writable disk state automatically with the VM, as requested in #1329.
-Snapshot each disk at the same consistency boundary as CPU and RAM. Verify disk
+Snapshot each disk at the same consistency boundary as CPU and RAM. Capture a
+full copy or immutable copy-on-write version; retaining a reference to a writable
+live disk is insufficient. On a failed transfer before retirement, unfreeze the
+source only after leaving migration state; subsequent writes cannot alter the
+committed snapshot. Verify disk
 identity, content and size before attaching the destination. Retire the source's
 write ownership before granting the destination write access. Test interrupted
 transfers, retries and recovery after either owner crashes. Shared storage cannot
@@ -150,7 +161,10 @@ The VM owner creates the TAP through the existing network machinery and passes
 its owned descriptor to QEMU using a TAP netdev with an explicit inheritance
 whitelist. Keep TAP, route and held-packet ownership in the common owner rather
 than in an engine-specific record. Include held-packet buffers and delivery
-positions in the transfer. The source withdraws its active route and holds
+positions in the transfer. Guest virtio queues are saved with RAM/device state.
+Held-buffer delivery follows ordinary network retry semantics: preserve TCP
+stream continuity, while UDP duplicates/loss remain observable network behavior.
+The source withdraws its active route and holds
 traffic before export; the destination publishes its route after ownership
 commit. Verify destination route updates, source withdrawal and packet delivery
 under the existing migration ordering before enabling the backend. The foreground userspace
