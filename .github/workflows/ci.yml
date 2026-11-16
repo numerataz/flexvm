@@ -141,7 +141,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/software-qemu
-          key: software-qemu-x86_64-ubuntu24-${{ hashFiles('scripts/build-qemu.sh') }}
+          key: software-qemu-x86_64-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch') }}
       - name: Install fixed x86 software CPU engine
         if: matrix.arch == 'x86_64'
         run: |
@@ -206,6 +206,10 @@ jobs:
         run: |
           sudo python3 scripts/compat/software-kvm.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --firecracker "$RUNNER_TEMP/software-state/artifacts/firecracker" --output "$RUNNER_TEMP/software-kvm"
           cat "$RUNNER_TEMP/software-kvm/report.json"
+      - name: Live nested Linux through ordinary software stop/start
+        run: |
+          sudo python3 scripts/compat/software-lifecycle.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --firecracker "$RUNNER_TEMP/software-state/artifacts/firecracker" --output "$RUNNER_TEMP/software-nested-lifecycle" --timeout 900
+          cat "$RUNNER_TEMP/software-nested-lifecycle/report.json"
       - name: Upload software execution evidence
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -236,6 +240,9 @@ jobs:
             ${{ runner.temp }}/software-lifecycle/*.json
             ${{ runner.temp }}/software-lifecycle/*.log
             ${{ runner.temp }}/software-lifecycle/*.strace
+            ${{ runner.temp }}/software-nested-lifecycle/*.json
+            ${{ runner.temp }}/software-nested-lifecycle/*.log
+            ${{ runner.temp }}/software-nested-lifecycle/*.strace
             ${{ runner.temp }}/software-kvm/*.json
             ${{ runner.temp }}/software-kvm/*.log
             ${{ runner.temp }}/software-kvm/*.strace

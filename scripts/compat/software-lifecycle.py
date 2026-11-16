@@ -8,6 +8,7 @@ from pathlib import Path
 import platform
 import runpy
 import select
+import shutil
 import signal
 import subprocess
 import sys
@@ -31,9 +32,11 @@ def exercise(args):
         env['FLEXVM_TEST_KILL_PARENT_SYNC'] = str(args.output / 'kill-parent-sync')
         return env
 
-    def cli(*words, env=None):
+    def cli(*words, env=None, pending=False):
         result = subprocess.run([*base, *words], capture_output=True, text=True,
                                 timeout=max(.1, deadline - time.monotonic()), env=env)
+        if pending and result.returncode == 1:
+            return None
         if result.returncode:
             raise RuntimeError(f'{words}: exit {result.returncode}: {result.stdout} {result.stderr}')
         return result.stdout
@@ -56,7 +59,48 @@ def exercise(args):
         raise TimeoutError('owner did not publish')
 
     def observation():
-        return [int(v) for v in cli('exec', 'state-test', '/state-probe', 'status').split()]
+        until = min(deadline, time.monotonic() + 30)
+        while time.monotonic() < until:
+            data = cli('exec', 'state-test', '/state-probe', 'status', pending=args.firecracker is not None)
+            if data is not None:
+                values = [int(v) for v in data.split()]
+                if len(values) != 5:
+                    raise RuntimeError(f'invalid workload observation: {data}')
+                return values
+            time.sleep(.1)
+        raise TimeoutError('workload did not publish its initial observation')
+
+    def nested_observation():
+        values = [int(v) for v in cli('exec', 'state-test', '/state-probe', 'status-full').split()]
+        if len(values) != 12:
+            raise RuntimeError(f'invalid nested observation: {values}')
+        return values
+
+    def nested_mode(mode):
+        before = nested_observation()
+        cli('exec', 'state-test', '/state-probe', 'mode', mode)
+        until = min(deadline, time.monotonic() + 10)
+        while time.monotonic() < until:
+            seen = nested_observation()
+            if seen[10] == (1 if mode == 'spin' else 0) and seen[8] > before[8] and (mode != 'spin' or seen[11] > before[11]):
+                return seen
+            time.sleep(.1)
+        raise RuntimeError(f'inner guest did not enter {mode} mode with forward progress')
+
+    def nested_restored(before, identity):
+        initial = nested_observation()
+        until = min(deadline, time.monotonic() + 5)
+        while time.monotonic() < until:
+            time.sleep(.15)
+            seen = nested_observation()
+            if initial[:8] != identity[:8] or seen[:8] != identity[:8] or seen[10] != before[10]:
+                raise RuntimeError(f'inner process/RAM/mode continuity lost: {before} -> {seen}')
+            if seen[10] == 0 and (initial[11] != before[11] or seen[11] != before[11]):
+                raise RuntimeError('timer workload unexpectedly executed the CPU spin loop')
+            if seen[8] >= initial[8] + 2 and seen[8] > before[8] and seen[9] > initial[9] and seen[9] > before[9]:
+                if seen[10] == 0 or (seen[11] > initial[11] and seen[11] > before[11]):
+                    return seen
+        raise RuntimeError('inner CPU/timer did not make fresh post-restore progress')
 
     def advancing_observation():
         initial = observation()
@@ -93,11 +137,23 @@ def exercise(args):
     evidence = {'cycles': []}
     try:
         owner, entry = launch('software', '--name', 'state-test', '--control', 'serial', '--kernel', str(args.kernel),
-                              '--mem', '512', str(args.output / 'image.tar'))
+                              '--mem', '512', '--vcpus', '2' if args.firecracker else '1', str(args.output / 'image.tar'))
         first = observation()
         identity = entry['gen']
+        nested_identity = nested_observation() if args.firecracker else None
         for cycle in range(2):
+            nested_before = None
+            if args.firecracker:
+                mode = 'spin' if cycle == 0 else 'timer'
+                nested_before = nested_mode(mode)
+                cli('pause', 'state-test')
+                if live()['state'] != 'paused':
+                    raise RuntimeError('nested pause did not confirm outer CPU state')
+                cli('unpause', 'state-test')
+                advancing_observation()
             before = observation()
+            if args.firecracker:
+                nested_before = nested_observation()
             if cycle == 1:
                 # Fail the parent directory fsync after the replacement rename.
                 # Roll back explicitly, then capture again from the same engine.
@@ -125,6 +181,8 @@ def exercise(args):
                 if rolled_back[:3] != first[:3] or rolled_back[3] < before[3]:
                     raise RuntimeError('publication rollback lost source identity')
                 evidence['publication_rollback'] = {'error': refused.stderr, 'source': rolled_back}
+                if args.firecracker:
+                    nested_before = nested_observation()
                 cli('pause', 'state-test')
             cli('stop', 'state-test')
             if owner.wait(timeout=10) != 0:
@@ -157,9 +215,14 @@ def exercise(args):
             after = advancing_observation()
             if after[:3] != first[:3] or after[3] < before[3] or after[4] < before[4] or entry['gen'] != identity:
                 raise RuntimeError(f'workload continuity lost: {before} -> {after}; {entry}')
-            evidence['cycles'].append({'before': before, 'after': after, 'entry': entry})
+            cycle_evidence = {'before': before, 'after': after, 'entry': entry}
+            if args.firecracker:
+                nested_after = nested_restored(nested_before, nested_identity)
+                cycle_evidence.update(nested_mode=mode, nested_before=nested_before, nested_after=nested_after)
+            evidence['cycles'].append(cycle_evidence)
         # Exercise the normal detached start notification and owner handoff too.
         before = observation()
+        nested_before = nested_observation() if args.firecracker else None
         cli('stop', 'state-test')
         if owner.wait(timeout=10) != 0:
             raise RuntimeError('last attached owner failed to suspend')
@@ -170,11 +233,14 @@ def exercise(args):
         if not entry or after[:3] != first[:3] or after[3] < before[3] or entry['gen'] != identity:
             raise RuntimeError('detached start lost workload identity')
         evidence['detached_start'] = {'before': before, 'after': after, 'entry': entry}
+        if args.firecracker:
+            evidence['detached_start'].update(nested_before=nested_before, nested_after=nested_restored(nested_before, nested_identity))
         # Kill the owner after exchange, before parent fsync/RETIRED. The new
         # complete checkpoint must survive collection and recover on this host.
         checkpoint = args.state / 'state' / 'suspended' / 'state-test'
         old_snapshot = json.loads((checkpoint / 'manifest.json').read_text())['snapshot_id']
         before = observation()
+        nested_before = nested_observation() if args.firecracker else None
         marker = args.output / 'kill-parent-sync'
         owner_pidfd = os.pidfd_open(entry['pid'])
         try:
@@ -204,6 +270,8 @@ def exercise(args):
             raise RuntimeError('commit-before-retirement recovery lost workload continuity')
         evidence['publication_owner_death'] = {'snapshot_id': published['snapshot_id'], 'before': before, 'after': after,
                                                'runtime_and_staging_cleanup': 'passed'}
+        if args.firecracker:
+            evidence['publication_owner_death'].update(nested_before=nested_before, nested_after=nested_restored(nested_before, nested_identity))
         cli('kill', 'state-test')
         if cli('wait', 'state-test').strip() != '130':
             raise RuntimeError('detached owner lost kill status')
@@ -215,6 +283,10 @@ def exercise(args):
         ticks = [int(line.split()[1]) for line in lines if line.startswith('STATE_TICK ')]
         if lines.count('STATE_WORKLOAD_BOOT') != 1 or not ticks or ticks != list(range(ticks[-1] + 1)):
             raise RuntimeError(f'foreground output duplicated or skipped: {lines}')
+        if args.firecracker:
+            if lines.count('NESTED_INNER_BOOT') != 1 or lines.count('NESTED_INNER_READY') != 1:
+                raise RuntimeError('nested Firecracker guest booted repeatedly or never completed startup')
+            evidence['nested_firecracker'] = {'boots': 1, 'identity': nested_identity[:8], 'cpu_and_timer_restore': 'passed'}
         evidence.update(status='passed', boots=1, delivered_ticks=len(ticks))
         (args.output / 'owner.json').write_text(json.dumps(evidence, indent=2) + '\n')
     finally:
@@ -239,10 +311,13 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--timeout', type=int, default=180)
     parser.add_argument('--cc', default='cc')
+    parser.add_argument('--firecracker', type=Path, help='run a live inner Linux VM through the normal software owner')
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--state', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     args.bin, args.kernel, args.output = (p.resolve() for p in (args.bin, args.kernel, args.output))
+    if args.firecracker:
+        args.firecracker = args.firecracker.resolve(strict=True)
     if args.worker:
         exercise(args)
         return 0
@@ -261,15 +336,30 @@ def main():
         raise HELPERS['Interrupted'](number)
     previous = {number: signal.signal(number, interrupted) for number in (signal.SIGINT, signal.SIGTERM)}
     try:
+        engine = shutil.which('qemu-system-' + platform.machine())
+        if engine is None:
+            raise FileNotFoundError('native QEMU is required for lifecycle acceptance')
+        report['qemu_sha256'] = HELPERS['digest'](Path(engine).resolve())
+        report['qemu_version'] = subprocess.check_output([engine, '--version'], text=True, timeout=10).splitlines()[0]
         probe = args.output / 'state-probe'
-        HELPERS['run']([args.cc, '-O2', '-Wall', '-Wextra', '-Werror', '-static', str(ROOT / 'state-probe.c'), '-o', str(probe)],
+        source = ROOT / ('nested-state.c' if args.firecracker else 'state-probe.c')
+        HELPERS['run']([args.cc, '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', '-static', '-pthread', str(source), '-o', str(probe)],
                        60, args.output / 'compile.log')
         HELPERS['run']([args.cc, '-O2', '-Wall', '-Wextra', '-Werror', '-shared', '-fPIC',
                         str(ROOT / 'fail-parent-sync.c'), '-ldl', '-o', str(args.output / 'fail-parent-sync.so')],
                        60, args.output / 'compile-fault.log')
-        IMAGE(args.output / 'image.tar', 'amd64' if platform.machine() == 'x86_64' else 'arm64', {
-            'state-probe': (probe.read_bytes(), 0o755), 'etc/passwd': (b'root:x:0:0:root:/root:/bin/sh\n', 0o644),
-            'etc/group': (b'root:x:0:\n', 0o644)}, ['/state-probe'])
+        files = {'state-probe': (probe.read_bytes(), 0o755), 'etc/passwd': (b'root:x:0:0:root:/root:/bin/sh\n', 0o644),
+                 'etc/group': (b'root:x:0:\n', 0o644)}
+        if args.firecracker:
+            config = {'boot-source': {'kernel_image_path': '/inner-kernel', 'initrd_path': '/inner-initramfs.cpio',
+                                      'boot_args': 'console=ttyS0 quiet panic=1 rdinit=/init' + (' reboot=k' if platform.machine() == 'x86_64' else '')},
+                      'machine-config': {'vcpu_count': 1, 'mem_size_mib': 128}, 'drives': [], 'network-interfaces': []}
+            files.update({'firecracker': (args.firecracker.read_bytes(), 0o755), 'inner-kernel': (args.kernel.read_bytes(), 0o600),
+                          'inner-initramfs.cpio': (HELPERS['initramfs'](probe.read_bytes()), 0o600),
+                          'firecracker.json': (json.dumps(config).encode(), 0o600)})
+            report.update(scope='nested Firecracker through named software lifecycle',
+                          firecracker_sha256=HELPERS['digest'](args.firecracker), inner_kernel_sha256=HELPERS['digest'](args.kernel))
+        IMAGE(args.output / 'image.tar', 'amd64' if platform.machine() == 'x86_64' else 'arm64', files, ['/state-probe'])
         with tempfile.TemporaryDirectory(prefix='flexvm-software-lifecycle-', dir='/var/lib') as state:
             mask = args.output / 'unusable-device'
             mask.touch(mode=0o600)
@@ -279,6 +369,8 @@ def main():
                        'sh', str(mask), 'strace', '-f', '-e', 'trace=file', '-o', str(trace), sys.executable, str(Path(__file__).resolve()),
                        '--worker', '--bin', str(args.bin), '--kernel', str(args.kernel), '--output', str(args.output), '--state', state,
                        '--timeout', str(args.timeout)]
+            if args.firecracker:
+                command += ['--firecracker', str(args.firecracker)]
             HELPERS['run'](command, args.timeout, args.output / 'worker.log')
             if any(f'"{dev}"' in trace.read_text(errors='replace') for dev in ('/dev/kvm', '/dev/vhost-vsock')):
                 raise RuntimeError('host virtualization device access; see files.strace')
