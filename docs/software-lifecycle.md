@@ -43,6 +43,16 @@ until PDEATHSIG terminates it. Unknown records and namespace-invisible processes
 are preserved; canonical quarantine and ownership journals are never replayed by
 runtime cleanup.
 
+With `--firecracker`, the lifecycle fixture runs an unchanged Firecracker inner
+Linux guest through the same OCI/agent and named-owner path. Its inner PID 1
+alternates between a sustained CPU loop and timer sleeps. Observations retain the
+outer supervisor and VMM PID/start time, inner process identity, separate RAM
+canaries, an inner counter and monotonic time. The test repeats normal
+pause/unpause, fresh-owner stop/start, rollback and publication-owner-death
+recovery, and checks that the inner guest boots once. This extends the earlier
+input-gated raw-emulator experiment; cross-host and accelerated nested migration
+still have separate acceptance gates.
+
 ## Execution and state identity
 
 Persist an explicit backend discriminator alongside every machine and snapshot.
@@ -71,7 +81,12 @@ by reopening a pathname is insufficient. Staging and published artifacts must be
 owned by the host and inaccessible for writes by guests or other principals. No implicit conversion between engines or architectures.
 
 The x86 profile keeps SVM and NPT enabled and requires QEMU 9.2 or newer for real
-mode nested page walks. The tested engine is 10.2.1. ARM uses Cortex-A72 with EL2;
+mode nested page walks. The pinned x86 engine is 10.2.1 with the TCG SVM restore fix from
+`scripts/build-qemu.sh` (package `flexvm-tcg-nested-1`). Stock Linux builds can
+incorrectly require KVM's opaque nested-state blob when restoring TCG while a
+vCPU is in SVM guest mode. The patch restricts that validation to the KVM
+accelerator; TCG's architectural SVM/NPT state uses its existing serialization.
+ARM uses Cortex-A72 with EL2;
 the max/VHE cold-restore failure remains a documented profile limitation.
 
 ## Ownership and guest requests

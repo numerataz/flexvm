@@ -1,0 +1,17 @@
+Subject: target/i386: restrict kernel nested-state validation to KVM
+
+TCG SVM has architectural guest-mode state, but does not use KVM's opaque
+nested-state blob. Keep the consistency check for the KVM accelerator.
+QEMU 10.2.1 already serializes TCG SVM NPT and interrupt-control state.
+
+--- a/target/i386/machine.c
++++ b/target/i386/machine.c
+@@ -355,7 +355,7 @@
+     env->hflags |= (env->segs[R_SS].flags >> DESC_DPL_SHIFT) & HF_CPL_MASK;
+ 
+ #ifdef CONFIG_KVM
+-    if ((env->hflags & HF_GUEST_MASK) &&
++    if (kvm_enabled() && (env->hflags & HF_GUEST_MASK) &&
+         (!env->nested_state ||
+         !(env->nested_state->flags & KVM_STATE_NESTED_GUEST_MODE))) {
+         error_report("vCPU set in guest-mode inconsistent with "
