@@ -59,6 +59,10 @@ Use persisted request identities for mutating operations, reusing session IDs fo
 command creation, and retain their acceptance/results across restore. An accepted
 operation with side effects cannot be blindly retried as a fresh request. A
 barrier timeout fails checkpointing rather than saving an ambiguous request.
+After ACK, the dispatcher refuses new work until an idempotent RESUME for the
+same barrier identity. Bound the deduplication table; reject expired identities
+as expired rather than executing them anew. Retire entries only after explicit
+result acknowledgment and after their generation can no longer attach.
 
 On restore establish a fresh control connection and the guest's existing
 `FENCE generation epoch` protocol before attaching sessions. Keep monotonic
@@ -92,8 +96,22 @@ or paused response while admission is closed.
    destination ownership and resume. Rollback cannot leave both copies running.
 
 Use durable transfer journals on both hosts, without requiring shared storage.
-The source first records its irrevocable retired generation, stops and reaps its
-engine, then issues a retirement receipt bound to the transfer and generation.
+Only after the checkpoint is committed, the source records its irrevocable
+retired generation, stops and reaps its engine, then issues a retirement receipt.
+Retain the committed source snapshot until the destination durably commits and
+retains a verified recovery copy. Before retirement, a failed transfer may resume
+the source; disks remain frozen between capture and resolution. After retirement,
+that generation can never resume. Recover from retained artifacts under a fresh
+generation only after the destination has durably aborted/retired or otherwise
+been fenced. An unresolved destination outcome never permits unilateral resume.
+
+Authenticate receipts using explicitly configured trusted host signing keys;
+unsigned or unknown-host receipts cannot authorize restore. Bind the VM, source
+and destination identities, transfer ID, retired generation and complete manifest
+digest, including every disk digest. The target checks all bindings against its
+prepared state and durable generation record; a receipt is not a reusable bearer
+permission for another target or snapshot. Cross-host migration stays unavailable
+until this trust and replay protection are implemented and verified.
 The destination requires that receipt and commits its journal before resuming.
 Recovery never automatically resumes an ambiguously transferred source; it
 remains fenced until the journal protocol resolves ownership. Retry receipts
@@ -105,14 +123,18 @@ After load, use the guest agent to step CLOCK_REALTIME from the current host tim
 Do not reset CLOCK_MONOTONIC through the agent. Preserve the engine virtual clock
 and device timers through migration, and test nondecreasing monotonic time and
 nested timer progress across pause/restore. Clock or fencing setup failure keeps
-the destination paused.
+the destination paused. Realtime corrections use clock_settime, including
+backward steps when host time is behind; preserve the kernel's normal clock-change
+notifications. Test cancel-on-set realtime timers and monotonic time separately.
 
 Begin with eager, complete RAM state. Reserve and account for its full committed
 memory. Elastic memory and demand paging require their own engine integration;
 fixed RAM must not be reported as elastic or charged only for initial RSS. Guest
 KVM child memory already lives in its parent RAM reservation and is charged
 there. A parent-managed sibling engine needs its own reservation against the
-same hierarchy budget; do not double-charge guest-resident child RAM.
+same hierarchy budget; do not double-charge guest-resident child RAM. Reserve
+the full destination RAM before loading state. Failed admission returns a
+resource error without a partial load; every later failure releases reservations.
 
 ## Storage and networking
 
@@ -127,7 +149,11 @@ Persistent lifecycle networking must retain the VM's routed address and MAC.
 The VM owner creates the TAP through the existing network machinery and passes
 its owned descriptor to QEMU using a TAP netdev with an explicit inheritance
 whitelist. Keep TAP, route and held-packet ownership in the common owner rather
-than in an engine-specific record. The foreground userspace
+than in an engine-specific record. Include held-packet buffers and delivery
+positions in the transfer. The source withdraws its active route and holds
+traffic before export; the destination publishes its route after ownership
+commit. Verify destination route updates, source withdrawal and packet delivery
+under the existing migration ordering before enabling the backend. The foreground userspace
 network stack has no established cross-host connection continuity contract.
 Require TCP and UDP continuity tests before advertising migration for that mode;
 changing the guest address or silently dropping connections is insufficient.
@@ -148,10 +174,17 @@ changing the guest address or silently dropping connections is insufficient.
   Docker API operations with the same semantics as their advertised capabilities.
 - Resource limits include nested guests. Destroying the parent destroys its owned
   hierarchy, and stale parent/child owners cannot regain authority after migration.
+- Hierarchy transfer records enumerate all descendant identities and generations.
+  Close child creation admission, freeze and retire all source descendants before
+  issuing the parent receipt. Load all targets paused and commit one destination
+  hierarchy journal before any target runs. The source retains the whole
+  hierarchy tombstone across recovery; individual child restart cannot bypass it.
 - Repeat the applicable lifecycle tests with optional hardware acceleration.
   Software-path success cannot substitute for nested hardware state verification.
   Use the authorized GCE environment for hardware tests where GitHub runners do
   not expose the required nested acceleration; record the exact host capabilities.
+  Missing hardware coverage leaves the corresponding acceptance gate and issues
+  open; it is not a skip that counts as successful verification.
 
 Close #1358/#1327 only after their complete acceptance criteria pass. Narrow
 milestones and engine experiments must leave those issues open.
