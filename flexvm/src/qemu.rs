@@ -4,6 +4,8 @@
 //! templates/checkpoints; native QEMU vhost-user-vsock is not yet migratable.
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::RawFd;
+use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -320,6 +322,69 @@ fn check_engine(greeting: &Value, arch: &str) -> Result<()> {
     Ok(())
 }
 
+/// A single, deadline-bound QMP transaction stream. Descriptor-bearing commands
+/// use the existing SCM_RIGHTS helper, including its partial-write handling.
+struct Qmp {
+    reader: BufReader<By<UnixStream>>,
+    next_id: u64,
+    broken: bool,
+}
+
+impl Qmp {
+    fn connect(path: &Path, deadline: Instant) -> Result<Self> {
+        let stream = util::connect_unix(path, remaining(deadline)?)?;
+        let mut qmp = Self { reader: BufReader::new(By { s: stream, at: deadline }), next_id: 0, broken: false };
+        let greeting = qmp.reply()?;
+        if greeting["QMP"].is_null() {
+            bail!("missing QMP greeting");
+        }
+        check_engine(&greeting, std::env::consts::ARCH)?;
+        qmp.command("qmp_capabilities", json!({}), &[])?;
+        Ok(qmp)
+    }
+
+    fn reply(&mut self) -> Result<Value> {
+        loop {
+            let mut line = String::new();
+            if self.reader.by_ref().take(1 << 20).read_line(&mut line)? == 0 || !line.ends_with('\n') {
+                bail!("QMP disconnected or reply too long");
+            }
+            let reply: Value = serde_json::from_str(&line)?;
+            if reply["event"].is_null() {
+                return Ok(reply);
+            }
+        }
+    }
+
+    fn command(&mut self, command: &str, arguments: Value, fds: &[RawFd]) -> Result<Value> {
+        if self.broken {
+            bail!("QMP connection is unusable after a protocol or I/O failure");
+        }
+        // A failed read can consume part of a frame. Reconnect after any
+        // transport/protocol failure instead of reusing that ambiguous stream.
+        self.broken = true;
+        self.next_id = self.next_id.checked_add(1).ok_or("QMP request ID exhausted")?;
+        let mut wire = serde_json::to_vec(&json!({"execute":command,"arguments":arguments,"id":self.next_id}))?;
+        wire.push(b'\n');
+        let stream = self.reader.get_ref();
+        util::send_with_fds(&stream.s, &wire, fds, stream.at)?;
+        let reply = self.reply()?;
+        if reply["id"].is_null() && !reply["error"].is_null() {
+            bail!("QMP protocol error while waiting for {command}: {}", reply["error"]);
+        }
+        if reply["id"].as_u64() != Some(self.next_id) {
+            bail!("QMP response ID does not match {command}: {reply}");
+        }
+        if !reply["error"].is_null() {
+            self.broken = false;
+            bail!("QMP refused {command}: {}", reply["error"]);
+        }
+        let result = reply.get("return").cloned().ok_or_else(|| format!("QMP missing {command} result: {reply}"))?;
+        self.broken = false;
+        Ok(result)
+    }
+}
+
 impl Machine {
     /// vhost-device-vsock 0.3 reads ahead and discards bytes after CONNECT.
     /// Wait for its OK before writing the agent command; Firecracker keeps its
@@ -351,36 +416,11 @@ impl Machine {
     }
 
     fn switch(&mut self, command: &str, deadline: Instant) -> Result<()> {
-        let stream = util::connect_unix(&self.sockets.api, remaining(deadline)?)?;
-        let mut r = BufReader::new(By { s: stream, at: deadline });
-        fn reply(r: &mut impl BufRead) -> Result<Value> {
-            loop {
-                let mut line = String::new();
-                if r.take(1 << 20).read_line(&mut line)? == 0 || !line.ends_with('\n') {
-                    bail!("QMP disconnected or reply too long");
-                }
-                let v: Value = serde_json::from_str(&line)?;
-                if !v["error"].is_null() {
-                    bail!("QMP refused operation: {}", v["error"]);
-                }
-                if v["event"].is_null() {
-                    return Ok(v);
-                }
-            }
-        }
-        let greeting = reply(&mut r)?;
-        if greeting["QMP"].is_null() {
-            bail!("missing QMP greeting");
-        }
-        check_engine(&greeting, std::env::consts::ARCH)?;
-        for action in ["qmp_capabilities", command] {
-            r.get_mut().write_all(format!("{{\"execute\":\"{action}\"}}\n").as_bytes())?;
-            reply(&mut r)?;
-        }
-        r.get_mut().write_all(b"{\"execute\":\"query-status\"}\n")?;
-        let state = reply(&mut r)?;
+        let mut qmp = Qmp::connect(&self.sockets.api, deadline)?;
+        qmp.command(command, json!({}), &[])?;
+        let state = qmp.command("query-status", json!({}), &[])?;
         let expected = if command == "stop" { "paused" } else { "running" };
-        if state["return"]["status"] != expected {
+        if state["status"] != expected {
             bail!("QMP did not enter {expected}: {state}");
         }
         Ok(())
@@ -414,6 +454,109 @@ impl Machine {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    fn qmp_peer(listener: UnixListener) -> UnixStream {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        writeln!(stream, "{}", json!({"QMP":{"version":{"qemu":{"major":10,"minor":2,"micro":1}}}})).unwrap();
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let capabilities: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(capabilities["execute"], "qmp_capabilities");
+        assert_eq!(capabilities["id"], 1);
+        writeln!(reader.get_mut(), "{}", json!({"return":{},"id":capabilities["id"]})).unwrap();
+        assert!(reader.buffer().is_empty());
+        reader.into_inner()
+    }
+
+    #[test]
+    fn qmp_transfers_owned_descriptor_and_skips_events_before_matching_reply() {
+        use std::os::fd::AsRawFd;
+        let machine = machine();
+        let listener = UnixListener::bind(&machine.sockets.api).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut stream = qmp_peer(listener);
+            let (wire, fds) = util::recv_with_fds_by(&stream, 4096, Instant::now() + Duration::from_secs(2)).unwrap();
+            let command: Value = serde_json::from_slice(&wire).unwrap();
+            assert_eq!(command["execute"], "getfd");
+            assert_eq!(command["id"], 2);
+            assert_eq!(command["arguments"]["fdname"], "snapshot");
+            assert_eq!(fds.len(), 1);
+            let mut received = File::from(fds.into_iter().next().unwrap());
+            received.write_all(b"receiver").unwrap();
+            writeln!(stream, "{}", json!({"event":"STOP"})).unwrap();
+            let reply = format!("{}\n", json!({"return":{},"id":command["id"]}));
+            let middle = reply.len() / 2;
+            stream.write_all(&reply.as_bytes()[..middle]).unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+            stream.write_all(&reply.as_bytes()[middle..]).unwrap();
+        });
+        let mut qmp = Qmp::connect(&machine.sockets.api, Instant::now() + Duration::from_secs(2)).unwrap();
+        let path = machine.logs.join("descriptor");
+        let mut file = File::create_new(&path).unwrap();
+        assert_eq!(qmp.command("getfd", json!({"fdname":"snapshot"}), &[file.as_raw_fd()]).unwrap(), json!({}));
+        server.join().unwrap();
+        file.write_all(b"-sender").unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"receiver-sender");
+    }
+
+    #[test]
+    fn qmp_partial_reply_timeout_permanently_closes_command_admission() {
+        let machine = machine();
+        let listener = UnixListener::bind(&machine.sockets.api).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut stream = qmp_peer(listener);
+            let _ = util::recv_with_fds_by(&stream, 4096, Instant::now() + Duration::from_secs(2)).unwrap();
+            stream.write_all(b"{\"return\":").unwrap();
+            // The client must time out and drop this stream, rather than send
+            // another command into the partially consumed reply.
+            stream.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+            assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+        });
+        let mut qmp = Qmp::connect(&machine.sockets.api, Instant::now() + Duration::from_secs(2)).unwrap();
+        assert!(qmp.command("stop", json!({}), &[]).is_err());
+        assert!(qmp.command("query-status", json!({}), &[]).unwrap_err().to_string().contains("unusable"));
+        drop(qmp);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn qmp_rejects_mismatched_ids_and_reports_engine_errors() {
+        for (case, expected) in [("engine", "device blocks migration"), ("mismatch", "response ID"), ("missing_id", "protocol error")] {
+            let machine = machine();
+            let listener = UnixListener::bind(&machine.sockets.api).unwrap();
+            let server = std::thread::spawn(move || {
+                let mut stream = qmp_peer(listener);
+                let (wire, fds) = util::recv_with_fds_by(&stream, 4096, Instant::now() + Duration::from_secs(2)).unwrap();
+                assert!(fds.is_empty());
+                let command: Value = serde_json::from_slice(&wire).unwrap();
+                let id = command["id"].as_u64().unwrap();
+                let reply = match case {
+                    "mismatch" => json!({"return":{},"id":id + 1}),
+                    "missing_id" => json!({"error":{"desc":"invalid request"}}),
+                    _ => json!({"error":{"desc":"device blocks migration"},"id":id}),
+                };
+                writeln!(stream, "{reply}").unwrap();
+                if case == "engine" {
+                    let (wire, _) = util::recv_with_fds_by(&stream, 4096, Instant::now() + Duration::from_secs(2)).unwrap();
+                    let command: Value = serde_json::from_slice(&wire).unwrap();
+                    assert_eq!(command["id"], id + 1);
+                    writeln!(stream, "{}", json!({"return":{"status":"paused"},"id":command["id"]})).unwrap();
+                }
+            });
+            let mut qmp = Qmp::connect(&machine.sockets.api, Instant::now() + Duration::from_secs(2)).unwrap();
+            let error = qmp.command("stop", json!({}), &[]).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+            let next = qmp.command("query-status", json!({}), &[]);
+            if case == "engine" {
+                assert_eq!(next.unwrap()["status"], "paused");
+            } else {
+                assert!(next.unwrap_err().to_string().contains("unusable"));
+            }
+            server.join().unwrap();
+        }
+    }
 
     #[test]
     fn rejects_x86_engines_without_real_mode_nested_paging_fix() {
