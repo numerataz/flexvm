@@ -3925,9 +3925,32 @@ impl Drop for NameLock {
     }
 }
 
+/// Legacy records have no backend field and retain Firecracker semantics.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum Backend {
+    #[default]
+    Firecracker,
+    QemuTcg {
+        process: Ident,
+        image: String,
+        digest: String,
+        argv: Vec<String>,
+        ram_mib: u32,
+    },
+}
+
+impl Backend {
+    pub fn is_firecracker(&self) -> bool {
+        matches!(self, Self::Firecracker)
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Entry {
+    #[serde(skip_serializing_if = "Backend::is_firecracker")]
+    pub backend: Backend,
     /// One lazy process scan shared by an entries() pass; never persisted.
     #[serde(skip)]
     pub(crate) processes: Option<Arc<OnceLock<ProcessMap>>>,
@@ -3964,11 +3987,23 @@ impl Entry {
     }
 
     fn rss_in(&self, proc: &Path, ns_of: &dyn Fn(&Path, &str) -> std::io::Result<u64>) -> Option<u64> {
-        let pid = self.firecracker?;
-        let ns = self.ident.ns?;
+        let (pid, ns, start) = match &self.backend {
+            Backend::Firecracker => (self.firecracker?, self.ident.ns?, None),
+            Backend::QemuTcg { process, .. } => {
+                if process.boot != boot_id() {
+                    return None;
+                }
+                (process.pid, process.ns?, Some(process.start))
+            }
+        };
         let read = |dir: &Path| -> Option<u64> {
             if ns_of(dir, "pid").ok()? != ns {
                 return None;
+            }
+            if let Some(start) = start {
+                if parse_stat(&std::fs::read_to_string(dir.join("stat")).ok()?)?.1 != start {
+                    return None;
+                }
             }
             let status = std::fs::read_to_string(dir.join("status")).ok()?;
             if nspid(&status)?.last().copied()? != pid {
@@ -6429,6 +6464,55 @@ pub(crate) mod tests {
         assert_eq!(liveness_with_time(&id, "boot", |_| Ok(stat("S", 43)), || true), Liveness::Gone);
         assert_eq!(liveness_with_time(&id, "boot", |_| Ok(stat("S", 42)), || false), Liveness::Alive);
         assert_eq!(liveness_with_time(&id, "boot", |_| Ok(stat("Z", 43)), || false), Liveness::Gone);
+    }
+
+    #[test]
+    fn software_records_are_explicit_and_legacy_records_keep_their_backend() {
+        let legacy: Entry =
+            serde_json::from_value(serde_json::json!({"name":"legacy","template":"image","firecracker":7,"pid":1,"start":1,"boot":"boot"})).unwrap();
+        assert!(legacy.backend.is_firecracker());
+        assert!(serde_json::to_value(&legacy).unwrap().get("backend").is_none());
+        let software = Entry {
+            backend: Backend::QemuTcg {
+                process: Ident::me(),
+                image: "busybox:1.36".into(),
+                digest: "sha256:abcd".into(),
+                argv: vec!["sleep".into()],
+                ram_mib: 512,
+            },
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&software).unwrap();
+        assert_eq!(value["backend"]["kind"], "qemu-tcg");
+        assert!(value["firecracker"].is_null());
+        let mut unknown = serde_json::to_value(&legacy).unwrap();
+        unknown["backend"] = serde_json::json!({"kind":"unknown"});
+        assert!(serde_json::from_value::<Entry>(unknown).unwrap_err().to_string().contains("unknown variant"));
+    }
+
+    #[test]
+    fn software_rss_uses_the_engine_identity_and_rejects_reused_pids() {
+        let root = crate::test_util::TempDir::new("rss-software");
+        std::fs::create_dir(root.join("100")).unwrap();
+        std::fs::write(root.join("100/status"), "NSpid: 100 7\nVmRSS: 8192 kB\n").unwrap();
+        std::fs::write(root.join("100/stat"), format!("100 (qemu) S {}42", "0 ".repeat(18))).unwrap();
+        let ns = |dir: &Path, _: &str| Ok(if dir.ends_with("100") { 2 } else { 1 });
+        let mut entry = Entry {
+            ident: Ident { ns: Some(1), ..Default::default() },
+            backend: Backend::QemuTcg {
+                process: Ident { pid: 7, ns: Some(2), start: 42, boot: boot_id().into() },
+                image: "image".into(),
+                digest: "hash".into(),
+                argv: vec![],
+                ram_mib: 512,
+            },
+            ..Default::default()
+        };
+        assert_eq!(entry.rss_in(&root, &ns), Some(8 << 20));
+        if let Backend::QemuTcg { process, .. } = &mut entry.backend {
+            process.start = 43;
+        }
+        assert_eq!(entry.rss_in(&root, &ns), None);
     }
 
     #[test]

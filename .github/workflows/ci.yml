@@ -194,6 +194,10 @@ jobs:
         run: |
           sudo python3 scripts/compat/software-agent.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --control serial --output "$RUNNER_TEMP/software-serial" --docker --timeout 600
           cat "$RUNNER_TEMP/software-serial/report.json"
+      - name: Named software VM ownership without virtualization devices
+        run: |
+          sudo python3 scripts/compat/software-owner.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-owner" --timeout 300
+          cat "$RUNNER_TEMP/software-owner/report.json"
       - name: Unchanged KVM clients inside software FlexVM
         run: |
           sudo python3 scripts/compat/software-kvm.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --firecracker "$RUNNER_TEMP/software-state/artifacts/firecracker" --output "$RUNNER_TEMP/software-kvm"
@@ -222,6 +226,9 @@ jobs:
             ${{ runner.temp }}/software-serial/*.json
             ${{ runner.temp }}/software-serial/*.log
             ${{ runner.temp }}/software-serial/*.strace
+            ${{ runner.temp }}/software-owner/*.json
+            ${{ runner.temp }}/software-owner/*.log
+            ${{ runner.temp }}/software-owner/*.strace
             ${{ runner.temp }}/software-kvm/*.json
             ${{ runner.temp }}/software-kvm/*.log
             ${{ runner.temp }}/software-kvm/*.strace

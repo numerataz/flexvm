@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parent
 HELPERS = runpy.run_path(str(ROOT / 'software-boot.py'))
 
 
-def image(path, arch, files):
+def image(path, arch, files, entrypoint=None):
     """Docker-save archive with static workloads; the real agent is injected normally."""
     layer = io.BytesIO()
     with tarfile.open(fileobj=layer, mode='w', format=tarfile.USTAR_FORMAT) as tar:
@@ -30,7 +30,7 @@ def image(path, arch, files):
             entry = tarfile.TarInfo(name)
             entry.mode, entry.size = mode, len(data)
             tar.addfile(entry, io.BytesIO(data))
-    config = {'architecture': arch, 'os': 'linux', 'config': {'Entrypoint': ['/kvm-workload']},
+    config = {'architecture': arch, 'os': 'linux', 'config': {'Entrypoint': entrypoint or ['/kvm-workload']},
               'rootfs': {'type': 'layers', 'diff_ids': ['sha256:' + hashlib.sha256(layer.getvalue()).hexdigest()]}}
     manifest = [{'Config': 'config.json', 'RepoTags': ['flexvm-kvm:test'], 'Layers': ['layer.tar']}]
     with tarfile.open(path, 'w', format=tarfile.USTAR_FORMAT) as tar:

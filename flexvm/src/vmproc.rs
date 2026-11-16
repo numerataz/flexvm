@@ -4,7 +4,7 @@
 //! Every operation, starting included, holds `op`; the process ends only
 //! through `finish`, which holds it too.
 
-use std::io::{BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -328,6 +328,66 @@ fn relay_input<T>(guest: UnixStream, client: &UnixStream, relay: impl FnOnce() -
     res
 }
 
+/// The ordinary owner session wire protocol, also used by a software VM owner.
+/// A timed guest read observes client disconnects even while the VM is paused.
+pub(crate) fn relay_direct(
+    mut guest: BufReader<UnixStream>,
+    client: &UnixStream,
+    both: bool,
+    claim: &Claim,
+    ended: &dyn Fn() -> bool,
+    pressed: &dyn Fn() -> bool,
+) -> Result<Option<(u64, i32)>> {
+    struct Reader<'a> {
+        stream: UnixStream,
+        pending: std::io::Cursor<Vec<u8>>,
+        client: &'a UnixStream,
+        ended: &'a dyn Fn() -> bool,
+    }
+    impl Read for Reader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pending.position() < self.pending.get_ref().len() as u64 {
+                return self.pending.read(buf);
+            }
+            loop {
+                match self.stream.read(buf) {
+                    Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+                        if (self.ended)() || read_side_gone(self.client) {
+                            return Err(std::io::ErrorKind::ConnectionAborted.into());
+                        }
+                    }
+                    result => return result,
+                }
+            }
+        }
+    }
+    impl Write for Reader<'_> {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.stream.write(bytes)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.stream.flush()
+        }
+    }
+    guest.get_ref().set_read_timeout(Some(Duration::from_millis(250)))?;
+    guest.get_ref().set_write_timeout(Some(guest::TIMEOUT))?;
+    let buffered = guest.buffer().to_vec();
+    guest.consume(buffered.len());
+    let stream = guest.into_inner();
+    let input = stream.try_clone()?;
+    let fd = stream.as_raw_fd();
+    let mut reader = BufReader::new(Reader { stream, pending: std::io::Cursor::new(buffered), client, ended });
+    let replaced = || !claim.current();
+    let wait = Wait { stall: Duration::from_secs(5), pressed, guest: std::cell::Cell::new(fd), cut: ended, replaced: &replaced, exited: &|| (), polls: None };
+    let result = if both {
+        relay_input(input, client, || relay_session(&mut reader, &mut &*client, &wait, true, None))
+    } else {
+        relay_session(&mut reader, &mut &*client, &wait, false, None)
+    };
+    let _ = (client.shutdown(std::net::Shutdown::Both), reader.get_ref().stream.shutdown(std::net::Shutdown::Both));
+    result
+}
+
 /// Each exec session's newest relay: a client attaching again (or another client on its id) takes the session
 /// over, as the guest does, and an older relay still waiting on its client ends rather than hold it (#1016).
 static CLAIMS: Mutex<std::collections::BTreeMap<String, Claims>> = Mutex::new(std::collections::BTreeMap::new());
@@ -343,14 +403,14 @@ struct Claims {
     lock: Arc<Mutex<()>>,
 }
 
-struct Claim {
+pub(crate) struct Claim {
     session: String,
-    n: u64,
+    pub(crate) n: u64,
     lock: Arc<Mutex<()>>,
 }
 
 impl Claim {
-    fn new(session: &str) -> Claim {
+    pub(crate) fn new(session: &str) -> Claim {
         let lock = {
             let mut claims = CLAIMS.lock().unwrap();
             let entry = claims.entry(session.to_string()).or_insert_with(|| Claims { newest: 0, held: 0, lock: Arc::default() });
@@ -364,7 +424,7 @@ impl Claim {
         Claim { session: session.to_string(), n, lock: lock.clone() }
     }
 
-    fn current(&self) -> bool {
+    pub(crate) fn current(&self) -> bool {
         CLAIMS.lock().unwrap().get(&self.session).is_some_and(|c| c.newest == self.n)
     }
 
@@ -1360,6 +1420,7 @@ impl Proc {
             return crate::log!("vm {n}: registry: injected fault: not published");
         }
         let e = Entry {
+            backend: crate::host::Backend::Firecracker,
             processes: None,
             name: n.clone(),
             ident: self.ident.clone(),
@@ -4059,6 +4120,31 @@ fn call_checked(host: &Host, name: &str, req: Value, at: Option<Instant>, check:
 mod tests {
     use super::*;
     use crate::test_util::{wait_until, JoinWithin, WAIT};
+
+    #[test]
+    fn direct_owner_relay_preserves_read_ahead_and_delivers_one_exit_ack() {
+        let (guest, mut agent) = UnixStream::pair().unwrap();
+        let (client, mut peer) = UnixStream::pair().unwrap();
+        agent.set_read_timeout(Some(WAIT)).unwrap();
+        peer.set_read_timeout(Some(WAIT)).unwrap();
+        guest::write_frame(&mut agent, guest::FRAME_MSG, b"direct-owner").unwrap();
+        let mut guest = BufReader::with_capacity(4096, guest);
+        assert!(!guest.fill_buf().unwrap().is_empty());
+        let relay = thread::spawn(move || {
+            let claim = Claim::new("direct-owner");
+            relay_direct(guest, &client, false, &claim, &|| false, &|| false)
+        });
+        assert_eq!(guest::read_frame(&mut peer).unwrap(), Some((guest::FRAME_MSG, b"direct-owner".to_vec())));
+        let mut exit = 0u64.to_le_bytes().to_vec();
+        exit.extend_from_slice(&17i32.to_le_bytes());
+        guest::write_frame(&mut agent, guest::FRAME_EXIT, &exit).unwrap();
+        assert_eq!(guest::read_frame(&mut peer).unwrap(), Some((guest::FRAME_EXIT, exit)));
+        peer.write_all(&[guest::SESSION_DONE]).unwrap();
+        let mut ack = [0];
+        agent.read_exact(&mut ack).unwrap();
+        assert_eq!(ack, [guest::SESSION_DONE]);
+        relay.join().unwrap().unwrap();
+    }
 
     #[test]
     fn borrowing_retries_busy_and_a_lost_start_reply() {
