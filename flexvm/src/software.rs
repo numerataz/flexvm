@@ -553,12 +553,12 @@ fn serve(
             // STARTED was synchronized before this first guest instruction.
             // As with the ordinary start command, execution resumes even when
             // the source was paused before it was suspended.
-            machine.switch("cont", deadline)?;
+            machine.switch("cont", deadline).map_err(|error| format!("software destination CPU resume failed: {error}"))?;
             machine.resume_admission(resumed.generation, epoch, resumed.manifest.barrier_generation, resumed.manifest.barrier_sequence, deadline)?;
             let main = &resumed.manifest.main;
             let claim = main.claim.checked_add(1).ok_or("software main claim exhausted")?;
             let line = guest::attach_line(&main.id, main.offset, claim, epoch, guest::AttachForm::Epoch, false)?;
-            let mut reader = machine.request(&line, deadline)?;
+            let mut reader = machine.request(&line, deadline).map_err(|error| format!("software main reattach transport failed: {error}"))?;
             guest::untimed(&reader)?;
             reader.get_ref().set_read_timeout(Some(Duration::from_millis(250)))?;
             machine.exec_started(&mut reader, &main.id)?;

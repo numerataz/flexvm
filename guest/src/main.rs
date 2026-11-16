@@ -587,6 +587,7 @@ fn serve_serial(statuses: Statuses, sessions: session::Sessions) -> io::Result<(
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     loop {
         let port = File::options().read(true).write(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(&path)?;
+        let peer = port.try_clone()?;
         if let Some((generation, sequence)) = reset_admission.drained_identity() {
             log(&format!("serial control ready barrier {generation} {sequence}"));
         } else {
@@ -595,6 +596,14 @@ fn serve_serial(statuses: Statuses, sessions: session::Sessions) -> io::Result<(
         if let Err(e) = control::serve(port, incoming.clone()) {
             log(&format!("serial control disconnected: {e}"));
         }
+        // GoAway can finish the parser before the host closes its character
+        // device. Keep the old port open until the real disconnect is observed,
+        // then close its last descriptor to discard queued old-connection bytes.
+        // Only the next fresh port may acknowledge a snapshot reset boundary.
+        while !control::hung_up(peer.as_raw_fd())? {
+            thread::sleep(Duration::from_millis(10));
+        }
+        drop(peer);
         thread::sleep(Duration::from_millis(100));
     }
 }

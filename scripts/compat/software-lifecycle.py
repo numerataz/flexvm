@@ -52,6 +52,18 @@ def exercise(args):
     def observation():
         return [int(v) for v in cli('exec', 'state-test', '/state-probe', 'status').split()]
 
+    def advancing_observation():
+        initial = observation()
+        until = min(deadline, time.monotonic() + 3)
+        while time.monotonic() < until:
+            time.sleep(.15)
+            latest = observation()
+            if latest[:3] != initial[:3] or latest[4] < initial[4]:
+                raise RuntimeError('restored workload identity or monotonic clock changed')
+            if latest[3] > initial[3] and latest[4] > initial[4]:
+                return latest
+        raise RuntimeError('restored workload timers did not make forward progress')
+
     def engine_gone(ident):
         try:
             fields = Path(f'/proc/{ident["pid"]}/stat').read_text().rsplit(')', 1)[1].split()
@@ -113,7 +125,7 @@ def exercise(args):
                     kernel.write_bytes(original)
                     kernel.chmod(0o400)
             owner, entry = launch('start', '--attach', 'state-test')
-            after = observation()
+            after = advancing_observation()
             if after[:3] != first[:3] or after[3] < before[3] or after[4] < before[4] or entry['gen'] != identity:
                 raise RuntimeError(f'workload continuity lost: {before} -> {after}; {entry}')
             evidence['cycles'].append({'before': before, 'after': after, 'entry': entry})
@@ -125,7 +137,7 @@ def exercise(args):
         engine_gone(entry['backend']['process'])
         cli('start', 'state-test')
         entry = live()
-        after = observation()
+        after = advancing_observation()
         if not entry or after[:3] != first[:3] or after[3] < before[3] or entry['gen'] != identity:
             raise RuntimeError('detached start lost workload identity')
         evidence['detached_start'] = {'before': before, 'after': after, 'entry': entry}

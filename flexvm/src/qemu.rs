@@ -310,7 +310,9 @@ impl Config {
             bail!("software restore configuration changed after artifact validation");
         }
         verified.state.unchanged()?;
-        let machine = self.launch(verified.inputs, processes, Some((&verified.state.file, &verified.manifest.engine_version)))?;
+        let machine = self
+            .launch(verified.inputs, processes, Some((&verified.state.file, &verified.manifest.engine_version)))
+            .map_err(|error| format!("software incoming engine load failed: {error}"))?;
         verified.state.unchanged()?;
         Ok(machine)
     }
@@ -727,6 +729,7 @@ impl Machine {
 
     pub fn resume_admission(&self, generation: u64, epoch: u64, saved_generation: u64, sequence: u64, deadline: Instant) -> Result<()> {
         self.set_admission(generation, epoch, saved_generation, sequence, true, deadline)
+            .map_err(|error| format!("software request-admission resume failed: {error}\n{}", self.diagnostics()).into())
     }
 
     pub fn abort_admission(&self, generation: u64, epoch: u64, saved_generation: u64, sequence: u64, deadline: Instant) -> Result<()> {
@@ -735,18 +738,22 @@ impl Machine {
 
     fn set_admission(&self, generation: u64, epoch: u64, saved_generation: u64, sequence: u64, correct_clock: bool, deadline: Instant) -> Result<()> {
         self.reconnect_control(deadline)?;
-        if self.message(&format!("FENCE {generation} {epoch}"), deadline)? != format!("ok {generation}").as_bytes() {
+        if self.message(&format!("FENCE {generation} {epoch}"), deadline).map_err(|error| format!("owner fence transport: {error}"))?
+            != format!("ok {generation}").as_bytes()
+        {
             bail!("software guest rejected its owner fence");
         }
         if correct_clock {
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
             let clock = format!("BARRIER 1 MAINT {generation} {epoch} CLOCK {}.{:09}", now.as_secs(), now.subsec_nanos());
-            if !self.message(&clock, deadline)?.starts_with(b"ok ") {
+            if !self.message(&clock, deadline).map_err(|error| format!("clock maintenance transport: {error}"))?.starts_with(b"ok ") {
                 bail!("software guest rejected clock maintenance");
             }
         }
         let request = format!("BARRIER 1 RESUME {generation} {epoch} {saved_generation} {sequence}");
-        if self.message(&request, deadline)? != format!("ok BARRIER 1 RESUMED {saved_generation} {sequence}").as_bytes() {
+        if self.message(&request, deadline).map_err(|error| format!("barrier resume transport: {error}"))?
+            != format!("ok BARRIER 1 RESUMED {saved_generation} {sequence}").as_bytes()
+        {
             bail!("software guest did not resume request admission");
         }
         Ok(())
