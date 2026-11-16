@@ -38,7 +38,7 @@ mod vmproc;
 
 use std::io::{BufReader, IsTerminal, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -80,6 +80,8 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      address unless --name and --ip IP|auto), or from a checkpoint
                                      directory (a path, with a '/'); --paused holds it until unpause
   flexvm software --kernel FILE [OPTIONS] IMAGE [CMD...]
+                                     --kernel-sdk: matching native module build inputs;
+                                     --kernel-modules FILE: custom runtime or SDK bundle
                                      experimental foreground QEMU TCG execution without host KVM;
                                      --qemu PATH, --vsock-backend PATH, --mem MIB, --vcpus N,
                                      --timeout SECS (boot only); image env/workdir/user options apply
@@ -130,7 +132,8 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      printed); its template by content id, unnamed, if not here
   flexvm migrate NAME HOST:PORT      live-migrate a VM to the host listening there
   flexvm pull IMAGE[:TAG|@DIGEST] [--tag NAME] [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB]
-              [--standby N] ...      pull an image and build its template (an archive or OCI layout
+              [--standby N] [--kernel-sdk | --kernel-modules FILE] ...
+                                     pull an image and build its template (an archive or OCI layout
                                      directory needs --tag; see README); again: rebuilt if it changed;
                                      --standby N keeps N of its VMs restored and paused (run: ~5 ms);
                                      of an image pulled here, alone it only sets that count
@@ -179,6 +182,7 @@ flexvm fails, 124 when the VM dies; exec returns the command's status, 127 when 
 
 /// Flags that take no value (`-a`, `-f` and `--standby` depend on the command: `takes_value`).
 const SWITCHES: &[&str] = &[
+    "kernel-sdk",
     "warm",
     "force-shared",
     "stop",
@@ -463,6 +467,8 @@ const GLOBAL: &[&str] = &["state", "run", "help", "version", "verbose"];
 
 /// What `pull` takes besides the sizes.
 const IMAGE_FLAGS: &[&str] = &[
+    "kernel-modules",
+    "kernel-sdk",
     "init",
     "entrypoint",
     "cmd",
@@ -626,6 +632,9 @@ fn check_applies(args: &Args) -> Result<()> {
             }
         }
         _ => {}
+    }
+    if args.has("kernel-sdk") && args.get("kernel-modules").is_some() {
+        bail!("use --kernel-modules FILE for a custom runtime or SDK bundle, or --kernel-sdk for the reviewed SDK");
     }
     let image = matches!(cmd.as_str(), "pull" | "software");
     if let Some((f, _)) = args.flags.iter().find(|(f, _)| ![GLOBAL, flags, if image { IMAGE_FLAGS } else { &[] }].concat().contains(&f.as_str())) {
@@ -2110,6 +2119,8 @@ fn pull(args: &Args, src: &str) -> Result<()> {
     let opts = image_options(args, src)?;
     let host = open_host(args)?;
     let _pull = template::pull_lock(&paths, &name)?;
+    artifacts::ensure(&[(&paths.kernel, &artifacts::KERNEL)])?;
+    let modules = kernel_bundle(args, &paths.kernel, true)?;
     let me = host::Ident::me();
     host::clear_taps(&host.run, &me);
     let tap = template::tap(&host.tap_prefix());
@@ -2117,7 +2128,7 @@ fn pull(args: &Args, src: &str) -> Result<()> {
     let res = (|| {
         let init = args.get("init").map(PathBuf::from);
         // Held until the template is published: `rmi` leaves the root filesystem to this build.
-        let (rootfs, meta, _reserved, _cache_lock) = image::prepare(&state(args)?.join("images"), init.as_deref(), &opts)?;
+        let (rootfs, meta, _reserved, _cache_lock) = image::prepare(&state(args)?.join("images"), init.as_deref(), &opts, modules.as_ref())?;
         let size = pull_size(args, host_ram_mib(), Some(std::fs::metadata(&rootfs)?.len()), compat::Arch::HOST)?;
         if let Some(id) = template::up_to_date(&paths, &name, size, &rootfs, &meta) {
             output(format_args!("image {} is up to date (template {name}, id {id})\n", template::image_of(&name)))?;
@@ -2258,6 +2269,43 @@ fn image_options(args: &Args, src: &str) -> Result<image::Options> {
     })
 }
 
+/// A custom kernel can bring adjacent modules; the reviewed kernel fetches
+/// its authenticated runtime bundle by default. The large SDK is opt-in.
+fn kernel_bundle(args: &Args, kernel: &Path, reviewed: bool) -> Result<Option<image::KernelBundle>> {
+    if let Some(custom) = args.get("kernel-modules") {
+        let bundle = image::KernelBundle::open(kernel, Path::new(custom), None)?;
+        if reviewed {
+            artifacts::KERNEL.check_digest(&bundle.kernel.artifact.sha256)?;
+        }
+        return Ok(Some(bundle));
+    }
+    let development = args.has("kernel-sdk");
+    let asset = if development { &artifacts::KERNEL_SDK } else { &artifacts::MODULES };
+    let kernel = kernel.canonicalize()?;
+    let adjacent = kernel.with_file_name(asset.name);
+    let state_kernel = paths(args)?.kernel;
+    let state_artifacts = state_kernel.parent().ok_or("kernel has no artifact directory")?;
+    let authenticated = reviewed || !adjacent.exists() || state_artifacts.canonicalize().is_ok_and(|directory| adjacent.parent() == Some(directory.as_path()));
+    let selected = if reviewed || adjacent.exists() {
+        adjacent
+    } else if development {
+        paths(args)?.kernel.with_file_name(asset.name)
+    } else {
+        return Ok(None);
+    };
+    if authenticated {
+        artifacts::ensure(&[(&selected, asset)])?;
+    }
+    let bundle = image::KernelBundle::open(&kernel, &selected, Some(development))?;
+    if authenticated {
+        asset.check_digest(&bundle.identity().bundle_sha256)?;
+    }
+    if reviewed {
+        artifacts::KERNEL.check_digest(&bundle.kernel.artifact.sha256)?;
+    }
+    Ok(Some(bundle))
+}
+
 /// First software execution slice: reuse OCI preparation and the real agent,
 /// with engine processes owned by this foreground command. Named VMs also expose
 /// live management and local suspend/restore; migration remains separate work.
@@ -2310,7 +2358,8 @@ fn software(args: &Args, src: &str) -> Result<i32> {
         opts.cmd = Some(args.rest.clone());
     }
     let init = args.get("init").map(PathBuf::from);
-    let (rootfs, meta, _reserved, _cache_lock) = image::prepare(&state(args)?.join("images"), init.as_deref(), &opts)?;
+    let modules = kernel_bundle(args, &config.kernel, false)?;
+    let (rootfs, meta, _reserved, _cache_lock) = image::prepare(&state(args)?.join("images"), init.as_deref(), &opts, modules.as_ref())?;
     if meta.argv.is_empty() {
         bail!("software execution needs an image command or CMD");
     }
@@ -2324,7 +2373,10 @@ fn software(args: &Args, src: &str) -> Result<i32> {
         .transpose()?;
     let _reservation =
         named.as_ref().map(|(host, _)| software::Reservation::new(host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)).transpose()?;
-    let machine = config.boot(&rootfs, processes.clone())?;
+    let machine = match modules {
+        Some(bundle) => config.boot_with_kernel(&rootfs, processes.clone(), bundle.kernel)?,
+        None => config.boot(&rootfs, processes.clone())?,
+    };
     drop(_cache_lock);
     if let Some((host, lock)) = named {
         return software::run(host, lock, machine, processes, &config, &meta);

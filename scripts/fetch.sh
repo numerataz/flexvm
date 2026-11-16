@@ -5,7 +5,7 @@
 # (this host's; scripts/versions.sh). flexvm itself
 # downloads the release's on first use; this is for fetching ahead (an offline host, say: --state a directory
 # to copy over).
-# usage: fetch.sh [--state DIR (${FLEXVM_STATE_DIR:-/var/lib/flexvm})] [--urls | --kernel (the kernel only)]
+# usage: fetch.sh [--state DIR (${FLEXVM_STATE_DIR:-/var/lib/flexvm})] [--urls | --kernel | --kernel-sdk]
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -18,12 +18,12 @@ while (( $# )); do
       state=$(realpath -m "$2")
       shift 2
       ;;
-    --urls|--kernel)
-      if [ -n "$mode" ]; then echo 'choose only one of --urls or --kernel' >&2; exit 2; fi
+    --urls|--kernel|--kernel-sdk)
+      if [ -n "$mode" ]; then echo 'choose only one of --urls, --kernel or --kernel-sdk' >&2; exit 2; fi
       mode=$1
       shift
       ;;
-    *) echo 'usage: fetch.sh [--state DIR] [--urls | --kernel]' >&2; exit 2 ;;
+    *) echo 'usage: fetch.sh [--state DIR] [--urls | --kernel | --kernel-sdk]' >&2; exit 2 ;;
   esac
 done
 # shellcheck source=versions.sh
@@ -44,13 +44,29 @@ else
   KERNEL_URL=$("$root/scripts/build-kernel.sh" --key)
 fi
 
-# --urls: print what would be fetched, as `NAME URL` lines (CI keys its caches on them).
+# A pinned kernel is distributed with both matching bundles. Never silently
+# combine an old release kernel with locally generated headers or modules.
+MODULES_URL= SDK_URL=
+for name in kernel-modules.tar.gz kernel-sdk.tar.gz; do
+  candidate=$ARTIFACTS_URL/$(asset "$name")
+  if pinned "$candidate" >/dev/null; then
+    if [[ $KERNEL_URL == build:* ]]; then echo 'module pins require the matching release kernel pin' >&2; exit 1; fi
+  else
+    [ "$?" = 2 ] || exit 1
+    if [[ $KERNEL_URL != build:* ]]; then echo "pinned kernel requires the matching $name pin" >&2; exit 1; fi
+    candidate=$KERNEL_URL:$name
+  fi
+  if [[ $name == kernel-modules.tar.gz ]]; then MODULES_URL=$candidate; else SDK_URL=$candidate; fi
+done
+
+# --urls: print artifact identities for cache keys. The SDK is fetched only
+# with --kernel-sdk, or produced alongside a source-built kernel.
 if [ "$mode" = --urls ]; then
-  printf '%s %s\n' firecracker "$FC_URL" vmlinux "$KERNEL_URL" base.squashfs "$CI/ubuntu-24.04.squashfs"
+  printf '%s %s\n' firecracker "$FC_URL" vmlinux "$KERNEL_URL" kernel-modules.tar.gz "$MODULES_URL" kernel-sdk.tar.gz "$SDK_URL" base.squashfs "$CI/ubuntu-24.04.squashfs"
   exit 0
 fi
 only_kernel=
-if [ "$mode" = --kernel ]; then only_kernel=1; fi
+if [[ $mode == --kernel || $mode == --kernel-sdk ]]; then only_kernel=1; fi
 
 out=$state/artifacts
 sudo mkdir -p "$out"
@@ -156,6 +172,22 @@ elif ! fetched vmlinux "$KERNEL_URL"; then
 else
   # Checked just now (and perhaps fetched before records were kept).
   record vmlinux "$(pinned "$KERNEL_URL")" "$KERNEL_URL"
+fi
+
+if [[ $KERNEL_URL != build:* ]]; then
+  bundles=(kernel-modules.tar.gz)
+  if [[ $mode == --kernel-sdk ]]; then bundles+=(kernel-sdk.tar.gz); fi
+  for name in "${bundles[@]}"; do
+    url=$MODULES_URL
+    if [[ $name == kernel-sdk.tar.gz ]]; then url=$SDK_URL; fi
+    if ! fetched "$name" "$url"; then
+      echo "fetching $name from $url"
+      download "$name" "$url"
+      place 644 "$work/$name" "$name" "$url"
+    else
+      record "$name" "$(pinned "$url")" "$url"
+    fi
+  done
 fi
 
 if [ -z "$only_kernel" ] && ! fetched base.squashfs "$CI/ubuntu-24.04.squashfs"; then

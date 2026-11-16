@@ -20,15 +20,21 @@ mkdir -p "$out"
 
 # Firecracker builds with the toolchain its own rust-toolchain.toml (at FC_COMMIT) pins; rustup installs it.
 sudo apt-get update -q
-sudo apt-get install -y -q --no-install-recommends musl-tools libseccomp-dev build-essential flex bison bc libelf-dev libssl-dev dwarves xz-utils
+sudo apt-get install -y -q --no-install-recommends musl-tools libseccomp-dev build-essential flex bison bc libelf-dev libssl-dev dwarves xz-utils kmod pkg-config zlib1g-dev libzstd-dev
 "$root/scripts/build-firecracker.sh" --state "$state"
 # Build the guest kernel from the reviewed source/configuration.
 "$root/scripts/build-kernel.sh" --state "$state"
 
-firecracker=$(asset firecracker) vmlinux=$(asset vmlinux) inputs=$(asset inputs.txt) sums=SHA256SUMS-$ARCH
-install -m 755 "$state/artifacts/firecracker" "$out/$firecracker"
-install -m 644 "$state/artifacts/vmlinux" "$out/$vmlinux"
+inputs=$(asset inputs.txt) sums=SHA256SUMS-$ARCH
+assets=()
+for name in firecracker vmlinux kernel-modules.tar.gz kernel-sdk.tar.gz; do
+  mode=644
+  if [[ $name == firecracker ]]; then mode=755; fi
+  destination=$(asset "$name")
+  install -m "$mode" "$state/artifacts/$name" "$out/$destination"
+  assets+=("$destination")
+done
 "$root/scripts/pin-artifacts.sh" --inputs > "$out/$inputs"
-(cd "$out" && sha256sum "$firecracker" "$vmlinux" "$inputs" > "$sums")
-"$out/$firecracker" --version
+(cd "$out" && sha256sum "${assets[@]}" "$inputs" > "$sums")
+"$out/$(asset firecracker)" --version
 cat "$out/$inputs" "$out/$sums"

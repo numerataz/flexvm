@@ -89,6 +89,7 @@ impl Manifest {
         }) {
             bail!("software state has an empty artifact or invalid content digest");
         }
+        self.image.check_kernel(&self.kernel.sha256)?;
         Ok(())
     }
 }
@@ -187,6 +188,11 @@ pub struct Inputs {
 
 impl Inputs {
     pub fn open(engine: &str, kernel: &Path, rootfs: &Path) -> Result<Self> {
+        Self::with_kernel(engine, Input::open(&kernel.canonicalize()?)?, rootfs)
+    }
+
+    pub fn with_kernel(engine: &str, kernel: Input, rootfs: &Path) -> Result<Self> {
+        kernel.unchanged()?;
         let engine = if engine.contains('/') {
             PathBuf::from(engine)
         } else {
@@ -197,7 +203,7 @@ impl Inputs {
         };
         let engine = Input::open(&engine.canonicalize()?)?;
         let firmware = discover_firmware(&engine)?;
-        Ok(Self { engine, kernel: Input::open(&kernel.canonicalize()?)?, rootfs: Input::open(&rootfs.canonicalize()?)?, firmware })
+        Ok(Self { engine, kernel, rootfs: Input::open(&rootfs.canonicalize()?)?, firmware })
     }
 }
 

@@ -410,6 +410,12 @@ fn content_id(components: &BTreeMap<String, Component>, image: Option<&ImageMeta
             hash.update(part.as_bytes());
         }
         hash.word(i.warm as u64);
+        if let Some(modules) = &i.kernel_modules {
+            for part in ["kernel-modules", &modules.kernel_sha256, &modules.bundle_sha256, &modules.release] {
+                hash.update(part.as_bytes());
+            }
+            hash.word(modules.development as u64);
+        }
     }
     hash.finish()
 }
@@ -1243,6 +1249,7 @@ fn up_to_date_with(
     let same_image = meta.image.as_ref().is_some_and(|i| {
         (&i.digest, &i.config_digest, &i.app_conf, &i.argv, i.warm) == (&image.digest, &image.config_digest, &image.app_conf, &image.argv, image.warm)
             && serde_json::to_value(&i.ready).ok() == serde_json::to_value(&image.ready).ok()
+            && i.kernel_modules == image.kernel_modules
     });
     let sizes = (meta.vcpus, meta.mem_mib, meta.max_mib, meta.plugged_mib) == (size.vcpus, size.mem_mib, size.mem_mib + size.hotplug_mib(), size.plugged_mib());
     if !same_image || !sizes || meta.recipe != recipe() || std::fs::canonicalize(rootfs).ok()? != meta.rootfs {
@@ -1938,8 +1945,11 @@ fn build(host: &crate::host::Host, paths: &Paths, dir: &Path, name: &str, size: 
     // Downloaded on first use if missing (`artifacts`): every later VM restores with the Firecracker built with.
     crate::artifacts::ensure(&[(&paths.kernel, &crate::artifacts::KERNEL), (&paths.firecracker, &crate::artifacts::FIRECRACKER)])?;
     let kernel = std::fs::canonicalize(&paths.kernel).map_err(|e| format!("{}: {e} (fetch it: scripts/fetch.sh)", paths.kernel.display()))?;
-    let kernel_file = File::open(&kernel)?;
-    let kernel_component = hash_open_file(&kernel_file, &kernel)?;
+    let kernel_input = crate::software_state::Input::open(&kernel)?;
+    crate::artifacts::KERNEL.check_digest(&kernel_input.artifact.sha256)?;
+    image.check_kernel(&kernel_input.artifact.sha256)?;
+    let kernel_file = &kernel_input.file;
+    let kernel_component = hash_open_file(kernel_file, &kernel)?;
     let kernel_source = crate::host::fd_path(kernel_file.as_raw_fd());
     let sockets = SocketRoot::unique(&std::fs::canonicalize(dir)?)?;
     let start = Instant::now();
@@ -1970,7 +1980,9 @@ fn build(host: &crate::host::Host, paths: &Paths, dir: &Path, name: &str, size: 
     fc.put("/vsock", json!({"guest_cid": 3, "uds_path": vsock}))?;
     fc.put("/network-interfaces/eth0", json!({"iface_id": "eth0", "host_dev_name": tap, "guest_mac": crate::net::mac_string(&crate::net::GUEST_MAC)}))?;
     fc.put("/entropy", json!({}))?;
+    kernel_input.unchanged()?;
     fc.put("/actions", json!({"action_type": "InstanceStart"}))?;
+    kernel_input.unchanged()?;
     retry(Duration::from_secs(30), Duration::from_millis(10), || guest::ping(&vsock))
         .map_err(|e| format!("the guest did not boot: {e}; {}", fc.post_mortem()))?;
     let booted = start.elapsed();
@@ -2628,6 +2640,7 @@ pub(crate) mod tests {
 
     fn image(digest: &str, conf: &str) -> ImageMeta {
         ImageMeta {
+            kernel_modules: None,
             source: "x".into(),
             digest: digest.into(),
             config_digest: "sha256:c".into(),

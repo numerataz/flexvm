@@ -38,7 +38,7 @@ missing or unusable (or with --no-kvm), only the untagged ones run, and no
 template is built: CI runs them so on its aarch64 runner, which has no KVM.
 --require-kvm (CI's KVM runners) fails there instead.
 """
-import argparse, contextlib, fcntl, glob, hashlib, ipaddress, json, os, re, select, shutil, signal, socket, struct, subprocess, sys, tempfile, termios, threading, time, traceback
+import argparse, contextlib, fcntl, glob, hashlib, ipaddress, json, os, re, select, shutil, signal, socket, struct, subprocess, sys, tarfile, tempfile, termios, threading, time, traceback
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -2340,6 +2340,95 @@ def tree(root):
             kind = "l" if os.path.islink(p) else "d" if os.path.isdir(p) else "f"
             out[os.path.relpath(p, root)] = (kind, st.st_mode & 0o7777, what)
     return out
+
+
+def build_test_kernel_modules(directory):
+    """Compile opaque guest modules against the matching SDK; never load them on the host."""
+    subprocess.run([os.path.join(ROOT, "scripts/fetch.sh"), "--kernel-sdk", "--state", args.state], check=True)
+    sdk = os.path.join(ARTIFACTS, "kernel-sdk.tar.gz")
+    expected = open(sdk + ".sha256").read().split()[0]
+    with open(sdk, "rb") as stream:
+        assert hashlib.file_digest(stream, "sha256").hexdigest() == expected, "kernel SDK checksum mismatch"
+    with tarfile.open(sdk, "r:gz") as archive:
+        entry = next(item for item in archive if item.name.removeprefix("./") == "usr/lib/flexvm/kernel-modules.json")
+        manifest = json.load(archive.extractfile(entry))
+        with open(os.path.join(ARTIFACTS, "vmlinux"), "rb") as kernel:
+            assert manifest["kernel_sha256"] == hashlib.file_digest(kernel, "sha256").hexdigest(), "SDK/kernel mismatch"
+        prefix = f"lib/modules/{manifest['release']}/build"
+        selected = [item for item in archive.getmembers() if item.name.removeprefix("./") == prefix or item.name.removeprefix("./").startswith(prefix + "/")]
+        os.makedirs(directory)
+        archive.extractall(directory, members=selected, filter="data")
+    build = os.path.join(directory, prefix)
+    modules = os.path.join(directory, "kmods")
+    os.makedirs(modules)
+    fixtures = os.path.join(ROOT, "scripts/compat/modules")
+    for name in ("Makefile", "flexvm_test_state.c", "flexvm_test_device.c"):
+        shutil.copyfile(os.path.join(fixtures, name), os.path.join(modules, name))
+    environment = os.environ.copy()
+    for name in ("ARCH", "KVM", "LOCALVERSION"):
+        environment.pop(name, None)
+    subprocess.run(["make", "-C", build, f"M={modules}", "-j1", "modules"], check=True, env=environment)
+    subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static",
+                    os.path.join(fixtures, "module-control.c"), "-o", os.path.join(modules, "module-control")], check=True)
+    return modules
+
+
+@case
+@needs_kvm
+def kernel_modules():
+    """loaded module RAM/device/timer survives suspend, checkpoint and bidirectional migration."""
+    vm, ck = "e2e-kernel-modules", ckpt_dir("kernel-modules")
+    module_names = ("flexvm_test_state", "flexvm_test_device")
+    for name in module_names:
+        assert not os.path.exists("/sys/module/" + name), "guest test module is loaded on the host"
+    directory = build_test_kernel_modules(os.path.join(WORK, "kernel-module-build"))
+    try:
+        A.run(vm)
+        manifest = json.loads(must(A, vm, "cat /usr/lib/flexvm/kernel-modules.json"))
+        check("runtime modules match guest release", manifest["release"] == must(A, vm, "uname -r").strip() and not manifest["development"], manifest)
+        A.cli("cp", directory, f"{vm}:/tmp")
+        must(A, vm, "/tmp/kmods/module-control load")
+        must(A, vm, "/tmp/kmods/module-control busy")
+
+        def observation(host):
+            values = [int(value) for value in must(host, vm, "/tmp/kmods/module-control read").split()]
+            assert len(values) == 2, values
+            return values
+
+        cookie, previous = observation(A)
+
+        def advances(host, label, before):
+            initial = observation(host)
+            def ready():
+                value = observation(host)
+                assert value[0] == cookie, f"{label}: module random RAM identity changed"
+                return value[1] if value[1] >= initial[1] + 2 and value[1] > before else None
+            value = wait_for(ready, 15)
+            check(f"{label}: fresh kernel timer progress", value is not None and initial[0] == cookie, (before, initial, observation(host)))
+            return value
+
+        previous = advances(A, "initial load", previous)
+        A.pause(vm)
+        A.resume(vm)
+        previous = advances(A, "pause/unpause", previous)
+        A.suspend(vm)
+        A.resume(vm)
+        previous = advances(A, "suspend/start", previous)
+        A.checkpoint(vm, ck, stop=True)
+        A.restore(ck)
+        previous = advances(A, "checkpoint/restore", previous)
+        for source, target in ((A, B), (B, A)):
+            source.migrate(vm, target)
+            check(f"migration to {target.label}", wait_for(lambda: where(vm) == {target.label: "running"}, 60), where(vm))
+            previous = advances(target, f"migration to {target.label}", previous)
+        must(A, vm, "/tmp/kmods/module-control unload")
+        check("module device removed", A.exec(vm, "test ! -e /dev/flexvm-module-test")[0] == 0)
+        for name in module_names:
+            assert not os.path.exists("/sys/module/" + name), "test module appeared on the host"
+    finally:
+        for host in (A, B):
+            host.rm(vm, force=True, check=False)
+        rm_ckpt(ck)
 
 
 @case

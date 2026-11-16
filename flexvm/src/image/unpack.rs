@@ -670,6 +670,101 @@ impl Root {
         }
     }
 
+    /// Module artifacts have their own bounded budget. Shared image directories
+    /// are resolved, preserving merged-/usr links rather than replacing them as
+    /// an ordinary OCI directory entry would.
+    pub(super) fn apply_kernel_bundle(&mut self, bundle: &super::kernel::Bundle) -> Result<()> {
+        let limits = Limits { download: 512 << 20, unpacked: super::kernel::MAX_BYTES, file: 512 << 20, entries: super::kernel::MAX_ENTRIES };
+        let mut injected = Root::from_fd(self.fd.try_clone()?, limits);
+        let prefix = PathBuf::from(format!("lib/modules/{}", bundle.manifest.release));
+        // Only /lib's standard merged-/usr alias may redirect these parents.
+        for directory in ["usr", "usr/lib", "usr/src"] {
+            injected.secure_kernel_directory(Path::new(directory))?;
+        }
+        let lib = injected.at(Path::new("lib"), false)?;
+        if is_type(lib.dir.as_raw_fd(), &lib.name, libc::S_IFLNK) {
+            if injected.real(&injected.resolve(Path::new("lib"))?)? != Path::new("usr/lib") {
+                bail!("kernel module injection requires /lib to be a directory or alias of /usr/lib");
+            }
+        } else {
+            injected.secure_kernel_directory(Path::new("lib"))?;
+        }
+        injected.secure_kernel_directory(Path::new("lib/modules"))?;
+        let old = injected.at(&prefix, true)?;
+        old.remove()?;
+        let module_root = injected.secure_kernel_directory(&prefix)?;
+        let manifest_root = injected.secure_kernel_directory(Path::new("usr/lib/flexvm"))?;
+        let source_root = if bundle.manifest.development {
+            injected.secure_kernel_directory(Path::new("usr/src/flexvm"))?;
+            injected.at(Path::new("usr/src/flexvm"), false)?.remove()?;
+            Some(injected.secure_kernel_directory(Path::new("usr/src/flexvm"))?)
+        } else {
+            None
+        };
+        let mut mine = Layer::default();
+        bundle.visit(|entry, mut meta| {
+            let rel = super::kernel::path(&meta.path)?;
+            if super::kernel::shared_directory(&rel) {
+                return Ok(());
+            }
+            let kind = entry.header().entry_type();
+            let allowed = if rel.starts_with(&prefix) {
+                &module_root
+            } else if rel == Path::new("usr/lib/flexvm/kernel-modules.json") {
+                &manifest_root
+            } else {
+                source_root.as_ref().ok_or("runtime module archive contains development source")?
+            };
+            if rel != prefix || !kind.is_dir() {
+                let at = injected.at(&rel, true)?;
+                if !injected.real(&at.dir)?.starts_with(allowed) {
+                    bail!("kernel module artifact resolves outside its tree: {rel:?}");
+                }
+            }
+            if kind.is_hard_link() {
+                let target = super::kernel::path(meta.link.as_deref().ok_or("module hard link has no target")?)?;
+                let target = injected.at(&target, false)?;
+                if !injected.real(&target.dir)?.starts_with(&module_root) {
+                    bail!("kernel module hard link resolves outside its tree");
+                }
+            }
+            if !kind.is_symlink() && entry.header().mode()? & 0o7000 != 0 {
+                bail!("kernel module artifact has special permission bits");
+            }
+            meta.uid = unsafe { libc::geteuid() };
+            meta.gid = unsafe { libc::getegid() };
+            meta.xattrs.clear();
+            let at = injected.entry(entry, &rel, meta, &mut mine)?;
+            if !kind.is_symlink() {
+                check(
+                    unsafe { libc::fchmodat(at.dir.as_raw_fd(), at.name.as_ptr(), (entry.header().mode()? & 0o755) as libc::mode_t, 0) },
+                    "chmod module input",
+                    &rel,
+                )?;
+            }
+            Ok(())
+        })?;
+        self.entries = self.entries.saturating_add(injected.entries);
+        self.limits.entries = self.limits.entries.saturating_add(injected.entries);
+        Ok(())
+    }
+
+    fn secure_kernel_directory(&mut self, rel: &Path) -> Result<PathBuf> {
+        let at = self.at(rel, false)?;
+        match stat_at(at.dir.as_raw_fd(), &at.name) {
+            Some(st) if st.st_mode & libc::S_IFMT == libc::S_IFDIR => {}
+            Some(_) => bail!("kernel module injection requires a real directory at {rel:?}"),
+            None => {
+                self.create(|| check(unsafe { libc::mkdirat(at.dir.as_raw_fd(), at.name.as_ptr(), 0o755) }, "mkdir module directory", rel))?;
+            }
+        }
+        let directory = open_dir_at(at.dir.as_raw_fd(), &at.name)?;
+        let real = self.real(&directory)?;
+        own(&directory, rel)?;
+        check(unsafe { libc::fchmod(directory.as_raw_fd(), 0o755) }, "chmod module directory", rel)?;
+        Ok(real)
+    }
+
     /// Child creation (including injected files) changes the root's mtime.
     pub fn restore_root_metadata(&self) -> Result<()> {
         if let Some((h, m)) = &self.root_meta {

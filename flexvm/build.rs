@@ -9,8 +9,12 @@ use std::process::Command;
 /// The repository whose releases hold the prebuilt artifacts.
 const REPO: &str = "numerataz/flexvm";
 /// The assets flexvm downloads, and the `rustc-env`s each one's pin and its name in the release go in.
-const ASSETS: [(&str, &str, &str); 2] =
-    [("firecracker", "FLEXVM_PIN_FIRECRACKER", "FLEXVM_ASSET_FIRECRACKER"), ("vmlinux", "FLEXVM_PIN_VMLINUX", "FLEXVM_ASSET_VMLINUX")];
+const ASSETS: [(&str, &str, &str); 4] = [
+    ("firecracker", "FLEXVM_PIN_FIRECRACKER", "FLEXVM_ASSET_FIRECRACKER"),
+    ("vmlinux", "FLEXVM_PIN_VMLINUX", "FLEXVM_ASSET_VMLINUX"),
+    ("kernel-modules.tar.gz", "FLEXVM_PIN_MODULES", "FLEXVM_ASSET_MODULES"),
+    ("kernel-sdk.tar.gz", "FLEXVM_PIN_KERNEL_SDK", "FLEXVM_ASSET_KERNEL_SDK"),
+];
 
 fn main() {
     let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
@@ -70,11 +74,15 @@ fn shell_default(text: &str, name: &str) -> Option<String> {
 /// An asset's name in a release for an architecture, as asset() in scripts/versions.sh names it: x86_64's keep the
 /// names of the releases that had no other architecture (v0.2.2 and older), the others' end in `-ARCH`.
 fn release_name(asset: &str, arch: &str) -> String {
-    match (arch, asset.strip_suffix(".txt")) {
-        ("x86_64", _) => asset.into(),
-        (_, Some(stem)) => format!("{stem}-{arch}.txt"),
-        (_, None) => format!("{asset}-{arch}"),
+    if arch == "x86_64" {
+        return asset.into();
     }
+    for suffix in [".txt", ".tar.gz"] {
+        if let Some(stem) = asset.strip_suffix(suffix) {
+            return format!("{stem}-{arch}{suffix}");
+        }
+    }
+    format!("{asset}-{arch}")
 }
 
 /// The same vMAJOR.MINOR.PATCH form as release.yml and pin-artifacts.sh.
@@ -189,6 +197,10 @@ mod tests {
             ("firecracker", "aarch64", "firecracker-aarch64"),
             ("vmlinux", "aarch64", "vmlinux-aarch64"),
             ("inputs.txt", "aarch64", "inputs-aarch64.txt"),
+            ("kernel-modules.tar.gz", "x86_64", "kernel-modules.tar.gz"),
+            ("kernel-sdk.tar.gz", "x86_64", "kernel-sdk.tar.gz"),
+            ("kernel-modules.tar.gz", "aarch64", "kernel-modules-aarch64.tar.gz"),
+            ("kernel-sdk.tar.gz", "aarch64", "kernel-sdk-aarch64.tar.gz"),
         ] {
             assert_eq!(release_name(asset, arch), name);
         }

@@ -2,6 +2,8 @@
 //! (`blobs/sha256/<hex>`, `rootfs/<key>.ext4`), attached in place, so deleting one breaks its templates.
 
 pub mod auth;
+mod kernel;
+pub use kernel::{Bundle as KernelBundle, Identity as KernelModules};
 mod reference;
 pub(crate) mod registry;
 mod source;
@@ -60,12 +62,21 @@ pub struct ImageMeta {
     /// Started before the snapshot (true) or on every `run` (false).
     pub warm: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kernel_modules: Option<KernelModules>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready: Option<Ready>,
     #[serde(skip)]
     pub ready_timeout: Duration,
 }
 
 impl ImageMeta {
+    pub fn check_kernel(&self, sha256: &str) -> Result<()> {
+        if let Some(modules) = &self.kernel_modules {
+            modules.check_kernel(sha256)?;
+        }
+        Ok(())
+    }
+
     /// Whether the image has an entrypoint or command to start: one without idles.
     pub fn has_app(&self) -> bool {
         !self.argv.is_empty()
@@ -176,7 +187,10 @@ fn app_config(config: &Value, o: &Options) -> Result<App> {
 
 /// `init` is flexvm-init's path, or the one built into flexvm (`artifacts::INIT`) for `None`.
 /// The root filesystem comes reserved (`Cached::reserved`): hold it until the template is published.
-pub fn prepare(cache: &Path, init: Option<&Path>, o: &Options) -> Result<(PathBuf, ImageMeta, Flock, crate::host::HeldLock)> {
+pub fn prepare(cache: &Path, init: Option<&Path>, o: &Options, modules: Option<&KernelBundle>) -> Result<(PathBuf, ImageMeta, Flock, crate::host::HeldLock)> {
+    if let Some(bundle) = modules {
+        bundle.unchanged()?;
+    }
     private_dir(cache, Path::new(""))?;
     let cache_dir = crate::host::Directory::open(cache)?;
     let key = crate::host::keyed("image-cache", &cache_dir.stat()?, "");
@@ -203,10 +217,11 @@ pub fn prepare(cache: &Path, init: Option<&Path>, o: &Options) -> Result<(PathBu
         Some(init) => std::fs::read(init).map_err(|e| format!("flexvm-init at {init:?}: {e}"))?,
         None => crate::artifacts::INIT.to_vec(),
     };
-    // Rebuild older cached images without declared volume directories/configuration.
+    // Bind injected modules and their kernel to the cached root filesystem.
     let key = json!({
-        "v": 5, "config": img.config_digest, "diff_ids": img.diff_ids,
+        "v": 6, "config": img.config_digest, "diff_ids": img.diff_ids,
         "init": sha256_hex(&init_bytes), "options": o,
+        "kernel_modules": modules.map(KernelBundle::identity),
     });
     let key = sha256_hex(key.to_string().as_bytes());
     let cached = cache.join("rootfs").join(format!("{}.ext4", &key["sha256:".len()..]));
@@ -218,11 +233,15 @@ pub fn prepare(cache: &Path, init: Option<&Path>, o: &Options) -> Result<(PathBu
         &cached,
         |tmp| {
             img.download_layers()?;
-            build_rootfs(&o.staging, &img, &app, &init_bytes, tmp, &o.limits)
+            build_rootfs(&o.staging, &img, &app, &init_bytes, tmp, &o.limits, modules)
         },
         sync_dir,
     )?;
+    if let Some(bundle) = modules {
+        bundle.unchanged()?;
+    }
     let meta = ImageMeta {
+        kernel_modules: modules.map(KernelBundle::identity),
         source: o.image.clone(),
         digest: img.digest,
         config_digest: img.config_digest,
@@ -935,7 +954,7 @@ fn sweep_staging(staging: &OwnedFd) -> Result<()> {
     Ok(())
 }
 
-fn build_rootfs(staging: &Path, img: &source::Image, app: &App, init: &[u8], dest: &Path, limits: &Limits) -> Result<String> {
+fn build_rootfs(staging: &Path, img: &source::Image, app: &App, init: &[u8], dest: &Path, limits: &Limits, modules: Option<&KernelBundle>) -> Result<String> {
     let staging = staging_dir(staging)?;
     let work = Work::new(&staging)?;
     let name = &work.name;
@@ -950,6 +969,9 @@ fn build_rootfs(staging: &Path, img: &source::Image, app: &App, init: &[u8], des
             let path = crate::host::fd_path(staging.as_raw_fd()).join(name);
             let mut root = Root::from_fd(work, *limits);
             unpack_layers(&mut root, img)?;
+            if let Some(bundle) = modules {
+                root.apply_kernel_bundle(bundle)?;
+            }
             let conf = inject(&mut root, app, init)?;
             root.restore_root_metadata()?;
             interrupted()?;
@@ -1245,6 +1267,7 @@ mod tests {
             let path = dir.join("vsock");
             let listener = UnixListener::bind(&path).unwrap();
             let meta = ImageMeta {
+                kernel_modules: None,
                 source: String::new(),
                 digest: String::new(),
                 config_digest: String::new(),
@@ -1315,6 +1338,7 @@ mod tests {
                 let listener = UnixListener::bind(&path).unwrap();
                 let stopped = AtomicBool::new(false);
                 let meta = ImageMeta {
+                    kernel_modules: None,
                     source: String::new(),
                     digest: String::new(),
                     config_digest: String::new(),
@@ -2260,7 +2284,7 @@ mod tests {
         let init = d.join("init");
         std::fs::write(&init, b"init").unwrap();
         let o = Options { image: src.display().to_string(), ..Options::default() };
-        let err = prepare(&d.join("cache"), Some(&init), &o).err().unwrap().to_string();
+        let err = prepare(&d.join("cache"), Some(&init), &o, None).err().unwrap().to_string();
         assert!(err.contains(&format!("image is linux/{other}; only linux/{HOST_ARCH} runs on this host")), "{err}");
     }
 
@@ -2411,11 +2435,12 @@ mod tests {
         std::fs::write(&init, b"init").unwrap();
         let o = Options { image, ..Options::default() };
         let config_value: Value = serde_json::from_str(&config).unwrap();
-        let key = json!({"v": 5, "config": cd, "diff_ids": config_value["rootfs"]["diff_ids"], "init": sha256_hex(b"init"), "options": o});
+        let key =
+            json!({"v": 6, "config": cd, "diff_ids": config_value["rootfs"]["diff_ids"], "init": sha256_hex(b"init"), "options": o, "kernel_modules": null});
         let key = sha256_hex(key.to_string().as_bytes());
         let cached = d.join("rootfs").join(format!("{}.ext4", &key[7..]));
         cached_rootfs(&cached, build("cached"), sync_dir).unwrap();
-        let (path, meta, _reserved, _cache_lock) = prepare(&d, Some(&init), &o).unwrap();
+        let (path, meta, _reserved, _cache_lock) = prepare(&d, Some(&init), &o, None).unwrap();
         serving.join().unwrap();
         assert_eq!(read(path), "cached image");
         assert_eq!(meta.app_conf, "cached config");

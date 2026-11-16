@@ -119,14 +119,32 @@ features or make nested VM state safe to checkpoint.
 
 For a development checkout whose release is pending, `scripts/fetch.sh` builds
 this kernel locally. Install `build-essential flex bison bc libelf-dev
-libssl-dev dwarves xz-utils`, then run `sudo ./scripts/build-kernel.sh` (or pass
+libssl-dev dwarves xz-utils kmod pkg-config zlib1g-dev libzstd-dev`, then run `sudo ./scripts/build-kernel.sh` (or pass
 `--state DIR`). Builds are native on x86_64 and aarch64. `--key` prints the
 source/configuration/recipe identity without building or downloading anything.
 The release pipeline builds the same kernel on each architecture and attests
 the resulting assets; users of a pinned release download those assets.
-All required drivers are built in because OCI images do not provide a matching
-`/lib/modules` tree. Loading additional modules requires supplying modules built
-for this exact kernel; FlexVM does not install a distro's kernel modules.
+The build also produces a small runtime module bundle and an opt-in development
+bundle. Image preparation installs the matching runtime tree in `/lib/modules`.
+To compile additional guest modules or use DKMS, add `--kernel-sdk` to `pull`
+or `software`. This installs prepared headers, generated configuration, symbol
+versions, BTF, native build tools, and the pinned source archive. Install a
+compiler, make, kmod, dwarves (`pahole` for module BTF), and package-specific
+dependencies in the guest. For example:
+
+```sh
+sudo flexvm pull --kernel-sdk my-compiler-image:latest
+```
+
+`--kernel-modules FILE` selects a custom runtime or development bundle instead.
+With `software --kernel PATH`, adjacent `kernel-modules.tar.gz` is used
+when present; `--kernel-sdk` selects adjacent `kernel-sdk.tar.gz`. Fetch the
+published development inputs separately with `scripts/fetch.sh --kernel-sdk`.
+Bundle admission checks the kernel digest, architecture, configuration, symbol
+versions and payload hashes before starting a VM. Module bundle identity also
+participates in image/template caching. A distro's unrelated headers or modules
+cannot substitute for the matching FlexVM inputs. Loading modules occurs inside
+the guest and requires guest root privileges.
 
 ### Releasing the artifacts
 

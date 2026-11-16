@@ -321,6 +321,11 @@ impl Config {
         self.launch(inputs, processes, None)
     }
 
+    pub fn boot_with_kernel(&self, rootfs: &Path, processes: Arc<Processes>, kernel: software_state::Input) -> Result<Machine> {
+        let inputs = software_state::Inputs::with_kernel(&self.qemu, kernel, rootfs)?;
+        self.launch(inputs, processes, None)
+    }
+
     /// Load state into a fresh engine, with CPUs paused and public admission closed.
     pub fn restore(&self, verified: software_state::Verified, processes: Arc<Processes>) -> Result<Machine> {
         if self.control != Control::Serial {
@@ -939,7 +944,7 @@ mod tests {
         }
         let _cleanup = Cleanup(dir.clone());
         let options = crate::image::Options { image, staging: dir.join("staging"), ..Default::default() };
-        let (rootfs, meta, _reservation, _use_lock) = crate::image::prepare(&dir.join("images"), None, &options).unwrap();
+        let (rootfs, meta, _reservation, _use_lock) = crate::image::prepare(&dir.join("images"), None, &options, None).unwrap();
         let mut config = Config {
             control: Control::Serial,
             kernel: kernel.into(),

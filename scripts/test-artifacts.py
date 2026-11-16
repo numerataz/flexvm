@@ -18,7 +18,7 @@ class Pins(unittest.TestCase):
         self.root = Path(self.temp.name)
         for name in ('scripts', 'firecracker', '.github', 'flexvm', 'guest'):
             (self.root / name).mkdir()
-        for name in ('versions.sh', 'fetch.sh', 'pin-artifacts.sh', 'release-assets.sh', 'build-firecracker.sh', 'build-kernel.sh'):
+        for name in ('versions.sh', 'fetch.sh', 'pin-artifacts.sh', 'release-assets.sh', 'build-firecracker.sh', 'build-kernel.sh', 'package-kernel-modules.sh'):
             shutil.copy2(ROOT / 'scripts' / name, self.root / 'scripts' / name)
         shutil.copytree(ROOT / 'kernel', self.root / 'kernel')
         shutil.copytree(ROOT / 'firecracker', self.root / 'firecracker', dirs_exist_ok=True)
@@ -37,8 +37,8 @@ class Pins(unittest.TestCase):
         self.kernel = self.source_url
         self.digest = 'a' * 64
         # Each architecture's assets in a release: x86_64's keep their names.
-        self.assets = {'x86_64': ('firecracker', 'vmlinux', 'inputs.txt'),
-                       'aarch64': ('firecracker-aarch64', 'vmlinux-aarch64', 'inputs-aarch64.txt')}
+        self.assets = {'x86_64': ('firecracker', 'vmlinux', 'kernel-modules.tar.gz', 'kernel-sdk.tar.gz', 'inputs.txt'),
+                       'aarch64': ('firecracker-aarch64', 'vmlinux-aarch64', 'kernel-modules-aarch64.tar.gz', 'kernel-sdk-aarch64.tar.gz', 'inputs-aarch64.txt')}
 
     def run_script(self, name, *args):
         return subprocess.run(['bash', str(self.root / 'scripts' / name), *args], env=self.env, text=True, capture_output=True)
@@ -66,7 +66,7 @@ class Pins(unittest.TestCase):
         self.assertEqual(self.pinned().returncode, 1)
 
     def test_fetch_fallback(self):
-        for arch, (firecracker, vmlinux, _) in self.assets.items():
+        for arch, (firecracker, vmlinux, _, _, _) in self.assets.items():
             with self.subTest(arch=arch):
                 self.env['ARCH'] = arch
                 self.checksums.write_text(self.source_pin)
@@ -77,11 +77,11 @@ class Pins(unittest.TestCase):
                 self.assertIn(f'/v1.15/{arch}/ubuntu-24.04.squashfs', result.stdout)
                 # Another architecture's pins are not this one's.
                 other = next(a for a in self.assets if a != arch)
-                self.checksums.write_text(self.source_pin + ''.join(f'{self.digest} {self.url}/{asset}\n' for asset in self.assets[other][:2]))
+                self.checksums.write_text(self.source_pin + ''.join(f'{self.digest} {self.url}/{asset}\n' for asset in self.assets[other][:-1]))
                 result = self.run_script('fetch.sh', '--urls')
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(f'firecracker-v1.17.0-{arch}.tgz', result.stdout)
-                self.checksums.write_text(''.join(f'{self.digest} {self.url}/{asset}\n' for asset in (firecracker, vmlinux)))
+                self.checksums.write_text(''.join(f'{self.digest} {self.url}/{asset}\n' for asset in self.assets[arch][:-1]))
                 result = self.run_script('fetch.sh', '--urls')
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(f'firecracker {self.url}/{firecracker}\n', result.stdout)
@@ -91,7 +91,7 @@ class Pins(unittest.TestCase):
         payload = self.root / 'kernel-payload'
         payload.write_bytes(b'fixture kernel')
         digest = hashlib.sha256(payload.read_bytes()).hexdigest()
-        self.checksums.write_text(f'{digest} {self.url}/vmlinux\n')
+        self.checksums.write_text(''.join(f'{digest} {self.url}/{name}\n' for name in ('vmlinux', 'kernel-modules.tar.gz', 'kernel-sdk.tar.gz')))
         commands = self.root / 'bin'
         commands.mkdir()
         for name, body in {'sudo': 'exec "$@"', 'curl': 'cp "$TEST_PAYLOAD" "$3"'}.items():
@@ -107,6 +107,15 @@ class Pins(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual((state / 'artifacts/vmlinux').read_bytes(), payload.read_bytes())
             self.assertTrue((state / 'artifacts/vmlinux.sha256').read_text().startswith(digest))
+        # The normal fetch stays small; SDK download is explicit and independently repaired.
+        self.assertTrue((state / 'artifacts/kernel-modules.tar.gz').exists())
+        self.assertFalse((state / 'artifacts/kernel-sdk.tar.gz').exists())
+        for corrupt in (False, True):
+            if corrupt:
+                (state / 'artifacts/kernel-sdk.tar.gz').write_bytes(b'corrupted SDK')
+            result = self.run_script('fetch.sh', '--state', str(state), '--kernel-sdk')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((state / 'artifacts/kernel-sdk.tar.gz').read_bytes(), payload.read_bytes())
         # A substituted download never replaces even a corrupted existing file.
         (state / 'artifacts/vmlinux').write_bytes(b'old file')
         payload.write_bytes(b'unverified replacement')
@@ -114,6 +123,15 @@ class Pins(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('SHA256 mismatch', result.stderr)
         self.assertEqual((state / 'artifacts/vmlinux').read_bytes(), b'old file')
+
+    def test_pinned_kernel_requires_matching_bundle_pins(self):
+        for names in [('vmlinux',), ('vmlinux', 'kernel-modules.tar.gz'),
+                      ('vmlinux', 'kernel-sdk.tar.gz')]:
+            with self.subTest(names=names):
+                self.checksums.write_text(''.join(f'{self.digest} {self.url}/{name}\n' for name in names))
+                result = self.run_script('fetch.sh', '--urls')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
 
     def test_kernel_identity_binds_recipe_and_source(self):
         first = self.run_script('build-kernel.sh', '--key')
@@ -147,12 +165,12 @@ class Pins(unittest.TestCase):
 
     def test_malformed_release_never_falls_back(self):
         for arch, assets in self.assets.items():
-            for asset in assets[:2]:
+            for asset in assets[:-1]:
                 for line in (f'bad {self.url}/{asset}\n', f'{self.url}/{asset}\n',
                              f'{self.digest} {self.url}/{asset}\n' * 2):
                     with self.subTest(arch=arch, asset=asset, line=line):
                         self.env['ARCH'] = arch
-                        self.checksums.write_text(line)
+                        self.checksums.write_text(self.source_pin + line)
                         result = self.run_script('fetch.sh', '--urls')
                         self.assertEqual(result.returncode, 1)
                         self.assertIn('Malformed SHA256', result.stderr)
@@ -168,14 +186,14 @@ class Pins(unittest.TestCase):
         upstream = self.source_pin
         self.checksums.write_text(upstream)
         pins = {}
-        for arch, (firecracker, vmlinux, inputs) in self.assets.items():
+        for arch, (firecracker, vmlinux, _, _, inputs) in self.assets.items():
             self.env['ARCH'] = arch
             result = self.run_script('pin-artifacts.sh', '--inputs')
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(result.stdout.startswith(f'firecracker v1.17.0 {arch}\n'), result.stdout)
             self.assertIn(f'linux-source {"c" * 64} 6.1.155\n', result.stdout)
             digest = hashlib.sha256(result.stdout.encode()).hexdigest()
-            pins[arch] = f'{self.digest} {self.url}/{firecracker}\n{self.digest} {self.url}/{vmlinux}\n{digest} {self.url}/{inputs}\n'
+            pins[arch] = ''.join(f'{self.digest} {self.url}/{asset}\n' for asset in self.assets[arch][:-1]) + f'{digest} {self.url}/{inputs}\n'
         everything = upstream + pins['x86_64'] + pins['aarch64']
         # The same answer on either host.
         for arch in self.assets:
@@ -205,13 +223,15 @@ class Pins(unittest.TestCase):
         assets = self.root / 'assets'
         assets.mkdir()
         original = self.source_pin
-        for arch, (firecracker, vmlinux, _) in self.assets.items():
+        for arch, (firecracker, vmlinux, _, _, _) in self.assets.items():
             (assets / firecracker).write_text(f'not executable {arch}')
             (assets / vmlinux).write_text(f'kernel {arch}')
+            for name in self.assets[arch][2:-1]:
+                (assets / name).write_text(f'matching bundle fixture {name}')
         original += f'{self.digest} https://unrelated\n'
         self.checksums.write_text(original)
         self.checksums.chmod(0o644)
-        for arch, (_, _, inputs_name) in self.assets.items():
+        for arch, (_, _, _, _, inputs_name) in self.assets.items():
             # Run on any host, for each architecture.
             self.env['ARCH'] = arch
             inputs = self.run_script('pin-artifacts.sh', '--inputs')
