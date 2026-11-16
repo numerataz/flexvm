@@ -30,9 +30,13 @@ pub struct Reservation {
 }
 
 impl Reservation {
-    pub fn new(host: &Host, mib: u32, deadline: Instant) -> Result<Self> {
+    pub fn new(host: &Host, mib: u32, deadline: Instant, processes: &qemu::Processes) -> Result<Self> {
         let (grant, hold) = host.grant_start(u64::from(mib), crate::host::Floor::Reserve, true, Some(deadline))?;
-        Ok(Self { host: host.clone(), grant, hold })
+        let reservation = Self { host: host.clone(), grant, hold };
+        if let Some(hold) = &reservation.hold {
+            processes.inherit_lease(hold.inherit()?);
+        }
+        Ok(reservation)
     }
 }
 
@@ -752,7 +756,7 @@ pub fn restore(host: Host, vm_name: &str, notify: Option<std::fs::File>) -> Resu
             vcpus: metadata.vcpus,
             boot_timeout: Duration::from_secs(120),
         };
-        let _reservation = Reservation::new(&host, config.mem_mib, Instant::now() + config.boot_timeout)?;
+        let _reservation = Reservation::new(&host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)?;
         let verified = software_state::open(&path, &config.profile()?)?;
         let manifest = verified.manifest.clone();
         let prepared = verified.prepare(&name, &software_state::host_id(&host.state)?)?;

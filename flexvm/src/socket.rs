@@ -1,8 +1,8 @@
 //! Short, private socket directories, independent of artifact and run paths.
 
-use std::fs::{self, DirBuilder};
+use std::fs::{self, DirBuilder, File};
 use std::io;
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -197,6 +197,7 @@ fn recorded_root(bases: &[PathBuf], key: &Path) -> Option<PathBuf> {
 pub struct SocketRoot {
     pub dir: PathBuf,
     next: AtomicU64,
+    software_lease: Option<File>,
 }
 
 impl SocketRoot {
@@ -228,7 +229,7 @@ impl SocketRoot {
                 check(&dir.join("ffffffffffffffff/v.sock_4294967295"))?;
                 let _ = fs::remove_dir_all(&dir);
                 DirBuilder::new().mode(0o700).create(&dir)?;
-                Ok(Arc::new(Self { dir, next: AtomicU64::new(0) }))
+                Ok(Arc::new(Self { dir, next: AtomicU64::new(0), software_lease: None }))
             })();
             match attempt {
                 Ok(root) => return Ok(root),
@@ -236,6 +237,52 @@ impl SocketRoot {
             }
         }
         Err(format!("cannot create a private socket directory: {}", errors.join("; ")).into())
+    }
+
+    /// A versioned software runtime, with a lease also inherited by its children.
+    pub fn software() -> Result<Arc<Self>> {
+        if let Err(error) = sweep_software(None) {
+            crate::log!("software runtime cleanup: {error}");
+        }
+        Self::software_in(&bases())
+    }
+
+    fn software_in(bases: &[PathBuf]) -> Result<Arc<Self>> {
+        let mut errors = Vec::new();
+        for base in bases {
+            let attempt = (|| -> Result<Arc<Self>> {
+                base_dir(base)?;
+                let base_file = File::open(base)?;
+                let creating = crate::host::Flock::new(base_file, libc::LOCK_EX)?;
+                let dir = base.join(format!("{SOFTWARE_PREFIX}{}", crate::util::random_hex(16)?));
+                check(&dir.join("ffffffffffffffff/v.sock_4294967295"))?;
+                DirBuilder::new().mode(0o700).create(&dir)?;
+                let lease = open_software_dir(&dir)?;
+                crate::host::flock(&lease, libc::LOCK_SH)?;
+                let root = Arc::new(Self { dir, next: AtomicU64::new(0), software_lease: Some(lease) });
+                // The root lease now protects initial owner publication. Release
+                // the base lock before any error can run the root destructor.
+                drop(creating);
+                let owner = SoftwareOwner { version: 1, owner: crate::host::Ident::me() };
+                crate::util::write_file(&root.dir, "software-owner", &serde_json::to_vec(&owner)?, true)?;
+                Ok(root)
+            })();
+            match attempt {
+                Ok(root) => return Ok(root),
+                Err(error) => errors.push(format!("{}: {error}", base.display())),
+            }
+        }
+        Err(format!("cannot create software runtime: {}", errors.join("; ")).into())
+    }
+
+    pub fn software_lease(&self) -> Result<File> {
+        self.software_lease.as_ref().ok_or("not a software runtime")?.try_clone().map_err(Into::into)
+    }
+
+    pub fn record_software_child(&self, index: usize, kind: SoftwareKind, process: crate::host::Ident) -> Result<()> {
+        let child = SoftwareChild { kind, process };
+        crate::util::write_file(&self.dir, &format!("child-{index}"), &serde_json::to_vec(&child)?, true)?;
+        Ok(())
     }
 
     pub fn allocate(self: &Arc<Self>) -> Result<Sockets> {
@@ -248,8 +295,139 @@ impl SocketRoot {
 
 impl Drop for SocketRoot {
     fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.dir);
+        if let Some(lease) = self.software_lease.take() {
+            drop(lease);
+            let Some(base) = self.dir.parent() else { return };
+            let Ok(base) = File::open(base) else { return };
+            let Ok(_removing) = crate::host::Flock::new(base, libc::LOCK_EX) else { return };
+            // A fresh description must acquire EX: upgrading the inherited OFD
+            // itself would also upgrade the child's duplicate, proving nothing.
+            if let Ok(directory) = open_software_dir(&self.dir) {
+                if crate::host::flock(&directory, libc::LOCK_EX | libc::LOCK_NB).is_ok()
+                    && software_children(&self.dir)
+                        .is_ok_and(|children| children.iter().all(|child| matches!(crate::host::PidFd::open(&child.process), Ok(None))))
+                {
+                    let _ = fs::remove_dir_all(&self.dir);
+                }
+            }
+        } else {
+            let _ = fs::remove_dir(&self.dir);
+        }
     }
+}
+
+const SOFTWARE_PREFIX: &str = "q1-";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SoftwareOwner {
+    version: u32,
+    owner: crate::host::Ident,
+}
+
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SoftwareKind {
+    QemuTcg,
+    VhostUserVsock,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SoftwareChild {
+    kind: SoftwareKind,
+    process: crate::host::Ident,
+}
+
+fn open_software_dir(path: &Path) -> Result<File> {
+    let file = File::options().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(path)?;
+    let stat = file.metadata()?;
+    if stat.uid() != unsafe { libc::geteuid() } || stat.mode() & 0o7777 != 0o700 {
+        return Err(denied(path, "untrusted software runtime").into());
+    }
+    Ok(file)
+}
+
+fn software_children(path: &Path) -> Result<Vec<SoftwareChild>> {
+    let mut children = Vec::new();
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if entry.file_name().to_str().and_then(|s| s.strip_prefix("child-")).is_some_and(|s| s.parse::<usize>().is_ok()) {
+            children.push(crate::host::load(&entry.path())?.ok_or("software child record disappeared")?);
+        }
+    }
+    Ok(children)
+}
+
+/// Global short roots are independent of host state/run bindings. Unknown or
+/// namespace-invisible owners are preserved; a name reuser requests its exact
+/// old owner, while periodic collection considers every proven-dead owner.
+pub fn sweep_software(owner: Option<&crate::host::Ident>) -> Result<()> {
+    sweep_software_in(&bases(), owner)
+}
+
+fn sweep_software_in(bases: &[PathBuf], selected: Option<&crate::host::Ident>) -> Result<()> {
+    for base in bases.iter().filter(|base| private(base).is_ok()) {
+        let base_file = File::open(base)?;
+        let _sweeping = match crate::host::Flock::new(base_file, libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(lock) => lock,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock && selected.is_none() => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for entry in fs::read_dir(base)? {
+            let entry = entry?;
+            let recognized = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.strip_prefix(SOFTWARE_PREFIX))
+                .is_some_and(|s| s.len() == 32 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+            if !recognized {
+                continue;
+            }
+            let directory = match open_software_dir(&entry.path()) {
+                Ok(directory) => directory,
+                Err(error) if selected.is_some() => return Err(error),
+                Err(_) => continue,
+            };
+            let pinned = crate::host::fd_path(directory.as_raw_fd());
+            let owner = match crate::host::load::<SoftwareOwner>(&pinned.join("software-owner")) {
+                Ok(Some(owner)) if owner.version == 1 => owner,
+                Ok(None) if selected.is_none() => {
+                    // No child can spawn until the initial owner record exists.
+                    if crate::host::flock(&directory, libc::LOCK_EX | libc::LOCK_NB).is_ok() {
+                        fs::remove_dir_all(entry.path())?;
+                    }
+                    continue;
+                }
+                _ if selected.is_some() => return Err("cannot fence a software runtime with an unknown owner record".into()),
+                _ => continue,
+            };
+            if selected.is_some_and(|selected| *selected != owner.owner) {
+                continue;
+            }
+            match crate::host::PidFd::open(&owner.owner) {
+                Ok(None) => {}
+                Err(error) if selected.is_some() => return Err(error),
+                _ => continue,
+            }
+            for child in software_children(&pinned)? {
+                if let Some(child) = crate::host::PidFd::open(&child.process)? {
+                    child.signal(libc::SIGKILL)?;
+                    if !child.wait(std::time::Duration::from_secs(5)) {
+                        return Err("software child of a dead owner did not exit".into());
+                    }
+                }
+            }
+            // A child may have inherited leases before its parent could record
+            // it. PDEATHSIG kills it; keep paths and RAM charged until it exits.
+            match crate::host::flock(&directory, libc::LOCK_EX | libc::LOCK_NB) {
+                Ok(()) => fs::remove_dir_all(entry.path())?,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock && selected.is_none() => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// One Firecracker's sockets; removing the directory also removes its vsock port UDSes.
@@ -271,6 +449,133 @@ impl Drop for Sockets {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+
+    struct Sleeping(std::process::Child);
+
+    impl Sleeping {
+        fn with_lease(lease: &File) -> Self {
+            use std::os::unix::process::CommandExt;
+            let fd = lease.as_raw_fd();
+            let mut cmd = std::process::Command::new("sleep");
+            cmd.arg("30");
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            Self(cmd.spawn().unwrap())
+        }
+    }
+
+    impl Drop for Sleeping {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn dead_software_owner(root: &SocketRoot) -> crate::host::Ident {
+        let mut owner = crate::host::Ident::me();
+        owner.start += 1;
+        crate::util::write_file(&root.dir, "software-owner", &serde_json::to_vec(&SoftwareOwner { version: 1, owner: owner.clone() }).unwrap(), false).unwrap();
+        owner
+    }
+
+    #[test]
+    fn software_runtime_waits_for_an_unrecorded_childs_inherited_lease() {
+        let temp = crate::test_util::TempDir::new("qgap");
+        let bases = [temp.join("s")];
+        let mut root = SocketRoot::software_in(&bases).unwrap();
+        let owner = dead_software_owner(&root);
+        let path = root.dir.clone();
+        let lease = root.software_lease().unwrap();
+        let mut child = Sleeping::with_lease(&lease);
+        drop(lease);
+        drop(Arc::get_mut(&mut root).unwrap().software_lease.take());
+        sweep_software_in(&bases, None).unwrap();
+        assert!(path.exists(), "spawn-to-record crash window lost its lease");
+        assert!(sweep_software_in(&bases, Some(&owner)).is_err(), "name reuse must wait for the unknown child's lease");
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        sweep_software_in(&bases, None).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn software_runtime_reaps_recorded_children_without_signaling_a_reused_pid() {
+        let temp = crate::test_util::TempDir::new("qreap");
+        let bases = [temp.join("s")];
+        let mut root = SocketRoot::software_in(&bases).unwrap();
+        dead_software_owner(&root);
+        let path = root.dir.clone();
+        let lease = root.software_lease().unwrap();
+        let mut owned = Sleeping::with_lease(&lease);
+        let mut unrelated = Sleeping::with_lease(&File::open("/dev/null").unwrap());
+        root.record_software_child(0, SoftwareKind::QemuTcg, crate::host::Ident::of(owned.0.id()).unwrap()).unwrap();
+        let mut reused = crate::host::Ident::of(unrelated.0.id()).unwrap();
+        reused.start += 1;
+        root.record_software_child(1, SoftwareKind::VhostUserVsock, reused).unwrap();
+        drop(lease);
+        drop(Arc::get_mut(&mut root).unwrap().software_lease.take());
+        sweep_software_in(&bases, None).unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(owned.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert!(unrelated.0.try_wait().unwrap().is_none(), "reused PID was signaled");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn software_runtime_collects_abandoned_initialization_and_preserves_unknown_roots() {
+        let temp = crate::test_util::TempDir::new("qinit");
+        let bases = [temp.join("s")];
+        base_dir(&bases[0]).unwrap();
+        let initializing = bases[0].join(format!("{SOFTWARE_PREFIX}{}", "a".repeat(32)));
+        DirBuilder::new().mode(0o700).create(&initializing).unwrap();
+        let lease = open_software_dir(&initializing).unwrap();
+        crate::host::flock(&lease, libc::LOCK_SH).unwrap();
+        sweep_software_in(&bases, None).unwrap();
+        assert!(initializing.exists(), "live owner publication lost its root");
+        drop(lease);
+        let legacy = bases[0].join("0123456789abcdef");
+        DirBuilder::new().mode(0o700).create(&legacy).unwrap();
+        let unknown = bases[0].join(format!("{SOFTWARE_PREFIX}{}", "b".repeat(32)));
+        DirBuilder::new().mode(0o700).create(&unknown).unwrap();
+        fs::write(unknown.join("software-owner"), b"unknown owner format").unwrap();
+        let linked = bases[0].join(format!("{SOFTWARE_PREFIX}{}", "c".repeat(32)));
+        symlink(&legacy, &linked).unwrap();
+        sweep_software_in(&bases, None).unwrap();
+        assert!(!initializing.exists());
+        assert!(legacy.exists() && unknown.exists() && linked.is_symlink());
+        let mut selected = crate::host::Ident::me();
+        selected.start += 1;
+        assert!(sweep_software_in(&bases, Some(&selected)).is_err(), "unknown ownership cannot authorize name reuse");
+    }
+
+    #[test]
+    fn software_runtime_keeps_live_owners_and_unreadable_child_records() {
+        let temp = crate::test_util::TempDir::new("qkeep");
+        let bases = [temp.join("s")];
+        let mut root = SocketRoot::software_in(&bases).unwrap();
+        let path = root.dir.clone();
+        drop(Arc::get_mut(&mut root).unwrap().software_lease.take());
+        sweep_software_in(&bases, None).unwrap();
+        assert!(path.exists(), "live owner must be preserved even without its lease");
+        dead_software_owner(&root);
+        fs::write(path.join("child-0"), b"partial record").unwrap();
+        assert!(sweep_software_in(&bases, None).is_err());
+        assert!(path.exists());
+        let mut unseen = crate::host::Ident::me();
+        unseen.pid = 0;
+        root.record_software_child(0, SoftwareKind::QemuTcg, unseen).unwrap();
+        assert!(sweep_software_in(&bases, None).is_err(), "pidfd failure cannot prove death");
+        assert!(path.exists());
+        fs::remove_file(path.join("child-0")).unwrap();
+        sweep_software_in(&bases, None).unwrap();
+        assert!(!path.exists());
+    }
 
     #[test]
     fn activation_checks_environment_and_sets_cloexec() {

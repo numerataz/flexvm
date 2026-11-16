@@ -31,9 +31,17 @@ input bundles. After an exchange, an abandoned hidden input bundle is reclaimed
 only once its recorded engine identity is proven gone. Public checkpoint manifests,
 execution grants, retirement records and quarantined snapshots are preserved;
 only recognized journal temporaries are removed there. Earlier unleased temporary
-names are retained for compatibility with concurrent older writers. Runtime child
-registration and resource lease recovery after abrupt owner death remain tracked
-in #1388.
+names are retained for compatibility with concurrent older writers.
+
+Versioned private software runtime roots record the owning process and each QEMU
+or vsock backend by full process identity. Children inherit the runtime directory
+lease and, for named VMs, the charged RAM hold. An abrupt owner death therefore
+keeps RAM charged until its children exit. Recovery signals recorded children via
+pidfds, waits for exit, then requires an exclusive runtime lease before removing
+paths. An unrecorded child in the spawn-to-record crash window keeps both leases
+until PDEATHSIG terminates it. Unknown records and namespace-invisible processes
+are preserved; canonical quarantine and ownership journals are never replayed by
+runtime cleanup.
 
 ## Execution and state identity
 
