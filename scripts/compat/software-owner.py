@@ -74,9 +74,26 @@ def exercise(args):
             time.sleep(.02)
         raise RuntimeError('software engine survived its owner')
 
+    def inherited_leases(entry):
+        links = []
+        for path in Path(f'/proc/{entry["backend"]["process"]["pid"]}/fd').iterdir():
+            try:
+                links.append(path.readlink())
+            except FileNotFoundError:
+                pass
+        holds = [str(path) for path in links if path.parent.name == 'holds']
+        roots = [path for path in links if path.name.startswith('q1-') and (path / 'software-owner').is_file()]
+        if not holds or len(roots) != 1:
+            raise RuntimeError(f'engine did not retain RAM and runtime directory leases: {links}')
+        owner = json.loads((roots[0] / 'software-owner').read_text())['owner']
+        if any(owner[key] != entry[key] for key in ('pid', 'start', 'boot', 'pidns')):
+            raise RuntimeError('runtime lease belongs to a different owner')
+        return {'ram': holds, 'runtime': str(roots[0])}
+
     owner, entry = start('owner-test')
     evidence = {'entry': entry}
     try:
+        evidence['inherited_leases'] = inherited_leases(entry)
         if entry['backend']['kind'] != 'qemu-tcg' or entry.get('firecracker') is not None:
             raise RuntimeError('owner did not publish an honest software backend identity')
         if entry['max_mib'] != 512 or entry['backend']['ram_mib'] != 512 or entry.get('template_id'):
@@ -137,14 +154,58 @@ def exercise(args):
         # A hard owner death must also fence and terminate its actual engine.
         crashed, crash_entry = start('owner-crash')
         try:
+            crash_leases = inherited_leases(crash_entry)
             crashed.kill()
             crashed.wait(timeout=5)
             engine_gone(crash_entry['backend']['process'])
+            cli('debug', 'gc')
+            if Path(crash_leases['runtime']).exists():
+                raise RuntimeError('owner death left a software runtime after garbage collection')
+            evidence['runtime_death_cleanup'] = 'passed'
             if live('owner-crash') is not None:
                 raise RuntimeError('dead owner remained live in registry')
             evidence['crash_engine'] = crash_entry['backend']['process']
         finally:
             stop(crashed)
+        # A dead restored owner must leave its committed grant quarantined,
+        # while its private runtime and RAM leases become collectable.
+        restored, _ = start('owner-restore-crash')
+        try:
+            cli('stop', 'owner-restore-crash')
+            if restored.wait(timeout=10) != 0:
+                raise RuntimeError('restore crash source did not suspend')
+            cli('start', 'owner-restore-crash')
+            restored_entry = live('owner-restore-crash')
+            if restored_entry is None:
+                raise RuntimeError('restore crash target did not publish')
+            leases = inherited_leases(restored_entry)
+            checkpoint = args.state / 'state' / 'suspended' / 'owner-restore-crash'
+            committed = {name: (checkpoint / name).read_bytes() for name in ('manifest.json', 'STARTED', 'RETIRED', 'HIGHEST')}
+            pidfd = os.pidfd_open(restored_entry['pid'])
+            try:
+                fields = Path(f'/proc/{restored_entry["pid"]}/stat').read_text().rsplit(')', 1)[1].split()
+                if int(fields[19]) != restored_entry['start']:
+                    raise RuntimeError('restore owner identity changed before crash injection')
+                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+            finally:
+                os.close(pidfd)
+            engine_gone(restored_entry['backend']['process'])
+            cli('debug', 'gc')
+            if Path(leases['runtime']).exists():
+                raise RuntimeError('restored owner runtime survived collection')
+            if any((checkpoint / name).read_bytes() != data for name, data in committed.items()):
+                raise RuntimeError('collection modified committed quarantine or ownership records')
+            refused = cli('start', 'owner-restore-crash', status=None)
+            if refused.returncode == 0 or 'already granted' not in refused.stderr:
+                raise RuntimeError('dead restored owner was implicitly replayed')
+            evidence['restored_owner_death'] = {'runtime_cleanup': 'passed', 'quarantine_preserved': 'passed'}
+        finally:
+            try:
+                cli('kill', 'owner-restore-crash', status=None)
+            except subprocess.TimeoutExpired:
+                pass
+            finally:
+                stop(restored)
         # Flock ownership, rather than an old pathname, determines live reservations.
         for hold in (args.state / 'run').rglob('holds/*-*'):
             with hold.open('rb') as stream:

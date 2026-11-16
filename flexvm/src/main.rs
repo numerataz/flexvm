@@ -2322,7 +2322,8 @@ fn software(args: &Args, src: &str) -> Result<i32> {
             Ok((host, lock))
         })
         .transpose()?;
-    let _reservation = named.as_ref().map(|(host, _)| software::Reservation::new(host, config.mem_mib, Instant::now() + config.boot_timeout)).transpose()?;
+    let _reservation =
+        named.as_ref().map(|(host, _)| software::Reservation::new(host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)).transpose()?;
     let machine = config.boot(&rootfs, processes.clone())?;
     drop(_cache_lock);
     if let Some((host, lock)) = named {

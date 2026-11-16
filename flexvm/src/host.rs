@@ -43,6 +43,11 @@ pub struct Hold {
 }
 
 impl Hold {
+    /// Keep the charged lease alive in a software engine after abrupt owner death.
+    pub fn inherit(&self) -> std::io::Result<File> {
+        self._file.try_clone()
+    }
+
     /// Renamed to count `mib`, under the host lock.
     fn resize(&mut self, mib: u64) -> std::io::Result<()> {
         let path = self.path.with_file_name(format!("{}-{mib}", self.id));
@@ -4347,6 +4352,7 @@ fn reap_swept(run: &Path, owner: &Ident, swept: bool) -> Result<()> {
         Liveness::Alive => bail!("process {} is alive", owner.pid),
         Liveness::Unknown => bail!("cannot tell whether process {} is gone", owner.pid),
     }
+    crate::socket::sweep_software(Some(owner))?;
     trusted_root(run)?;
     trusted_dir(&run.join("w"))?;
     if !swept {
@@ -4934,6 +4940,7 @@ impl Host {
         collect_owned(&self.run);
         crate::checkpoint::sweep_staging(&self.state);
         crate::software_state::sweep(&self.state)?;
+        crate::socket::sweep_software(None)?;
         // What a write killed midway left of the records.
         for dir in [self.run.join("claims"), self.run.join("vms"), self.state.join("addrs"), self.state.join("standby")] {
             remove_write_debris(&dir, |_| true);

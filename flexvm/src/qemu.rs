@@ -9,7 +9,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -41,7 +41,11 @@ pub struct Config {
 /// Children remain unreaped until their owner observes exit, so their pids cannot
 /// be reused while cancellation holds this mutex.
 #[derive(Default)]
-pub struct Processes(Mutex<Vec<Process>>);
+pub struct Processes {
+    children: Mutex<Vec<Process>>,
+    leases: Mutex<Vec<File>>,
+    runtime: Mutex<Option<Weak<SocketRoot>>>,
+}
 
 struct Process {
     child: Child,
@@ -66,24 +70,37 @@ impl Drop for Process {
 }
 
 impl Processes {
+    pub fn inherit_lease(&self, file: File) {
+        self.leases.lock().unwrap().push(file);
+    }
+
     pub fn stop(&self) {
-        let mut children = self.0.lock().unwrap();
+        let mut children = self.children.lock().unwrap();
         while let Some(child) = children.pop() {
             drop(child);
         }
     }
 
     fn spawn(&self, cmd: &mut Command, log: &Path) -> Result<()> {
-        self.spawn_with_fds(cmd, log, &[])
+        self.spawn_kind(cmd, log, &[], crate::socket::SoftwareKind::VhostUserVsock)
     }
 
     fn spawn_with_fds(&self, cmd: &mut Command, log: &Path, inherited: &[RawFd]) -> Result<()> {
+        self.spawn_kind(cmd, log, inherited, crate::socket::SoftwareKind::QemuTcg)
+    }
+
+    fn spawn_kind(&self, cmd: &mut Command, log: &Path, inherited: &[RawFd], kind: crate::socket::SoftwareKind) -> Result<()> {
         template::interrupted()?;
         File::create(log)?;
         let (mut reader, writer) = std::io::pipe()?;
         cmd.stdin(Stdio::null()).stdout(writer.try_clone()?).stderr(writer);
+        let runtime = self.runtime.lock().unwrap().as_ref().and_then(Weak::upgrade);
+        let mut leases = self.leases.lock().unwrap().iter().map(File::try_clone).collect::<std::io::Result<Vec<_>>>()?;
+        if let Some(runtime) = &runtime {
+            leases.push(runtime.software_lease()?);
+        }
         let parent = unsafe { libc::getpid() };
-        let inherited = inherited.to_vec();
+        let inherited = inherited.iter().copied().chain(leases.iter().map(AsRawFd::as_raw_fd)).collect::<Vec<_>>();
         // An abrupt owner exit also kills its engines; no shell/helper processes.
         unsafe {
             cmd.pre_exec(move || {
@@ -107,7 +124,7 @@ impl Processes {
                 Ok(())
             });
         }
-        let mut children = self.0.lock().unwrap();
+        let mut children = self.children.lock().unwrap();
         // Cancellation may have arrived while opening logs/building the command.
         template::interrupted()?;
         let child = util::unblock_signals_in(cmd).spawn();
@@ -116,6 +133,9 @@ impl Processes {
         let child = child?;
         let ident = crate::host::Ident::of(child.id());
         let mut process = Process { child, ident, logging: None };
+        if let Some(runtime) = runtime {
+            runtime.record_software_child(children.len(), kind, process.ident.clone().ok_or("cannot identify software child")?)?;
+        }
         let log = log.to_path_buf();
         process.logging = Some(std::thread::Builder::new().spawn(move || {
             let mut buf = [0; 64 << 10];
@@ -135,7 +155,7 @@ impl Processes {
     }
 
     fn recorded_engine(&self) -> Result<crate::host::Ident> {
-        let children = self.0.lock().unwrap();
+        let children = self.children.lock().unwrap();
         children.last().and_then(|child| child.ident.clone()).ok_or_else(|| "cannot identify software engine process".into())
     }
 
@@ -149,7 +169,7 @@ impl Processes {
 
     pub fn alive(&self) -> Result<()> {
         template::interrupted()?;
-        for process in self.0.lock().unwrap().iter_mut() {
+        for process in self.children.lock().unwrap().iter_mut() {
             if let Some(status) = process.child.try_wait()? {
                 bail!("software VM process {} exited: {status}", process.child.id());
             }
@@ -324,8 +344,8 @@ impl Config {
         inputs.kernel.unchanged()?;
         inputs.rootfs.unchanged()?;
         let profile = self.profile()?;
-        let key = PathBuf::from(format!("software-{}-{}", std::process::id(), util::random_hex(16)?));
-        let root = SocketRoot::unique(&key)?;
+        let root = SocketRoot::software()?;
+        *processes.runtime.lock().unwrap() = Some(Arc::downgrade(&root));
         let sockets = root.allocate()?;
         let logs = root.dir.join("logs");
         fs::create_dir(&logs)?;
@@ -1198,7 +1218,7 @@ mod tests {
         let start = Instant::now();
         drop(machine);
         assert!(start.elapsed() < Duration::from_secs(3));
-        assert!(processes.0.lock().unwrap().is_empty());
+        assert!(processes.children.lock().unwrap().is_empty());
         assert!(!logs.exists());
         assert!(!sockets.exists());
     }

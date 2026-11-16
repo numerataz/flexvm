@@ -141,14 +141,26 @@ test "$found" = 1 || exit 24
             if len(owners) != 1:
                 raise RuntimeError(f'expected one software VM owner, got {owners}')
             owner = owners[0]
+            leased_roots = set()
             for pid in descendants(owner):
                 engines[pid] = identity(pid)
+                roots = set()
+                for fd in Path(f'/proc/{pid}/fd').iterdir():
+                    try:
+                        target = fd.readlink()
+                    except FileNotFoundError:
+                        continue
+                    if target.name.startswith('q1-') and (target / 'software-owner').is_file():
+                        roots.add(str(target))
+                if len(roots) != 1:
+                    raise RuntimeError(f'owned engine {pid} did not retain exactly one runtime lease: {roots}')
+                leased_roots.update(roots)
                 argv = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')
                 for i, arg in enumerate(argv[:-1]):
                     if arg == b'-qmp':
                         runtime.append(Path(os.fsdecode(argv[i + 1]).split(',')[0].removeprefix('unix:')).parent)
             expected = 1 if args.control == 'serial' else 2
-            if len(engines) != expected or not runtime:
+            if len(engines) != expected or not runtime or len(leased_roots) != 1:
                 raise RuntimeError(f'did not find {expected} owned engine(s) and the private socket directory')
             os.kill(owner, signal.SIGTERM)
 
@@ -161,6 +173,7 @@ test "$found" = 1 || exit 24
             raise RuntimeError('an owned engine survived owner cancellation')
         if any(path.exists() for path in runtime):
             raise RuntimeError('private sockets survived owner cancellation')
+        report['engine_runtime_leases'] = 'passed'
         traced = trace.read_text(errors='replace') + cancel_trace.read_text(errors='replace')
         if args.docker:
             docker_trace = out / 'docker-files.strace'

@@ -510,7 +510,18 @@ mod tests {
         let t = fixture();
         let path = t.join("docker.sock");
         drop(UnixListener::bind(&path).unwrap());
-        let (_listener, _lock) = bind(&path).unwrap();
+        // A parallel test may have forked while the listener was open. Its
+        // CLOEXEC copy remains live briefly until that child executes.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let (_listener, _lock) = loop {
+            match bind(&path) {
+                Ok(bound) => break bound,
+                Err(error) if error.to_string().contains("is served already") && std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(error) => panic!("stale socket was not replaced: {error}"),
+            }
+        };
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
         UnixStream::connect(&path).unwrap();
     }

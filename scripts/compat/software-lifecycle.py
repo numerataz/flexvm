@@ -23,9 +23,16 @@ def exercise(args):
     deadline = time.monotonic() + args.timeout
     owners = []
 
-    def cli(*words):
+    def owner_environment():
+        env = os.environ.copy()
+        env['LD_PRELOAD'] = str(args.output / 'fail-parent-sync.so')
+        env['FLEXVM_TEST_FAIL_PARENT_SYNC'] = str(args.output / 'fail-parent-sync')
+        env['FLEXVM_TEST_KILL_PARENT_SYNC'] = str(args.output / 'kill-parent-sync')
+        return env
+
+    def cli(*words, env=None):
         result = subprocess.run([*base, *words], capture_output=True, text=True,
-                                timeout=max(.1, deadline - time.monotonic()))
+                                timeout=max(.1, deadline - time.monotonic()), env=env)
         if result.returncode:
             raise RuntimeError(f'{words}: exit {result.returncode}: {result.stdout} {result.stderr}')
         return result.stdout
@@ -34,9 +41,7 @@ def exercise(args):
         return next((e for e in json.loads(cli('ps', '--json')) if e['name'] == 'state-test'), None)
 
     def launch(*words):
-        env = os.environ.copy()
-        env['LD_PRELOAD'] = str(args.output / 'fail-parent-sync.so')
-        env['FLEXVM_TEST_FAIL_PARENT_SYNC'] = str(args.output / 'fail-parent-sync')
+        env = owner_environment()
         with (args.output / 'workload.log').open('ab') as out, (args.output / f'owner-{len(owners)}.log').open('wb') as err:
             proc = subprocess.Popen([*base, *words], stdout=out, stderr=err, env=env)
         owners.append(proc)
@@ -65,12 +70,16 @@ def exercise(args):
         raise RuntimeError('restored workload timers did not make forward progress')
 
     def engine_gone(ident):
-        try:
-            fields = Path(f'/proc/{ident["pid"]}/stat').read_text().rsplit(')', 1)[1].split()
-        except FileNotFoundError:
-            return
-        if fields[0] != 'Z' and int(fields[19]) == ident['start']:
-            raise RuntimeError('retired engine survived')
+        until = min(deadline, time.monotonic() + 5)
+        while time.monotonic() < until:
+            try:
+                fields = Path(f'/proc/{ident["pid"]}/stat').read_text().rsplit(')', 1)[1].split()
+            except FileNotFoundError:
+                return
+            if fields[0] == 'Z' or int(fields[19]) != ident['start']:
+                return
+            time.sleep(.02)
+        raise RuntimeError('retired engine survived')
 
     evidence = {'cycles': []}
     try:
@@ -146,12 +155,38 @@ def exercise(args):
         if owner.wait(timeout=10) != 0:
             raise RuntimeError('last attached owner failed to suspend')
         engine_gone(entry['backend']['process'])
-        cli('start', 'state-test')
+        cli('start', 'state-test', env=owner_environment())
         entry = live()
         after = advancing_observation()
         if not entry or after[:3] != first[:3] or after[3] < before[3] or entry['gen'] != identity:
             raise RuntimeError('detached start lost workload identity')
         evidence['detached_start'] = {'before': before, 'after': after, 'entry': entry}
+        # Kill the owner after exchange, before parent fsync/RETIRED. The new
+        # complete checkpoint must survive collection and recover on this host.
+        checkpoint = args.state / 'state' / 'suspended' / 'state-test'
+        old_snapshot = json.loads((checkpoint / 'manifest.json').read_text())['snapshot_id']
+        before = observation()
+        marker = args.output / 'kill-parent-sync'
+        marker.touch()
+        crashed = subprocess.run([*base, 'stop', 'state-test'], capture_output=True, text=True, timeout=60)
+        if crashed.returncode == 0 or marker.exists():
+            raise RuntimeError('replacement owner-death fault did not execute')
+        engine_gone(entry['backend']['process'])
+        published = json.loads((checkpoint / 'manifest.json').read_text())
+        if published['snapshot_id'] == old_snapshot or (checkpoint / 'RETIRED').exists() or (checkpoint / 'STARTED').exists():
+            raise RuntimeError('replacement crash did not leave the expected unretired publication')
+        cli('debug', 'gc')
+        if list(checkpoint.parent.glob('.software-stage-v2-*')):
+            raise RuntimeError('dead replacement owner retained hidden input bundles')
+        if json.loads((checkpoint / 'manifest.json').read_text()) != published:
+            raise RuntimeError('collection changed the last complete checkpoint')
+        cli('start', 'state-test', env=owner_environment())
+        entry = live()
+        after = advancing_observation()
+        if not entry or after[:3] != first[:3] or after[3] < before[3] or entry['gen'] != identity:
+            raise RuntimeError('commit-before-retirement recovery lost workload continuity')
+        evidence['publication_owner_death'] = {'snapshot_id': published['snapshot_id'], 'before': before, 'after': after,
+                                               'runtime_and_staging_cleanup': 'passed'}
         cli('kill', 'state-test')
         if cli('wait', 'state-test').strip() != '130':
             raise RuntimeError('detached owner lost kill status')
