@@ -249,10 +249,9 @@ and `--cmd` options apply, and the command returns its guest exit status.
 Networking uses QEMU's userspace stack with no TAP device, and fresh vsock
 backends have private Unix sockets and independent CID spaces.
 
-This is an initial foreground execution path. It does not create the persistent
-VM records used by `ps`, `exec`, background/restart policies or the Docker API.
-Elastic memory, persistent lifecycle operations, checkpoint and migration still
-need integration. QEMU's vhost-user-vsock frontend currently blocks migration;
+Unnamed software execution is a foreground command. Add `--name NAME` for
+normal VM records and local lifecycle operations, described below. Restart
+policies, elastic memory, Docker API lifecycle and migration still need integration. QEMU's vhost-user-vsock frontend currently blocks migration;
 its device state/reset contract must be implemented and tested before it can
 replace the existing Firecracker lifecycle path. ARM exposes emulated EL2, and
 x86 TCG exposes AMD SVM, for the ordinary guest Linux KVM drivers. Intel VMX is
@@ -293,9 +292,8 @@ the full agent/Docker/BuildKit acceptance case through both control paths and
 checks that user 1001 cannot read or write the serial management device.
 
 This removes the vhost-user-vsock device from that execution profile. It is a
-prerequisite for software checkpoint integration, not a claim that persistent
-VM records, checkpoint/restore or migration are implemented. Vsock remains the
-default while the serial path's lifecycle behavior is established.
+prerequisite for the local software checkpoint path described below. Vsock remains
+the default for unnamed commands; named software owners use serial control.
 
 `scripts/compat/software-kvm.py` runs real KVM clients inside an ordinary OCI
 image using the software CLI and serial agent transport. On x86 it runs all nine
@@ -333,17 +331,25 @@ foreground path. The initial unfenced owner uses generation/epoch zero;
 persistent owners must establish a nonzero FENCE first. Fenced MAINT requests
 allow clock, network and hostname setup while public admission remains closed.
 The old unversioned QUIESCE remains a filesystem sync/cache operation and cannot
-acknowledge this barrier. General mutator deduplication, persistent owner records,
-checkpoint artifacts and migration still require the lifecycle work in #1358.
+acknowledge this barrier. General mutator deduplication and migration still
+require the lifecycle work in #1358.
 
 `flexvm software --name NAME` publishes the foreground VM through the ordinary
 name lock and owner control socket. `ps`, `inspect`, argv exec (including guest
 credentials, environment and cwd), pause/unpause, `wait` and `kill` use the normal
 CLI. Records explicitly identify QEMU TCG and its real process identity and image;
 software VMs have no Firecracker template or PID. The VM still ends with its
-initial command. Background/restart policy and checkpoint/migration are pending;
-`stop` refuses unsupported suspend rather than destroying the VM as if it had
-saved state. A direct SIGTERM is also refused, while SIGINT destroys the owner.
+initial command. `stop` captures a private, verified local snapshot and reaps the
+source engine; `start` or `start -a` restores that workload in a fresh owner and
+engine. Checkpoints bind the engine, kernel, root filesystem and firmware to their
+content digests and preserve the foreground session's delivered offset. A durable
+ownership grant prevents implicit replay of a checkpoint that has already run.
+An interrupted restore after that grant remains quarantined for explicit recovery.
+Native CI checks repeated stop/start, a paused source, detached startup, RAM and
+process identity, contiguous output, corrupted-input refusal and blocked-output
+kill. Restart policies, checkpoint export/import, cross-host migration and network
+connection continuity remain pending. A direct SIGTERM is refused; use `stop` for
+suspend or `kill` for destruction. See [the lifecycle contract](software-lifecycle.md).
 
 Named software VMs use serial control and fixed RAM. The initial admission policy
 holds a full RAM grant for the VM's lifetime. This is conservative: resident RAM

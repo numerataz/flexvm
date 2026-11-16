@@ -32,10 +32,11 @@ def exercise(args):
     def live(name):
         return next((entry for entry in json.loads(cli('ps', '--json').stdout) if entry['name'] == name), None)
 
-    def start(name, ignore_interrupt=False):
+    def start(name, ignore_interrupt=False, flood=False):
         log = (args.output / (name + '.log')).open('wb')
         proc = subprocess.Popen([*base, 'software', '--name', name, '--control', 'serial', '--kernel', str(args.kernel),
-                                 '--mem', '512', str(args.output / 'image.tar')], stdout=log, stderr=subprocess.STDOUT,
+                                 '--mem', '512', str(args.output / 'image.tar'), *(['flood'] if flood else [])],
+                                stdout=subprocess.PIPE if flood else log, stderr=log,
                                 preexec_fn=(lambda: signal.signal(signal.SIGINT, signal.SIG_IGN)) if ignore_interrupt else None)
         log.close()
         try:
@@ -96,9 +97,6 @@ def exercise(args):
             cli('unpause', 'owner-test')
             if live('owner-test')['state'] != 'running':
                 raise RuntimeError('unpause did not publish verified engine state')
-        refused = cli('stop', 'owner-test', status=None)
-        if refused.returncode == 0 or 'not implemented' not in refused.stderr or owner.poll() is not None:
-            raise RuntimeError('unsupported suspend destroyed the software VM or falsely succeeded')
         owner.send_signal(signal.SIGTERM)
         time.sleep(.1)
         if owner.poll() is not None:
@@ -123,6 +121,18 @@ def exercise(args):
             engine_gone(killed_entry['backend']['process'])
         finally:
             stop(killed)
+        # An unread foreground pipe must not prevent management kill or cleanup.
+        flooded, flooded_entry = start('owner-flood', flood=True)
+        try:
+            time.sleep(1)
+            cli('kill', 'owner-flood')
+            if flooded.wait(timeout=10) != -signal.SIGINT:
+                raise RuntimeError('blocked foreground output prevented management kill')
+            engine_gone(flooded_entry['backend']['process'])
+            evidence['blocked_output_cleanup'] = 'passed'
+        finally:
+            stop(flooded)
+            flooded.stdout.close()
         # A hard owner death must also fence and terminate its actual engine.
         crashed, crash_entry = start('owner-crash')
         try:

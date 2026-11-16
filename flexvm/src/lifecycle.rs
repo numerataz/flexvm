@@ -1215,6 +1215,9 @@ pub fn describe_suspended(host: &Host, name: &str) -> Option<Value> {
         return None;
     }
     let dir = host.suspended(name).ok()?;
+    if crate::software_state::identifies(&dir) {
+        return Some(crate::software_state::describe(&dir, name).unwrap_or_else(|error| json!({"name":name,"state":"quarantined","error":error.to_string()})));
+    }
     let m = match read_manifest(&dir) {
         Ok(m) => m,
         Err(e) => return Some(json!({"name": name, "state": "suspended", "error": e.to_string()})),

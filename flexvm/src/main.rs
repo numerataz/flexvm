@@ -759,6 +759,9 @@ fn real_main(args: &Args) -> Result<()> {
         Some("run") if args.has("checkpoint") => run_checkpoint(args),
         Some("run") => run(args, name),
         Some("start") if args.has("attach") => {
+            // A restored software owner (and the ordinary VM owner) consumes
+            // these signals itself. Block before Host can start log workers.
+            util::block_signals(&[libc::SIGTSTP, libc::SIGCONT, libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGHUP]);
             // A detached start's VM process (`start -a`, answering on FLEXVM_NOTIFY_FD) must answer
             // its parent through vmproc, even if another start won meanwhile.
             let host = open_host(args)?;
@@ -768,6 +771,9 @@ fn real_main(args: &Args) -> Result<()> {
                 if !host.alive(name) && !host.suspended(name)?.exists() && !host.has_record(name, "exited") {
                     return Err(no_vm(&host, name));
                 }
+            }
+            if software_state::identifies(&host.suspended(name)?) {
+                util::exit(software::restore(host, name, notify_fd())?);
             }
             let start = rerun(&host, name)?.unwrap_or(Start::Resume { name: name.into() });
             vmproc::main(host, paths(args)?, start, notify_fd())
@@ -1599,10 +1605,18 @@ const STOP_WAIT: Duration = Duration::from_secs(600);
 /// Returns the name the VM has last (a rename as it was signalled moves it on: `restart` starts that).
 fn stop(host: &Host, name: &str) -> Result<String> {
     host::check_name(name)?;
+    if let Ok(entry) = host.entry(name) {
+        if !entry.backend.is_firecracker() {
+            software::stop(host, name, &entry.ident)?;
+            return Ok(name.into());
+        }
+    }
     // The instance signalled: its exit status tells an app that exited first (`--rm` or attached VMs leave no exited record).
     let mut vm = match Tracked::signal(host, name, libc::SIGTERM, &|entry| {
         if !entry.backend.is_firecracker() {
-            bail!("software VM suspend is not implemented yet; flexvm kill destroys it");
+            // A software owner may have become ready after the initial lookup.
+            // Complete its acknowledged stop before considering the legacy signal.
+            software::stop(host, name, &entry.ident)?;
         }
         Ok(())
     })? {
@@ -2241,7 +2255,7 @@ fn image_options(args: &Args, src: &str) -> Result<image::Options> {
 
 /// First software execution slice: reuse OCI preparation and the real agent,
 /// with engine processes owned by this foreground command. Named VMs also expose
-/// live management; durable state and migration wait for the software state/device contract.
+/// live management and local suspend/restore; migration remains separate work.
 fn software(args: &Args, src: &str) -> Result<i32> {
     if args.get("name").is_some() {
         // A shell's background SIGINT/SIGQUIT disposition must not disable the

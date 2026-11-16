@@ -470,6 +470,7 @@ struct Qmp {
 impl Qmp {
     fn connect(path: &Path, deadline: Instant) -> Result<Self> {
         let stream = loop {
+            template::interrupted()?;
             match util::connect_unix(path, remaining(deadline)?) {
                 Ok(stream) => break stream,
                 Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ECONNREFUSED)) => {
@@ -619,6 +620,39 @@ impl Machine {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    pub fn capture_pending(&self) -> bool {
+        *self.capture.lock().unwrap() != Capture::None
+    }
+
+    pub fn checkpoint(
+        &self,
+        staging: software_state::Staging,
+        destination: &Path,
+        mut manifest: software_state::Manifest,
+        previous: Option<&software_state::Consumed>,
+        deadline: Instant,
+    ) -> Result<software_state::Published> {
+        if manifest.source_owner != crate::host::Ident::me() || manifest.source_engine != self.processes.engine_ident()? {
+            bail!("software capture metadata does not identify this engine and owner");
+        }
+        self.save(&staging.state, deadline)?;
+        manifest.profile = self.profile.clone();
+        manifest.engine_version = self.engine_version.clone();
+        let inputs = self.inputs.as_ref().ok_or("software engine has no pinned inputs")?;
+        match previous {
+            Some(previous) => staging.replace(destination, inputs, manifest, previous),
+            None => staging.commit(destination, inputs, manifest),
+        }
+    }
+
+    pub fn retire(&self, published: &software_state::Published) -> Result<()> {
+        if published.manifest.source_engine != self.processes.engine_ident()? {
+            bail!("software checkpoint belongs to another engine");
+        }
+        self.processes.stop();
+        published.retire()
     }
 
     pub fn disconnect_control(&self) {
@@ -900,8 +934,18 @@ mod tests {
             format: 1,
             backend: "qemu-tcg".into(),
             vm_id: util::random_hex(16).unwrap(),
+            snapshot_id: util::random_hex(16).unwrap(),
+            identity_generation: 1,
+            memory_mib: 512,
+            vcpus: 1,
+            paused: false,
+            terminal: true,
+            host_id: "00000000000000000000000000000000".into(),
+            source_owner: crate::host::Ident::me(),
+            source_engine: source.engine_ident().unwrap(),
             owner_generation: 1,
             saved_epoch: 42,
+            barrier_generation: 1,
             barrier_sequence: 1,
             profile: machine.profile.clone(),
             engine_version: machine.engine_version.clone(),
@@ -914,9 +958,10 @@ mod tests {
             image: meta,
         };
         let checkpoint = dir.join("checkpoint");
-        staging.commit(&checkpoint, machine.inputs.as_ref().unwrap(), manifest).unwrap();
+        let published = staging.commit(&checkpoint, machine.inputs.as_ref().unwrap(), manifest).unwrap();
         let old_engine = source.engine_ident().unwrap();
         source.stop();
+        published.retire().unwrap();
         drop(machine);
         assert!(!old_engine.alive());
         let verified = software_state::open(&checkpoint, &config.profile().unwrap()).unwrap();
