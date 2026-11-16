@@ -14,6 +14,9 @@ use crate::util::Result;
 use crate::{bail, util};
 
 const MAX_MANIFEST: u64 = 8 << 20;
+// Earlier writers did not take directory leases. Never sweep their names.
+const STAGING_PREFIX: &str = ".software-stage-v2-";
+const RECORD_PREFIX: &str = ".software-record-v2-";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -329,6 +332,7 @@ pub fn metadata(path: &Path) -> Result<Manifest> {
 
 pub fn open(path: &Path, profile: &Profile) -> Result<Verified> {
     let dir = private_directory(path)?;
+    crate::host::flock(&dir, libc::LOCK_SH)?;
     let manifest = read_manifest(&dir)?;
     if manifest.profile != *profile {
         bail!("software state execution profile does not match");
@@ -367,9 +371,29 @@ fn record<T: serde::de::DeserializeOwned>(dir: &File, name: &str) -> Result<T> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
+fn parent_lock(directory: &File, how: i32) -> std::io::Result<crate::host::HeldLock> {
+    crate::host::lock_at(crate::host::host_locks()?, &crate::host::keyed("software-parent", &util::fstat(directory.as_raw_fd())?, ""), how)
+}
+
+fn record_key(directory: &File) -> std::io::Result<String> {
+    Ok(crate::host::keyed("software-record", &util::fstat(directory.as_raw_fd())?, ""))
+}
+
+fn records_exclusive(directory: &File) -> std::io::Result<Option<crate::host::HeldLock>> {
+    match crate::host::host_locks().and_then(|locks| crate::host::try_lock_at(locks, &record_key(directory)?)) {
+        // Readers of another user's or a read-only host cannot collect its debris.
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Ok(None),
+        result => result,
+    }
+}
+
 fn write_record(dir: &File, name: &str, bytes: &[u8], replace: bool) -> Result<()> {
     let parent = crate::host::fd_path(dir.as_raw_fd());
-    let temporary = parent.join(format!(".record-{}", util::random_hex(16)?));
+    // The state root is publicly readable: exclusion belongs in private host
+    // locks, where an unprivileged reader cannot block a writer by flocking it.
+    let locks = crate::host::host_locks()?;
+    let _writing = crate::host::shared_at(&locks, &record_key(dir)?)?;
+    let temporary = parent.join(format!("{RECORD_PREFIX}{}", util::random_hex(16)?));
     let result = (|| {
         let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&temporary)?;
         file.write_all(bytes)?;
@@ -547,6 +571,8 @@ impl Drop for Consumed {
         }
         let Ok(pinned) = self.directory.metadata() else { return };
         for (parent, name) in self.replaced.get_mut().unwrap().drain(..) {
+            let Ok(_removing) = parent_lock(&parent, libc::LOCK_EX) else { continue };
+            let Ok(Some(_records)) = records_exclusive(&self.directory) else { continue };
             let path = crate::host::fd_path(parent.as_raw_fd()).join(name);
             if private_directory(&path)
                 .and_then(|dir| Ok(dir.metadata()?))
@@ -626,12 +652,18 @@ pub fn remove_discarded(path: &Path, vm_id: &str) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
+    let parent = parent_directory(path.parent().ok_or("software checkpoint has no parent")?)?;
+    let _removing = parent_lock(&parent, libc::LOCK_EX)?;
+    if !path.exists() {
+        return Ok(());
+    }
     let dir = private_directory(path)?;
     if present(&dir, "DISCARDED")? {
         let manifest = read_manifest(&dir)?;
         if manifest.vm_id != vm_id || manifest.source_owner != crate::host::Ident::me() {
             bail!("discarded software checkpoint belongs to another owner");
         }
+        let Some(_records) = records_exclusive(&dir)? else { bail!("software checkpoint journal is busy") };
         fs::remove_dir_all(path)?;
         util::sync_dir(path.parent().ok_or("software checkpoint has no parent")?)?;
     }
@@ -700,21 +732,29 @@ pub struct Staging {
     pub state: File,
     committed: bool,
     parent: File,
+    directory: File,
 }
 
 impl Staging {
     pub fn new(parent: &Path) -> Result<Self> {
         let parent = parent_directory(parent)?;
-        let path = crate::host::fd_path(parent.as_raw_fd()).join(format!(".software-stage-{}", util::random_hex(16)?));
+        // The parent lock closes the mkdir-before-lease window with a sweep.
+        let creating = parent_lock(&parent, libc::LOCK_EX)?;
+        let path = crate::host::fd_path(parent.as_raw_fd()).join(format!("{STAGING_PREFIX}{}", util::random_hex(16)?));
         fs::DirBuilder::new().mode(0o700).create(&path)?;
+        let directory = private_directory(&path)?;
+        crate::host::flock(&directory, libc::LOCK_SH)?;
+        drop(creating);
         let state = match OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(path.join("state")) {
             Ok(state) => state,
             Err(error) => {
-                let _ = fs::remove_dir(&path);
+                if let Ok(_removing) = parent_lock(&parent, libc::LOCK_EX) {
+                    let _ = fs::remove_dir(&path);
+                }
                 return Err(error.into());
             }
         };
-        Ok(Self { path, state, committed: false, parent })
+        Ok(Self { path, state, committed: false, parent, directory })
     }
 
     pub fn commit(self, destination: &Path, inputs: &Inputs, manifest: Manifest) -> Result<Published> {
@@ -751,7 +791,7 @@ impl Staging {
         manifest.state = Input::read(self.state.try_clone()?, None)?.artifact;
         self.state.set_permissions(fs::Permissions::from_mode(0o400))?;
         self.state.sync_all()?;
-        let directory = private_directory(&self.path)?;
+        let directory = self.directory.try_clone()?;
         write_record(&directory, "SOFTWARE", b"flexvm-qemu-state-1\n", false)?;
         write_record(&directory, "OWNER", &serde_json::to_vec(&manifest.source_owner)?, false)?;
         let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600).open(self.path.join("manifest.json"))?;
@@ -765,6 +805,10 @@ impl Staging {
         file.sync_all()?;
         util::sync_dir(&self.path)?;
         let cleanup_parent = previous.map(|_| self.parent.try_clone()).transpose()?;
+        let _publishing = parent_lock(&self.parent, libc::LOCK_EX)?;
+        if let Some(previous) = previous {
+            previous.check_replacement(&target, &manifest)?;
+        }
         if previous.is_some() {
             let (from, to) = (util::cpath(&self.path)?, util::cpath(&target)?);
             if unsafe { libc::renameat2(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), libc::RENAME_EXCHANGE) } < 0 {
@@ -787,9 +831,102 @@ impl Staging {
 impl Drop for Staging {
     fn drop(&mut self) {
         if !self.committed {
-            let _ = fs::remove_dir_all(&self.path);
+            if let Ok(_removing) = parent_lock(&self.parent, libc::LOCK_EX) {
+                if let Ok(Some(_records)) = records_exclusive(&self.directory) {
+                    let _ = fs::remove_dir_all(&self.path);
+                }
+            }
         }
     }
+}
+
+/// Only versioned debris participates: old writers and public checkpoints are
+/// preserved. Locks are inode-based, so exchange publication cannot lose a lease.
+pub fn sweep(state: &Path) -> Result<()> {
+    sweep_directory(state, false)?;
+    let suspended = state.join("suspended");
+    if suspended.exists() {
+        sweep_directory(&suspended, true)?;
+    }
+    Ok(())
+}
+
+fn debris_name(name: &std::ffi::OsStr, prefix: &str) -> bool {
+    name.to_str()
+        .and_then(|name| name.strip_prefix(prefix))
+        .is_some_and(|nonce| nonce.len() == 32 && nonce.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+}
+
+fn sweep_records(directory: &File) -> Result<()> {
+    let mut removed = false;
+    for entry in fs::read_dir(crate::host::fd_path(directory.as_raw_fd()))? {
+        let entry = entry?;
+        if debris_name(&entry.file_name(), RECORD_PREFIX) && entry.file_type()?.is_file() {
+            fs::remove_file(entry.path())?;
+            removed = true;
+        }
+    }
+    if removed {
+        directory.sync_all()?;
+    }
+    Ok(())
+}
+
+fn sweep_directory(path: &Path, stages: bool) -> Result<()> {
+    if fs::symlink_metadata(path)?.uid() != unsafe { libc::geteuid() } {
+        return Ok(());
+    }
+    let parent = parent_directory(path)?;
+    if !stages {
+        if let Some(_records) = records_exclusive(&parent)? {
+            sweep_records(&parent)?;
+        }
+        return Ok(());
+    }
+    let _sweeping = match parent_lock(&parent, libc::LOCK_EX | libc::LOCK_NB) {
+        Ok(lock) => lock,
+        Err(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::PermissionDenied) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    if let Some(_records) = records_exclusive(&parent)? {
+        sweep_records(&parent)?;
+    }
+    for entry in fs::read_dir(crate::host::fd_path(parent.as_raw_fd()))? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let Ok(directory) = private_directory(&entry.path()) else { continue };
+        sweep_entry(&directory, &entry.path(), debris_name(&entry.file_name(), STAGING_PREFIX))?;
+    }
+    Ok(())
+}
+
+fn sweep_entry(directory: &File, path: &Path, staging: bool) -> Result<()> {
+    if crate::host::flock(directory, libc::LOCK_EX | libc::LOCK_NB).is_err() {
+        return Ok(());
+    }
+    let pinned = directory.metadata()?;
+    if !fs::symlink_metadata(path).is_ok_and(|selected| selected.is_dir() && (selected.dev(), selected.ino()) == (pinned.dev(), pinned.ino())) {
+        return Ok(());
+    }
+    let Some(_records) = records_exclusive(directory)? else { return Ok(()) };
+    if staging {
+        // Owner death releases its lease before PDEATHSIG finishes killing the
+        // engine. An exchanged input bundle stays until that exact engine exits.
+        if present(directory, "STARTED")? {
+            let Ok(grant) = record::<Grant>(directory, "STARTED") else { return Ok(()) };
+            if !matches!(crate::host::PidFd::open(&grant.engine), Ok(None)) {
+                return Ok(());
+            }
+        }
+        fs::remove_dir_all(path)?;
+        util::sync_dir(path.parent().ok_or("software staging has no parent")?)?;
+    } else if present(directory, "SOFTWARE")? {
+        // Canonical checkpoint and quarantine retain all committed authority.
+        sweep_records(directory)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1011,6 +1148,166 @@ mod tests {
         fs::write(&file, serde_json::to_vec(&changed).unwrap()).unwrap();
         fs::set_permissions(&file, fs::Permissions::from_mode(0o400)).unwrap();
         assert!(open(&path, &profile).err().unwrap().to_string().contains("unsupported software state"));
+    }
+
+    #[test]
+    fn a_sweeper_opened_before_exchange_cannot_remove_the_new_input_inode() {
+        let root = TempDir::new("software-sweep-exchange-race");
+        let stage = root.join(format!("{STAGING_PREFIX}{}", "d".repeat(32)));
+        let canonical = root.join("checkpoint");
+        for path in [&stage, &canonical] {
+            fs::DirBuilder::new().mode(0o700).create(path).unwrap();
+        }
+        fs::write(canonical.join("live-input"), b"must remain linked").unwrap();
+        let stale = private_directory(&stage).unwrap();
+        let (from, to) = (util::cpath(&stage).unwrap(), util::cpath(&canonical).unwrap());
+        assert_eq!(unsafe { libc::renameat2(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), libc::RENAME_EXCHANGE) }, 0);
+        // The sweeper's fd pins the newly published bundle, but its old path
+        // names the consumed inputs. Locking that fd cannot authorize deletion.
+        sweep_entry(&stale, &stage, true).unwrap();
+        assert_eq!(fs::read(stage.join("live-input")).unwrap(), b"must remain linked");
+        assert!(canonical.exists());
+        // Concurrent orderly removal is also benign, never a collection error.
+        fs::remove_dir_all(&stage).unwrap();
+        sweep_entry(&stale, &stage, true).unwrap();
+    }
+
+    #[test]
+    fn public_directory_flocks_cannot_block_software_identity_writes() {
+        const CHILD: &str = "FLEXVM_TEST_SOFTWARE_PUBLIC_LOCK";
+        if let Some(root) = std::env::var_os(CHILD) {
+            host_id(Path::new(&root)).unwrap();
+            return;
+        }
+        let root = TempDir::new("software-public-lock");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let public = File::open(&root).unwrap();
+        crate::host::flock(&public, libc::LOCK_EX).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "software_state::tests::public_directory_flocks_cannot_block_software_identity_writes"])
+            .env(CHILD, &*root)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("a public directory flock blocked an identity writer");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        sweep(&root).unwrap();
+        assert!(root.join(".software-host-id").exists());
+    }
+
+    #[test]
+    fn sweeping_preserves_live_staging_and_reclaims_a_killed_writer() {
+        const CHILD: &str = "FLEXVM_TEST_SOFTWARE_STAGE_DEATH";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let staging = Staging::new(Path::new(&root)).unwrap();
+            fs::write(staging.path.join("partial-copy"), b"unfinished").unwrap();
+            // No Rust destructors: exercise the directory lease's kernel lifetime.
+            unsafe { libc::raise(libc::SIGKILL) };
+            unreachable!();
+        }
+        let root = TempDir::new("software-stage-death");
+        let suspended = root.join("suspended");
+        fs::DirBuilder::new().mode(0o700).create(&suspended).unwrap();
+        let live = Staging::new(&suspended).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "software_state::tests::sweeping_preserves_live_staging_and_reclaims_a_killed_writer"])
+            .env(CHILD, &suspended)
+            .status()
+            .unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert_eq!(fs::read_dir(&suspended).unwrap().count(), 2);
+        sweep(&root).unwrap();
+        assert!(live.path.join("state").exists(), "a live capture lost its output");
+        assert_eq!(fs::read_dir(&suspended).unwrap().count(), 1, "killed writer's partial copy was not reclaimed");
+    }
+
+    #[test]
+    fn sweeping_never_removes_legacy_unknown_or_symlinked_staging() {
+        let root = TempDir::new("software-stage-unknown");
+        let suspended = root.join("suspended");
+        fs::DirBuilder::new().mode(0o700).create(&suspended).unwrap();
+        for name in [".software-stage-0123456789abcdef0123456789abcdef", ".software-stage-v2-unrecognized", "ordinary"] {
+            fs::create_dir(suspended.join(name)).unwrap();
+        }
+        let outside = root.join("outside");
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, suspended.join(format!("{STAGING_PREFIX}{}", "a".repeat(32)))).unwrap();
+        sweep(&root).unwrap();
+        assert_eq!(fs::read_dir(suspended).unwrap().count(), 4);
+        assert!(outside.exists());
+    }
+
+    #[test]
+    fn record_sweeping_waits_for_the_whole_consumed_input_lifetime_and_preserves_quarantine() {
+        let root = TempDir::new("software-record-sweep");
+        let suspended = root.join("suspended");
+        fs::DirBuilder::new().mode(0o700).create(&suspended).unwrap();
+        let (path, profile) = checkpoint(&suspended);
+        let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let name = host.take_name("vm", false).unwrap();
+        let verified = open(&path, &profile).unwrap();
+        let local_host = verified.manifest.host_id.clone();
+        let prepared = verified.prepare(&name, &local_host).unwrap();
+        let temporary = path.join(format!("{RECORD_PREFIX}{}", "b".repeat(32)));
+        fs::write(&temporary, b"interrupted journal write").unwrap();
+        drop(verified);
+        sweep(&root).unwrap();
+        assert!(temporary.exists(), "preparation must retain the bundle lease");
+        let consumed = prepared.grant(crate::host::Ident::me()).unwrap();
+        sweep(&root).unwrap();
+        assert!(temporary.exists(), "execution must retain the bundle lease");
+        let manifest = fs::read(path.join("manifest.json")).unwrap();
+        let grant = fs::read(path.join("STARTED")).unwrap();
+        drop(consumed);
+        sweep(&root).unwrap();
+        assert!(!temporary.exists());
+        assert_eq!(fs::read(path.join("manifest.json")).unwrap(), manifest);
+        assert_eq!(fs::read(path.join("STARTED")).unwrap(), grant);
+        assert!(open(&path, &profile).unwrap().prepare(&name, &local_host).err().unwrap().to_string().contains("already granted"));
+    }
+
+    #[test]
+    fn exchanged_inputs_wait_for_the_recorded_engine_even_after_the_lease_is_lost() {
+        let root = TempDir::new("software-exchanged-sweep");
+        let suspended = root.join("suspended");
+        fs::DirBuilder::new().mode(0o700).create(&suspended).unwrap();
+        let (path, profile) = checkpoint(&suspended);
+        let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let name = host.take_name("vm", false).unwrap();
+        let verified = open(&path, &profile).unwrap();
+        let consumed = verified.prepare(&name, &verified.manifest.host_id).unwrap().grant(crate::host::Ident::me()).unwrap();
+        let hidden = suspended.join(format!("{STAGING_PREFIX}{}", "c".repeat(32)));
+        fs::rename(&path, &hidden).unwrap();
+        drop(verified);
+        drop(consumed);
+        sweep(&root).unwrap();
+        assert!(hidden.join("kernel").exists(), "engine still uses the hidden inputs");
+        let dir = private_directory(&hidden).unwrap();
+        let mut grant: Grant = record(&dir, "STARTED").unwrap();
+        write_record(&dir, "STARTED", b"partial grant", true).unwrap();
+        sweep(&root).unwrap();
+        assert!(hidden.exists(), "unreadable execution identity must be preserved");
+        let engine = grant.engine.clone();
+        grant.engine.pid = 0; // pidfd_open(EINVAL): not proof of death.
+        write_record(&dir, "STARTED", &serde_json::to_vec(&grant).unwrap(), true).unwrap();
+        sweep(&root).unwrap();
+        assert!(hidden.exists(), "an indeterminate engine must be preserved");
+        grant.engine = engine;
+        grant.engine.start += 1; // A reused PID is not the recorded engine.
+        write_record(&dir, "STARTED", &serde_json::to_vec(&grant).unwrap(), true).unwrap();
+        sweep(&root).unwrap();
+        assert!(!hidden.exists());
     }
 
     #[test]
