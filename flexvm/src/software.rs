@@ -436,7 +436,10 @@ impl Owner {
         if let Some((end, code)) = late {
             // The guest may have stopped waiting for an acknowledgment while a
             // slow client drained output. RELEASE checks delivery/attachment state.
-            let _ = self.machine.message(&format!("RELEASE {id} {end} {code}"), Instant::now() + guest::TIMEOUT);
+            let _op = self.op.read().unwrap();
+            if !self.ended.load(Ordering::SeqCst) && self.entry.lock().unwrap().state == "running" {
+                let _ = self.machine.message(&format!("RELEASE {id} {end} {code}"), Instant::now() + guest::TIMEOUT);
+            }
         }
         Ok(())
     }
