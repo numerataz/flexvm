@@ -1623,7 +1623,12 @@ fn stop(host: &Host, name: &str) -> Result<String> {
         Some(vm) => vm,
         // A stopped VM's checkpoint, not debris (a consumed or discarded one) under its name.
         // An exited one whose restart policy would run it again is not (docker's stop ends a restart loop).
-        None if host.is_suspended(name) || host.has_record(name, "exited") => {
+        None if host.is_suspended(name)
+            || host.has_record(name, "exited")
+            || (containers::exit_record(host, name).is_some_and(|exit| exit.app == Some(true))
+                && !host.has_record(name, "failed")
+                && !host.has_record(name, "lost")) =>
+        {
             restart::cancel(host, name)?;
             return Ok(name.into());
         }
@@ -2296,6 +2301,9 @@ fn software(args: &Args, src: &str) -> Result<i32> {
     util::on_signal(signals, move |sig| {
         template::interrupt(sig);
         stopping.stop();
+        loop {
+            std::thread::park();
+        }
     });
     let mut opts = image_options(args, src)?;
     if !args.rest.is_empty() {
@@ -2316,6 +2324,7 @@ fn software(args: &Args, src: &str) -> Result<i32> {
         .transpose()?;
     let _reservation = named.as_ref().map(|(host, _)| software::Reservation::new(host, config.mem_mib, Instant::now() + config.boot_timeout)).transpose()?;
     let machine = config.boot(&rootfs, processes.clone())?;
+    drop(_cache_lock);
     if let Some((host, lock)) = named {
         return software::run(host, lock, machine, processes, &config, &meta);
     }

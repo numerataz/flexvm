@@ -3183,6 +3183,24 @@ pub mod output {
         }
     }
 
+    /// Synchronous managed-log output: acknowledge only after the bounded log
+    /// accepts the bytes, without an intermediate relay queue.
+    pub struct CappedWriter(Log);
+
+    pub fn capped_writer(file: &File) -> Option<CappedWriter> {
+        capped(file).map(CappedWriter)
+    }
+
+    impl CappedWriter {
+        pub fn write(&self, bytes: &[u8]) -> std::io::Result<()> {
+            if self.0.append(bytes) {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("managed log write failed"))
+            }
+        }
+    }
+
     /// `dir`, a directory (never through a link), opened to work in.
     pub fn open_dir(dir: &Path) -> std::io::Result<File> {
         File::options().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(dir)

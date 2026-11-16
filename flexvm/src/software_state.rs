@@ -81,8 +81,10 @@ impl Manifest {
         {
             bail!("software state has invalid ownership, session or barrier identity");
         }
-        if [&self.engine, &self.kernel, &self.rootfs, &self.state].iter().any(|artifact| artifact.bytes == 0) {
-            bail!("software state has an empty artifact");
+        if [&self.engine, &self.kernel, &self.rootfs, &self.state].into_iter().chain(self.firmware.values()).any(|artifact| {
+            artifact.bytes == 0 || artifact.sha256.len() != 64 || !artifact.sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        }) {
+            bail!("software state has an empty artifact or invalid content digest");
         }
         Ok(())
     }
@@ -558,6 +560,28 @@ impl Drop for Consumed {
 }
 
 impl Consumed {
+    /// An orderly workload exit or explicit kill must not masquerade as a
+    /// failed restore. Invalidate only this owner's still-selected input bundle.
+    pub fn finish(&self, path: &Path) -> Result<()> {
+        if self.grant.owner != crate::host::Ident::me() || crate::host::PidFd::open(&self.grant.engine)?.is_some() {
+            bail!("software execution has not retired");
+        }
+        if !path.exists() {
+            return Ok(());
+        }
+        let (selected, pinned) = (private_directory(path)?.metadata()?, self.directory.metadata()?);
+        if (selected.dev(), selected.ino()) != (pinned.dev(), pinned.ino()) {
+            return Ok(());
+        }
+        if record::<Grant>(&self.directory, "STARTED")? != self.grant {
+            bail!("software execution grant changed before termination");
+        }
+        if !present(&self.directory, "DISCARDED")? {
+            write_record(&self.directory, "DISCARDED", b"discarded\n", false)?;
+        }
+        Ok(())
+    }
+
     fn check_replacement(&self, path: &Path, new: &Manifest) -> Result<()> {
         let target = private_directory(path)?;
         let (selected, pinned) = (target.metadata()?, self.directory.metadata()?);
@@ -572,6 +596,20 @@ impl Consumed {
             bail!("software checkpoint replacement does not belong to this live owner");
         }
         Ok(())
+    }
+}
+
+pub fn owner(path: &Path) -> Result<crate::host::Ident> {
+    let dir = private_directory(path)?;
+    let manifest = read_manifest(&dir)?;
+    if present(&dir, "STARTED")? {
+        let grant: Grant = record(&dir, "STARTED")?;
+        if grant.manifest_sha256 != Retirement::of(&manifest)?.manifest_sha256 || grant.snapshot_id != manifest.snapshot_id {
+            bail!("software execution grant does not match its checkpoint");
+        }
+        Ok(grant.owner)
+    } else {
+        Ok(manifest.source_owner)
     }
 }
 
@@ -608,6 +646,9 @@ pub fn discard_attempt(path: &Path, snapshot_id: &str) -> Result<()> {
     let dir = private_directory(path)?;
     let manifest = read_manifest(&dir)?;
     if manifest.snapshot_id != snapshot_id {
+        if manifest.source_owner == crate::host::Ident::me() && !present(&dir, "STARTED")? && !present(&dir, "RETIRED")? {
+            bail!("software rollback does not identify the published capture");
+        }
         return Ok(());
     }
     if manifest.source_owner != crate::host::Ident::me() || present(&dir, "STARTED")? || present(&dir, "RETIRED")? {
@@ -893,6 +934,8 @@ mod tests {
         // A publication can succeed before retirement fails. Rollback must
         // invalidate that new snapshot, and a later capture can fill the empty
         // slot without trying to exchange the now-removed consumed bundle.
+        assert!(discard_attempt(&path, "wrong-attempt").is_err(), "a different unretired publication cannot authorize rollback");
+        assert!(!path.join("DISCARDED").exists());
         discard_attempt(&path, &new.manifest.snapshot_id).unwrap();
         remove_discarded(&path, &new.manifest.vm_id).unwrap();
         assert!(!path.exists());

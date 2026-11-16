@@ -45,6 +45,7 @@ pub struct Processes(Mutex<Vec<Process>>);
 
 struct Process {
     child: Child,
+    ident: Option<crate::host::Ident>,
     logging: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -112,7 +113,9 @@ impl Processes {
         let child = util::unblock_signals_in(cmd).spawn();
         // The command must not keep the pipe open after the engine exits.
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
-        let mut process = Process { child: child?, logging: None };
+        let child = child?;
+        let ident = crate::host::Ident::of(child.id());
+        let mut process = Process { child, ident, logging: None };
         let log = log.to_path_buf();
         process.logging = Some(std::thread::Builder::new().spawn(move || {
             let mut buf = [0; 64 << 10];
@@ -131,10 +134,17 @@ impl Processes {
         Ok(())
     }
 
-    pub fn engine_ident(&self) -> Result<crate::host::Ident> {
+    fn recorded_engine(&self) -> Result<crate::host::Ident> {
         let children = self.0.lock().unwrap();
-        let child = children.last().ok_or("software engine is not running")?;
-        crate::host::Ident::of(child.child.id()).ok_or_else(|| "cannot identify software engine process".into())
+        children.last().and_then(|child| child.ident.clone()).ok_or_else(|| "cannot identify software engine process".into())
+    }
+
+    pub fn engine_ident(&self) -> Result<crate::host::Ident> {
+        let ident = self.recorded_engine()?;
+        if crate::host::PidFd::open(&ident)?.is_none() {
+            bail!("software engine has exited");
+        }
+        Ok(ident)
     }
 
     pub fn alive(&self) -> Result<()> {
@@ -299,7 +309,10 @@ impl Config {
         if self.profile()? != verified.manifest.profile {
             bail!("software restore configuration changed after artifact validation");
         }
-        self.launch(verified.inputs, processes, Some((&verified.state.file, &verified.manifest.engine_version)))
+        verified.state.unchanged()?;
+        let machine = self.launch(verified.inputs, processes, Some((&verified.state.file, &verified.manifest.engine_version)))?;
+        verified.state.unchanged()?;
+        Ok(machine)
     }
 
     fn launch(&self, inputs: software_state::Inputs, processes: Arc<Processes>, incoming: Option<(&File, &Value)>) -> Result<Machine> {
@@ -694,8 +707,18 @@ impl Machine {
         let expected = format!("flexvm-init: serial control ready barrier {generation} {sequence}");
         loop {
             self.processes.alive()?;
-            remaining(deadline)?;
-            if fs::read_to_string(self.logs.join("qemu.log"))?.lines().any(|line| line.trim_end() == expected) {
+            if remaining(deadline).is_err() {
+                bail!("software serial transport did not acknowledge barrier {generation}/{sequence} reset\n{}", self.diagnostics());
+            }
+            let mut console = Vec::new();
+            for name in ["qemu.log.1", "qemu.log"] {
+                match fs::read(self.logs.join(name)) {
+                    Ok(bytes) => console.extend(bytes),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if String::from_utf8_lossy(&console).lines().any(|line| line.trim_end() == expected) {
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -1118,6 +1141,18 @@ mod tests {
             transport: Control::Vsock,
             control: Mutex::new(None),
         }
+    }
+
+    #[test]
+    fn transport_reset_handles_rotated_split_and_non_utf8_console_lines() {
+        let machine = machine();
+        fs::write(machine.logs.join("qemu.log.1"), b"\xff\nflexvm-init: serial control ready barrier 8 ").unwrap();
+        fs::write(machine.logs.join("qemu.log"), b"3\r\n").unwrap();
+        machine.wait_control_reset(8, 3, Instant::now() + Duration::from_secs(1)).unwrap();
+        fs::write(machine.logs.join("qemu.log.1"), b"\xff\nflexvm-init: serial control ready barrier 8 3\n").unwrap();
+        fs::remove_file(machine.logs.join("qemu.log")).unwrap();
+        machine.wait_control_reset(8, 3, Instant::now() + Duration::from_secs(1)).unwrap();
+        assert!(machine.wait_control_reset(8, 4, Instant::now() + Duration::from_millis(20)).is_err(), "an earlier barrier cannot acknowledge the next reset");
     }
 
     #[test]

@@ -76,6 +76,9 @@ def exercise(args):
                 refused = subprocess.run([*base, 'stop', 'state-test'], capture_output=True, text=True, timeout=60)
                 if refused.returncode == 0 or marker.exists() or live()['state'] != 'paused':
                     raise RuntimeError(f'publication fault was not fenced: {refused}')
+                retried = subprocess.run([*base, 'stop', 'state-test'], capture_output=True, text=True, timeout=10)
+                if retried.returncode == 0 or 'unresolved' not in retried.stderr:
+                    raise RuntimeError('retried stop overwrote the pending capture identity')
                 cli('unpause', 'state-test')
                 rolled_back = observation()
                 if rolled_back[:3] != first[:3] or rolled_back[3] < before[3]:
@@ -130,6 +133,9 @@ def exercise(args):
         if cli('wait', 'state-test').strip() != '130':
             raise RuntimeError('detached owner lost kill status')
         engine_gone(entry['backend']['process'])
+        ended = next((e for e in json.loads(cli('ps', '-a', '--json')) if e['name'] == 'state-test'), None)
+        if ended and ended['state'] == 'quarantined':
+            raise RuntimeError('explicit kill retained a replay-quarantined checkpoint')
         lines = (args.output / 'workload.log').read_text().splitlines()
         ticks = [int(line.split()[1]) for line in lines if line.startswith('STATE_TICK ')]
         if lines.count('STATE_WORKLOAD_BOOT') != 1 or not ticks or ticks != list(range(ticks[-1] + 1)):

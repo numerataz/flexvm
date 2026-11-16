@@ -49,6 +49,7 @@ struct OutputTarget {
     file: std::fs::File,
     socket: bool,
     regular: bool,
+    capped: Option<util::output::CappedWriter>,
 }
 
 impl OutputTarget {
@@ -64,10 +65,14 @@ impl OutputTarget {
         if !regular && !socket && flags & libc::O_NONBLOCK == 0 {
             bail!("foreground output cannot be made interruptible");
         }
-        Ok(Self { file, socket, regular })
+        let capped = util::output::capped_writer(&file);
+        Ok(Self { file, socket, regular, capped })
     }
 
     fn write(&self, mut bytes: &[u8]) -> Result<()> {
+        if let Some(capped) = &self.capped {
+            return capped.write(bytes).map_err(Into::into);
+        }
         while !bytes.is_empty() {
             crate::template::interrupted()?;
             let fd = self.file.as_raw_fd();
@@ -151,6 +156,11 @@ impl Owner {
 
     fn switch(&self, paused: bool) -> Result<Value> {
         let _op = self.op.write().unwrap();
+        self.switch_locked(paused)
+    }
+
+    // Caller holds the operation write lock through its entire transition.
+    fn switch_locked(&self, paused: bool) -> Result<Value> {
         self.processes.alive()?;
         if self.ended.load(Ordering::SeqCst) {
             bail!("software VM is ending");
@@ -201,6 +211,7 @@ impl Owner {
                     }
                     self.machine.resume_admission(self.generation, self.epoch, saved_generation, sequence, deadline)?;
                     *self.barrier.lock().unwrap() = None;
+                    *self.pending.lock().unwrap() = None;
                     Ok(())
                 })()
             };
@@ -292,6 +303,7 @@ impl Owner {
                 guest::untimed(&reader)?;
                 reader.get_ref().set_read_timeout(Some(Duration::from_millis(250)))?;
                 handled_reset = reset;
+                self.machine.exec_started(&mut reader, &self.main_id)?;
                 // Mark reading before releasing admission's read guard. A new
                 // pause must wait for this attachment's final delivered offset.
                 self.drain.store(READING, Ordering::SeqCst);
@@ -305,9 +317,12 @@ impl Owner {
         if !self.reset_capable {
             bail!("software suspend requires a current serial guest agent");
         }
-        let was_paused = self.entry.lock().unwrap().state == "paused";
-        self.switch(true)?;
         let _op = self.op.write().unwrap();
+        if self.machine.capture_pending() || self.pending.lock().unwrap().is_some() {
+            bail!("software capture is unresolved; unpause to discard the failed attempt before retrying stop");
+        }
+        let was_paused = self.entry.lock().unwrap().state == "paused";
+        self.switch_locked(true)?;
         if self.ended.load(Ordering::SeqCst) {
             bail!("software VM is ending");
         }
@@ -322,8 +337,8 @@ impl Owner {
         software_state::remove_discarded(&checkpoint, &self.vm_id)?;
         let snapshot_id = util::random_hex(16)?;
         *self.pending.lock().unwrap() = Some((checkpoint.clone(), snapshot_id.clone()));
-        self.publish_state("suspending")?;
         let result = (|| {
+            self.publish_state("suspending")?;
             let staging = software_state::Staging::new(checkpoint.parent().ok_or("software checkpoint has no parent")?)?;
             let blank = software_state::Artifact { bytes: 0, sha256: String::new() };
             let entry = self.entry.lock().unwrap().clone();
@@ -495,11 +510,23 @@ fn send_notification(file: &std::fs::File, value: &Value) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
+struct Startup(Arc<Mutex<Option<std::fs::File>>>);
+
+impl Startup {
+    fn send(&self, value: &Value) -> Result<()> {
+        match self.0.lock().unwrap().take() {
+            Some(file) => send_notification(&file, value),
+            None => Ok(()),
+        }
+    }
+}
+
 struct Resume {
     manifest: software_state::Manifest,
     generation: u64,
     consumed: software_state::Consumed,
-    notify: Option<std::fs::File>,
+    notify: Option<Startup>,
 }
 
 pub fn run(host: Host, name: NameLock, machine: qemu::Machine, processes: Arc<qemu::Processes>, config: &qemu::Config, meta: &image::ImageMeta) -> Result<i32> {
@@ -518,7 +545,7 @@ fn serve(
     let machine = Arc::new(machine);
     let epoch = u64::from_str_radix(&util::random_hex(8)?, 16)?;
     let deadline = Instant::now() + guest::TIMEOUT;
-    let (generation, identity_generation, vm_id, main_id, main_reader, offset, claim, consumed, mut notify) = match resumed {
+    let (generation, identity_generation, vm_id, main_id, main_reader, offset, claim, consumed, notify) = match resumed {
         Some(resumed) => {
             // STARTED was synchronized before this first guest instruction.
             // As with the ordinary start command, execution resumes even when
@@ -661,18 +688,18 @@ fn serve(
         let entry = owner.entry.lock().unwrap().clone();
         owner.name.publish(&entry)
     };
-    if published.is_ok() {
-        if let Some(file) = notify.as_mut() {
-            let _ = send_notification(file, &json!({"ok":true,"result":owner.name.name}));
+    let result = published.and_then(|()| {
+        if let Some(notify) = notify {
+            notify.send(&json!({"ok":true,"result":owner.name.name}))?;
         }
-    }
-    let result = published.and_then(|()| owner.main_output(main_reader));
+        owner.main_output(main_reader)
+    });
     owner.ended.store(true, Ordering::SeqCst);
     {
         let _op = owner.op.write().unwrap();
-        owner.entry.lock().unwrap().state = "ending".into();
-        let entry = owner.entry.lock().unwrap().clone();
-        let _ = owner.name.publish(&entry);
+        if !owner.suspended.load(Ordering::SeqCst) {
+            let _ = owner.publish_state("ending");
+        }
         owner.processes.stop();
     }
     let _ = signals.join();
@@ -684,22 +711,29 @@ fn serve(
         }
         return Ok(0);
     }
+    if result.is_ok() || crate::template::interrupted_signal().is_some() {
+        if let Some(consumed) = &owner.consumed {
+            consumed.finish(&owner.host.suspended(&owner.name.name)?)?;
+        }
+    }
     let entry = owner.entry.lock().unwrap().clone();
-    let code =
-        result.as_ref().copied().unwrap_or_else(|error| crate::template::interrupted_signal().map_or_else(|| vmproc::exit_code(error), |signal| 128 + signal));
+    let signal = crate::template::interrupted_signal();
+    let code = signal.map_or_else(|| result.as_ref().copied().unwrap_or_else(vmproc::exit_code), |signal| 128 + signal);
     crate::containers::record_exit_of(
         &owner.host,
         &owner.name.name,
         &entry.ident,
         entry.ip.map(|ip| crate::Instance { ip, gen: entry.gen }),
         code,
-        result.is_ok(),
+        result.is_ok() && signal.is_none(),
     );
+    crate::template::interrupted()?;
     result
 }
 
 pub fn restore(host: Host, vm_name: &str, notify: Option<std::fs::File>) -> Result<i32> {
-    let failure_notify = notify.as_ref().map(std::fs::File::try_clone).transpose()?;
+    let notify = notify.map(|file| Startup(Arc::new(Mutex::new(Some(file)))));
+    let failure_notify = notify.clone();
     let result = (|| {
         let name = host.take_name(vm_name, true)?;
         let path = host.suspended(vm_name)?;
@@ -726,7 +760,7 @@ pub fn restore(host: Host, vm_name: &str, notify: Option<std::fs::File>) -> Resu
         serve(host, name, machine, processes, &config, &meta, Some(Resume { manifest, generation, consumed, notify }))
     })();
     if let (Err(error), Some(file)) = (&result, failure_notify) {
-        let _ = send_notification(&file, &json!({"ok":false,"error":error.to_string()}));
+        let _ = file.send(&json!({"ok":false,"error":error.to_string()}));
     }
     result
 }
@@ -740,6 +774,11 @@ pub fn setup_signals(processes: Arc<qemu::Processes>) {
     util::on_signal(&[libc::SIGINT, libc::SIGQUIT, libc::SIGHUP], move |signal| {
         crate::template::interrupt(signal);
         processes.stop();
+        // Keep a thread with these signals unblocked until process exit, so a
+        // second interrupt can terminate even if ordinary cleanup stalls.
+        loop {
+            std::thread::park();
+        }
     });
 }
 
@@ -757,6 +796,14 @@ pub fn stop(host: &Host, name: &str, expected: &Ident) -> Result<()> {
     let checkpoint = host.suspended(name)?;
     let local_host = software_state::host_id(&host.state)?;
     if result.is_err() && !software_state::retired_for(&checkpoint, expected, &local_host).unwrap_or(false) {
+        let gone = owner.as_ref().is_none_or(|owner| owner.wait(Duration::from_millis(250)));
+        if gone
+            && crate::containers::exit_record(host, name).is_some_and(|exit| exit.ident == *expected && exit.app == Some(true))
+            && !host.has_record(name, "failed")
+            && !host.has_record(name, "lost")
+        {
+            return Ok(());
+        }
         return result.map(|_| ());
     }
     if let Some(owner) = owner {

@@ -90,7 +90,7 @@ def exercise(args):
                        'owner-test', '/owner-probe', 'exec', 'literal $HOME *', status=17)
         if executed.stdout != 'uid=1001 gid=1001 cwd=/tmp env=value arg=literal $HOME *\n' or 'OWNER_EXEC_STDERR' not in executed.stderr:
             raise RuntimeError(f'named exec changed argv/credentials/env/output: {executed}')
-        for _ in range(2):
+        for _ in range(8):
             cli('pause', 'owner-test')
             if live('owner-test')['state'] != 'paused':
                 raise RuntimeError('pause did not publish verified engine state')
@@ -111,6 +111,7 @@ def exercise(args):
         if owner.wait(timeout=10) != 23 or cli('wait', 'owner-test').stdout.strip() != '23':
             raise RuntimeError('owner exit status was lost')
         engine_gone(entry['backend']['process'])
+        cli('stop', 'owner-test')
         if live('owner-test') is not None:
             raise RuntimeError('ended owner stayed live in registry')
         killed, killed_entry = start('owner-kill', ignore_interrupt=True)
@@ -148,7 +149,7 @@ def exercise(args):
         for hold in (args.state / 'run').rglob('holds/*-*'):
             with hold.open('rb') as stream:
                 fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        evidence.update(status='passed', exec_status=17, owner_status=23, pause_cycles=2, owner_death_cleanup='passed')
+        evidence.update(status='passed', exec_status=17, owner_status=23, pause_cycles=8, owner_death_cleanup='passed')
         (args.output / 'owner.json').write_text(json.dumps(evidence, indent=2) + '\n')
     finally:
         stop(owner)
