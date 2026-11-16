@@ -498,6 +498,15 @@ mod tests {
         owner
     }
 
+    // Parallel tests can fork while a directory lease is open. CLOEXEC
+    // releases that duplicate at exec; a nonblocking sweep must preserve it.
+    fn collect_software_root(bases: &[PathBuf], path: &Path) {
+        crate::test_util::wait_until("unleased software root collected", || {
+            sweep_software_in(bases, None).unwrap();
+            !path.exists()
+        });
+    }
+
     #[test]
     fn software_runtime_waits_for_an_unrecorded_childs_inherited_lease() {
         let temp = crate::test_util::TempDir::new("qgap");
@@ -514,8 +523,7 @@ mod tests {
         assert!(sweep_software_in(&bases, Some(&owner)).is_err(), "name reuse must wait for the unknown child's lease");
         child.0.kill().unwrap();
         child.0.wait().unwrap();
-        sweep_software_in(&bases, None).unwrap();
-        assert!(!path.exists());
+        collect_software_root(&bases, &path);
     }
 
     #[test]
@@ -538,7 +546,7 @@ mod tests {
         use std::os::unix::process::ExitStatusExt;
         assert_eq!(owned.0.wait().unwrap().signal(), Some(libc::SIGKILL));
         assert!(unrelated.0.try_wait().unwrap().is_none(), "reused PID was signaled");
-        assert!(!path.exists());
+        collect_software_root(&bases, &path);
     }
 
     #[test]
@@ -560,8 +568,7 @@ mod tests {
         fs::write(unknown.join("software-owner"), b"unknown owner format").unwrap();
         let linked = bases[0].join(format!("{SOFTWARE_PREFIX}{}", "c".repeat(32)));
         symlink(&legacy, &linked).unwrap();
-        sweep_software_in(&bases, None).unwrap();
-        assert!(!initializing.exists());
+        collect_software_root(&bases, &initializing);
         assert!(legacy.exists() && unknown.exists() && linked.is_symlink());
         let mut selected = crate::host::Ident::me();
         selected.start += 1;
@@ -616,8 +623,7 @@ mod tests {
         assert!(sweep_software_in(&bases, None).is_err(), "pidfd failure cannot prove death");
         assert!(path.exists());
         fs::remove_file(path.join("child-0")).unwrap();
-        sweep_software_in(&bases, None).unwrap();
-        assert!(!path.exists());
+        collect_software_root(&bases, &path);
     }
 
     #[test]
