@@ -2435,7 +2435,8 @@ mod tests {
         std::fs::write(&init, b"init").unwrap();
         let o = Options { image, ..Options::default() };
         let config_value: Value = serde_json::from_str(&config).unwrap();
-        let key = json!({"v": 6, "config": cd, "diff_ids": config_value["rootfs"]["diff_ids"], "init": sha256_hex(b"init"), "options": o, "kernel_modules": null});
+        let key =
+            json!({"v": 6, "config": cd, "diff_ids": config_value["rootfs"]["diff_ids"], "init": sha256_hex(b"init"), "options": o, "kernel_modules": null});
         let key = sha256_hex(key.to_string().as_bytes());
         let cached = d.join("rootfs").join(format!("{}.ext4", &key[7..]));
         cached_rootfs(&cached, build("cached"), sync_dir).unwrap();

@@ -197,6 +197,10 @@ mod tests {
             ("firecracker", "aarch64", "firecracker-aarch64"),
             ("vmlinux", "aarch64", "vmlinux-aarch64"),
             ("inputs.txt", "aarch64", "inputs-aarch64.txt"),
+            ("kernel-modules.tar.gz", "x86_64", "kernel-modules.tar.gz"),
+            ("kernel-sdk.tar.gz", "x86_64", "kernel-sdk.tar.gz"),
+            ("kernel-modules.tar.gz", "aarch64", "kernel-modules-aarch64.tar.gz"),
+            ("kernel-sdk.tar.gz", "aarch64", "kernel-sdk-aarch64.tar.gz"),
         ] {
             assert_eq!(release_name(asset, arch), name);
         }
