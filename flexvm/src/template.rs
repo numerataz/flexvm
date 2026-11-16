@@ -410,6 +410,14 @@ fn content_id(components: &BTreeMap<String, Component>, image: Option<&ImageMeta
             hash.update(part.as_bytes());
         }
         hash.word(i.warm as u64);
+        if !i.boot.is_app() {
+            hash.update(b"boot-profile");
+            hash.word(match i.boot {
+                crate::image::BootProfile::Systemd => 1,
+                crate::image::BootProfile::Openrc => 2,
+                crate::image::BootProfile::App => unreachable!(),
+            });
+        }
         if let Some(modules) = &i.kernel_modules {
             for part in ["kernel-modules", &modules.kernel_sha256, &modules.bundle_sha256, &modules.release] {
                 hash.update(part.as_bytes());
@@ -2640,6 +2648,7 @@ pub(crate) mod tests {
 
     fn image(digest: &str, conf: &str) -> ImageMeta {
         ImageMeta {
+            boot: crate::image::BootProfile::App,
             kernel_modules: None,
             source: "x".into(),
             digest: digest.into(),
@@ -4262,6 +4271,26 @@ pub(crate) mod tests {
         f.verify(&meta, &mut BTreeMap::new()).unwrap();
         meta.image.as_mut().unwrap().digest = "sha256:b".into();
         assert!(f.verify(&meta, &mut BTreeMap::new()).is_err());
+    }
+
+    #[test]
+    fn boot_profile_is_part_of_authenticated_image_identity() {
+        let f = Fixture::new();
+        let mut meta = f.meta.clone();
+        meta.image = Some(image("sha256:a", "arg /x\n"));
+        meta.identify(&f.paths, &f.dir).unwrap();
+        let app_id = meta.id.clone();
+        let image = meta.image.as_mut().unwrap();
+        image.boot = crate::image::BootProfile::Systemd;
+        assert!(f.verify(&meta, &mut BTreeMap::new()).is_err());
+        meta.identify(&f.paths, &f.dir).unwrap();
+        assert_ne!(meta.id, app_id);
+        let systemd_id = meta.id.clone();
+        meta.image.as_mut().unwrap().boot = crate::image::BootProfile::Openrc;
+        assert!(f.verify(&meta, &mut BTreeMap::new()).is_err());
+        meta.identify(&f.paths, &f.dir).unwrap();
+        assert_ne!(meta.id, app_id);
+        assert_ne!(meta.id, systemd_id);
     }
 
     #[test]

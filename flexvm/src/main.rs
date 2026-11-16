@@ -2251,6 +2251,7 @@ fn image_options(args: &Args, src: &str) -> Result<image::Options> {
         |flag, default| -> Result<u64> { args.parse_or::<u64>(flag, default)?.checked_mul(1 << 20).ok_or_else(|| format!("--{flag} is too large").into()) };
     Ok(image::Options {
         image: src.into(),
+        boot: image::BootProfile::App,
         entrypoint: args.get("entrypoint").map(image::parse_argv).transpose()?,
         cmd: args.get("cmd").map(image::parse_argv).transpose()?,
         env: env_flags(args)?,
