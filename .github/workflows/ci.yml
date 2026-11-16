@@ -123,7 +123,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { arch: x86_64, runner: ubuntu-24.04, qemu: qemu-system-x86, extra: "" }
+          - { arch: x86_64, runner: ubuntu-24.04, qemu: qemu-system-x86, extra: "--guest-kvm --checkpoint" }
           - { arch: aarch64, runner: ubuntu-24.04-arm, qemu: qemu-system-arm, extra: "--guest-kvm --checkpoint" }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -163,11 +163,7 @@ jobs:
         run: ./scripts/fetch.sh --state "$RUNNER_TEMP/software-state"
       - name: Boot with KVM masked
         run: |
-          extra=()
-          if [ '${{ matrix.arch }}' = aarch64 ]; then
-            extra=(--guest-firecracker "$RUNNER_TEMP/software-state/artifacts/firecracker")
-          fi
-          sudo python3 scripts/compat/software-boot.py --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-boot" ${{ matrix.extra }} "${extra[@]}"
+          sudo python3 scripts/compat/software-boot.py --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-boot" ${{ matrix.extra }} --guest-firecracker "$RUNNER_TEMP/software-state/artifacts/firecracker"
           cat "$RUNNER_TEMP/software-boot/report.json"
       - name: Save software kernel
         if: success() && steps.software-kernel.outputs.cache-hit != 'true'

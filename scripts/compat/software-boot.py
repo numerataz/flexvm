@@ -244,8 +244,6 @@ def main():
     arch = platform.machine()
     if arch not in ("x86_64", "aarch64"):
         parser.error(f"unsupported native architecture: {arch}")
-    if args.guest_kvm and arch != "aarch64":
-        parser.error("guest KVM execution currently targets ARM64 EL2")
     if args.guest_firecracker and not args.guest_kvm:
         parser.error("--guest-firecracker requires --guest-kvm")
     if args.checkpoint and not args.guest_firecracker:
@@ -266,7 +264,11 @@ def main():
         report.update(scope="software guest hypervisor execution", firecracker_sha256=digest(firecracker))
     # QEMU 10.2.1's max/VHE profile loses EL2 timer wakeups on cold restore;
     # Cortex-A72 still provides EL2/KVM and uses the verified non-VHE path.
-    cpu = "cortex-a72" if args.checkpoint else "max"
+    cpu = "max"
+    if arch == "x86_64":
+        cpu = "max,svm=on,npt=on,enforce=on"
+    elif args.checkpoint:
+        cpu = "cortex-a72"
     report["cpu"] = cpu
     started = time.monotonic()
 
@@ -282,8 +284,9 @@ def main():
         nested = None
         if args.guest_kvm:
             test = out / "kvm-abi"
-            run([args.cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static",
-                 str(ROOT / "kvm-arm.c"), "-o", str(test)], 60, out / "kvm-compile.log")
+            probe = "kvm-abi.c" if arch == "x86_64" else "kvm-arm.c"
+            run([args.cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static", "-pthread",
+                 str(ROOT / probe), "-o", str(test)], 60, out / "kvm-compile.log")
             nested = test.read_bytes()
         files = None
         if firecracker:
@@ -292,7 +295,7 @@ def main():
                  str(ROOT / "nested-init.c"), "-o", str(inner)], 60, out / "inner-compile.log")
             config = {"boot-source": {"kernel_image_path": "/inner-kernel",
                                       "initrd_path": "/inner-initramfs.cpio",
-                                      "boot_args": "console=ttyS0 quiet panic=1 rdinit=/init"},
+                                      "boot_args": "console=ttyS0 quiet panic=1 rdinit=/init" + (" reboot=k" if arch == "x86_64" else "")},
                       "machine-config": {"vcpu_count": 1, "mem_size_mib": 128},
                       "drives": [], "network-interfaces": []}
             gate = {"checkpoint-gate": b""} if args.checkpoint else None
@@ -311,7 +314,7 @@ def main():
                       "-chardev", "stdio,id=console,signal=off",
                       "-device", "virtio-serial-device,id=serial",
                       "-device", "virtconsole,chardev=console,bus=serial.0"]
-        if args.guest_kvm:
+        if args.guest_kvm and arch == "aarch64":
             machine += ",virtualization=on,gic-version=3"
         cmd = [qemu, "-machine", machine, "-accel", "tcg,thread=multi", "-cpu", cpu,
                "-m", "512" if firecracker else "256", "-smp", "1", *serial, "-no-reboot", "-nic", "none",
@@ -321,7 +324,7 @@ def main():
         # becomes a regular file, so it cannot provide KVM ioctls even to root.
         def isolated(command, trace):
             return ["unshare", "--mount", "--propagation", "private", "sh", "-ec",
-                    'if [ -e /dev/kvm ]; then mount --bind "$1" /dev/kvm; fi; shift; exec "$@"',
+                    'for dev in /dev/kvm /dev/vhost-vsock; do if [ -e "$dev" ]; then mount --bind "$1" "$dev"; fi; done; shift; exec "$@"',
                     "sh", str(blocked), "strace", "-f", "-e", "trace=file", "-o", str(trace), *command]
 
         traces = [out / "files.strace"]
@@ -335,16 +338,19 @@ def main():
         expected = ["FLEXVM_SOFTWARE_GUEST_BOOTED", "FLEXVM_SOFTWARE_GUEST_COMPLETE"]
         expected += [f"FLEXVM_SOFTWARE_GUEST_TICK {i}" for i in range(3)]
         if args.guest_kvm:
-            expected.append("FLEXVM_SOFTWARE_GUEST_KVM_PASSED")
+            expected.append("PASS: 9 KVM ABI reference checks" if arch == "x86_64" else "FLEXVM_SOFTWARE_GUEST_KVM_PASSED")
         if firecracker:
             expected += ["FLEXVM_SOFTWARE_INNER_BOOTED", "FLEXVM_SOFTWARE_INNER_COMPLETE",
                          "FLEXVM_SOFTWARE_GUEST_FIRECRACKER_PASSED"]
             expected += [f"FLEXVM_SOFTWARE_INNER_TICK {i}" for i in range(3)]
-        if any(marker not in log for marker in expected):
+        if any(log.splitlines().count(marker) != 1 for marker in expected):
             raise RuntimeError("guest did not finish its boot/timer/shutdown checks; see guest.log")
-        if any('"/dev/kvm"' in trace.read_text(errors="replace") for trace in traces):
-            raise RuntimeError("software execution attempted to access /dev/kvm; see files.strace")
-        report.update(status="passed", guest_init_sha256=digest(init), kvm_access=False, guest_kvm=args.guest_kvm)
+        if "Kernel panic" in log or "Oops:" in log:
+            raise RuntimeError("guest kernel failed; see guest.log/restored.log")
+        if any(f'"{dev}"' in trace.read_text(errors="replace")
+               for trace in traces for dev in ("/dev/kvm", "/dev/vhost-vsock")):
+            raise RuntimeError("software execution attempted to access a host virtualization device; see files.strace")
+        report.update(status="passed", guest_init_sha256=digest(init), kvm_access=False, guest_kvm=args.guest_kvm, vhost_vsock_access=False)
         if firecracker:
             report.update(guest_firecracker=True, inner_init_sha256=digest(inner))
     except Interrupted as exc:
