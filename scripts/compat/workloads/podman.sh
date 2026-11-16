@@ -1,11 +1,11 @@
 #!/bin/sh
 # Guest workload for compat.py: stock Ubuntu packages, rootful and rootless Podman.
-set -eu
+set -eux
 step=$1 nonce=$2 phase=$3
 base=/var/lib/flexvm-compat-$nonce
 user=fc$(printf %.12s "$nonce")
 cgroup=/sys/fs/cgroup/$user
-image=docker.io/library/busybox:1.36
+image=public.ecr.aws/docker/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
 
 pod() {
     if [ "$mode" = rootless ]; then
@@ -60,6 +60,8 @@ EOF
     echo '+cpu +memory +pids' > "$cgroup/cgroup.subtree_control"
     chown -R "$user:$user" "$cgroup"
     echo "$uid" > "$base/uid"
+    uname -r
+    dpkg-query -W podman crun fuse-overlayfs slirp4netns netavark aardvark-dns uidmap
     podman --version
     crun --version
     fuse-overlayfs --version
@@ -67,6 +69,7 @@ EOF
         if [ "$mode" = rootless ]; then pod unshare cat /proc/self/uid_map; fi
         test "$(pod info --format '{{.Store.GraphDriverName}}')" = overlay
         pod pull "$image"
+        pod image inspect --format '{{.Id}} {{.Digest}} {{.Architecture}}' "$image"
         parent=/libpod_parent
         port=18081
         if [ "$mode" = rootless ]; then parent=/$user; port=18082; fi

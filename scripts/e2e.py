@@ -2431,6 +2431,84 @@ def kernel_modules():
         rm_ckpt(ck)
 
 
+@contextlib.contextmanager
+def podman_test_egress():
+    """The coordinator owns temporary egress rules, even if a worker is killed."""
+    if args.worker or args.selftest or args.no_kvm or os.geteuid() != 0 or "podman" not in (args.cases or CASES) or kvm_unusable():
+        yield
+        return
+    dns = ENV.get("FLEXVM_TEST_DNS", "").split()
+    if not dns:
+        for path in ("/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"):
+            try:
+                values = re.findall(r"^nameserver\s+(\S+)", open(path).read(), re.M)
+            except FileNotFoundError:
+                continue
+            dns = [str(ipaddress.IPv4Address(value)) for value in values
+                   if ":" not in value and not ipaddress.IPv4Address(value).is_loopback and not ipaddress.IPv4Address(value).is_unspecified]
+            if dns:
+                break
+    assert dns, "Podman egress needs reachable IPv4 DNS (FLEXVM_TEST_DNS)"
+    dns = [str(ipaddress.IPv4Address(value)) for value in dns[:3]]
+    route = json.loads(subprocess.check_output(["ip", "-j", "-4", "route", "get", "1.1.1.1"], text=True, timeout=10))[0]
+    device = route["dev"]
+    comment = f"fvci-podman-{os.getpid()}-{time.time_ns()}"
+    previous_dns = ENV.get("FLEXVM_TEST_DNS")
+    previous_term = signal.signal(signal.SIGTERM, signal.default_int_handler)
+    ENV["FLEXVM_TEST_DNS"] = " ".join(dns)
+    rules = contextlib.ExitStack()
+    try:
+        for network in sorted({f"{net}.0/24" for _, a, b in lanes() for net in (a, b)}):
+            for table, chain, match in (
+                ("nat", "POSTROUTING", ["-s", network, "-o", device, "-j", "MASQUERADE"]),
+                ("filter", "FORWARD", ["-s", network, "-o", device, "-j", "ACCEPT"]),
+                ("filter", "FORWARD", ["-d", network, "-i", device, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"]),
+            ):
+                rule = ["-m", "comment", "--comment", comment, *match]
+                subprocess.run(["iptables", "-w", "10", "-t", table, "-I", chain, *rule], check=True, timeout=20)
+                rules.callback(subprocess.run, ["iptables", "-w", "10", "-t", table, "-D", chain, *rule], check=True, timeout=20)
+        print(f"Podman test egress: {device}, DNS {' '.join(dns)} (temporary {comment})", flush=True)
+        yield
+    finally:
+        blocked = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT, signal.SIGTERM})
+        try:
+            rules.close()
+        finally:
+            if previous_dns is None:
+                ENV.pop("FLEXVM_TEST_DNS", None)
+            else:
+                ENV["FLEXVM_TEST_DNS"] = previous_dns
+            signal.signal(signal.SIGTERM, previous_term)
+            signal.pthread_sigmask(signal.SIG_SETMASK, blocked)
+
+
+@case
+@needs_kvm
+def podman():
+    """rootful/rootless Podman builds, networking, limits and live containers across VM lifecycle."""
+    output = os.path.join(args.log_dir, "podman-compat")
+    previous_dns = [(host, json.load(open(os.path.join(host.state_dir, "host.json"))).get("dns")) for host in (A, B)]
+    try:
+        for host, _ in previous_dns:
+            host.configure(dns=ENV["FLEXVM_TEST_DNS"].split())
+        subprocess.run([
+            "python3", os.path.join(ROOT, "scripts/compat.py"), "--bin", BIN,
+            "--state", A.state_dir, "--run", A.run_dir, "--image", "public.ecr.aws/docker/library/ubuntu@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8",
+            "--workload", os.path.join(ROOT, "scripts/compat/workloads/podman.sh"),
+            "--phases", "run,suspend,checkpoint,migration", "--migration-to", B.addr,
+            "--to-state", B.state_dir, "--to-run", B.run_dir,
+            "--vcpus", "2", "--memory-mib", "2048", "--require", "storage.fuse",
+            "--output", output,
+        ], check=True, timeout=1500, env=ENV)
+    finally:
+        for host, dns in previous_dns:
+            host.configure(dns=dns)
+    report = json.load(open(os.path.join(output, "report.json")))
+    check("rootful/rootless Podman lifecycle", report["status"] == "passed" and
+          [(phase["phase"], phase["status"]) for phase in report["phases"]] ==
+          [(phase, "passed") for phase in ("run", "suspend", "checkpoint", "migration")], report)
+
+
 @case
 @needs_kvm
 def copy():
@@ -3205,7 +3283,7 @@ def worker():
 # runs, as e2e.py's summary prints them): --split balances by these, the long ones start first, and
 # the short ones go in batches of about BATCH_S (each batch is a worker, with hosts of its own).
 # Unlisted ones count as 2 s.
-COST = {"faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "ipv6_taps": 10, "nettest_ipv6": 30, "docker_api": 15, "restart_policy": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
+COST = {"podman": 180, "faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "ipv6_taps": 10, "nettest_ipv6": 30, "docker_api": 15, "restart_policy": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
         "faults/cow_grow": 65, "faults/reconcile_kill": 64, "faults/target_renamed": 40, "faults/plug_race": 45, "faults/guest_hang": 44,
         "faults/exec_pause_grace": 42, "faults/exec_ckpt_stalled": 115, "faults/route_abort": 35, "faults/unplug_collapsed": 30,
         "faults/arrival_grew": 25, "faults/pause_resume": 24, "faults/evict_latency": 25, "faults/mem_high": 25, "faults/target_killed": 25,
@@ -3430,7 +3508,7 @@ def main():
                     f"[print(f'scenario {{x}}: ' + ('SKIPPED (selftest)' if x == {SELFTEST_SKIP_NAME!r} else 'ok') + ' in 0.0 s') for x in s]; "
                     "json.dump([[x, 'PASS', 0.0] for x in c] + ([['faults', 'PASS', 0.0]] if s else []), open(res, 'w'))")
             cmd = [sys.executable, "-c", fake, json.dumps([cases, scens, res])]
-        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True)
+        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True, env=ENV)
 
     def run_batch(i, label, batch, port, net_a, net_b):
         """Runs one batch in a worker; returns its results."""
@@ -3578,7 +3656,8 @@ def main():
 
 if __name__ == "__main__":
     try:
-        code = main()
+        with podman_test_egress():
+            code = main()
     finally:
         forget_states(TEMPLATES, WORK)
         shutil.rmtree(WORK, ignore_errors=True)
