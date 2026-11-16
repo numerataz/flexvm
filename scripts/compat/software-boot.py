@@ -347,9 +347,11 @@ def main():
             raise RuntimeError("guest did not finish its boot/timer/shutdown checks; see guest.log")
         if "Kernel panic" in log or "Oops:" in log:
             raise RuntimeError("guest kernel failed; see guest.log/restored.log")
-        if any(f'"{dev}"' in trace.read_text(errors="replace")
-               for trace in traces for dev in ("/dev/kvm", "/dev/vhost-vsock")):
-            raise RuntimeError("software execution attempted to access a host virtualization device; see files.strace")
+        for trace in traces:
+            traced = trace.read_text(errors="replace")
+            for dev in ("/dev/kvm", "/dev/vhost-vsock"):
+                if f'"{dev}"' in traced:
+                    raise RuntimeError(f"software execution attempted to access {dev}; see files.strace")
         report.update(status="passed", guest_init_sha256=digest(init), kvm_access=False, guest_kvm=args.guest_kvm, vhost_vsock_access=False)
         if firecracker:
             report.update(guest_firecracker=True, inner_init_sha256=digest(inner))
