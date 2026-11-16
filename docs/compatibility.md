@@ -9,6 +9,7 @@ an installed binary or successful capability inventory alone does not establish 
 |---|---|---|
 | Capability and lifecycle harness | [#1331](https://github.com/numerataz/flexvm/issues/1331) | First: isolated probes, ownership/cleanup, lifecycle state |
 | Guest kernel capabilities | [#1330](https://github.com/numerataz/flexvm/issues/1330) | Audit, reproducible kernel/configuration, runtime verification |
+| Guest kernel modules and matching SDK | [#1380](https://github.com/numerataz/flexvm/issues/1380) | Native guest compilation/DKMS, ABI checks and loaded module lifecycle |
 | Usable RAM-filesystem capacity | [#1333](https://github.com/numerataz/flexvm/issues/1333) | Unblock ordinary package installation |
 | Podman and rootless Docker | [#1322](https://github.com/numerataz/flexvm/issues/1322) | User namespaces/helpers, storage, network, delegation |
 | containerd, nerdctl and BuildKit | [#1323](https://github.com/numerataz/flexvm/issues/1323) | Direct runtimes, CNI, snapshotters and image builds |
@@ -359,3 +360,31 @@ density. Elastic memory and accurate shared admission accounting remain work in
 The owner and actual engine have distinct verified identities; a hard owner death
 terminates the engine through its parent-death signal. Recovery/garbage collection
 of private runtime paths after an abrupt death remains part of lifecycle integration.
+
+## Guest kernel module acceptance
+
+`--kernel-sdk` installs the native development bundle matching the selected
+kernel. `--kernel-modules FILE` accepts a custom runtime or development bundle
+with the same validation. Ordinary images receive the small runtime bundle.
+
+```sh
+scripts/fetch.sh --kernel-sdk
+sudo scripts/compat/software-modules.py --bin target/release/flexvm \
+  --kernel /var/lib/flexvm/artifacts/vmlinux --output /tmp/software-modules
+```
+
+The software harness uses the normal CLI to prepare an immutable compiler OCI
+image, compiles two modules inside the guest, installs them with kbuild and real
+DKMS, checks modprobe dependencies and rejects incompatible vermagic. Its module
+creates a random kernel cookie and advances a kernel timer. Both must remain
+live through pause and stop/start, with fresh progress after restoration; an
+unload/reload must generate a new cookie. Userspace PID, process start time, RAM
+and progress are checked independently. Both host virtualization devices are
+masked before tracing; host module-loading syscalls must be absent.
+
+Native x86_64 and aarch64 CI run this harness separately and upload reports,
+logs and host traces. The accelerated `kernel_modules` E2E case additionally
+checks loaded state through suspend/start, checkpoint/restore and migration in
+both directions. Modules requiring hardware that the selected engine does not
+provide still need that device to be implemented; matching build inputs alone
+do not establish device support.

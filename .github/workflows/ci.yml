@@ -467,11 +467,14 @@ jobs:
           key: downloads-${{ steps.keys.outputs.downloads }}-${{ hashFiles('scripts/build-kernel.sh', 'scripts/package-kernel-modules.sh', 'scripts/fetch.sh', 'scripts/versions.sh', 'scripts/checksums.sha256') }}
       - name: Fetch kernel and base rootfs
         run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends build-essential dwarves
           if ./scripts/fetch.sh --urls | grep -q '^vmlinux build:'; then
             sudo apt-get update -q
             sudo apt-get install -y -q --no-install-recommends build-essential flex bison bc libelf-dev libssl-dev dwarves xz-utils kmod pkg-config zlib1g-dev libzstd-dev
           fi
           ./scripts/fetch.sh
+          ./scripts/fetch.sh --kernel-sdk
           echo "base=$(sha256sum "$STATE/artifacts/base.squashfs" | cut -c1-16)" >> "$GITHUB_OUTPUT"
         id: fetch
       - name: Save downloads

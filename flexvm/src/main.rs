@@ -80,6 +80,8 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      address unless --name and --ip IP|auto), or from a checkpoint
                                      directory (a path, with a '/'); --paused holds it until unpause
   flexvm software --kernel FILE [OPTIONS] IMAGE [CMD...]
+                                     --kernel-sdk: matching native module build inputs;
+                                     --kernel-modules FILE: custom runtime or SDK bundle
                                      experimental foreground QEMU TCG execution without host KVM;
                                      --qemu PATH, --vsock-backend PATH, --mem MIB, --vcpus N,
                                      --timeout SECS (boot only); image env/workdir/user options apply
@@ -130,7 +132,8 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      printed); its template by content id, unnamed, if not here
   flexvm migrate NAME HOST:PORT      live-migrate a VM to the host listening there
   flexvm pull IMAGE[:TAG|@DIGEST] [--tag NAME] [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB]
-              [--standby N] ...      pull an image and build its template (an archive or OCI layout
+              [--standby N] [--kernel-sdk | --kernel-modules FILE] ...
+                                     pull an image and build its template (an archive or OCI layout
                                      directory needs --tag; see README); again: rebuilt if it changed;
                                      --standby N keeps N of its VMs restored and paused (run: ~5 ms);
                                      of an image pulled here, alone it only sets that count
@@ -2270,12 +2273,19 @@ fn image_options(args: &Args, src: &str) -> Result<image::Options> {
 /// its authenticated runtime bundle by default. The large SDK is opt-in.
 fn kernel_bundle(args: &Args, kernel: &Path, reviewed: bool) -> Result<Option<image::KernelBundle>> {
     if let Some(custom) = args.get("kernel-modules") {
-        return Ok(Some(image::KernelBundle::open(kernel, Path::new(custom), None)?));
+        let bundle = image::KernelBundle::open(kernel, Path::new(custom), None)?;
+        if reviewed {
+            artifacts::KERNEL.check_digest(&bundle.kernel.artifact.sha256)?;
+        }
+        return Ok(Some(bundle));
     }
     let development = args.has("kernel-sdk");
     let asset = if development { &artifacts::KERNEL_SDK } else { &artifacts::MODULES };
+    let kernel = kernel.canonicalize()?;
     let adjacent = kernel.with_file_name(asset.name);
-    let authenticated = reviewed || !adjacent.exists();
+    let state_kernel = paths(args)?.kernel;
+    let state_artifacts = state_kernel.parent().ok_or("kernel has no artifact directory")?;
+    let authenticated = reviewed || !adjacent.exists() || state_artifacts.canonicalize().is_ok_and(|directory| adjacent.parent() == Some(directory.as_path()));
     let selected = if reviewed || adjacent.exists() {
         adjacent
     } else if development {
@@ -2286,7 +2296,7 @@ fn kernel_bundle(args: &Args, kernel: &Path, reviewed: bool) -> Result<Option<im
     if authenticated {
         artifacts::ensure(&[(&selected, asset)])?;
     }
-    let bundle = image::KernelBundle::open(kernel, &selected, Some(development))?;
+    let bundle = image::KernelBundle::open(&kernel, &selected, Some(development))?;
     if authenticated {
         asset.check_digest(&bundle.identity().bundle_sha256)?;
     }

@@ -170,18 +170,37 @@ impl Bundle {
                 bail!("kernel module archive writes outside its release: {name:?}");
             }
         }
+        // Entries may never traverse an archive link, regardless of tar order.
+        // This keeps extraction's parent creation inside the fresh release tree.
+        let link_paths: BTreeSet<_> = links.iter().map(|(name, _, _)| name.clone()).collect();
+        for name in &paths {
+            if name.ancestors().skip(1).any(|parent| link_paths.contains(parent)) {
+                bail!("kernel module archive member traverses a link: {name:?}");
+            }
+        }
         for (name, symlink, target) in links {
-            let target = if symlink {
-                if target.is_absolute() {
-                    bail!("kernel module archive has an absolute link");
+            if target.is_absolute()
+                || target.as_os_str().as_encoded_bytes().contains(&0)
+                || target.as_os_str().as_encoded_bytes().len() >= libc::PATH_MAX as usize
+                || target.components().any(|part| part.as_os_str().as_encoded_bytes().len() > libc::NAME_MAX as usize)
+            {
+                bail!("kernel module archive has an invalid link target: {name:?}");
+            }
+            let mut resolved = if symlink { name.parent().ok_or("kernel module link has no parent")?.to_path_buf() } else { PathBuf::new() };
+            for part in target.components() {
+                match part {
+                    Component::Normal(value) => resolved.push(value),
+                    Component::CurDir => continue,
+                    Component::ParentDir if symlink && resolved != prefix => {
+                        resolved.pop();
+                    }
+                    _ => bail!("kernel module archive link escapes its release: {name:?}"),
                 }
-                // Parent components are valid inside a source tree; resolve
-                // them lexically and require the result to stay in this release.
-                unpack::lexical(&name.parent().ok_or("kernel module link has no parent")?.join(target))
-            } else {
-                path(&target)?
-            };
-            if !target.starts_with(&prefix) {
+                if (symlink && !resolved.starts_with(&prefix)) || link_paths.contains(&resolved) {
+                    bail!("kernel module archive link escapes or traverses another link: {name:?}");
+                }
+            }
+            if !resolved.starts_with(&prefix) {
                 bail!("kernel module archive link escapes its release: {name:?}");
             }
         }
@@ -334,13 +353,13 @@ mod tests {
             assert!(name.len() < 100);
             header.as_mut_bytes()[..name.len()].copy_from_slice(name.as_bytes());
             if kind.is_symlink() || kind.is_hard_link() {
-                header.set_link_name(std::str::from_utf8(&data).unwrap()).unwrap();
                 header.set_size(0);
+                tar.append_link(&mut header, &name, std::str::from_utf8(&data).unwrap()).unwrap();
             } else {
                 header.set_size(data.len() as u64);
+                header.set_cksum();
+                tar.append(&header, data.as_slice()).unwrap();
             }
-            header.set_cksum();
-            tar.append(&header, if kind.is_symlink() || kind.is_hard_link() { b"".as_slice() } else { &data }).unwrap();
         }
         tar.into_inner().unwrap().finish().unwrap();
         (temp, kernel, archive)
@@ -396,6 +415,59 @@ mod tests {
     }
 
     #[test]
+    fn links_cannot_leave_then_reenter_or_traverse_another_link() {
+        for target in ["../../../../../../lib/modules/6.1-test", &"x".repeat(256), &"a/".repeat(2048)] {
+            let (_temp, kernel, archive) = fixture(false, |_, entries| {
+                entries.push(("lib/modules/6.1-test/link".into(), tar::EntryType::Symlink, target.as_bytes().to_vec()));
+            });
+            assert!(Bundle::open(&kernel, &archive, None).is_err(), "accepted target {target}");
+        }
+        for reverse in [false, true] {
+            let (_temp, kernel, archive) = fixture(false, |_, entries| {
+                let mut additions = vec![
+                    ("lib/modules/6.1-test/a/b/c/up".into(), tar::EntryType::Symlink, b"../../..".to_vec()),
+                    ("lib/modules/6.1-test/a/b/c/up/escape".into(), tar::EntryType::Symlink, b"../../../../etc".to_vec()),
+                ];
+                if reverse {
+                    additions.reverse();
+                }
+                entries.extend(additions);
+            });
+            assert!(Bundle::open(&kernel, &archive, None).is_err());
+        }
+        let (_temp, kernel, archive) = fixture(false, |_, entries| {
+            entries.push(("lib/modules/6.1-test/link".into(), tar::EntryType::Symlink, b".".to_vec()));
+            entries.push(("lib/modules/6.1-test/other".into(), tar::EntryType::Symlink, b"link/../escape".to_vec()));
+        });
+        assert!(Bundle::open(&kernel, &archive, None).is_err());
+        let (_temp, kernel, archive) = fixture(false, |_, entries| {
+            entries.push(("lib/modules/6.1-test/alias".into(), tar::EntryType::Symlink, b"test.ko".to_vec()));
+        });
+        assert!(Bundle::open(&kernel, &archive, None).is_ok());
+    }
+
+    #[test]
+    fn injection_refuses_image_directory_aliases_without_changing_their_targets() {
+        use std::os::unix::fs::PermissionsExt;
+        for directory in ["usr", "usr/lib", "usr/src", "lib", "lib/modules", "usr/lib/flexvm", "usr/src/flexvm"] {
+            let (temp, kernel, archive) = fixture(true, |_, _| {});
+            let bundle = Bundle::open(&kernel, &archive, None).unwrap();
+            let root = temp.join("root");
+            std::fs::create_dir_all(root.join("etc")).unwrap();
+            std::fs::set_permissions(root.join("etc"), std::fs::Permissions::from_mode(0o771)).unwrap();
+            std::fs::write(root.join("etc/keep"), b"keep").unwrap();
+            let alias = root.join(directory);
+            std::fs::create_dir_all(alias.parent().unwrap()).unwrap();
+            symlink("/etc", &alias).unwrap();
+            let mut filesystem = unpack::Root::open(&root, unpack::Limits::default()).unwrap();
+            assert!(filesystem.apply_kernel_bundle(&bundle).is_err(), "accepted {directory}");
+            assert_eq!(std::fs::read(root.join("etc/keep")).unwrap(), b"keep");
+            assert_eq!(std::fs::metadata(root.join("etc")).unwrap().permissions().mode() & 0o777, 0o771);
+            assert_eq!(std::fs::read_dir(root.join("etc")).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
     fn wrong_architecture_and_missing_generated_sdk_inputs_are_refused() {
         let (_temp, kernel, archive) = fixture(false, |manifest, _| manifest["architecture"] = json!("unsupported"));
         assert!(Bundle::open(&kernel, &archive, None).is_err());
@@ -413,6 +485,8 @@ mod tests {
         std::fs::create_dir_all(root.join("usr/lib/modules/6.1-test")).unwrap();
         std::fs::create_dir_all(root.join("usr/lib/modules/other")).unwrap();
         symlink("usr/lib", root.join("lib")).unwrap();
+        std::fs::create_dir_all(root.join("usr/src/flexvm")).unwrap();
+        std::fs::write(root.join("usr/src/flexvm/stale"), b"stale").unwrap();
         std::fs::write(root.join("lib/modules/6.1-test/stale.ko"), b"stale").unwrap();
         std::fs::write(root.join("lib/modules/other/keep.ko"), b"keep").unwrap();
         let mut filesystem = unpack::Root::open(&root, unpack::Limits::default()).unwrap();
@@ -422,6 +496,7 @@ mod tests {
         assert!(!root.join("lib/modules/6.1-test/stale.ko").exists());
         assert_eq!(std::fs::read(root.join("lib/modules/other/keep.ko")).unwrap(), b"keep");
         assert_eq!(std::fs::read(root.join(format!("{BUILD}.config"))).unwrap(), b"config");
+        assert!(!root.join("usr/src/flexvm/stale").exists());
     }
 
     #[test]

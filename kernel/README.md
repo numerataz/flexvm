@@ -17,6 +17,22 @@ cgroups and container facilities. Required drivers are built in, so stock OCI
 images do not need a matching modules package. `CONFIG_MODULES` allows additional
 user-supplied modules built for this exact kernel.
 
+The native build outputs `vmlinux`, `kernel-modules.tar.gz` and
+`kernel-sdk.tar.gz` with matching checksum records. The runtime archive contains
+the release's module tree and dependency indexes. The SDK adds prepared headers,
+generated configuration, symbol versions, the matching BTF ELF, static native
+build helpers and the verified Linux source archive. It is injected only with
+`--kernel-sdk` or an explicit `--kernel-modules FILE` selection. Guest builds
+still need their own compiler, make, kmod, dwarves (`pahole` for BTF) and workload dependencies.
+
+`scripts/package-kernel-modules.sh` verifies the source tree against that archive
+and the actual boot image against the completed native build before packaging.
+Bundle manifests bind architecture, kernel, source, configuration, symbol
+versions and module payloads. Image preparation rejects mismatches before boot;
+cache identities include the chosen bundle. Do not use a distro's unrelated
+kernel headers for FlexVM modules. All loading and unloading occurs in the guest;
+the build and acceptance harnesses never load these modules on the host.
+
 The kernel build identity includes the exact source archive hash, script and
 configuration contents. Published release provenance also binds the release
 workflow and scripts. Changing these inputs requires a new immutable artifacts

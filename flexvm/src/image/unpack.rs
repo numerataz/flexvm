@@ -677,12 +677,30 @@ impl Root {
         let limits = Limits { download: 512 << 20, unpacked: super::kernel::MAX_BYTES, file: 512 << 20, entries: super::kernel::MAX_ENTRIES };
         let mut injected = Root::from_fd(self.fd.try_clone()?, limits);
         let prefix = PathBuf::from(format!("lib/modules/{}", bundle.manifest.release));
+        // Only /lib's standard merged-/usr alias may redirect these parents.
+        for directory in ["usr", "usr/lib", "usr/src"] {
+            injected.secure_kernel_directory(Path::new(directory))?;
+        }
+        let lib = injected.at(Path::new("lib"), false)?;
+        if is_type(lib.dir.as_raw_fd(), &lib.name, libc::S_IFLNK) {
+            if injected.real(&injected.resolve(Path::new("lib"))?)? != Path::new("usr/lib") {
+                bail!("kernel module injection requires /lib to be a directory or alias of /usr/lib");
+            }
+        } else {
+            injected.secure_kernel_directory(Path::new("lib"))?;
+        }
         injected.secure_kernel_directory(Path::new("lib/modules"))?;
         let old = injected.at(&prefix, true)?;
         old.remove()?;
         let module_root = injected.secure_kernel_directory(&prefix)?;
         let manifest_root = injected.secure_kernel_directory(Path::new("usr/lib/flexvm"))?;
-        let source_root = if bundle.manifest.development { Some(injected.secure_kernel_directory(Path::new("usr/src/flexvm"))?) } else { None };
+        let source_root = if bundle.manifest.development {
+            injected.secure_kernel_directory(Path::new("usr/src/flexvm"))?;
+            injected.at(Path::new("usr/src/flexvm"), false)?.remove()?;
+            Some(injected.secure_kernel_directory(Path::new("usr/src/flexvm"))?)
+        } else {
+            None
+        };
         let mut mine = Layer::default();
         bundle.visit(|entry, mut meta| {
             let rel = super::kernel::path(&meta.path)?;
@@ -732,9 +750,16 @@ impl Root {
     }
 
     fn secure_kernel_directory(&mut self, rel: &Path) -> Result<PathBuf> {
-        let directory = self.mkdir_p(rel, 0)?;
+        let at = self.at(rel, false)?;
+        match stat_at(at.dir.as_raw_fd(), &at.name) {
+            Some(st) if st.st_mode & libc::S_IFMT == libc::S_IFDIR => {}
+            Some(_) => bail!("kernel module injection requires a real directory at {rel:?}"),
+            None => {
+                self.create(|| check(unsafe { libc::mkdirat(at.dir.as_raw_fd(), at.name.as_ptr(), 0o755) }, "mkdir module directory", rel))?;
+            }
+        }
+        let directory = open_dir_at(at.dir.as_raw_fd(), &at.name)?;
         let real = self.real(&directory)?;
-        let directory = self.openat2(real.as_os_str().as_bytes(), libc::O_RDONLY | libc::O_DIRECTORY)?;
         own(&directory, rel)?;
         check(unsafe { libc::fchmod(directory.as_raw_fd(), 0o755) }, "chmod module directory", rel)?;
         Ok(real)

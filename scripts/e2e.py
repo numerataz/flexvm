@@ -2364,7 +2364,10 @@ def build_test_kernel_modules(directory):
     fixtures = os.path.join(ROOT, "scripts/compat/modules")
     for name in ("Makefile", "flexvm_test_state.c", "flexvm_test_device.c"):
         shutil.copyfile(os.path.join(fixtures, name), os.path.join(modules, name))
-    subprocess.run(["make", "-C", build, f"M={modules}", "-j1", "modules"], check=True)
+    environment = os.environ.copy()
+    for name in ("ARCH", "KVM", "LOCALVERSION"):
+        environment.pop(name, None)
+    subprocess.run(["make", "-C", build, f"M={modules}", "-j1", "modules"], check=True, env=environment)
     subprocess.run(["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static",
                     os.path.join(fixtures, "module-control.c"), "-o", os.path.join(modules, "module-control")], check=True)
     return modules

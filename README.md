@@ -127,17 +127,17 @@ the resulting assets; users of a pinned release download those assets.
 The build also produces a small runtime module bundle and an opt-in development
 bundle. Image preparation installs the matching runtime tree in `/lib/modules`.
 To compile additional guest modules or use DKMS, add `--kernel-sdk` to `pull`
-(or to the image options of `run`). This installs prepared headers, generated
-configuration, symbol versions, BTF, native build tools, and the pinned source
-archive. Install a compiler, make, kmod and any package-specific dependencies in
-the guest. For example:
+or `software`. This installs prepared headers, generated configuration, symbol
+versions, BTF, native build tools, and the pinned source archive. Install a
+compiler, make, kmod, dwarves (`pahole` for module BTF), and package-specific
+dependencies in the guest. For example:
 
 ```sh
 sudo flexvm pull --kernel-sdk my-compiler-image:latest
 ```
 
 `--kernel-modules FILE` selects a custom runtime or development bundle instead.
-With `run --software --kernel PATH`, adjacent `kernel-modules.tar.gz` is used
+With `software --kernel PATH`, adjacent `kernel-modules.tar.gz` is used
 when present; `--kernel-sdk` selects adjacent `kernel-sdk.tar.gz`. Fetch the
 published development inputs separately with `scripts/fetch.sh --kernel-sdk`.
 Bundle admission checks the kernel digest, architecture, configuration, symbol

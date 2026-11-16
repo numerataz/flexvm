@@ -1946,6 +1946,7 @@ fn build(host: &crate::host::Host, paths: &Paths, dir: &Path, name: &str, size: 
     crate::artifacts::ensure(&[(&paths.kernel, &crate::artifacts::KERNEL), (&paths.firecracker, &crate::artifacts::FIRECRACKER)])?;
     let kernel = std::fs::canonicalize(&paths.kernel).map_err(|e| format!("{}: {e} (fetch it: scripts/fetch.sh)", paths.kernel.display()))?;
     let kernel_input = crate::software_state::Input::open(&kernel)?;
+    crate::artifacts::KERNEL.check_digest(&kernel_input.artifact.sha256)?;
     image.check_kernel(&kernel_input.artifact.sha256)?;
     let kernel_file = &kernel_input.file;
     let kernel_component = hash_open_file(kernel_file, &kernel)?;
