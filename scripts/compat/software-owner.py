@@ -103,7 +103,13 @@ def exercise(args):
         time.sleep(.1)
         if owner.poll() is not None:
             raise RuntimeError('legacy suspend signal destroyed a named software VM')
-        cli('exec', 'owner-test', '/owner-probe', 'finish')
+        # This command ends the main workload, which tears down the VM and may
+        # close the exec connection before its own reply. The main status below
+        # proves that the finish request actually ran.
+        finished = cli('exec', 'owner-test', '/owner-probe', 'finish', status=None)
+        lost_after_exit = finished.returncode == 125 and not finished.stdout and finished.stderr.strip() == 'flexvm: no vm named "owner-test"'
+        if finished.returncode != 0 and not lost_after_exit:
+            raise RuntimeError(f'finish command failed unexpectedly: {finished}')
         if owner.wait(timeout=10) != 23 or cli('wait', 'owner-test').stdout.strip() != '23':
             raise RuntimeError('owner exit status was lost')
         engine_gone(entry['backend']['process'])
