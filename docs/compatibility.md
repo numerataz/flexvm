@@ -307,3 +307,14 @@ PSCI power-off; x86 requests i8042 reset because Firecracker has no ACPI power-o
 device. This is client boot/execution acceptance, not software checkpoint or
 migration acceptance. Native x86/ARM CI masks both host virtualization devices,
 traces the entire host process tree and retains a digest-bearing report and logs.
+
+The native x86 engine check also cold-restores an outer VM with a running,
+unchanged Firecracker and inner Linux guest. With QEMU 10.2.1 and the
+`max,svm=on,npt=on,enforce=on` profile, the inner guest reaches an input gate
+after tick 0. QMP pauses and saves the outer VM, the source emulator exits,
+and a fresh emulator loads that state. Only the restored guest receives the
+release token and produces ticks 1 and 2, then both guests shut down. This
+verifies nested SVM state continuity in the execution engine. It does not yet
+provide checkpoint/restore through the production `flexvm software` lifecycle;
+that integration remains tracked in #1358. Both source and target process trees
+mask and trace host KVM and vhost-vsock, and panic or duplicate markers fail.
