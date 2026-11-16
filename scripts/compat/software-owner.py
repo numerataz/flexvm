@@ -90,7 +90,7 @@ def exercise(args):
                        'owner-test', '/owner-probe', 'exec', 'literal $HOME *', status=17)
         if executed.stdout != 'uid=1001 gid=1001 cwd=/tmp env=value arg=literal $HOME *\n' or 'OWNER_EXEC_STDERR' not in executed.stderr:
             raise RuntimeError(f'named exec changed argv/credentials/env/output: {executed}')
-        for _ in range(8):
+        for _ in range(args.pause_cycles):
             cli('pause', 'owner-test')
             if live('owner-test')['state'] != 'paused':
                 raise RuntimeError('pause did not publish verified engine state')
@@ -149,7 +149,7 @@ def exercise(args):
         for hold in (args.state / 'run').rglob('holds/*-*'):
             with hold.open('rb') as stream:
                 fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        evidence.update(status='passed', exec_status=17, owner_status=23, pause_cycles=8, owner_death_cleanup='passed')
+        evidence.update(status='passed', exec_status=17, owner_status=23, pause_cycles=args.pause_cycles, owner_death_cleanup='passed')
         (args.output / 'owner.json').write_text(json.dumps(evidence, indent=2) + '\n')
     finally:
         stop(owner)
@@ -162,6 +162,7 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--timeout', type=int, default=180)
     parser.add_argument('--cc', default='cc')
+    parser.add_argument('--pause-cycles', type=int, default=8)
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--state', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -173,6 +174,8 @@ def main():
         parser.error('run as root for image preparation and private device masking')
     if not 1 <= args.timeout <= 3600:
         parser.error('--timeout must be 1..3600 seconds')
+    if not 1 <= args.pause_cycles <= 1000:
+        parser.error('--pause-cycles must be 1..1000')
     args.output.mkdir(parents=True, exist_ok=True)
     report_path = args.output / 'report.json'
     if report_path.exists():
@@ -198,7 +201,7 @@ def main():
                        'for dev in /dev/kvm /dev/vhost-vsock; do if [ -e "$dev" ]; then mount --bind "$1" "$dev"; fi; done; shift; exec "$@"',
                        'sh', str(mask), 'strace', '-f', '-e', 'trace=file', '-o', str(trace), sys.executable, str(Path(__file__).resolve()),
                        '--worker', '--bin', str(args.bin), '--kernel', str(args.kernel), '--output', str(args.output), '--state', state,
-                       '--timeout', str(args.timeout)]
+                       '--timeout', str(args.timeout), '--pause-cycles', str(args.pause_cycles)]
             HELPERS['run'](command, args.timeout, args.output / 'worker.log')
             if any(f'"{dev}"' in trace.read_text(errors='replace') for dev in ('/dev/kvm', '/dev/vhost-vsock')):
                 raise RuntimeError('host virtualization device access; see files.strace')

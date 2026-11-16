@@ -97,6 +97,24 @@ fn runtime() -> io::Result<tokio::runtime::Runtime> {
 struct Serial {
     fd: tokio::io::unix::AsyncFd<File>,
     started: bool,
+    retry: Pin<Box<tokio::time::Sleep>>,
+}
+
+impl Serial {
+    fn new(fd: tokio::io::unix::AsyncFd<File>) -> Self {
+        Self { fd, started: false, retry: Box::pin(tokio::time::sleep(Duration::from_millis(10))) }
+    }
+
+    fn wait<T>(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<T>> {
+        // Tokio retains closed readiness permanently, but virtio-serial HUP
+        // means a reconnectable host peer. Its nonblocking I/O can still return
+        // EAGAIN. Yield and arrange a retry instead of spinning on cached HUP.
+        if self.retry.as_mut().poll(cx).is_ready() {
+            self.retry.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(10));
+            let _ = self.retry.as_mut().poll(cx);
+        }
+        Poll::Pending
+    }
 }
 
 impl AsyncRead for Serial {
@@ -107,7 +125,8 @@ impl AsyncRead for Serial {
             match ready.try_io(|fd| fd.get_mut().read(buf.initialize_unfilled())) {
                 Ok(Ok(0)) if !this.started => {
                     ready.clear_ready();
-                    return Poll::Pending;
+                    drop(ready);
+                    return this.wait(cx);
                 }
                 Ok(Ok(n)) => {
                     this.started |= n != 0;
@@ -116,7 +135,10 @@ impl AsyncRead for Serial {
                 }
                 Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Ok(Err(e)) => return Poll::Ready(Err(e)),
-                Err(_) => continue,
+                Err(_) => {
+                    drop(ready);
+                    return this.wait(cx);
+                }
             }
         }
     }
@@ -130,7 +152,15 @@ impl AsyncWrite for Serial {
             match ready.try_io(|fd| fd.get_mut().write(buf)) {
                 Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Ok(result) => return Poll::Ready(result),
-                Err(_) => continue,
+                Err(_) => {
+                    drop(ready);
+                    // A disconnected virtio port reports HUP while writes
+                    // return EAGAIN. End an established parser so it can reset.
+                    if this.started && hung_up(this.fd.as_raw_fd())? {
+                        return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
+                    }
+                    return this.wait(cx);
+                }
             }
         }
     }
@@ -153,7 +183,7 @@ pub fn serve(port: File, incoming: SyncSender<UnixStream>) -> io::Result<()> {
         // File owns the descriptor; it is never replaced or closed separately
         // while registered with the reactor.
         let fd = unsafe { tokio::io::unix::AsyncFd::register(port)? };
-        let io = Serial { fd, started: false };
+        let io = Serial::new(fd);
         let (_alive, stop) = watch::channel(false);
         drive(io, None, Some(incoming), stop).await
     })
@@ -531,6 +561,60 @@ mod tests {
         guest.read_exact(&mut first).unwrap();
         assert_eq!(&first, b"x");
         (host, guest)
+    }
+
+    #[test]
+    fn serial_reconnect_does_not_spin_on_cached_hangup_readiness() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "flexvm-serial-reconnect-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(path.clone());
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let reader = File::options().read(true).custom_flags(libc::O_NONBLOCK).open(&path).unwrap();
+        let first = File::options().write(true).custom_flags(libc::O_NONBLOCK).open(&path).unwrap();
+        drop(first);
+        runtime().unwrap().block_on(async {
+            let fd = unsafe { tokio::io::unix::AsyncFd::register(reader).unwrap() };
+            // Cache HUP, then reconnect the FIFO. The descriptor is unchanged,
+            // but reads now return EAGAIN: the same transition as virtio-serial.
+            fd.readable().await.unwrap().clear_ready();
+            let mut writer = File::options().write(true).custom_flags(libc::O_NONBLOCK).open(&path).unwrap();
+            let writing = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                writer.write_all(b"x")
+            });
+            let mut serial = Serial::new(fd);
+            let mut bytes = [0];
+            fn cpu_time() -> u64 {
+                let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) }, 0);
+                time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
+            }
+            let before = cpu_time();
+            let result = tokio::time::timeout(Duration::from_millis(30), serial.read(&mut bytes)).await;
+            let cpu_ns = cpu_time() - before;
+            writing.join().unwrap().unwrap();
+            assert!(cpu_ns < 10_000_000, "idle serial read burned {cpu_ns} ns of thread CPU in a 30 ms wait");
+            // A heavily descheduled test thread may see data before polling
+            // its expired timer. Either outcome must retain the byte exactly once.
+            match result {
+                Err(_) => assert_eq!(serial.read(&mut bytes).await.unwrap(), 1),
+                Ok(read) => assert_eq!(read.unwrap(), 1),
+            }
+            assert_eq!(&bytes, b"x");
+            assert_eq!(serial.read(&mut bytes).await.unwrap(), 0);
+        });
     }
 
     #[test]

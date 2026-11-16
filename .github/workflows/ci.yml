@@ -198,7 +198,7 @@ jobs:
           cat "$RUNNER_TEMP/software-serial/report.json"
       - name: Named software VM ownership without virtualization devices
         run: |
-          sudo python3 scripts/compat/software-owner.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-owner" --timeout 300
+          sudo python3 scripts/compat/software-owner.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-owner" --timeout 300 --pause-cycles 32
           cat "$RUNNER_TEMP/software-owner/report.json"
           sudo python3 scripts/compat/software-lifecycle.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-lifecycle" --timeout 600
           cat "$RUNNER_TEMP/software-lifecycle/report.json"
