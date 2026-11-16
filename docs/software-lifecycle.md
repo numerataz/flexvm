@@ -22,7 +22,18 @@ volatile RAM canary, advancing counters, a single workload boot, contiguous
 foreground output, retired engine cleanup and rejection of a corrupted kernel. It also injects a
 parent-directory fsync error after checkpoint replacement, explicitly rolls back
 the paused source and checks that a new capture succeeds without losing its
-verified inputs.
+verified inputs, including a foreground garbage-collection pass while the live
+engine retains the exchanged input bundle.
+
+Software staging and atomic journal writers use versioned temporary names and
+directory leases. Collection skips active captures and all prepared or consumed
+input bundles. After an exchange, an abandoned hidden input bundle is reclaimed
+only once its recorded engine identity is proven gone. Public checkpoint manifests,
+execution grants, retirement records and quarantined snapshots are preserved;
+only recognized journal temporaries are removed there. Earlier unleased temporary
+names are retained for compatibility with concurrent older writers. Runtime child
+registration and resource lease recovery after abrupt owner death remain tracked
+in #1388.
 
 ## Execution and state identity
 

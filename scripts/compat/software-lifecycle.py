@@ -92,6 +92,17 @@ def exercise(args):
                 if retried.returncode == 0 or 'unresolved' not in retried.stderr:
                     raise RuntimeError('retried stop overwrote the pending capture identity')
                 cli('unpause', 'state-test')
+                # The rollback keeps the consumed inputs at an exchange name.
+                # A sweep must preserve their links while QEMU still uses them.
+                hidden = list((args.state / 'state' / 'suspended').glob('.software-stage-v2-*'))
+                if not hidden:
+                    raise RuntimeError('replacement rollback did not retain the consumed inputs')
+                pinned = {str(path): (path.stat().st_ino, (path / 'kernel').stat().st_ino) for path in hidden}
+                cli('debug', 'gc')
+                if any(not Path(path).exists() or (Path(path).stat().st_ino, (Path(path) / 'kernel').stat().st_ino) != inode
+                       for path, inode in pinned.items()):
+                    raise RuntimeError('garbage collection removed live exchanged inputs')
+                evidence['live_input_gc'] = 'passed'
                 rolled_back = observation()
                 if rolled_back[:3] != first[:3] or rolled_back[3] < before[3]:
                     raise RuntimeError('publication rollback lost source identity')
