@@ -128,6 +128,32 @@ This case requires a KVM host and the expanded guest kernel with FUSE, TUN and
 container networking enabled. Rootless Docker and service-managed user sessions
 remain separate acceptance work in #1322/#1328.
 
+## Namespace sandbox acceptance
+
+The `namespace_sandboxes` E2E case installs ordinary Ubuntu packages for chroot,
+util-linux `unshare`, and bubblewrap. It verifies an isolated root filesystem,
+unprivileged user/PID/mount/network/UTS/IPC namespaces, read-only mounts, and an
+explicit seccomp filter. A live bubblewrap process must retain its random cookie,
+PID/start time and fresh in-memory counter progress through all lifecycle phases.
+
+The same case installs the complete SHA256-pinned upstream gVisor
+`release-20261109.0` archive for its architecture, including companion binaries.
+It selects `systrap`, with guest `/dev/kvm` and `/dev/vhost-vsock` masked. Real OCI
+containers exercise filesystem/process isolation, bridge DNS, outbound HTTP and
+published ports; their process identity, random cookie and fresh counter progress
+must survive suspend/start, checkpoint/restore and migration. This is gVisor's
+software isolation backend; outer FlexVM execution in this E2E case uses KVM.
+The runtime installation layout follows the [upstream guide](https://gvisor.dev/docs/user_guide/install/).
+
+```sh
+sudo scripts/e2e.py --jobs 1 --no-image --faults '' namespace_sandboxes
+```
+
+The coordinator supplies temporary test egress as for Podman. CI retains the
+machine-readable compatibility reports on success and failure. For configured
+hosts, `scripts/compat.py --workload scripts/compat/workloads/namespace-sandboxes.sh`
+also runs the workload with its ordinary source/peer lifecycle options.
+
 ## Initial audit
 
 The pinned 6.1.155 guest kernel passed the basic namespace, cgroup, overlay,
