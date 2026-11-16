@@ -203,7 +203,10 @@ impl Config {
             }
             let arch = std::env::consts::ARCH;
             let (board, cpu, console, block, vsock, nic) = match arch {
-                "x86_64" => ("q35", "max", "ttyS0", "virtio-blk-pci", "vhost-user-vsock-pci", "virtio-net-pci"),
+                // TCG implements AMD SVM: the ordinary guest Linux KVM driver
+                // supplies the ABI without a host KVM device. Enforce support
+                // instead of silently losing guest virtualization capabilities.
+                "x86_64" => ("q35", "max,svm=on,npt=on,enforce=on", "ttyS0", "virtio-blk-pci", "vhost-user-vsock-pci", "virtio-net-pci"),
                 "aarch64" => {
                     ("virt,virtualization=on,gic-version=3", "cortex-a72", "ttyAMA0", "virtio-blk-device", "vhost-user-vsock-device", "virtio-net-device")
                 }
@@ -307,6 +310,16 @@ fn remaining(deadline: Instant) -> Result<Duration> {
     Ok(left)
 }
 
+fn check_engine(greeting: &Value, arch: &str) -> Result<()> {
+    let version = &greeting["QMP"]["version"]["qemu"];
+    let major = version["major"].as_u64();
+    let minor = version["minor"].as_u64();
+    if arch == "x86_64" && !matches!((major, minor), (Some(major), Some(minor)) if (major, minor) >= (9, 2)) {
+        bail!("x86 software execution requires QEMU 9.2 or newer for correct SVM nested paging (found {version}); select a fixed engine with --qemu");
+    }
+    Ok(())
+}
+
 impl Machine {
     /// vhost-device-vsock 0.3 reads ahead and discards bytes after CONNECT.
     /// Wait for its OK before writing the agent command; Firecracker keeps its
@@ -355,9 +368,11 @@ impl Machine {
                 }
             }
         }
-        if reply(&mut r)?["QMP"].is_null() {
+        let greeting = reply(&mut r)?;
+        if greeting["QMP"].is_null() {
             bail!("missing QMP greeting");
         }
+        check_engine(&greeting, std::env::consts::ARCH)?;
         for action in ["qmp_capabilities", command] {
             r.get_mut().write_all(format!("{{\"execute\":\"{action}\"}}\n").as_bytes())?;
             reply(&mut r)?;
@@ -399,6 +414,16 @@ impl Machine {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn rejects_x86_engines_without_real_mode_nested_paging_fix() {
+        for (major, minor, supported) in [(8, 2, false), (9, 1, false), (9, 2, true), (10, 0, true)] {
+            let greeting = json!({"QMP":{"version":{"qemu":{"major":major,"minor":minor,"micro":0}}}});
+            assert_eq!(check_engine(&greeting, "x86_64").is_ok(), supported);
+            assert!(check_engine(&greeting, "aarch64").is_ok());
+        }
+        assert!(check_engine(&json!({"QMP":{}}), "x86_64").is_err());
+    }
 
     fn machine() -> Machine {
         let key = PathBuf::from(format!("software-test-{}", util::random_hex(16).unwrap()));

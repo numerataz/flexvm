@@ -162,6 +162,8 @@ static void concurrent_ram(int kvm, const struct kvm_cpuid2 *cpuid) {
 }
 
 int main(int argc, char **argv) {
+    // Preserve the last completed case when the watchdog must use _exit().
+    setvbuf(stdout, NULL, _IONBF, 0);
     REQUIRE(argc <= 2);
     signal(SIGALRM, expired);
     const char *path = argc == 2 ? argv[1] : "/dev/kvm";

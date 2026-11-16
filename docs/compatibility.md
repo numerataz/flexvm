@@ -220,8 +220,17 @@ nor `/dev/vhost-vsock`. The foreground command owns both engine processes and
 removes them when the guest command exits, startup fails, or it is interrupted.
 Image preparation currently requires root, as with the existing image builder.
 
-Install QEMU with its seccomp and userspace networking support, and the reviewed
-userspace vsock tool:
+Install QEMU with its seccomp and userspace networking support. The x86 software
+profile requires QEMU **9.2 or newer**: older engines omit nested page walks in
+real mode ([upstream fix b56617bbcb47](https://github.com/qemu/qemu/commit/b56617bbcb47)).
+Ubuntu 24.04's QEMU 8.2 reproduced a stall on the first nested vCPU run; disabling
+NPT passed the ABI probe but loses nested paging performance. FlexVM retains NPT
+and rejects old x86 engines before running the workload. CI builds the pinned
+10.2.1 source with `scripts/build-qemu.sh INSTALL_PREFIX`, then tests unchanged
+clients with both host virtualization devices masked. ARM retains its separately
+tested distribution engine and Cortex-A72 profile.
+
+Install the reviewed userspace vsock tool:
 
 ```sh
 cargo install vhost-device-vsock --version 0.3.0 --locked
@@ -245,9 +254,11 @@ VM records used by `ps`, `exec`, background/restart policies or the Docker API.
 Elastic memory, persistent lifecycle operations, checkpoint and migration still
 need integration. QEMU's vhost-user-vsock frontend currently blocks migration;
 its device state/reset contract must be implemented and tested before it can
-replace the existing Firecracker lifecycle path. ARM exposes emulated EL2 for
-the guest Linux KVM driver; x86 TCG does not yet provide the required VMX/SVM
-interface for unchanged nested KVM clients. These remain tracked in #1358/#1327.
+replace the existing Firecracker lifecycle path. ARM exposes emulated EL2, and
+x86 TCG exposes AMD SVM, for the ordinary guest Linux KVM drivers. Intel VMX is
+not the x86 software profile. The previous statement that TCG lacked both VMX
+and SVM was incorrect. Hierarchical lifecycle integration and optional
+parent-level child scheduling remain tracked in #1358/#1327.
 
 The native x86/ARM CI acceptance case masks both host virtualization devices,
 traces the complete process tree, pulls BusyBox, boots the real agent, and checks
@@ -285,3 +296,14 @@ This removes the vhost-user-vsock device from that execution profile. It is a
 prerequisite for software checkpoint integration, not a claim that persistent
 VM records, checkpoint/restore or migration are implemented. Vsock remains the
 default while the serial path's lifecycle behavior is established.
+
+`scripts/compat/software-kvm.py` runs real KVM clients inside an ordinary OCI
+image using the software CLI and serial agent transport. On x86 it runs all nine
+KVM ABI reference checks, including coherent/concurrent caller RAM, ioeventfd,
+descriptor lifetime and vCPU state. ARM runs its architecture-specific KVM probe.
+The same VM then runs an unchanged, pinned Firecracker binary, which boots an
+inner Linux guest, runs independent timer ticks and exits successfully. ARM uses
+PSCI power-off; x86 requests i8042 reset because Firecracker has no ACPI power-off
+device. This is client boot/execution acceptance, not software checkpoint or
+migration acceptance. Native x86/ARM CI masks both host virtualization devices,
+traces the entire host process tree and retains a digest-bearing report and logs.
