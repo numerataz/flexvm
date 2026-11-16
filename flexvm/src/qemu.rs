@@ -4,7 +4,7 @@
 //! templates/checkpoints; native QEMU vhost-user-vsock is not yet migratable.
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 
 use crate::socket::{SocketRoot, Sockets};
 use crate::util::{By, Result};
-use crate::{bail, guest, template, util};
+use crate::{bail, guest, software_state, template, util};
 
 #[path = "../../guest/src/control.rs"]
 #[allow(dead_code)]
@@ -73,11 +73,16 @@ impl Processes {
     }
 
     fn spawn(&self, cmd: &mut Command, log: &Path) -> Result<()> {
+        self.spawn_with_fds(cmd, log, &[])
+    }
+
+    fn spawn_with_fds(&self, cmd: &mut Command, log: &Path, inherited: &[RawFd]) -> Result<()> {
         template::interrupted()?;
         File::create(log)?;
         let (mut reader, writer) = std::io::pipe()?;
         cmd.stdin(Stdio::null()).stdout(writer.try_clone()?).stderr(writer);
         let parent = unsafe { libc::getpid() };
+        let inherited = inherited.to_vec();
         // An abrupt owner exit also kills its engines; no shell/helper processes.
         unsafe {
             cmd.pre_exec(move || {
@@ -91,6 +96,12 @@ impl Processes {
                 }
                 if libc::getppid() != parent {
                     return Err(std::io::Error::other("software VM owner exited before spawn"));
+                }
+                for fd in &inherited {
+                    let flags = libc::fcntl(*fd, libc::F_GETFD);
+                    if flags < 0 || libc::fcntl(*fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
                 Ok(())
             });
@@ -137,7 +148,26 @@ impl Processes {
     }
 }
 
+#[derive(Default, PartialEq)]
+enum Capture {
+    #[default]
+    None,
+    Exported,
+    Uncertain,
+}
+
+struct Endpoints<'a> {
+    api: &'a Path,
+    control: &'a Path,
+    backend: &'a Path,
+    firmware: &'a Path,
+}
+
 pub struct Machine {
+    inputs: Option<software_state::Inputs>,
+    profile: software_state::Profile,
+    engine_version: Value,
+    capture: Mutex<Capture>,
     processes: Arc<Processes>,
     sockets: Sockets,
     logs: PathBuf,
@@ -174,6 +204,14 @@ impl Drop for Machine {
 
 impl Config {
     pub fn validate(&self) -> Result<()> {
+        self.validate_limits()?;
+        if !self.kernel.is_file() {
+            bail!("software kernel is not a file: {}", self.kernel.display());
+        }
+        Ok(())
+    }
+
+    fn validate_limits(&self) -> Result<()> {
         if !(128..=1_048_576).contains(&self.mem_mib) {
             bail!("software --mem must be 128..1048576 MiB");
         }
@@ -183,23 +221,113 @@ impl Config {
         if self.boot_timeout.is_zero() || self.boot_timeout > Duration::from_secs(3600) {
             bail!("software --timeout must be 1..3600 seconds (boot only)");
         }
-        if !self.kernel.is_file() {
-            bail!("software kernel is not a file: {}", self.kernel.display());
-        }
         Ok(())
     }
 
+    fn command(&self, engine: &Path, kernel: &Path, rootfs: &Path, endpoints: &Endpoints<'_>) -> Result<Command> {
+        let arch = std::env::consts::ARCH;
+        let (board, cpu, console, block, vsock, nic) = match arch {
+            // TCG implements AMD SVM: the ordinary guest Linux KVM driver
+            // supplies the ABI without a host KVM device. Enforce support
+            // instead of silently losing guest virtualization capabilities.
+            "x86_64" => ("q35", "max,svm=on,npt=on,enforce=on", "ttyS0", "virtio-blk-pci", "vhost-user-vsock-pci", "virtio-net-pci"),
+            "aarch64" => ("virt,virtualization=on,gic-version=3", "cortex-a72", "ttyAMA0", "virtio-blk-device", "vhost-user-vsock-device", "virtio-net-device"),
+            _ => bail!("software execution is not implemented for {arch}"),
+        };
+        let mut cmd = Command::new(engine);
+        cmd.arg("-L").arg(endpoints.firmware);
+        cmd.args(["-machine", &format!("{board},memory-backend=ram"), "-accel", "tcg,thread=multi", "-cpu", cpu]);
+        cmd.args(["-m", &self.mem_mib.to_string(), "-smp", &self.vcpus.to_string()]);
+        cmd.args(["-object", &json!({"qom-type":"memory-backend-memfd", "id":"ram", "size":u64::from(self.mem_mib)<<20, "share":true}).to_string()]);
+        cmd.args(["-display", "none", "-monitor", "none", "-serial", "stdio", "-no-reboot"]);
+        cmd.args(["-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"]);
+        let control_arg = if self.control == Control::Serial { " flexvm.control=serial" } else { "" };
+        cmd.arg("-kernel").arg(kernel).args([
+            "-append",
+            &format!("console={console} quiet panic=1 root=/dev/vda ro init=/sbin/flexvm-init flexvm.tmpfs_mib={}{}", self.mem_mib, control_arg),
+        ]);
+        cmd.args([
+            "-blockdev",
+            &json!({"driver":"raw", "node-name":"root", "read-only":true, "file":{"driver":"file", "filename":rootfs}}).to_string(),
+            "-device",
+            &format!("{block},drive=root"),
+        ]);
+        // Private short socket paths contain no keyval separators.
+        if self.control == Control::Vsock {
+            cmd.args(["-chardev", &format!("socket,id=vsock,path={}", endpoints.backend.display()), "-device", &format!("{vsock},chardev=vsock")]);
+        } else {
+            let device = if arch == "x86_64" { "virtio-serial-pci" } else { "virtio-serial-device" };
+            cmd.args(["-device", &format!("{device},id=controlbus")]);
+            cmd.args(["-chardev", &format!("socket,id=control,path={},server=on,wait=off", endpoints.control.display())]);
+            cmd.args(["-device", &format!("virtserialport,bus=controlbus.0,chardev=control,name={}", control::PORT_NAME)]);
+        }
+        // Match the agent's existing static gateway and /32 configuration.
+        cmd.args([
+            "-netdev",
+            "user,id=net,net=169.254.0.0/16,host=169.254.1.1,dns=169.254.1.3,dhcpstart=169.254.1.2,ipv6=off",
+            "-device",
+            &format!("{nic},netdev=net"),
+        ]);
+        cmd.args(["-qmp", &format!("unix:{},server=on,wait=off", endpoints.api.display())]);
+        Ok(cmd)
+    }
+
+    pub fn profile(&self) -> Result<software_state::Profile> {
+        let endpoints =
+            Endpoints { api: Path::new("@qmp"), control: Path::new("@control"), backend: Path::new("@vsock-backend"), firmware: Path::new("@firmware") };
+        let command = self.command(Path::new("@engine"), Path::new("@kernel"), Path::new("@rootfs"), &endpoints)?;
+        Ok(software_state::Profile {
+            architecture: std::env::consts::ARCH.into(),
+            arguments: command
+                .get_args()
+                .map(|arg| arg.to_str().map(str::to_owned).ok_or_else(|| "software profile contains a non-UTF8 argument".into()))
+                .collect::<Result<_>>()?,
+        })
+    }
+
     pub fn boot(&self, rootfs: &Path, processes: Arc<Processes>) -> Result<Machine> {
-        self.validate()?;
-        let rootfs = rootfs.canonicalize()?;
-        let kernel = self.kernel.canonicalize()?;
+        let inputs = software_state::Inputs::open(&self.qemu, &self.kernel, rootfs)?;
+        self.launch(inputs, processes, None)
+    }
+
+    /// Load state into a fresh engine, with CPUs paused and public admission closed.
+    pub fn restore(&self, verified: software_state::Verified, processes: Arc<Processes>) -> Result<Machine> {
+        if self.control != Control::Serial {
+            bail!("software restore requires serial control");
+        }
+        if self.profile()? != verified.manifest.profile {
+            bail!("software restore configuration changed after artifact validation");
+        }
+        self.launch(verified.inputs, processes, Some((&verified.state.file, &verified.manifest.engine_version)))
+    }
+
+    fn launch(&self, inputs: software_state::Inputs, processes: Arc<Processes>, incoming: Option<(&File, &Value)>) -> Result<Machine> {
+        // Restore uses pinned artifacts and does not require the original input paths.
+        self.validate_limits()?;
+        inputs.engine.unchanged()?;
+        inputs.kernel.unchanged()?;
+        inputs.rootfs.unchanged()?;
+        let profile = self.profile()?;
         let key = PathBuf::from(format!("software-{}-{}", std::process::id(), util::random_hex(16)?));
         let root = SocketRoot::unique(&key)?;
         let sockets = root.allocate()?;
         let logs = root.dir.join("logs");
         fs::create_dir(&logs)?;
-        let mut machine = Machine { processes, sockets, logs, control: None };
+        let kernel = PathBuf::from(format!("/proc/self/fd/{}", inputs.kernel.file.as_raw_fd()));
+        let rootfs = PathBuf::from(format!("/proc/self/fd/{}", inputs.rootfs.file.as_raw_fd()));
+        let engine = PathBuf::from(format!("/proc/self/fd/{}", inputs.engine.file.as_raw_fd()));
+        let mut inherited = vec![inputs.engine.file.as_raw_fd(), inputs.kernel.file.as_raw_fd(), inputs.rootfs.file.as_raw_fd()];
+        let mut machine =
+            Machine { inputs: Some(inputs), profile, engine_version: Value::Null, capture: Mutex::default(), processes, sockets, logs, control: None };
+        let firmware = machine.logs.join("firmware");
         let result = (|| -> Result<()> {
+            fs::create_dir(&firmware)?;
+            for (name, input) in &machine.inputs.as_ref().ok_or("software inputs are missing")?.firmware {
+                input.unchanged()?;
+                let fd = input.file.as_raw_fd();
+                inherited.push(fd);
+                std::os::unix::fs::symlink(format!("/proc/self/fd/{fd}"), firmware.join(name))?;
+            }
             let vhost = machine.sockets.uffd.clone();
             let deadline = Instant::now() + self.boot_timeout;
             if self.control == Control::Vsock {
@@ -214,52 +342,33 @@ impl Config {
                     std::thread::sleep(Duration::from_millis(10));
                 }
             }
-            let arch = std::env::consts::ARCH;
-            let (board, cpu, console, block, vsock, nic) = match arch {
-                // TCG implements AMD SVM: the ordinary guest Linux KVM driver
-                // supplies the ABI without a host KVM device. Enforce support
-                // instead of silently losing guest virtualization capabilities.
-                "x86_64" => ("q35", "max,svm=on,npt=on,enforce=on", "ttyS0", "virtio-blk-pci", "vhost-user-vsock-pci", "virtio-net-pci"),
-                "aarch64" => {
-                    ("virt,virtualization=on,gic-version=3", "cortex-a72", "ttyAMA0", "virtio-blk-device", "vhost-user-vsock-device", "virtio-net-device")
-                }
-                _ => bail!("software execution is not implemented for {arch}"),
-            };
-            let mut cmd = Command::new(&self.qemu);
-            cmd.args(["-machine", &format!("{board},memory-backend=ram"), "-accel", "tcg,thread=multi", "-cpu", cpu]);
-            cmd.args(["-m", &self.mem_mib.to_string(), "-smp", &self.vcpus.to_string()]);
-            cmd.args(["-object", &json!({"qom-type":"memory-backend-memfd", "id":"ram", "size":u64::from(self.mem_mib)<<20, "share":true}).to_string()]);
-            cmd.args(["-display", "none", "-monitor", "none", "-serial", "stdio", "-no-reboot"]);
-            cmd.args(["-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"]);
-            let control_arg = if self.control == Control::Serial { " flexvm.control=serial" } else { "" };
-            cmd.arg("-kernel").arg(&kernel).args([
-                "-append",
-                &format!("console={console} quiet panic=1 root=/dev/vda ro init=/sbin/flexvm-init flexvm.tmpfs_mib={}{}", self.mem_mib, control_arg),
-            ]);
-            cmd.args([
-                "-blockdev",
-                &json!({"driver":"raw", "node-name":"root", "read-only":true, "file":{"driver":"file", "filename":rootfs}}).to_string(),
-                "-device",
-                &format!("{block},drive=root"),
-            ]);
-            // Private short socket paths contain no keyval separators.
-            if self.control == Control::Vsock {
-                cmd.args(["-chardev", &format!("socket,id=vsock,path={}", vhost.display()), "-device", &format!("{vsock},chardev=vsock")]);
-            } else {
-                let device = if arch == "x86_64" { "virtio-serial-pci" } else { "virtio-serial-device" };
-                cmd.args(["-device", &format!("{device},id=controlbus")]);
-                cmd.args(["-chardev", &format!("socket,id=control,path={},server=on,wait=off", machine.sockets.vsock.display())]);
-                cmd.args(["-device", &format!("virtserialport,bus=controlbus.0,chardev=control,name={}", control::PORT_NAME)]);
+            let endpoints = Endpoints { api: &machine.sockets.api, control: &machine.sockets.vsock, backend: &machine.sockets.uffd, firmware: &firmware };
+            let mut cmd = self.command(&engine, &kernel, &rootfs, &endpoints)?;
+            if incoming.is_some() {
+                cmd.args(["-incoming", "defer", "-S"]);
             }
-            // Match the agent's existing static gateway and /32 configuration.
-            cmd.args([
-                "-netdev",
-                "user,id=net,net=169.254.0.0/16,host=169.254.1.1,dns=169.254.1.3,dhcpstart=169.254.1.2,ipv6=off",
-                "-device",
-                &format!("{nic},netdev=net"),
-            ]);
-            cmd.args(["-qmp", &format!("unix:{},server=on,wait=off", machine.sockets.api.display())]);
-            machine.processes.spawn(&mut cmd, &machine.logs.join("qemu.log"))?;
+            machine.processes.spawn_with_fds(&mut cmd, &machine.logs.join("qemu.log"), &inherited)?;
+            while !machine.sockets.api.exists() {
+                machine.processes.alive()?;
+                remaining(deadline)?;
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let mut qmp = Qmp::connect(&machine.sockets.api, deadline)?;
+            machine.engine_version = qmp.command("query-version", json!({}), &[])?;
+            if let Some((state, expected_version)) = incoming {
+                if machine.engine_version != *expected_version {
+                    bail!("software engine version differs from the captured profile");
+                }
+                qmp.command("getfd", json!({"fdname":"restore"}), &[state.as_raw_fd()])?;
+                qmp.command("migrate-incoming", json!({"uri":"fd:restore"}), &[])?;
+                machine.wait_migration(&mut qmp, deadline, true)?;
+                let status = qmp.command("query-status", json!({}), &[])?;
+                if status["running"] != false || status["status"] != "paused" {
+                    bail!("restored engine is not paused: {status}");
+                }
+                return Ok(());
+            }
+            drop(qmp);
             crate::info!("software: waiting for guest agent");
             // The userspace device accepts host connections before the guest's
             // queues are initialized. Do not send requests into that boot window.
@@ -325,7 +434,7 @@ impl Config {
 fn remaining(deadline: Instant) -> Result<Duration> {
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
-        bail!("software VM boot timed out");
+        bail!("software VM operation timed out");
     }
     Ok(left)
 }
@@ -350,7 +459,16 @@ struct Qmp {
 
 impl Qmp {
     fn connect(path: &Path, deadline: Instant) -> Result<Self> {
-        let stream = util::connect_unix(path, remaining(deadline)?)?;
+        let stream = loop {
+            match util::connect_unix(path, remaining(deadline)?) {
+                Ok(stream) => break stream,
+                Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ECONNREFUSED)) => {
+                    remaining(deadline)?;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
         let mut qmp = Self { reader: BufReader::new(By { s: stream, at: deadline }), next_id: 0, broken: false };
         let greeting = qmp.reply()?;
         if greeting["QMP"].is_null() {
@@ -404,6 +522,108 @@ impl Qmp {
 }
 
 impl Machine {
+    /// The caller owns the admission/CPU boundary and the output artifact. A
+    /// failed export does not authorize source resume: cancel and verify first.
+    pub fn save(&self, state: &File, deadline: Instant) -> Result<()> {
+        let mut capture = self.capture.lock().unwrap();
+        if *capture != Capture::None {
+            bail!("software state capture is unresolved");
+        }
+        let mut qmp = Qmp::connect(&self.sockets.api, deadline)?;
+        let status = qmp.command("query-status", json!({}), &[])?;
+        if status["running"] != false || status["status"] != "paused" {
+            bail!("software state capture requires a paused engine: {status}");
+        }
+        // Neither a completed export nor an ambiguous failure can be undone by
+        // an ordinary cont. The owner must either retire this engine or resolve
+        // the capture before explicitly authorizing source execution again.
+        *capture = Capture::Uncertain;
+        qmp.command("migrate-set-parameters", json!({"max-bandwidth":64u64 << 30}), &[])?;
+        qmp.command("getfd", json!({"fdname":"snapshot"}), &[state.as_raw_fd()])?;
+        qmp.command("migrate", json!({"uri":"fd:snapshot"}), &[])?;
+        self.wait_migration(&mut qmp, deadline, false)?;
+        *capture = Capture::Exported;
+        Ok(())
+    }
+
+    /// Only an owner that still holds CPU/disk authority may use this rollback.
+    /// It is forbidden once the artifact or a transfer grants another owner execution.
+    pub fn resume_source(&self, deadline: Instant) -> Result<()> {
+        let mut capture = self.capture.lock().unwrap();
+        if *capture == Capture::None {
+            bail!("software VM has no capture to resolve");
+        }
+        let result = (|| {
+            let mut qmp = Qmp::connect(&self.sockets.api, deadline)?;
+            let mut cancelling = false;
+            loop {
+                self.processes.alive()?;
+                remaining(deadline)?;
+                let state = qmp.command("query-migrate", json!({}), &[])?;
+                match state["status"].as_str() {
+                    None | Some("none" | "cancelled" | "failed" | "completed") => break,
+                    Some("setup" | "active" | "device" | "wait-unplug" | "cancelling") => {
+                        if !cancelling {
+                            qmp.command("migrate_cancel", json!({}), &[])?;
+                            cancelling = true;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    _ => bail!("cannot resolve software capture: {state}"),
+                }
+            }
+            let status = qmp.command("query-status", json!({}), &[])?;
+            if status["running"] != false || !matches!(status["status"].as_str(), Some("paused" | "postmigrate")) {
+                bail!("source is not fenced at a paused capture boundary: {status}");
+            }
+            qmp.command("cont", json!({}), &[])?;
+            let status = qmp.command("query-status", json!({}), &[])?;
+            if status["running"] != true || status["status"] != "running" {
+                bail!("software source did not resume: {status}");
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                *capture = Capture::None;
+                Ok(())
+            }
+            Err(error) => {
+                *capture = Capture::Uncertain;
+                self.processes.stop();
+                Err(error)
+            }
+        }
+    }
+
+    fn wait_migration(&self, qmp: &mut Qmp, deadline: Instant, incoming: bool) -> Result<()> {
+        loop {
+            self.processes.alive()?;
+            remaining(deadline)?;
+            let state = qmp.command("query-migrate", json!({}), &[])?;
+            match state["status"].as_str() {
+                Some("completed") => return Ok(()),
+                Some("setup" | "active" | "device" | "wait-unplug") => {}
+                None | Some("none") if incoming => {}
+                _ => bail!("software state transfer failed: {state}"),
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    pub fn disconnect_control(&mut self) {
+        self.control.take();
+    }
+
+    pub fn reconnect_control(&mut self, deadline: Instant) -> Result<()> {
+        if self.control.is_some() {
+            bail!("software control is already connected");
+        }
+        let stream = util::connect_unix(&self.sockets.vsock, remaining(deadline)?)?;
+        self.control = Some(control::Client::connect(stream)?);
+        Ok(())
+    }
+
     /// vhost-device-vsock 0.3 reads ahead and discards bytes after CONNECT.
     /// Wait for its OK before writing the agent command; Firecracker keeps its
     /// existing pipelined handshake and does not pay this extra round trip.
@@ -434,6 +654,10 @@ impl Machine {
     }
 
     pub fn switch(&self, command: &str, deadline: Instant) -> Result<()> {
+        let capture = self.capture.lock().unwrap();
+        if *capture != Capture::None {
+            bail!("software state capture must be resolved before changing CPU state");
+        }
         let mut qmp = Qmp::connect(&self.sockets.api, deadline)?;
         qmp.command(command, json!({}), &[])?;
         let state = qmp.command("query-status", json!({}), &[])?;
@@ -502,6 +726,169 @@ mod tests {
         writeln!(reader.get_mut(), "{}", json!({"return":{},"id":capabilities["id"]})).unwrap();
         assert!(reader.buffer().is_empty());
         reader.into_inner()
+    }
+
+    #[test]
+    fn unresolved_capture_blocks_ordinary_resume_and_cancellation_is_verified() {
+        let machine = machine();
+        *machine.capture.lock().unwrap() = Capture::Exported;
+        assert!(machine.switch("cont", Instant::now() + Duration::from_secs(2)).is_err());
+        let listener = UnixListener::bind(&machine.sockets.api).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut reader = BufReader::new(qmp_peer(listener));
+            for (command, result) in [
+                ("query-migrate", json!({"status":"active"})),
+                ("migrate_cancel", json!({})),
+                ("query-migrate", json!({"status":"cancelled"})),
+                ("query-status", json!({"status":"paused","running":false})),
+                ("cont", json!({})),
+                ("query-status", json!({"status":"running","running":true})),
+            ] {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["execute"], command);
+                writeln!(reader.get_mut(), "{}", json!({"return":result,"id":request["id"]})).unwrap();
+            }
+        });
+        machine.resume_source(Instant::now() + Duration::from_secs(2)).unwrap();
+        assert!(*machine.capture.lock().unwrap() == Capture::None);
+        server.join().unwrap();
+    }
+
+    /// Run explicitly with the native pinned kernel and a local OCI state-probe image.
+    /// This is the actual image preparation + guest agent path, not a replacement init.
+    #[test]
+    #[ignore = "requires root, native QEMU, kernel and state-probe OCI image"]
+    fn real_agent_cold_restore_preserves_process_ram_and_sessions() {
+        use std::os::unix::fs::DirBuilderExt;
+        let image = std::env::var("FLEXVM_SOFTWARE_TEST_IMAGE").expect("local state-probe OCI image");
+        let kernel = std::env::var_os("FLEXVM_SOFTWARE_TEST_KERNEL").expect("native FlexVM kernel");
+        let dir = PathBuf::from(format!("/var/lib/flexvm-state-test-{}", util::random_hex(16).unwrap()));
+        fs::DirBuilder::new().mode(0o700).create(&dir).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        let options = crate::image::Options { image, staging: dir.join("staging"), ..Default::default() };
+        let (rootfs, meta, _reservation, _use_lock) = crate::image::prepare(&dir.join("images"), None, &options).unwrap();
+        let mut config = Config {
+            control: Control::Serial,
+            kernel: kernel.into(),
+            qemu: std::env::var("FLEXVM_SOFTWARE_TEST_QEMU").unwrap_or_else(|_| format!("qemu-system-{}", std::env::consts::ARCH)),
+            vsock_backend: String::new(),
+            mem_mib: 512,
+            vcpus: 1,
+            boot_timeout: Duration::from_secs(60),
+        };
+        let source = Arc::new(Processes::default());
+        let mut machine = config.boot(&rootfs, source.clone()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        assert_eq!(machine.message("FENCE 1 42", deadline).unwrap(), b"ok 1");
+        let (id, mut output) = machine.start_exec(meta.argv.clone()).unwrap();
+        machine.exec_started(&mut output, &id).unwrap();
+        fn observation(machine: &Machine, deadline: Instant) -> Vec<u64> {
+            loop {
+                assert!(Instant::now() < deadline);
+                let mut bytes = Vec::new();
+                let code = machine
+                    .exec(vec!["/state-probe".into(), "status".into()], |_, data| {
+                        bytes.extend_from_slice(data);
+                        Ok(())
+                    })
+                    .unwrap();
+                if code == 0 {
+                    return String::from_utf8(bytes).unwrap().split_whitespace().map(|n| n.parse().unwrap()).collect();
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let before = observation(&machine, deadline);
+        assert_eq!(before.len(), 5);
+        assert_eq!(machine.message("BARRIER 1 QUIESCE 1 42 1", deadline).unwrap(), b"ok BARRIER 1 QUIESCED 1 1");
+        drop(output);
+        machine.disconnect_control();
+        // Wait for the guest to discard the old Yamux parser and arm a fresh
+        // serial transport before saving it. A new owner cannot reuse its peer.
+        loop {
+            assert!(Instant::now() < deadline, "guest serial reset did not finish");
+            let log = fs::read_to_string(machine.logs.join("qemu.log")).unwrap();
+            if log.lines().filter(|line| line.contains("flexvm-init: serial control ready")).count() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        machine.switch("stop", deadline).unwrap();
+        let staging = software_state::Staging::new(&dir).unwrap();
+        machine.save(&staging.state, deadline).unwrap();
+        assert!(machine.switch("cont", deadline).unwrap_err().to_string().contains("capture must be resolved"));
+        let blank = software_state::Artifact { bytes: 0, sha256: String::new() };
+        let manifest = software_state::Manifest {
+            format: 1,
+            backend: "qemu-tcg".into(),
+            vm_id: util::random_hex(16).unwrap(),
+            owner_generation: 1,
+            saved_epoch: 42,
+            barrier_sequence: 1,
+            profile: machine.profile.clone(),
+            engine_version: machine.engine_version.clone(),
+            engine: blank.clone(),
+            kernel: blank.clone(),
+            rootfs: blank.clone(),
+            state: blank,
+            firmware: std::collections::BTreeMap::new(),
+            main: software_state::Session { id: id.clone(), offset: 0, claim: 0 },
+            image: meta,
+        };
+        let checkpoint = dir.join("checkpoint");
+        staging.commit(&checkpoint, machine.inputs.as_ref().unwrap(), manifest).unwrap();
+        let old_engine = source.engine_ident().unwrap();
+        source.stop();
+        drop(machine);
+        assert!(!old_engine.alive());
+        let verified = software_state::open(&checkpoint, &config.profile().unwrap()).unwrap();
+        fs::rename(&checkpoint, dir.join("saved-artifacts")).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&checkpoint).unwrap();
+        config.kernel = PathBuf::from("/missing-original-kernel");
+        config.qemu = "/missing-original-engine".into();
+        let target = Arc::new(Processes::default());
+        let mut machine = config.restore(verified, target).unwrap();
+        machine.switch("cont", deadline).unwrap();
+        machine.reconnect_control(deadline).unwrap();
+        assert_eq!(machine.message("PING", deadline).unwrap(), b"pong");
+        assert_eq!(machine.message("FENCE 2 84", deadline).unwrap(), b"ok 2");
+        assert_ne!(machine.message("FENCE 1 42", deadline).unwrap(), b"ok 1");
+        assert_ne!(machine.message("BARRIER 1 RESUME 2 84 1 99", deadline).unwrap(), b"ok BARRIER 1 RESUMED 1 99");
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        let clock = format!("BARRIER 1 MAINT 2 84 CLOCK {}.{:09}", now.as_secs(), now.subsec_nanos());
+        assert!(machine.message(&clock, deadline).unwrap().starts_with(b"ok "));
+        assert_eq!(machine.message("BARRIER 1 RESUME 2 84 1 1", deadline).unwrap(), b"ok BARRIER 1 RESUMED 1 1");
+        let after = loop {
+            let seen = observation(&machine, deadline);
+            if seen[3] > before[3] {
+                break seen;
+            }
+        };
+        assert_eq!(&before[..3], &after[..3], "PID, start time or random RAM canary changed");
+        assert!(after[4] >= before[4], "guest monotonic clock went backwards");
+        let line = guest::attach_line(&id, 0, 1, 84, guest::AttachForm::Epoch, false).unwrap();
+        let mut session = machine.request(&line, deadline).unwrap();
+        assert_eq!(guest::read_frame(&mut By { s: &mut session, at: deadline }).unwrap(), Some((guest::FRAME_MSG, id.into_bytes())));
+        let mut live_output = Vec::new();
+        loop {
+            let (kind, data) = guest::read_frame(&mut By { s: &mut session, at: deadline }).unwrap().unwrap();
+            if kind == guest::FRAME_STDOUT {
+                live_output.extend_from_slice(&data[8..]);
+                let text = String::from_utf8_lossy(&live_output);
+                if text.lines().filter_map(|line| line.strip_prefix("STATE_TICK ")).filter_map(|n| n.parse::<u64>().ok()).any(|n| n > after[3]) {
+                    assert_eq!(text.matches("STATE_WORKLOAD_BOOT").count(), 1);
+                    break;
+                }
+            }
+        }
     }
 
     #[test]
@@ -608,7 +995,16 @@ mod tests {
         let sockets = root.allocate().unwrap();
         let logs = root.dir.join("logs");
         fs::create_dir(&logs).unwrap();
-        Machine { processes: Arc::new(Processes::default()), sockets, logs, control: None }
+        Machine {
+            inputs: None,
+            profile: software_state::Profile { architecture: std::env::consts::ARCH.into(), arguments: Vec::new() },
+            engine_version: Value::Null,
+            capture: Mutex::default(),
+            processes: Arc::new(Processes::default()),
+            sockets,
+            logs,
+            control: None,
+        }
     }
 
     #[test]

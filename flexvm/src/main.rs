@@ -28,6 +28,7 @@ mod qemu;
 mod restart;
 mod socket;
 mod software;
+mod software_state;
 mod standby;
 mod template;
 mod uffd;
