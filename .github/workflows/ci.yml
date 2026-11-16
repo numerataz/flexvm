@@ -315,6 +315,72 @@ jobs:
             ${{ runner.temp }}/software-modules/*.strace
           if-no-files-found: warn
 
+  software-workloads:
+    name: guest workload without KVM (${{ matrix.arch }}, ${{ matrix.workload }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+        workload: [podman, namespace-sandboxes]
+        include:
+          - { arch: x86_64, runner: ubuntu-24.04, qemu: qemu-system-x86 }
+          - { arch: aarch64, runner: ubuntu-24.04-arm, qemu: qemu-system-arm }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends ${{ matrix.qemu }} strace build-essential flex bison bc libelf-dev libssl-dev dwarves xz-utils kmod pkg-config zlib1g-dev libzstd-dev
+      - name: Cache fixed x86 software CPU engine
+        if: matrix.arch == 'x86_64'
+        id: software-qemu
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/software-qemu
+          key: software-qemu-x86_64-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch') }}
+      - name: Install fixed x86 software CPU engine
+        if: matrix.arch == 'x86_64'
+        run: |
+          if [ ! -x "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" ]; then
+            sudo apt-get install -y -q --no-install-recommends ninja-build python3-venv libglib2.0-dev libpixman-1-dev libslirp-dev libseccomp-dev libfdt-dev
+            scripts/build-qemu.sh "$RUNNER_TEMP/software-qemu"
+          fi
+          sudo ln -sf "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" /usr/local/bin/qemu-system-x86_64
+          sudo qemu-system-x86_64 --version
+      - name: Kernel artifact directory
+        run: sudo install -d -o "$(id -u)" -g "$(id -g)" "$RUNNER_TEMP/software-state/artifacts"
+      - name: Matching kernel runtime artifacts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/software-state/artifacts
+          key: workload-artifacts-${{ matrix.arch }}-${{ hashFiles('scripts/build-kernel.sh', 'scripts/package-kernel-modules.sh', 'scripts/fetch.sh', 'scripts/versions.sh', 'scripts/checksums.sha256', 'kernel/config/*', 'kernel/features*.config', 'kernel/source.env') }}
+      - name: Fetch matching kernel and runtime modules
+        run: scripts/fetch.sh --kernel --state "$RUNNER_TEMP/software-state"
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build FlexVM
+        run: cargo build --release -p flexvm
+      - name: Guest workload and fresh-owner software restoration
+        run: |
+          sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --workload "scripts/compat/workloads/${{ matrix.workload }}.sh" --require storage.fuse --output "$RUNNER_TEMP/software-workload" --timeout 1800
+          cat "$RUNNER_TEMP/software-workload/report.json"
+      - name: Upload software workload evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: software-workload-${{ matrix.arch }}-${{ matrix.workload }}
+          path: |
+            ${{ runner.temp }}/software-workload/*.json
+            ${{ runner.temp }}/software-workload/*.log
+            ${{ runner.temp }}/software-workload/*.strace
+          if-no-files-found: warn
+
   kvm-aarch64:
     name: KVM probe (aarch64)
     runs-on: ubuntu-24.04-arm
