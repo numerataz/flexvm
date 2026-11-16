@@ -57,10 +57,11 @@ elif verb == 'rmi':
 elif verb == 'exec' and '-s' in args:
     script = sys.stdin.read()
     step = args[args.index('--') + 1]
-    state.setdefault('workload_steps', []).append(step)
+    kind = 'inode' if 'flexvm-root-inodes-' in script else 'workload'
+    state.setdefault(kind + '_steps', []).append(step)
     state_path.write_text(json.dumps(state))
-    if os.environ.get('FAIL_WORKLOAD') == step: sys.exit(22)
-    print('workload-' + step)
+    if os.environ.get('FAIL_' + kind.upper()) == step: sys.exit(22)
+    print(kind + '-' + step)
 elif verb == 'exec' and any(a.startswith('/tmp/flexvm-probe-') for a in args) and 'if [ -e' not in ' '.join(args):
     if os.environ.get('DELAY_PROBE'): time.sleep(30)
     print(json.dumps({'schema_version': 1, 'probes': [
@@ -118,6 +119,9 @@ class Harness(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         state = json.loads((self.root / 'state').read_text())
         self.assertEqual(state['workload_steps'], ['prepare', 'verify', 'verify', 'verify'])
+        self.assertEqual(state['inode_steps'], ['prepare', 'verify', 'verify', 'verify'])
+        self.assertEqual(self.report()['root_filesystem'], 'inode-prepare\n')
+        self.assertTrue(all(p['inode_identity'] == 'inode-verify\n' for p in self.report()['phases']))
         self.assertEqual(self.report()['workload']['name'], workload.name)
         self.assertEqual(len(self.report()['workload']['sha256']), 64)
         self.assertTrue(all(p['workload'] == 'workload-verify\n' for p in self.report()['phases']))
@@ -129,6 +133,16 @@ class Harness(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(self.report()['phases'][0]['status'], 'failed')
         self.assertFalse(json.loads((self.root / 'state').read_text())['active'])
+
+    def test_inode_failure_cleans_owned_vm_before_workload_setup(self):
+        workload = self.root / 'workload.sh'
+        workload.write_text('exit 0\n')
+        result = self.run_suite('--workload', str(workload), FAIL_INODE='prepare')
+        self.assertEqual(result.returncode, 1)
+        state = json.loads((self.root / 'state').read_text())
+        self.assertFalse(state['active'])
+        self.assertNotIn('workload_steps', state)
+        self.assertIsNone(state['image'])
 
     def test_borrowed_workload_rejected_before_any_guest_changes(self):
         result = self.run_suite('--vm', 'existing', '--workload', str(self.root / 'absent'))

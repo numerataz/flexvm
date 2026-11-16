@@ -2434,12 +2434,12 @@ def kernel_modules():
 @contextlib.contextmanager
 def workload_test_egress():
     """The coordinator owns temporary egress rules, even if a worker is killed."""
-    if args.worker or args.selftest or args.no_kvm or os.geteuid() != 0 or not {"podman", "namespace_sandboxes"}.intersection(args.cases or CASES) or kvm_unusable():
+    if args.worker or args.selftest or args.no_kvm or os.geteuid() != 0 or not {"podman", "namespace_sandboxes", "containerd"}.intersection(args.cases or CASES) or kvm_unusable():
         yield
         return
     selected = args.cases or list(CASES)
     scenarios = args.faults.split() if "faults" in selected else []
-    if not any(item[0] in ("podman", "namespace_sandboxes") for item in selected_work(selected, scenarios, faults_scenarios(), args.split)):
+    if not any(item[0] in ("podman", "namespace_sandboxes", "containerd") for item in selected_work(selected, scenarios, faults_scenarios(), args.split)):
         yield
         return
     dns = ENV.get("FLEXVM_TEST_DNS", "").split()
@@ -2507,6 +2507,13 @@ def podman():
 def namespace_sandboxes():
     """bubblewrap, util-linux namespaces and gVisor systrap isolation through VM lifecycle."""
     compat_workload("namespace-sandboxes")
+
+
+@case
+@needs_kvm
+def containerd():
+    """standalone containerd, nerdctl/CNI and BuildKit state through VM lifecycle."""
+    compat_workload("containerd")
 
 
 def compat_workload(workload):
@@ -3307,7 +3314,7 @@ def worker():
 # runs, as e2e.py's summary prints them): --split balances by these, the long ones start first, and
 # the short ones go in batches of about BATCH_S (each batch is a worker, with hosts of its own).
 # Unlisted ones count as 2 s.
-COST = {"namespace_sandboxes": 180, "podman": 180, "faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "ipv6_taps": 10, "nettest_ipv6": 30, "docker_api": 15, "restart_policy": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
+COST = {"containerd": 180, "namespace_sandboxes": 180, "podman": 180, "faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "ipv6_taps": 10, "nettest_ipv6": 30, "docker_api": 15, "restart_policy": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
         "faults/cow_grow": 65, "faults/reconcile_kill": 64, "faults/target_renamed": 40, "faults/plug_race": 45, "faults/guest_hang": 44,
         "faults/exec_pause_grace": 42, "faults/exec_ckpt_stalled": 115, "faults/route_abort": 35, "faults/unplug_collapsed": 30,
         "faults/arrival_grew": 25, "faults/pause_resume": 24, "faults/evict_latency": 25, "faults/mem_high": 25, "faults/target_killed": 25,
@@ -3653,7 +3660,7 @@ def main():
     print(f"{len([r for r in summary if r[1] == 'PASS'])} passed, {len(skipped)} skipped{' (failures: --no-skips)' if skipped and args.no_skips else ''}, {len([r for r in summary if r[1] == 'FAIL'])} failed "
           f"in {time.time() - started:.0f} s ({sum(r[2] for r in summary):.0f} s of work in {len(lanes())} lanes)")
     if args.selftest:
-        for egress_case in ("podman", "namespace_sandboxes"):
+        for egress_case in ("podman", "namespace_sandboxes", "containerd"):
             assigned = [any(item[0] == egress_case for item in selected_work(list(CASES), scenarios, kvm, f"{i}/4")) for i in range(1, 5)]
             assert sum(assigned) == 1, f"{egress_case} egress must belong to exactly one split: {assigned}"
         # The second batch could not be spawned: exactly its cases and scenarios fail, the rest pass.

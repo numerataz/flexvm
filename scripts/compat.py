@@ -79,6 +79,7 @@ class Suite:
         self.marker = "/tmp/flexvm-state-" + self.nonce
         self.process = None
         self.workload = args.workload.read_text() if args.workload else None
+        self.inode_probe = (ROOT / "scripts/compat/root-inodes.sh").read_text() if args.workload else None
         self.report = {"schema_version": 1, "vm": self.name, "image": None if args.vm else args.image,
                        "status": "running", "phases": [], "cleanup_errors": []}
 
@@ -104,6 +105,8 @@ class Suite:
         self.probe_attempted = True
         self.source.call("cp", str(probe), f"{self.name}:{self.probe}")
         if self.workload is not None:
+            self.report["root_filesystem"] = self.host.call("exec", "-i", self.name, "sh", "-s", "--", "prepare", self.nonce,
+                                                            stdin=self.inode_probe)
             self.report["workload"]["prepare"] = self.workload_step("prepare")
             self.save()
         if "namespaces" in self.args.cases:
@@ -146,6 +149,8 @@ class Suite:
                 if (state[0], state[21]) != (self.process[0], self.process[21]):
                     raise Failure("live process identity changed")
             if self.workload is not None:
+                result["inode_identity"] = self.host.call("exec", "-i", self.name, "sh", "-s", "--", "verify", self.nonce,
+                                                          stdin=self.inode_probe)
                 result["workload"] = self.workload_step("verify", phase)
             result["status"] = "passed"
         except BaseException as exc:
