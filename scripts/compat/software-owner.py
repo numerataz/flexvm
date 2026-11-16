@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import platform
 import runpy
+import select
 import signal
 import subprocess
 import sys
@@ -62,17 +63,24 @@ def exercise(args):
                 proc.wait(timeout=5)
 
     def engine_gone(ident):
-        path = Path(f'/proc/{ident["pid"]}/stat')
-        until = min(deadline, time.monotonic() + 5)
-        while time.monotonic() < until:
+        try:
+            pidfd = os.pidfd_open(ident['pid'])
+        except ProcessLookupError:
+            return
+        try:
             try:
-                fields = path.read_text().rsplit(')', 1)[1].split()
+                fields = Path(f'/proc/{ident["pid"]}/stat').read_text().rsplit(')', 1)[1].split()
             except FileNotFoundError:
                 return
-            if fields[0] == 'Z' or int(fields[19]) != ident['start']:
+            if int(fields[19]) != ident['start']:
                 return
-            time.sleep(.02)
-        raise RuntimeError('software engine survived its owner')
+            # A zombie leader can precede its last exiting worker thread.
+            waiter = select.poll()
+            waiter.register(pidfd, select.POLLIN)
+            if not waiter.poll(max(1, int(min(5, deadline - time.monotonic()) * 1000))):
+                raise RuntimeError('software engine thread group survived its owner')
+        finally:
+            os.close(pidfd)
 
     def inherited_leases(entry):
         links = []
@@ -187,6 +195,11 @@ def exercise(args):
                 if int(fields[19]) != restored_entry['start']:
                     raise RuntimeError('restore owner identity changed before crash injection')
                 signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                # A zombie leader can still have exiting worker threads.
+                waiter = select.poll()
+                waiter.register(pidfd, select.POLLIN)
+                if not waiter.poll(5000):
+                    raise RuntimeError('restored owner thread group did not exit')
             finally:
                 os.close(pidfd)
             engine_gone(restored_entry['backend']['process'])

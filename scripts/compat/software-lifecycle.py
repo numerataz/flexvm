@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import platform
 import runpy
+import select
 import signal
 import subprocess
 import sys
@@ -70,16 +71,24 @@ def exercise(args):
         raise RuntimeError('restored workload timers did not make forward progress')
 
     def engine_gone(ident):
-        until = min(deadline, time.monotonic() + 5)
-        while time.monotonic() < until:
+        try:
+            pidfd = os.pidfd_open(ident['pid'])
+        except ProcessLookupError:
+            return
+        try:
             try:
                 fields = Path(f'/proc/{ident["pid"]}/stat').read_text().rsplit(')', 1)[1].split()
             except FileNotFoundError:
                 return
-            if fields[0] == 'Z' or int(fields[19]) != ident['start']:
+            if int(fields[19]) != ident['start']:
                 return
-            time.sleep(.02)
-        raise RuntimeError('retired engine survived')
+            # A zombie leader can precede its last exiting worker thread.
+            waiter = select.poll()
+            waiter.register(pidfd, select.POLLIN)
+            if not waiter.poll(max(1, int(min(5, deadline - time.monotonic()) * 1000))):
+                raise RuntimeError('software engine thread group survived its owner')
+        finally:
+            os.close(pidfd)
 
     evidence = {'cycles': []}
     try:
@@ -167,10 +176,18 @@ def exercise(args):
         old_snapshot = json.loads((checkpoint / 'manifest.json').read_text())['snapshot_id']
         before = observation()
         marker = args.output / 'kill-parent-sync'
-        marker.touch()
-        crashed = subprocess.run([*base, 'stop', 'state-test'], capture_output=True, text=True, timeout=60)
-        if crashed.returncode == 0 or marker.exists():
-            raise RuntimeError('replacement owner-death fault did not execute')
+        owner_pidfd = os.pidfd_open(entry['pid'])
+        try:
+            marker.touch()
+            crashed = subprocess.run([*base, 'stop', 'state-test'], capture_output=True, text=True, timeout=60)
+            if crashed.returncode == 0 or marker.exists():
+                raise RuntimeError('replacement owner-death fault did not execute')
+            waiter = select.poll()
+            waiter.register(owner_pidfd, select.POLLIN)
+            if not waiter.poll(5000):
+                raise RuntimeError('publication owner thread group did not exit')
+        finally:
+            os.close(owner_pidfd)
         engine_gone(entry['backend']['process'])
         published = json.loads((checkpoint / 'manifest.json').read_text())
         if published['snapshot_id'] == old_snapshot or (checkpoint / 'RETIRED').exists() or (checkpoint / 'STARTED').exists():
