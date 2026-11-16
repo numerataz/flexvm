@@ -48,8 +48,9 @@ recovery; use pidfds while the live owner holds the processes.
 Use virtio-serial for migratable software control. Disconnecting its host client
 is necessary but does not by itself prove guest requests have drained. Introduce
 an acknowledged guest quiescence barrier covering the serial dispatcher and
-accepted requests. This requires a new, versioned QUIESCE/ACK/RESUME agent
-protocol; reject agents without it for checkpoint operations. Its barrier covers
+accepted requests. This requires a new `BARRIER 1` QUIESCE/ACK/RESUME agent protocol; reject agents
+without it for checkpoint operations. The existing unversioned `QUIESCE` only
+syncs filesystems and drops caches; its `ok` cannot acknowledge request quiescence. Its barrier covers
 incomplete Yamux bodies and accepted asynchronous request setup. It does not wait
 for user processes or long-lived output attachments to finish. Stop admission,
 resolve or cancel outstanding operations,
