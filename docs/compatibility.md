@@ -102,15 +102,31 @@ limits, outbound DNS/HTTP, custom bridge DNS, bind mounts, named volumes, a live
 ports through each phase:
 
 ```sh
-sudo scripts/compat.py --memory-mib 16384 \
+sudo scripts/compat.py --memory-mib 2048 \
   --workload scripts/compat/workloads/podman.sh \
   --phases run,suspend,checkpoint --output /tmp/compat-podman
 ```
 
-Use the migration options above to include migration. This case requires the
-expanded guest kernel with FUSE, TUN and container networking enabled. Its
-presence here is an executable acceptance case; support status depends on the
-recorded results for the tested build and runtime versions.
+Use the migration options above to include migration. The standalone runner
+uses the configured hosts' guest DNS and outbound routing/NAT.
+
+The `podman` case in `scripts/e2e.py` automates all four phases with a pinned
+upstream Ubuntu image and a pinned multi-architecture BusyBox image. Its test
+coordinator installs temporary NAT/forwarding rules scoped to its own guest
+address ranges and supplies reachable host DNS; it removes those rules on
+completion or interruption, including after worker failure. `FLEXVM_TEST_DNS`
+can override resolver discovery. This setup belongs to the test harness;
+FlexVM's normal routed-networking policy is unchanged. Reports under the
+selected log directory record package versions, image identities, capability
+results, workload output and cleanup errors.
+
+```sh
+sudo scripts/e2e.py --jobs 1 --no-image --faults '' podman
+```
+
+This case requires a KVM host and the expanded guest kernel with FUSE, TUN and
+container networking enabled. Rootless Docker and service-managed user sessions
+remain separate acceptance work in #1322/#1328.
 
 ## Initial audit
 
