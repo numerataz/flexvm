@@ -95,8 +95,15 @@ or paused response while admission is closed.
    and visibly failed. Source resume is forbidden after destination write or CPU
    ownership has been granted.
 6. Restore in a fresh process, load all state while paused and verify completion.
-   Reconnect and fence control, reconcile network/clock state, then publish the
-   destination ownership and resume. Rollback cannot leave both copies running.
+   Establish the host transport endpoint, then durably commit destination CPU and
+   disk ownership before running any guest instructions. Resume CPUs with network
+   traffic held, public command admission closed and the saved guest barrier still
+   closed. Guest CPUs must run to acknowledge FENCE, clock updates and RESUME;
+   those requests cannot be completed while the engine is paused. Only after
+   maintenance acknowledgments succeed, activate routing, release held traffic
+   and publish the VM as running. On failure pause the target and retain its
+   committed ownership; never revive the retired source. Rollback cannot leave
+   both copies running.
 
 Use durable transfer journals on both hosts, without requiring shared storage.
 Only after the checkpoint is committed, the source records its irrevocable
@@ -130,8 +137,10 @@ destination commit before its acknowledgment reaches the source.
 After load, use the guest agent to step CLOCK_REALTIME from the current host time.
 Do not reset CLOCK_MONOTONIC through the agent. Preserve the engine virtual clock
 and device timers through migration, and test nondecreasing monotonic time and
-nested timer progress across pause/restore. Clock or fencing setup failure keeps
-the destination paused. Realtime corrections use clock_settime, including
+nested timer progress across pause/restore. Guest workloads may execute during
+the quarantined maintenance interval, before the realtime correction; do not
+promise that their first restored clock read already matches host time. A clock
+or fencing setup failure pauses the destination and keeps admission closed. Realtime corrections use clock_settime, including
 backward steps when host time is behind; preserve the kernel's normal clock-change
 notifications. Test cancel-on-set realtime timers and monotonic time separately.
 
