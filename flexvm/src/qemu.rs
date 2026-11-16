@@ -171,7 +171,8 @@ pub struct Machine {
     processes: Arc<Processes>,
     sockets: Sockets,
     logs: PathBuf,
-    control: Option<control::Client>,
+    transport: Control,
+    control: Mutex<Option<control::Client>>,
 }
 
 /// A dead emulator must end an exec even if its device backend still holds the
@@ -197,7 +198,7 @@ impl<R: Read> Read for Watched<'_, R> {
 impl Drop for Machine {
     fn drop(&mut self) {
         self.processes.stop();
-        self.control.take();
+        self.control.get_mut().unwrap().take();
         let _ = fs::remove_dir_all(&self.logs);
     }
 }
@@ -317,8 +318,17 @@ impl Config {
         let rootfs = PathBuf::from(format!("/proc/self/fd/{}", inputs.rootfs.file.as_raw_fd()));
         let engine = PathBuf::from(format!("/proc/self/fd/{}", inputs.engine.file.as_raw_fd()));
         let mut inherited = vec![inputs.engine.file.as_raw_fd(), inputs.kernel.file.as_raw_fd(), inputs.rootfs.file.as_raw_fd()];
-        let mut machine =
-            Machine { inputs: Some(inputs), profile, engine_version: Value::Null, capture: Mutex::default(), processes, sockets, logs, control: None };
+        let mut machine = Machine {
+            inputs: Some(inputs),
+            profile,
+            engine_version: Value::Null,
+            capture: Mutex::default(),
+            processes,
+            sockets,
+            logs,
+            transport: self.control,
+            control: Mutex::new(None),
+        };
         let firmware = machine.logs.join("firmware");
         let result = (|| -> Result<()> {
             fs::create_dir(&firmware)?;
@@ -388,7 +398,7 @@ impl Config {
             }
             if self.control == Control::Serial {
                 let stream = util::connect_unix(&machine.sockets.vsock, remaining(deadline)?)?;
-                machine.control = Some(control::Client::connect(stream)?);
+                *machine.control.lock().unwrap() = Some(control::Client::connect(stream)?);
             }
             let mut last = String::new();
             loop {
@@ -611,16 +621,77 @@ impl Machine {
         }
     }
 
-    pub fn disconnect_control(&mut self) {
-        self.control.take();
+    pub fn disconnect_control(&self) {
+        let previous = self.control.lock().unwrap().take();
+        drop(previous);
     }
 
-    pub fn reconnect_control(&mut self, deadline: Instant) -> Result<()> {
-        if self.control.is_some() {
-            bail!("software control is already connected");
+    pub fn reconnect_control(&self, deadline: Instant) -> Result<()> {
+        let mut control = self.control.lock().unwrap();
+        if control.is_none() {
+            let stream = util::connect_unix(&self.sockets.vsock, remaining(deadline)?)?;
+            *control = Some(control::Client::connect(stream)?);
         }
-        let stream = util::connect_unix(&self.sockets.vsock, remaining(deadline)?)?;
-        self.control = Some(control::Client::connect(stream)?);
+        Ok(())
+    }
+
+    pub fn checkpoint_capable(&self, deadline: Instant) -> Result<()> {
+        if self.transport != Control::Serial || self.message("BARRIER 1 TRANSPORT", deadline)? != b"ok BARRIER 1 TRANSPORT 1" {
+            bail!("software checkpoint requires serial transport reset support; rebuild the guest agent");
+        }
+        Ok(())
+    }
+
+    /// Close admission, discard both old transport parsers, then stop CPUs. The
+    /// reset marker is bound to this barrier, so log rotation or an earlier reset
+    /// cannot be mistaken for this acknowledged transition.
+    pub fn quiesce_control(&self, generation: u64, epoch: u64, sequence: u64, deadline: Instant) -> Result<()> {
+        let request = format!("BARRIER 1 QUIESCE {generation} {epoch} {sequence}");
+        let expected = format!("ok BARRIER 1 QUIESCED {generation} {sequence}");
+        if self.message(&request, deadline)? != expected.as_bytes() {
+            bail!("software guest did not acknowledge its request barrier");
+        }
+        self.disconnect_control();
+        self.wait_control_reset(generation, sequence, deadline)?;
+        self.switch("stop", deadline)
+    }
+
+    pub fn wait_control_reset(&self, generation: u64, sequence: u64, deadline: Instant) -> Result<()> {
+        let expected = format!("flexvm-init: serial control ready barrier {generation} {sequence}");
+        loop {
+            self.processes.alive()?;
+            remaining(deadline)?;
+            if fs::read_to_string(self.logs.join("qemu.log"))?.lines().any(|line| line.trim_end() == expected) {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    pub fn resume_admission(&self, generation: u64, epoch: u64, saved_generation: u64, sequence: u64, deadline: Instant) -> Result<()> {
+        self.set_admission(generation, epoch, saved_generation, sequence, true, deadline)
+    }
+
+    pub fn abort_admission(&self, generation: u64, epoch: u64, saved_generation: u64, sequence: u64, deadline: Instant) -> Result<()> {
+        self.set_admission(generation, epoch, saved_generation, sequence, false, deadline)
+    }
+
+    fn set_admission(&self, generation: u64, epoch: u64, saved_generation: u64, sequence: u64, correct_clock: bool, deadline: Instant) -> Result<()> {
+        self.reconnect_control(deadline)?;
+        if self.message(&format!("FENCE {generation} {epoch}"), deadline)? != format!("ok {generation}").as_bytes() {
+            bail!("software guest rejected its owner fence");
+        }
+        if correct_clock {
+            let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+            let clock = format!("BARRIER 1 MAINT {generation} {epoch} CLOCK {}.{:09}", now.as_secs(), now.subsec_nanos());
+            if !self.message(&clock, deadline)?.starts_with(b"ok ") {
+                bail!("software guest rejected clock maintenance");
+            }
+        }
+        let request = format!("BARRIER 1 RESUME {generation} {epoch} {saved_generation} {sequence}");
+        if self.message(&request, deadline)? != format!("ok BARRIER 1 RESUMED {saved_generation} {sequence}").as_bytes() {
+            bail!("software guest did not resume request admission");
+        }
         Ok(())
     }
 
@@ -628,12 +699,12 @@ impl Machine {
     /// Wait for its OK before writing the agent command; Firecracker keeps its
     /// existing pipelined handshake and does not pay this extra round trip.
     pub fn request(&self, line: &str, deadline: Instant) -> Result<BufReader<std::os::unix::net::UnixStream>> {
-        let stream = match &self.control {
-            Some(control) => control.open(deadline)?,
-            None => util::connect_unix(&self.sockets.vsock, remaining(deadline)?)?,
+        let stream = match self.transport {
+            Control::Serial => self.control.lock().unwrap().as_ref().ok_or("software serial control is disconnected")?.open(deadline)?,
+            Control::Vsock => util::connect_unix(&self.sockets.vsock, remaining(deadline)?)?,
         };
         let mut r = BufReader::with_capacity(1, stream);
-        if self.control.is_none() {
+        if self.transport == Control::Vsock {
             By { s: r.get_mut(), at: deadline }.write_all(b"CONNECT 52\n")?;
             let mut ok = String::new();
             By { s: &mut r, at: deadline }.take(64).read_line(&mut ok)?;
@@ -688,6 +759,16 @@ impl Machine {
 
     pub fn finish_exec(&self, reader: &mut BufReader<UnixStream>, id: &str, out: impl FnMut(u8, &[u8]) -> Result<()>) -> Result<i32> {
         guest::exec_output(&mut Watched { reader, processes: &self.processes }, id, out)
+    }
+
+    pub fn finish_exec_at(
+        &self,
+        reader: &mut BufReader<UnixStream>,
+        id: &str,
+        offset: &mut u64,
+        out: impl FnMut(u8, &[u8]) -> Result<()>,
+    ) -> std::result::Result<i32, guest::OutputError> {
+        guest::exec_output_at(&mut Watched { reader, processes: &self.processes }, id, offset, out)
     }
 
     pub fn exec(&self, argv: Vec<String>, out: impl FnMut(u8, &[u8]) -> Result<()>) -> Result<i32> {
@@ -785,7 +866,7 @@ mod tests {
             boot_timeout: Duration::from_secs(60),
         };
         let source = Arc::new(Processes::default());
-        let mut machine = config.boot(&rootfs, source.clone()).unwrap();
+        let machine = config.boot(&rootfs, source.clone()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(60);
         assert_eq!(machine.message("FENCE 1 42", deadline).unwrap(), b"ok 1");
         let (id, mut output) = machine.start_exec(meta.argv.clone()).unwrap();
@@ -808,20 +889,9 @@ mod tests {
         }
         let before = observation(&machine, deadline);
         assert_eq!(before.len(), 5);
-        assert_eq!(machine.message("BARRIER 1 QUIESCE 1 42 1", deadline).unwrap(), b"ok BARRIER 1 QUIESCED 1 1");
+        machine.checkpoint_capable(deadline).unwrap();
         drop(output);
-        machine.disconnect_control();
-        // Wait for the guest to discard the old Yamux parser and arm a fresh
-        // serial transport before saving it. A new owner cannot reuse its peer.
-        loop {
-            assert!(Instant::now() < deadline, "guest serial reset did not finish");
-            let log = fs::read_to_string(machine.logs.join("qemu.log")).unwrap();
-            if log.lines().filter(|line| line.contains("flexvm-init: serial control ready")).count() >= 2 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        machine.switch("stop", deadline).unwrap();
+        machine.quiesce_control(1, 42, 1, deadline).unwrap();
         let staging = software_state::Staging::new(&dir).unwrap();
         machine.save(&staging.state, deadline).unwrap();
         assert!(machine.switch("cont", deadline).unwrap_err().to_string().contains("capture must be resolved"));
@@ -855,17 +925,14 @@ mod tests {
         config.kernel = PathBuf::from("/missing-original-kernel");
         config.qemu = "/missing-original-engine".into();
         let target = Arc::new(Processes::default());
-        let mut machine = config.restore(verified, target).unwrap();
+        let machine = config.restore(verified, target).unwrap();
         machine.switch("cont", deadline).unwrap();
         machine.reconnect_control(deadline).unwrap();
         assert_eq!(machine.message("PING", deadline).unwrap(), b"pong");
         assert_eq!(machine.message("FENCE 2 84", deadline).unwrap(), b"ok 2");
         assert_ne!(machine.message("FENCE 1 42", deadline).unwrap(), b"ok 1");
         assert_ne!(machine.message("BARRIER 1 RESUME 2 84 1 99", deadline).unwrap(), b"ok BARRIER 1 RESUMED 1 99");
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        let clock = format!("BARRIER 1 MAINT 2 84 CLOCK {}.{:09}", now.as_secs(), now.subsec_nanos());
-        assert!(machine.message(&clock, deadline).unwrap().starts_with(b"ok "));
-        assert_eq!(machine.message("BARRIER 1 RESUME 2 84 1 1", deadline).unwrap(), b"ok BARRIER 1 RESUMED 1 1");
+        machine.resume_admission(2, 84, 1, 1, deadline).unwrap();
         let after = loop {
             let seen = observation(&machine, deadline);
             if seen[3] > before[3] {
@@ -1003,7 +1070,8 @@ mod tests {
             processes: Arc::new(Processes::default()),
             sockets,
             logs,
-            control: None,
+            transport: Control::Vsock,
+            control: Mutex::new(None),
         }
     }
 

@@ -97,6 +97,11 @@ impl Gate {
         }
     }
 
+    pub fn drained_identity(&self) -> Option<(u64, u64)> {
+        let state = self.state.lock().unwrap();
+        state.closed.filter(|_| state.active == 0)
+    }
+
     pub fn maintenance(&self) -> io::Result<()> {
         let state = self.state.lock().unwrap();
         if state.closed.is_some() && state.active == 0 {

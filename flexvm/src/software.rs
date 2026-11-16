@@ -1,8 +1,8 @@
 //! Named software VM owner using the ordinary name lock and control wire protocol.
-use std::io::Write;
+use std::io::{BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -13,6 +13,10 @@ use crate::{bail, guest, image, qemu, util, vmproc};
 
 const MAX_CONTROL: usize = 64;
 const MAX_SESSIONS: usize = 48;
+const READING: u8 = 0;
+const DETACHED: u8 = 1;
+const EXITED: u8 = 2;
+const OUTPUT_FAILED: u8 = 3;
 
 /// Conservatively hold the entire fixed-RAM grant for this initial owner path.
 /// Unlike an ordinary start grant it must not expire while RAM is still promised.
@@ -47,9 +51,26 @@ struct Owner {
     active: AtomicUsize,
     sessions: AtomicUsize,
     epoch: u64,
+    generation: u64,
+    reset_capable: bool,
+    barrier: Mutex<Option<(u64, u64)>>,
+    sequence: AtomicU64,
+    changed: Condvar,
+    main_id: String,
+    offset: AtomicU64,
+    drain: AtomicU8,
+    resets: AtomicU64,
+    main_claim: AtomicU64,
 }
 
 impl Owner {
+    fn publish_state(&self, state: &str) -> Result<()> {
+        self.entry.lock().unwrap().state = state.into();
+        self.changed.notify_all();
+        let entry = self.entry.lock().unwrap().clone();
+        self.name.publish(&entry)
+    }
+
     fn switch(&self, paused: bool) -> Result<Value> {
         let _op = self.op.write().unwrap();
         self.processes.alive()?;
@@ -58,17 +79,131 @@ impl Owner {
         }
         let state = if paused { "paused" } else { "running" };
         if self.entry.lock().unwrap().state != state {
-            if let Err(e) = self.machine.switch(if paused { "stop" } else { "cont" }, Instant::now() + guest::TIMEOUT) {
-                // An uncertain engine transition is never published as running.
-                self.ended.store(true, Ordering::SeqCst);
-                self.processes.stop();
-                return Err(e);
+            let deadline = Instant::now() + guest::TIMEOUT;
+            let result = if !self.reset_capable {
+                // Legacy agents retain their existing live pause support, but
+                // cannot establish the transport boundary needed for capture.
+                self.machine.switch(if paused { "stop" } else { "cont" }, deadline)
+            } else if paused {
+                (|| {
+                    self.machine.checkpoint_capable(deadline)?;
+                    let sequence = self
+                        .sequence
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1))
+                        .map_err(|_| "software barrier sequence exhausted")?
+                        + 1;
+                    *self.barrier.lock().unwrap() = Some((self.generation, sequence));
+                    self.resets.fetch_add(1, Ordering::SeqCst);
+                    self.machine.quiesce_control(self.generation, self.epoch, sequence, deadline)?;
+                    while self.drain.load(Ordering::SeqCst) == READING {
+                        self.processes.alive()?;
+                        if Instant::now() >= deadline {
+                            bail!("foreground output did not reach its pause boundary");
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    if self.drain.load(Ordering::SeqCst) != DETACHED {
+                        self.ended.store(true, Ordering::SeqCst);
+                        bail!("foreground command ended before pause completed");
+                    }
+                    Ok(())
+                })()
+            } else {
+                (|| {
+                    let (saved_generation, sequence) = self.barrier.lock().unwrap().ok_or("paused software VM has no request barrier")?;
+                    self.machine.switch("cont", deadline)?;
+                    self.machine.resume_admission(self.generation, self.epoch, saved_generation, sequence, deadline)?;
+                    *self.barrier.lock().unwrap() = None;
+                    Ok(())
+                })()
+            };
+            if let Err(error) = result {
+                // A failed drain still belongs to this owner. Only a confirmed
+                // rollback may reopen admission; an ambiguous outcome ends it.
+                let rollback = if self.reset_capable && !self.ended.load(Ordering::SeqCst) {
+                    self.machine.switch("cont", Instant::now() + guest::TIMEOUT).and_then(|()| {
+                        if let Some((saved_generation, sequence)) = *self.barrier.lock().unwrap() {
+                            self.machine.abort_admission(self.generation, self.epoch, saved_generation, sequence, Instant::now() + guest::TIMEOUT)?;
+                        }
+                        Ok(())
+                    })
+                } else {
+                    Err("software pause transition could not be resolved".into())
+                };
+                if rollback.is_ok() {
+                    *self.barrier.lock().unwrap() = None;
+                    let _ = self.publish_state("running");
+                } else {
+                    self.ended.store(true, Ordering::SeqCst);
+                    self.changed.notify_all();
+                    self.processes.stop();
+                }
+                return Err(error);
             }
-            self.entry.lock().unwrap().state = state.into();
         }
-        let published = self.entry.lock().unwrap().clone();
-        self.name.publish(&published)?;
+        self.publish_state(state)?;
         Ok(json!({"state":state,"name":self.name.name}))
+    }
+
+    fn main_output(&self, mut reader: BufReader<UnixStream>) -> Result<i32> {
+        let mut offset = self.offset.load(Ordering::SeqCst);
+        let mut handled_reset = 0;
+        loop {
+            let result = self.machine.finish_exec_at(&mut reader, &self.main_id, &mut offset, |kind, bytes| {
+                let mut output: Box<dyn Write> =
+                    if kind == guest::FRAME_STDERR { Box::new(std::io::stderr().lock()) } else { Box::new(std::io::stdout().lock()) };
+                output.write_all(bytes)?;
+                output.flush()?;
+                Ok(())
+            });
+            self.offset.store(offset, Ordering::SeqCst);
+            let status = match &result {
+                Ok(_) => EXITED,
+                Err(guest::OutputError::Transport(_)) => DETACHED,
+                Err(_) => OUTPUT_FAILED,
+            };
+            self.drain.store(status, Ordering::SeqCst);
+            let error = match result {
+                Ok(code) => return Ok(code),
+                Err(error) => error,
+            };
+            if status != DETACHED {
+                return Err(error.into_inner());
+            }
+            loop {
+                crate::template::interrupted()?;
+                if self.ended.load(Ordering::SeqCst) {
+                    return Err(error.into_inner());
+                }
+                let op = self.op.read().unwrap();
+                let mut entry = self.entry.lock().unwrap();
+                if entry.state == "paused" {
+                    drop(op);
+                    entry = self.changed.wait_timeout(entry, Duration::from_millis(250)).unwrap().0;
+                    drop(entry);
+                    continue;
+                }
+                let reset = self.resets.load(Ordering::SeqCst);
+                if entry.state != "running" || reset <= handled_reset {
+                    return Err(error.into_inner());
+                }
+                drop(entry);
+                self.processes.alive()?;
+                let claim =
+                    self.main_claim.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1)).map_err(|_| "software main claim exhausted")? + 1;
+                let deadline = Instant::now() + guest::TIMEOUT;
+                let line = guest::attach_line(&self.main_id, offset, claim, self.epoch, guest::AttachForm::Epoch, false)?;
+                reader = self.machine.request(&line, deadline)?;
+                guest::untimed(&reader)?;
+                reader.get_ref().set_read_timeout(Some(Duration::from_millis(250)))?;
+                handled_reset = reset;
+                // Mark reading before releasing admission's read guard. A new
+                // pause must wait for this attachment's final delivered offset.
+                self.drain.store(READING, Ordering::SeqCst);
+                drop(op);
+                break;
+            }
+        }
     }
 
     fn exec(&self, req: &Value, client: &UnixStream, acknowledged: &mut bool) -> Result<()> {
@@ -177,6 +312,7 @@ pub fn run(host: Host, name: NameLock, machine: qemu::Machine, processes: Arc<qe
     if machine.message(&format!("FENCE 1 {epoch}"), deadline)? != b"ok 1" {
         bail!("named software VM requires guest host-epoch fencing");
     }
+    let reset_capable = machine.checkpoint_capable(deadline).is_ok();
     let (main_id, mut main_reader) = machine.start_exec(meta.argv.clone())?;
     machine.exec_started(&mut main_reader, &main_id)?;
     let entry = Entry {
@@ -212,6 +348,16 @@ pub fn run(host: Host, name: NameLock, machine: qemu::Machine, processes: Arc<qe
         active: AtomicUsize::new(0),
         sessions: AtomicUsize::new(0),
         epoch,
+        generation: 1,
+        reset_capable,
+        barrier: Mutex::new(None),
+        sequence: AtomicU64::new(0),
+        changed: Condvar::new(),
+        main_id: main_id.clone(),
+        offset: AtomicU64::new(0),
+        drain: AtomicU8::new(READING),
+        resets: AtomicU64::new(0),
+        main_claim: AtomicU64::new(0),
     });
     // The caller blocked these before starting its first worker/engine thread.
     let set = util::block_signals(&[libc::SIGTSTP, libc::SIGCONT, libc::SIGTERM]);
@@ -266,14 +412,7 @@ pub fn run(host: Host, name: NameLock, machine: qemu::Machine, processes: Arc<qe
         let entry = owner.entry.lock().unwrap().clone();
         owner.name.publish(&entry)
     };
-    let result = published.and_then(|()| {
-        owner.machine.finish_exec(&mut main_reader, &main_id, |kind, bytes| {
-            let mut output: Box<dyn Write> = if kind == guest::FRAME_STDERR { Box::new(std::io::stderr().lock()) } else { Box::new(std::io::stdout().lock()) };
-            output.write_all(bytes)?;
-            output.flush()?;
-            Ok(())
-        })
-    });
+    let result = published.and_then(|()| owner.main_output(main_reader));
     owner.ended.store(true, Ordering::SeqCst);
     {
         let _op = owner.op.write().unwrap();

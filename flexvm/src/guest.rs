@@ -242,20 +242,40 @@ pub(crate) fn session_on<S: Read + Write>(
     Ok(r)
 }
 
-pub fn exec_output(r: &mut impl Read, id: &str, mut out: impl FnMut(u8, &[u8]) -> Result<()>) -> Result<i32> {
-    let mut offset = 0;
+/// The distinction matters to an owner deliberately resetting its transport:
+/// only a transport failure can be reattached at the last delivered offset.
+#[derive(Debug)]
+pub enum OutputError {
+    Transport(Error),
+    Output(Error),
+    Protocol(Error),
+}
+
+impl OutputError {
+    pub fn into_inner(self) -> Error {
+        match self {
+            Self::Transport(error) | Self::Output(error) | Self::Protocol(error) => error,
+        }
+    }
+}
+
+pub fn exec_output(r: &mut impl Read, id: &str, out: impl FnMut(u8, &[u8]) -> Result<()>) -> Result<i32> {
+    exec_output_at(r, id, &mut 0, out).map_err(OutputError::into_inner)
+}
+
+pub fn exec_output_at(r: &mut impl Read, id: &str, offset: &mut u64, mut out: impl FnMut(u8, &[u8]) -> Result<()>) -> std::result::Result<i32, OutputError> {
     loop {
-        match read_frame(r)? {
-            Some((kind @ (FRAME_STDOUT | FRAME_STDERR), d)) => {
-                let bytes = session_output(&d, offset)?;
-                offset += bytes.len() as u64;
-                out(kind, bytes)?;
+        match read_frame(r).map_err(OutputError::Transport)? {
+            Some((kind @ (FRAME_STDOUT | FRAME_STDERR), data)) => {
+                let bytes = session_output(&data, *offset).map_err(OutputError::Protocol)?;
+                out(kind, bytes).map_err(OutputError::Output)?;
+                *offset += bytes.len() as u64;
             }
-            Some((FRAME_EXIT, d)) => return session_exit(&d, offset),
-            Some((FRAME_MSG, m)) if m == id.as_bytes() || m == b"waiting" => {}
-            Some((FRAME_LOST, _)) => bail!("guest command output lost"),
-            Some((_, m)) => bail!("guest command: {}", refusal(&m)),
-            None => bail!("guest closed the connection before the command exited"),
+            Some((FRAME_EXIT, data)) => return session_exit(&data, *offset).map_err(OutputError::Protocol),
+            Some((FRAME_MSG, message)) if message == id.as_bytes() || message == b"waiting" => {}
+            Some((FRAME_LOST, _)) => return Err(OutputError::Protocol("guest command output lost".into())),
+            Some((_, message)) => return Err(OutputError::Protocol(format!("guest command: {}", refusal(&message)).into())),
+            None => return Err(OutputError::Transport("guest closed the connection before the command exited".into())),
         }
     }
 }
@@ -545,6 +565,31 @@ pub fn start_logs(s: UnixStream, offset: u64, follow: bool, timeout: Duration) -
 mod tests {
     use super::*;
     use std::os::unix::net::{UnixListener, UnixStream};
+
+    #[test]
+    fn resumed_output_advances_only_after_delivery_and_separates_failure_origins() {
+        let mut payload = 19u64.to_le_bytes().to_vec();
+        payload.extend_from_slice(b"saved-output");
+        let mut exit = (19u64 + 12).to_le_bytes().to_vec();
+        exit.extend_from_slice(&17i32.to_le_bytes());
+        let wire = [frame(FRAME_STDOUT, &[&payload]), frame(FRAME_EXIT, &[&exit])].concat();
+        let mut offset = 19;
+        assert!(matches!(exec_output_at(&mut wire.as_slice(), "saved", &mut offset, |_, _| Err("closed output".into())), Err(OutputError::Output(_))));
+        assert_eq!(offset, 19, "failed delivery cannot acknowledge output");
+        let mut delivered = Vec::new();
+        assert_eq!(
+            exec_output_at(&mut wire.as_slice(), "saved", &mut offset, |_, bytes| {
+                delivered.extend_from_slice(bytes);
+                Ok(())
+            })
+            .unwrap(),
+            17
+        );
+        assert_eq!(delivered, b"saved-output");
+        assert_eq!(offset, 31);
+        assert!(matches!(exec_output_at(&mut wire.as_slice(), "saved", &mut offset, |_, _| Ok(())), Err(OutputError::Protocol(_))));
+        assert!(matches!(exec_output_at(&mut &[][..], "saved", &mut offset, |_, _| Ok(())), Err(OutputError::Transport(_))));
+    }
 
     #[test]
     fn attachment_forms_keep_old_agents_compatible() {
