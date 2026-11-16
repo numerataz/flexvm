@@ -102,11 +102,18 @@ def main():
                     'sh', str(mask), 'strace', '-f', '-e', 'trace=file', '-o', str(trace), *cmd]
         HELPERS['run'](isolated, args.timeout, out / 'guest.log')
         lines = (out / 'guest.log').read_text(errors='replace').splitlines()
-        for marker in ('FLEXVM_SOFTWARE_KVM_API_PASSED', 'FLEXVM_SOFTWARE_KVM_FIRECRACKER_PASSED',
-                       'FLEXVM_SOFTWARE_INNER_BOOTED', 'FLEXVM_SOFTWARE_INNER_COMPLETE',
-                       *(f'FLEXVM_SOFTWARE_INNER_TICK {i}' for i in range(3))):
+        markers = ('FLEXVM_SOFTWARE_KVM_API_PASSED', 'FLEXVM_SOFTWARE_INNER_BOOTED',
+                   *(f'FLEXVM_SOFTWARE_INNER_TICK {i}' for i in range(3)),
+                   'FLEXVM_SOFTWARE_INNER_COMPLETE', 'FLEXVM_SOFTWARE_KVM_FIRECRACKER_PASSED')
+        positions = []
+        for marker in markers:
             if lines.count(marker) != 1:
                 raise RuntimeError(f'expected one {marker}; see guest.log')
+            positions.append(lines.index(marker))
+        if positions != sorted(positions):
+            raise RuntimeError('nested execution markers are out of order; see guest.log')
+        if any('Kernel panic' in line or 'Oops:' in line for line in lines):
+            raise RuntimeError('guest kernel failed; see guest.log')
         abi_marker = 'PASS: 9 KVM ABI reference checks' if arch == 'x86_64' else 'FLEXVM_SOFTWARE_GUEST_KVM_PASSED'
         if abi_marker not in lines:
             raise RuntimeError('missing successful KVM ABI report; see guest.log')

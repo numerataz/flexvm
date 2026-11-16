@@ -220,8 +220,17 @@ nor `/dev/vhost-vsock`. The foreground command owns both engine processes and
 removes them when the guest command exits, startup fails, or it is interrupted.
 Image preparation currently requires root, as with the existing image builder.
 
-Install QEMU with its seccomp and userspace networking support, and the reviewed
-userspace vsock tool:
+Install QEMU with its seccomp and userspace networking support. The x86 software
+profile requires QEMU **9.2 or newer**: older engines omit nested page walks in
+real mode ([upstream fix b56617bbcb47](https://github.com/qemu/qemu/commit/b56617bbcb47)).
+Ubuntu 24.04's QEMU 8.2 reproduced a stall on the first nested vCPU run; disabling
+NPT passed the ABI probe but loses nested paging performance. FlexVM retains NPT
+and rejects old x86 engines before running the workload. CI builds the pinned
+10.2.1 source with `scripts/build-qemu.sh INSTALL_PREFIX`, then tests unchanged
+clients with both host virtualization devices masked. ARM retains its separately
+tested distribution engine and Cortex-A72 profile.
+
+Install the reviewed userspace vsock tool:
 
 ```sh
 cargo install vhost-device-vsock --version 0.3.0 --locked

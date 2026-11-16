@@ -133,6 +133,22 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends ${{ matrix.qemu }} strace build-essential flex bison bc libelf-dev libssl-dev dwarves xz-utils
+      - name: Cache fixed x86 software CPU engine
+        if: matrix.arch == 'x86_64'
+        id: software-qemu
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/software-qemu
+          key: software-qemu-x86_64-ubuntu24-${{ hashFiles('scripts/build-qemu.sh') }}
+      - name: Install fixed x86 software CPU engine
+        if: matrix.arch == 'x86_64'
+        run: |
+          if [ ! -x "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" ]; then
+            sudo apt-get install -y -q --no-install-recommends ninja-build python3-venv libglib2.0-dev libpixman-1-dev libslirp-dev libseccomp-dev libfdt-dev
+            scripts/build-qemu.sh "$RUNNER_TEMP/software-qemu"
+          fi
+          sudo ln -sf "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" /usr/local/bin/qemu-system-x86_64
+          sudo qemu-system-x86_64 --version
       - name: Software state directory
         run: sudo install -d -o "$(id -u)" -g "$(id -g)" "$RUNNER_TEMP/software-state/artifacts"
       - name: Cache kernel
