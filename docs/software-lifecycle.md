@@ -231,6 +231,24 @@ rejects that offer, and a replacement needs a higher generation and a different
 transfer ID. These commands record ownership decisions. Guest execution on a
 destination requires artifact transport and restore integration.
 
+For a prepared destination and a retired source, run
+`software-transfer send VM OFFER` on the source. Pipe its stdout into
+`software-transfer receive OFFER` on the destination, for example through SSH.
+Both sides use the same offer file. The receiver enforces a 16 GiB artifact
+limit by default, configurable with `--max-bundle-mib`, and reserves disk
+space before writing each member. It publishes the bundle under
+`STATE/software-incoming/VM-ID-TRANSFER-ID` after digest verification and
+a final check that the exact offer is still pending or committed. Retrying
+the same transfer rechecks the stored bytes.
+
+The stream starts with `flexvm-software-bundle-v1` and a newline, followed by
+the four-byte big-endian header length and a JSON object with `offer` and
+`manifest`. Raw members follow in the order engine, kernel, root filesystem,
+VM state, and firmware in manifest key order. The manifest supplies every
+length and digest. A truncated, extended or corrupted stream fails verification.
+The published bundle is an input to future destination activation and carries
+no source retirement or local execution grant.
+
 After load, use the guest agent to step CLOCK_REALTIME from the current host time.
 Do not reset CLOCK_MONOTONIC through the agent. Preserve the engine virtual clock
 and device timers through migration, and test nondecreasing monotonic time and

@@ -12,6 +12,8 @@ use super::{host_id, host_id_in, parent_directory, parent_lock, present, private
 use crate::host::{Host, PidFd};
 use crate::{bail, util::Result};
 
+pub(crate) mod bundle;
+
 const RECEIPT_DOMAIN: &[u8] = b"flexvm/software-retirement/v1\0";
 const ABORT_DOMAIN: &[u8] = b"flexvm/software-abort/v1\0";
 
@@ -86,8 +88,8 @@ fn transition(state: &Path, offer: Offer, action: Action) -> Result<Status> {
     }
     let _lock = parent_lock(&dir, libc::LOCK_EX)?;
     // A single durable record per VM retains its highest observed generation.
-    let name = format!(".software-transfer-v1-{}", offer.vm_id);
-    let previous: Option<Journal> = if present(&dir, &name)? { Some(record(&dir, &name)?) } else { None };
+    let name = incoming_record(&offer);
+    let previous = read_incoming(&dir, &offer)?;
     let next = match action {
         Action::Prepare(source_key) => {
             decode::<32>(&source_key, "source public key")?;
@@ -304,6 +306,31 @@ fn recover_source(state: &File, receipt: Receipt) -> Result<()> {
 pub(crate) fn recover(state: &Path, input: &Path) -> Result<serde_json::Value> {
     recover_source(&parent_directory(state)?, read_input(input)?)?;
     Ok(serde_json::json!({"status": "recovered"}))
+}
+
+fn incoming_record(offer: &Offer) -> String {
+    format!(".software-transfer-v1-{}", offer.vm_id)
+}
+
+fn read_incoming(state: &File, offer: &Offer) -> Result<Option<Journal>> {
+    let name = incoming_record(offer);
+    if present(state, &name)? {
+        Ok(Some(record(state, &name)?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Call with the destination journal lock held, including at publication.
+fn require_incoming(state: &File, offer: &Offer) -> Result<()> {
+    offer.validate()?;
+    if offer.destination_host != host_id_in(state)? {
+        bail!("software transfer does not name this host as its remote destination");
+    }
+    if matching(&read_incoming(state, offer)?, offer)?.status == Status::Aborted {
+        bail!("software transfer was aborted");
+    }
+    Ok(())
 }
 
 fn matching(previous: &Option<Journal>, offer: &Offer) -> Result<Journal> {

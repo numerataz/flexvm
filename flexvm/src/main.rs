@@ -95,6 +95,10 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      write the abort and sign its acknowledgment
   flexvm software-transfer recover ABORT-RECEIPT
                                      authorize the source at a higher generation
+  flexvm software-transfer send VM OFFER
+                                     stream the exact retired software checkpoint to stdout
+  flexvm software-transfer receive OFFER [--max-bundle-mib MIB]
+                                     verify a prepared checkpoint bundle from stdin
   flexvm software --kernel FILE [OPTIONS] IMAGE [CMD...]
                                      --kernel-sdk: matching native module build inputs;
                                      --kernel-modules FILE: custom runtime or SDK bundle
@@ -556,7 +560,7 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("rm", NAMES, &["force"]),
     ("volume", NAMES, &["size"]),
     ("checkpoint", NAMES, &["stop", "incremental", "quiet", "format", "filter", "force", "older-than", "output", "input", "name", "sha256"]),
-    ("software-transfer", 4, &["source-key", "signing-key", "destination-key"]),
+    ("software-transfer", 4, &["source-key", "signing-key", "destination-key", "max-bundle-mib"]),
     ("migrate", 3, &[]),
     ("reclaim", 2, &["force"]),
     ("listen", 2, &[]),
@@ -645,13 +649,16 @@ fn check_applies(args: &Args) -> Result<()> {
         "software-transfer" => {
             let words = args.positional.len();
             let keys = (args.has("source-key"), args.has("signing-key"), args.has("destination-key"));
+            if args.has("max-bundle-mib") && first.map(String::as_str) != Some("receive") {
+                bail!("--max-bundle-mib applies only to software-transfer receive");
+            }
             if !matches!(
                 (first.map(String::as_str), words, keys),
                 (Some("id"), 2, (false, false, false))
                     | (Some("prepare"), 3, (true, false, false))
-                    | (Some("commit" | "abort" | "recover"), 3, (false, false, false))
+                    | (Some("commit" | "abort" | "recover" | "receive"), 3, (false, false, false))
                     | (Some("acknowledge-abort"), 3, (false, true, false))
-                    | (Some("offer"), 4, (false, false, false))
+                    | (Some("offer" | "send"), 4, (false, false, false))
                     | (Some("retire"), 4, (false, true, true))
             ) {
                 bail!("invalid software-transfer arguments (see flexvm --help)");
@@ -808,6 +815,9 @@ fn real_main(args: &Args) -> Result<()> {
             }
         }
         Some("pull") => pull(args, name),
+        Some("software-transfer") if name == "send" => {
+            software_state::transfer::bundle::send(&open_host(args)?, pos[2], Path::new(pos[3]), &mut std::io::stdout().lock())
+        }
         Some("software-transfer") if name == "offer" => print(software_state::transfer::offer(&open_host(args)?, pos[2], pos[3])?),
         Some("software-transfer") if name == "retire" => print(software_state::transfer::retire(
             &open_host(args)?,
@@ -819,6 +829,9 @@ fn real_main(args: &Args) -> Result<()> {
         Some("software-transfer") => {
             let path = state(args)?;
             host::host_dir(&path, 0o755)?;
+            if name == "receive" {
+                return print(software_state::transfer::bundle::import(&path, Path::new(pos[2]), &mut std::io::stdin().lock(), args.get("max-bundle-mib"))?);
+            }
             if name == "acknowledge-abort" {
                 return print(software_state::transfer::acknowledge_abort(&path, Path::new(pos[2]), Path::new(args.get("signing-key").unwrap()))?);
             }

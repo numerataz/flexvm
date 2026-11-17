@@ -199,6 +199,18 @@ def exercise(args):
 
         prepare_and_retire()
         require_refused('software-transfer', 'recover', ack, error='does not match a source fence')
+        with (args.output / 'transfer-send.log').open('wb') as errors:
+            source = subprocess.Popen([*base, 'software-transfer', 'send', 'state-test', offer], stdout=subprocess.PIPE, stderr=errors)
+            try:
+                received = json.loads(subprocess.check_output([*target, 'receive', offer], stdin=source.stdout,
+                                                             timeout=max(.1, deadline - time.monotonic())))
+                if source.wait(timeout=10) != 0 or received['status'] != 'received' or received['bytes'] <= 0:
+                    raise RuntimeError('software checkpoint bundle did not transfer; see transfer-send.log')
+            finally:
+                source.stdout.close()
+                if source.poll() is None:
+                    source.kill()
+                    source.wait(timeout=10)
         if destination('commit', receipt)['status'] != 'committed':
             raise RuntimeError('transfer destination did not commit')
         require_refused('start', 'state-test', error='source cannot restart')

@@ -909,6 +909,10 @@ pub fn sweep(state: &Path) -> Result<()> {
     if suspended.exists() {
         sweep_directory(&suspended, true)?;
     }
+    let incoming = state.join(transfer::bundle::INCOMING);
+    if incoming.exists() {
+        sweep_directory(&incoming, true)?;
+    }
     Ok(())
 }
 
