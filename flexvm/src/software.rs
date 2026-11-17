@@ -337,6 +337,9 @@ impl Owner {
     }
 
     fn suspend(&self) -> Result<Value> {
+        if self.machine.has_routed_network() {
+            bail!("software suspend does not support routed networking yet");
+        }
         if !self.reset_capable {
             bail!("software suspend requires a current serial guest agent");
         }

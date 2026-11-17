@@ -525,7 +525,7 @@ const NAMES: usize = usize::MAX;
 
 /// Each command's words (itself included) at most, and its flags besides `GLOBAL`.
 const COMMANDS: &[(&str, usize, &[&str])] = &[
-    ("software", 2, &["name", "kernel", "qemu", "control", "vsock-backend", "mem", "vcpus", "timeout", "disk"]),
+    ("software", 2, &["name", "kernel", "qemu", "control", "vsock-backend", "mem", "vcpus", "timeout", "disk", "network"]),
     (
         "run",
         2,
@@ -2442,6 +2442,12 @@ fn kernel_bundle(args: &Args, kernel: &Path, reviewed: bool) -> Result<Option<im
 /// with engine processes owned by this foreground command. Named VMs also expose
 /// live management and local suspend/restore; migration remains separate work.
 fn software(args: &Args, src: &str) -> Result<i32> {
+    let routed = match args.get("network").unwrap_or("private") {
+        "private" => false,
+        "routed" if args.has("name") => true,
+        "routed" => bail!("software --network routed requires --name"),
+        other => bail!("unsupported software network {other:?}: use private or routed"),
+    };
     if args.has("disk") && !args.has("name") {
         bail!("--disk requires a named software VM");
     }
@@ -2519,9 +2525,15 @@ fn software(args: &Args, src: &str) -> Result<i32> {
     } else {
         Vec::new()
     };
+    let routed = if routed {
+        let (host, lock) = named.as_ref().ok_or("routed software networking needs a named VM")?;
+        Some(qemu::Routed::new(host, &lock.name)?)
+    } else {
+        None
+    };
     let machine = match modules {
-        Some(bundle) => config.boot_with_kernel(&rootfs, processes.clone(), bundle.kernel, disks)?,
-        None => config.boot(&rootfs, processes.clone(), disks)?,
+        Some(bundle) => config.boot_with_kernel(&rootfs, processes.clone(), bundle.kernel, disks, routed)?,
+        None => config.boot(&rootfs, processes.clone(), disks, routed)?,
     };
     drop(_cache_lock);
     if let Some((host, lock)) = named {

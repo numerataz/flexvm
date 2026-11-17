@@ -2,9 +2,11 @@
 //!
 //! This cold-boot path owns both processes. Its state is separate from Firecracker
 //! templates/checkpoints; native QEMU vhost-user-vsock is not yet migratable.
+use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::fd::{AsRawFd, RawFd};
+use std::net::IpAddr;
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -14,6 +16,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
+use crate::host::{AddrClaim, Host, Ident};
+use crate::net::{self, VmAddr};
 use crate::socket::{SocketRoot, Sockets};
 use crate::util::{By, Result};
 use crate::{bail, guest, software_state, template, util, volume};
@@ -32,6 +36,7 @@ pub enum Control {
 pub enum Network {
     Private,
     Legacy,
+    Routed(VmAddr),
 }
 
 impl Network {
@@ -39,6 +44,7 @@ impl Network {
         match self {
             Self::Private => "user,id=net,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15,ipv6=off",
             Self::Legacy => "user,id=net,net=169.254.0.0/16,host=169.254.1.1,dns=169.254.1.3,dhcpstart=169.254.1.2,ipv6=off",
+            Self::Routed(_) => "tap,id=net,fd=@tap,vhost=off",
         }
     }
 
@@ -46,6 +52,7 @@ impl Network {
         match self {
             Self::Private => std::net::Ipv4Addr::new(10, 0, 2, 15),
             Self::Legacy => std::net::Ipv4Addr::new(169, 254, 1, 2),
+            Self::Routed(address) => address.v4,
         }
     }
 
@@ -53,13 +60,14 @@ impl Network {
         match self {
             Self::Private => "10.0.2.3",
             Self::Legacy => "169.254.1.3",
+            Self::Routed(_) => "",
         }
     }
 
     fn kernel_arg(self) -> &'static str {
         match self {
             Self::Private => " flexvm.gateway4=10.0.2.2",
-            Self::Legacy => "",
+            Self::Legacy | Self::Routed(_) => "",
         }
     }
 
@@ -67,6 +75,37 @@ impl Network {
     pub fn from_profile(profile: &software_state::Profile) -> Option<Self> {
         let value = profile.arguments.windows(2).find(|args| args[0] == "-netdev")?.get(1)?;
         [Self::Private, Self::Legacy].into_iter().find(|network| network.netdev() == value)
+    }
+}
+
+pub struct Routed {
+    tap: OwnedFd,
+    index: u32,
+    address: VmAddr,
+    dns: Vec<IpAddr>,
+    host: Host,
+    claim: AddrClaim,
+}
+
+impl Routed {
+    pub fn new(host: &Host, name: &str) -> Result<Self> {
+        let config = host.config_now();
+        let owner = Ident::me();
+        let claim = {
+            let lock = host.lock()?;
+            host.claim_new_in(&lock, &config, name, None)?
+        };
+        let address = config.vm_addr(claim.ip);
+        let alias = crate::host::tap_alias(&host.run, &owner);
+        let (tap, name, index) = net::open_software_tap(&alias, &format!("fsw{:x}", owner.pid))?;
+        net::neighbour(address, &name)?;
+        Ok(Self { tap, index, address, dns: config.guest_dns(), host: host.clone(), claim })
+    }
+
+    fn publish(&self) -> Result<()> {
+        let lock = self.host.fence(self.claim.ip, self.claim.gen)?;
+        net::route(self.address, self.index)?;
+        self.host.publish_live(&lock, self.claim.ip, self.claim.gen, self.claim.rev)
     }
 }
 
@@ -247,6 +286,7 @@ struct Endpoints<'a> {
     control: &'a Path,
     backend: &'a Path,
     firmware: &'a Path,
+    tap: Option<RawFd>,
 }
 
 pub struct Machine {
@@ -254,6 +294,7 @@ pub struct Machine {
     disks: Vec<volume::Writer>,
     profile: software_state::Profile,
     network: Network,
+    routed: Option<Routed>,
     engine_version: Value,
     capture: Mutex<Capture>,
     processes: Arc<Processes>,
@@ -364,7 +405,15 @@ impl Config {
             cmd.args(["-chardev", &format!("socket,id=control,path={},server=on,wait=off", endpoints.control.display())]);
             cmd.args(["-device", &format!("virtserialport,bus=controlbus.0,chardev=control,name={}", control::PORT_NAME)]);
         }
-        cmd.args(["-netdev", network.netdev(), "-device", &format!("{nic},netdev=net")]);
+        match network {
+            Network::Routed(_) => {
+                let backend = endpoints.tap.map_or_else(|| network.netdev().to_owned(), |fd| format!("tap,id=net,fd={fd},vhost=off"));
+                cmd.args(["-netdev", &backend, "-device", &format!("{nic},netdev=net,mac={}", net::mac_string(&net::GUEST_MAC))]);
+            }
+            _ => {
+                cmd.args(["-netdev", network.netdev(), "-device", &format!("{nic},netdev=net")]);
+            }
+        }
         cmd.args(["-qmp", &format!("unix:{},server=on,wait=off", endpoints.api.display())]);
         Ok(cmd)
     }
@@ -389,8 +438,13 @@ impl Config {
     }
 
     fn profile_for(&self, network: Network, disks: &[(&str, PathBuf)]) -> Result<software_state::Profile> {
-        let endpoints =
-            Endpoints { api: Path::new("@qmp"), control: Path::new("@control"), backend: Path::new("@vsock-backend"), firmware: Path::new("@firmware") };
+        let endpoints = Endpoints {
+            api: Path::new("@qmp"),
+            control: Path::new("@control"),
+            backend: Path::new("@vsock-backend"),
+            firmware: Path::new("@firmware"),
+            tap: None,
+        };
         let command = self.command(Path::new("@engine"), Path::new("@kernel"), Path::new("@rootfs"), &endpoints, network, disks)?;
         Ok(software_state::Profile {
             architecture: std::env::consts::ARCH.into(),
@@ -401,14 +455,23 @@ impl Config {
         })
     }
 
-    pub fn boot(&self, rootfs: &Path, processes: Arc<Processes>, disks: Vec<volume::Writer>) -> Result<Machine> {
+    pub fn boot(&self, rootfs: &Path, processes: Arc<Processes>, disks: Vec<volume::Writer>, routed: Option<Routed>) -> Result<Machine> {
         let inputs = software_state::Inputs::open(&self.qemu, &self.kernel, rootfs)?;
-        self.launch(inputs, processes, None, Network::Private, disks)
+        let network = routed.as_ref().map_or(Network::Private, |routed| Network::Routed(routed.address));
+        self.launch(inputs, processes, None, network, disks, routed)
     }
 
-    pub fn boot_with_kernel(&self, rootfs: &Path, processes: Arc<Processes>, kernel: software_state::Input, disks: Vec<volume::Writer>) -> Result<Machine> {
+    pub fn boot_with_kernel(
+        &self,
+        rootfs: &Path,
+        processes: Arc<Processes>,
+        kernel: software_state::Input,
+        disks: Vec<volume::Writer>,
+        routed: Option<Routed>,
+    ) -> Result<Machine> {
         let inputs = software_state::Inputs::with_kernel(&self.qemu, kernel, rootfs)?;
-        self.launch(inputs, processes, None, Network::Private, disks)
+        let network = routed.as_ref().map_or(Network::Private, |routed| Network::Routed(routed.address));
+        self.launch(inputs, processes, None, network, disks, routed)
     }
 
     /// Load state into a fresh engine, with CPUs paused and public admission closed.
@@ -426,7 +489,7 @@ impl Config {
         };
         verified.state.unchanged()?;
         let machine = self
-            .launch(verified.inputs, processes, Some((&verified.state.file, &verified.manifest.engine_version)), network, disks)
+            .launch(verified.inputs, processes, Some((&verified.state.file, &verified.manifest.engine_version)), network, disks, None)
             .map_err(|error| format!("software incoming engine load failed: {error}"))?;
         verified.state.unchanged()?;
         Ok(machine)
@@ -439,6 +502,7 @@ impl Config {
         incoming: Option<(&File, &Value)>,
         network: Network,
         disks: Vec<volume::Writer>,
+        routed: Option<Routed>,
     ) -> Result<Machine> {
         // Restore uses pinned artifacts and does not require the original input paths.
         self.validate_limits()?;
@@ -461,6 +525,7 @@ impl Config {
             disks,
             profile,
             network,
+            routed,
             engine_version: Value::Null,
             capture: Mutex::default(),
             processes,
@@ -492,7 +557,9 @@ impl Config {
                     std::thread::sleep(Duration::from_millis(10));
                 }
             }
-            let endpoints = Endpoints { api: &machine.sockets.api, control: &machine.sockets.vsock, backend: &machine.sockets.uffd, firmware: &firmware };
+            let tap = machine.routed.as_ref().map(|routed| routed.tap.as_raw_fd());
+            inherited.extend(tap);
+            let endpoints = Endpoints { api: &machine.sockets.api, control: &machine.sockets.vsock, backend: &machine.sockets.uffd, firmware: &firmware, tap };
             let disks: Vec<_> = machine
                 .disks
                 .iter()
@@ -576,9 +643,26 @@ impl Config {
             }
             crate::info!("software: configuring guest network and clock");
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-            let line = format!("START {} {}.{:09} {}", network.ip(), now.as_secs(), now.subsec_nanos(), network.dns());
-            if machine.message(&line, deadline)? != b"ok" {
-                bail!("software guest rejected network/clock setup");
+            let clock = format!("{}.{:09}", now.as_secs(), now.subsec_nanos());
+            let line = match &machine.routed {
+                Some(routed) => {
+                    let mut line = match routed.address.v6 {
+                        Some(ip6) => format!("START6 {} {ip6} {clock}", routed.address.v4),
+                        None => format!("START {} {clock}", routed.address.v4),
+                    };
+                    for dns in &routed.dns {
+                        write!(line, " {dns}")?;
+                    }
+                    line
+                }
+                None => format!("START {} {clock} {}", network.ip(), network.dns()),
+            };
+            let reply = machine.message(&line, deadline)?;
+            if reply != b"ok" {
+                bail!("software guest rejected network/clock setup: {}", String::from_utf8_lossy(&reply));
+            }
+            if let Some(routed) = &machine.routed {
+                routed.publish()?;
             }
             crate::info!("software: guest ready");
             Ok(())
@@ -682,6 +766,10 @@ impl Qmp {
 }
 
 impl Machine {
+    pub fn has_routed_network(&self) -> bool {
+        self.routed.is_some()
+    }
+
     pub fn ip(&self) -> std::net::Ipv4Addr {
         self.network.ip()
     }
@@ -1135,7 +1223,7 @@ mod tests {
             boot_timeout: Duration::from_secs(60),
         };
         let source = Arc::new(Processes::default());
-        let machine = config.boot(&rootfs, source.clone(), Vec::new()).unwrap();
+        let machine = config.boot(&rootfs, source.clone(), Vec::new(), None).unwrap();
         let deadline = Instant::now() + Duration::from_secs(60);
         assert_eq!(machine.message("FENCE 1 42", deadline).unwrap(), b"ok 1");
         let (id, mut output) = machine.start_exec(meta.argv.clone()).unwrap();
@@ -1348,6 +1436,7 @@ mod tests {
             disks: Vec::new(),
             profile: software_state::Profile { architecture: std::env::consts::ARCH.into(), arguments: Vec::new() },
             network: Network::Private,
+            routed: None,
             engine_version: Value::Null,
             capture: Mutex::default(),
             processes: Arc::new(Processes::default()),
