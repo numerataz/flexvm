@@ -754,7 +754,7 @@ fn serve(
     let published = {
         let _op = owner.op.write().unwrap();
         let entry = owner.entry.lock().unwrap().clone();
-        owner.name.publish(&entry).and_then(|()| owner.machine.complete_routed_import())
+        owner.name.publish(&entry).and_then(|()| owner.machine.activate_routed_address())
     };
     let result = published.and_then(|()| {
         if let Some(notify) = notify {
