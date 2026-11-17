@@ -55,7 +55,7 @@ inputs() {
   printf 'commit %s\n' "$FC_COMMIT" || return 1
   (cd "$root/firecracker" && sha256sum -- *.patch) || return 1
   (cd "$root" && sha256sum .github/workflows/release.yml scripts/release-assets.sh scripts/build-firecracker.sh scripts/fetch.sh scripts/versions.sh) || return 1
-  (cd "$root" && sha256sum scripts/build-kernel.sh scripts/package-kernel-modules.sh kernel/source.env kernel/features.config "kernel/features-$arch.config" "kernel/config/$arch.config") || return 1
+  (cd "$root" && sha256sum scripts/build-kernel.sh scripts/package-kernel-modules.sh scripts/apply-kernel-patches.sh kernel/patches/series kernel/patches/*.patch kernel/source.env kernel/features.config "kernel/features-$arch.config" "kernel/config/$arch.config") || return 1
   printf 'linux-source %s %s\n' "$kernel" "$LINUX_VERSION"
 }
 

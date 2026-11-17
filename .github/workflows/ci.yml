@@ -158,7 +158,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/software-state/artifacts
-          key: software-kernel-${{ matrix.arch }}-${{ hashFiles('scripts/build-kernel.sh', 'scripts/package-kernel-modules.sh', 'scripts/fetch.sh', 'scripts/versions.sh', 'scripts/checksums.sha256', 'kernel/config/*', 'kernel/features*.config', 'kernel/source.env') }}
+          key: software-kernel-${{ matrix.arch }}-${{ hashFiles('scripts/build-kernel.sh', 'scripts/package-kernel-modules.sh', 'scripts/fetch.sh', 'scripts/versions.sh', 'scripts/checksums.sha256', 'kernel/config/*', 'kernel/features*.config', 'kernel/source.env', 'kernel/patches/*', 'scripts/apply-kernel-patches.sh') }}
       - name: Fetch or build the reviewed kernel
         run: ./scripts/fetch.sh --kernel --state "$RUNNER_TEMP/software-state"
       - name: Fetch the unchanged hypervisor
@@ -167,6 +167,9 @@ jobs:
         run: |
           sudo python3 scripts/compat/software-boot.py --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-boot" ${{ matrix.extra }} --guest-firecracker "$RUNNER_TEMP/software-state/artifacts/firecracker"
           cat "$RUNNER_TEMP/software-boot/report.json"
+      - name: TSC initialization without hardware scaling
+        if: matrix.arch == 'x86_64'
+        run: sudo python3 scripts/compat/software-boot.py --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-tsc" --guest-kvm --guest-tsc
       - name: Save software kernel
         if: success() && steps.software-kernel.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -240,6 +243,9 @@ jobs:
             ${{ runner.temp }}/software-distro/*.json
             ${{ runner.temp }}/software-distro/*.log
             ${{ runner.temp }}/software-distro/*.strace
+            ${{ runner.temp }}/software-tsc/*.json
+            ${{ runner.temp }}/software-tsc/*.log
+            ${{ runner.temp }}/software-tsc/*.strace
             ${{ runner.temp }}/software-boot/report.json
             ${{ runner.temp }}/software-boot/guest.log
             ${{ runner.temp }}/software-boot/files.strace
@@ -320,7 +326,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/software-state/artifacts
-          key: module-artifacts-${{ matrix.arch }}-${{ hashFiles('scripts/build-kernel.sh', 'scripts/package-kernel-modules.sh', 'scripts/fetch.sh', 'scripts/versions.sh', 'scripts/checksums.sha256', 'kernel/config/*', 'kernel/features*.config', 'kernel/source.env') }}
+          key: module-artifacts-${{ matrix.arch }}-${{ hashFiles('scripts/build-kernel.sh', 'scripts/package-kernel-modules.sh', 'scripts/fetch.sh', 'scripts/versions.sh', 'scripts/checksums.sha256', 'kernel/config/*', 'kernel/features*.config', 'kernel/source.env', 'kernel/patches/*', 'scripts/apply-kernel-patches.sh') }}
       - name: Fetch matching kernel, runtime modules and SDK
         run: scripts/fetch.sh --kernel-sdk --state "$RUNNER_TEMP/software-state"
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
@@ -386,7 +392,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/software-state/artifacts
-          key: workload-artifacts-${{ matrix.arch }}-${{ hashFiles('scripts/build-kernel.sh', 'scripts/package-kernel-modules.sh', 'scripts/fetch.sh', 'scripts/versions.sh', 'scripts/checksums.sha256', 'kernel/config/*', 'kernel/features*.config', 'kernel/source.env') }}
+          key: workload-artifacts-${{ matrix.arch }}-${{ hashFiles('scripts/build-kernel.sh', 'scripts/package-kernel-modules.sh', 'scripts/fetch.sh', 'scripts/versions.sh', 'scripts/checksums.sha256', 'kernel/config/*', 'kernel/features*.config', 'kernel/source.env', 'kernel/patches/*', 'scripts/apply-kernel-patches.sh') }}
       - name: Fetch matching kernel and runtime modules
         run: scripts/fetch.sh --kernel --state "$RUNNER_TEMP/software-state"
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
