@@ -1057,6 +1057,29 @@ pub fn unroute_dev(ip: IpAddr, ifindex: u32) -> Result<()> {
     netlink(RTM_DELROUTE, 0, &dev_route_msg(ip, ifindex))
 }
 
+/// A less preferred route to a software VM's TAP while a TUN holds packets.
+/// If the holder dies before the VM stops, removal of its TUN exposes this route.
+pub fn hold_fallback(add: bool, ip: VmAddr, ifindex: u32) -> Result<()> {
+    let change = |dst| {
+        let mut route = dev_route_msg(dst, ifindex);
+        attr(&mut route, libc::RTA_PRIORITY, &2048_u32.to_ne_bytes());
+        if add {
+            netlink(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE, &route)
+        } else {
+            netlink(RTM_DELROUTE, 0, &route)
+        }
+    };
+    if add {
+        change(ip.v4.into())?;
+        if let Err(error) = ip.v6.map_or(Ok(()), |ip| change(ip.into())) {
+            let _ = hold_fallback(false, ip.v4.into(), ifindex);
+            return Err(error);
+        }
+        return Ok(());
+    }
+    ip.each().map(change).fold(Ok(()), Result::and)
+}
+
 /// The route of `ip` (a /32 or /128) to the device at `ifindex`.
 fn dev_route_msg(ip: IpAddr, ifindex: u32) -> Vec<u8> {
     let (mut route, dst) = match ip {
@@ -1187,6 +1210,29 @@ pub fn ifindex(dev: &str) -> Result<u32> {
         0 => bail!("no interface {dev}"),
         i => Ok(i),
     }
+}
+
+pub fn link_alias(index: u32) -> Result<String> {
+    let sock = socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE, "netlink socket")?;
+    let mut buf = [0u8; 8192];
+    let reply = exchange(&sock, libc::RTM_GETLINK, 0, &ifinfomsg(index), &mut buf).map_err(|_| "could not read link alias")?;
+    if reply.len() < 32 || u16::from_ne_bytes([reply[4], reply[5]]) != libc::RTM_NEWLINK {
+        bail!("could not read alias for interface {index}");
+    }
+    let mut attrs = &reply[32..];
+    while attrs.len() >= 4 {
+        let len = u16::from_ne_bytes([attrs[0], attrs[1]]) as usize;
+        let kind = u16::from_ne_bytes([attrs[2], attrs[3]]);
+        if len < 4 || len.next_multiple_of(4) > attrs.len() {
+            break;
+        }
+        if kind == IFLA_IFALIAS {
+            let alias = &attrs[4..len];
+            return Ok(std::str::from_utf8(alias.strip_suffix(&[0]).unwrap_or(alias))?.into());
+        }
+        attrs = &attrs[len.next_multiple_of(4)..];
+    }
+    Ok(String::new())
 }
 
 pub fn parse_mac(s: &str) -> Result<[u8; 6]> {

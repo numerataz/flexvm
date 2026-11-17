@@ -97,6 +97,8 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      sign a routed software VM's active destination
   flexvm software-transfer install-route ROUTE-ACK
                                      install the signed peer route at the retired source
+  flexvm software-transfer hold-route VM [--timeout SECONDS]
+                                     buffer ingress until the signed route arrives (default 600s)
   flexvm software-transfer abort OFFER
                                      durably reject the prepared transfer
   flexvm software-transfer acknowledge-abort OFFER --signing-key FILE
@@ -575,7 +577,7 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("rm", NAMES, &["force"]),
     ("volume", NAMES, &["size"]),
     ("checkpoint", NAMES, &["stop", "incremental", "quiet", "format", "filter", "force", "older-than", "output", "input", "name", "sha256"]),
-    ("software-transfer", 4, &["source-key", "signing-key", "destination-key", "handoff-chain", "max-bundle-mib", "qemu", "route-peer"]),
+    ("software-transfer", 4, &["source-key", "signing-key", "destination-key", "handoff-chain", "max-bundle-mib", "qemu", "route-peer", "timeout"]),
     ("migrate", 3, &[]),
     ("reclaim", 2, &["force"]),
     ("listen", 2, &[]),
@@ -671,6 +673,9 @@ fn check_applies(args: &Args) -> Result<()> {
             if args.has("max-bundle-mib") && first.map(String::as_str) != Some("receive") {
                 bail!("--max-bundle-mib applies only to software-transfer receive");
             }
+            if args.has("timeout") && first.map(String::as_str) != Some("hold-route") {
+                bail!("--timeout applies only to software-transfer hold-route");
+            }
             let activating = first.map(String::as_str) == Some("activate");
             if (args.has("route-peer") && !activating) || (activating && args.has("route-peer") != args.has("signing-key")) {
                 bail!("software-transfer activate takes --route-peer PEER together with --signing-key FILE");
@@ -682,7 +687,7 @@ fn check_applies(args: &Args) -> Result<()> {
                 (first.map(String::as_str), words, keys),
                 (Some("id"), 2, (false, false, false))
                     | (Some("prepare"), 3, (true, false, false))
-                    | (Some("commit" | "abort" | "recover" | "receive" | "install-route"), 3, (false, false, false))
+                    | (Some("commit" | "abort" | "recover" | "receive" | "install-route" | "hold-route"), 3, (false, false, false))
                     | (Some("acknowledge-abort" | "acknowledge-commit" | "acknowledge-route" | "finalize"), 3, (false, true, false))
                     | (Some("offer" | "send" | "activate"), 4, (false, false, false))
                     | (Some("activate"), 4, (false, true, false))
@@ -863,6 +868,11 @@ fn real_main(args: &Args) -> Result<()> {
             print(software_state::transfer::routing::acknowledge(&open_host(args)?, Path::new(pos[2]), Path::new(args.get("signing-key").unwrap()))?)
         }
         Some("software-transfer") if name == "install-route" => print(software_state::transfer::routing::install(&open_host(args)?, Path::new(pos[2]))?),
+        Some("software-transfer") if name == "hold-route" => {
+            let timeout = Duration::from_secs(args.parse_or("timeout", 600)?);
+            let result = software_state::transfer::routing::hold::run(&open_host(args)?, pos[2], timeout, |ready| output(format_args!("{ready}\n")))?;
+            output(format_args!("{result}\n"))
+        }
         Some("software-transfer") => {
             let path = state(args)?;
             host::host_dir(&path, 0o755)?;

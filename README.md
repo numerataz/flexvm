@@ -710,6 +710,17 @@ to `software-transfer activate`. The destination signs its active
 route with the destination key and sends it to the source listener.
 The peer route is withdrawn when the VM exits.
 
+For a routed transfer between separate hosts, run
+`flexvm software-transfer hold-route VM` on the source before
+`flexvm stop VM`. Wait for the `holding` line and leave the command
+running while you transfer and activate the checkpoint. The source queues
+up to 4 MiB of ingress packets for this address. Once it installs the
+signed peer route, the command forwards the queue and prints packet and
+drop counts. The hold expires after 600 seconds by default. Set
+`--timeout SECONDS` for a different transfer window. If a hold is
+cancelled or expires and the original owner is still running, the command
+restores its TAP route.
+
 
 ## IPv6 addresses
 

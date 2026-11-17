@@ -11,6 +11,9 @@ use super::{bundle::activate, decode, host_id_in, parent_directory, parent_lock,
 use crate::host::{Backend, Hop, Host};
 use crate::{bail, util::Result};
 
+#[path = "routing_hold.rs"]
+pub(crate) mod hold;
+
 const ROUTE_DOMAIN: &[u8] = b"flexvm/software-routed-activation/v1\0";
 
 #[derive(Serialize, Deserialize)]
@@ -114,6 +117,7 @@ fn install_ack(host: &Host, acknowledgement: Acknowledgement) -> Result<serde_js
     }
     let lock = host.lock()?;
     host.install_software_route(&lock, network.address.v4, network.generation, revision, via)?;
+    hold::route_installed(host, &lock, network.address.v4, network.generation, revision)?;
     Ok(serde_json::json!({"status":"routed","address":network.address,"generation":network.generation,"revision":revision,"via":via.via(),"via6":via.via6()}))
 }
 
