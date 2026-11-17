@@ -627,11 +627,13 @@ fn serve_serial(statuses: Statuses, sessions: session::Sessions) -> io::Result<(
     loop {
         let port = File::options().read(true).write(true).custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW).open(&path)?;
         let peer = port.try_clone()?;
-        if let Some((generation, sequence)) = reset_admission.drained_identity() {
-            log(&format!("serial control ready barrier {generation} {sequence}"));
-        } else {
-            log("serial control ready");
-        }
+        let marker = match reset_admission.drained_identity() {
+            Some((generation, sequence)) => format!("\nflexvm-init: serial control ready barrier {generation} {sequence}\n"),
+            None => "\nflexvm-init: serial control ready\n".to_string(),
+        };
+        // A getty may have left an unterminated prompt. Keep the separator and
+        // marker in one write so the host can require a complete, exact line.
+        let _ = io::stderr().write_all(marker.as_bytes());
         if let Err(e) = control::serve(port, incoming.clone()) {
             log(&format!("serial control disconnected: {e}"));
         }

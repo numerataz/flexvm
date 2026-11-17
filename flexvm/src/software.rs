@@ -134,7 +134,7 @@ struct Owner {
     barrier: Mutex<Option<(u64, u64)>>,
     sequence: AtomicU64,
     changed: Condvar,
-    main_id: String,
+    main_id: Option<String>,
     offset: AtomicU64,
     drain: AtomicU8,
     resets: AtomicU64,
@@ -254,12 +254,13 @@ impl Owner {
     }
 
     fn main_output(&self, mut reader: BufReader<UnixStream>) -> Result<i32> {
+        let main_id = self.main_id.as_deref().ok_or("software app output has no main session")?;
         let stdout = OutputTarget::new(1)?;
         let stderr = OutputTarget::new(2)?;
         let mut offset = self.offset.load(Ordering::SeqCst);
         let mut handled_reset = 0;
         loop {
-            let result = self.machine.finish_exec_at(&mut reader, &self.main_id, &mut offset, |kind, bytes| {
+            let result = self.machine.finish_exec_at(&mut reader, main_id, &mut offset, |kind, bytes| {
                 if kind == guest::FRAME_STDERR {
                     stderr.write(bytes)
                 } else {
@@ -302,18 +303,36 @@ impl Owner {
                 let claim =
                     self.main_claim.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_add(1)).map_err(|_| "software main claim exhausted")? + 1;
                 let deadline = Instant::now() + guest::TIMEOUT;
-                let line = guest::attach_line(&self.main_id, offset, claim, self.epoch, guest::AttachForm::Epoch, false)?;
+                let line = guest::attach_line(main_id, offset, claim, self.epoch, guest::AttachForm::Epoch, false)?;
                 reader = self.machine.request(&line, deadline)?;
                 guest::untimed(&reader)?;
                 reader.get_ref().set_read_timeout(Some(Duration::from_millis(250)))?;
                 handled_reset = reset;
-                self.machine.exec_started(&mut reader, &self.main_id)?;
+                self.machine.exec_started(&mut reader, main_id)?;
                 // Mark reading before releasing admission's read guard. A new
                 // pause must wait for this attachment's final delivered offset.
                 self.drain.store(READING, Ordering::SeqCst);
                 drop(op);
                 break;
             }
+        }
+    }
+
+    fn distro_output(&self) -> Result<i32> {
+        loop {
+            crate::template::interrupted()?;
+            {
+                // Retirement/capture holds the write lock. Never mistake its
+                // engine termination for an unexpected guest exit mid-suspend.
+                let _op = self.op.read().unwrap();
+                if self.ended.load(Ordering::SeqCst) {
+                    bail!("software distro lifecycle completed");
+                }
+                if let Some(code) = self.machine.distro_exit()? {
+                    return Ok(code);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
 
@@ -370,10 +389,13 @@ impl Owner {
                 rootfs: blank.clone(),
                 state: blank,
                 firmware: std::collections::BTreeMap::new(),
-                main: software_state::Session {
-                    id: self.main_id.clone(),
-                    offset: self.offset.load(Ordering::SeqCst),
-                    claim: self.main_claim.load(Ordering::SeqCst),
+                main: match &self.main_id {
+                    Some(id) => software_state::Main::App(software_state::Session {
+                        id: id.clone(),
+                        offset: self.offset.load(Ordering::SeqCst),
+                        claim: self.main_claim.load(Ordering::SeqCst),
+                    }),
+                    None => software_state::Main::Distro(software_state::Distro { boot: self.image.boot }),
                 },
                 image: self.image.clone(),
             };
@@ -482,6 +504,18 @@ impl Owner {
                     self.exec(&req, &client, &mut acknowledged)?;
                     Ok(Value::Null)
                 }
+                "signal" if self.main_id.is_none() => {
+                    let _op = self.op.read().unwrap();
+                    if self.ended.load(Ordering::SeqCst) || self.entry.lock().unwrap().state != "running" {
+                        bail!("software distro VM is not running");
+                    }
+                    let signal = req["signal"].as_i64().and_then(|value| i32::try_from(value).ok()).ok_or("missing signal")?;
+                    let reply = self.machine.message(&format!("SIGNAL {signal}"), deadline)?;
+                    if reply != b"ok" {
+                        bail!("software distro signal refused: {}", String::from_utf8_lossy(&reply));
+                    }
+                    Ok(json!({"name":self.name.name,"signal":signal}))
+                }
                 "resume" if self.suspended.load(Ordering::SeqCst) || self.entry.lock().unwrap().state == "suspending" => Ok(json!({"suspending":true})),
                 "resume" => self.switch(false),
                 "suspend" => {
@@ -551,7 +585,7 @@ fn serve(
 ) -> Result<i32> {
     let machine = Arc::new(machine);
     let epoch = u64::from_str_radix(&util::random_hex(8)?, 16)?;
-    let deadline = Instant::now() + guest::TIMEOUT;
+    let deadline = Instant::now() + if meta.boot.is_app() { guest::TIMEOUT } else { config.boot_timeout };
     let (generation, identity_generation, vm_id, main_id, main_reader, offset, claim, consumed, notify) = match resumed {
         Some(resumed) => {
             // STARTED was synchronized before this first guest instruction.
@@ -559,20 +593,30 @@ fn serve(
             // the source was paused before it was suspended.
             machine.switch("cont", deadline).map_err(|error| format!("software destination CPU resume failed: {error}"))?;
             machine.resume_admission(resumed.generation, epoch, resumed.manifest.barrier_generation, resumed.manifest.barrier_sequence, deadline)?;
-            let main = &resumed.manifest.main;
-            let claim = main.claim.checked_add(1).ok_or("software main claim exhausted")?;
-            let line = guest::attach_line(&main.id, main.offset, claim, epoch, guest::AttachForm::Epoch, false)?;
-            let mut reader = machine.request(&line, deadline).map_err(|error| format!("software main reattach transport failed: {error}"))?;
-            guest::untimed(&reader)?;
-            reader.get_ref().set_read_timeout(Some(Duration::from_millis(250)))?;
-            machine.exec_started(&mut reader, &main.id)?;
+            let (main_id, reader, offset, claim) = match resumed.manifest.main.session() {
+                Some(main) => {
+                    let claim = main.claim.checked_add(1).ok_or("software main claim exhausted")?;
+                    let line = guest::attach_line(&main.id, main.offset, claim, epoch, guest::AttachForm::Epoch, false)?;
+                    let mut reader = machine.request(&line, deadline).map_err(|error| format!("software main reattach transport failed: {error}"))?;
+                    guest::untimed(&reader)?;
+                    reader.get_ref().set_read_timeout(Some(Duration::from_millis(250)))?;
+                    machine.exec_started(&mut reader, &main.id)?;
+                    (Some(main.id.clone()), Some(reader), main.offset, claim)
+                }
+                None => {
+                    // Admission already proved the restored broker is live.
+                    // Keep an existing distro running even if its runtime
+                    // service was stopped; APP would replace its cold identity.
+                    (None, None, 0, 0)
+                }
+            };
             (
                 resumed.generation,
                 resumed.manifest.identity_generation,
                 resumed.manifest.vm_id,
-                main.id.clone(),
+                main_id,
                 reader,
-                main.offset,
+                offset,
                 claim,
                 Some(resumed.consumed),
                 resumed.notify,
@@ -582,8 +626,18 @@ fn serve(
             if machine.message(&format!("FENCE 1 {epoch}"), deadline)? != b"ok 1" {
                 bail!("named software VM requires guest host-epoch fencing");
             }
-            let (id, mut reader) = machine.start_exec(meta.argv.clone())?;
-            machine.exec_started(&mut reader, &id)?;
+            let (id, reader) = if meta.boot.is_app() {
+                let (id, mut reader) = machine.start_exec(meta.argv.clone())?;
+                machine.exec_started(&mut reader, &id)?;
+                (Some(id), Some(reader))
+            } else {
+                let reply = machine.message(&format!("HOSTNAME {}", name.name), deadline)?;
+                if reply != b"ok" {
+                    bail!("setting software distro hostname: {}", String::from_utf8_lossy(&reply));
+                }
+                machine.start_distro(deadline)?;
+                (None, None)
+            };
             (1, u64::from_str_radix(&util::random_hex(8)?, 16)?.max(1), util::random_hex(16)?, id, reader, 0, 0, None, None)
         }
     };
@@ -603,7 +657,7 @@ fn serve(
         vcpus: config.vcpus,
         max_mib: u64::from(config.mem_mib),
         state: "running".into(),
-        cmd: true,
+        cmd: meta.boot.is_app(),
         ..Default::default()
     };
     let socket = host.sock(&name.name)?;
@@ -629,7 +683,7 @@ fn serve(
         changed: Condvar::new(),
         main_id: main_id.clone(),
         offset: AtomicU64::new(offset),
-        drain: AtomicU8::new(READING),
+        drain: AtomicU8::new(if main_id.is_some() { READING } else { DETACHED }),
         resets: AtomicU64::new(0),
         main_claim: AtomicU64::new(claim),
         vm_id,
@@ -699,7 +753,10 @@ fn serve(
         if let Some(notify) = notify {
             notify.send(&json!({"ok":true,"result":owner.name.name}))?;
         }
-        owner.main_output(main_reader)
+        match main_reader {
+            Some(reader) => owner.main_output(reader),
+            None => owner.distro_output(),
+        }
     });
     owner.ended.store(true, Ordering::SeqCst);
     {

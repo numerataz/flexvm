@@ -36,15 +36,15 @@ def exercise(args):
     owner = None
     evidence = {'status': 'running', 'phases': []}
 
-    def cli(*words, input=None, check=True):
+    def cli(*words, input=None, check=True, result=False):
         binary = isinstance(input, bytes)
-        result = subprocess.run([*base, *words], input=input, capture_output=True, text=not binary,
+        completed = subprocess.run([*base, *words], input=input, capture_output=True, text=not binary,
                                 timeout=max(.1, deadline - time.monotonic()), env=environment)
-        out = result.stdout.decode(errors='replace') if binary else result.stdout
-        err = result.stderr.decode(errors='replace') if binary else result.stderr
-        if check and result.returncode:
-            raise RuntimeError(f'{words[:4]}: exit {result.returncode}: {out[-2000:]} {err[-4000:]}')
-        return out
+        out = completed.stdout.decode(errors='replace') if binary else completed.stdout
+        err = completed.stderr.decode(errors='replace') if binary else completed.stderr
+        if check and completed.returncode:
+            raise RuntimeError(f'{words[:4]}: exit {completed.returncode}: {out[-2000:]} {err[-4000:]}')
+        return completed if result else out
 
     def entry():
         return next((item for item in json.loads(cli('ps', '--json')) if item['name'] == NAME), None)
@@ -101,18 +101,22 @@ def exercise(args):
         gate = 'while [ ! -x /state-probe ]; do sleep .05; done; exec /state-probe'
         with (args.output / 'guest.log').open('w') as out, (args.output / 'owner.log').open('w') as err:
             owner = subprocess.Popen([*base, 'software', '--name', NAME, '--control', 'serial', '--kernel', str(args.kernel),
-                                      '--mem', str(args.mem), '--vcpus', '2', '--timeout', '120', '--entrypoint', '[]',
-                                      args.image, '/bin/sh', '-ec', gate], stdout=out, stderr=err, env=environment)
+                                      '--mem', str(args.mem), '--vcpus', '2', '--timeout', '120', '--boot', args.boot,
+                                      *(['--entrypoint', '[]', args.image, '/bin/sh', '-ec', gate] if args.boot == 'app' else [args.image])], stdout=out, stderr=err, env=environment)
         ready()
         # Software management supports streaming exec. Transfer opaque guest
         # binaries through stdin instead of assuming the KVM-only cp operation.
         for name in ('guest-probe', 'state-probe'):
             cli('exec', '-i', NAME, '/bin/sh', '-ec', f'cat >/{name}.tmp; chmod 755 /{name}.tmp; mv /{name}.tmp /{name}',
                 input=(args.output / name).read_bytes())
-        while 'STATE_WORKLOAD_BOOT' not in (args.output / 'guest.log').read_text(errors='replace'):
-            if owner.poll() is not None or time.monotonic() >= deadline:
-                raise RuntimeError('foreground canary did not start')
-            time.sleep(.1)
+        if args.boot == 'systemd':
+            cli('exec', NAME, 'systemd-run', '--unit=flexvm-state-probe', '--collect', '/state-probe')
+            cli('exec', NAME, '/bin/sh', '-ec', 'while [ ! -s /tmp/state-observation ]; do sleep .05; done')
+        else:
+            while 'STATE_WORKLOAD_BOOT' not in (args.output / 'guest.log').read_text(errors='replace'):
+                if owner.poll() is not None or time.monotonic() >= deadline:
+                    raise RuntimeError('foreground canary did not start')
+                time.sleep(.1)
         before = observation()
         evidence['initial_process'] = before
         (args.output / 'owner.json').write_text(json.dumps(evidence, indent=2) + '\n')
@@ -134,13 +138,42 @@ def exercise(args):
         if source == target:
             raise RuntimeError('restoration reused the source emulator')
         verify('stop-start', before)
+        if args.boot == 'systemd':
+            journal = cli('exec', NAME, 'journalctl', '--unit=flexvm-state-probe', '--output=cat', '--no-pager')
+            (args.output / 'guest.log').write_text(journal)
         lines = (args.output / 'guest.log').read_text().splitlines()
         ticks = [int(line.split()[1]) for line in lines if line.startswith('STATE_TICK ')]
         if lines.count('STATE_WORKLOAD_BOOT') != 1 or not ticks or ticks != list(range(ticks[-1] + 1)):
             raise RuntimeError('foreground output rebooted, duplicated or skipped ticks')
-        cli('kill', NAME)
-        if cli('wait', NAME).strip() != '130':
-            raise RuntimeError('restored VM lost its kill status')
+        if args.boot == 'systemd':
+            # A deliberately stopped exec service must not prevent the whole
+            # distro from restoring or completing a normal OS power-off.
+            stopped = cli('exec', NAME, 'systemctl', 'stop', 'flexvm-runtime.service', check=False, result=True)
+            # systemctl itself occupies the unit being stopped, so systemd may
+            # terminate it along with the provider after accepting the request.
+            if stopped.returncode not in (0, 143):
+                raise RuntimeError(f'could not stop distro runtime: {stopped.returncode}: {stopped.stderr}')
+            cli('pause', NAME)
+            cli('unpause', NAME)
+            cli('stop', NAME)
+            owner.wait(timeout=10)
+            ENGINE_GONE(target, deadline)
+            with (args.output / 'guest.log').open('a') as out, (args.output / 'restore-no-runtime.log').open('w') as err:
+                owner = subprocess.Popen([*base, 'start', '--attach', NAME], stdout=out, stderr=err, env=environment)
+            restored = ready()['backend']['process']
+            if restored == target:
+                raise RuntimeError('distro restoration without runtime service reused its source engine')
+            evidence['restore_without_runtime_service'] = {'status': 'passed', 'source_engine': target, 'target_engine': restored}
+            target = restored
+            cli('kill', '--signal', 'TERM', NAME)
+            if owner.wait(timeout=30) != 0 or cli('wait', NAME).strip() != '0':
+                raise RuntimeError('software distro did not report completed OS poweroff')
+            evidence['poweroff'] = {'owner_status': 0, 'wait_status': 0}
+        else:
+            cli('kill', NAME)
+            if cli('wait', NAME).strip() != '130':
+                raise RuntimeError('restored VM lost its kill status')
+        evidence.update(boot_count=1, process_ticks=len(ticks))
         ENGINE_GONE(target, deadline)
         evidence.update(status='passed', source_engine=source, target_engine=target)
         (args.output / 'owner.json').write_text(json.dumps(evidence, indent=2) + '\n')
@@ -163,6 +196,7 @@ def main():
     for name in ('bin', 'kernel', 'workload', 'output'):
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--image', default=IMAGE)
+    parser.add_argument('--boot', choices=('app', 'systemd'), default='app')
     parser.add_argument('--mem', type=int, default=2048)
     parser.add_argument('--timeout', type=int, default=1800)
     parser.add_argument('--require', action='append', default=[])
@@ -190,7 +224,7 @@ def main():
     report = {'schema_version': 1, 'status': 'failed', 'arch': platform.machine(), 'accelerator': 'tcg',
               'scope': 'ordinary guest workload through software pause and fresh-owner stop/start',
               'binary_sha256': HELPERS['digest'](args.bin), 'kernel_sha256': HELPERS['digest'](args.kernel),
-              'qemu_sha256': HELPERS['digest'](qemu), 'image': args.image,
+              'qemu_sha256': HELPERS['digest'](qemu), 'image': args.image, 'boot_profile': args.boot,
               'workload': {'name': args.workload.name, 'sha256': HELPERS['digest'](args.workload)}}
     started = time.monotonic()
     def interrupted(number, _frame):
@@ -212,7 +246,7 @@ def main():
                        'sh', str(mask), 'strace', '-f', '-e', 'trace=file,init_module,finit_module,delete_module', '-o', str(trace),
                        sys.executable, str(Path(__file__).resolve()), '--worker', '--bin', str(args.bin), '--kernel', str(args.kernel),
                        '--workload', str(args.workload), '--image', args.image, '--mem', str(args.mem), '--output', str(args.output),
-                       '--state', state, '--timeout', str(args.timeout)]
+                       '--state', state, '--timeout', str(args.timeout), '--boot', args.boot]
             for required in args.require:
                 command.extend(['--require', required])
             try:
