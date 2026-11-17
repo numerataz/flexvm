@@ -20,7 +20,8 @@ echo 'a3717477d8e2c84d630bfffbc20f6cd3293eb45aa1e6dac6d0cc27689991c9e1  '"$build
 tar -xJf "$build/qemu.tar.xz" -C "$build"
 cd "$build/qemu-10.2.1"
 patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-svm-restore.patch"
-./configure --prefix="$prefix" --target-list=x86_64-softmmu --with-pkgversion=flexvm-tcg-nested-1 \
+patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-svm-feature-control.patch"
+./configure --prefix="$prefix" --target-list=x86_64-softmmu --with-pkgversion=flexvm-tcg-nested-2 \
   --disable-docs --disable-tools --disable-guest-agent --disable-werror \
   --disable-download --disable-gtk --disable-sdl --disable-vnc \
   --disable-opengl --disable-curses --enable-slirp --enable-seccomp
