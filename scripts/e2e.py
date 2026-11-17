@@ -1463,13 +1463,26 @@ def guest_poweroff():
                 result = host.exec(vm, "python3 -c " + shlex.quote(poweroff), timeout=30)
                 check(f"{phase}: actual VMM exits on guest poweroff", bool(poll.poll(10000)), result)
                 check(f"{phase}: owner retires after VMM exits", wait_for(lambda: not alive(entry["pid"]), 10), host.ps().get(vm))
+                if phase == "migration":
+                    # The target exits before the source necessarily observes
+                    # the release and retires its paused owner.
+                    def source_retired():
+                        source = A.ps().get(vm)
+                        if source and source.get("state") != "source":
+                            raise AssertionError(f"migration: unexpected source state after target poweroff: {source}")
+                        return source is None
+
+                    check("migration: source retires after target poweroff",
+                          wait_for(source_retired, 10), A.ps().get(vm))
             finally:
                 os.close(fd)
         finally:
-            A.rm(vm, force=True, check=False)
-            B.rm(vm, force=True, check=False)
+            for label, peer in (("A", A), ("B", B)):
+                removed = peer.rm(vm, force=True, check=False)
+                print(f"{phase}: cleanup {label}: exit={removed.returncode} stdout={removed.stdout!r} stderr={removed.stderr!r}", flush=True)
             clear_checkpoints(A, B)
-            check(f"{phase}: no VM records left", vm not in A.ps() and vm not in B.ps())
+            records = {label: peer.ps().get(vm) for label, peer in (("A", A), ("B", B))}
+            check(f"{phase}: no VM records left", not any(records.values()), records)
 
 
 @case
