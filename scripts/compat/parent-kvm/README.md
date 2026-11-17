@@ -1,8 +1,9 @@
 # Guest KVM provider experiment
 
 The x86 compatibility fixture loads this module into a disposable software VM
-with guest SVM and VMX disabled. A PCI shared-memory mailbox connects it to a
-parent process that starts a separate QEMU TCG worker. A standalone Linux KVM
+with guest SVM and VMX disabled. A PCI shared-memory mailbox with
+eventfd-backed doorbells connects it to a parent process that starts a
+separate QEMU TCG worker. A standalone Linux KVM
 client opens `/dev/kvm`, creates a VM and vCPU, maps `kvm_run`, and gets a port
 I/O exit. A second `KVM_RUN` resumes the same child. The child reads a byte
 the client changed while it was paused and reports it on the next I/O exit.
@@ -23,5 +24,5 @@ sudo python3 scripts/compat/parent-kvm-run.py \
 
 On a host with working KVM, add `--native-oracle` to run the same client binary
 against the host kernel before starting the software-only proof. The report
-records first-run and warm re-entry durations, including the mailbox and
-monitor waits on the software path.
+records first-run and warm re-entry durations. The parent waits for the QEMU
+stop event, and the guest uses an MSI-X interrupt to receive the reply.

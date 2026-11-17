@@ -3,7 +3,7 @@
 #define FLEXVM_PVKVM_MAILBOX_H
 
 #define PVKVM_MAGIC        0x4d564b46
-#define PVKVM_VERSION      1
+#define PVKVM_VERSION      2
 #define PVKVM_MAGIC_AT     0
 #define PVKVM_VERSION_AT   4
 #define PVKVM_REQUEST_AT   8
@@ -16,6 +16,10 @@
 #define PVKVM_MEMORY_LEN   4096
 #define PVKVM_GUEST_START  4096
 #define PVKVM_IO_PORT      0x30
+#define PVKVM_IVPOSITION_AT 8
+#define PVKVM_DOORBELL_AT   12
+#define PVKVM_GUEST_POSITION 1
+#define PVKVM_HOST_VECTOR    0
 
 enum pvkvm_command {
 	PVKVM_CREATE_VM = 1,

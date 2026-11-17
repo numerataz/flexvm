@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Two x86 KVM I/O exits from the same TCG worker via a guest PCI mailbox."""
 import argparse
-import errno
+from contextlib import ExitStack
 import json
 import mmap
 import os
@@ -9,7 +9,9 @@ from pathlib import Path
 import platform
 import re
 import runpy
+import select
 import shutil
+import socket
 import struct
 import subprocess
 import sys
@@ -31,6 +33,44 @@ QEMU_OPTIONS = [
 ]
 
 
+def stop_process(process):
+    if process.poll() is None:
+        process.kill()
+    process.wait()
+
+
+class ExitMonitor(HELPERS["QMP"]):
+    def __init__(self, path, process, deadline):
+        self.stops = 0
+        super().__init__(path, process, deadline)
+
+    def receive(self):
+        self.socket.settimeout(self.remaining())
+        line = self.stream.readline()
+        if not line:
+            raise RuntimeError("child QMP disconnected")
+        message = json.loads(line)
+        if "error" in message:
+            raise RuntimeError(f"child QMP error: {message['error']}")
+        if message.get("event") == "STOP":
+            self.stops += 1
+        return message
+
+    def reply(self):
+        while True:
+            message = self.receive()
+            if "event" not in message:
+                return message
+
+    def wait_stop(self):
+        while not self.stops:
+            if "event" not in self.receive():
+                raise RuntimeError("unexpected child QMP reply while waiting for STOP")
+        if self.stops != 1:
+            raise RuntimeError("child reported multiple stop events for one run")
+        self.stops = 0
+
+
 class Child:
     def __init__(self, qemu, output, socket_path):
         self.process = None
@@ -50,7 +90,7 @@ class Child:
             ]
             with (output / "child.log").open("wb") as log:
                 self.process = subprocess.Popen(command, pass_fds=(self.memory,), stdout=log, stderr=log)
-            self.monitor = HELPERS["QMP"](socket_path, self.process, time.monotonic() + 3)
+            self.monitor = ExitMonitor(socket_path, self.process, time.monotonic() + 3)
         except BaseException:
             self.close()
             raise
@@ -66,16 +106,13 @@ class Child:
                 raise RuntimeError("child passed the exit or client changed instructions between runs")
         os.pwrite(self.memory, code, RAM_AT)
         self.monitor.ask("cont")
-        while True:
-            state = self.monitor.ask("query-status")
-            exits = self.port.read_bytes()
-            if len(exits) > len(self.exits) + 1:
-                raise RuntimeError("child executed beyond the requested I/O exit")
-            if state["status"] == "paused" and len(exits) == len(self.exits) + 1:
-                self.exits.append(exits[-1])
-                self.timings.append(round((time.monotonic() - started) * 1000, 3))
-                return exits[-1], os.pread(self.memory, len(code), RAM_AT)
-            time.sleep(.001)
+        self.monitor.wait_stop()
+        exits = self.port.read_bytes()
+        if exits[:-1] != bytes(self.exits) or len(exits) != len(self.exits) + 1:
+            raise RuntimeError("child did not produce exactly one byte per run")
+        self.exits.append(exits[-1])
+        self.timings.append(round((time.monotonic() - started) * 1000, 3))
+        return exits[-1], os.pread(self.memory, len(code), RAM_AT)
 
     def close(self):
         try:
@@ -83,10 +120,23 @@ class Child:
                 self.monitor.close()
         finally:
             if self.process is not None:
-                if self.process.poll() is None:
-                    self.process.kill()
-                self.process.wait()
+                stop_process(self.process)
             os.close(self.memory)
+
+
+def doorbell_peer(server, memory, requests, replies):
+    peer, _ = server.accept()
+    try:
+        peer.settimeout(3)
+        # ivshmem protocol 0. The parent is peer 0 and the outer guest is peer 1.
+        peer.sendall(struct.pack("<qq", 0, 1))
+        for value, descriptor in ((-1, memory), (0, requests), (1, replies)):
+            if socket.send_fds(peer, [struct.pack("<q", value)], [descriptor]) != 8:
+                raise RuntimeError("short ivshmem setup message")
+        return peer
+    except BaseException:
+        peer.close()
+        raise
 
 
 def exercise(qemu, kernel, output):
@@ -94,60 +144,70 @@ def exercise(qemu, kernel, output):
     # The reset vector far-jumps to 0000:1000, the client's guest RAM.
     reset[0xfff0:0xfff5] = bytes.fromhex("ea00100000")
     (output / "reset.rom").write_bytes(reset)
-    mailbox = output / "mailbox"
-    command = [
-        qemu, *QEMU_OPTIONS, "-machine", "q35,accel=tcg", "-cpu", "max,vmx=off,svm=off", "-m", "192",
-        "-serial", "stdio", "-kernel", kernel, "-initrd", output / "initramfs",
-        "-append", "console=ttyS0 quiet panic=1 rdinit=/init",
-        "-object", f"memory-backend-file,id=mailbox,mem-path={mailbox},share=on,size=64K",
-        "-device", "ivshmem-plain,memdev=mailbox",
-    ]
     expected = (OPEN_VM, OPEN_CPU, RUN, RUN, CLOSE_CPU, CLOSE_VM)
     observed = []
     child = None
-    with tempfile.TemporaryDirectory(prefix="flexvm-kvm-qmp-") as control, mailbox.open("w+b") as backing:
-        backing.truncate(MAILBOX_SIZE)
-        with mmap.mmap(backing.fileno(), MAILBOX_SIZE) as mapping, (output / "outer.log").open("wb") as log:
-            struct.pack_into("<II", mapping, 0, 0x4d564b46, 1)
+    with ExitStack() as cleanup:
+        control = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix="flexvm-kvm-")))
+        server = cleanup.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
+        server.bind(str(control / "doorbell"))
+        server.listen(1)
+        server.settimeout(3)
+        memory = os.memfd_create("flexvm-kvm-mailbox", os.MFD_CLOEXEC)
+        cleanup.callback(os.close, memory)
+        os.ftruncate(memory, MAILBOX_SIZE)
+        mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 2)
+        requests = os.eventfd(0, os.EFD_CLOEXEC | os.EFD_NONBLOCK)
+        cleanup.callback(os.close, requests)
+        replies = os.eventfd(0, os.EFD_CLOEXEC | os.EFD_NONBLOCK)
+        cleanup.callback(os.close, replies)
+        command = [
+            qemu, *QEMU_OPTIONS, "-machine", "q35,accel=tcg", "-cpu", "max,vmx=off,svm=off", "-m", "192",
+            "-serial", "stdio", "-kernel", kernel, "-initrd", output / "initramfs",
+            "-append", "console=ttyS0 quiet panic=1 rdinit=/init",
+            "-chardev", f"socket,id=doorbell,path={control / 'doorbell'}",
+            "-device", "ivshmem-doorbell,chardev=doorbell,vectors=1",
+        ]
+        with (output / "outer.log").open("wb") as log:
             outer = subprocess.Popen(command, stdout=log, stderr=log)
-            try:
-                deadline = time.monotonic() + 60
-                while outer.poll() is None and time.monotonic() < deadline:
-                    pending, complete, opcode, _, length = struct.unpack_from("<IIIII", mapping, 8)
-                    if pending == complete:
-                        time.sleep(.001)
-                        continue
-                    status = -errno.EINVAL
-                    if (pending == complete + 1 and len(observed) < len(expected)
-                            and opcode == expected[len(observed)] and length == (4096 if opcode == RUN else 0)):
-                        if opcode == RUN:
-                            if child is None:
-                                child = Child(qemu, output, Path(control) / "child.sock")
-                            io_value, data = child.run(mapping[RAM_AT:RAM_AT + length])
-                            mapping[RAM_AT:RAM_AT + length] = data
-                            struct.pack_into("<I", mapping, 28, io_value)
-                        observed.append(opcode)
-                        status = 0
-                    struct.pack_into("<i", mapping, 20, status)
-                    struct.pack_into("<I", mapping, 12, pending)
-                if outer.poll() is None:
-                    raise TimeoutError("outer guest did not shut down")
-                guest = (output / "outer.log").read_text(errors="replace")
-                if (outer.returncode != 0 or tuple(observed) != expected or child is None or tuple(child.exits) != IO_VALUES
-                        or "PASS /dev/kvm returned two port I/O exits" not in guest
-                        or "PASS parent KVM guest shutdown" not in guest):
-                    raise RuntimeError(f"parent execution proof failed; commands={observed}, see outer.log")
-            finally:
-                try:
-                    if child is not None:
-                        child.close()
-                finally:
-                    if outer.poll() is None:
-                        outer.kill()
-                    outer.wait()
+        cleanup.callback(stop_process, outer)
+        cleanup.enter_context(doorbell_peer(server, memory, requests, replies))
+        exited = os.pidfd_open(outer.pid)
+        cleanup.callback(os.close, exited)
+        deadline = time.monotonic() + 60
+        while True:
+            readable, _, _ = select.select([exited, requests], [], [], max(0, deadline - time.monotonic()))
+            if exited in readable:
+                break
+            if requests not in readable:
+                raise TimeoutError("outer guest did not shut down")
+            if os.eventfd_read(requests) != 1:
+                raise RuntimeError("multiple outstanding doorbell requests")
+            pending, complete, opcode, _, length = struct.unpack_from("<IIIII", mapping, 8)
+            if pending != complete + 1 or len(observed) >= len(expected) or opcode != expected[len(observed)]:
+                raise RuntimeError(f"unexpected doorbell request {pending}, command {opcode}")
+            if length != (4096 if opcode == RUN else 0):
+                raise RuntimeError(f"unexpected data length {length} for command {opcode}")
+            if opcode == RUN:
+                if child is None:
+                    child = Child(qemu, output, control / "child.sock")
+                    cleanup.callback(child.close)
+                io_value, data = child.run(mapping[RAM_AT:RAM_AT + length])
+                mapping[RAM_AT:RAM_AT + length] = data
+                struct.pack_into("<I", mapping, 28, io_value)
+            observed.append(opcode)
+            struct.pack_into("<i", mapping, 20, 0)
+            struct.pack_into("<I", mapping, 12, pending)
+            os.eventfd_write(replies, 1)
+        guest = (output / "outer.log").read_text(errors="replace")
+        if (outer.wait() != 0 or tuple(observed) != expected or child is None or tuple(child.exits) != IO_VALUES
+                or "PASS /dev/kvm returned two port I/O exits" not in guest
+                or "PASS parent KVM guest shutdown" not in guest):
+            raise RuntimeError(f"parent execution proof failed; commands={observed}, see outer.log")
     return {
         "guest_path": "/dev/kvm", "guest_vmx": False, "guest_svm": False,
-        "parent_accelerator": "tcg", "parent_commands": observed,
+        "parent_accelerator": "tcg", "parent_commands": observed, "transport": "eventfd and MSI-X",
         "io_values": child.exits, "child_memory_write_visible": True, "same_child_worker": True,
         "client_run_ns": client_timings(guest), "worker_run_ms": child.timings,
     }
