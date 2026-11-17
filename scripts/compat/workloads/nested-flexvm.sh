@@ -4,11 +4,24 @@ set -eux
 step=$1 nonce=$2 phase=$3
 base=/var/lib/flexvm-nested-$nonce
 cli() { /nested-input/flexvm --state "$base/state" --run "$base/run" "$@"; }
+traffic_control() {
+    # Isolate the real netlink operations; a kernel without any one facility fails.
+    unshare --net /bin/sh -ec '
+        tc qdisc add dev lo clsact
+        tc filter add dev lo ingress protocol all pref 1 bpf da bytecode "1,6 0 0 0,"
+        tc qdisc add dev lo root handle 1: plug
+        tc qdisc change dev lo root handle 1: plug release_indefinite
+        tc -j qdisc show dev lo'
+}
 case $step in
 prepare)
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get update -qq
-    apt-get install -y -qq --no-install-recommends e2fsprogs python3
+    if ! (command -v mkfs.ext4 >/dev/null && command -v debugfs >/dev/null &&
+          command -v python3 >/dev/null && command -v tc >/dev/null && command -v unshare >/dev/null); then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq
+        apt-get install -y -qq --no-install-recommends e2fsprogs python3 iproute2 util-linux
+    fi
+    traffic_control
     test -c /dev/kvm
     test -c /dev/net/tun
     mkdir -p "$base/state/artifacts"
@@ -24,9 +37,13 @@ prepare)
         sleep .1
     done
     test -s "$base/initial"
+    # Exercise the native child's plug queue as well as the outer emulator.
+    cli pause child
+    cli unpause child
     cli ps --json > "$base/initial-vms.json"
     ;;
 verify)
+    traffic_control
     cli exec child /state-probe status > "$base/current"
     python3 - "$base/initial" "$base/current" <<'PY'
 from pathlib import Path

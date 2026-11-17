@@ -24,6 +24,11 @@ Each streamed input's SHA-256 is checked inside the guest and recorded in the
 report. A seed must be a regular file, at most 256 MiB; the combined limit is
 512 MiB. Seed destinations must stay beneath `/nested-input/`.
 
+The guest first creates a real clsact qdisc, a classic BPF direct-action filter
+and a plug queue in a private network namespace, including releasing the queue.
+It repeats these operations after every outer lifecycle transition. The child
+also pauses and unpauses through the normal native CLI.
+
 The child runs the regular `pull`, `run`, `exec` and `ps` commands. Its one-vCPU,
 128 MiB template avoids implicit memory hotplug, and the parent has 2048 MiB and
 one vCPU. The workload verifies the child's PID, process start time and random
