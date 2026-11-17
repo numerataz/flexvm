@@ -377,10 +377,13 @@ pub fn metadata(path: &Path) -> Result<Manifest> {
 }
 
 pub fn open(path: &Path, profiles: impl AsRef<[Profile]>) -> Result<Verified> {
-    let dir = private_directory(path)?;
+    open_pinned(private_directory(path)?, profiles.as_ref())
+}
+
+fn open_pinned(dir: File, profiles: &[Profile]) -> Result<Verified> {
     crate::host::flock(&dir, libc::LOCK_SH)?;
     let manifest = read_manifest(&dir)?;
-    if !profiles.as_ref().contains(&manifest.profile) {
+    if !profiles.contains(&manifest.profile) {
         bail!("software state execution profile does not match");
     }
     Ok(Verified {

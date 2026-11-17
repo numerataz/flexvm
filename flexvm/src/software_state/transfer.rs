@@ -323,14 +323,18 @@ fn read_incoming(state: &File, offer: &Offer) -> Result<Option<Journal>> {
 
 /// Call with the destination journal lock held, including at publication.
 fn require_incoming(state: &File, offer: &Offer) -> Result<()> {
+    if incoming_status(state, offer)? == Status::Aborted {
+        bail!("software transfer was aborted");
+    }
+    Ok(())
+}
+
+fn incoming_status(state: &File, offer: &Offer) -> Result<Status> {
     offer.validate()?;
     if offer.destination_host != host_id_in(state)? {
         bail!("software transfer does not name this host as its remote destination");
     }
-    if matching(&read_incoming(state, offer)?, offer)?.status == Status::Aborted {
-        bail!("software transfer was aborted");
-    }
-    Ok(())
+    Ok(matching(&read_incoming(state, offer)?, offer)?.status)
 }
 
 fn matching(previous: &Option<Journal>, offer: &Offer) -> Result<Journal> {

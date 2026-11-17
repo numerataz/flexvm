@@ -139,7 +139,9 @@ def exercise(args):
             '--mem', '512', '--vcpus', '2' if args.firecracker else '1', str(args.output / 'image.tar'))
 
     def transfer_retirement():
-        target = [str(args.bin), '--state', str(args.state / 'target'), 'software-transfer']
+        destination_state = args.state / 'target'
+        destination_base = [str(args.bin), '--state', str(destination_state), '--run', str(args.state / 'target-run')]
+        target = [*destination_base, 'software-transfer']
 
         def destination(*words):
             return json.loads(subprocess.check_output([*target, *words], timeout=max(.1, deadline - time.monotonic())))
@@ -211,11 +213,67 @@ def exercise(args):
                 if source.poll() is None:
                     source.kill()
                     source.wait(timeout=10)
+        engine = shutil.which('qemu-system-' + platform.machine())
+        if engine is None:
+            raise RuntimeError('trusted local QEMU was not found')
+        remote = 'received-test'
+
+        def target_cli(*words):
+            return subprocess.check_output([*destination_base, *words], text=True, timeout=max(.1, deadline - time.monotonic()))
+
+        def denied_activation(expected, vm=remote, qemu=engine):
+            result = subprocess.run([*target, 'activate', offer, vm, '--qemu', qemu], capture_output=True, text=True, timeout=30)
+            if result.returncode == 0 or expected not in result.stderr:
+                raise RuntimeError(f'destination activation accepted or failed for the wrong reason: {result}')
+
+        def destination_observation():
+            return [int(value) for value in target_cli('exec', remote, '/state-probe', 'status').split()]
+
+        def destination_progress(previous):
+            initial = destination_observation()
+            until = min(deadline, time.monotonic() + 15)
+            while time.monotonic() < until:
+                seen = destination_observation()
+                if initial[:3] != previous[:3] or seen[:3] != previous[:3] or seen[4] < previous[4]:
+                    raise RuntimeError('destination lost guest process, RAM or monotonic time')
+                if seen[3] > max(initial[3], previous[3]) and seen[4] > initial[4]:
+                    return seen
+                time.sleep(.15)
+            raise RuntimeError('destination guest did not make fresh progress')
+
+        denied_activation('requires a committed destination transfer')
         if destination('commit', receipt)['status'] != 'committed':
             raise RuntimeError('transfer destination did not commit')
-        require_refused('start', 'state-test', error='source cannot restart')
-        if live() is not None:
-            raise RuntimeError('the committed transfer source is running')
+        denied_activation('trusted local QEMU does not match', qemu='/bin/true')
+        try:
+            with (args.output / 'transfer-target.log').open('wb') as log:
+                activated = subprocess.Popen([*target, 'activate', offer, remote, '--qemu', engine], stdout=log, stderr=log)
+            owners.append(activated)
+            while time.monotonic() < deadline and activated.poll() is None:
+                if any(entry['name'] == remote and entry['state'] == 'running' for entry in json.loads(target_cli('ps', '--json'))):
+                    break
+                time.sleep(.1)
+            else:
+                raise RuntimeError('destination owner failed to publish; see transfer-target.log')
+            activated_state = destination_progress(after)
+            denied_activation('already granted execution', vm='duplicate')
+            require_refused('start', 'state-test', error='source cannot restart')
+            if live() is not None:
+                raise RuntimeError('the committed transfer source is running')
+            target_cli('pause', remote)
+            target_cli('unpause', remote)
+            target_cli('stop', remote)
+            if activated.wait(timeout=15) != 0:
+                raise RuntimeError('destination owner failed to stop after activation')
+            restored = json.loads((destination_state / 'suspended' / remote / 'manifest.json').read_text())
+            if restored['host_id'] != target_id or restored['owner_generation'] <= json.loads(offer.read_text())['generation']:
+                raise RuntimeError('destination checkpoint lacked its local host identity or newer generation')
+            target_cli('start', remote)
+            destination_progress(activated_state)
+            target_cli('kill', remote)
+            denied_activation('already granted execution', vm='duplicate')
+        finally:
+            subprocess.run([*destination_base, 'rm', '-f', remote], capture_output=True, timeout=20)
         cli('rm', '-f', 'state-test')
 
     evidence = {'cycles': []}
@@ -373,6 +431,7 @@ def exercise(args):
         else:
             transfer_retirement()
             evidence['source_transfer_retirement'] = 'passed'
+            evidence['destination_transfer_activation'] = 'passed'
         evidence.update(status='passed', boots=1, delivered_ticks=len(ticks))
         (args.output / 'owner.json').write_text(json.dumps(evidence, indent=2) + '\n')
     finally:

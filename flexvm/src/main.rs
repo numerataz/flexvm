@@ -99,6 +99,8 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      stream the exact retired software checkpoint to stdout
   flexvm software-transfer receive OFFER [--max-bundle-mib MIB]
                                      verify a prepared checkpoint bundle from stdin
+  flexvm software-transfer activate OFFER VM --qemu FILE
+                                     run one committed checkpoint with a matching local emulator
   flexvm software --kernel FILE [OPTIONS] IMAGE [CMD...]
                                      --kernel-sdk: matching native module build inputs;
                                      --kernel-modules FILE: custom runtime or SDK bundle
@@ -469,7 +471,8 @@ fn main() {
         _ => false,
     };
     util::set_verbose(args.has("verbose") || logged);
-    let vm = matches!(args.positional.first().map(String::as_str), Some("run" | "start" | "exec" | "software"));
+    let vm = matches!(args.positional.first().map(String::as_str), Some("run" | "start" | "exec" | "software"))
+        || args.positional.first().is_some_and(|s| s == "software-transfer") && args.positional.get(1).is_some_and(|s| s == "activate");
     // Here, not in `real_main`, which unit tests run on any host; after the arguments, whose errors come first.
     let host_fits = || if reads_only(&args) { Ok(()) } else { check_applies(&args).and_then(|()| util::check_page_size()) };
     let result = error.map_or_else(|| host_fits().and_then(|()| real_main(&args)), Err);
@@ -560,7 +563,7 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("rm", NAMES, &["force"]),
     ("volume", NAMES, &["size"]),
     ("checkpoint", NAMES, &["stop", "incremental", "quiet", "format", "filter", "force", "older-than", "output", "input", "name", "sha256"]),
-    ("software-transfer", 4, &["source-key", "signing-key", "destination-key", "max-bundle-mib"]),
+    ("software-transfer", 4, &["source-key", "signing-key", "destination-key", "max-bundle-mib", "qemu"]),
     ("migrate", 3, &[]),
     ("reclaim", 2, &["force"]),
     ("listen", 2, &[]),
@@ -652,13 +655,17 @@ fn check_applies(args: &Args) -> Result<()> {
             if args.has("max-bundle-mib") && first.map(String::as_str) != Some("receive") {
                 bail!("--max-bundle-mib applies only to software-transfer receive");
             }
+            let activating = first.map(String::as_str) == Some("activate");
+            if args.has("qemu") != activating {
+                bail!("software-transfer activate requires --qemu FILE; other transfer commands do not take it");
+            }
             if !matches!(
                 (first.map(String::as_str), words, keys),
                 (Some("id"), 2, (false, false, false))
                     | (Some("prepare"), 3, (true, false, false))
                     | (Some("commit" | "abort" | "recover" | "receive"), 3, (false, false, false))
                     | (Some("acknowledge-abort"), 3, (false, true, false))
-                    | (Some("offer" | "send"), 4, (false, false, false))
+                    | (Some("offer" | "send" | "activate"), 4, (false, false, false))
                     | (Some("retire"), 4, (false, true, true))
             ) {
                 bail!("invalid software-transfer arguments (see flexvm --help)");
@@ -815,6 +822,10 @@ fn real_main(args: &Args) -> Result<()> {
             }
         }
         Some("pull") => pull(args, name),
+        Some("software-transfer") if name == "activate" => {
+            util::block_signals(&[libc::SIGTSTP, libc::SIGCONT, libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGHUP]);
+            util::exit(software::activate(open_host(args)?, pos[3], Path::new(pos[2]), Path::new(args.get("qemu").unwrap()))?)
+        }
         Some("software-transfer") if name == "send" => {
             software_state::transfer::bundle::send(&open_host(args)?, pos[2], Path::new(pos[3]), &mut std::io::stdout().lock())
         }

@@ -209,7 +209,7 @@ domain `flexvm/software-abort/v1` followed by a NUL. Run
 `recover ABORT-RECEIPT` at the source. A valid acknowledgment for the exact
 fence permits restart above that transfer generation. A recovered source
 retains the generation floor, and a previous acknowledgment cannot release a
-newer fence. Use disposable VMs until destination activation is available.
+newer fence. Use portable matching artifacts on both hosts.
 
 An offer is a JSON object with these fields in wire order:
 
@@ -228,8 +228,7 @@ standard padded base64 `signature`. The Ed25519 message is the ASCII bytes
 in the field order above. The destination pins the public key and offer at
 preparation. A commit retry verifies the same receipt. `abort OFFER` permanently
 rejects that offer, and a replacement needs a higher generation and a different
-transfer ID. These commands record ownership decisions. Guest execution on a
-destination requires artifact transport and restore integration.
+transfer ID. These commands record ownership decisions for subsequent activation.
 
 For a prepared destination and a retired source, run
 `software-transfer send VM OFFER` on the source. Pipe its stdout into
@@ -246,8 +245,15 @@ the four-byte big-endian header length and a JSON object with `offer` and
 `manifest`. Raw members follow in the order engine, kernel, root filesystem,
 VM state, and firmware in manifest key order. The manifest supplies every
 length and digest. A truncated, extended or corrupted stream fails verification.
-The published bundle is an input to future destination activation and carries
-no source retirement or local execution grant.
+The published bundle carries artifacts and the offer identity. After the
+destination commits the retirement receipt, run
+`software-transfer activate OFFER VM --qemu FILE` there. Choose a locally
+trusted QEMU binary with exactly the engine digest and size in the bundle.
+FlexVM launches from the local descriptor, loads the guest with its CPUs
+paused, and records its one-time execution grant in the host journal before
+resuming. A retry before the grant uses the same destination name and a newer
+generation. The grant survives removal of the VM or its imported artifacts.
+After activation, ordinary destination `stop` and `start` use local checkpoints.
 
 After load, use the guest agent to step CLOCK_REALTIME from the current host time.
 Do not reset CLOCK_MONOTONIC through the agent. Preserve the engine virtual clock

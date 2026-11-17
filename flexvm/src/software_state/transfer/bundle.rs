@@ -18,6 +18,8 @@ use crate::{
 
 const MAGIC: &[u8] = b"flexvm-software-bundle-v1\n";
 const HEADER_LIMIT: u64 = MAX_MANIFEST + 4096;
+
+pub(crate) mod activate;
 pub(in crate::software_state) const INCOMING: &str = "software-incoming";
 
 #[derive(Serialize, Deserialize)]
@@ -187,7 +189,7 @@ fn receive(state: &Path, expected: &Offer, reader: &mut dyn Read, limit: u64) ->
     let incoming = private_directory(&incoming_path)?;
     state.sync_all()?;
     let incoming_path = crate::host::fd_path(incoming.as_raw_fd());
-    let name = format!("{}-{}", expected.vm_id, expected.transfer_id);
+    let name = bundle_name(expected);
     let _bundle =
         crate::host::lock_at(crate::host::host_locks()?, &crate::host::keyed("software-bundle", &util::fstat(incoming.as_raw_fd())?, &name), libc::LOCK_EX)?;
     let target = incoming_path.join(&name);
@@ -225,6 +227,10 @@ fn receive(state: &Path, expected: &Offer, reader: &mut dyn Read, limit: u64) ->
     Ok(bytes)
 }
 
+fn bundle_name(offer: &Offer) -> String {
+    format!("{}-{}", offer.vm_id, offer.transfer_id)
+}
+
 pub(crate) fn import(state: &Path, offer: &Path, reader: &mut dyn Read, max_mib: Option<&str>) -> Result<serde_json::Value> {
     let max_mib: u64 = max_mib.unwrap_or("16384").parse()?;
     let limit = max_mib.checked_mul(1 << 20).filter(|bytes| *bytes > 0 && *bytes <= i64::MAX as u64).ok_or("invalid software bundle size limit")?;
@@ -240,7 +246,7 @@ mod tests {
     use crate::test_util::TempDir;
     use base64::{engine::general_purpose::STANDARD, Engine};
 
-    fn wire(source: &Path, target: &Path) -> (Offer, Vec<u8>) {
+    pub(super) fn wire(source: &Path, target: &Path) -> (Offer, Vec<u8>) {
         let (path, _) = crate::software_state::tests::checkpoint(source);
         let checkpoint = private_directory(&path).unwrap();
         let manifest = read_manifest(&checkpoint).unwrap();
