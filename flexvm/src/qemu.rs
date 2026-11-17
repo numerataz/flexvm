@@ -87,6 +87,7 @@ pub struct Routed {
     host: Host,
     claim: Option<AddrClaim>,
     incoming: bool,
+    active: AtomicBool,
     keep: AtomicBool,
 }
 
@@ -189,7 +190,17 @@ impl Routed {
                 return Err(error);
             }
         };
-        Ok(Self { tap, index, network, dns: config.guest_dns(), host: host.clone(), claim: Some(claim), incoming, keep: AtomicBool::new(keep) })
+        Ok(Self {
+            tap,
+            index,
+            network,
+            dns: config.guest_dns(),
+            host: host.clone(),
+            claim: Some(claim),
+            incoming,
+            active: AtomicBool::new(false),
+            keep: AtomicBool::new(keep),
+        })
     }
 
     fn current_claim(&self) -> Result<(&AddrClaim, crate::host::Locked)> {
@@ -225,22 +236,37 @@ impl Routed {
         publication
     }
 
-    fn complete_import(&self) -> Result<()> {
+    fn activate_route(&self) -> Result<()> {
         if self.incoming {
             let (claim, lock) = self.current_claim()?;
             self.host.unlend(&lock, claim.ip, claim.gen)?;
         }
+        self.active.store(true, Ordering::Relaxed);
         Ok(())
     }
 }
 
 impl Drop for Routed {
     fn drop(&mut self) {
-        if !*self.keep.get_mut() {
-            return;
-        }
-        if let Some(claim) = self.claim.take() {
+        let Some(claim) = self.claim.take() else { return };
+        if *self.keep.get_mut() {
             claim.keep();
+        } else if *self.active.get_mut() {
+            let lock = match self.host.lock() {
+                Ok(lock) => lock,
+                Err(error) => {
+                    crate::log!("software route {}: address withdrawal deferred: {error}", claim.ip);
+                    claim.keep();
+                    return;
+                }
+            };
+            let address = claim.ip;
+            if let Err(error) = claim.withdraw(&lock) {
+                crate::log!("software route {address}: address withdrawal deferred: {error}");
+                return;
+            }
+            drop(lock);
+            self.host.deliver_withdrawals();
         }
     }
 }
@@ -917,9 +943,9 @@ impl Machine {
         Ok(())
     }
 
-    pub fn complete_routed_import(&self) -> Result<()> {
+    pub fn activate_routed_address(&self) -> Result<()> {
         if let Some(routed) = &self.routed {
-            routed.complete_import()?;
+            routed.activate_route()?;
         }
         Ok(())
     }

@@ -706,7 +706,7 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant, lo
         let locking = Slot::take(locking, MAX_LOCKING).ok_or(BUSY)?;
         Ok((active, locking))
     };
-    let locking = matches!(op, "route" | "lend").then(|| Slot::take(locking, MAX_LOCKING));
+    let locking = matches!(op, "route" | "lend" | "software-route").then(|| Slot::take(locking, MAX_LOCKING));
     let reply = match op {
         // Checked by the arrival (`check_vm_ip`) against these, as route and lend are: a name
         // with no addresses yet, its lookup under way (a peer just added), is waited for.
@@ -750,6 +750,7 @@ fn handle(host: &Host, peers: &Peers, mut conn: TcpStream, deadline: Instant, lo
                 route(host, &req, &all, &from.map(|f| peers.sender(&cfg, f)).unwrap_or_default())
             })
         }
+        "software-route" => crate::software_state::transfer::routing::request(host, &req),
         "lend" => (|| {
             let cfg = host.config_now();
             let from = conn.peer_addr()?.ip();

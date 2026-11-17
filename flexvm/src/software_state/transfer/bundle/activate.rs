@@ -79,6 +79,15 @@ fn decision_for_offer(state: &File, offer: &Offer) -> Result<Option<Decision>> {
     Ok(read_decision(state, &offer.vm_id)?.filter(|decision| decision.offer == *offer))
 }
 
+pub(in crate::software_state::transfer) fn routed_grant(state: &File, offer: &Offer) -> Result<(String, Grant)> {
+    let decision = decision_for_offer(state, offer)?.filter(|decision| !decision.finished).ok_or("software route has no current activation")?;
+    let grant = decision.grant.ok_or("software route has no execution grant")?;
+    if PidFd::open(&grant.owner)?.is_none() || PidFd::open(&grant.engine)?.is_none() {
+        bail!("software route destination owner or engine has exited");
+    }
+    Ok((decision.name, grant))
+}
+
 pub(in crate::software_state::transfer) fn finished(state: &File, offer: &Offer) -> Result<bool> {
     Ok(decision_for_offer(state, offer)?.is_some_and(|decision| decision.finished))
 }
@@ -193,6 +202,10 @@ impl<'a> Activation<'a> {
 
     pub(crate) fn manifest(&self) -> &Manifest {
         &self.header.manifest
+    }
+
+    pub(in crate::software_state::transfer) fn offer(&self) -> &Offer {
+        &self.decision.offer
     }
 
     pub(crate) fn returns_routed_address(&self) -> bool {

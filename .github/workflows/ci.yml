@@ -239,7 +239,7 @@ jobs:
         run: |
           sudo systemd-run --scope --collect -p MemoryMax=5G -p MemorySwapMax=0 -p CPUQuota=250% python3 scripts/compat/routed-network.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-routed-network" --timeout 300
           cat "$RUNNER_TEMP/software-routed-network/report.json"
-          sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=250% python3 scripts/compat/routed-transfer.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-routed-transfer" --timeout 360
+          sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=250% python3 scripts/compat/routed-transfer.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-routed-transfer" --timeout 360 --peer-routes
           cat "$RUNNER_TEMP/software-routed-transfer/report.json"
       - name: Distro PID 1 and fresh-owner restore without virtualization devices
         run: |

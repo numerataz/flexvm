@@ -574,6 +574,7 @@ struct Resume {
     generation: u64,
     consumed: software_state::Consumed,
     notify: Option<Startup>,
+    route: Option<software_state::transfer::routing::Automatic>,
 }
 
 pub fn run(host: Host, name: NameLock, machine: qemu::Machine, processes: Arc<qemu::Processes>, config: &qemu::Config, meta: &image::ImageMeta) -> Result<i32> {
@@ -587,8 +588,9 @@ fn serve(
     processes: Arc<qemu::Processes>,
     config: &qemu::Config,
     meta: &image::ImageMeta,
-    resumed: Option<Resume>,
+    mut resumed: Option<Resume>,
 ) -> Result<i32> {
+    let route = resumed.as_mut().and_then(|resume| resume.route.take());
     let machine = Arc::new(machine);
     let epoch = u64::from_str_radix(&util::random_hex(8)?, 16)?;
     let deadline = Instant::now() + if meta.boot.is_app() { guest::TIMEOUT } else { config.boot_timeout };
@@ -754,11 +756,16 @@ fn serve(
     let published = {
         let _op = owner.op.write().unwrap();
         let entry = owner.entry.lock().unwrap().clone();
-        owner.name.publish(&entry).and_then(|()| owner.machine.complete_routed_import())
+        owner.name.publish(&entry).and_then(|()| owner.machine.activate_routed_address())
     };
     let result = published.and_then(|()| {
         if let Some(notify) = notify {
             notify.send(&json!({"ok":true,"result":owner.name.name}))?;
+        }
+        if let Some(route) = route {
+            if let Err(error) = route.deliver(&owner.host) {
+                crate::log!("software VM {}: signed source route could not be delivered: {error}", owner.name.name);
+            }
         }
         match main_reader {
             Some(reader) => owner.main_output(reader),
@@ -824,7 +831,7 @@ pub fn restore(host: Host, vm_name: &str, notify: Option<std::fs::File>) -> Resu
         let machine = config.restore(verified, processes.clone(), disks, routed)?;
         let consumed = prepared.grant(processes.engine_ident()?)?;
         let meta = manifest.image.clone();
-        serve(host, name, machine, processes, &config, &meta, Some(Resume { manifest, generation, consumed, notify }))
+        serve(host, name, machine, processes, &config, &meta, Some(Resume { manifest, generation, consumed, notify, route: None }))
     })();
     if let (Err(error), Some(file)) = (&result, failure_notify) {
         let _ = file.send(&json!({"ok":false,"error":error.to_string()}));
@@ -844,9 +851,10 @@ fn restore_config(manifest: &software_state::Manifest) -> qemu::Config {
     }
 }
 
-pub fn activate(host: Host, vm: &str, offer: &Path, trusted_engine: &Path) -> Result<i32> {
+pub fn activate(host: Host, vm: &str, offer: &Path, trusted_engine: &Path, automatic_route: Option<(&str, &Path)>) -> Result<i32> {
     let name = host.take_name(vm, false)?;
     let activation = software_state::transfer::bundle::activate::Activation::prepare(&name, offer)?;
+    let route = automatic_route.map(|(peer, key)| software_state::transfer::routing::Automatic::prepare(&host, &activation, peer, key)).transpose()?;
     let manifest = activation.manifest().clone();
     let config = restore_config(&manifest);
     let processes = Arc::new(qemu::Processes::default());
@@ -859,7 +867,7 @@ pub fn activate(host: Host, vm: &str, offer: &Path, trusted_engine: &Path) -> Re
     let machine = config.restore(verified, processes.clone(), disks, routed)?;
     let (generation, consumed) = activation.grant(processes.engine_ident()?)?;
     let meta = manifest.image.clone();
-    serve(host, name, machine, processes, &config, &meta, Some(Resume { manifest, generation, consumed, notify: None }))
+    serve(host, name, machine, processes, &config, &meta, Some(Resume { manifest, generation, consumed, notify: None, route }))
 }
 
 pub fn setup_signals(processes: Arc<qemu::Processes>) {

@@ -93,6 +93,10 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      sign the destination's committed decision
   flexvm software-transfer finalize COMMIT-ACK --signing-key FILE
                                      record the completed outgoing handoff and sign its proof
+  flexvm software-transfer acknowledge-route OFFER --signing-key FILE
+                                     sign a routed software VM's active destination
+  flexvm software-transfer install-route ROUTE-ACK
+                                     install the signed peer route at the retired source
   flexvm software-transfer abort OFFER
                                      durably reject the prepared transfer
   flexvm software-transfer acknowledge-abort OFFER --signing-key FILE
@@ -104,6 +108,7 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
   flexvm software-transfer receive OFFER [--max-bundle-mib MIB]
                                      verify a prepared checkpoint bundle from stdin
   flexvm software-transfer activate OFFER VM --qemu FILE
+                                     --route-peer PEER --signing-key FILE installs the source route
                                      run one committed checkpoint with a matching local emulator
   flexvm software --kernel FILE [OPTIONS] IMAGE [CMD...]
                                      --kernel-sdk: matching native module build inputs;
@@ -570,7 +575,7 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("rm", NAMES, &["force"]),
     ("volume", NAMES, &["size"]),
     ("checkpoint", NAMES, &["stop", "incremental", "quiet", "format", "filter", "force", "older-than", "output", "input", "name", "sha256"]),
-    ("software-transfer", 4, &["source-key", "signing-key", "destination-key", "handoff-chain", "max-bundle-mib", "qemu"]),
+    ("software-transfer", 4, &["source-key", "signing-key", "destination-key", "handoff-chain", "max-bundle-mib", "qemu", "route-peer"]),
     ("migrate", 3, &[]),
     ("reclaim", 2, &["force"]),
     ("listen", 2, &[]),
@@ -667,6 +672,9 @@ fn check_applies(args: &Args) -> Result<()> {
                 bail!("--max-bundle-mib applies only to software-transfer receive");
             }
             let activating = first.map(String::as_str) == Some("activate");
+            if (args.has("route-peer") && !activating) || (activating && args.has("route-peer") != args.has("signing-key")) {
+                bail!("software-transfer activate takes --route-peer PEER together with --signing-key FILE");
+            }
             if args.has("qemu") != activating {
                 bail!("software-transfer activate requires --qemu FILE; other transfer commands do not take it");
             }
@@ -674,9 +682,10 @@ fn check_applies(args: &Args) -> Result<()> {
                 (first.map(String::as_str), words, keys),
                 (Some("id"), 2, (false, false, false))
                     | (Some("prepare"), 3, (true, false, false))
-                    | (Some("commit" | "abort" | "recover" | "receive"), 3, (false, false, false))
-                    | (Some("acknowledge-abort" | "acknowledge-commit" | "finalize"), 3, (false, true, false))
+                    | (Some("commit" | "abort" | "recover" | "receive" | "install-route"), 3, (false, false, false))
+                    | (Some("acknowledge-abort" | "acknowledge-commit" | "acknowledge-route" | "finalize"), 3, (false, true, false))
                     | (Some("offer" | "send" | "activate"), 4, (false, false, false))
+                    | (Some("activate"), 4, (false, true, false))
                     | (Some("retire"), 4, (false, true, true))
             ) {
                 bail!("invalid software-transfer arguments (see flexvm --help)");
@@ -836,7 +845,8 @@ fn real_main(args: &Args) -> Result<()> {
         Some("pull") => pull(args, name),
         Some("software-transfer") if name == "activate" => {
             util::block_signals(&[libc::SIGTSTP, libc::SIGCONT, libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGHUP]);
-            util::exit(software::activate(open_host(args)?, pos[3], Path::new(pos[2]), Path::new(args.get("qemu").unwrap()))?)
+            let route = args.get("route-peer").zip(args.get("signing-key").map(Path::new));
+            util::exit(software::activate(open_host(args)?, pos[3], Path::new(pos[2]), Path::new(args.get("qemu").unwrap()), route)?)
         }
         Some("software-transfer") if name == "send" => {
             software_state::transfer::bundle::send(&open_host(args)?, pos[2], Path::new(pos[3]), &mut std::io::stdout().lock())
@@ -849,6 +859,10 @@ fn real_main(args: &Args) -> Result<()> {
             Path::new(args.get("signing-key").unwrap()),
             args.get("destination-key").unwrap(),
         )?),
+        Some("software-transfer") if name == "acknowledge-route" => {
+            print(software_state::transfer::routing::acknowledge(&open_host(args)?, Path::new(pos[2]), Path::new(args.get("signing-key").unwrap()))?)
+        }
+        Some("software-transfer") if name == "install-route" => print(software_state::transfer::routing::install(&open_host(args)?, Path::new(pos[2]))?),
         Some("software-transfer") => {
             let path = state(args)?;
             host::host_dir(&path, 0o755)?;
