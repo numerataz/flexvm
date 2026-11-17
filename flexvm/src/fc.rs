@@ -186,6 +186,12 @@ impl Firecracker {
         matches!(exited(&self.child), Ok(None))
     }
 
+    /// Classify an already terminated VMM, after draining its console. A console
+    /// message alone must never terminate a live VM or turn a panic into success.
+    pub fn powered_off(&self) -> bool {
+        matches!(exited(&self.child), Ok(Some(status)) if status.success()) && kernel_powered_off(&self.log_tail())
+    }
+
     pub fn post_mortem(&self) -> String {
         let status = match exited(&self.child) {
             Ok(Some(st)) => {
@@ -303,6 +309,14 @@ pub(crate) fn snapshot_load_body(vmstate: &Path, template: &crate::template::Tem
         "vsock_override": {"uds_path": vsock},
         "network_overrides": [{"iface_id": "eth0", "host_dev_name": tap}],
     }))
+}
+
+fn kernel_powered_off(log: &str) -> bool {
+    !log.contains("Kernel panic")
+        && log.lines().any(|line| {
+            let line = line.trim_end_matches('\r');
+            line.starts_with('[') && line.ends_with("] reboot: Power down")
+        })
 }
 
 /// One reader for both streams, with bounded memory even for a console without newlines.
@@ -757,6 +771,20 @@ mod tests {
 
     use std::os::unix::net::UnixListener;
     use std::thread::JoinHandle;
+
+    #[test]
+    fn poweroff_requires_kernel_completion_and_rejects_panic() {
+        assert!(kernel_powered_off("Unmounting filesystems\r\n[    3.725045] reboot: Power down\r\n"));
+        for log in [
+            "Powering off.\n",
+            "[    3.0] reboot: System halted\n",
+            "[    3.0] reboot: Restarting system\n",
+            "a service says reboot: Power down\n",
+            "[    2.0] Kernel panic - not syncing: fatal\n[    3.0] reboot: Power down\n",
+        ] {
+            assert!(!kernel_powered_off(log), "{log}");
+        }
+    }
 
     #[test]
     fn failed_cgroup_join_disables_limits_and_removes_the_directory() {

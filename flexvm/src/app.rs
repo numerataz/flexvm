@@ -211,6 +211,9 @@ impl RunSpec {
         for kv in &self.env {
             validate_env(kv)?;
         }
+        if image.is_some_and(|image| !image.boot.is_app()) && (self.entrypoint.is_some() || self.stdin || self.tty) {
+            bail!("distro boot runs its real init as PID 1; use exec for an interactive command or another program");
+        }
         if !self.changes_app() {
             return Ok(());
         }

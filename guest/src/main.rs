@@ -20,6 +20,7 @@ mod app;
 mod barrier;
 #[allow(dead_code)]
 mod control;
+mod distro;
 mod input;
 mod mem;
 mod net;
@@ -69,16 +70,48 @@ fn main() {
     if let Some(code) = tar::tool_main(&std::env::args().skip(1).collect::<Vec<_>>()) {
         std::process::exit(code);
     }
-    if unsafe { libc::getpid() } == 1 {
-        if let Err(e) = setup_root() {
+    app::init();
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    if arguments.first().is_some_and(|arg| arg == "--distro-runtime") {
+        if let Err(error) = distro::provider() {
+            log(&format!("runtime service failed: {error}"));
+        }
+        std::process::exit(1);
+    }
+    if arguments.first().is_some_and(|arg| arg == "--distro-broker") {
+        let result = arguments
+            .get(1)
+            .and_then(|value| value.parse::<i32>().ok())
+            .ok_or_else(|| io::Error::other("missing broker gate descriptor"))
+            .and_then(distro::broker)
+            .and_then(|_| net::setup());
+        if let Err(error) = result {
+            log(&format!("distro broker failed: {error}"));
+            std::process::exit(1);
+        }
+    } else if unsafe { libc::getpid() } == 1 {
+        let profile = app::boot_profile().unwrap_or(app::BootProfile::App);
+        if let Err(e) = setup_root(profile != app::BootProfile::App) {
             log(&format!("root setup failed: {e}"));
+            if profile != app::BootProfile::App {
+                loop {
+                    unsafe { libc::pause() };
+                }
+            }
         }
         if let Err(e) = net::setup() {
             log(&format!("network setup failed: {e}"));
         }
+        if profile != app::BootProfile::App {
+            if let Err(error) = distro::boot(profile) {
+                log(&format!("distro init failed: {error}"));
+            }
+            loop {
+                unsafe { libc::pause() };
+            }
+        }
         mem::start();
     }
-    app::init();
     let statuses = Statuses::default();
     let reaped = statuses.clone();
     thread::spawn(move || reap(reaped));
@@ -175,7 +208,7 @@ fn copy_root_metadata_with_xattrs(lower: &str, upper: &str, list: impl FnOnce(Ra
 }
 
 /// Pivots into an overlay whose tmpfs upper layer keeps guest writes in RAM, so they migrate.
-fn setup_root() -> io::Result<()> {
+fn setup_root(distro: bool) -> io::Result<()> {
     mount("proc", "/proc", "proc", 0, "")?;
     mount("sysfs", "/sys", "sysfs", 0, "")?;
     mount("devtmpfs", "/dev", "devtmpfs", 0, "")?;
@@ -205,6 +238,10 @@ fn setup_root() -> io::Result<()> {
     // The read-only image and upper tmpfs have different devices. Stable directory
     // inode numbers keep tar/scanners from mistaking cache eviction for a rename.
     mount("overlay", "/run/root", "overlay", 0, "lowerdir=/,upperdir=/run/ovl/upper,workdir=/run/ovl/work,xino=on")?;
+    if distro {
+        std::fs::create_dir_all("/run/root/run")?;
+        mount("tmpfs", "/run/root/run", "tmpfs", libc::MS_NOSUID | libc::MS_NODEV, &format!("mode=755,{tmpfs}"))?;
+    }
     for d in ["/proc", "/sys", "/dev"] {
         mount(d, &format!("/run/root{d}"), "", libc::MS_MOVE, "")?;
     }
@@ -865,6 +902,10 @@ const MAX_ETC: u64 = 1 << 20;
 /// no link followed): anything else (a FIFO, a device) is never waited on but refused.
 fn read_etc(path: &std::path::Path, flags: libc::c_int) -> io::Result<(String, std::fs::Metadata)> {
     let f = File::options().read(true).custom_flags(flags | libc::O_NONBLOCK | libc::O_NOCTTY).open(path)?;
+    read_etc_file(f)
+}
+
+fn read_etc_file(f: File) -> io::Result<(String, std::fs::Metadata)> {
     let meta = f.metadata()?;
     let mut text = String::new();
     if !meta.is_file() || f.take(MAX_ETC + 1).read_to_string(&mut text)? as u64 > MAX_ETC {

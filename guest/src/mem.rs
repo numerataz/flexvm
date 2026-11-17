@@ -68,6 +68,10 @@ fn setup() -> io::Result<(File, OwnedFd, High)> {
     std::fs::create_dir_all(WORK)?;
     crate::runtime::prepare()?;
     enable_controllers(CGROUP)?;
+    observe()
+}
+
+fn observe() -> io::Result<(File, OwnedFd, High)> {
     let uev = uevents()?;
     let total = meminfo().map(|(total, _)| total);
     if let Some(total) = total {
@@ -79,10 +83,31 @@ fn setup() -> io::Result<(File, OwnedFd, High)> {
 
 /// Delegate the available controllers through /vm. Nested runtimes create sibling cgroups under
 /// it, keeping their containers under memory.high rather than at the guest hierarchy's root.
-fn enable_controllers(dir: &str) -> io::Result<()> {
+pub(crate) fn enable_controllers(dir: &str) -> io::Result<()> {
     let controllers = std::fs::read_to_string(format!("{dir}/cgroup.controllers"))?;
     let enabled = controllers.split_whitespace().map(|c| format!("+{c}")).collect::<Vec<_>>().join(" ");
     std::fs::write(format!("{dir}/cgroup.subtree_control"), enabled)
+}
+
+/// PID 1 calls this before starting threads or creating its cgroup namespace.
+/// Keep /vm's controllers disabled until PID 1 has moved to init.scope.
+pub(crate) fn prepare_distro() -> io::Result<()> {
+    std::fs::write("/proc/sys/vm/overcommit_memory", "1")?;
+    std::fs::create_dir_all(CGROUP_ROOT)?;
+    crate::mount("cgroup2", CGROUP_ROOT, "cgroup2", libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV, "nsdelegate,memory_recursiveprot")?;
+    enable_controllers(CGROUP_ROOT)?;
+    std::fs::create_dir_all("/sys/fs/cgroup/flexvm")?;
+    enable_controllers("/sys/fs/cgroup/flexvm")?;
+    std::fs::create_dir_all("/sys/fs/cgroup/flexvm/broker")?;
+    std::fs::create_dir_all(CGROUP)
+}
+
+/// The broker has retained the initial cgroup namespace and mount view. Its
+/// pressure watcher stays outside /vm while the distro owns the tree inside it.
+pub(crate) fn start_distro() -> io::Result<()> {
+    let (events, uev, high) = observe()?;
+    thread::Builder::new().name("memory-pressure".into()).spawn(move || watch(events, uev, high))?;
+    Ok(())
 }
 
 fn meminfo() -> Option<(u64, u64)> {

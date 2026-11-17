@@ -2478,6 +2478,11 @@ impl Proc {
     /// Death's end: why goes in `RUN/vms/NAME.failed`, exit 124.
     pub fn end_died(&self, op: &Op, last: Option<(&mut dyn std::io::Write, Value)>) -> ! {
         let vm = self.vm();
+        if vm.pager.failed().is_none() && vm.distro_powered_off() {
+            crate::log!("vm {}: guest powered off", vm.name);
+            *self.exiting.lock().unwrap() = Some(0);
+            self.finish(op, End::Gone, 0, last)
+        }
         let why = format!("{}; {}", vm.pager.failed().unwrap_or("its firecracker exited"), vm.post_mortem());
         crate::log!("vm {}: died: {why}", vm.name);
         crate::util::log_long(&format!("vm {}: its firecracker's log, to its end:", vm.name), &vm.firecracker_log());

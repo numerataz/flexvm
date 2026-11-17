@@ -132,7 +132,7 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      printed); its template by content id, unnamed, if not here
   flexvm migrate NAME HOST:PORT      live-migrate a VM to the host listening there
   flexvm pull IMAGE[:TAG|@DIGEST] [--tag NAME] [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB]
-              [--standby N] [--kernel-sdk | --kernel-modules FILE] ...
+              [--standby N] [--boot app|systemd] [--kernel-sdk | --kernel-modules FILE] ...
                                      pull an image and build its template (an archive or OCI layout
                                      directory needs --tag; see README); again: rebuilt if it changed;
                                      --standby N keeps N of its VMs restored and paused (run: ~5 ms);
@@ -467,6 +467,7 @@ const GLOBAL: &[&str] = &["state", "run", "help", "version", "verbose"];
 
 /// What `pull` takes besides the sizes.
 const IMAGE_FLAGS: &[&str] = &[
+    "boot",
     "kernel-modules",
     "kernel-sdk",
     "init",
@@ -2230,6 +2231,10 @@ fn rmi(host: &Host, paths: &Paths, what: &str) -> Result<()> {
 }
 
 fn image_options(args: &Args, src: &str) -> Result<image::Options> {
+    let boot: image::BootProfile = args.get("boot").unwrap_or("app").parse()?;
+    if boot == image::BootProfile::Openrc {
+        bail!("OpenRC boot integration is not ready yet");
+    }
     let warm = args.has("warm");
     let ready = match (args.get("ready-port"), args.get("ready-cmd")) {
         (Some(_), Some(_)) => return Err("pass --ready-port or --ready-cmd, not both".into()),
@@ -2251,7 +2256,7 @@ fn image_options(args: &Args, src: &str) -> Result<image::Options> {
         |flag, default| -> Result<u64> { args.parse_or::<u64>(flag, default)?.checked_mul(1 << 20).ok_or_else(|| format!("--{flag} is too large").into()) };
     Ok(image::Options {
         image: src.into(),
-        boot: image::BootProfile::App,
+        boot,
         entrypoint: args.get("entrypoint").map(image::parse_argv).transpose()?,
         cmd: args.get("cmd").map(image::parse_argv).transpose()?,
         env: env_flags(args)?,
@@ -2355,6 +2360,9 @@ fn software(args: &Args, src: &str) -> Result<i32> {
         }
     });
     let mut opts = image_options(args, src)?;
+    if !opts.boot.is_app() {
+        bail!("software distro boot integration is not ready yet");
+    }
     if !args.rest.is_empty() {
         opts.cmd = Some(args.rest.clone());
     }

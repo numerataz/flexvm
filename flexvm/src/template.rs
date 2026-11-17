@@ -976,6 +976,9 @@ fn record_working_set(host: &crate::host::Host, paths: &Paths, dir: &Path, tap: 
     guest::start(&fc.sockets.vsock, ip, host.config_now().vm_ipv6(ip), &[])?;
     if tpl.meta.image.as_ref().is_some_and(|i| i.starts_at_run()) {
         guest::start_app(&fc.sockets.vsock, "")?;
+        if tpl.meta.image.as_ref().is_some_and(|image| !image.boot.is_app()) {
+            guest::wait_distro_ready(&fc.sockets.vsock, Duration::from_secs(120))?;
+        }
     }
     // An exec records the session path's pages, so the first exec after a restore is fast;
     // an image with no shell can't run one, and an agent round trip stands in.
@@ -1257,6 +1260,7 @@ fn up_to_date_with(
     let same_image = meta.image.as_ref().is_some_and(|i| {
         (&i.digest, &i.config_digest, &i.app_conf, &i.argv, i.warm) == (&image.digest, &image.config_digest, &image.app_conf, &image.argv, image.warm)
             && serde_json::to_value(&i.ready).ok() == serde_json::to_value(&image.ready).ok()
+            && i.boot == image.boot
             && i.kernel_modules == image.kernel_modules
     });
     let sizes = (meta.vcpus, meta.mem_mib, meta.max_mib, meta.plugged_mib) == (size.vcpus, size.mem_mib, size.mem_mib + size.hotplug_mib(), size.plugged_mib());

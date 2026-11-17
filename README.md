@@ -1251,6 +1251,43 @@ Overrides follow `docker run`: `--entrypoint`, `--cmd`, `--env K[=V]`
 with the same userland state (RNG seeds, keys), so use it only for apps that
 hold no secrets at startup. Details: [docs/images.md](docs/images.md).
 
+### Distro init as PID 1
+
+`pull --boot systemd` builds an opt-in template for an image containing an
+executable `/sbin/init` and systemd's service manager. App mode remains the
+default. For example, with a distro OCI layout that includes those packages:
+
+```sh
+flexvm pull ./my-systemd-image --tag my-distro --boot systemd
+flexvm run -d --name my-vm -e EXAMPLE=value my-distro
+flexvm exec my-vm systemctl is-system-running --wait
+flexvm exec my-vm systemctl start my-service
+flexvm kill --signal TERM my-vm     # request systemd power-off
+```
+
+Each fresh VM gets its hostname, environment and a fresh machine ID before
+systemd becomes PID 1. The template pauses before service startup;
+`--warm` and app entrypoint/user/workdir overrides are refused. The environment
+is supplied to PID 1; units use systemd's normal environment configuration.
+Use `exec -it` for an interactive shell; PID 1 has no app stdin or pseudo-TTY.
+
+FlexVM installs a delegated `flexvm-runtime.service` for exec and check
+processes. A bootstrap broker keeps the management connection and aggregate
+memory-pressure controller outside the distro's cgroup boundary. Systemd
+owns its hierarchy within that boundary. Restarting the runtime service
+restores exec without replacing PID 1 or other service processes. FlexVM
+manages `eth0`; other interfaces remain available to distro network managers.
+
+Suspend, checkpoint restore and migration preserve machine identity and
+running services. Normal power-off waits for actual VMM exit before recording
+status zero; a kernel panic or VMM failure remains a failure. The writable
+root remains VM memory, with the same lifecycle semantics as app mode.
+
+This first distro integration targets the accelerated backend and systemd.
+OpenRC, software-engine distro boot, full user sessions/rootless service
+integration and guest reboot semantics remain tracked in
+[the distro boot issue](https://github.com/numerataz/flexvm/issues/1328).
+
 ## Docker inside a VM
 
 The official `docker:27-dind` image can run Docker inside a FlexVM guest,

@@ -188,7 +188,19 @@ fn app_config(config: &Value, o: &Options) -> Result<App> {
         (None, None) => strings(&c["Cmd"]),
     };
     // None: no app; its VMs idle until told what to run (`exec`, `run -- CMD`).
-    let argv: Vec<String> = entrypoint.into_iter().chain(cmd).collect();
+    let argv: Vec<String> = if o.boot.is_app() {
+        entrypoint.into_iter().chain(cmd).collect()
+    } else {
+        if o.entrypoint.is_some() || o.cmd.is_some() || o.user.is_some() || o.workdir.is_some() {
+            bail!("distro boot uses its real init as root from /; entrypoint, cmd, user and workdir select app mode behavior");
+        }
+        vec![match o.boot {
+            BootProfile::Systemd => "/sbin/init",
+            BootProfile::Openrc => "/sbin/openrc-init",
+            BootProfile::App => unreachable!(),
+        }
+        .into()]
+    };
     let mut env = strings(&c["Env"]);
     for kv in &o.env {
         crate::app::validate_env(kv)?;
@@ -214,8 +226,12 @@ fn app_config(config: &Value, o: &Options) -> Result<App> {
         boot: o.boot,
         argv,
         env,
-        workdir: o.workdir.clone().or_else(|| c["WorkingDir"].as_str().map(String::from)).filter(|w| !w.is_empty()).unwrap_or("/".into()),
-        user: o.user.clone().or_else(|| c["User"].as_str().map(String::from)).unwrap_or_default(),
+        workdir: if o.boot.is_app() {
+            o.workdir.clone().or_else(|| c["WorkingDir"].as_str().map(String::from)).filter(|w| !w.is_empty()).unwrap_or("/".into())
+        } else {
+            "/".into()
+        },
+        user: if o.boot.is_app() { o.user.clone().or_else(|| c["User"].as_str().map(String::from)).unwrap_or_default() } else { "0".into() },
         ports,
         volumes,
     })
@@ -224,6 +240,9 @@ fn app_config(config: &Value, o: &Options) -> Result<App> {
 /// `init` is flexvm-init's path, or the one built into flexvm (`artifacts::INIT`) for `None`.
 /// The root filesystem comes reserved (`Cached::reserved`): hold it until the template is published.
 pub fn prepare(cache: &Path, init: Option<&Path>, o: &Options, modules: Option<&KernelBundle>) -> Result<(PathBuf, ImageMeta, Flock, crate::host::HeldLock)> {
+    if !o.boot.is_app() && o.warm {
+        bail!("distro init boots cold per VM; --warm would clone initialized service identity");
+    }
     if let Some(bundle) = modules {
         bundle.unchanged()?;
     }
@@ -1071,6 +1090,15 @@ pub fn escape(s: &str) -> String {
 }
 
 fn inject(root: &mut Root, app: &App, init: &[u8]) -> Result<String> {
+    if !app.boot.is_app() {
+        let path = app.argv.first().ok_or("distro image has no init path")?;
+        if !root.executable(path) {
+            bail!("distro boot requires executable {path} in the image; install its init/service-manager packages first");
+        }
+        if app.boot == BootProfile::Systemd {
+            inject_systemd(root)?;
+        }
+    }
     for (dir, mode) in [("proc", 0o555), ("sys", 0o555), ("dev", 0o755), ("run", 0o755), ("tmp", 0o1777), ("mnt", 0o755), ("root", 0o700), ("sbin", 0o755)] {
         root.ensure_dir(dir, mode)?;
     }
@@ -1108,6 +1136,38 @@ fn inject(root: &mut Root, app: &App, init: &[u8]) -> Result<String> {
     root.secure_dir("etc/flexvm", 0o755)?;
     root.write_file("etc/flexvm/app.conf", conf.as_bytes(), 0o644)?;
     Ok(conf)
+}
+
+fn inject_systemd(root: &mut Root) -> Result<()> {
+    root.secure_dir("etc/systemd/system", 0o755)?;
+    root.secure_dir("etc/systemd/system/multi-user.target.wants", 0o755)?;
+    root.write_file(
+        "etc/systemd/system/flexvm-runtime.service",
+        br#"[Unit]
+Description=FlexVM workload delegation
+After=local-fs.target
+
+[Service]
+Type=notify
+ExecStart=/sbin/flexvm-init --distro-runtime
+Delegate=yes
+KillMode=control-group
+Restart=always
+RestartSec=250ms
+
+[Install]
+WantedBy=multi-user.target
+"#,
+        0o644,
+    )?;
+    root.write_symlink("etc/systemd/system/multi-user.target.wants/flexvm-runtime.service", "../flexvm-runtime.service")?;
+    // The management agent already configures eth0 before init. Other links
+    // remain available to the distro's normal network managers.
+    root.secure_dir("etc/systemd/network", 0o755)?;
+    root.write_file("etc/systemd/network/00-flexvm-eth0.link", b"[Match]\nOriginalName=eth0\n[Link]\nNamePolicy=\nName=eth0\n", 0o644)?;
+    root.write_file("etc/systemd/network/00-flexvm-eth0.network", b"[Match]\nName=eth0\n[Link]\nUnmanaged=yes\n", 0o644)?;
+    root.secure_dir("etc/NetworkManager/conf.d", 0o755)?;
+    root.write_file("etc/NetworkManager/conf.d/10-flexvm-eth0.conf", b"[keyfile]\nunmanaged-devices=interface-name:eth0\n", 0o644)
 }
 
 /// Resolves an image `User` against the image's own /etc/passwd and /etc/group.
