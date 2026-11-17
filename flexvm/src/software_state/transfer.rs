@@ -163,6 +163,15 @@ struct SourceFence {
     disks: Vec<super::Disk>,
 }
 
+impl SourceFence {
+    fn active(&self, state: &File) -> Result<bool> {
+        if self.recovered {
+            return Ok(false);
+        }
+        Ok(bundle::activate::return_grant_generation(state, &self.offer)?.is_none_or(|generation| generation <= self.offer.generation))
+    }
+}
+
 const SOURCE_FENCE_PREFIX: &str = ".software-transfer-source-v1-";
 
 fn source_record(vm_id: &str) -> String {
@@ -200,11 +209,8 @@ fn require_disk_source(state: &File, volume_id: &str, allowed_return: Option<&Of
             continue;
         }
         let fence = record::<SourceFence>(state, name)?;
-        if !fence.recovered && Some(&fence.offer) != allowed_return && fence.disks.iter().any(|disk| disk.volume_id == volume_id) {
-            let returned = bundle::activate::return_grant_generation(state, &fence.offer)?;
-            if returned.is_none_or(|generation| generation <= fence.offer.generation) {
-                bail!("managed volume {volume_id} is fenced by software VM transfer");
-            }
+        if Some(&fence.offer) != allowed_return && fence.disks.iter().any(|disk| disk.volume_id == volume_id) && fence.active(state)? {
+            bail!("managed volume {volume_id} is fenced by software VM transfer");
         }
     }
     Ok(())
@@ -356,6 +362,9 @@ fn issue(state: &File, checkpoint: &File, offer: Offer, key: &Ed25519KeyPair, de
                 && existing.disks == fence.disks
                 && !existing.recovered =>
         {
+            if !existing.active(state)? {
+                bail!("software transfer already returned to this source");
+            }
             state.sync_all()?
         }
         _ => {

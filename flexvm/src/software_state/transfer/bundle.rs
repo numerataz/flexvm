@@ -128,7 +128,8 @@ pub(crate) fn send(host: &Host, vm: &str, input: &Path, output: &mut dyn Write) 
     let header = {
         let _transfer = parent_lock(&state, libc::LOCK_EX)?;
         let (manifest, _) = retired_checkpoint(&checkpoint)?;
-        if host_id_in(&state)? != offer.source_host || !read_fence(&state, &offer.vm_id)?.is_some_and(|fence| !fence.recovered && fence.offer == offer) {
+        let fence = read_fence(&state, &offer.vm_id)?.filter(|fence| fence.offer == offer).ok_or("software bundle needs an exact fenced source")?;
+        if host_id_in(&state)? != offer.source_host || !fence.active(&state)? {
             bail!("software bundle needs an exact fenced source");
         }
         let header = Header { offer, manifest };
