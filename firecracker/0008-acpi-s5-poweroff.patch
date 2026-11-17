@@ -1,0 +1,358 @@
+diff --git a/src/acpi-tables/src/fadt.rs b/src/acpi-tables/src/fadt.rs
+index c14f62bf2..4ee4ff9da 100644
+--- a/src/acpi-tables/src/fadt.rs
++++ b/src/acpi-tables/src/fadt.rs
+@@ -137,6 +137,16 @@ impl Fadt {
+         self.flags = U32::new(flags);
+     }
+ 
++    /// Set the hardware-reduced ACPI sleep registers.
++    pub fn set_sleep_registers(
++        &mut self,
++        control: GenericAddressStructure,
++        status: GenericAddressStructure,
++    ) {
++        self.sleep_control_reg = control;
++        self.sleep_status_reg = status;
++    }
++
+     /// Set the IA-PC specific flags
+     pub fn setup_iapc_flags(&mut self, flags: u16) {
+         self.iapc_boot_arch = U16::new(flags);
+diff --git a/src/vmm/src/acpi/x86_64.rs b/src/vmm/src/acpi/x86_64.rs
+index 53eeac7b5..9676d59fa 100644
+--- a/src/vmm/src/acpi/x86_64.rs
++++ b/src/vmm/src/acpi/x86_64.rs
+@@ -5,12 +5,13 @@ use std::mem::size_of;
+ 
+ use acpi_tables::fadt::IAPC_BOOT_ARG_FLAGS_VGA_NOT_PRESENT;
+ use acpi_tables::madt::{IoAPIC, LocalAPIC};
+-use acpi_tables::{Fadt, aml};
++use acpi_tables::{Aml, Fadt, GenericAddressStructure, aml};
+ use vm_memory::GuestAddress;
+ use zerocopy::IntoBytes;
+ 
+ use crate::arch::x86_64::layout;
+ use crate::device_manager::legacy::PortIODeviceManager;
++use crate::devices::legacy::acpi_power::{ACPI_SLEEP_CONTROL, ACPI_SLEEP_STATUS};
+ 
+ #[inline(always)]
+ pub(crate) fn setup_interrupt_controllers(nr_vcpus: u8) -> Vec<u8> {
+@@ -31,11 +32,21 @@ pub(crate) fn setup_arch_fadt(fadt: &mut Fadt) {
+     // More info here:
+     // https://uefi.org/specs/ACPI/6.5/05_ACPI_Software_Programming_Model.html?highlight=0a06#ia-pc-boot-architecture-flags
+     fadt.setup_iapc_flags(1 << IAPC_BOOT_ARG_FLAGS_VGA_NOT_PRESENT);
++    // System I/O, byte-wide registers, naturally aligned byte accesses.
++    fadt.set_sleep_registers(
++        GenericAddressStructure::new(1, 8, 0, 1, ACPI_SLEEP_CONTROL),
++        GenericAddressStructure::new(1, 8, 0, 1, ACPI_SLEEP_STATUS),
++    );
+ }
+ 
+ #[inline(always)]
+ pub(crate) fn setup_arch_dsdt(dsdt_data: &mut Vec<u8>) -> Result<(), aml::AmlError> {
+-    PortIODeviceManager::append_aml_bytes(dsdt_data)
++    PortIODeviceManager::append_aml_bytes(dsdt_data)?;
++    aml::Name::new(
++        "\\_S5_".try_into()?,
++        &aml::Package::new(vec![&aml::ZERO, &aml::ZERO, &aml::ZERO, &aml::ZERO]),
++    )?
++    .append_aml_bytes(dsdt_data)
+ }
+ 
+ pub(crate) const fn apic_addr() -> u32 {
+@@ -45,3 +56,52 @@ pub(crate) const fn apic_addr() -> u32 {
+ pub(crate) const fn rsdp_addr() -> GuestAddress {
+     GuestAddress(layout::RSDP_ADDR)
+ }
++
++#[cfg(test)]
++mod tests {
++    use acpi_tables::Sdt;
++    use vm_memory::{Bytes, GuestMemoryMmap};
++
++    use super::*;
++
++    #[test]
++    fn test_s5_firmware_registers_and_checksum() {
++        let mut fadt = Fadt::new(*b"FLEXVM", *b"TESTS5  ", 1);
++        setup_arch_fadt(&mut fadt);
++        let mem = GuestMemoryMmap::<()>::from_ranges(&[(GuestAddress(0), 4096)]).unwrap();
++        fadt.write_to_guest(&mem, GuestAddress(0)).unwrap();
++        let mut bytes = vec![0; fadt.len()];
++        mem.read_slice(&mut bytes, GuestAddress(0)).unwrap();
++        assert_eq!(
++            bytes.iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte)),
++            0
++        );
++        for (offset, address) in [(244, ACPI_SLEEP_CONTROL), (256, ACPI_SLEEP_STATUS)] {
++            assert_eq!(&bytes[offset..offset + 4], &[1, 8, 0, 1]);
++            assert_eq!(&bytes[offset + 4..offset + 12], &address.to_le_bytes());
++        }
++        let mut dsdt = vec![];
++        setup_arch_dsdt(&mut dsdt).unwrap();
++        // Root NameOp, \\_S5_, PackageOp, PkgLength, count and four ZeroOps.
++        assert!(dsdt.ends_with(&[0x08, b'\\', b'_', b'S', b'5', b'_', 0x12, 6, 4, 0, 0, 0, 0]));
++    }
++
++    #[test]
++    fn test_snapshot_rejects_pending_s5() {
++        use crate::builder::tests::default_vmm;
++        use crate::persist::{MicrovmStateError, VmInfo};
++        use crate::vstate::bus::BusDevice;
++
++        let mut vmm = default_vmm();
++        vmm.device_manager
++            .legacy_devices
++            .as_ref()
++            .unwrap()
++            .acpi_power
++            .lock()
++            .unwrap()
++            .write(ACPI_SLEEP_CONTROL, 0, &[0x20]);
++        assert!(matches!(vmm.save_state(&VmInfo::default()),
++            Err(MicrovmStateError::NotAllowed(reason)) if reason == "ACPI power-off is pending"));
++    }
++}
+diff --git a/src/vmm/src/device_manager/legacy.rs b/src/vmm/src/device_manager/legacy.rs
+index 799ac1631..3dbef9790 100644
+--- a/src/vmm/src/device_manager/legacy.rs
++++ b/src/vmm/src/device_manager/legacy.rs
+@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
+ use acpi_tables::aml::AmlError;
+ use acpi_tables::{Aml, aml};
+ 
++use crate::devices::legacy::acpi_power::{ACPI_SLEEP_CONTROL, AcpiPowerDevice};
+ use crate::devices::legacy::{I8042Device, SerialDevice};
+ use crate::vstate::bus::BusError;
+ use crate::vstate::vm::KvmVm;
+@@ -32,6 +33,8 @@ pub struct PortIODeviceManager {
+     pub stdio_serial: Arc<Mutex<SerialDevice>>,
+     // BusDevice::I8042Device
+     pub i8042: Arc<Mutex<I8042Device>>,
++    /// Hardware-reduced ACPI S5 control and status registers.
++    pub acpi_power: Arc<Mutex<AcpiPowerDevice>>,
+ }
+ 
+ impl PortIODeviceManager {
+@@ -65,6 +68,8 @@ impl PortIODeviceManager {
+             Self::I8042_KDB_DATA_REGISTER_SIZE,
+         )?;
+ 
++        io_bus.insert(self.acpi_power.clone(), ACPI_SLEEP_CONTROL, 2)?;
++
+         vm.register_irq(
+             self.stdio_serial
+                 .lock()
+@@ -85,6 +90,23 @@ impl PortIODeviceManager {
+     }
+ 
+     pub(crate) fn append_aml_bytes(bytes: &mut Vec<u8>) -> Result<(), AmlError> {
++        // Reserve the sleep registers from operating-system resource allocation.
++        aml::Device::new(
++            "_SB_.PWR_".try_into()?,
++            vec![
++                &aml::Name::new("_HID".try_into()?, &aml::EisaName::new("PNP0C02")?)?,
++                &aml::Name::new(
++                    "_CRS".try_into()?,
++                    &aml::ResourceTemplate::new(vec![&aml::Io::new(
++                        ACPI_SLEEP_CONTROL as u16,
++                        ACPI_SLEEP_CONTROL as u16,
++                        1,
++                        2,
++                    )]),
++                )?,
++            ],
++        )
++        .append_aml_bytes(bytes)?;
+         // Setup COM1
+         aml::Device::new(
+             "_SB_.COM1".try_into()?,
+@@ -168,6 +190,11 @@ mod tests {
+                 ),
+                 input: None,
+             })),
++            acpi_power: Arc::new(Mutex::new(
++                crate::devices::legacy::acpi_power::AcpiPowerDevice::new(
++                    EventFd::new(libc::EFD_NONBLOCK).unwrap(),
++                ),
++            )),
+             i8042: Arc::new(Mutex::new(
+                 I8042Device::new(EventFd::new(libc::EFD_NONBLOCK).unwrap()).unwrap(),
+             )),
+diff --git a/src/vmm/src/device_manager/mod.rs b/src/vmm/src/device_manager/mod.rs
+index a8493785d..1b6274170 100644
+--- a/src/vmm/src/device_manager/mod.rs
++++ b/src/vmm/src/device_manager/mod.rs
+@@ -271,6 +271,13 @@ impl DeviceManager {
+         // create pio dev manager with legacy devices
+         let mut legacy_devices = PortIODeviceManager {
+             stdio_serial: serial,
++            acpi_power: Arc::new(Mutex::new(
++                crate::devices::legacy::acpi_power::AcpiPowerDevice::new(
++                    vcpus_exit_evt
++                        .try_clone()
++                        .map_err(DeviceManagerCreateError::EventFd)?,
++                ),
++            )),
+             i8042,
+         };
+         legacy_devices.register_devices(vm)?;
+@@ -858,6 +865,11 @@ pub(crate) mod tests {
+             stdio_serial: Arc::new(Mutex::new(
+                 SerialDevice::new(None, SerialOut::new(SerialOutInner::Sink, None), None).unwrap(),
+             )),
++            acpi_power: Arc::new(Mutex::new(
++                crate::devices::legacy::acpi_power::AcpiPowerDevice::new(
++                    EventFd::new(libc::EFD_NONBLOCK).unwrap(),
++                ),
++            )),
+             i8042: Arc::new(Mutex::new(
+                 I8042Device::new(EventFd::new(libc::EFD_NONBLOCK).unwrap()).unwrap(),
+             )),
+diff --git a/src/vmm/src/devices/legacy/acpi_power.rs b/src/vmm/src/devices/legacy/acpi_power.rs
+new file mode 100644
+index 000000000..cd5967cff
+--- /dev/null
++++ b/src/vmm/src/devices/legacy/acpi_power.rs
+@@ -0,0 +1,99 @@
++// Copyright 2026 FlexVM contributors.
++// SPDX-License-Identifier: Apache-2.0
++
++//! Hardware-reduced ACPI S5 (soft off). No suspend states or wake sources.
++use std::sync::{Arc, Barrier};
++
++use vmm_sys_util::eventfd::EventFd;
++
++use crate::logger::error;
++use crate::vstate::bus::BusDevice;
++
++/// Adjacent byte-wide Sleep Control and Sleep Status I/O registers.
++pub const ACPI_SLEEP_CONTROL: u64 = 0x600;
++pub const ACPI_SLEEP_STATUS: u64 = ACPI_SLEEP_CONTROL + 1;
++const SLP_EN: u8 = 1 << 5;
++const SLP_TYP: u8 = 7 << 2;
++
++/// The sole advertised sleep type is zero, meaning S5.
++#[derive(Debug)]
++pub struct AcpiPowerDevice {
++    exit_evt: EventFd,
++    requested: bool,
++}
++
++impl AcpiPowerDevice {
++    /// Use the same VMM termination event as the legacy reset device.
++    pub fn new(exit_evt: EventFd) -> Self {
++        Self {
++            exit_evt,
++            requested: false,
++        }
++    }
++
++    /// A pending power-off cannot be captured as a resumable checkpoint.
++    pub fn requested(&self) -> bool {
++        self.requested
++    }
++}
++
++impl BusDevice for AcpiPowerDevice {
++    fn read(&mut self, _base: u64, _offset: u64, data: &mut [u8]) {
++        // SLP_EN is write-only. S5 has type zero and cannot wake (WAK_STS=0).
++        data.fill(0);
++    }
++
++    fn write(&mut self, _base: u64, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
++        if offset == 0 && data.len() == 1 && data[0] & (SLP_EN | SLP_TYP) == SLP_EN {
++            self.requested = true;
++            if let Err(err) = self.exit_evt.write(1) {
++                error!("Failed to trigger ACPI S5 power-off: {err}");
++            }
++        }
++        // Status writes have no effect: there are no wake events to clear.
++        None
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn rejects_other_sleep_states_and_invalid_accesses() {
++        let evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
++        let mut dev = AcpiPowerDevice::new(evt.try_clone().unwrap());
++        for offset in [0, 1, 2] {
++            for value in 0..=u8::MAX {
++                if offset == 0 && value & (SLP_EN | SLP_TYP) == SLP_EN {
++                    continue;
++                }
++                dev.write(ACPI_SLEEP_CONTROL, offset, &[value]);
++            }
++        }
++        dev.write(ACPI_SLEEP_CONTROL, 0, &[]);
++        dev.write(ACPI_SLEEP_CONTROL, 0, &[SLP_EN, 0]);
++        assert!(!dev.requested());
++        assert_eq!(
++            evt.read().unwrap_err().kind(),
++            std::io::ErrorKind::WouldBlock
++        );
++        let mut bytes = [0xff; 2];
++        dev.read(ACPI_SLEEP_CONTROL, 0, &mut bytes);
++        assert_eq!(bytes, [0, 0]);
++    }
++
++    #[test]
++    fn s5_notifies_vmm_and_latches_pending_shutdown() {
++        let evt = EventFd::new(libc::EFD_NONBLOCK).unwrap();
++        let mut dev = AcpiPowerDevice::new(evt.try_clone().unwrap());
++        dev.write(ACPI_SLEEP_CONTROL, 0, &[SLP_EN]);
++        assert!(dev.requested());
++        assert_eq!(evt.read().unwrap(), 1);
++        dev.write(ACPI_SLEEP_CONTROL, 1, &[0x80]);
++        assert!(dev.requested());
++        let mut value = [0xff];
++        dev.read(ACPI_SLEEP_CONTROL, 0, &mut value);
++        assert_eq!(value, [0]);
++    }
++}
+diff --git a/src/vmm/src/devices/legacy/mod.rs b/src/vmm/src/devices/legacy/mod.rs
+index 9804625cf..8de93b808 100644
+--- a/src/vmm/src/devices/legacy/mod.rs
++++ b/src/vmm/src/devices/legacy/mod.rs
+@@ -6,6 +6,8 @@
+ // found in the THIRD-PARTY file.
+ 
+ //! Implements legacy devices (UART, RTC etc).
++#[cfg(target_arch = "x86_64")]
++pub mod acpi_power;
+ mod i8042;
+ #[cfg(target_arch = "aarch64")]
+ pub mod rtc_pl031;
+diff --git a/src/vmm/src/lib.rs b/src/vmm/src/lib.rs
+index 179f6bb85..cc19f6c18 100644
+--- a/src/vmm/src/lib.rs
++++ b/src/vmm/src/lib.rs
+@@ -499,6 +499,23 @@ impl Vmm {
+     /// Saves the state of a paused Microvm.
+     pub fn save_state(&mut self, vm_info: &VmInfo) -> Result<MicrovmState, MicrovmStateError> {
+         self.check_unsnapshottable_devices()?;
++        #[cfg(target_arch = "x86_64")]
++        if self
++            .device_manager
++            .legacy_devices
++            .as_ref()
++            .is_some_and(|legacy| {
++                legacy
++                    .acpi_power
++                    .lock()
++                    .expect("ACPI power lock poisoned")
++                    .requested()
++            })
++        {
++            return Err(MicrovmStateError::NotAllowed(
++                "ACPI power-off is pending".into(),
++            ));
++        }
+ 
+         // We need to save device state before saving KVM state.
+         // Some devices, (at the time of writing this comment block device with async engine)

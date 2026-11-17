@@ -38,7 +38,7 @@ missing or unusable (or with --no-kvm), only the untagged ones run, and no
 template is built: CI runs them so on its aarch64 runner, which has no KVM.
 --require-kvm (CI's KVM runners) fails there instead.
 """
-import argparse, contextlib, fcntl, glob, hashlib, ipaddress, json, os, re, select, shutil, signal, socket, struct, subprocess, sys, tarfile, tempfile, termios, threading, time, traceback
+import argparse, contextlib, fcntl, glob, hashlib, ipaddress, json, os, re, select, shutil, shlex, signal, socket, struct, subprocess, sys, tarfile, tempfile, termios, threading, time, traceback
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -1425,6 +1425,45 @@ def checkpoint_load_other_build():
             check("B: --keep: the VM stays up once its app exited", B.ps(all=False).get(vm, {}).get("state") == "running"
                   and B.exec(vm, "echo up")[1] == "up\n", B.ps())
             B.kill(vm)
+        finally:
+            A.kill(vm, check=False)
+            B.kill(vm, check=False)
+            clear_checkpoints(A, B)
+
+
+@case
+@needs_kvm
+def guest_poweroff():
+    """Unchanged Linux reboot(RB_POWER_OFF) terminates the VMM after each restore path."""
+    for phase in ("run", "suspend", "checkpoint", "migration"):
+        vm, host = f"e2e-poweroff-{phase}", A
+        A.run(vm)
+        try:
+            if phase == "suspend":
+                A.suspend(vm)
+                A.resume(vm)
+            elif phase == "checkpoint":
+                saved = A.checkpoint(vm, stop=True)
+                A.restore(saved["id"])
+            elif phase == "migration":
+                A.migrate(vm, B)
+                host = B
+            entry = host.ps()[vm]
+            fc = entry["firecracker"]
+            # Keep a stable process reference: a reused PID cannot satisfy or defeat the assertion.
+            fd = os.pidfd_open(fc)
+            try:
+                poll = select.poll()
+                poll.register(fd, select.POLLIN)
+                poweroff = ('import ctypes,os; os.sync(); '
+                            'libc=ctypes.CDLL(None,use_errno=True); '
+                            'libc.reboot(0x4321fedc); '
+                            'raise OSError(ctypes.get_errno(), "poweroff returned")')
+                result = host.exec(vm, "python3 -c " + shlex.quote(poweroff), timeout=30)
+                check(f"{phase}: actual VMM exits on guest poweroff", bool(poll.poll(10000)), result)
+                check(f"{phase}: owner retires after VMM exits", wait_for(lambda: not alive(entry["pid"]), 10), host.ps().get(vm))
+            finally:
+                os.close(fd)
         finally:
             A.kill(vm, check=False)
             B.kill(vm, check=False)
@@ -3314,7 +3353,7 @@ def worker():
 # runs, as e2e.py's summary prints them): --split balances by these, the long ones start first, and
 # the short ones go in batches of about BATCH_S (each batch is a worker, with hosts of its own).
 # Unlisted ones count as 2 s.
-COST = {"containerd": 180, "namespace_sandboxes": 180, "podman": 180, "faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "ipv6_taps": 10, "nettest_ipv6": 30, "docker_api": 15, "restart_policy": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
+COST = {"guest_poweroff": 10, "containerd": 180, "namespace_sandboxes": 180, "podman": 180, "faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "ipv6_taps": 10, "nettest_ipv6": 30, "docker_api": 15, "restart_policy": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
         "faults/cow_grow": 65, "faults/reconcile_kill": 64, "faults/target_renamed": 40, "faults/plug_race": 45, "faults/guest_hang": 44,
         "faults/exec_pause_grace": 42, "faults/exec_ckpt_stalled": 115, "faults/route_abort": 35, "faults/unplug_collapsed": 30,
         "faults/arrival_grew": 25, "faults/pause_resume": 24, "faults/evict_latency": 25, "faults/mem_high": 25, "faults/target_killed": 25,
