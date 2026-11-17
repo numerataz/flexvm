@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Keep a TCP connection through a signed routed software VM round trip."""
 import argparse
+from contextlib import contextmanager
 import base64
 import os
 import json
 from pathlib import Path
 import platform
 import runpy
+import selectors
 import shutil
 import signal
 import socket
@@ -20,7 +22,60 @@ HELPERS = runpy.run_path(str(ROOT / "software-boot.py"))
 IMAGE = runpy.run_path(str(ROOT / "software-kvm.py"))["image"]
 
 
-def exercise(binary, kernel, output, engine, root, arch):
+TCP_CLIENT = """
+import socket, sys
+with socket.create_connection((sys.argv[1], 28143), timeout=15) as connection:
+    print("connected", flush=True)
+    for message in sys.stdin.buffer:
+        connection.sendall(message)
+        reply = bytearray()
+        while len(reply) < len(message):
+            part = connection.recv(4096)
+            if not part:
+                raise RuntimeError("TCP client reached EOF")
+            reply.extend(part)
+        print(reply.hex(), flush=True)
+"""
+
+
+@contextmanager
+def configured_peers(enabled, timeout):
+    if not enabled:
+        yield {}
+        return
+    namespaces = []
+    try:
+        for site in ("a", "b"):
+            process = sp.Popen(["unshare", "--net", "sleep", str(timeout + 60)])
+            namespaces.append((site, process))
+            until = time.monotonic() + 5
+            while (Path(f"/proc/{process.pid}/ns/net").stat().st_ino == Path("/proc/self/ns/net").stat().st_ino
+                   and time.monotonic() < until):
+                time.sleep(.05)
+            if Path(f"/proc/{process.pid}/ns/net").stat().st_ino == Path("/proc/self/ns/net").stat().st_ino:
+                raise RuntimeError(f"peer {site} did not enter its own network namespace")
+        sp.run(["ip", "link", "add", "peer-a", "type", "veth", "peer", "name", "peer-b"], check=True, timeout=10)
+        routes = {}
+        for index, (site, process) in enumerate(namespaces, 1):
+            interface = "peer-" + site
+            prefix = ["nsenter", "--net", "-t", str(process.pid)]
+            address = f"198.18.0.{index}"
+            other = f"198.18.0.{3 - index}:7150"
+            sp.run(["ip", "link", "set", interface, "netns", str(process.pid)], check=True, timeout=10)
+            for words in (["ip", "link", "set", "lo", "up"], ["ip", "link", "set", interface, "up"],
+                          ["ip", "address", "add", address + "/30", "dev", interface],
+                          ["sysctl", "-qw", "net.ipv4.ip_forward=1"]):
+                sp.run([*prefix, *words], check=True, timeout=10)
+            routes[site] = (prefix, address, other)
+        yield routes
+    finally:
+        for _, process in namespaces:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+
+
+def exercise(binary, kernel, output, engine, root, arch, network):
     probe = output / "probe"
     IMAGE(output / "fixture.tar", "amd64" if arch == "x86_64" else "arm64",
           {"routed-probe": (probe.read_bytes(), 0o755)}, ["/routed-probe"])
@@ -30,9 +85,15 @@ def exercise(binary, kernel, output, engine, root, arch):
     for site, pool in [('a', '192.0.2.60-192.0.2.61'), ('b', '192.0.2.80-192.0.2.81')]:
         state = root / site
         state.mkdir()
-        (state/'host.json').write_text(json.dumps({'vm_ips':pool, 'cluster_ips':'192.0.2.0/24', 'announce_dev':'none',
-                                                 'vm_ipv6_prefix':'2001:db8:0:1::/96'}))
-        bases[site] = [binary, '--state', state, '--run', root/(site+'-run')]
+        config = {"vm_ips": pool, "cluster_ips": "192.0.2.0/24", "announce_dev": "none"}
+        prefix = []
+        if network:
+            prefix, address, other = network[site]
+            config.update(listen=f"{address}:7150", underlay=address, peers=[other])
+        else:
+            config["vm_ipv6_prefix"] = "2001:db8:0:1::/96"
+        (state / "host.json").write_text(json.dumps(config))
+        bases[site] = [*prefix, binary, "--state", state, "--run", root / f"{site}-run"]
     a, b = bases['a'], bases['b']
 
     def cli(base, *args, timeout=30, failure=None):
@@ -53,10 +114,14 @@ def exercise(binary, kernel, output, engine, root, arch):
         pub = sp.check_output(['openssl', 'pkey', '-inform', 'DER', '-in', path, '-pubout', '-outform', 'DER'], timeout=15)
         return path, base64.b64encode(pub[-32:]).decode()
 
+    def spawn(base, label, *args):
+        with (output / f"{label}.log").open("wb") as log:
+            process = sp.Popen([*base, *args], stdout=log, stderr=log)
+        owners.append(process)
+        return process
+
     def launch(base, name, *args):
-        with (output/f'{name}-owner.log').open('wb') as log:
-            proc = sp.Popen([*base,*args], stdout=log, stderr=log)
-        owners.append(proc)
+        proc = spawn(base, f"{name}-owner", *args)
         until = time.monotonic()+100
         while proc.poll() is None and time.monotonic() < until:
             for entry in json.loads(cli(base, 'ps', '--json')):
@@ -87,11 +152,66 @@ def exercise(binary, kernel, output, engine, root, arch):
                     if stream.poll() is None:
                         stream.kill()
         assert json.loads(transfer(receiver, "commit", receipt))["status"] == "committed"
-        owner, entry = launch(receiver, other, "software-transfer", "activate", offer, other, "--qemu", engine)
+        options = []
+        if network:
+            receiver_site = "a" if receiver is a else "b"
+            options.extend(["--route-peer", network[receiver_site][2], "--signing-key", dst[0]])
+        owner, entry = launch(receiver, other, "software-transfer", "activate", offer, other, "--qemu", engine, *options)
+        if network:
+            source_site = "a" if sender is a else "b"
+            ip = proposed["routed"]["address"]["v4"]
+            wanted = network[receiver_site][1]
+            until = time.monotonic() + 12
+            while time.monotonic() < until:
+                if any(entry.get("gateway") == wanted for entry in routes(source_site, ip)):
+                    break
+                time.sleep(.1)
+            else:
+                raise RuntimeError(f"{source_site} did not install the signed route to {wanted}")
         transfer(receiver, "activate", offer, other + "-replay", "--qemu", engine, failure="already granted")
         return owner, entry, proposed["routed"], received["bytes"]
 
+    def routes(site, ip):
+        prefix = network[site][0] if network else []
+        return json.loads(sp.check_output([*prefix, "ip", "-j", "-4", "route", "show", "exact", ip + "/32"], timeout=5))
+
+    def client_line(process):
+        with selectors.DefaultSelector() as selector:
+            selector.register(process.stdout, selectors.EVENT_READ)
+            if not selector.select(timeout=20):
+                raise TimeoutError("the original TCP client stopped responding")
+            response = process.stdout.readline()
+        if not response:
+            raise RuntimeError("the original TCP client exited")
+        return response.rstrip()
+
+    @contextmanager
+    def connection(ip):
+        if not network:
+            with socket.create_connection((ip, 28143), timeout=15) as client:
+                yield client
+            return
+        with (output / "tcp-client.log").open("wb") as log:
+            client = sp.Popen([*network["a"][0], sys.executable, "-c", TCP_CLIENT, ip],
+                              stdin=sp.PIPE, stdout=sp.PIPE, stderr=log, text=True, bufsize=1)
+        try:
+            assert client_line(client) == "connected"
+            yield client
+        finally:
+            client.stdin.close()
+            try:
+                client.wait(timeout=8)
+            except sp.TimeoutExpired:
+                client.kill()
+                client.wait(timeout=5)
+            client.stdout.close()
+
     def echo(tcp, message):
+        if network:
+            tcp.stdin.write(message.decode() + "\n")
+            tcp.stdin.flush()
+            assert client_line(tcp) == (message + b"\n").hex()
+            return
         tcp.sendall(message)
         response = bytearray()
         while len(response) < len(message):
@@ -104,10 +224,25 @@ def exercise(binary, kernel, output, engine, root, arch):
         return json.loads((root/site/'addrs'/ip).read_text())
 
     try:
+        if network:
+            for site, peer in bases.items():
+                spawn(peer, site + "-listener", "listen")
+            until = time.monotonic() + 12
+            for site in ("a", "b"):
+                prefix, address, other = network[site]
+                while time.monotonic() < until:
+                    probe = sp.run([*prefix, sys.executable, "-c",
+                                    "import socket,sys; socket.create_connection((sys.argv[1], 7150), 1).close()",
+                                    other.rsplit(":", 1)[0]], capture_output=True, timeout=3)
+                    if probe.returncode == 0:
+                        break
+                    time.sleep(.1)
+                else:
+                    raise RuntimeError(f"peer listener was not reachable from {address}")
         a_key, b_key = key('a'), key('b')
         first, initial = launch(a,'source','software','--name','source','--network','routed','--qemu',engine,'--kernel',kernel,output/'fixture.tar')
         ip = initial['ip']
-        with socket.create_connection((ip,28143), timeout=15) as tcp:
+        with connection(ip) as tcp:
             echo(tcp,b'routed-connection-before-transfer')
             stop(a,'source',first)
             peer, moved, outbound, sent = move(a,b,'source','peer',a_key,b_key)
@@ -125,12 +260,23 @@ def exercise(binary, kernel, output, engine, root, arch):
             echo(tcp,b'same-routed-connection-returned')
         cli(a,'rm','-f','returned')
         returned.wait(timeout=12)
-        assert not json.loads(sp.check_output(['ip','-j','-4','route','show','exact',ip+'/32'], timeout=5))
+        assert not routes("a", ip)
+        if network:
+            until = time.monotonic() + 20
+            while time.monotonic() < until:
+                old = addr_record("b", ip)
+                if old["withdrawn"] and old["lent"] is None and not routes("b", ip):
+                    break
+                time.sleep(.1)
+            else:
+                raise RuntimeError("the previous peer did not withdraw the route and release its loan")
         report = {
             "status": "passed",
             "same_tcp_socket": True,
             "separate_state_roots": True,
-            "shared_network_namespace": True,
+            "shared_network_namespace": not bool(network),
+            "automatic_peer_routes": bool(network),
+            "peer_route_withdrawal": bool(network),
             "outbound": outbound,
             "return": inbound,
             "outbound_bytes": sent,
@@ -156,6 +302,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--timeout", type=int, default=360)
     parser.add_argument("--cc", default="cc")
+    parser.add_argument("--peer-routes", action="store_true")
     parser.add_argument("--worker-state", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     binary, kernel, output = (path.resolve() for path in (args.bin, args.kernel, args.output))
@@ -166,7 +313,8 @@ def main():
     if not 1 <= args.timeout <= 3600:
         parser.error("--timeout must be 1..3600 seconds")
     if args.worker_state:
-        exercise(binary, kernel, output, engine, args.worker_state, arch)
+        with configured_peers(args.peer_routes, args.timeout) as network:
+            exercise(binary, kernel, output, engine, args.worker_state, arch, network)
         return 0
     output.mkdir(parents=True, exist_ok=True)
     report_path = output / "report.json"
@@ -192,7 +340,8 @@ def main():
             HELPERS["run"](["unshare", "--net", "--mount", "--propagation", "private", "sh", "-ec", setup,
                             "sh", str(mask), "strace", "-f", "-e", "trace=file", "-o", str(trace),
                             sys.executable, str(Path(__file__).resolve()), "--bin", str(binary), "--kernel", str(kernel),
-                            "--output", str(output), "--worker-state", state], args.timeout, output / "worker.log")
+                            "--output", str(output), "--worker-state", state,
+                            *(["--peer-routes"] if args.peer_routes else [])], args.timeout, output / "worker.log")
         with trace.open(errors="replace") as records:
             if any(f'"{device}"' in line for line in records for device in devices):
                 raise RuntimeError("host virtualization device access; see files.strace")

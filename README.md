@@ -704,7 +704,12 @@ and TCP state through a new TAP. A signed software transfer carries
 the same address and its revision to a peer configured for the same
 cluster address range and IPv6 prefix. Transfer keeps the source address
 reserved until the VM returns or the loan is withdrawn. Arrange for
-traffic to reach the destination when it takes ownership.
+traffic to reach the destination when it takes ownership. If the source
+listens as a configured peer, add `--route-peer PEER --signing-key FILE`
+to `software-transfer activate`. The destination signs its active
+route with the destination key and sends it to the source listener.
+The peer route is withdrawn when the VM exits.
+
 
 ## IPv6 addresses
 
