@@ -2810,9 +2810,15 @@ impl Proc {
         let vm = self.vm().clone();
         let Some(p) = self.me.upgrade().filter(|_| !vm.clock_pending.swap(true, Ordering::SeqCst)) else { return };
         thread::spawn(move || {
+            // Guest maintenance may fault on pages the migration is still pulling.
+            // Wait outside the operation lock so a pause can proceed meanwhile.
+            if vm.pager.pulling_from_peer() && !vm.pager.wait_pulled(None) {
+                vm.clock_pending.store(false, Ordering::SeqCst);
+                return;
+            }
             let res = {
                 let _op = p.op();
-                match vm.state() {
+                let result = match vm.state() {
                     State::Running => {
                         let off = vm.sync_clock(Instant::now() + CLOCK_DEADLINE).map(Some);
                         // A rename while it was paused reaches the guest now.
@@ -2820,9 +2826,11 @@ impl Proc {
                         off
                     }
                     _ => Ok(None),
-                }
+                };
+                // A later resume taking this lock can now schedule its own check.
+                vm.clock_pending.store(false, Ordering::SeqCst);
+                result
             };
-            vm.clock_pending.store(false, Ordering::SeqCst);
             let failed = res.is_err();
             match res {
                 Ok(Some(off)) if off.abs() > CLOCK_TOLERANCE.as_secs_f64() * 1e3 => {
