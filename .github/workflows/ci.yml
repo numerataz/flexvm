@@ -207,6 +207,11 @@ jobs:
           sudo python3 scripts/test-image.py --state "$RUNNER_TEMP/software-state" "$RUNNER_TEMP/software-systemd-image"
           sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --image "$RUNNER_TEMP/software-systemd-image" --workload scripts/compat/workloads/distro-systemd.sh --boot systemd --mem 1536 --timeout 900 --require storage.fuse --output "$RUNNER_TEMP/software-distro"
           cat "$RUNNER_TEMP/software-distro/report.json"
+      - name: OpenRC PID 1 and fresh-owner restore without virtualization devices
+        run: |
+          sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/openrc-image.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-openrc-image"
+          sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --image "$RUNNER_TEMP/software-openrc-image" --workload scripts/compat/workloads/distro-openrc.sh --boot openrc --mem 1536 --timeout 900 --require storage.fuse --output "$RUNNER_TEMP/software-openrc"
+          cat "$RUNNER_TEMP/software-openrc/report.json"
       - name: Unchanged KVM clients inside software FlexVM
         run: |
           sudo python3 scripts/compat/software-kvm.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --firecracker "$RUNNER_TEMP/software-state/artifacts/firecracker" --output "$RUNNER_TEMP/software-kvm"
@@ -221,6 +226,10 @@ jobs:
         with:
           name: software-execution-${{ matrix.arch }}
           path: |
+            ${{ runner.temp }}/software-openrc-image/fixture.json
+            ${{ runner.temp }}/software-openrc/*.json
+            ${{ runner.temp }}/software-openrc/*.log
+            ${{ runner.temp }}/software-openrc/*.strace
             ${{ runner.temp }}/software-distro/*.json
             ${{ runner.temp }}/software-distro/*.log
             ${{ runner.temp }}/software-distro/*.strace
