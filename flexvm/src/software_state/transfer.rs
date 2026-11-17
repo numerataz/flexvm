@@ -106,7 +106,7 @@ fn transition(state: &Path, offer: Offer, action: Action) -> Result<Status> {
             }
             let return_fence = return_fence(&dir, &offer, &source_key)?;
             if let Some(current) = previous.as_ref().filter(|previous| previous.status == Status::Committed) {
-                if !return_fence.as_ref().is_some_and(|fence| fence.generation > current.offer.generation) {
+                if return_fence.as_ref().is_none_or(|fence| fence.generation <= current.offer.generation) {
                     bail!("software transfer conflicts with the committed destination journal");
                 }
             }

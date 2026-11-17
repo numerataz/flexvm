@@ -71,7 +71,7 @@ impl<'a> Activation<'a> {
                     bail!("software activation is already bound to another offer or VM name");
                 }
                 floor = floor.max(previous.generation);
-            } else if !return_fence.as_ref().is_some_and(|fence| fence.generation > previous.generation) {
+            } else if return_fence.as_ref().is_none_or(|fence| fence.generation <= previous.generation) {
                 bail!("software activation cannot supersede the previous execution decision");
             }
         }
