@@ -1308,8 +1308,12 @@ fresh engine and owner process. A named distro's lifetime follows the OS,
 including `kill --signal TERM` to request power-off; it has no synthetic app
 session. The software backend's other documented lifecycle limits still apply.
 
-Full user sessions/rootless service integration and guest reboot
-semantics remain tracked in
+With ordinary `dbus-user-session` and `libpam-systemd` packages, systemd/logind
+can run a user manager and user D-Bus. The lifecycle tests use
+`loginctl enable-linger USER` and normal user units, preserving their process
+and bus identities and enforcing CPU, memory and PID limits across restores.
+
+Runtime-specific rootless service integration and guest reboot semantics remain tracked in
 [the distro boot issue](https://github.com/numerataz/flexvm/issues/1328).
 
 ## Docker inside a VM

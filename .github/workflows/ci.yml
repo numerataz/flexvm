@@ -207,6 +207,10 @@ jobs:
           sudo python3 scripts/test-image.py --state "$RUNNER_TEMP/software-state" "$RUNNER_TEMP/software-systemd-image"
           sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --image "$RUNNER_TEMP/software-systemd-image" --workload scripts/compat/workloads/distro-systemd.sh --boot systemd --mem 1536 --timeout 900 --require storage.fuse --output "$RUNNER_TEMP/software-distro"
           cat "$RUNNER_TEMP/software-distro/report.json"
+      - name: Delegated user services without virtualization devices
+        run: |
+          sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --image "$RUNNER_TEMP/software-systemd-image" --workload scripts/compat/workloads/user-sessions.sh --boot systemd --mem 2048 --timeout 900 --require storage.fuse --output "$RUNNER_TEMP/software-user-sessions"
+          cat "$RUNNER_TEMP/software-user-sessions/report.json"
       - name: OpenRC PID 1 and fresh-owner restore without virtualization devices
         run: |
           sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/openrc-image.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-openrc-image"
@@ -226,6 +230,9 @@ jobs:
         with:
           name: software-execution-${{ matrix.arch }}
           path: |
+            ${{ runner.temp }}/software-user-sessions/*.json
+            ${{ runner.temp }}/software-user-sessions/*.log
+            ${{ runner.temp }}/software-user-sessions/*.strace
             ${{ runner.temp }}/software-openrc-image/fixture.json
             ${{ runner.temp }}/software-openrc/*.json
             ${{ runner.temp }}/software-openrc/*.log

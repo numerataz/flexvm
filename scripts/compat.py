@@ -81,6 +81,7 @@ class Suite:
         self.workload = args.workload.read_text() if args.workload else None
         self.inode_probe = (ROOT / "scripts/compat/root-inodes.sh").read_text() if args.workload else None
         self.report = {"schema_version": 1, "vm": self.name, "image": None if args.vm else args.image,
+                       "boot_profile": None if args.vm else args.boot,
                        "status": "running", "phases": [], "cleanup_errors": []}
 
         if self.workload is not None:
@@ -97,11 +98,11 @@ class Suite:
     def start(self, probe):
         if not self.args.vm:
             self.source.call("pull", self.args.image, "--tag", self.image,
-                             "--vcpus", str(self.args.vcpus), "--max", str(self.args.memory_mib), timeout=600)
+                             "--boot", self.args.boot, "--vcpus", str(self.args.vcpus), "--max", str(self.args.memory_mib), timeout=600)
             self.pulled = True
             self.started = True
             self.source.call("run", "-d", "--name", self.name,
-                             "--entrypoint", '["sleep","infinity"]', self.image)
+                             *(["--entrypoint", '["sleep","infinity"]'] if self.args.boot == "app" else []), self.image)
         self.probe_attempted = True
         self.source.call("cp", str(probe), f"{self.name}:{self.probe}")
         if self.workload is not None:
@@ -219,6 +220,7 @@ def parse_args(argv=None):
     p.add_argument("--state", default=os.environ.get("FLEXVM_STATE_DIR"))
     p.add_argument("--run")
     p.add_argument("--image", default="ubuntu:24.04")
+    p.add_argument("--boot", choices=("app", "systemd", "openrc"), default="app", help="init profile for an owned VM")
     p.add_argument("--workload", type=Path, help="guest shell script: prepare/verify NONCE PHASE; runs only in an owned VM")
     p.add_argument("--vm", help="probe an existing VM without changing its lifecycle")
     p.add_argument("--case", dest="cases", action="append", choices=("capabilities", "namespaces"))
