@@ -356,7 +356,39 @@ pub(crate) fn offer(host: &Host, vm: &str, destination: &str) -> Result<serde_js
     Ok(serde_json::to_value(offer)?)
 }
 
-fn issue(state: &File, checkpoint: &File, offer: Offer, key: &Ed25519KeyPair, destination_key: &str) -> Result<Receipt> {
+/// The name lock and the software transfer lock are held by the caller. The
+/// native address loan outlives the stopped VM's address holder.
+fn lend_routed_address(host: &Host, vm: &str, network: RoutedNetwork, destination: &str) -> Result<()> {
+    let ip = network.address.v4;
+    if host.config_now().vm_addr(ip) != network.address {
+        bail!("software transfer routed address no longer matches the source network");
+    }
+    let lock = host.lock()?;
+    let address = host.addr(&lock, ip)?;
+    if address.holder.as_deref() != Some(vm)
+        || address.seen != network.generation
+        || address.held != network.generation
+        || !address.current(network.generation)
+        || address.holder_id.as_ref() == Some(&crate::host::Ident::me())
+        || Some(address.rev) != network.revision
+        || address.arriving.is_some()
+        || address.leaving.is_some()
+        || address.lent.is_some_and(|generation| generation != network.generation)
+    {
+        bail!("software transfer routed source no longer owns the exact address revision");
+    }
+    host.lend(&lock, ip, network.generation, 0, destination)?;
+    Ok(())
+}
+
+fn issue_with_host(
+    state: &File,
+    checkpoint: &File,
+    offer: Offer,
+    key: &Ed25519KeyPair,
+    destination_key: &str,
+    location: Option<(&Host, &str)>,
+) -> Result<Receipt> {
     if decode::<32>(destination_key, "destination public key")?.as_slice() == key.public_key().as_ref() {
         bail!("software transfer source and destination signing keys must differ");
     }
@@ -372,6 +404,9 @@ fn issue(state: &File, checkpoint: &File, offer: Offer, key: &Ed25519KeyPair, de
         || offer.generation < proposed_generation(checkpoint, manifest.owner_generation)?
     {
         bail!("transfer offer does not match the retired software checkpoint");
+    }
+    if offer.routed.is_some() && location.is_none() {
+        bail!("software routed retirement needs its source address owner");
     }
     let path = source_record(&offer.vm_id);
     let predecessor = bundle::activate::preceding_grant(state, &manifest)?;
@@ -426,6 +461,11 @@ fn issue(state: &File, checkpoint: &File, offer: Offer, key: &Ed25519KeyPair, de
             write_record(state, &path, &bytes, previous.is_some())?;
         }
     }
+    // No signed receipt escapes until both the software fence and network
+    // reservation are durable. An exact retry repairs an interrupted write.
+    if let (Some(network), Some((host, name))) = (fence.offer.routed, location) {
+        lend_routed_address(host, name, network, &fence.offer.destination_host)?;
+    }
     signed_receipt(fence.offer, key, RECEIPT_DOMAIN)
 }
 
@@ -454,7 +494,7 @@ pub(crate) fn retire(host: &Host, vm: &str, input: &Path, key_file: &Path, desti
     let _name = host.take_name(vm, true)?;
     let state = parent_directory(&host.state)?;
     let checkpoint = private_directory(&host.suspended(vm)?)?;
-    Ok(serde_json::to_value(issue(&state, &checkpoint, offer, &key, destination_key)?)?)
+    Ok(serde_json::to_value(issue_with_host(&state, &checkpoint, offer, &key, destination_key, Some((host, vm)))?)?)
 }
 
 pub(crate) fn acknowledge_abort(state: &Path, input: &Path, key_file: &Path) -> Result<serde_json::Value> {
@@ -591,6 +631,10 @@ mod tests {
     use super::*;
     use crate::test_util::TempDir;
 
+    fn issue(state: &File, checkpoint: &File, offer: Offer, key: &Ed25519KeyPair, destination_key: &str) -> Result<Receipt> {
+        issue_with_host(state, checkpoint, offer, key, destination_key, None)
+    }
+
     fn offer(state: &Path) -> Offer {
         Offer {
             vm_id: "11".repeat(16),
@@ -628,6 +672,42 @@ mod tests {
         assert!(successor.validate().is_err());
         successor.routed = None;
         assert!(!successor.follows_routed_network(&prior));
+    }
+
+    #[test]
+    fn routed_source_loan_reserves_only_the_exact_retired_claim() {
+        let tmp = TempDir::new("software-routed-loan");
+        let mut host = Host::open(&tmp.join("state"), &tmp.join("run")).unwrap();
+        host.configure(|config| {
+            config.vm_ips = "192.0.2.80-192.0.2.81".into();
+            Ok(())
+        })
+        .unwrap();
+        let name = host.take_name("source", false).unwrap();
+        let claim = {
+            let lock = host.lock().unwrap();
+            host.claim_new(&lock, &name.name, Some("192.0.2.80".parse().unwrap())).unwrap()
+        };
+        let network = RoutedNetwork { address: claim.ip.into(), generation: claim.gen, revision: Some(claim.rev) };
+        claim.keep();
+        let record = host.state.join("addrs").join(network.address.v4.to_string());
+        let mut address: crate::host::Addr = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+        assert!(lend_routed_address(&host, "source", network, "remote").is_err(), "an active owner cannot be retired by this process");
+        address.holder_id.as_mut().unwrap().start = 0;
+        fs::write(&record, serde_json::to_vec(&address).unwrap()).unwrap();
+
+        assert!(lend_routed_address(&host, "wrong-vm", network, "remote").is_err());
+        assert!(lend_routed_address(&host, "source", RoutedNetwork { revision: Some(9), ..network }, "remote").is_err());
+        assert_eq!(host.addr(&host.lock().unwrap(), network.address.v4).unwrap().lent, None);
+
+        lend_routed_address(&host, "source", network, "remote").unwrap();
+        lend_routed_address(&host, "source", network, "remote").unwrap();
+        let lock = host.lock().unwrap();
+        let lent = host.addr(&lock, network.address.v4).unwrap();
+        assert_eq!(lent.lent, Some(network.generation));
+        assert!(lent.leaving.is_none(), "stopped transfers use the software receipt for reconciliation");
+        host.release(&lock, network.address.v4, "source", None).unwrap();
+        assert!(host.claim_new(&lock, "another-vm", Some(network.address.v4)).is_err());
     }
 
     fn key(seed: u8) -> Ed25519KeyPair {
