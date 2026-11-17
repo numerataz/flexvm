@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 use crate::util::Result;
 use crate::{bail, util};
 
+pub(crate) mod transfer;
+
 const MAX_MANIFEST: u64 = 8 << 20;
 // Earlier writers did not take directory leases. Never sweep their names.
 const STAGING_PREFIX: &str = ".software-stage-v2-";
@@ -459,15 +461,18 @@ fn write_record(dir: &File, name: &str, bytes: &[u8], replace: bool) -> Result<(
 }
 
 pub fn host_id(state: &Path) -> Result<String> {
-    let dir = parent_directory(state)?;
-    if !present(&dir, ".software-host-id")? {
+    host_id_in(&parent_directory(state)?)
+}
+
+fn host_id_in(dir: &File) -> Result<String> {
+    if !present(dir, ".software-host-id")? {
         let id = util::random_hex(16)?;
-        match write_record(&dir, ".software-host-id", &serde_json::to_vec(&id)?, false) {
+        match write_record(dir, ".software-host-id", &serde_json::to_vec(&id)?, false) {
             Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists) => {}
             result => result?,
         }
     }
-    let id: String = record(&dir, ".software-host-id")?;
+    let id: String = record(dir, ".software-host-id")?;
     if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!("invalid software host identity");
     }

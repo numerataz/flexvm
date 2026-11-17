@@ -188,6 +188,30 @@ idempotently, and retain the source tombstone across owner/host restarts. Test
 every crash window, including retirement recorded before the source exits, and
 destination commit before its acknowledgment reaches the source.
 
+The destination journal uses `flexvm software-transfer`. The `id` command
+prints the destination host ID. An operator prepares a transfer with
+`prepare OFFER --source-key KEY`. The key is the source's 32-byte Ed25519 public
+key in standard padded base64. The offer is a JSON object with these fields in
+the order defined by the wire format:
+
+1. `vm_id`
+2. `source_host`
+3. `destination_host`
+4. `transfer_id`
+5. `manifest_sha256`
+6. `generation`
+
+The first four fields are 32 lowercase hexadecimal characters. The digest is
+64 lowercase hexadecimal characters and the generation is a positive integer.
+`commit RECEIPT` verifies a JSON object containing the original `offer` and a
+standard padded base64 `signature`. The Ed25519 message is the ASCII bytes
+`flexvm/software-retirement/v1`, one NUL, and the compact JSON offer serialized
+with the field order above. The public key and offer are pinned at preparation.
+A commit retry verifies the same receipt. `abort OFFER` permanently rejects
+that offer, and a replacement needs a higher generation and a different
+transfer ID. Command success records a destination decision. Guest execution
+requires the source issuer, artifact transport and restore integration.
+
 After load, use the guest agent to step CLOCK_REALTIME from the current host time.
 Do not reset CLOCK_MONOTONIC through the agent. Preserve the engine virtual clock
 and device timers through migration, and test nondecreasing monotonic time and

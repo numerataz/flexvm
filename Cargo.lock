@@ -156,6 +156,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "ring",
  "ruzstd",
  "serde",
  "serde_json",

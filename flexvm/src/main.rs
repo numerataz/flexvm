@@ -80,6 +80,13 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
       --checkpoint NAME|ID           start it from a stored checkpoint instead of IMAGE (its name and
                                      address unless --name and --ip IP|auto), or from a checkpoint
                                      directory (a path, with a '/'); --paused holds it until unpause
+  flexvm software-transfer id        show the local software host identity
+  flexvm software-transfer prepare OFFER --source-key KEY
+                                     record an incoming transfer and its base64 Ed25519 public key
+  flexvm software-transfer commit RECEIPT
+                                     verify source retirement and commit the destination journal
+  flexvm software-transfer abort OFFER
+                                     durably reject the prepared transfer
   flexvm software --kernel FILE [OPTIONS] IMAGE [CMD...]
                                      --kernel-sdk: matching native module build inputs;
                                      --kernel-modules FILE: custom runtime or SDK bundle
@@ -541,6 +548,7 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("rm", NAMES, &["force"]),
     ("volume", NAMES, &["size"]),
     ("checkpoint", NAMES, &["stop", "incremental", "quiet", "format", "filter", "force", "older-than", "output", "input", "name", "sha256"]),
+    ("software-transfer", 3, &["source-key"]),
     ("migrate", 3, &[]),
     ("reclaim", 2, &["force"]),
     ("listen", 2, &[]),
@@ -624,6 +632,13 @@ fn check_applies(args: &Args) -> Result<()> {
             };
             if !valid {
                 bail!("volume needs create NAME --size BYTES, inspect NAME|ID, ls, or rm NAME|ID");
+            }
+        }
+        "software-transfer" => {
+            let count = args.positional.len();
+            let key = args.has("source-key");
+            if !matches!((first.map(String::as_str), count, key), (Some("id"), 2, false) | (Some("prepare"), 3, true) | (Some("commit" | "abort"), 3, false)) {
+                bail!("software-transfer needs id, prepare OFFER --source-key KEY, commit RECEIPT or abort OFFER");
             }
         }
         "checkpoint" => {
@@ -777,6 +792,11 @@ fn real_main(args: &Args) -> Result<()> {
             }
         }
         Some("pull") => pull(args, name),
+        Some("software-transfer") => {
+            let path = state(args)?;
+            host::host_dir(&path, 0o755)?;
+            print(software_state::transfer::command(&path, name, Path::new(arg2.unwrap_or("")), args.get("source-key"))?)
+        }
         Some("software") => util::exit(software(args, name)?),
         Some("images") => images(&open_host(args)?, &paths(args)?, args),
         Some("tag") => print(template::tag(&paths(args)?, name, arg2.ok_or("tag needs SRC DST")?)?),
