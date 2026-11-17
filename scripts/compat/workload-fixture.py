@@ -16,6 +16,7 @@ import tempfile
 
 SOURCE = 'public.ecr.aws/docker/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662'
 PIN = SOURCE.split('@')[1]
+UBUNTU = 'docker.io/library/ubuntu@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8'
 TAG = 'docker.io/flexvm/busybox:compat'
 LIMIT = 64 << 20
 
@@ -43,7 +44,7 @@ def checked_blob(root, descriptor):
     return data
 
 
-def validate_cache(root, arch):
+def validate_cache(root, arch, source=SOURCE):
     if not stat.S_ISDIR(root.lstat().st_mode):
         raise ValueError('fixture cache must be a directory')
     total, count = 0, 0
@@ -56,7 +57,8 @@ def validate_cache(root, arch):
         if total > LIMIT or count > 128:
             raise ValueError('fixture cache exceeds its budget')
     upstream = (root / 'upstream-index.json').read_bytes()
-    if digest(upstream) != PIN:
+    pin = PIN if source == SOURCE else source.split('@')[1]
+    if digest(upstream) != pin:
         raise ValueError('fixture upstream index differs from the pinned digest')
     index = document(upstream)
     matches = [item for item in index['manifests'] if item.get('platform', {}).get('os') == 'linux'
@@ -81,8 +83,9 @@ def validate_cache(root, arch):
         raise ValueError('fixture OCI layout points at a different image')
     if local['manifests'][0]['size'] != selected['size']:
         raise ValueError('fixture OCI layout descriptor size differs')
-    return dict(source=SOURCE, architecture=arch, manifest_digest=selected['digest'],
-                config_digest=manifest['config']['digest'], diff_ids=diff_ids, tag=TAG)
+    return dict(source=source, architecture=arch, manifest_digest=selected['digest'],
+                config_digest=manifest['config']['digest'], diff_ids=diff_ids,
+                **({'tag': TAG} if source == SOURCE else {}))
 
 
 def validate_archive(path, identity):
@@ -147,7 +150,8 @@ def canonical_archive(source, target):
                 output.addfile(canonical, archive.extractfile(entry))
 
 
-def prepare(cache, output, arch):
+def prepare(cache, output, arch, source=SOURCE):
+    pin = PIN if source == SOURCE else source.split('@')[1]
     cache.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(cache.parent / (cache.name + '.lock'), os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, 'a') as lock:
@@ -155,15 +159,17 @@ def prepare(cache, output, arch):
         if not cache.exists():
             with tempfile.TemporaryDirectory(prefix='.' + cache.name + '-', dir=cache.parent) as temporary:
                 stage = Path(temporary) / 'oci'
-                upstream = subprocess.check_output(['skopeo', 'inspect', '--raw', 'docker://' + SOURCE], timeout=120)
-                if digest(upstream) != PIN:
+                upstream = subprocess.check_output(['skopeo', 'inspect', '--raw', 'docker://' + source], timeout=120)
+                if digest(upstream) != pin:
                     raise ValueError('downloaded fixture index differs from the pin')
                 subprocess.run(['skopeo', 'copy', '--preserve-digests', '--override-os', 'linux', '--override-arch', arch,
-                                'docker://' + SOURCE, f'oci:{stage}:fixture'], check=True, timeout=180)
+                                'docker://' + source, f'oci:{stage}:fixture'], check=True, timeout=180)
                 (stage / 'upstream-index.json').write_bytes(upstream)
-                validate_cache(stage, arch)
+                validate_cache(stage, arch, source)
                 stage.rename(cache)
-        identity = validate_cache(cache, arch)
+        identity = validate_cache(cache, arch, source)
+        if output is None:
+            return identity
         exported = cache / 'busybox.tar'
         if not exported.exists():
             temporary = cache / 'export.partial'
@@ -187,14 +193,18 @@ def prepare(cache, output, arch):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cache', type=Path, required=True)
-    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--output', type=Path, help='directory for the BusyBox Docker archive and metadata')
+    parser.add_argument('--ubuntu', action='store_true', help='prepare a verified Ubuntu OCI layout in the cache')
     parser.add_argument('--arch', choices=('amd64', 'arm64'),
                         default={'x86_64': 'amd64', 'aarch64': 'arm64'}.get(platform.machine()))
     args = parser.parse_args()
     if args.arch is None:
         parser.error('native x86_64 or aarch64 is required')
+    if args.ubuntu == (args.output is not None):
+        parser.error("choose --ubuntu for OCI or --output for the BusyBox archive")
     try:
-        print(json.dumps(prepare(args.cache.absolute(), args.output, args.arch), indent=2))
+        source = UBUNTU if args.ubuntu else SOURCE
+        print(json.dumps(prepare(args.cache.absolute(), args.output, args.arch, source), indent=2))
     except (OSError, ValueError, KeyError, TypeError, tarfile.TarError, subprocess.SubprocessError) as error:
         parser.exit(1, f'fixture preparation failed: {error}\n')
 

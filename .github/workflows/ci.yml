@@ -432,9 +432,30 @@ jobs:
         with:
           path: ${{ runner.temp }}/workload-fixture-cache
           key: ${{ steps.workload-fixture-cache.outputs.cache-primary-key }}
+      - name: Restore pinned Ubuntu workload image
+        if: matrix.workload == 'podman' || matrix.workload == 'namespace-sandboxes' || matrix.workload == 'containerd'
+        id: ubuntu-workload-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ubuntu-workload-oci
+          key: ubuntu-workload-v1-${{ runner.arch }}-${{ hashFiles('scripts/compat/workload-fixture.py') }}
+      - name: Verify pinned Ubuntu workload image
+        if: matrix.workload == 'podman' || matrix.workload == 'namespace-sandboxes' || matrix.workload == 'containerd'
+        run: |
+          if [[ ! -d "$RUNNER_TEMP/ubuntu-workload-oci" ]] && ! command -v skopeo >/dev/null; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q --no-install-recommends skopeo
+          fi
+          python3 scripts/compat/workload-fixture.py --ubuntu --cache "$RUNNER_TEMP/ubuntu-workload-oci"
+      - name: Save verified Ubuntu workload image
+        if: (matrix.workload == 'podman' || matrix.workload == 'namespace-sandboxes' || matrix.workload == 'containerd') && steps.ubuntu-workload-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ubuntu-workload-oci
+          key: ${{ steps.ubuntu-workload-cache.outputs.cache-primary-key }}
       - name: Guest workload and fresh-owner software restoration
         run: |
-          workload_args=()
+          workload_args=(--image "$RUNNER_TEMP/ubuntu-workload-oci")
           memory_limit=6G
           cpu_quota=200%
           workload_timeout=1800
@@ -765,6 +786,27 @@ jobs:
         with:
           path: ${{ runner.temp }}/workload-fixture-cache
           key: ${{ steps.workload-fixture-cache.outputs.cache-primary-key }}
+      - name: Restore pinned Ubuntu workload image
+        if: env.KVM == 'true'
+        id: ubuntu-workload-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ubuntu-workload-oci
+          key: ubuntu-workload-v1-${{ runner.arch }}-${{ hashFiles('scripts/compat/workload-fixture.py') }}
+      - name: Verify pinned Ubuntu workload image
+        if: env.KVM == 'true'
+        run: |
+          if [[ ! -d "$RUNNER_TEMP/ubuntu-workload-oci" ]] && ! command -v skopeo >/dev/null; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q --no-install-recommends skopeo
+          fi
+          python3 scripts/compat/workload-fixture.py --ubuntu --cache "$RUNNER_TEMP/ubuntu-workload-oci"
+      - name: Save verified Ubuntu workload image
+        if: (env.KVM == 'true') && steps.ubuntu-workload-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ubuntu-workload-oci
+          key: ${{ steps.ubuntu-workload-cache.outputs.cache-primary-key }}
       - name: End-to-end tests
         env:
           SHARD: ${{ matrix.shard }}
@@ -773,7 +815,7 @@ jobs:
           set -- $SHARD
           jobs=4; if [ "$1" = heavy ]; then jobs=1; fi
           kvm=--require-kvm; if [ "$KVM" != true ]; then kvm=--no-kvm; fi
-          sudo env FLEXVM_WORKLOAD_FIXTURE="$RUNNER_TEMP/workload-fixture" python3 -u scripts/e2e.py --shard "$1" ${2:+--split "$2"} --jobs "$jobs" --no-skips "$kvm" --image "$E2E_IMAGE" --image-cache "$RUNNER_TEMP/image-cache" --test-image "/var/lib/flexvm-test-image" --log-dir "$RUNNER_TEMP/e2e-logs"
+          sudo env FLEXVM_WORKLOAD_FIXTURE="$RUNNER_TEMP/workload-fixture" FLEXVM_COMPAT_APP_IMAGE="$RUNNER_TEMP/ubuntu-workload-oci" python3 -u scripts/e2e.py --shard "$1" ${2:+--split "$2"} --jobs "$jobs" --no-skips "$kvm" --image "$E2E_IMAGE" --image-cache "$RUNNER_TEMP/image-cache" --test-image "/var/lib/flexvm-test-image" --log-dir "$RUNNER_TEMP/e2e-logs"
       - name: Test image made
         id: test-image-made
         if: always() && steps.test-image-cache.outputs.cache-hit != 'true'
