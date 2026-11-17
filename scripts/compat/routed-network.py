@@ -87,6 +87,8 @@ def exercise(binary, kernel, output, root, engine, arch):
         original_route, = route(addr)
         tap = original_route['dev']
         assert tap.startswith('fsw'), original_route
+        unsynced_claim = root / "run" / "claims" / addr
+        assert unsynced_claim.is_file(), "the fresh claim should begin unsynced"
         assert route(addr6)[0]["dev"] == tap
         with socket.create_connection((addr, PORT), timeout=10) as tcp:
             tcp_echo(tcp, b'tcp-before')
@@ -94,6 +96,7 @@ def exercise(binary, kernel, output, root, engine, arch):
             udp_echo(addr6, b'udp6-before')
             call('stop', 'routed', timeout=120)
             assert source.wait(timeout=15) == 0
+            assert not unsynced_claim.exists(), "the checkpoint must preserve a durable address claim"
             removed(addr, addr6, tap)
             assert lookup('suspended', 'routed')['ip'] == addr
             result = sp.run([*cli, 'software-transfer', 'offer', 'routed', '11111111111111111111111111111111'], capture_output=True, text=True, timeout=20)
@@ -128,6 +131,7 @@ def exercise(binary, kernel, output, root, engine, arch):
             "tcp_socket_preserved": True,
             "udp_v4_v6_before_and_after": True,
             "address_held_while_stopped": True,
+            "address_claim_durable": True,
             "address_held_on_quarantined_restore": True,
             "peer_transfer_refused": True,
             "owner_signal": -resumed.returncode,
