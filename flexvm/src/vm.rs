@@ -273,6 +273,10 @@ impl Vm {
         self.fc.lock().unwrap().as_ref().map_or_else(|| "no firecracker".into(), Firecracker::post_mortem)
     }
 
+    pub fn distro_powered_off(&self) -> bool {
+        self.template.meta.image.as_ref().is_some_and(|image| !image.boot.is_app()) && self.fc.lock().unwrap().as_ref().is_some_and(Firecracker::powered_off)
+    }
+
     pub fn firecracker_log(&self) -> String {
         self.fc.lock().unwrap().as_ref().map(Firecracker::log_tail).unwrap_or_default()
     }
@@ -1016,7 +1020,11 @@ impl Vm {
 
     pub fn start_app(&self, settings: &str) -> Result<u32> {
         self.running_here()?;
-        crate::guest::start_app(&self.vsock, settings)
+        let pid = crate::guest::start_app(&self.vsock, settings)?;
+        if self.template.meta.image.as_ref().is_some_and(|image| !image.boot.is_app()) {
+            crate::guest::wait_distro_ready(&self.vsock, Duration::from_secs(120))?;
+        }
+        Ok(pid)
     }
 
     pub fn signal_app(&self, sig: i32) -> Result<()> {

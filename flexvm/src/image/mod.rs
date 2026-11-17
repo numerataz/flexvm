@@ -51,6 +51,34 @@ pub fn runs_on(arch: &str, platform: &str) -> bool {
     parts.next().is_none() && (a.is_none() && os == Some("linux") || source::platform_rank(arch, os, a, variant).is_some())
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BootProfile {
+    #[default]
+    App,
+    Systemd,
+    Openrc,
+}
+
+impl BootProfile {
+    pub fn is_app(&self) -> bool {
+        *self == Self::App
+    }
+}
+
+impl std::str::FromStr for BootProfile {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "app" => Ok(Self::App),
+            "systemd" => Ok(Self::Systemd),
+            "openrc" => Ok(Self::Openrc),
+            _ => Err(format!("unknown boot profile {value:?}: use app, systemd or openrc")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageMeta {
     pub source: String,
@@ -61,6 +89,10 @@ pub struct ImageMeta {
     pub argv: Vec<String>,
     /// Started before the snapshot (true) or on every `run` (false).
     pub warm: bool,
+    /// App snapshots retain their old metadata shape; distro snapshots stop
+    /// before init so each cold run can receive its own identity and settings.
+    #[serde(default, skip_serializing_if = "BootProfile::is_app")]
+    pub boot: BootProfile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_modules: Option<KernelModules>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -84,7 +116,7 @@ impl ImageMeta {
 
     /// Started at `run` (not before the snapshot, as `--warm` does).
     pub fn starts_at_run(&self) -> bool {
-        self.has_app() && !self.warm
+        (self.has_app() || !self.boot.is_app()) && !self.warm
     }
 }
 
@@ -101,6 +133,8 @@ pub struct Options {
     /// Not in the key: the same image by another name is the same image.
     #[serde(skip)]
     pub image: String,
+    #[serde(skip_serializing_if = "BootProfile::is_app")]
+    pub boot: BootProfile,
     pub entrypoint: Option<Vec<String>>,
     pub cmd: Option<Vec<String>>,
     pub env: Vec<String>,
@@ -127,6 +161,7 @@ pub fn parse_argv(s: &str) -> Result<Vec<String>> {
 }
 
 struct App {
+    boot: BootProfile,
     argv: Vec<String>,
     env: Vec<String>,
     workdir: String,
@@ -153,7 +188,19 @@ fn app_config(config: &Value, o: &Options) -> Result<App> {
         (None, None) => strings(&c["Cmd"]),
     };
     // None: no app; its VMs idle until told what to run (`exec`, `run -- CMD`).
-    let argv: Vec<String> = entrypoint.into_iter().chain(cmd).collect();
+    let argv: Vec<String> = if o.boot.is_app() {
+        entrypoint.into_iter().chain(cmd).collect()
+    } else {
+        if o.entrypoint.is_some() || o.cmd.is_some() || o.user.is_some() || o.workdir.is_some() {
+            bail!("distro boot uses its real init as root from /; entrypoint, cmd, user and workdir select app mode behavior");
+        }
+        vec![match o.boot {
+            BootProfile::Systemd => "/sbin/init",
+            BootProfile::Openrc => "/sbin/openrc-init",
+            BootProfile::App => unreachable!(),
+        }
+        .into()]
+    };
     let mut env = strings(&c["Env"]);
     for kv in &o.env {
         crate::app::validate_env(kv)?;
@@ -176,10 +223,15 @@ fn app_config(config: &Value, o: &Options) -> Result<App> {
         }
     }
     Ok(App {
+        boot: o.boot,
         argv,
         env,
-        workdir: o.workdir.clone().or_else(|| c["WorkingDir"].as_str().map(String::from)).filter(|w| !w.is_empty()).unwrap_or("/".into()),
-        user: o.user.clone().or_else(|| c["User"].as_str().map(String::from)).unwrap_or_default(),
+        workdir: if o.boot.is_app() {
+            o.workdir.clone().or_else(|| c["WorkingDir"].as_str().map(String::from)).filter(|w| !w.is_empty()).unwrap_or("/".into())
+        } else {
+            "/".into()
+        },
+        user: if o.boot.is_app() { o.user.clone().or_else(|| c["User"].as_str().map(String::from)).unwrap_or_default() } else { "0".into() },
         ports,
         volumes,
     })
@@ -188,6 +240,9 @@ fn app_config(config: &Value, o: &Options) -> Result<App> {
 /// `init` is flexvm-init's path, or the one built into flexvm (`artifacts::INIT`) for `None`.
 /// The root filesystem comes reserved (`Cached::reserved`): hold it until the template is published.
 pub fn prepare(cache: &Path, init: Option<&Path>, o: &Options, modules: Option<&KernelBundle>) -> Result<(PathBuf, ImageMeta, Flock, crate::host::HeldLock)> {
+    if !o.boot.is_app() && o.warm {
+        bail!("distro init boots cold per VM; --warm would clone initialized service identity");
+    }
     if let Some(bundle) = modules {
         bundle.unchanged()?;
     }
@@ -241,6 +296,7 @@ pub fn prepare(cache: &Path, init: Option<&Path>, o: &Options, modules: Option<&
         bundle.unchanged()?;
     }
     let meta = ImageMeta {
+        boot: o.boot,
         kernel_modules: modules.map(KernelBundle::identity),
         source: o.image.clone(),
         digest: img.digest,
@@ -1034,6 +1090,15 @@ pub fn escape(s: &str) -> String {
 }
 
 fn inject(root: &mut Root, app: &App, init: &[u8]) -> Result<String> {
+    if !app.boot.is_app() {
+        let path = app.argv.first().ok_or("distro image has no init path")?;
+        if !root.executable(path) {
+            bail!("distro boot requires executable {path} in the image; install its init/service-manager packages first");
+        }
+        if app.boot == BootProfile::Systemd {
+            inject_systemd(root)?;
+        }
+    }
     for (dir, mode) in [("proc", 0o555), ("sys", 0o555), ("dev", 0o755), ("run", 0o755), ("tmp", 0o1777), ("mnt", 0o755), ("root", 0o700), ("sbin", 0o755)] {
         root.ensure_dir(dir, mode)?;
     }
@@ -1058,6 +1123,11 @@ fn inject(root: &mut Root, app: &App, init: &[u8]) -> Result<String> {
         }
     }
     let mut conf: String = app.argv.iter().map(|a| format!("arg {}\n", escape(a))).chain(env.iter().map(|e| format!("env {}\n", escape(e)))).collect();
+    match app.boot {
+        BootProfile::App => {}
+        BootProfile::Systemd => conf += "boot systemd\n",
+        BootProfile::Openrc => conf += "boot openrc\n",
+    }
     conf += &format!("cwd {}\nuid {uid}\ngid {gid}\n", escape(&app.workdir));
     conf += &format!("groups {}\n", groups.iter().map(|g| g.to_string()).collect::<Vec<_>>().join(" "));
     for path in &app.volumes {
@@ -1066,6 +1136,39 @@ fn inject(root: &mut Root, app: &App, init: &[u8]) -> Result<String> {
     root.secure_dir("etc/flexvm", 0o755)?;
     root.write_file("etc/flexvm/app.conf", conf.as_bytes(), 0o644)?;
     Ok(conf)
+}
+
+fn inject_systemd(root: &mut Root) -> Result<()> {
+    root.secure_dir("etc/systemd/system", 0o755)?;
+    root.secure_dir("etc/systemd/system/multi-user.target.wants", 0o755)?;
+    root.write_file(
+        "etc/systemd/system/flexvm-runtime.service",
+        br#"[Unit]
+Description=FlexVM workload delegation
+After=local-fs.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=notify
+ExecStart=/sbin/flexvm-init --distro-runtime
+Delegate=yes
+KillMode=control-group
+Restart=always
+RestartSec=250ms
+
+[Install]
+WantedBy=multi-user.target
+"#,
+        0o644,
+    )?;
+    root.write_symlink("etc/systemd/system/multi-user.target.wants/flexvm-runtime.service", "../flexvm-runtime.service")?;
+    // The management agent already configures eth0 before init. Other links
+    // remain available to the distro's normal network managers.
+    root.secure_dir("etc/systemd/network", 0o755)?;
+    root.write_file("etc/systemd/network/00-flexvm-eth0.link", b"[Match]\nOriginalName=eth0\n[Link]\nNamePolicy=\nName=eth0\n", 0o644)?;
+    root.write_file("etc/systemd/network/00-flexvm-eth0.network", b"[Match]\nName=eth0\n[Link]\nUnmanaged=yes\n", 0o644)?;
+    root.secure_dir("etc/NetworkManager/conf.d", 0o755)?;
+    root.write_file("etc/NetworkManager/conf.d/10-flexvm-eth0.conf", b"[keyfile]\nunmanaged-devices=interface-name:eth0\n", 0o644)
 }
 
 /// Resolves an image `User` against the image's own /etc/passwd and /etc/group.
@@ -1253,6 +1356,22 @@ mod tests {
     }
 
     #[test]
+    fn legacy_image_metadata_keeps_app_boot_and_cache_shape() {
+        let old = json!({"source":"x", "digest":"d", "config_digest":"c", "app_conf":"", "argv":[], "warm":false});
+        let mut meta: ImageMeta = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(meta.boot, BootProfile::App);
+        assert!(!meta.starts_at_run());
+        assert!(serde_json::to_value(&meta).unwrap().get("boot").is_none());
+        assert!(serde_json::to_value(Options::default()).unwrap().get("boot").is_none());
+        meta.boot = BootProfile::Systemd;
+        assert!(meta.starts_at_run());
+        assert_eq!(serde_json::to_value(&meta).unwrap()["boot"], "systemd");
+        let mut unknown = old;
+        unknown["boot"] = json!("unrecognized");
+        assert!(serde_json::from_value::<ImageMeta>(unknown).is_err());
+    }
+
+    #[test]
     fn warm_readiness_requires_a_running_app_before_the_deadline() {
         use std::io::{BufRead, BufReader};
         use std::os::unix::net::UnixListener;
@@ -1267,6 +1386,7 @@ mod tests {
             let path = dir.join("vsock");
             let listener = UnixListener::bind(&path).unwrap();
             let meta = ImageMeta {
+                boot: crate::image::BootProfile::App,
                 kernel_modules: None,
                 source: String::new(),
                 digest: String::new(),
@@ -1338,6 +1458,7 @@ mod tests {
                 let listener = UnixListener::bind(&path).unwrap();
                 let stopped = AtomicBool::new(false);
                 let meta = ImageMeta {
+                    boot: crate::image::BootProfile::App,
                     kernel_modules: None,
                     source: String::new(),
                     digest: String::new(),

@@ -2359,6 +2359,9 @@ impl Proc {
         let mut w = &c;
         let vm = self.vm();
         let input = req["op"] == "stdin";
+        if vm.template.meta.image.as_ref().is_some_and(|image| !image.boot.is_app()) {
+            return drop(send_json(&mut w, &json!({"ok": false, "error": format!("distro PID 1 has no app terminal; use flexvm exec -it {} sh", vm.name)})));
+        }
         if !self.spec.lock().unwrap().has_app(vm.template.meta.image.as_ref()) {
             let e = format!("vm {} has no app to attach to (its image has no entrypoint or command); flexvm exec -it {} sh", vm.name, vm.name);
             return drop(send_json(&mut w, &json!({"ok": false, "error": e})));
@@ -2478,6 +2481,11 @@ impl Proc {
     /// Death's end: why goes in `RUN/vms/NAME.failed`, exit 124.
     pub fn end_died(&self, op: &Op, last: Option<(&mut dyn std::io::Write, Value)>) -> ! {
         let vm = self.vm();
+        if vm.pager.failed().is_none() && vm.distro_powered_off() {
+            crate::log!("vm {}: guest powered off", vm.name);
+            *self.exiting.lock().unwrap() = Some(0);
+            self.finish(op, End::Gone, 0, last)
+        }
         let why = format!("{}; {}", vm.pager.failed().unwrap_or("its firecracker exited"), vm.post_mortem());
         crate::log!("vm {}: died: {why}", vm.name);
         crate::util::log_long(&format!("vm {}: its firecracker's log, to its end:", vm.name), &vm.firecracker_log());

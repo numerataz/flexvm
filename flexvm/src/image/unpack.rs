@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -809,6 +810,20 @@ impl Root {
 
     pub fn is_file(&mut self, rel: &str) -> bool {
         self.at(Path::new(rel), false).is_ok_and(|at| is_type(at.dir.as_raw_fd(), &at.name, libc::S_IFREG))
+    }
+
+    pub fn executable(&self, rel: &str) -> bool {
+        self.openat2(rel.trim_start_matches('/').as_bytes(), libc::O_PATH)
+            .is_ok_and(|fd| File::from(fd).metadata().is_ok_and(|meta| meta.is_file() && meta.mode() & 0o111 != 0))
+    }
+
+    pub fn write_symlink(&mut self, rel: &str, target: &str) -> Result<()> {
+        let at = self.at(Path::new(rel), true)?;
+        if stat_at(at.dir.as_raw_fd(), &at.name).is_some() {
+            unlink_at(at.dir.as_raw_fd(), &at.name)?;
+        }
+        let target = CString::new(target)?;
+        self.create(|| check(unsafe { libc::symlinkat(target.as_ptr(), at.dir.as_raw_fd(), at.name.as_ptr()) }, "symlink", Path::new(rel)))
     }
 
     /// At most 1 MiB of a regular file; anything else (a FIFO, a device) is never opened.

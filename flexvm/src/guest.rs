@@ -462,6 +462,22 @@ pub fn start_app(uds: &Path, settings: &str) -> Result<u32> {
     app_started(&reply, !settings.is_empty())
 }
 
+pub fn wait_distro_ready(uds: &Path, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now().checked_add(timeout).ok_or("distro boot timeout is too large")?;
+    loop {
+        crate::template::interrupted()?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("distro PID 1 did not register its runtime service before the boot deadline");
+        }
+        match message(uds, "APPSTATUS", remaining.min(TIMEOUT))?.as_str() {
+            "running 1" => return Ok(()),
+            "starting 1" => std::thread::sleep(remaining.min(Duration::from_millis(50))),
+            other => bail!("distro PID 1 failed to start: {other}"),
+        }
+    }
+}
+
 /// `ok <pid>`, and ` applied` or ` ignored` if settings were sent: an older agent starts the image's app as is.
 fn app_started(reply: &str, settings: bool) -> Result<u32> {
     let Some(rest) = reply.strip_prefix("ok ") else { bail!("starting the app: {}", reply.trim_start_matches("error: ")) };

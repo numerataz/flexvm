@@ -25,11 +25,22 @@ use crate::input::{feed, Stdin};
 use crate::proto::{FRAME_ACK, FRAME_LOST, FRAME_NOTE};
 use crate::session::{cannot_run, Output, DRAIN};
 use crate::user::resolve_user;
-use crate::{fail, kill_running, mem, msg, spawn_watched, wait_exit, write_frame, Statuses, FRAME_STDOUT};
+use crate::{fail, kill_running, mem, msg, os, spawn_watched, wait_exit, write_frame, Statuses, FRAME_STDOUT};
 
 const CONF: &str = "/etc/flexvm/app.conf";
 static CONFIG: LazyLock<io::Result<Conf>> = LazyLock::new(|| read_conf(CONF));
 const RING_BYTES: usize = 1 << 20;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BootProfile {
+    App,
+    Systemd,
+    Openrc,
+}
+
+pub(crate) fn boot_profile() -> io::Result<BootProfile> {
+    Ok(config()?.boot)
+}
 
 /// Capture the image's configuration before serving requests or starting any app process.
 pub fn init() {
@@ -97,6 +108,7 @@ pub fn handle(verb: &str, arg: &str, out: &File, statuses: &Statuses) -> io::Res
     }
     let reply = match verb {
         "APP" => start(arg, statuses),
+        "APPSTATUS" if crate::distro::is_broker() => Ok(crate::distro::status()),
         "APPSTATUS" => Ok(APP.lock().unwrap().status()),
         "CHECK" => check(arg, statuses),
         "SIGNAL" => signal(arg, statuses),
@@ -123,6 +135,7 @@ pub fn handle(verb: &str, arg: &str, out: &File, statuses: &Statuses) -> io::Res
 
 #[derive(Clone)]
 pub(crate) struct Conf {
+    boot: BootProfile,
     argv: Vec<String>,
     env: Vec<(String, String)>,
     cwd: String,
@@ -149,12 +162,21 @@ fn unescape(s: &str) -> String {
 }
 
 fn parse_conf(text: &str) -> io::Result<Conf> {
-    let mut c = Conf { argv: vec![], env: vec![], cwd: "/".into(), uid: 0, gid: 0, groups: vec![], volumes: vec![], stdin: false, tty: false };
+    let mut c =
+        Conf { boot: BootProfile::App, argv: vec![], env: vec![], cwd: "/".into(), uid: 0, gid: 0, groups: vec![], volumes: vec![], stdin: false, tty: false };
     let num = |v: &str| v.trim().parse::<u32>().map_err(|_| io::Error::other(format!("{CONF}: bad id {v:?}")));
     // Only LF delimits records; str::lines() also removes a value's trailing CR.
     for line in text.split('\n') {
         let (k, v) = line.split_once(' ').unwrap_or((line, ""));
         match k {
+            "boot" => {
+                c.boot = match v {
+                    "app" => BootProfile::App,
+                    "systemd" => BootProfile::Systemd,
+                    "openrc" => BootProfile::Openrc,
+                    _ => return Err(io::Error::other(format!("{CONF}: unknown boot profile {v:?}"))),
+                };
+            }
             "arg" => c.argv.push(unescape(v)),
             "env" => {
                 let kv = unescape(v);
@@ -235,8 +257,10 @@ pub(crate) fn exec_command(e: &crate::proto::Exec) -> io::Result<(Command, Conf)
     };
     // Only `-u` needs them (the image's user was resolved at pull), through links as pull reads them. One
     // there but unreadable (a dangling link too) fails the exec: read as empty, a numeric user's group would become 0.
-    let read = |p: &str| match e.user.as_ref().map(|_| crate::read_etc(p.as_ref(), 0)) {
-        Some(Err(err)) if err.kind() != io::ErrorKind::NotFound || std::fs::symlink_metadata(p).is_ok() => {
+    let read = |p: &str| match e.user.as_ref().map(|_| crate::runtime::root_file(p, (libc::O_NONBLOCK | libc::O_NOCTTY) as u64).and_then(crate::read_etc_file))
+    {
+        Some(Err(err)) if err.kind() == io::ErrorKind::WouldBlock => Err(err),
+        Some(Err(err)) if err.kind() != io::ErrorKind::NotFound || crate::runtime::root_file(p, (libc::O_PATH | libc::O_NOFOLLOW) as u64).is_ok() => {
             Err(cannot_run(126, format!("cannot read {p}: {err}")))
         }
         got => Ok(got.and_then(Result::ok).map(|(text, _)| text).unwrap_or_default()),
@@ -383,8 +407,12 @@ fn exec_conf(mut c: Conf, e: &crate::proto::Exec, passwd: &str, group: &str) -> 
     if e.tty {
         terminal_env(&mut c);
     }
-    if !std::fs::metadata(&c.cwd).is_ok_and(|m| m.is_dir()) {
-        let why = std::fs::metadata(&c.cwd).map_or_else(|e| e.to_string(), |_| "not a directory".into());
+    let cwd = crate::runtime::root_file(&c.cwd, libc::O_PATH as u64).and_then(|file| file.metadata());
+    if cwd.as_ref().is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock) {
+        return Err(cwd.unwrap_err());
+    }
+    if !cwd.as_ref().is_ok_and(|m| m.is_dir()) {
+        let why = cwd.map_or_else(|e| e.to_string(), |_| "not a directory".into());
         return Err(cannot_run(126, format!("cannot change to directory {}: {why}", c.cwd)));
     }
     Ok(c)
@@ -401,7 +429,7 @@ fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
     let c = config()?;
     let mut cg = match CheckGroup::new() {
         Ok(g) => Some(g),
-        Err(_) if c.uid == 0 => None,
+        Err(_) if c.uid == 0 && !crate::distro::is_broker() => None,
         Err(e) => return Err(io::Error::other(format!("cannot contain a non-root readiness check: {e}"))),
     };
     let mut cmd = command(c, &["/bin/sh", "-c", &String::from_utf8_lossy(&bytes)]);
@@ -410,12 +438,18 @@ fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
         Some(g) => mem::enter(&mut cmd, g.procs.clone(), true),
         None => mem::work_procs().into_iter().for_each(|work| mem::enter(&mut cmd, work, false)),
     }
-    crate::runtime::enter(&mut cmd)?;
+    match cg.as_ref().and_then(|group| group.context.as_ref()) {
+        Some(context) => crate::runtime::enter_check(&mut cmd, context)?,
+        None => crate::runtime::enter(&mut cmd)?,
+    }
     if c.uid != 0 {
         confine_check(&mut cmd);
     }
     credentials(&mut cmd, c, true);
-    let (child, _, token) = spawn_watched(&mut cmd, statuses, false).map_err(|e| io::Error::new(e.kind(), format!("cannot run /bin/sh: {e}")))?;
+    let (child, _, token) = spawn_watched(&mut cmd, statuses, false).map_err(|e| {
+        let hint = if crate::distro::is_broker() && e.kind() == io::ErrorKind::WouldBlock { crate::proto::TRY_AGAIN } else { "" };
+        io::Error::new(e.kind(), format!("cannot run /bin/sh: {e}{hint}"))
+    })?;
     let pid = child.id() as i32;
     let code = wait_exit(statuses, token, Some(deadline));
     // Kill whatever is left, the leader included if it timed out. Without a cgroup only its session
@@ -474,6 +508,7 @@ struct CheckGroup {
     done: bool,
     /// `cleanup` ran (and failed): the drop does not wait out its tasks again, past the host's deadline.
     tried: bool,
+    context: Option<Arc<crate::runtime::DistroContext>>,
 }
 
 impl CheckGroup {
@@ -484,15 +519,27 @@ impl CheckGroup {
             crate::mount("cgroup2", mem::CGROUP_ROOT, "cgroup2", 0, "")?;
         }
         // Under the guest's memory mark, like the app (see mem.rs).
-        let parent = if mem::work_procs().is_some() { mem::CGROUP } else { mem::CGROUP_ROOT };
+        let context = crate::runtime::distro_context()?;
+        let parent = context
+            .as_ref()
+            .map(|context| context.check_parent())
+            .unwrap_or_else(|| if mem::work_procs().is_some() { mem::CGROUP } else { mem::CGROUP_ROOT }.to_string());
         let dir = format!("{parent}/flexvm-check-{}", NEXT.fetch_add(1, Ordering::Relaxed));
         {
             let mut live = CHECK_GROUPS.lock().unwrap();
-            sweep_check_groups(parent, &live);
-            std::fs::create_dir(&dir).map_err(|e| io::Error::other(format!("create {dir}: {e}")))?;
+            sweep_check_groups(&parent, &live);
+            std::fs::create_dir(&dir).map_err(|e| {
+                if context.is_some() && matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENODEV)) {
+                    io::Error::new(io::ErrorKind::WouldBlock, format!("distro runtime changed before check{}", crate::proto::TRY_AGAIN))
+                } else {
+                    io::Error::other(format!("create {dir}: {e}"))
+                }
+            })?;
             live.push(dir.clone());
         }
-        Self::from_dir(dir)
+        let mut group = Self::from_dir(dir)?;
+        group.context = context;
+        Ok(group)
     }
 
     /// Done: removed, or left for a sweep.
@@ -502,7 +549,7 @@ impl CheckGroup {
     }
 
     fn from_dir(dir: String) -> io::Result<CheckGroup> {
-        let mut g = CheckGroup { procs: CString::new(format!("{dir}/cgroup.procs")).unwrap(), dir, done: false, tried: false };
+        let mut g = CheckGroup { procs: CString::new(format!("{dir}/cgroup.procs")).unwrap(), dir, done: false, tried: false, context: None };
         // Needs cgroup.kill (Linux 5.14) to kill every task at once.
         if !std::path::Path::new(&format!("{}/cgroup.kill", g.dir)).exists() {
             g.finished();
@@ -514,6 +561,16 @@ impl CheckGroup {
 
     /// Done only once the group is removed: until then the drop tries again.
     fn cleanup(&mut self) -> io::Result<()> {
+        match self.cleanup_present() {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.finished();
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    fn cleanup_present(&mut self) -> io::Result<()> {
         self.tried = true;
         std::fs::write(format!("{}/cgroup.kill", self.dir), "1")?;
         // Reading through the polled fd rearms its POLLPRI, so a change after the read still wakes the poll.
@@ -609,6 +666,17 @@ fn start(settings: &str, statuses: &Statuses) -> io::Result<String> {
     }
     let settings = unhex(settings.trim()).ok_or_else(|| io::Error::other("bad app settings encoding"))?;
     let c = &mut with_settings(config()?, &String::from_utf8_lossy(&settings))?;
+    if crate::distro::is_broker() {
+        if c.stdin || c.tty || c.uid != 0 || c.argv != config()?.argv {
+            return Err(io::Error::other("distro init requires root, its configured init command and no app stdin/pty"));
+        }
+        let environment: String = c.env.iter().map(|(key, value)| format!("env {}\n", escape_conf(&format!("{key}={value}")))).collect();
+        *RUN.lock().unwrap() = Some(c.clone());
+        crate::distro::release(&environment)?;
+        app.state = State::Running(1);
+        app.push(FRAME_NOTE, b"flexvm-init: released distro PID 1\n");
+        return Ok(format!("ok 1{}", if settings.is_empty() { "" } else { " applied" }));
+    }
     if c.argv.is_empty() {
         return Err(io::Error::other("the image has no entrypoint or command: there is no app"));
     }
@@ -660,7 +728,21 @@ fn launch(app: &mut App, cmd: &mut Command, statuses: &Statuses, pty: Option<Fil
 
 /// `kill -s SIGNAL NAME`: to the app's process (not its group), while it runs.
 fn signal(arg: &str, statuses: &Statuses) -> io::Result<String> {
+    if crate::distro::is_broker() {
+        let signal: i32 = arg.trim().parse().map_err(|_| io::Error::other("invalid distro signal"))?;
+        let signal = if signal == libc::SIGTERM && boot_profile()? == BootProfile::Systemd { libc::SIGRTMIN() + 4 } else { signal };
+        os(unsafe { libc::kill(1, signal) })?;
+        return Ok("ok".into());
+    }
     signal_app(&APP.lock().unwrap(), arg, statuses)
+}
+
+fn escape_conf(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\n', "\\n")
+}
+
+pub(crate) fn distro_environment(text: &str) -> io::Result<Vec<(String, String)>> {
+    Ok(parse_conf(text)?.env)
 }
 
 fn signal_app(app: &App, arg: &str, statuses: &Statuses) -> io::Result<String> {

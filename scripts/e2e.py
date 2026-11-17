@@ -2551,6 +2551,167 @@ def namespace_sandboxes():
 
 @case
 @needs_kvm
+def distro_bad_init():
+    """Report an init exec failure promptly, without waiting for a service that cannot start."""
+    import io
+    layout = os.path.join(WORK, "distro-bad-init")
+    blobs = os.path.join(layout, "blobs", "sha256")
+    os.makedirs(blobs)
+    for name in os.listdir(os.path.join(TEST_IMAGE, "blobs", "sha256")):
+        os.link(os.path.join(TEST_IMAGE, "blobs", "sha256", name), os.path.join(blobs, name))
+
+    def blob(data, media):
+        digest = hashlib.sha256(data).hexdigest()
+        path = os.path.join(blobs, digest)
+        if not os.path.exists(path):
+            with open(path, "wb") as file:
+                file.write(data)
+        return {"mediaType": media, "digest": "sha256:" + digest, "size": len(data)}
+
+    def read(desc):
+        return json.load(open(os.path.join(blobs, desc["digest"].removeprefix("sha256:"))))
+
+    manifest = read(json.load(open(os.path.join(TEST_IMAGE, "index.json")))["manifests"][0])
+    config = read(manifest["config"])
+    data = io.BytesIO()
+    with tarfile.open(fileobj=data, mode="w") as archive:
+        script = b"#!/no/such/flexvm-init-interpreter\n"
+        entry = tarfile.TarInfo("usr/sbin/init")
+        entry.mode, entry.size = 0o755, len(script)
+        archive.addfile(entry, io.BytesIO(script))
+    layer = blob(data.getvalue(), "application/vnd.oci.image.layer.v1.tar")
+    config["rootfs"]["diff_ids"].append(layer["digest"])
+    manifest["layers"].append(layer)
+    manifest["config"] = blob(json.dumps(config).encode(), manifest["config"]["mediaType"])
+    desc = blob(json.dumps(manifest).encode(), manifest["mediaType"])
+    with open(os.path.join(layout, "index.json"), "w") as file:
+        json.dump({"schemaVersion": 2, "manifests": [desc]}, file)
+    with open(os.path.join(layout, "oci-layout"), "w") as file:
+        json.dump({"imageLayoutVersion": "1.0.0"}, file)
+    started = time.monotonic()
+    result = A.cli("pull", "--boot", "systemd", "--tag", "ci-bad-systemd", "--vcpus", "2", "--max", "2048", layout, check=False, timeout=40)
+    check("distro: failed init is diagnosed", result.returncode != 0 and "distro init exec failed" in result.stderr, (result.stdout, result.stderr))
+    check("distro: failed init does not wait out readiness", time.monotonic() - started < 30)
+
+
+@case
+@needs_kvm
+def distro_pressure():
+    """Keep real distro init responsive when the host refuses more workload RAM."""
+    tag = "ci-systemd-pressure"
+    A.cli("pull", "--boot", "systemd", "--tag", tag, "--vcpus", "2", "--max", "2048", TEST_IMAGE, timeout=600)
+    faults(template=tag, scenarios="mem_high")
+
+
+@case
+@needs_kvm
+def distro_systemd():
+    """Real PID 1 and delegated services keep their identity across all VM lifecycle operations."""
+    vm, clone, tag, host = "e2e-distro", "e2e-distro-clone", "ci-systemd", A
+    A.cli("pull", "--boot", "systemd", "--tag", tag, "--vcpus", "2", "--max", "2048", TEST_IMAGE, timeout=600)
+    A.run(vm, template=tag)
+    previous = None
+    try:
+        def execute(command, check_code=True):
+            result = host.exec(vm, command, timeout=60)
+            if check_code:
+                check("distro exec", result[0] == 0, result)
+            return result
+
+        def identity():
+            code = ('import json,os,pathlib; p=pathlib.Path; '
+                    'print(json.dumps(dict(init=p("/proc/1/comm").read_text().strip(), executable=os.readlink("/proc/1/exe"), '
+                    'start=p("/proc/1/stat").read_text().rsplit(")",1)[1].split()[19], '
+                    'machine=p("/etc/machine-id").read_text().strip())))')
+            return json.loads(execute("python3 -c " + shlex.quote(code))[1])
+
+        original = identity()
+        check("distro: real systemd PID 1", original["init"] == "systemd" and original["executable"].endswith("/systemd"), original)
+        A.run(clone, template=tag)
+        other = A.exec(clone, "cat /etc/machine-id")[1].strip()
+        check("distro: fresh clone machine identity", len(other) == 32 and other != original["machine"], (original, other))
+        A.kill(clone)
+        execute("systemctl is-system-running --wait")
+        code = ('import json,os,pathlib,secrets,time\n'
+                'cookie=secrets.token_hex(16); counter=0\n'
+                'pathlib.Path("/tmp/flexvm-distro-private").write_text(cookie)\n'
+                'while True:\n'
+                ' counter+=1\n'
+                ' value=dict(cookie=cookie,counter=counter,pid=os.getpid(),'
+                'start=pathlib.Path("/proc/self/stat").read_text().rsplit(")",1)[1].split()[19])\n'
+                ' pathlib.Path("/run/flexvm-distro-probe.new").write_text(json.dumps(value))\n'
+                ' os.replace("/run/flexvm-distro-probe.new","/run/flexvm-distro-probe.json")\n'
+                ' time.sleep(0.05)\n')
+        execute("python3 -c " + shlex.quote('from pathlib import Path; Path("/run/flexvm-distro-probe.py").write_text(' + repr(code) + ')'))
+        execute("systemd-run --unit=flexvm-distro-probe --property=PrivateTmp=yes --property=NoNewPrivileges=yes "
+                "--property=MemoryMax=67108864 --property=TasksMax=16 --property=CPUQuota=50% /usr/bin/python3 /run/flexvm-distro-probe.py")
+        check("distro: transient service runs", wait_for(lambda: execute("test -s /run/flexvm-distro-probe.json", False)[0] == 0, 15))
+
+        def observe(phase):
+            nonlocal previous
+            now = json.loads(execute("cat /run/flexvm-distro-probe.json")[1])
+            check(f"{phase}: PID 1 and machine identity preserved", identity() == original, original)
+            if previous:
+                check(f"{phase}: service memory and process preserved", all(now[k] == previous[k] for k in ("cookie", "pid", "start")), (previous, now))
+                check(f"{phase}: service advances", wait_for(lambda: json.loads(execute("cat /run/flexvm-distro-probe.json")[1])["counter"] > previous["counter"], 5), (previous, now))
+            execute("systemctl is-active --quiet flexvm-runtime.service; "
+                    "test \"$(systemctl show --property=Delegate --value flexvm-runtime.service)\" = yes; "
+                    "test ! -e /tmp/flexvm-distro-private; "
+                    "test \"$(systemctl show --property=MemoryMax --value flexvm-distro-probe.service)\" = 67108864; "
+                    "test \"$(systemctl show --property=TasksMax --value flexvm-distro-probe.service)\" = 16")
+            previous = now
+
+        observe("run")
+        A.suspend(vm)
+        A.resume(vm)
+        observe("suspend")
+        saved = A.checkpoint(vm, stop=True)
+        A.restore(saved["id"])
+        observe("checkpoint")
+        A.migrate(vm, B)
+        host = B
+        observe("migration")
+        old = execute("systemctl show --property=MainPID --value flexvm-runtime.service")[1].strip()
+        restart = "for i in $(seq 1 8); do systemctl restart flexvm-runtime.service || exit; done; touch /run/flexvm-restarts-done"
+        execute("systemd-run --unit=flexvm-runtime-restart-probe --collect --no-block /bin/sh -ec " + shlex.quote(restart), False)
+        check("distro: repeated runtime restart restores exec", wait_for(lambda: execute("test -f /run/flexvm-restarts-done", False)[0] == 0, 30))
+        check("distro: runtime provider replaced", execute("systemctl show --property=MainPID --value flexvm-runtime.service")[1].strip() not in ("", "0", old))
+        observe("runtime restart")
+        attached = host.cli("attach", vm, check=False, timeout=10)
+        check("distro: attach directs users to exec", attached.returncode != 0 and "exec -it" in attached.stderr, (attached.stdout, attached.stderr))
+        # These mounts exist only in PID 1's mount namespace, which exec joins.
+        execute("cp -a /etc /run/flexvm-distro-etc; mount --bind /run/flexvm-distro-etc /etc; "
+                "for file in hosts hostname resolv.conf; do cp -L /etc/$file /run/flexvm-distro-$file; "
+                "mount --bind /run/flexvm-distro-$file /etc/$file; done")
+        renamed = vm + "-renamed"
+        host.cli("rename", vm, renamed)
+        host.vms.add(renamed)
+        vm = renamed
+        check("distro: hostname follows PID 1's mount view", wait_for(lambda: execute('test "$(hostname)" = ' + shlex.quote(vm) + '; test "$(cat /etc/hostname)" = ' + shlex.quote(vm), False)[0] == 0, 10))
+        execute("grep -F " + shlex.quote(vm) + " /etc/hosts")
+        dns = json.load(open(os.path.join(host.state_dir, "host.json"))).get("dns")
+        try:
+            host.configure(dns=["203.0.113.53"])
+            saved = host.checkpoint(vm, stop=True)
+            host.restore(saved["id"], ip="auto")
+            execute("cat /etc/resolv.conf; grep -Fx 'nameserver 203.0.113.53' /etc/resolv.conf")
+            observe("bind-mounted configuration")
+        finally:
+            host.configure(dns=dns)
+        execute("systemctl stop flexvm-distro-probe.service; systemctl is-active --quiet flexvm-runtime.service")
+        check("distro: stopping a unit keeps its VM running", host.ps()[vm]["state"] == "running")
+        host.cli("kill", "--signal", "TERM", vm)
+        check("distro: guest shutdown records successful exit", wait_for(lambda: host.ps().get(vm, {}).get("state") == "exited", 30), host.ps().get(vm))
+        check("distro: poweroff status is zero", host.ps()[vm].get("status") == 0, host.ps()[vm])
+    finally:
+        A.rm(vm, force=True, check=False)
+        B.rm(vm, force=True, check=False)
+        A.rm(clone, force=True, check=False)
+        clear_checkpoints(A, B)
+
+
+@case
+@needs_kvm
 def containerd():
     """standalone containerd, nerdctl/CNI and BuildKit state through VM lifecycle."""
     compat_workload("containerd")
@@ -3153,14 +3314,16 @@ def restart_policy():
 
 # Not tagged: its scenarios are, each in scripts/faults.py (`faults_scenarios`), and main selects them.
 @case
-def faults():
+def faults(template=None, scenarios=None):
     """The selected scripts/faults.py scenarios against the same two hosts."""
-    if not args.faults.split():
+    template = args.template if template is None else template
+    scenarios = args.faults if scenarios is None else scenarios
+    if not scenarios.split():
         print("  none selected")
         return
     # Growth needs a template that starts with little plugged.
     env = {**os.environ, "COW_GROW_TEMPLATE": GROW, "PLUG_TEMPLATE": GROW, "APP_TEMPLATE": APP,
-           "SHRINK_TEMPLATE": args.template, "EVICT_TEMPLATE": args.template}
+           "SHRINK_TEMPLATE": template, "EVICT_TEMPLATE": template}
     # The app-log template is built from the cached image when there is one (CI), not pulled.
     layout = image_layout()
     image = ["--image", layout] if layout else ["--image", args.image]
@@ -3173,8 +3336,8 @@ def faults():
                           "--a-state", A.state_dir, "--a-run", A.run_dir, "--b-state", B.state_dir, "--b-run", B.run_dir,
                           "--a-listen-log", A.log, "--b-listen-log", B.log,
                           "--a-ips", f"{A.net}.2-{A.net}.60", "--b-ips", f"{B.net}.2-{B.net}.60",
-                          *listeners, *(["--no-skips"] if args.no_skips else []), "--bin", BIN, "--template", args.template,
-                          "--ckpt-dir", os.path.join(WORK, "faults-ckpt"), *image, *args.faults.split()], env=env, start_new_session=True)
+                          *listeners, *(["--no-skips"] if args.no_skips else []), "--bin", BIN, "--template", template,
+                          "--ckpt-dir", os.path.join(WORK, "faults-ckpt"), *image, *scenarios.split()], env=env, start_new_session=True)
     code = None
     try:
         code = p.wait(FAULTS_TIMEOUT_S)
@@ -3354,7 +3517,7 @@ def worker():
 # runs, as e2e.py's summary prints them): --split balances by these, the long ones start first, and
 # the short ones go in batches of about BATCH_S (each batch is a worker, with hosts of its own).
 # Unlisted ones count as 2 s.
-COST = {"guest_poweroff": 10, "containerd": 180, "namespace_sandboxes": 180, "podman": 180, "faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "ipv6_taps": 10, "nettest_ipv6": 30, "docker_api": 15, "restart_policy": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
+COST = {"distro_bad_init": 10, "distro_pressure": 80, "distro_systemd": 40, "guest_poweroff": 10, "containerd": 180, "namespace_sandboxes": 180, "podman": 180, "faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "ipv6_taps": 10, "nettest_ipv6": 30, "docker_api": 15, "restart_policy": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
         "faults/cow_grow": 65, "faults/reconcile_kill": 64, "faults/target_renamed": 40, "faults/plug_race": 45, "faults/guest_hang": 44,
         "faults/exec_pause_grace": 42, "faults/exec_ckpt_stalled": 115, "faults/route_abort": 35, "faults/unplug_collapsed": 30,
         "faults/arrival_grew": 25, "faults/pause_resume": 24, "faults/evict_latency": 25, "faults/mem_high": 25, "faults/target_killed": 25,
