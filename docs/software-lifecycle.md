@@ -188,11 +188,25 @@ idempotently, and retain the source tombstone across owner/host restarts. Test
 every crash window, including retirement recorded before the source exits, and
 destination commit before its acknowledgment reaches the source.
 
-The destination journal uses `flexvm software-transfer`. The `id` command
-prints the destination host ID. An operator prepares a transfer with
-`prepare OFFER --source-key KEY`. The key is the source's 32-byte Ed25519 public
-key in standard padded base64. The offer is a JSON object with these fields in
-the order defined by the wire format:
+The transfer journals use `flexvm software-transfer`. Run `id` on the
+destination to get its host ID, then `offer VM DESTINATION` on the source
+after the software VM has stopped. The offer identifies the exact unconsumed
+checkpoint and the next generation. On the destination, use
+`prepare OFFER --source-key KEY` with the source's trusted 32-byte Ed25519
+public key in standard padded base64.
+
+On the source, `retire VM OFFER --signing-key FILE` checks that the exact
+checkpoint is retired and that neither its owner nor engine is still alive.
+It writes a durable restart fence keyed by VM identity before returning the
+signed receipt. The private key must be a private, locally owned regular file
+containing Ed25519 PKCS#8 DER. Keep the source checkpoint for receipt retries
+and artifact transfer. Retirement blocks local starts, including grants that
+were prepared before the fence was written. Recovery after destination abort
+requires the authenticated acknowledgment and generation rules above. Until
+that recovery and destination activation are available, exercise retirement
+only with disposable software VMs.
+
+An offer is a JSON object with these fields in wire order:
 
 1. `vm_id`
 2. `source_host`
@@ -206,11 +220,11 @@ The first four fields are 32 lowercase hexadecimal characters. The digest is
 `commit RECEIPT` verifies a JSON object containing the original `offer` and a
 standard padded base64 `signature`. The Ed25519 message is the ASCII bytes
 `flexvm/software-retirement/v1`, one NUL, and the compact JSON offer serialized
-with the field order above. The public key and offer are pinned at preparation.
-A commit retry verifies the same receipt. `abort OFFER` permanently rejects
-that offer, and a replacement needs a higher generation and a different
-transfer ID. Command success records a destination decision. Guest execution
-requires the source issuer, artifact transport and restore integration.
+in the field order above. The destination pins the public key and offer at
+preparation. A commit retry verifies the same receipt. `abort OFFER` permanently
+rejects that offer, and a replacement needs a higher generation and a different
+transfer ID. These commands record ownership decisions. Guest execution on a
+destination requires artifact transport and restore integration.
 
 After load, use the guest agent to step CLOCK_REALTIME from the current host time.
 Do not reset CLOCK_MONOTONIC through the agent. Preserve the engine virtual clock

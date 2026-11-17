@@ -538,7 +538,7 @@ pub struct Prepared<'a> {
     directory: File,
     manifest: Manifest,
     pub generation: u64,
-    _name: &'a crate::host::NameLock,
+    name: &'a crate::host::NameLock,
 }
 
 pub struct Consumed {
@@ -556,6 +556,9 @@ impl Verified {
         if self.manifest.host_id != local_host {
             bail!("software checkpoint belongs to another host; cross-host transfer is not enabled");
         }
+        let host = parent_directory(name.state_path())?;
+        let _transfer = parent_lock(&host, libc::LOCK_EX)?;
+        transfer::check_local_restart(&host, &self.manifest.vm_id)?;
         if present(dir, "DISCARDED")? {
             bail!("software checkpoint was discarded");
         }
@@ -583,12 +586,15 @@ impl Verified {
         let highest = if present(dir, "HIGHEST")? { record::<u64>(dir, "HIGHEST")? } else { self.manifest.owner_generation };
         let generation = highest.max(self.manifest.owner_generation).checked_add(1).ok_or("software owner generation exhausted")?;
         write_record(dir, "HIGHEST", &serde_json::to_vec(&generation)?, true)?;
-        Ok(Prepared { directory: dir.try_clone()?, manifest: self.manifest.clone(), generation, _name: name })
+        Ok(Prepared { directory: dir.try_clone()?, manifest: self.manifest.clone(), generation, name })
     }
 }
 
 impl Prepared<'_> {
     pub fn grant(self, engine: crate::host::Ident) -> Result<Consumed> {
+        let host = parent_directory(self.name.state_path())?;
+        let _transfer = parent_lock(&host, libc::LOCK_EX)?;
+        transfer::check_local_restart(&host, &self.manifest.vm_id)?;
         if record::<u64>(&self.directory, "HIGHEST")? != self.generation {
             bail!("software owner preparation was superseded");
         }
@@ -1053,7 +1059,7 @@ mod tests {
         assert!(serde_json::from_value::<Main>(json!({"boot":"systemd", "id":"saved-main", "offset":19, "claim":2})).is_err());
     }
 
-    fn checkpoint(dir: &Path) -> (PathBuf, Profile) {
+    pub(super) fn checkpoint(dir: &Path) -> (PathBuf, Profile) {
         let inputs = Inputs {
             engine: source(dir, "source-engine", b"engine"),
             kernel: source(dir, "source-kernel", b"kernel"),

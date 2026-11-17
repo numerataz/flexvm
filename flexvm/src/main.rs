@@ -81,6 +81,10 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      address unless --name and --ip IP|auto), or from a checkpoint
                                      directory (a path, with a '/'); --paused holds it until unpause
   flexvm software-transfer id        show the local software host identity
+  flexvm software-transfer offer VM DESTINATION
+                                     identify a stopped VM and its intended destination
+  flexvm software-transfer retire VM OFFER --signing-key FILE
+                                     fence local restart and sign a retirement receipt
   flexvm software-transfer prepare OFFER --source-key KEY
                                      record an incoming transfer and its base64 Ed25519 public key
   flexvm software-transfer commit RECEIPT
@@ -548,7 +552,7 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("rm", NAMES, &["force"]),
     ("volume", NAMES, &["size"]),
     ("checkpoint", NAMES, &["stop", "incremental", "quiet", "format", "filter", "force", "older-than", "output", "input", "name", "sha256"]),
-    ("software-transfer", 3, &["source-key"]),
+    ("software-transfer", 4, &["source-key", "signing-key"]),
     ("migrate", 3, &[]),
     ("reclaim", 2, &["force"]),
     ("listen", 2, &[]),
@@ -635,10 +639,18 @@ fn check_applies(args: &Args) -> Result<()> {
             }
         }
         "software-transfer" => {
-            let count = args.positional.len();
-            let key = args.has("source-key");
-            if !matches!((first.map(String::as_str), count, key), (Some("id"), 2, false) | (Some("prepare"), 3, true) | (Some("commit" | "abort"), 3, false)) {
-                bail!("software-transfer needs id, prepare OFFER --source-key KEY, commit RECEIPT or abort OFFER");
+            let words = args.positional.len();
+            let source_key = args.has("source-key");
+            let signing_key = args.has("signing-key");
+            if !matches!(
+                (first.map(String::as_str), words, source_key, signing_key),
+                (Some("id"), 2, false, false)
+                    | (Some("prepare"), 3, true, false)
+                    | (Some("commit" | "abort"), 3, false, false)
+                    | (Some("offer"), 4, false, false)
+                    | (Some("retire"), 4, false, true)
+            ) {
+                bail!("software-transfer needs id, offer VM DESTINATION, prepare OFFER --source-key KEY, retire VM OFFER --signing-key FILE, commit RECEIPT or abort OFFER");
             }
         }
         "checkpoint" => {
@@ -792,6 +804,10 @@ fn real_main(args: &Args) -> Result<()> {
             }
         }
         Some("pull") => pull(args, name),
+        Some("software-transfer") if name == "offer" => print(software_state::transfer::offer(&open_host(args)?, pos[2], pos[3])?),
+        Some("software-transfer") if name == "retire" => {
+            print(software_state::transfer::retire(&open_host(args)?, pos[2], Path::new(pos[3]), Path::new(args.get("signing-key").unwrap()))?)
+        }
         Some("software-transfer") => {
             let path = state(args)?;
             host::host_dir(&path, 0o755)?;
