@@ -311,7 +311,7 @@ pub(crate) fn snapshot_load_body(vmstate: &Path, template: &crate::template::Tem
     }))
 }
 
-fn kernel_powered_off(log: &str) -> bool {
+pub(crate) fn kernel_powered_off(log: &str) -> bool {
     !log.contains("Kernel panic")
         && log.lines().any(|line| {
             let line = line.trim_end_matches('\r');

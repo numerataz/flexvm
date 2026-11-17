@@ -8,7 +8,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -165,6 +165,20 @@ impl Processes {
             bail!("software engine has exited");
         }
         Ok(ident)
+    }
+
+    /// Join the engine logger only after actual process exit, so shutdown
+    /// classification sees its final console bytes and never blocks a live VM.
+    fn engine_status(&self) -> Result<Option<ExitStatus>> {
+        let mut children = self.children.lock().unwrap();
+        let engine = children.last_mut().ok_or("software engine is retired")?;
+        let status = engine.child.try_wait()?;
+        if status.is_some() {
+            if let Some(logging) = engine.logging.take() {
+                logging.join().map_err(|_| "software engine logger panicked")?;
+            }
+        }
+        Ok(status)
     }
 
     pub fn alive(&self) -> Result<()> {
@@ -860,6 +874,46 @@ impl Machine {
         guest::exec_output_at(&mut Watched { reader, processes: &self.processes }, id, offset, out)
     }
 
+    pub fn start_distro(&self, deadline: Instant) -> Result<()> {
+        if self.message("APP", deadline)? != b"ok 1" {
+            bail!("software distro init did not accept its cold boot gate");
+        }
+        self.wait_distro_ready(deadline)
+    }
+
+    pub fn wait_distro_ready(&self, deadline: Instant) -> Result<()> {
+        loop {
+            self.processes.alive()?;
+            let left = remaining(deadline)?;
+            let reply = self.message("APPSTATUS", Instant::now() + left.min(guest::TIMEOUT))?;
+            match reply.as_slice() {
+                b"running 1" => return Ok(()),
+                b"starting 1" => std::thread::sleep(left.min(Duration::from_millis(50))),
+                _ => bail!("software distro init failed to start: {}", String::from_utf8_lossy(&reply)),
+            }
+        }
+    }
+
+    /// A distro follows the engine's real lifetime, not a synthetic exec session.
+    pub fn distro_exit(&self) -> Result<Option<i32>> {
+        let Some(status) = self.processes.engine_status()? else {
+            self.processes.alive()?;
+            return Ok(None);
+        };
+        let mut console = Vec::new();
+        for name in ["qemu.log.1", "qemu.log"] {
+            match fs::read(self.logs.join(name)) {
+                Ok(bytes) => console.extend(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        if status.success() && crate::fc::kernel_powered_off(&String::from_utf8_lossy(&console)) {
+            return Ok(Some(0));
+        }
+        bail!("software distro engine exited without a completed guest power-off: {status}; {}", self.diagnostics())
+    }
+
     pub fn exec(&self, argv: Vec<String>, out: impl FnMut(u8, &[u8]) -> Result<()>) -> Result<i32> {
         let (id, mut reader) = self.start_exec(argv)?;
         self.finish_exec(&mut reader, &id, out)
@@ -1009,7 +1063,7 @@ mod tests {
             rootfs: blank.clone(),
             state: blank,
             firmware: std::collections::BTreeMap::new(),
-            main: software_state::Session { id: id.clone(), offset: 0, claim: 0 },
+            main: software_state::Main::App(software_state::Session { id: id.clone(), offset: 0, claim: 0 }),
             image: meta,
         };
         let checkpoint = dir.join("checkpoint");
@@ -1185,6 +1239,41 @@ mod tests {
         fs::remove_file(machine.logs.join("qemu.log")).unwrap();
         machine.wait_control_reset(8, 3, Instant::now() + Duration::from_secs(1)).unwrap();
         assert!(machine.wait_control_reset(8, 4, Instant::now() + Duration::from_millis(20)).is_err(), "an earlier barrier cannot acknowledge the next reset");
+    }
+
+    #[test]
+    fn distro_poweroff_requires_actual_engine_exit_and_drained_console() {
+        let machine = machine();
+        let gate = machine.logs.join("exit-gate");
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "printf '[    1.0] reboot: Power down\n'; while [ ! -f \"$1\" ]; do sleep .01; done", "sh"]).arg(&gate);
+        machine.processes.spawn(&mut cmd, &machine.logs.join("qemu.log")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fs::read_to_string(machine.logs.join("qemu.log")).unwrap_or_default().contains("Power down") {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(machine.distro_exit().unwrap(), None, "a live console cannot terminate or complete a VM");
+        machine.processes.alive().unwrap();
+        fs::write(gate, b"exit").unwrap();
+        while machine.distro_exit().unwrap().is_none() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(machine.distro_exit().unwrap(), Some(0));
+    }
+
+    #[test]
+    fn distro_exit_rejects_panics_and_failed_engines() {
+        for script in ["printf 'Kernel panic - not syncing: fatal\n[    1.0] reboot: Power down\n'", "printf '[    1.0] reboot: Power down\n'; exit 7"] {
+            let machine = machine();
+            machine.processes.spawn(Command::new("sh").args(["-c", script]), &machine.logs.join("qemu.log")).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while machine.distro_exit().is_ok() {
+                assert!(Instant::now() < deadline);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
     }
 
     #[test]

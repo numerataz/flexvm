@@ -2325,7 +2325,11 @@ fn software(args: &Args, src: &str) -> Result<i32> {
         }
         util::block_signals(&[libc::SIGTSTP, libc::SIGCONT, libc::SIGTERM]);
     }
-    let control = match args.get("control").unwrap_or(if args.get("name").is_some() { "serial" } else { "vsock" }) {
+    let control = match args.get("control").unwrap_or(if args.get("name").is_some() || args.get("boot").is_some_and(|boot| boot != "app") {
+        "serial"
+    } else {
+        "vsock"
+    }) {
         "vsock" => qemu::Control::Vsock,
         "serial" => qemu::Control::Serial,
         other => bail!("unsupported software control transport {other:?}: use vsock or serial"),
@@ -2360,9 +2364,6 @@ fn software(args: &Args, src: &str) -> Result<i32> {
         }
     });
     let mut opts = image_options(args, src)?;
-    if !opts.boot.is_app() {
-        bail!("software distro boot integration is not ready yet");
-    }
     if !args.rest.is_empty() {
         opts.cmd = Some(args.rest.clone());
     }
@@ -2391,6 +2392,16 @@ fn software(args: &Args, src: &str) -> Result<i32> {
         return software::run(host, lock, machine, processes, &config, &meta);
     }
 
+    if !meta.boot.is_app() {
+        machine.start_distro(Instant::now() + config.boot_timeout)?;
+        loop {
+            template::interrupted()?;
+            if let Some(code) = machine.distro_exit()? {
+                return Ok(code);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
     machine.exec(meta.argv, |kind, bytes| {
         if kind == guest::FRAME_STDERR {
             let mut out = std::io::stderr().lock();

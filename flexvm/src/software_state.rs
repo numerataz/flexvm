@@ -40,6 +40,38 @@ pub struct Session {
     pub claim: u64,
 }
 
+/// App state keeps its legacy JSON shape. A distro has no main session; older
+/// readers reject that shape rather than restoring init as an application.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Main {
+    App(Session),
+    Distro(Distro),
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Distro {
+    pub boot: crate::image::BootProfile,
+}
+
+impl Main {
+    pub fn session(&self) -> Option<&Session> {
+        match self {
+            Self::App(session) => Some(session),
+            Self::Distro(_) => None,
+        }
+    }
+
+    fn validate(&self, image: &crate::image::ImageMeta) -> Result<()> {
+        match self {
+            Self::App(session) if image.boot.is_app() && crate::guest::valid_session_id(&session.id) => Ok(()),
+            Self::Distro(distro) if !distro.boot.is_app() && distro.boot == image.boot => Ok(()),
+            _ => bail!("software state main mode does not match its image or has an invalid session"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -66,7 +98,7 @@ pub struct Manifest {
     pub rootfs: Artifact,
     pub state: Artifact,
     pub firmware: BTreeMap<String, Artifact>,
-    pub main: Session,
+    pub main: Main,
     pub image: crate::image::ImageMeta,
 }
 
@@ -80,7 +112,6 @@ impl Manifest {
             || self.barrier_generation > self.owner_generation
             || self.owner_generation == 0
             || self.barrier_sequence == 0
-            || !crate::guest::valid_session_id(&self.main.id)
         {
             bail!("software state has invalid ownership, session or barrier identity");
         }
@@ -89,6 +120,7 @@ impl Manifest {
         }) {
             bail!("software state has an empty artifact or invalid content digest");
         }
+        self.main.validate(&self.image)?;
         self.image.check_kernel(&self.kernel.sha256)?;
         Ok(())
     }
@@ -977,11 +1009,31 @@ mod tests {
             rootfs: blank.clone(),
             state: blank,
             firmware: BTreeMap::new(),
-            main: Session { id: "saved-main".into(), offset: 19, claim: 2 },
+            main: Main::App(Session { id: "saved-main".into(), offset: 19, claim: 2 }),
             image: serde_json::from_value(json!({"source":"local", "digest":"sha256:image", "config_digest":"sha256:config",
                 "app_conf":"", "argv":["/probe"], "warm":false}))
             .unwrap(),
         }
+    }
+
+    #[test]
+    fn main_mode_preserves_app_wire_format_and_refuses_downgrading_distro_state() {
+        let legacy = json!({"id":"saved-main", "offset":19, "claim":2});
+        let app: Main = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&app).unwrap(), legacy);
+        let mut image = manifest(Profile { architecture: "x86_64".into(), arguments: vec![] }).image;
+        app.validate(&image).unwrap();
+        image.boot = crate::image::BootProfile::Systemd;
+        assert!(app.validate(&image).is_err());
+        let distro = Main::Distro(Distro { boot: image.boot });
+        distro.validate(&image).unwrap();
+        let wire = serde_json::to_value(&distro).unwrap();
+        assert!(serde_json::from_value::<Session>(wire.clone()).is_err(), "old readers must reject distro state");
+        let restored: Main = serde_json::from_value(wire).unwrap();
+        restored.validate(&image).unwrap();
+        image.boot = crate::image::BootProfile::App;
+        assert!(restored.validate(&image).is_err());
+        assert!(serde_json::from_value::<Main>(json!({"boot":"systemd", "id":"saved-main", "offset":19, "claim":2})).is_err());
     }
 
     fn checkpoint(dir: &Path) -> (PathBuf, Profile) {
@@ -1098,7 +1150,7 @@ mod tests {
         let (path, profile) = checkpoint(&root);
         let verified = open(&path, &profile).unwrap();
         assert_eq!(verified.manifest.owner_generation, 7);
-        assert_eq!(verified.manifest.main.offset, 19);
+        assert_eq!(verified.manifest.main.session().unwrap().offset, 19);
         fs::rename(&path, root.join("old")).unwrap();
         fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
         fs::write(path.join("kernel"), b"replacement").unwrap();

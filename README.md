@@ -1283,9 +1283,26 @@ running services. Normal power-off waits for actual VMM exit before recording
 status zero; a kernel panic or VMM failure remains a failure. The writable
 root remains VM memory, with the same lifecycle semantics as app mode.
 
-This first distro integration targets the accelerated backend and systemd.
-OpenRC, software-engine distro boot, full user sessions/rootless service
-integration and guest reboot semantics remain tracked in
+Systemd also runs with the software CPU engine, without host virtualization
+devices. Start a distro OCI layout directly:
+
+```sh
+sudo flexvm software --boot systemd --name my-vm --kernel /path/to/vmlinux --mem 1536 ./my-systemd-image
+# In another terminal:
+sudo flexvm exec my-vm systemctl is-system-running --wait
+sudo flexvm pause my-vm
+sudo flexvm unpause my-vm
+sudo flexvm stop my-vm
+sudo flexvm start --attach my-vm
+```
+
+Software stop/start preserves PID 1, machine identity and running services in a
+fresh engine and owner process. A named distro's lifetime follows the OS,
+including `kill --signal TERM` to request power-off; it has no synthetic app
+session. The software backend's other documented lifecycle limits still apply.
+
+OpenRC, full user sessions/rootless service integration and guest reboot
+semantics remain tracked in
 [the distro boot issue](https://github.com/numerataz/flexvm/issues/1328).
 
 ## Docker inside a VM
