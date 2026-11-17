@@ -700,8 +700,11 @@ Add `--network routed` to a named `flexvm software` VM to use the host's
 TAP from `/dev/net/tun` and the host installs routes to the VM. QEMU
 handles the guest CPU and virtio networking in userspace. `flexvm stop` keeps
 the address reserved, and `flexvm start` restores the same addresses
-and TCP state through a new TAP on this host. Routed software VM
-checkpoints currently support local restore.
+and TCP state through a new TAP. A signed software transfer carries
+the same address and its revision to a peer configured for the same
+cluster address range and IPv6 prefix. Transfer keeps the source address
+reserved until the VM returns or the loan is withdrawn. Arrange for
+traffic to reach the destination when it takes ownership.
 
 ## IPv6 addresses
 
