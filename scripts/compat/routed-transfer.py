@@ -37,6 +37,19 @@ with socket.create_connection((sys.argv[1], 28143), timeout=15) as connection:
         print(reply.hex(), flush=True)
 """
 
+UDP_CLIENT = """
+import socket, sys
+payload = b'one-shot-udp-during-software-checkpoint'
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as connection:
+    connection.settimeout(105)
+    connection.sendto(payload, (sys.argv[1], 28143))
+    print("sent", flush=True)
+    reply, _ = connection.recvfrom(4096)
+    if reply != payload:
+        raise RuntimeError(f"unexpected UDP echo: {reply!r}")
+    print("received", flush=True)
+"""
+
 
 @contextmanager
 def configured_peers(enabled, timeout):
@@ -223,6 +236,14 @@ def exercise(binary, kernel, output, engine, root, arch, network):
     def addr_record(site, ip):
         return json.loads((root/site/'addrs'/ip).read_text())
 
+    def hold_route(label, timeout=150):
+        with (output / (label + ".log")).open("wb") as log:
+            process = sp.Popen([*a, "software-transfer", "hold-route", "source", "--timeout", str(timeout)],
+                               stdout=sp.PIPE, stderr=log, text=True, bufsize=1)
+        owners.append(process)
+        assert json.loads(client_line(process))["status"] == "holding"
+        return process
+
     try:
         if network:
             for site, peer in bases.items():
@@ -242,10 +263,33 @@ def exercise(binary, kernel, output, engine, root, arch, network):
         a_key, b_key = key('a'), key('b')
         first, initial = launch(a,'source','software','--name','source','--network','routed','--qemu',engine,'--kernel',kernel,output/'fixture.tar')
         ip = initial['ip']
+        held_packets = None
         with connection(ip) as tcp:
             echo(tcp,b'routed-connection-before-transfer')
+            if network:
+                cancelled = hold_route("hold-cancelled", timeout=1)
+                assert json.loads(client_line(cancelled))["status"] == "restored-source"
+                assert cancelled.wait(timeout=5) == 0
+                cancelled.stdout.close()
+                echo(tcp,b'routed-connection-after-hold-expiry')
+                hold = hold_route("hold-outbound")
             stop(a,'source',first)
+            if network:
+                with (output / "udp-client.log").open("wb") as log:
+                    udp = sp.Popen([*network["a"][0], sys.executable, "-c", UDP_CLIENT, ip],
+                                   stdout=sp.PIPE, stderr=log, text=True, bufsize=1)
+                owners.append(udp)
+                assert client_line(udp) == "sent"
             peer, moved, outbound, sent = move(a,b,'source','peer',a_key,b_key)
+            if network:
+                held = json.loads(client_line(hold))
+                assert held["status"] == "forwarded", held
+                held_packets = held["hold"]
+                assert held_packets["packets"] >= 1 and held_packets["dropped"] == 0, held
+                assert client_line(udp) == "received"
+                assert udp.wait(timeout=5) == 0 and hold.wait(timeout=5) == 0
+                udp.stdout.close()
+                hold.stdout.close()
             assert moved['ip'] == ip and moved['gen'] == initial['gen']
             assert addr_record('a',ip)['lent'] == outbound['generation']
             echo(tcp,b'same-routed-connection-on-peer')
@@ -277,6 +321,7 @@ def exercise(binary, kernel, output, engine, root, arch, network):
             "shared_network_namespace": not bool(network),
             "automatic_peer_routes": bool(network),
             "peer_route_withdrawal": bool(network),
+            "held_packets": held_packets,
             "outbound": outbound,
             "return": inbound,
             "outbound_bytes": sent,

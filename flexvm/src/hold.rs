@@ -606,6 +606,27 @@ impl Holder {
         Stats { dropped, ..Stats::default() }
     }
 
+    pub fn can_replay(&self, addr: crate::net::VmAddr) -> bool {
+        self.resend.is_some() && (addr.v6.is_none() || (self.resend6.is_some() && self.ipv6()))
+    }
+
+    /// The peer route (or the original TAP on cancellation) has been installed.
+    /// Remove any surviving link-scoped hold route before sending to the FIB.
+    pub fn replay_routed(&self, ip: Ipv4Addr, mig: u64) -> Result<Stats> {
+        let e = self.entry(ip).filter(|e| e.mig == mig).ok_or("software packet queue is gone")?;
+        let addr = crate::net::VmAddr { v4: ip, v6: e.v6 };
+        let _ = crate::net::route_dev(false, addr, self.ifindex);
+        for destination in addr.each() {
+            if crate::net::route_get(destination)?.0 == self.dev {
+                bail!("the route for {destination} is still on the hold device");
+            }
+        }
+        let mut resend = |packet: &[u8]| self.resend(ip, packet);
+        let (stats, routed) = self.release_local(ip, mig, &mut resend, || Ok(()), Duration::from_millis(30)).ok_or("software packet queue is busy")?;
+        routed?;
+        Ok(stats)
+    }
+
     /// Drops `e` and its TUN route, unless a newer hold replaced it.
     fn unroute(&self, ip: Ipv4Addr, e: &Arc<Entry>) {
         // Under `routes`: a newer hold of `ip` never loses its route to this one.
