@@ -105,7 +105,7 @@ EOF
     systemctl start systemd-nspawn@fvns.service
     wait_boot
     printf '%s\n' "$leader" > "$base/leader"
-    cp "/proc/$leader/root/run/state-probe.json" "$base/initial"
+    cat "/proc/$leader/root/run/state-probe.json" > "$base/initial"
     dpkg-query -W systemd-container debootstrap
     ;;
 verify)
