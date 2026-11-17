@@ -274,7 +274,7 @@ mod tests {
         let (offer, bytes) = wire(&source, &target);
         let limit = 1 << 20;
         assert!(receive(&target, &offer, &mut bytes.as_slice(), limit).is_err());
-        transition(&target, offer.clone(), Action::Prepare(STANDARD.encode([2; 32]))).unwrap();
+        transition(&target, offer.clone(), Action::Prepare(STANDARD.encode([2; 32]), Vec::new())).unwrap();
         let unrelated = TempDir::new("transfer-bundle-unrelated");
         assert!(receive(&unrelated, &offer, &mut bytes.as_slice(), limit).is_err());
         let incoming = target.join(INCOMING);
@@ -304,7 +304,7 @@ mod tests {
         let source = TempDir::new("transfer-bundle-race-source");
         let target = TempDir::new("transfer-bundle-race-target");
         let (offer, bytes) = wire(&source, &target);
-        transition(&target, offer.clone(), Action::Prepare(STANDARD.encode([2; 32]))).unwrap();
+        transition(&target, offer.clone(), Action::Prepare(STANDARD.encode([2; 32]), Vec::new())).unwrap();
 
         struct AbortAtEnd<'a> {
             bytes: &'a [u8],

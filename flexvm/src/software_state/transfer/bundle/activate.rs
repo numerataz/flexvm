@@ -35,14 +35,23 @@ pub(crate) struct Activation<'a> {
     _name: &'a NameLock,
 }
 
-fn decision_name(offer: &Offer) -> String {
-    format!(".software-activation-v1-{}", offer.vm_id)
+fn decision_name(vm_id: &str) -> String {
+    format!(".software-activation-v1-{vm_id}")
+}
+
+pub(in crate::software_state::transfer) fn preceding_grant(state: &File, manifest: &Manifest) -> Result<Option<Offer>> {
+    let key = decision_name(&manifest.vm_id.to_ascii_lowercase());
+    if !present(state, &key)? {
+        return Ok(None);
+    }
+    let decision = record::<Decision>(state, &key)?;
+    Ok(decision.grant.filter(|grant| grant.generation <= manifest.owner_generation).map(|_| decision.offer))
 }
 
 /// Use only under the host transfer lock. A new outbound fence always
 /// supersedes an older inbound grant.
 pub(in crate::software_state::transfer) fn return_grant_generation(state: &File, outgoing: &Offer) -> Result<Option<u64>> {
-    let key = decision_name(outgoing);
+    let key = decision_name(&outgoing.vm_id);
     if !present(state, &key)? {
         return Ok(None);
     }
@@ -59,7 +68,7 @@ impl<'a> Activation<'a> {
         let state = parent_directory(name.state_path())?;
         let _transfer = parent_lock(&state, libc::LOCK_EX)?;
         let return_fence = committed_return_fence(&state, &offer)?;
-        let key = decision_name(&offer);
+        let key = decision_name(&offer.vm_id);
         let previous = if present(&state, &key)? { Some(record::<Decision>(&state, &key)?) } else { None };
         let mut floor = offer.generation;
         if let Some(previous) = &previous {
@@ -113,7 +122,7 @@ impl<'a> Activation<'a> {
         if committed_return_fence(&self.state, &self.decision.offer)? != self.decision.return_fence {
             bail!("software activation outgoing handoff changed before the grant");
         }
-        let key = decision_name(&self.decision.offer);
+        let key = decision_name(&self.decision.offer.vm_id);
         if record::<Decision>(&self.state, &key)? != self.decision {
             bail!("software activation preparation was superseded");
         }
@@ -150,7 +159,7 @@ mod tests {
         let host = Host::open(&target.join("state"), &target.join("run")).unwrap();
         let (offer, bytes) = super::super::tests::wire(&source, &host.state);
         let key = Ed25519KeyPair::from_seed_unchecked(&[5; 32]).unwrap();
-        transition(&host.state, offer.clone(), Action::Prepare(STANDARD.encode(key.public_key()))).unwrap();
+        transition(&host.state, offer.clone(), Action::Prepare(STANDARD.encode(key.public_key()), Vec::new())).unwrap();
         let name = host.take_name("remote", false).unwrap();
         super::super::receive(&host.state, &offer, &mut bytes.as_slice(), 1 << 20).unwrap();
         assert!(Activation::prepare_offer(&name, offer.clone()).err().unwrap().to_string().contains("requires a committed"));

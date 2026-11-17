@@ -9,11 +9,11 @@ copies, and a durable local ownership journal prevents implicit replay after a
 restore has been granted CPU authority. A failed restore after that grant remains
 quarantined; it is never silently restarted from the older state.
 
-This is a local lifecycle milestone, not completion of this contract. Software
-snapshots currently use private user networking: open host network connections
-are not preserved. Cross-host migration, persistent disk transfer, routed network
-continuity, elastic memory, hierarchy ownership and explicit quarantine recovery
-remain work to implement. Unknown or older guest agents cannot checkpoint; a
+Stopped software VMs can transfer across hosts with signed ownership handoffs.
+Software snapshots currently use private user networking, and open host network
+connections close on a move. Persistent disk transfer, routed network continuity,
+elastic memory, hierarchy ownership and explicit quarantine recovery remain work
+to implement. Unknown or older guest agents cannot checkpoint; a
 current serial agent must acknowledge its request and transport barriers.
 
 `scripts/compat/software-lifecycle.py` exercises two normal CLI stop/start cycles
@@ -179,9 +179,8 @@ unsigned or unknown-host receipts cannot authorize restore. Bind the VM, source
 and destination identities, transfer ID, retired generation and complete manifest
 digest, including every disk digest. The target checks all bindings against its
 prepared state and durable generation record; a receipt is not a reusable bearer
-permission for another target or snapshot. Cross-host migration stays unavailable
-until this trust and replay protection are implemented and verified.
-The destination requires that receipt and commits its journal before resuming.
+permission for another target or snapshot. The destination requires that receipt
+and commits its journal before resuming.
 Recovery never automatically resumes an ambiguously transferred source; it
 remains fenced until the journal protocol resolves ownership. Retry receipts
 idempotently, and retain the source tombstone across owner/host restarts. Test
@@ -260,8 +259,7 @@ destination reversed. The returning offer must advance the generation and
 use the host identity and signing key pinned by the last outbound handoff.
 Activate under a free name if the previous local checkpoint still holds its
 old name. That checkpoint stays fenced after the return. Only a checkpoint
-captured by the new local owner can start or transfer again. The current return
-protocol covers direct handoffs between the same pair of hosts.
+captured by the new local owner can start or transfer again.
 
 To obtain a finalized handoff proof, run
 `software-transfer acknowledge-commit OFFER --signing-key FILE` with the
@@ -269,8 +267,16 @@ destination signing key. Pass its signed output to
 `software-transfer finalize COMMIT-ACK --signing-key FILE` with the source
 signing key. The source verifies the commit against the pinned destination key
 and records the decision before issuing the proof. The same transfer cannot
-both finalize and recover from an abort. Keep the proof with the transfer
-records for future ownership-chain verification.
+both finalize and recover from an abort. The proof binds the preceding
+inbound offer if the VM arrived through a transfer and activated here.
+
+For a return through intermediary hosts, pass
+`--handoff-chain FILE` to `prepare`. The file is a JSON array containing
+the finalized proofs in transfer order, beginning with the first move
+after the destination's last outbound fence. For A→B→C→A, supply the
+finalized B→C proof when preparing C→A on A. Each link must name the
+preceding offer and advance the VM's generation. The final link identifies
+the returning source and key supplied to `prepare`.
 
 After load, use the guest agent to step CLOCK_REALTIME from the current host time.
 Do not reset CLOCK_MONOTONIC through the agent. Preserve the engine virtual clock

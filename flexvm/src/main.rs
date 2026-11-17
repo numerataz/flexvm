@@ -85,7 +85,7 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      identify a stopped VM and its intended destination
   flexvm software-transfer retire VM OFFER --signing-key FILE --destination-key KEY
                                      fence local restart and sign a retirement receipt
-  flexvm software-transfer prepare OFFER --source-key KEY
+  flexvm software-transfer prepare OFFER --source-key KEY [--handoff-chain FILE]
                                      record an incoming transfer and its base64 Ed25519 public key
   flexvm software-transfer commit RECEIPT
                                      verify source retirement and commit the destination journal
@@ -567,7 +567,7 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("rm", NAMES, &["force"]),
     ("volume", NAMES, &["size"]),
     ("checkpoint", NAMES, &["stop", "incremental", "quiet", "format", "filter", "force", "older-than", "output", "input", "name", "sha256"]),
-    ("software-transfer", 4, &["source-key", "signing-key", "destination-key", "max-bundle-mib", "qemu"]),
+    ("software-transfer", 4, &["source-key", "signing-key", "destination-key", "handoff-chain", "max-bundle-mib", "qemu"]),
     ("migrate", 3, &[]),
     ("reclaim", 2, &["force"]),
     ("listen", 2, &[]),
@@ -656,6 +656,9 @@ fn check_applies(args: &Args) -> Result<()> {
         "software-transfer" => {
             let words = args.positional.len();
             let keys = (args.has("source-key"), args.has("signing-key"), args.has("destination-key"));
+            if args.has("handoff-chain") && first.map(String::as_str) != Some("prepare") {
+                bail!("--handoff-chain applies only to software-transfer prepare");
+            }
             if args.has("max-bundle-mib") && first.map(String::as_str) != Some("receive") {
                 bail!("--max-bundle-mib applies only to software-transfer receive");
             }
@@ -859,7 +862,13 @@ fn real_main(args: &Args) -> Result<()> {
             if name == "recover" {
                 return print(software_state::transfer::recover(&path, Path::new(pos[2]))?);
             }
-            print(software_state::transfer::command(&path, name, Path::new(arg2.unwrap_or("")), args.get("source-key"))?)
+            print(software_state::transfer::command(
+                &path,
+                name,
+                Path::new(arg2.unwrap_or("")),
+                args.get("source-key"),
+                args.get("handoff-chain").map(Path::new),
+            )?)
         }
         Some("software") => util::exit(software(args, name)?),
         Some("images") => images(&open_host(args)?, &paths(args)?, args),
