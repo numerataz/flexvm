@@ -2812,14 +2812,11 @@ impl Proc {
         thread::spawn(move || {
             // Guest maintenance may fault on pages the migration is still pulling.
             // Wait outside the operation lock so a pause can proceed meanwhile.
-            if vm.pager.pulling_from_peer() && !vm.pager.wait_pulled(None) {
-                vm.clock_pending.store(false, Ordering::SeqCst);
-                return;
-            }
+            let ready = !vm.pager.pulling_from_peer() || vm.pager.wait_pulled(None);
             let res = {
                 let _op = p.op();
-                let result = match vm.state() {
-                    State::Running => {
+                let result = match (ready, vm.state()) {
+                    (true, State::Running) => {
                         let off = vm.sync_clock(Instant::now() + CLOCK_DEADLINE).map(Some);
                         // A rename while it was paused reaches the guest now.
                         vm.set_hostname(&p.name());
