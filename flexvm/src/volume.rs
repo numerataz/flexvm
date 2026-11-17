@@ -30,6 +30,7 @@ pub struct Info {
 }
 
 pub struct Catalog {
+    state: File,
     directory: File,
 }
 
@@ -176,15 +177,19 @@ impl Catalog {
         let name = util::cpath(Path::new(state.file_name().ok_or("volume state needs a directory name")?))?;
         make_directory(&parent, &name)?;
         let state: File = util::open_dir_at(parent.as_raw_fd(), &name)?.into();
+        parent.sync_all()?;
+        Self::from_state(state)
+    }
+
+    pub(crate) fn from_state(state: File) -> Result<Self> {
         let stat = state.metadata()?;
         if stat.uid() != unsafe { libc::geteuid() } || stat.mode() & 0o022 != 0 {
             bail!("volume state directory is writable by another user or owned by someone else");
         }
-        parent.sync_all()?;
         make_directory(&state, c"volumes")?;
         let directory = directory(&state, "volumes")?;
         state.sync_all()?;
-        Ok(Self { directory })
+        Ok(Self { state, directory })
     }
 
     // Locks the stable catalog directory inode. It is never unlinked by catalog operations.
@@ -296,6 +301,14 @@ impl Catalog {
     /// Opening and taking the per-volume lease must precede releasing the
     /// catalog lock. Removal and cloning take the same backing-file lease.
     pub(crate) fn writer(&self, volume: &str) -> Result<Writer> {
+        let admission = crate::software_state::transfer::DiskAdmission::new(&self.state)?;
+        let writer = self.writer_for_retirement(volume)?;
+        admission.require(&writer.id)?;
+        Ok(writer)
+    }
+
+    /// Used by the owner that already holds the state admission lock.
+    pub(crate) fn writer_for_retirement(&self, volume: &str) -> Result<Writer> {
         let _catalog = self.lock(libc::LOCK_SH)?;
         let (info, file) = self.locked_writer(volume)?;
         Ok(Writer { id: info.metadata.id, size: info.metadata.capacity_bytes, file })
@@ -345,10 +358,12 @@ impl Catalog {
     }
 
     pub fn remove(&self, name: &str) -> Result<()> {
+        let admission = crate::software_state::transfer::DiskAdmission::new(&self.state)?;
         let _catalog = self.lock(libc::LOCK_EX)?;
         self.recover()?;
         let volume = self.find(name)?;
         let id = volume.metadata.id;
+        admission.require(&id)?;
         let (_, dir, disk) = self.read(&id)?;
         if entries(&dir)?.iter().any(|n| !MEMBERS.contains(&n.as_str())) {
             bail!("unrecognized volume member; removal refused");

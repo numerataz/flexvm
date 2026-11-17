@@ -147,6 +147,7 @@ mod tests {
             recovered: false,
             finalized: false,
             predecessor: None,
+            disks: Vec::new(),
         };
         let path = source_record(&offer.vm_id);
         let mut legacy = serde_json::to_value(&fence).unwrap();
@@ -207,6 +208,7 @@ mod tests {
             recovered: false,
             finalized: false,
             predecessor: None,
+            disks: Vec::new(),
         };
         write_record(&state, &source_record(&anchor.vm_id), &serde_json::to_vec(&fence).unwrap(), false).unwrap();
 
