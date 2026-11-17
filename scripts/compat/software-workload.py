@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run ordinary guest workloads through software VM lifecycle without host virtualization."""
 import argparse
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -78,9 +79,13 @@ def exercise(args):
         raise RuntimeError('foreground canary did not make fresh progress')
 
     def step(action, phase):
-        output = cli('exec', '-i', NAME, '/bin/sh', '-s', '--', action, nonce, phase, input=workload)
-        (args.output / f'{action}-{phase}.log').write_text(output)
-        return output
+        completed = cli('exec', '-i', NAME, '/bin/sh', '-s', '--', action, nonce, phase,
+                        input=workload, check=False, result=True)
+        (args.output / f'{action}-{phase}.log').write_text(completed.stdout)
+        (args.output / f'{action}-{phase}.stderr.log').write_text(completed.stderr)
+        if completed.returncode:
+            raise RuntimeError(f'workload {action}-{phase} exited {completed.returncode}; see its stdout/stderr logs')
+        return completed.stdout
 
     def verify(phase, before):
         capabilities = json.loads(cli('exec', NAME, '/guest-probe'))
@@ -101,7 +106,7 @@ def exercise(args):
         gate = 'while [ ! -x /state-probe ]; do sleep .05; done; exec /state-probe'
         with (args.output / 'guest.log').open('w') as out, (args.output / 'owner.log').open('w') as err:
             owner = subprocess.Popen([*base, 'software', '--name', NAME, '--control', 'serial', '--kernel', str(args.kernel),
-                                      '--mem', str(args.mem), '--vcpus', '2', '--timeout', '120', '--boot', args.boot,
+                                      '--mem', str(args.mem), '--vcpus', str(args.vcpus), '--timeout', '120', '--boot', args.boot,
                                       *(['--entrypoint', '[]', args.image, '/bin/sh', '-ec', gate] if args.boot == 'app' else [args.image])], stdout=out, stderr=err, env=environment)
         ready()
         # Software management supports streaming exec. Transfer opaque guest
@@ -182,10 +187,32 @@ rc-service flexvm-state-probe start''')
                 raise RuntimeError('distro restoration without runtime service reused its source engine')
             evidence['restore_without_runtime_service'] = {'status': 'passed', 'source_engine': target, 'target_engine': restored}
             target = restored
-            cli('kill', '--signal', 'TERM', NAME)
-            if owner.wait(timeout=30) != 0 or cli('wait', NAME).strip() != '0':
-                raise RuntimeError('software distro did not report completed OS poweroff')
-            evidence['poweroff'] = {'owner_status': 0, 'wait_status': 0}
+            # Keep the owned engine's console open across normal owner cleanup.
+            with contextlib.ExitStack() as held:
+                console = []
+                try:
+                    proc = Path('/proc') / str(target['pid'])
+                    start = int((proc / 'stat').read_text().rsplit(')', 1)[1].split()[19])
+                    if start != target['start']:
+                        raise RuntimeError('engine identity changed before shutdown diagnostics')
+                    words = (proc / 'cmdline').read_bytes().decode().split('\0')
+                    qmp = words[words.index('-qmp') + 1]
+                    if not qmp.startswith('unix:'):
+                        raise RuntimeError('engine QMP socket is not a local path')
+                    logs = Path(qmp[5:].split(',', 1)[0]).parent.parent / 'logs'
+                    for name in ('qemu.log.1', 'qemu.log'):
+                        if (logs / name).exists():
+                            console.append(held.enter_context((logs / name).open('rb')))
+                except (OSError, ValueError, RuntimeError) as error:
+                    (args.output / 'poweroff-console-error.log').write_text(str(error) + '\n')
+                started = time.monotonic()
+                try:
+                    cli('kill', '--signal', 'TERM', NAME)
+                    if owner.wait(timeout=min(args.poweroff_timeout, max(.1, deadline - time.monotonic()))) != 0 or cli('wait', NAME).strip() != '0':
+                        raise RuntimeError('software distro did not report completed OS poweroff')
+                    evidence['poweroff'] = {'owner_status': 0, 'wait_status': 0, 'elapsed_s': round(time.monotonic() - started, 3)}
+                finally:
+                    (args.output / 'poweroff-console.log').write_bytes(b''.join(stream.read() for stream in console))
         else:
             cli('kill', NAME)
             if cli('wait', NAME).strip() != '130':
@@ -215,7 +242,9 @@ def main():
     parser.add_argument('--image', default=IMAGE)
     parser.add_argument('--boot', choices=('app', 'systemd', 'openrc'), default='app')
     parser.add_argument('--mem', type=int, default=2048)
+    parser.add_argument('--vcpus', type=int, default=2)
     parser.add_argument('--timeout', type=int, default=1800)
+    parser.add_argument('--poweroff-timeout', type=int, default=30, help='bounded OS shutdown wait, within the overall test deadline')
     parser.add_argument('--require', action='append', default=[])
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--state', type=Path, help=argparse.SUPPRESS)
@@ -227,8 +256,8 @@ def main():
         return 0
     if os.geteuid() != 0:
         parser.error('run as root for private device masking and image preparation')
-    if not 1 <= args.timeout <= 3600 or not 512 <= args.mem <= 4096:
-        parser.error('--timeout must be 1..3600 and --mem 512..4096')
+    if not 1 <= args.timeout <= 3600 or not 512 <= args.mem <= 4096 or not 1 <= args.poweroff_timeout <= 300 or not 1 <= args.vcpus <= 8:
+        parser.error('--timeout must be 1..3600, --mem 512..4096 and --poweroff-timeout 1..300 and --vcpus 1..8')
     args.output.mkdir(parents=True, exist_ok=True)
     report_path = args.output / 'report.json'
     if report_path.exists():
@@ -242,6 +271,7 @@ def main():
               'scope': 'ordinary guest workload through software pause and fresh-owner stop/start',
               'binary_sha256': HELPERS['digest'](args.bin), 'kernel_sha256': HELPERS['digest'](args.kernel),
               'qemu_sha256': HELPERS['digest'](qemu), 'image': args.image, 'boot_profile': args.boot,
+              'vcpus': args.vcpus, 'memory_mib': args.mem, 'poweroff_timeout_s': args.poweroff_timeout,
               'workload': {'name': args.workload.name, 'sha256': HELPERS['digest'](args.workload)}}
     started = time.monotonic()
     def interrupted(number, _frame):
@@ -262,8 +292,8 @@ def main():
                        'for dev in /dev/kvm /dev/vhost-vsock; do if [ -e "$dev" ]; then mount --bind "$1" "$dev"; fi; done; shift; exec "$@"',
                        'sh', str(mask), 'strace', '-f', '-e', 'trace=file,init_module,finit_module,delete_module', '-o', str(trace),
                        sys.executable, str(Path(__file__).resolve()), '--worker', '--bin', str(args.bin), '--kernel', str(args.kernel),
-                       '--workload', str(args.workload), '--image', args.image, '--mem', str(args.mem), '--output', str(args.output),
-                       '--state', state, '--timeout', str(args.timeout), '--boot', args.boot]
+                       '--workload', str(args.workload), '--image', args.image, '--mem', str(args.mem), '--vcpus', str(args.vcpus), '--output', str(args.output),
+                       '--state', state, '--timeout', str(args.timeout), '--boot', args.boot, '--poweroff-timeout', str(args.poweroff_timeout)]
             for required in args.require:
                 command.extend(['--require', required])
             try:

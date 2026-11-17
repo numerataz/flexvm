@@ -103,6 +103,37 @@ real container CPU/memory/PID limits, user-manager execution, veth HTTP traffic,
 DNS and outbound HTTP. This does not establish Incus support or storage
 durability (#1325/#1329).
 
+## Kubernetes acceptance
+
+The `k3s` workload runs pinned K3s v1.37.2+k3s1 with its stock containerd,
+CoreDNS, local-path provisioner, Traefik and metrics-server. The `kind` workload
+runs pinned kind v0.33.0 and its digest-pinned Kubernetes v1.37.0 node image
+inside stock Ubuntu Docker. Binary and air-gap downloads have architecture-specific
+checksums; image identities and installed versions are retained in the evidence.
+
+Each creates two non-root application pods, an actual PVC and service. Checks
+retain node/pod UIDs, container identities/restart counts, random RAM canaries
+and advancing counters through the outer VM lifecycle. They verify configured
+CPU/memory limits, volume contents, service DNS, pod-to-pod traffic, outbound
+HTTP and NodePort traffic. K3s also verifies Traefik ingress.
+
+The native `k3s` and `kind` cases exercise run, suspend/resume, checkpoint/restore
+and migration. The software workload matrix runs both on x86_64 and aarch64
+with host virtualization devices masked and traced, exercising pause/unpause,
+fresh-emulator stop/start, restoration with the management service stopped and
+completed OS poweroff. Software Kubernetes fixtures allocate four vCPUs and
+4 GiB RAM with a bounded one-hour workload deadline. Failed workload stdout,
+stderr and available shutdown console logs remain in the artifacts.
+
+The current guest root is a RAM-backed union filesystem. These fixtures mount
+native tmpfs filesystems at the engines' standard data directories so their
+ordinary overlayfs snapshotters have a supported upper filesystem. K3s uses
+`/var/lib/rancher/k3s`; Docker uses both `/var/lib/docker` and
+`/var/lib/containerd` (its separate image store). They retain the normal overlay
+drivers and do not select a fallback snapshotter. Guest RAM includes the PVC
+data during saved-state operations; destroying the VM removes it. Durable
+writable disks remain tracked in #1329. These are single-node acceptance cases.
+
 ## Migration
 
 A configured local peer must use compatible CPU/kernel/Firecracker artifacts
