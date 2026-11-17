@@ -4,6 +4,7 @@
  * One VM, one vCPU, one copied real-mode 4 KiB slot, and port-output exits.
  */
 #include <linux/anon_inodes.h>
+#include <linux/atomic.h>
 #include <linux/fs.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
@@ -27,6 +28,7 @@ struct pvkvm {
 	void __iomem *mailbox;
 	void __iomem *doorbell;
 	wait_queue_head_t replied;
+	atomic_t interrupt_count;
 	int irq;
 	bool dead;
 	bool vm_open;
@@ -70,7 +72,7 @@ static int request(struct pvkvm *provider, enum pvkvm_command command, void *pag
 	void __iomem *m = provider->mailbox;
 	u32 before, seq;
 	long waited;
-	int status;
+	int status, interrupts;
 
 	if (provider->dead)
 		return -ENODEV;
@@ -80,6 +82,7 @@ static int request(struct pvkvm *provider, enum pvkvm_command command, void *pag
 		return -EIO;
 	}
 	seq = before + 1;
+	interrupts = atomic_read(&provider->interrupt_count);
 	if (page)
 		memcpy_toio(m + PVKVM_MEMORY_AT, page, PVKVM_MEMORY_LEN);
 	writel(page ? PVKVM_MEMORY_LEN : 0, m + PVKVM_DATA_SIZE_AT);
@@ -89,9 +92,12 @@ static int request(struct pvkvm *provider, enum pvkvm_command command, void *pag
 	writel(PVKVM_HOST_VECTOR, provider->doorbell + PVKVM_DOORBELL_AT);
 	if (command == PVKVM_RUN)
 		waited = wait_event_interruptible_timeout(provider->replied,
+				atomic_read(&provider->interrupt_count) != interrupts &&
 				readl(m + PVKVM_REPLY_AT) == seq, 5 * HZ);
 	else
-		waited = wait_event_timeout(provider->replied, readl(m + PVKVM_REPLY_AT) == seq, 5 * HZ);
+		waited = wait_event_timeout(provider->replied,
+				atomic_read(&provider->interrupt_count) != interrupts &&
+				readl(m + PVKVM_REPLY_AT) == seq, 5 * HZ);
 	if (waited <= 0) {
 		/* The parent can still finish the request. A fresh provider
 		 * must use a fresh mailbox.
@@ -447,6 +453,7 @@ static irqreturn_t reply_ready(int irq, void *data)
 {
 	struct pvkvm *p = data;
 
+	atomic_inc(&p->interrupt_count);
 	wake_up(&p->replied);
 	return IRQ_HANDLED;
 }
@@ -463,6 +470,7 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	result = pcim_enable_device(dev);
 	if (result)
 		return result;
+	pci_set_master(dev);
 	result = pcim_iomap_regions(dev, BIT(0) | BIT(2), KBUILD_MODNAME);
 	if (result)
 		return result;
@@ -472,6 +480,7 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	kref_init(&p->refs);
 	mutex_init(&p->lock);
 	init_waitqueue_head(&p->replied);
+	atomic_set(&p->interrupt_count, 0);
 	p->doorbell = pcim_iomap_table(dev)[0];
 	p->mailbox = pcim_iomap_table(dev)[2];
 	if (readl(p->doorbell + PVKVM_IVPOSITION_AT) != PVKVM_GUEST_POSITION ||
