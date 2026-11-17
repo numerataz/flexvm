@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Experimental x86 proof for a KVM client and a parent CPU worker.
- * One VM, one vCPU, one copied real-mode 4 KiB slot, and one port-output exit.
+ * One VM, one vCPU, one copied real-mode 4 KiB slot, and port-output exits.
  */
 #include <linux/anon_inodes.h>
 #include <linux/delay.h>
@@ -226,7 +226,7 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	result = mutex_lock_interruptible(&cpu->execution);
 	if (result)
 		return -EINTR;
-	if (cpu->ran) {
+	if (cpu->ran && cmd != KVM_RUN) {
 		mutex_unlock(&cpu->execution);
 		return -EOPNOTSUPP;
 	}
