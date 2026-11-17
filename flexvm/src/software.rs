@@ -811,8 +811,9 @@ pub fn restore(host: Host, vm_name: &str, notify: Option<std::fs::File>) -> Resu
         setup_signals(processes.clone());
         let config = restore_config(&metadata);
         let _reservation = Reservation::new(&host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)?;
-        let disks = metadata.open_disks(&host.state)?;
-        let verified = software_state::open(&path, config.profiles_for_disks(&disks)?)?;
+        let profiles = config.profiles_for_disk_ids(metadata.disks.iter().map(|disk| disk.volume_id.as_str()))?;
+        let verified = software_state::open(&path, profiles)?;
+        let disks = verified.manifest.open_disks(&host.state)?;
         let manifest = verified.manifest.clone();
         let prepared = verified.prepare(&name, &software_state::host_id(&host.state)?)?;
         let generation = prepared.generation;

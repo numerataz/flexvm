@@ -377,9 +377,13 @@ impl Config {
         Ok([self.profile()?, self.profile_for(Network::Legacy, &[])?])
     }
 
-    pub fn profiles_for_disks(&self, disks: &[volume::Writer]) -> Result<[software_state::Profile; 2]> {
-        let profile: Vec<_> = disks.iter().map(|disk| (disk.id.as_str(), PathBuf::from(format!("@disk:{}", disk.id)))).collect();
-        Ok([self.profile_for(Network::Private, &profile)?, self.profile_for(Network::Legacy, &profile)?])
+    fn disk_profile<'a>(ids: impl Iterator<Item = &'a str>) -> Vec<(&'a str, PathBuf)> {
+        ids.map(|id| (id, PathBuf::from(format!("@disk:{id}")))).collect()
+    }
+
+    pub fn profiles_for_disk_ids<'a>(&self, ids: impl Iterator<Item = &'a str>) -> Result<[software_state::Profile; 2]> {
+        let disks = Self::disk_profile(ids);
+        Ok([self.profile_for(Network::Private, &disks)?, self.profile_for(Network::Legacy, &disks)?])
     }
 
     fn profile_for(&self, network: Network, disks: &[(&str, PathBuf)]) -> Result<software_state::Profile> {
@@ -410,7 +414,7 @@ impl Config {
         if self.control != Control::Serial {
             bail!("software restore requires serial control");
         }
-        let [private, legacy] = self.profiles_for_disks(&disks)?;
+        let [private, legacy] = self.profiles_for_disk_ids(disks.iter().map(|disk| disk.id.as_str()))?;
         let network = if private == verified.manifest.profile {
             Network::Private
         } else if legacy == verified.manifest.profile {
@@ -439,7 +443,7 @@ impl Config {
         inputs.engine.unchanged()?;
         inputs.kernel.unchanged()?;
         inputs.rootfs.unchanged()?;
-        let disk_profile: Vec<_> = disks.iter().map(|disk| (disk.id.as_str(), PathBuf::from(format!("@disk:{}", disk.id)))).collect();
+        let disk_profile = Self::disk_profile(disks.iter().map(|disk| disk.id.as_str()));
         let profile = self.profile_for(network, &disk_profile)?;
         let root = SocketRoot::software()?;
         *processes.runtime.lock().unwrap() = Some(Arc::downgrade(&root));
