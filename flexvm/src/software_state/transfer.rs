@@ -13,6 +13,7 @@ use crate::host::{Host, PidFd};
 use crate::{bail, util::Result};
 
 pub(crate) mod bundle;
+pub(crate) mod finalize;
 
 const RECEIPT_DOMAIN: &[u8] = b"flexvm/software-retirement/v1\0";
 const ABORT_DOMAIN: &[u8] = b"flexvm/software-abort/v1\0";
@@ -152,6 +153,8 @@ struct SourceFence {
     source_key: String,
     destination_key: String,
     recovered: bool,
+    #[serde(default)]
+    finalized: bool,
 }
 
 fn source_record(vm_id: &str) -> String {
@@ -266,10 +269,18 @@ fn issue(state: &File, checkpoint: &File, offer: Offer, key: &Ed25519KeyPair, de
         bail!("transfer offer does not match the retired software checkpoint");
     }
     let path = source_record(&offer.vm_id);
-    let fence = SourceFence { offer, source_key: STANDARD.encode(key.public_key()), destination_key: destination_key.into(), recovered: false };
+    let fence =
+        SourceFence { offer, source_key: STANDARD.encode(key.public_key()), destination_key: destination_key.into(), recovered: false, finalized: false };
     let previous = read_fence(state, &fence.offer.vm_id)?;
     match &previous {
-        Some(existing) if existing == &fence => state.sync_all()?,
+        Some(existing)
+            if existing.offer == fence.offer
+                && existing.source_key == fence.source_key
+                && existing.destination_key == fence.destination_key
+                && !existing.recovered =>
+        {
+            state.sync_all()?
+        }
         _ => {
             let floor = local_restart_floor(state, &manifest)?;
             if fence.offer.generation <= floor || previous.as_ref().is_some_and(|existing| fence.offer.transfer_id == existing.offer.transfer_id) {
@@ -330,6 +341,9 @@ fn recover_source(state: &File, receipt: Receipt) -> Result<()> {
     UnparsedPublicKey::new(&ED25519, key)
         .verify(&receipt.offer.signing_message(ABORT_DOMAIN)?, &signature)
         .map_err(|_| "invalid software transfer abort signature")?;
+    if fence.finalized {
+        bail!("finalized software transfer cannot recover at the source");
+    }
     if fence.recovered {
         state.sync_all()?;
     } else {
@@ -521,6 +535,7 @@ mod tests {
             source_key: STANDARD.encode(signer.public_key()),
             destination_key: STANDARD.encode(peer.public_key()),
             recovered: false,
+            finalized: false,
         };
         let path = source_record(&first.vm_id);
         write_record(&local, &path, &serde_json::to_vec(&outgoing).unwrap(), false).unwrap();
