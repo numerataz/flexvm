@@ -1,0 +1,28 @@
+/* SPDX-License-Identifier: GPL-2.0-only */
+#ifndef FLEXVM_PVKVM_MAILBOX_H
+#define FLEXVM_PVKVM_MAILBOX_H
+
+#define PVKVM_MAGIC        0x4d564b46
+#define PVKVM_VERSION      1
+#define PVKVM_MAGIC_AT     0
+#define PVKVM_VERSION_AT   4
+#define PVKVM_REQUEST_AT   8
+#define PVKVM_REPLY_AT     12
+#define PVKVM_COMMAND_AT   16
+#define PVKVM_STATUS_AT    20
+#define PVKVM_DATA_SIZE_AT 24
+#define PVKVM_IO_VALUE_AT  28
+#define PVKVM_MEMORY_AT    4096
+#define PVKVM_MEMORY_LEN   4096
+#define PVKVM_GUEST_START  4096
+#define PVKVM_IO_PORT      0x30
+
+enum pvkvm_command {
+	PVKVM_CREATE_VM = 1,
+	PVKVM_CLOSE_VM,
+	PVKVM_CREATE_VCPU,
+	PVKVM_CLOSE_VCPU,
+	PVKVM_RUN,
+};
+
+#endif
