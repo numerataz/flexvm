@@ -79,6 +79,14 @@ fn ask(uds: &Path, line: &str, deadline: Instant) -> Result<(u8, Vec<u8>)> {
     ask_watched(uds, line, deadline, |_| Ok(()))
 }
 
+/// Preserve the I/O kind used by retry policy, and identify the request without logging its payload.
+fn request_error(phase: &str, line: &str, error: Error) -> Error {
+    match error.downcast::<std::io::Error>() {
+        Ok(error) => std::io::Error::new(error.kind(), format!("{phase} ({}): {error}", line.split_whitespace().next().unwrap_or("unknown"))).into(),
+        Err(error) => error,
+    }
+}
+
 /// `ask`, with `watch` shown the connection before anything is sent.
 fn ask_watched(uds: &Path, line: &str, deadline: Instant, watch: impl FnOnce(&UnixStream) -> Result<()>) -> Result<(u8, Vec<u8>)> {
     let left = deadline.saturating_duration_since(Instant::now());
@@ -88,12 +96,13 @@ fn ask_watched(uds: &Path, line: &str, deadline: Instant, watch: impl FnOnce(&Un
     if ABANDONED.lock().unwrap().iter().any(|p| p == uds) {
         bail!("its firecracker exited");
     }
-    let s = crate::util::connect_unix(uds, left)?;
+    let s = crate::util::connect_unix(uds, left).map_err(|e| request_error("vsock socket", line, e.into()))?;
     if fault("guest_drop") {
         return Err(lost("injected fault: guest connection refused"));
     }
     watch(&s)?;
-    let reply = read_frame(&mut handshake(By { s, at: deadline }, line)?)?;
+    let mut stream = handshake(By { s, at: deadline }, line).map_err(|e| request_error("vsock handshake", line, e))?;
+    let reply = read_frame(&mut stream).map_err(|e| request_error("guest reply", line, e))?;
     let reply = reply.ok_or_else(|| lost(format!("guest closed the connection before answering {line:?}")))?;
     if tripped_once("guest_lose_reply") {
         return Err(lost("injected fault: guest reply lost"));
@@ -801,6 +810,42 @@ mod tests {
         assert!(readiness(&path, "PROBE 80", TIMEOUT, &|| Ok(())).is_err());
         assert!(readiness(&path, "CHECK 1 78", TIMEOUT, &|| Ok(())).unwrap_err().to_string().contains("unexpected reply"));
         server.join().unwrap();
+    }
+
+    #[test]
+    fn request_timeouts_identify_handshake_or_reply_without_payloads() {
+        for (phase, acknowledged) in [("vsock handshake", false), ("guest reply", true)] {
+            let (_dir, path, listener) = agent("request-phase");
+            let (release, wait) = std::sync::mpsc::channel();
+            let server = std::thread::spawn(move || {
+                let (mut stream, line) = accept(&listener);
+                assert_eq!(line, "START private-payload\n");
+                if acknowledged {
+                    stream.get_mut().write_all(b"OK 1\n").unwrap();
+                    // A partial frame must keep the same absolute deadline and phase.
+                    stream.get_mut().write_all(&[FRAME_MSG, 0]).unwrap();
+                }
+                wait.recv().unwrap();
+            });
+            let error = ask(&path, "START private-payload", Instant::now() + Duration::from_millis(150)).unwrap_err();
+            release.send(()).unwrap();
+            server.join().unwrap();
+            assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), ErrorKind::TimedOut);
+            assert!(error.to_string().starts_with(&format!("{phase} (START): ")), "{error}");
+            assert!(!error.to_string().contains("private-payload"));
+            assert!(!dropped(&error));
+        }
+    }
+
+    #[test]
+    fn request_diagnostics_preserve_retry_classification() {
+        for kind in [ErrorKind::ConnectionRefused, ErrorKind::ConnectionReset, ErrorKind::ConnectionAborted, ErrorKind::BrokenPipe, ErrorKind::UnexpectedEof] {
+            let error = request_error("vsock handshake", "PING", std::io::Error::from(kind).into());
+            assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), kind);
+            assert!(dropped(&error));
+        }
+        let error = request_error("guest reply", "PING", "non-I/O error".into());
+        assert_eq!(error.to_string(), "non-I/O error");
     }
 
     #[test]
