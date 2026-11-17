@@ -49,6 +49,7 @@ impl Finalized {
             || offer.vm_id != previous.vm_id
             || offer.source_host != previous.destination_host
             || offer.generation <= previous.generation
+            || !offer.follows_routed_network(previous)
         {
             bail!("software handoff chain link does not continue its predecessor");
         }
@@ -139,6 +140,7 @@ mod tests {
             transfer_id: "22".repeat(16),
             manifest_sha256: "33".repeat(32),
             generation: 5,
+            routed: None,
         };
         let mut fence = SourceFence {
             offer: offer.clone(),
@@ -200,6 +202,7 @@ mod tests {
             transfer_id: "33".repeat(16),
             manifest_sha256: "44".repeat(32),
             generation: 5,
+            routed: None,
         };
         let fence = SourceFence {
             offer: anchor.clone(),

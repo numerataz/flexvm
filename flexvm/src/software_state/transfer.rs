@@ -10,7 +10,9 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use ring::signature::{Ed25519KeyPair, KeyPair, UnparsedPublicKey, ED25519};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use super::{host_id, host_id_in, parent_directory, parent_lock, present, private_directory, read_manifest, record, write_record, Manifest, Retirement};
+use super::{
+    host_id, host_id_in, parent_directory, parent_lock, present, private_directory, read_manifest, record, write_record, Manifest, Retirement, RoutedNetwork,
+};
 use crate::host::{Host, PidFd};
 use crate::{bail, util::Result};
 
@@ -29,6 +31,8 @@ struct Offer {
     transfer_id: String,
     manifest_sha256: String,
     generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    routed: Option<RoutedNetwork>,
 }
 
 impl Offer {
@@ -43,7 +47,27 @@ impl Offer {
         if self.destination_host == self.source_host {
             bail!("software transfer source and destination must differ");
         }
+        if let Some(network) = self.routed {
+            let ip = network.address.v4;
+            if network.generation == 0
+                || network.revision.is_none_or(|revision| revision == u64::MAX)
+                || ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_multicast()
+                || ip.is_broadcast()
+            {
+                bail!("software transfer has an invalid routed address or revision");
+            }
+        }
         Ok(())
+    }
+
+    fn follows_routed_network(&self, prior: &Self) -> bool {
+        match (self.routed, prior.routed) {
+            (None, None) => true,
+            (Some(next), Some(previous)) => next.address == previous.address && next.generation == previous.generation && next.revision > previous.revision,
+            _ => false,
+        }
     }
 
     fn signing_message(&self, domain: &[u8]) -> Result<Vec<u8>> {
@@ -240,7 +264,8 @@ fn return_fence(state: &File, offer: &Offer, source_key: &str, chain: &[finalize
         }
         (previous, key) = (link, successor);
     }
-    if previous.destination_host != offer.source_host || key != source_key || previous.generation >= offer.generation {
+    if previous.destination_host != offer.source_host || key != source_key || previous.generation >= offer.generation || !offer.follows_routed_network(previous)
+    {
         bail!("software return transfer does not extend the pinned outgoing handoff");
     }
     Ok(Some(fence.offer))
@@ -254,6 +279,17 @@ fn require_unchanged_return_fence(state: &File, journal: &Journal) -> Result<()>
         bail!("software transfer outgoing handoff changed after preparation");
     }
     Ok(())
+}
+
+pub(crate) fn active_routed_loan(state: &Path, manifest: &Manifest) -> Result<bool> {
+    let Some(network) = manifest.routed else { return Ok(false) };
+    let state = parent_directory(state)?;
+    let _transfer = parent_lock(&state, libc::LOCK_EX)?;
+    let Some(fence) = read_fence(&state, &manifest.vm_id)? else { return Ok(false) };
+    if fence.offer.routed.is_some_and(|outgoing| outgoing.address == network.address && outgoing.generation == network.generation) {
+        return fence.active(&state);
+    }
+    Ok(false)
 }
 
 fn read_fence(state: &File, vm_id: &str) -> Result<Option<SourceFence>> {
@@ -286,9 +322,6 @@ pub(super) fn local_restart_floor(state: &File, manifest: &Manifest) -> Result<u
 
 fn retired_checkpoint(checkpoint: &File) -> Result<(Manifest, Retirement)> {
     let manifest = read_manifest(checkpoint)?;
-    if manifest.routed.is_some() {
-        bail!("software routed addresses currently support local restore only");
-    }
     let retirement = Retirement::of(&manifest)?;
     if present(checkpoint, "STARTED")? || present(checkpoint, "DISCARDED")? {
         bail!("software transfer needs an unconsumed checkpoint");
@@ -325,12 +358,44 @@ pub(crate) fn offer(host: &Host, vm: &str, destination: &str) -> Result<serde_js
         transfer_id: crate::util::random_hex(16)?,
         manifest_sha256: retirement.manifest_sha256,
         generation: proposed_generation(&checkpoint, floor.max(manifest.owner_generation))?,
+        routed: manifest.routed,
     };
     offer.validate()?;
     Ok(serde_json::to_value(offer)?)
 }
 
-fn issue(state: &File, checkpoint: &File, offer: Offer, key: &Ed25519KeyPair, destination_key: &str) -> Result<Receipt> {
+/// An existing native loan can be reused only by an exact retry or a
+/// reissued transfer whose prior software loan was explicitly aborted.
+fn check_routed_loan(host: &Host, lock: &crate::host::Locked, vm: &str, network: RoutedNetwork, retry_owned_loan: bool) -> Result<()> {
+    let ip = network.address.v4;
+    if host.config_now().vm_addr(ip) != network.address {
+        bail!("software transfer routed address no longer matches the source network");
+    }
+    let address = host.addr(lock, ip)?;
+    let owner = address.holder_id.as_ref().ok_or("software transfer source address has no recorded owner")?;
+    if address.holder.as_deref() != Some(vm)
+        || address.seen != network.generation
+        || address.held != network.generation
+        || !address.current(network.generation)
+        || PidFd::open(owner)?.is_some()
+        || Some(address.rev) != network.revision
+        || address.arriving.is_some()
+        || address.leaving.is_some()
+        || address.lent.is_some_and(|generation| !retry_owned_loan || generation != network.generation)
+    {
+        bail!("software transfer routed source no longer owns the exact address revision");
+    }
+    Ok(())
+}
+
+fn issue_with_host(
+    state: &File,
+    checkpoint: &File,
+    offer: Offer,
+    key: &Ed25519KeyPair,
+    destination_key: &str,
+    location: Option<(&Host, &str)>,
+) -> Result<Receipt> {
     if decode::<32>(destination_key, "destination public key")?.as_slice() == key.public_key().as_ref() {
         bail!("software transfer source and destination signing keys must differ");
     }
@@ -342,58 +407,85 @@ fn issue(state: &File, checkpoint: &File, offer: Offer, key: &Ed25519KeyPair, de
         || offer.source_host != manifest.host_id
         || offer.vm_id != manifest.vm_id
         || offer.manifest_sha256 != retirement.manifest_sha256
+        || offer.routed != manifest.routed
         || offer.generation < proposed_generation(checkpoint, manifest.owner_generation)?
     {
         bail!("transfer offer does not match the retired software checkpoint");
     }
+    if offer.routed.is_some() && location.is_none() {
+        bail!("software routed retirement needs its source address owner");
+    }
     let path = source_record(&offer.vm_id);
+    let predecessor = bundle::activate::preceding_grant(state, &manifest)?;
+    if predecessor.as_ref().is_some_and(|previous| !offer.follows_routed_network(previous)) {
+        bail!("software transfer does not preserve the preceding routed address and revision");
+    }
     let fence = SourceFence {
         offer,
         source_key: STANDARD.encode(key.public_key()),
         destination_key: destination_key.into(),
         recovered: false,
         finalized: false,
-        predecessor: bundle::activate::preceding_grant(state, &manifest)?,
+        predecessor,
         disks: manifest.disks.clone(),
     };
     let previous = read_fence(state, &fence.offer.vm_id)?;
-    match &previous {
-        Some(existing)
-            if existing.offer == fence.offer
-                && existing.source_key == fence.source_key
-                && existing.destination_key == fence.destination_key
-                && existing.disks == fence.disks
-                && !existing.recovered =>
-        {
-            if !existing.active(state)? {
-                bail!("software transfer already returned to this source");
-            }
-            state.sync_all()?
+    let exact_retry = previous.as_ref().filter(|existing| {
+        existing.offer == fence.offer
+            && existing.source_key == fence.source_key
+            && existing.destination_key == fence.destination_key
+            && existing.disks == fence.disks
+            && !existing.recovered
+    });
+    if let Some(existing) = exact_retry {
+        if !existing.active(state)? {
+            bail!("software transfer already returned to this source");
         }
-        _ => {
-            let floor = local_restart_floor(state, &manifest)?;
-            if fence.offer.generation <= floor || previous.as_ref().is_some_and(|existing| fence.offer.transfer_id == existing.offer.transfer_id) {
-                bail!("software VM already has a newer or conflicting transfer fence");
-            }
-            let _writers = if fence.disks.is_empty() {
-                Vec::new()
-            } else {
-                let catalog = crate::volume::Catalog::from_state(state.try_clone()?)?;
-                fence
-                    .disks
-                    .iter()
-                    .map(|disk| {
-                        require_local_disk(state, &disk.volume_id)?;
-                        disk.verify_writer(catalog.writer_for_retirement(&disk.volume_id)?)
-                    })
-                    .collect::<Result<Vec<_>>>()?
-            };
-            let bytes = serde_json::to_vec(&fence)?;
-            if bytes.len() > 8192 {
-                bail!("software transfer source fence is too large");
-            }
-            write_record(state, &path, &bytes, previous.is_some())?;
+    } else {
+        let floor = local_restart_floor(state, &manifest)?;
+        if fence.offer.generation <= floor || previous.as_ref().is_some_and(|existing| fence.offer.transfer_id == existing.offer.transfer_id) {
+            bail!("software VM already has a newer or conflicting transfer fence");
         }
+    }
+
+    let _writers = if exact_retry.is_some() || fence.disks.is_empty() {
+        Vec::new()
+    } else {
+        let catalog = crate::volume::Catalog::from_state(state.try_clone()?)?;
+        fence
+            .disks
+            .iter()
+            .map(|disk| {
+                require_local_disk(state, &disk.volume_id)?;
+                disk.verify_writer(catalog.writer_for_retirement(&disk.volume_id)?)
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    let loan = match (fence.offer.routed, location) {
+        (Some(network), Some((host, name))) => {
+            // Check the native claim before creating the fence. Hold its lock
+            // through publication, after disk verification has finished.
+            let lock = host.lock()?;
+            let retry_owned_loan = exact_retry.is_some() || previous.as_ref().is_some_and(|old| old.recovered && old.offer.routed == Some(network));
+            check_routed_loan(host, &lock, name, network, retry_owned_loan)?;
+            Some((host, lock, network))
+        }
+        _ => None,
+    };
+
+    if exact_retry.is_some() {
+        state.sync_all()?;
+    } else {
+        let bytes = serde_json::to_vec(&fence)?;
+        if bytes.len() > 8192 {
+            bail!("software transfer source fence is too large");
+        }
+        write_record(state, &path, &bytes, previous.is_some())?;
+    }
+    // No signed receipt escapes until both records are durable. An exact
+    // retry can repair a fence whose address loan did not finish publishing.
+    if let Some((host, lock, network)) = loan {
+        host.lend(&lock, network.address.v4, network.generation, 0, &fence.offer.destination_host)?;
     }
     signed_receipt(fence.offer, key, RECEIPT_DOMAIN)
 }
@@ -423,7 +515,7 @@ pub(crate) fn retire(host: &Host, vm: &str, input: &Path, key_file: &Path, desti
     let _name = host.take_name(vm, true)?;
     let state = parent_directory(&host.state)?;
     let checkpoint = private_directory(&host.suspended(vm)?)?;
-    Ok(serde_json::to_value(issue(&state, &checkpoint, offer, &key, destination_key)?)?)
+    Ok(serde_json::to_value(issue_with_host(&state, &checkpoint, offer, &key, destination_key, Some((host, vm)))?)?)
 }
 
 pub(crate) fn acknowledge_abort(state: &Path, input: &Path, key_file: &Path) -> Result<serde_json::Value> {
@@ -560,6 +652,10 @@ mod tests {
     use super::*;
     use crate::test_util::TempDir;
 
+    fn issue(state: &File, checkpoint: &File, offer: Offer, key: &Ed25519KeyPair, destination_key: &str) -> Result<Receipt> {
+        issue_with_host(state, checkpoint, offer, key, destination_key, None)
+    }
+
     fn offer(state: &Path) -> Offer {
         Offer {
             vm_id: "11".repeat(16),
@@ -568,7 +664,77 @@ mod tests {
             transfer_id: "33".repeat(16),
             manifest_sha256: "44".repeat(32),
             generation: 7,
+            routed: None,
         }
+    }
+
+    #[test]
+    fn routed_handoffs_bind_address_generation_and_advance_revision() {
+        let tmp = TempDir::new("software-routed-offer");
+        let mut prior = offer(&tmp);
+        let address = crate::net::VmAddr { v4: "192.0.2.34".parse().unwrap(), v6: None };
+        let network = RoutedNetwork { address, generation: 9, revision: Some(2) };
+        prior.routed = Some(network);
+        let signer = key(1);
+        let proof = signed_receipt(prior.clone(), &signer, RECEIPT_DOMAIN).unwrap();
+        let signature = decode::<64>(&proof.signature, "retirement signature").unwrap();
+        let verifier = UnparsedPublicKey::new(&ED25519, signer.public_key().as_ref());
+        assert!(verifier.verify(&prior.signing_message(RECEIPT_DOMAIN).unwrap(), &signature).is_ok());
+
+        let mut successor = prior.clone();
+        assert!(!successor.follows_routed_network(&prior));
+        successor.routed = Some(RoutedNetwork { revision: Some(3), ..network });
+        assert!(successor.validate().is_ok());
+        assert!(successor.follows_routed_network(&prior));
+        assert!(verifier.verify(&successor.signing_message(RECEIPT_DOMAIN).unwrap(), &signature).is_err());
+        successor.routed = Some(RoutedNetwork { generation: 10, revision: Some(3), ..network });
+        assert!(!successor.follows_routed_network(&prior));
+        successor.routed = Some(RoutedNetwork { revision: None, ..network });
+        assert!(successor.validate().is_err());
+        successor.routed = None;
+        assert!(!successor.follows_routed_network(&prior));
+    }
+
+    #[test]
+    fn routed_source_loan_reserves_only_the_exact_retired_claim() {
+        let tmp = TempDir::new("software-routed-loan");
+        let mut host = Host::open(&tmp.join("state"), &tmp.join("run")).unwrap();
+        host.configure(|config| {
+            config.vm_ips = "192.0.2.80-192.0.2.81".into();
+            Ok(())
+        })
+        .unwrap();
+        let name = host.take_name("source", false).unwrap();
+        let claim = {
+            let lock = host.lock().unwrap();
+            host.claim_new(&lock, &name.name, Some("192.0.2.80".parse().unwrap())).unwrap()
+        };
+        let network = RoutedNetwork { address: claim.ip.into(), generation: claim.gen, revision: Some(claim.rev) };
+        claim.keep();
+        let record = host.state.join("addrs").join(network.address.v4.to_string());
+        let mut address: crate::host::Addr = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+        let check = |name, network, retry| {
+            let lock = host.lock().unwrap();
+            check_routed_loan(&host, &lock, name, network, retry)
+        };
+        assert!(check("source", network, false).is_err(), "an active owner cannot be retired by this process");
+        address.holder_id.as_mut().unwrap().start = 0;
+        fs::write(&record, serde_json::to_vec(&address).unwrap()).unwrap();
+
+        assert!(check("wrong-vm", network, false).is_err());
+        assert!(check("source", RoutedNetwork { revision: Some(9), ..network }, false).is_err());
+        assert_eq!(host.addr(&host.lock().unwrap(), network.address.v4).unwrap().lent, None);
+
+        check("source", network, false).unwrap();
+        host.lend(&host.lock().unwrap(), network.address.v4, network.generation, 0, "remote").unwrap();
+        assert!(check("source", network, false).is_err(), "a new transfer cannot reuse another loan");
+        check("source", network, true).unwrap();
+        let lock = host.lock().unwrap();
+        let lent = host.addr(&lock, network.address.v4).unwrap();
+        assert_eq!(lent.lent, Some(network.generation));
+        assert!(lent.leaving.is_none(), "stopped transfers use the software receipt for reconciliation");
+        host.release(&lock, network.address.v4, "source", None).unwrap();
+        assert!(host.claim_new(&lock, "another-vm", Some(network.address.v4)).is_err());
     }
 
     fn key(seed: u8) -> Ed25519KeyPair {

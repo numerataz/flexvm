@@ -86,6 +86,7 @@ pub struct Routed {
     dns: Vec<IpAddr>,
     host: Host,
     claim: Option<AddrClaim>,
+    incoming: bool,
     keep: AtomicBool,
 }
 
@@ -96,8 +97,8 @@ impl Routed {
             let lock = host.lock()?;
             host.claim_new_in(&lock, &config, name, None)?
         };
-        let network = software_state::RoutedNetwork { address: config.vm_addr(claim.ip), generation: claim.gen };
-        Self::prepare(host, &config, claim, network, false)
+        let network = software_state::RoutedNetwork { address: config.vm_addr(claim.ip), generation: claim.gen, revision: Some(claim.rev) };
+        Self::prepare(host, &config, claim, network, false, false)
     }
 
     pub fn restore(host: &Host, name: &str, network: software_state::RoutedNetwork) -> Result<Self> {
@@ -111,12 +112,67 @@ impl Routed {
             if address.holder.as_deref() != Some(name) || address.held != network.generation {
                 bail!("software checkpoint no longer holds its routed address");
             }
+            if network.revision.is_some_and(|revision| revision > address.rev) {
+                bail!("software checkpoint's routed revision was never published here");
+            }
+            // The local software preparation has already rejected an active
+            // outbound receipt. Any loan on this exact generation was aborted.
+            if address.lent == Some(network.generation) {
+                host.unlend(&lock, network.address.v4, network.generation)?;
+            }
             host.claim_incoming(&lock, name, network.address.v4, network.generation, None)?
         };
-        Self::prepare(host, &config, claim, network, true)
+        Self::prepare(host, &config, claim, network, false, true)
     }
 
-    fn prepare(host: &Host, config: &crate::host::Config, claim: AddrClaim, network: software_state::RoutedNetwork, keep: bool) -> Result<Self> {
+    pub fn arrive(host: &Host, name: &str, network: software_state::RoutedNetwork, returning: bool) -> Result<Self> {
+        let config = host.config_now();
+        let ip = network.address.v4;
+        let revision = network.revision.and_then(|previous| previous.checked_add(1)).ok_or("software routed transfer needs a valid revision")?;
+        crate::listen::check_vm_ip(host, ip, &crate::listen::known_peers(host)?)?;
+        if config.vm_addr(ip) != network.address {
+            bail!("software transfer routed address does not match the destination network");
+        }
+        if !returning && config.range()?.allocatable(ip) {
+            bail!("software transfer cannot take an address from the destination's own pool");
+        }
+        let claim = {
+            let lock = host.lock()?;
+            let address = host.addr(&lock, ip)?;
+            if address.arriving.is_some()
+                || address.leaving.is_some()
+                || !address.current(network.generation)
+                || (address.seen == network.generation && address.rev >= revision)
+            {
+                bail!("software transfer routed address was superseded or is moving");
+            }
+            if returning {
+                if address.lent != Some(network.generation) || address.seen != network.generation {
+                    bail!("software transfer return does not match this host's routed loan");
+                }
+            } else if address.lent.is_some() || host.held(&address) {
+                bail!("software transfer routed address is already held");
+            }
+            if let Some(previous) = address.holder.as_deref() {
+                let owner = address.holder_id.as_ref().ok_or("software transfer has an unidentified previous address holder")?;
+                if (returning && address.held != network.generation) || crate::host::PidFd::open(owner)?.is_some() {
+                    bail!("software transfer routed address still has a live or conflicting holder");
+                }
+                host.release(&lock, ip, previous, Some(owner))?;
+            }
+            host.claim_incoming(&lock, name, ip, network.generation, Some(revision))?
+        };
+        Self::prepare(host, &config, claim, network, true, false)
+    }
+
+    fn prepare(
+        host: &Host,
+        config: &crate::host::Config,
+        claim: AddrClaim,
+        network: software_state::RoutedNetwork,
+        incoming: bool,
+        keep: bool,
+    ) -> Result<Self> {
         let owner = Ident::me();
         let alias = crate::host::tap_alias(&host.run, &owner);
         let tap = (|| {
@@ -133,26 +189,48 @@ impl Routed {
                 return Err(error);
             }
         };
-        Ok(Self { tap, index, network, dns: config.guest_dns(), host: host.clone(), claim: Some(claim), keep: AtomicBool::new(keep) })
+        Ok(Self { tap, index, network, dns: config.guest_dns(), host: host.clone(), claim: Some(claim), incoming, keep: AtomicBool::new(keep) })
     }
 
-    fn checkpoint(&self) -> Result<software_state::RoutedNetwork> {
+    fn current_claim(&self) -> Result<(&AddrClaim, crate::host::Locked)> {
         let claim = self.claim.as_ref().ok_or("software routed guest has no address claim")?;
         let lock = self.host.fence(claim.ip, claim.gen)?;
         let address = self.host.addr(&lock, claim.ip)?;
-        if address.held != claim.gen || address.holder_id.as_ref() != Some(&Ident::me()) {
-            bail!("software checkpoint no longer owns its routed address");
+        if address.held != claim.gen || address.holder_id.as_ref() != Some(&Ident::me()) || address.rev > claim.rev {
+            bail!("software guest no longer owns its routed address revision");
         }
+        Ok((claim, lock))
+    }
+
+    fn checkpoint(&self) -> Result<software_state::RoutedNetwork> {
+        let (claim, lock) = self.current_claim()?;
         // A newly allocated address normally stays unsynced while its VM runs.
         self.host.sync_addr(&lock, claim.ip)?;
-        Ok(self.network)
+        Ok(software_state::RoutedNetwork { revision: Some(claim.rev), ..self.network })
     }
 
     fn publish(&self) -> Result<()> {
-        let claim = self.claim.as_ref().ok_or("software routed guest has no address claim")?;
-        let lock = self.host.fence(claim.ip, claim.gen)?;
+        let (claim, lock) = self.current_claim()?;
         net::route(self.network.address, self.index)?;
-        self.host.publish_live(&lock, claim.ip, claim.gen, claim.rev)
+        let publication = if self.incoming {
+            self.host.advance(&lock, claim.ip, claim.gen, claim.rev)
+        } else {
+            self.host.publish_live(&lock, claim.ip, claim.gen, claim.rev)
+        };
+        if publication.is_err() && self.incoming {
+            // The old peer route is still authoritative if committing the new
+            // revision failed. Only the VM's ephemeral TAP is abandoned.
+            let _ = self.host.reinstall(&lock, claim.ip, Some(&Ident::me()));
+        }
+        publication
+    }
+
+    fn complete_import(&self) -> Result<()> {
+        if self.incoming {
+            let (claim, lock) = self.current_claim()?;
+            self.host.unlend(&lock, claim.ip, claim.gen)?;
+        }
+        Ok(())
     }
 }
 
@@ -835,6 +913,13 @@ impl Machine {
     pub fn restore_route(&self) -> Result<()> {
         if let Some(routed) = &self.routed {
             routed.publish()?;
+        }
+        Ok(())
+    }
+
+    pub fn complete_routed_import(&self) -> Result<()> {
+        if let Some(routed) = &self.routed {
+            routed.complete_import()?;
         }
         Ok(())
     }

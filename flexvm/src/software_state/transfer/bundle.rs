@@ -36,6 +36,7 @@ impl Header {
         if &self.offer != expected
             || self.manifest.host_id != expected.source_host
             || self.manifest.vm_id != expected.vm_id
+            || self.manifest.routed != expected.routed
             || self.manifest.owner_generation >= expected.generation
             || Retirement::of(&self.manifest)?.manifest_sha256 != expected.manifest_sha256
         {
@@ -315,6 +316,7 @@ mod tests {
             transfer_id: "33".repeat(16),
             manifest_sha256: Retirement::of(&manifest).unwrap().manifest_sha256,
             generation: manifest.owner_generation + 1,
+            routed: manifest.routed,
         };
         let header = Header { offer: offer.clone(), manifest };
         let mut wire = Vec::new();

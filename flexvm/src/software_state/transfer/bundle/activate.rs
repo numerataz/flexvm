@@ -195,6 +195,10 @@ impl<'a> Activation<'a> {
         &self.header.manifest
     }
 
+    pub(crate) fn returns_routed_address(&self) -> bool {
+        self.decision.return_fence.as_ref().is_some_and(|previous| previous.routed.is_some())
+    }
+
     pub(crate) fn verify_inputs(&self, profiles: &[Profile], trusted_engine: &Path) -> Result<Verified> {
         let local = Input::open(&trusted_engine.canonicalize()?)?;
         if local.artifact != self.header.manifest.engine {
