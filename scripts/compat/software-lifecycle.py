@@ -11,6 +11,7 @@ import runpy
 import select
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -33,9 +34,19 @@ def exercise(args):
         env['FLEXVM_TEST_KILL_PARENT_SYNC'] = str(args.output / 'kill-parent-sync')
         return env
 
+    def phase(event, words, result=None):
+        try:
+            with (args.output / 'phases.jsonl').open('a') as log:
+                log.write(json.dumps({'event': event, 'monotonic_s': time.monotonic(),
+                                      'command': words, 'status': result}, default=str) + '\n')
+        except OSError:
+            pass
+
     def cli(*words, env=None, pending=False):
+        phase('begin', words)
         result = subprocess.run([*base, *words], capture_output=True, text=True,
                                 timeout=max(.1, deadline - time.monotonic()), env=env)
+        phase('end', words, result.returncode)
         if pending and result.returncode == 1:
             return None
         if result.returncode:
@@ -505,6 +516,9 @@ def exercise(args):
             evidence['destination_transfer_activation'] = 'passed'
         evidence.update(status='passed', boots=1, delivered_ticks=len(ticks))
         (args.output / 'owner.json').write_text(json.dumps(evidence, indent=2) + '\n')
+    except Exception:
+        retain_failed_state(args.state, args.output)
+        raise
     finally:
         try:
             subprocess.run([*base, 'kill', 'state-test'], capture_output=True, timeout=5)
@@ -518,6 +532,47 @@ def exercise(args):
                 except subprocess.TimeoutExpired:
                     owner.kill()
                     owner.wait(timeout=5)
+
+
+def retain_failed_state(directory, output):
+    """Archive only this helper's private fixture state after an already failed run."""
+    if (output / 'failure-state.json').exists() or (output / 'failure-state.tar.zst').exists():
+        return
+    report = {"status": "failed", "logical_bytes": 0, "entries": 0, "excluded": ["state/images"]}
+    try:
+        for root, directories, files in os.walk(directory / 'state', followlinks=False):
+            if Path(root) == directory / 'state':
+                directories[:] = [name for name in directories if name != 'images']
+                files = [name for name in files if name != 'images']
+            for name in directories + files:
+                entry = Path(root) / name
+                mode = entry.lstat()
+                report['entries'] += 1
+                if report['entries'] > 65536:
+                    raise ValueError('failure state exceeds the entry budget')
+                if stat.S_ISREG(mode.st_mode):
+                    report['logical_bytes'] += mode.st_size
+                    if report['logical_bytes'] > 2 << 30:
+                        raise ValueError('failure state exceeds the 2 GiB logical budget')
+                elif not (stat.S_ISDIR(mode.st_mode) or stat.S_ISLNK(mode.st_mode)):
+                    raise ValueError(f'failure state contains a special file: {entry}')
+        archive = output / 'failure-state.tar.zst'
+        partial = output / 'failure-state.tar.zst.partial'
+        with (output / 'failure-copy.log').open('wb') as log:
+            subprocess.run(['tar', '--sparse', '--blocking-factor=2048', '--one-file-system', '--exclude=state/images',
+                            '-I', 'zstd -T1 -1', '-cf', str(partial),
+                            '-C', str(directory), 'state'], stdout=log,
+                           stderr=subprocess.STDOUT, timeout=30, check=True)
+        partial.replace(archive)
+        report.update(status='captured', archive=archive.name, sha256=HELPERS['digest'](archive), bytes=archive.stat().st_size)
+    except Exception as error:
+        report['error'] = f'{type(error).__name__}: {error}'
+    try:
+        temporary = output / 'failure-state.json.tmp'
+        temporary.write_text(json.dumps(report, indent=2) + '\n')
+        temporary.replace(output / 'failure-state.json')
+    except OSError as error:
+        print(f'failure state report: {error}', flush=True)
 
 
 def main():
@@ -587,7 +642,11 @@ def main():
                        '--timeout', str(args.timeout)]
             if args.firecracker:
                 command += ['--firecracker', str(args.firecracker)]
-            HELPERS['run'](command, args.timeout, args.output / 'worker.log')
+            try:
+                HELPERS['run'](command, args.timeout, args.output / 'worker.log')
+            except Exception:
+                retain_failed_state(Path(state), args.output)
+                raise
             if any(f'"{dev}"' in trace.read_text(errors='replace') for dev in ('/dev/kvm', '/dev/vhost-vsock')):
                 raise RuntimeError('host virtualization device access; see files.strace')
         report.update(status='passed', owner=json.loads((args.output / 'owner.json').read_text()), kvm_access=False, vhost_vsock_access=False)

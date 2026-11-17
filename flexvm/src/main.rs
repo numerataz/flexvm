@@ -137,6 +137,7 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      -f: a running one too
   flexvm volume create NAME --size BYTES
                                      create an unattached sparse raw volume (512-byte multiple)
+  flexvm volume clone SOURCE NAME    clone unused raw storage to an independent sparse volume
   flexvm volume ls                   list volume IDs, names, logical and allocated bytes as JSON
   flexvm volume inspect NAME|ID      inspect a volume (VM attachment is not implemented yet)
   flexvm volume rm NAME|ID           remove an unused volume; refuses a held disk lock
@@ -641,12 +642,13 @@ fn check_applies(args: &Args) -> Result<()> {
             let words = args.positional.len();
             let valid = match first.map(String::as_str) {
                 Some("create") => words == 3 && args.get("size").is_some(),
+                Some("clone") => words == 4 && !args.has("size"),
                 Some("inspect" | "rm") => words == 3 && !args.has("size"),
                 Some("ls") => words == 2 && !args.has("size"),
                 _ => false,
             };
             if !valid {
-                bail!("volume needs create NAME --size BYTES, inspect NAME|ID, ls, or rm NAME|ID");
+                bail!("volume needs create NAME --size BYTES, clone SOURCE NAME, inspect NAME|ID, ls, or rm NAME|ID");
             }
         }
         "software-transfer" => {
@@ -815,6 +817,7 @@ fn real_main(args: &Args) -> Result<()> {
             let catalog = volume::Catalog::open(&state(args)?)?;
             match name {
                 "create" => print(json!(catalog.create(arg2.unwrap(), args.get("size").unwrap().parse().map_err(|_| "volume --size needs a byte count")?)?)),
+                "clone" => print(json!(catalog.clone_volume(arg2.unwrap(), pos[3])?)),
                 "ls" => print(json!(catalog.list()?)),
                 "inspect" => print(json!(catalog.inspect(arg2.unwrap())?)),
                 "rm" => catalog.remove(arg2.unwrap()),
