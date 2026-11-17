@@ -10,7 +10,9 @@ scheduled increasingly long waits. The invalid state can predate a checkpoint.
 
 The patch preserves frequency selection, valid hardware scaling and subsequent
 `KVM_SET_TSC_KHZ` error handling. It prevents a stopped clock; it does not emulate
-hardware frequency scaling.
+hardware frequency scaling. Existing outer checkpoints retain their saved
+kernel and vCPU state; this initialization fix applies to newly created vCPUs
+under the patched kernel.
 
 `scripts/compat/software-boot.py --guest-kvm --guest-tsc --kernel IMAGE --output DIR`
 runs a deterministic x86 regression with host KVM and vhost-vsock masked. It
