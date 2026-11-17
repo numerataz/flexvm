@@ -64,6 +64,13 @@ pub(crate) fn boot(profile: BootProfile) -> io::Result<()> {
     crate::mount("cgroup2", mem::CGROUP_ROOT, "cgroup2", libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV, "nsdelegate,memory_recursiveprot")?;
     // systemd creates init.scope and enables its own subtree controllers.
     // The bootstrap owns only the outer pressure boundary and broker tree.
+    if profile == BootProfile::Openrc {
+        // Packaged OpenRC versions enable the unified controllers without
+        // moving PID 1 out of the root first. Leave their root free of tasks.
+        fs::create_dir_all("/sys/fs/cgroup/init")?;
+        fs::write("/sys/fs/cgroup/init/cgroup.procs", "0")?;
+        mem::enable_controllers(mem::CGROUP_ROOT)?;
+    }
     parent.write_all(b"R")?;
     // Templates and standby VMs remain here. No real init/service identity has
     // started until the owner supplies per-VM settings and releases this gate.
@@ -225,11 +232,20 @@ fn registrations(listener: UnixListener) {
 
 /// systemd owns the unit root; this process owns only its delegated children.
 pub(crate) fn provider() -> io::Result<()> {
-    if crate::app::boot_profile()? == BootProfile::App {
+    let profile = crate::app::boot_profile()?;
+    if profile == BootProfile::App {
         return Err(io::Error::other("runtime provider requires distro boot"));
     }
     let current = fs::read_to_string("/proc/self/cgroup")?;
     let group = current.lines().find_map(|line| line.strip_prefix("0::")).ok_or_else(|| io::Error::other("no unified service cgroup"))?;
+    let group = if profile == BootProfile::Openrc {
+        match group {
+            "/openrc.flexvm-runtime" | "/openrc.flexvm-runtime/sup" => "/openrc.flexvm-runtime",
+            _ => return Err(io::Error::other("OpenRC runtime requires its supervised service cgroup")),
+        }
+    } else {
+        group
+    };
     if group == "/" || group.split('/').any(|part| matches!(part, "." | "..")) {
         return Err(io::Error::other("runtime provider requires a delegated service cgroup"));
     }
