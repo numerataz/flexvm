@@ -99,8 +99,9 @@ def exercise(binary, kernel, output, root, engine, arch):
             assert not unsynced_claim.exists(), "the checkpoint must preserve a durable address claim"
             removed(addr, addr6, tap)
             assert lookup('suspended', 'routed')['ip'] == addr
-            result = sp.run([*cli, 'software-transfer', 'offer', 'routed', '11111111111111111111111111111111'], capture_output=True, text=True, timeout=20)
-            assert result.returncode != 0 and 'local restore only' in result.stderr, result.stderr
+            offer = json.loads(call("software-transfer", "offer", "routed", "11111111111111111111111111111111"))
+            assert offer["routed"]["address"] == {"v4": addr, "v6": addr6}, offer
+            assert offer["routed"]["generation"] > 0 and offer["routed"]["revision"] >= 0, offer
             competitor, other = launch("competitor", "competitor", "software", "--name", "competitor",
                                        "--network", "routed", "--qemu", engine, "--kernel", kernel, output / "app.tar")
             assert other["ip"] != addr, other
@@ -133,7 +134,7 @@ def exercise(binary, kernel, output, root, engine, arch):
             "address_held_while_stopped": True,
             "address_claim_durable": True,
             "address_held_on_quarantined_restore": True,
-            "peer_transfer_refused": True,
+            "signed_offer_included_address": True,
             "owner_signal": -resumed.returncode,
             "first_tap": tap,
             "second_tap": new_route["dev"],
