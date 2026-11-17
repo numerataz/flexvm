@@ -94,7 +94,7 @@ CONFIG
         test "$(cat /sys/fs/cgroup/cpu.max)" = "50000 100000"
         test "$(cat /sys/fs/cgroup/pids.max)" = 64
         wget -qO /dev/null http://example.com'
-    nerd run -d --name compat-server --network compat-net -p 18086:8080 -v compat-data:/data -v "$base/bind:/bind:ro" "$image" sh -ec '
+    nerd run -d --name compat-server --network compat-net --memory=128m --cpus=.5 --pids-limit=64 -p 18086:8080 -v compat-data:/data -v "$base/bind:/bind:ro" "$image" sh -ec '
         mkdir /www; cp /data/marker /www/index.html; exec httpd -f -p 8080 -h /www'
     nerd exec compat-server cat /proc/1/stat > "$base/process"
     printf '%s\n' "$nonce" > "$base/secret"
@@ -117,6 +117,10 @@ verify)
     before=$(awk '{print $1, $22}' "$base/process")
     after=$(nerd exec compat-server cat /proc/1/stat | awk '{print $1, $22}')
     test "$before" = "$after"
+    nerd exec compat-server sh -ec '
+        test "$(cat /sys/fs/cgroup/memory.max)" = 134217728
+        test "$(cat /sys/fs/cgroup/cpu.max)" = "50000 100000"
+        test "$(cat /sys/fs/cgroup/pids.max)" = 64'
     test "$(curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:18086)" = "$nonce"
     test "$(nerd run --rm --network compat-net "$image" wget -qO- http://compat-server:8080)" = "$nonce"
     group=$(as_user systemctl --user show buildkit.service --property=ControlGroup --value)
