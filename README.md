@@ -1340,6 +1340,12 @@ networking, live containers and fresh builds with persistent cache/secret
 mount semantics through VM lifecycle transitions. BuildKit retains its normal
 process sandbox and runs in a resource-limited user unit.
 
+The [Podman user-service workload](scripts/compat/workloads/rootless-podman.sh)
+tests stock Ubuntu Podman through its normal `podman.socket` user activation
+path, using the systemd cgroup driver and FUSE overlay storage. It checks
+image pulls/builds, networking, volumes and constrained live containers
+through restores and migration without manually constructing user cgroups.
+
 ## Docker API
 
 `flexvm api` serves the Docker Engine API (v1.47; clients negotiate down to
