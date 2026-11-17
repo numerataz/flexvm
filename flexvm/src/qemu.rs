@@ -150,15 +150,15 @@ impl Routed {
                 if address.lent != Some(network.generation) || address.seen != network.generation {
                     bail!("software transfer return does not match this host's routed loan");
                 }
-                if let Some(previous) = address.holder.as_deref() {
-                    let owner = address.holder_id.as_ref().ok_or("software transfer return has an unidentified previous address holder")?;
-                    if address.held != network.generation || crate::host::PidFd::open(owner)?.is_some() {
-                        bail!("software transfer return address still has a live holder");
-                    }
-                    host.release(&lock, ip, previous, Some(owner))?;
-                }
-            } else if address.holder.is_some() || address.lent.is_some() {
+            } else if address.lent.is_some() || host.held(&address) {
                 bail!("software transfer routed address is already held");
+            }
+            if let Some(previous) = address.holder.as_deref() {
+                let owner = address.holder_id.as_ref().ok_or("software transfer has an unidentified previous address holder")?;
+                if (returning && address.held != network.generation) || crate::host::PidFd::open(owner)?.is_some() {
+                    bail!("software transfer routed address still has a live or conflicting holder");
+                }
+                host.release(&lock, ip, previous, Some(owner))?;
             }
             host.claim_incoming(&lock, name, ip, network.generation, Some(revision))?
         };
@@ -192,25 +192,42 @@ impl Routed {
         Ok(Self { tap, index, network, dns: config.guest_dns(), host: host.clone(), claim: Some(claim), incoming, keep: AtomicBool::new(keep) })
     }
 
-    fn checkpoint(&self) -> Result<software_state::RoutedNetwork> {
+    fn current_claim(&self) -> Result<(&AddrClaim, crate::host::Locked)> {
         let claim = self.claim.as_ref().ok_or("software routed guest has no address claim")?;
         let lock = self.host.fence(claim.ip, claim.gen)?;
         let address = self.host.addr(&lock, claim.ip)?;
-        if address.held != claim.gen || address.holder_id.as_ref() != Some(&Ident::me()) {
-            bail!("software checkpoint no longer owns its routed address");
+        if address.held != claim.gen || address.holder_id.as_ref() != Some(&Ident::me()) || address.rev > claim.rev {
+            bail!("software guest no longer owns its routed address revision");
         }
+        Ok((claim, lock))
+    }
+
+    fn checkpoint(&self) -> Result<software_state::RoutedNetwork> {
+        let (claim, lock) = self.current_claim()?;
         // A newly allocated address normally stays unsynced while its VM runs.
         self.host.sync_addr(&lock, claim.ip)?;
         Ok(software_state::RoutedNetwork { revision: Some(claim.rev), ..self.network })
     }
 
     fn publish(&self) -> Result<()> {
-        let claim = self.claim.as_ref().ok_or("software routed guest has no address claim")?;
-        let lock = self.host.fence(claim.ip, claim.gen)?;
+        let (claim, lock) = self.current_claim()?;
         net::route(self.network.address, self.index)?;
-        self.host.publish_live(&lock, claim.ip, claim.gen, claim.rev)?;
+        let publication = if self.incoming {
+            self.host.advance(&lock, claim.ip, claim.gen, claim.rev)
+        } else {
+            self.host.publish_live(&lock, claim.ip, claim.gen, claim.rev)
+        };
+        if publication.is_err() && self.incoming {
+            // The old peer route is still authoritative if committing the new
+            // revision failed. Only the VM's ephemeral TAP is abandoned.
+            let _ = self.host.reinstall(&lock, claim.ip, Some(&Ident::me()));
+        }
+        publication
+    }
+
+    fn complete_import(&self) -> Result<()> {
         if self.incoming {
-            self.host.advance(&lock, claim.ip, claim.gen, claim.rev)?;
+            let (claim, lock) = self.current_claim()?;
             self.host.unlend(&lock, claim.ip, claim.gen)?;
         }
         Ok(())
@@ -896,6 +913,13 @@ impl Machine {
     pub fn restore_route(&self) -> Result<()> {
         if let Some(routed) = &self.routed {
             routed.publish()?;
+        }
+        Ok(())
+    }
+
+    pub fn complete_routed_import(&self) -> Result<()> {
+        if let Some(routed) = &self.routed {
+            routed.complete_import()?;
         }
         Ok(())
     }

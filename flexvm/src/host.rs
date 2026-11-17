@@ -1831,7 +1831,7 @@ impl Host {
     /// name, until its Firecrackers are reaped once it is dead, or while it is
     /// suspended here with this generation. Another instance of the same name
     /// (a restart after a SIGKILL) does not hold it.
-    fn held(&self, a: &Addr) -> bool {
+    pub(crate) fn held(&self, a: &Addr) -> bool {
         self.held_swept(a, false)
     }
 
