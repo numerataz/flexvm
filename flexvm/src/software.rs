@@ -785,6 +785,7 @@ fn serve(
     if result.is_ok() || crate::template::interrupted_signal().is_some() {
         if let Some(consumed) = &owner.consumed {
             consumed.finish(&owner.host.suspended(&owner.name.name)?)?;
+            owner.machine.release_routed_checkpoint();
         }
     }
     let entry = owner.entry.lock().unwrap().clone();

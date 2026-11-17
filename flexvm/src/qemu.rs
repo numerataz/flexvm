@@ -823,9 +823,14 @@ impl Machine {
     pub fn restore_route(&self) -> Result<()> {
         if let Some(routed) = &self.routed {
             routed.publish()?;
-            routed.keep.store(false, Ordering::Relaxed);
         }
         Ok(())
+    }
+
+    pub fn release_routed_checkpoint(&self) {
+        if let Some(routed) = &self.routed {
+            routed.keep.store(false, Ordering::Relaxed);
+        }
     }
 
     /// The caller owns the admission/CPU boundary and the output artifact. A

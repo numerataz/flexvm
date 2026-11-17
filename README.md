@@ -697,8 +697,8 @@ the warnings.
 
 Add `--network routed` to a named `flexvm software` VM to use the host's
 `vm_ips`, DNS and optional `vm_ipv6_prefix`. The software engine uses a
-TAP from `/dev/net/tun` and the host installs routes to the VM. Host KVM
-and host vhost devices are optional for this mode. `flexvm stop` keeps
+TAP from `/dev/net/tun` and the host installs routes to the VM. QEMU
+handles the guest CPU and virtio networking in userspace. `flexvm stop` keeps
 the address reserved, and `flexvm start` restores the same addresses
 and TCP state through a new TAP on this host. Routed software VM
 checkpoints currently support local restore.

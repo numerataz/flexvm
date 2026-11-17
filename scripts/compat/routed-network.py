@@ -111,6 +111,9 @@ def exercise(binary, kernel, output, root, engine, arch):
         resumed.kill()
         assert resumed.wait(timeout=10) == -signal.SIGKILL
         removed(addr, addr6, new_route['dev'])
+        fenced = sp.run([*cli, "software", "--name", "third", "--network", "routed", "--qemu", engine,
+                         "--kernel", kernel, output / "app.tar"], capture_output=True, text=True, timeout=25)
+        assert fenced.returncode != 0 and "no free addresses" in fenced.stderr, fenced.stderr
         call('rm', '-f', 'routed')
         competitor.send_signal(signal.SIGINT)
         competitor.wait(timeout=15)
@@ -125,6 +128,7 @@ def exercise(binary, kernel, output, root, engine, arch):
             "tcp_socket_preserved": True,
             "udp_v4_v6_before_and_after": True,
             "address_held_while_stopped": True,
+            "address_held_on_quarantined_restore": True,
             "peer_transfer_refused": True,
             "owner_signal": -resumed.returncode,
             "first_tap": tap,
