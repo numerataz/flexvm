@@ -136,6 +136,18 @@ impl Routed {
         Ok(Self { tap, index, network, dns: config.guest_dns(), host: host.clone(), claim: Some(claim), keep: AtomicBool::new(keep) })
     }
 
+    fn checkpoint(&self) -> Result<software_state::RoutedNetwork> {
+        let claim = self.claim.as_ref().ok_or("software routed guest has no address claim")?;
+        let lock = self.host.fence(claim.ip, claim.gen)?;
+        let address = self.host.addr(&lock, claim.ip)?;
+        if address.held != claim.gen || address.holder_id.as_ref() != Some(&Ident::me()) {
+            bail!("software checkpoint no longer owns its routed address");
+        }
+        // A newly allocated address normally stays unsynced while its VM runs.
+        self.host.sync_addr(&lock, claim.ip)?;
+        Ok(self.network)
+    }
+
     fn publish(&self) -> Result<()> {
         let claim = self.claim.as_ref().ok_or("software routed guest has no address claim")?;
         let lock = self.host.fence(claim.ip, claim.gen)?;
@@ -937,12 +949,12 @@ impl Machine {
         if manifest.source_owner != crate::host::Ident::me() || manifest.source_engine != self.processes.engine_ident()? {
             bail!("software capture metadata does not identify this engine and owner");
         }
+        manifest.routed = self.routed.as_ref().map(Routed::checkpoint).transpose()?;
         self.save(&staging.state, deadline)?;
         // QEMU has paused vCPUs and drained its block layer at the
         // checkpoint boundary. Keep the writer leases through publication.
         manifest.disks = staging.capture_disks(&self.disks)?;
         manifest.profile = self.profile.clone();
-        manifest.routed = self.routed.as_ref().map(|routed| routed.network);
         manifest.engine_version = self.engine_version.clone();
         let inputs = self.inputs.as_ref().ok_or("software engine has no pinned inputs")?;
         match previous {
