@@ -730,6 +730,15 @@ fn launch(app: &mut App, cmd: &mut Command, statuses: &Statuses, pty: Option<Fil
 fn signal(arg: &str, statuses: &Statuses) -> io::Result<String> {
     if crate::distro::is_broker() {
         let signal: i32 = arg.trim().parse().map_err(|_| io::Error::other("invalid distro signal"))?;
+        if signal == libc::SIGTERM && boot_profile()? == BootProfile::Openrc {
+            use std::os::unix::fs::FileTypeExt;
+            let mut control = crate::runtime::init_file("/run/openrc/init.ctl", (libc::O_WRONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW) as u64)?;
+            if !control.metadata()?.file_type().is_fifo() {
+                return Err(io::Error::other("OpenRC shutdown control is not a FIFO"));
+            }
+            control.write_all(b"poweroff")?;
+            return Ok("ok".into());
+        }
         let signal = if signal == libc::SIGTERM && boot_profile()? == BootProfile::Systemd { libc::SIGRTMIN() + 4 } else { signal };
         os(unsafe { libc::kill(1, signal) })?;
         return Ok("ok".into());

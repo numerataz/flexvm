@@ -216,10 +216,14 @@ fn open_root_file(root: &File, path: &str, flags: u64) -> io::Result<File> {
 }
 
 pub(crate) fn init_etc() -> io::Result<File> {
+    init_file("/etc", libc::O_DIRECTORY as u64)
+}
+
+pub(crate) fn init_file(path: &str, flags: u64) -> io::Result<File> {
     if crate::distro::is_broker() {
-        return open_root_file(&File::open("/proc/1/root")?, "/etc", libc::O_DIRECTORY as u64);
+        return open_root_file(&File::open("/proc/1/root")?, path, flags);
     }
-    File::open("/etc")
+    open_root_file(&File::open("/")?, path, flags)
 }
 
 pub(crate) fn root_file(path: &str, flags: u64) -> io::Result<File> {

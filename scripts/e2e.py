@@ -2474,12 +2474,13 @@ def kernel_modules():
 @contextlib.contextmanager
 def workload_test_egress():
     """The coordinator owns temporary egress rules, even if a worker is killed."""
-    if args.worker or args.selftest or args.no_kvm or os.geteuid() != 0 or not {"podman", "namespace_sandboxes", "containerd"}.intersection(args.cases or CASES) or kvm_unusable():
+    workloads = {"podman", "namespace_sandboxes", "containerd", "distro_openrc", "distro_openrc_pressure"}
+    if args.worker or args.selftest or args.no_kvm or os.geteuid() != 0 or not workloads.intersection(args.cases or CASES) or kvm_unusable():
         yield
         return
     selected = args.cases or list(CASES)
     scenarios = args.faults.split() if "faults" in selected else []
-    if not any(item[0] in ("podman", "namespace_sandboxes", "containerd") for item in selected_work(selected, scenarios, faults_scenarios(), args.split)):
+    if not any(item[0] in workloads for item in selected_work(selected, scenarios, faults_scenarios(), args.split)):
         yield
         return
     dns = ENV.get("FLEXVM_TEST_DNS", "").split()
@@ -2547,6 +2548,137 @@ def podman():
 def namespace_sandboxes():
     """bubblewrap, util-linux namespaces and gVisor systrap isolation through VM lifecycle."""
     compat_workload("namespace-sandboxes")
+
+
+def openrc_test_image():
+    import runpy
+    from pathlib import Path
+    fixture = runpy.run_path(os.path.join(ROOT, "scripts", "compat", "openrc-image.py"))
+    output = Path(WORK) / "openrc-image"
+    if (output / "index.json").exists():
+        return str(output)
+    builder = "e2e-openrc-builder"
+    A.cli("pull", "--tag", "ci-openrc-builder", "--max", "1024", "--vcpus", "2",
+          "--cmd", '["/bin/sleep","1800"]', fixture["IMAGE"], timeout=300)
+    dns = json.load(open(os.path.join(A.state_dir, "host.json"))).get("dns")
+    try:
+        A.configure(dns=ENV["FLEXVM_TEST_DNS"].split())
+        A.run(builder, template="ci-openrc-builder")
+        fixture["prepare"]([BIN, "--state", A.state_dir, "--run", A.run_dir], builder, output, time.monotonic() + 300)
+    finally:
+        A.rm(builder, force=True, check=False)
+        A.configure(dns=dns)
+    return str(output)
+
+
+@case
+@needs_kvm
+def distro_openrc_pressure():
+    """Keep the OpenRC broker responsive when the host refuses workload RAM."""
+    tag = "ci-openrc-pressure"
+    A.cli("pull", "--boot", "openrc", "--tag", tag, "--vcpus", "2", "--max", "2048", openrc_test_image(), timeout=600)
+    faults(template=tag, scenarios="mem_high")
+
+
+@case
+@needs_kvm
+def distro_openrc():
+    """Real OpenRC PID 1 and supervised service state survive all native VM transitions."""
+    vm, clone, tag, host = "e2e-openrc", "e2e-openrc-clone", "ci-openrc", A
+    A.cli("pull", "--boot", "openrc", "--tag", tag, "--vcpus", "2", "--max", "2048", openrc_test_image(), timeout=600)
+    A.run(vm, template=tag)
+    saved, previous = None, None
+    try:
+        def execute(command, check_code=True):
+            result = host.exec(vm, command, timeout=60)
+            if check_code:
+                check("OpenRC exec", result[0] == 0, result)
+            return result
+
+        def identity():
+            code = ('import json,os,pathlib; p=pathlib.Path; '
+                    'print(json.dumps(dict(executable=os.readlink("/proc/1/exe"), '
+                    'start=p("/proc/1/stat").read_text().rsplit(")",1)[1].split()[19], '
+                    'machine=p("/etc/machine-id").read_text().strip())))')
+            return json.loads(execute("python3 -c " + shlex.quote(code))[1])
+
+        original = identity()
+        check("OpenRC: actual init executable", original["executable"] == "/sbin/openrc-init", original)
+        A.run(clone, template=tag)
+        other = A.exec(clone, "cat /etc/machine-id")[1].strip()
+        check("OpenRC: fresh clone identity", len(other) == 32 and other != original["machine"], (original, other))
+        A.kill(clone)
+        execute("rc-service dbus start; rc-service udev start; udevadm control --reload-rules; "
+                "udevadm trigger --action=add --subsystem-match=net; udevadm settle --timeout=15; ip link show dev eth0")
+
+        def bus_id():
+            reply = execute("dbus-send --system --print-reply --dest=org.freedesktop.DBus / org.freedesktop.DBus.GetId")[1]
+            return re.search(r'string "([0-9a-f]{32})"', reply).group(1)
+
+        original_bus = bus_id()
+        code = ('import json,os,pathlib,secrets,time\n'
+                'cookie=secrets.token_hex(16); counter=0\n'
+                'while True:\n'
+                ' counter+=1\n'
+                ' value=dict(cookie=cookie,counter=counter,pid=os.getpid(),'
+                'start=pathlib.Path("/proc/self/stat").read_text().rsplit(")",1)[1].split()[19])\n'
+                ' pathlib.Path("/run/flexvm-openrc-probe.new").write_text(json.dumps(value))\n'
+                ' os.replace("/run/flexvm-openrc-probe.new","/run/flexvm-openrc-probe.json")\n'
+                ' time.sleep(0.05)\n')
+        service = ('#!/sbin/openrc-run\nsupervisor=supervise-daemon\ncommand=/usr/bin/python3\n'
+                   'command_args=/run/flexvm-openrc-probe.py\nrc_cgroup_settings="memory.max 67108864\npids.max 16"\n')
+        write = ('from pathlib import Path; Path("/run/flexvm-openrc-probe.py").write_text(' + repr(code) + '); '
+                 'p=Path("/etc/init.d/flexvm-openrc-probe"); p.write_text(' + repr(service) + '); p.chmod(0o755)')
+        execute("python3 -c " + shlex.quote(write))
+        execute("rc-service flexvm-openrc-probe start")
+        check("OpenRC: supervised service runs", wait_for(lambda: execute("test -s /run/flexvm-openrc-probe.json", False)[0] == 0, 15))
+
+        def observe(phase):
+            nonlocal previous
+            now = json.loads(execute("cat /run/flexvm-openrc-probe.json")[1])
+            check(f"OpenRC {phase}: init and machine identity", identity() == original, original)
+            check(f"OpenRC {phase}: live system bus identity", bus_id() == original_bus)
+            if previous:
+                check(f"OpenRC {phase}: service process and RAM", all(now[k] == previous[k] for k in ("cookie", "pid", "start")), (previous, now))
+                check(f"OpenRC {phase}: service advances", wait_for(lambda: json.loads(execute("cat /run/flexvm-openrc-probe.json")[1])["counter"] > previous["counter"], 5))
+            execute('rc-service flexvm-runtime status; rc-service flexvm-openrc-probe status; rc-service udev status; '
+                    'test "$(cat /sys/fs/cgroup/openrc.flexvm-openrc-probe/memory.max)" = 67108864; '
+                    'test "$(cat /sys/fs/cgroup/openrc.flexvm-openrc-probe/pids.max)" = 16')
+            previous = now
+
+        observe("run")
+        A.suspend(vm)
+        A.resume(vm)
+        observe("suspend")
+        saved = A.checkpoint(vm, stop=True)
+        A.restore(saved["id"])
+        observe("checkpoint")
+        A.migrate(vm, B)
+        host = B
+        observe("migration")
+        provider = execute("pgrep -f '^/sbin/flexvm-init --distro-runtime$'")[1].strip()
+        execute("kill -KILL " + provider)
+        check("OpenRC: supervisor respawns provider", wait_for(lambda: execute("pgrep -f '^/sbin/flexvm-init --distro-runtime$'", False)[1].strip() not in ("", provider), 20))
+        observe("provider respawn")
+        restart = '#!/bin/sh\nset -e\nfor i in $(seq 1 8); do rc-service flexvm-runtime restart; done\ntouch /run/flexvm-openrc-restarts-done\nexec sleep 1800\n'
+        restart_service = '#!/sbin/openrc-run\nsupervisor=supervise-daemon\ncommand=/run/flexvm-openrc-restart.sh\n'
+        write = ('from pathlib import Path; p=Path("/run/flexvm-openrc-restart.sh"); p.write_text(' + repr(restart) + '); p.chmod(0o755); '
+                 'p=Path("/etc/init.d/flexvm-openrc-restart"); p.write_text(' + repr(restart_service) + '); p.chmod(0o755)')
+        execute("python3 -c " + shlex.quote(write))
+        execute("rc-service flexvm-openrc-restart start")
+        check("OpenRC: repeated service restart restores exec", wait_for(lambda: execute("test -f /run/flexvm-openrc-restarts-done", False)[0] == 0, 45))
+        observe("runtime restart")
+        execute("rc-service flexvm-openrc-restart stop")
+        execute("rc-service flexvm-openrc-probe stop; rc-service flexvm-runtime status")
+        check("OpenRC: stopping a service keeps OS alive", host.ps()[vm]["state"] == "running")
+        host.cli("kill", "--signal", "TERM", vm)
+        check("OpenRC: actual poweroff completes", wait_for(lambda: host.ps().get(vm, {}).get("state") == "exited", 30), host.ps().get(vm))
+        check("OpenRC: poweroff status zero", host.ps()[vm].get("status") == 0, host.ps().get(vm))
+    finally:
+        A.rm(vm, force=True, check=False)
+        B.rm(vm, force=True, check=False)
+        A.rm(clone, force=True, check=False)
+        clear_checkpoints(A, B)
 
 
 @case
@@ -3517,7 +3649,7 @@ def worker():
 # runs, as e2e.py's summary prints them): --split balances by these, the long ones start first, and
 # the short ones go in batches of about BATCH_S (each batch is a worker, with hosts of its own).
 # Unlisted ones count as 2 s.
-COST = {"distro_bad_init": 10, "distro_pressure": 80, "distro_systemd": 40, "guest_poweroff": 10, "containerd": 180, "namespace_sandboxes": 180, "podman": 180, "faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "ipv6_taps": 10, "nettest_ipv6": 30, "docker_api": 15, "restart_policy": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
+COST = {"distro_openrc": 160, "distro_openrc_pressure": 160, "distro_bad_init": 10, "distro_pressure": 80, "distro_systemd": 40, "guest_poweroff": 10, "containerd": 180, "namespace_sandboxes": 180, "podman": 180, "faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "ipv6_taps": 10, "nettest_ipv6": 30, "docker_api": 15, "restart_policy": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
         "faults/cow_grow": 65, "faults/reconcile_kill": 64, "faults/target_renamed": 40, "faults/plug_race": 45, "faults/guest_hang": 44,
         "faults/exec_pause_grace": 42, "faults/exec_ckpt_stalled": 115, "faults/route_abort": 35, "faults/unplug_collapsed": 30,
         "faults/arrival_grew": 25, "faults/pause_resume": 24, "faults/evict_latency": 25, "faults/mem_high": 25, "faults/target_killed": 25,

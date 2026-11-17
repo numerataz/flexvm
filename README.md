@@ -1265,16 +1265,23 @@ flexvm exec my-vm systemctl start my-service
 flexvm kill --signal TERM my-vm     # request systemd power-off
 ```
 
+For OpenRC images, use `--boot openrc` with an executable `/sbin/openrc-init`,
+`openrc-run` and `supervise-daemon` installed. FlexVM enables the normal
+`flexvm-runtime` service in the default runlevel; use `rc-service` to manage
+your distro's services. `kill --signal TERM` requests OpenRC power-off through
+its init control FIFO.
+
 Each fresh VM gets its hostname, environment and a fresh machine ID before
-systemd becomes PID 1. The template pauses before service startup;
+the distro init becomes PID 1. The template pauses before service startup;
 `--warm` and app entrypoint/user/workdir overrides are refused. The environment
 is supplied to PID 1; units use systemd's normal environment configuration.
 Use `exec -it` for an interactive shell; PID 1 has no app stdin or pseudo-TTY.
 
-FlexVM installs a delegated `flexvm-runtime.service` for exec and check
+FlexVM installs a delegated `flexvm-runtime.service` for systemd or a
+supervised `flexvm-runtime` service for OpenRC, supplying exec and check
 processes. A bootstrap broker keeps the management connection and aggregate
-memory-pressure controller outside the distro's cgroup boundary. Systemd
-owns its hierarchy within that boundary. Restarting the runtime service
+memory-pressure controller outside the distro's cgroup boundary. The init
+manager owns its hierarchy within that boundary. Restarting the runtime service
 restores exec without replacing PID 1 or other service processes. FlexVM
 manages `eth0`; other interfaces remain available to distro network managers.
 
@@ -1283,7 +1290,7 @@ running services. Normal power-off waits for actual VMM exit before recording
 status zero; a kernel panic or VMM failure remains a failure. The writable
 root remains VM memory, with the same lifecycle semantics as app mode.
 
-Systemd also runs with the software CPU engine, without host virtualization
+Both profiles also run with the software CPU engine, without host virtualization
 devices. Start a distro OCI layout directly:
 
 ```sh
@@ -1301,7 +1308,7 @@ fresh engine and owner process. A named distro's lifetime follows the OS,
 including `kill --signal TERM` to request power-off; it has no synthetic app
 session. The software backend's other documented lifecycle limits still apply.
 
-OpenRC, full user sessions/rootless service integration and guest reboot
+Full user sessions/rootless service integration and guest reboot
 semantics remain tracked in
 [the distro boot issue](https://github.com/numerataz/flexvm/issues/1328).
 

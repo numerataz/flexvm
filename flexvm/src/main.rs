@@ -2232,9 +2232,6 @@ fn rmi(host: &Host, paths: &Paths, what: &str) -> Result<()> {
 
 fn image_options(args: &Args, src: &str) -> Result<image::Options> {
     let boot: image::BootProfile = args.get("boot").unwrap_or("app").parse()?;
-    if boot == image::BootProfile::Openrc {
-        bail!("OpenRC boot integration is not ready yet");
-    }
     let warm = args.has("warm");
     let ready = match (args.get("ready-port"), args.get("ready-cmd")) {
         (Some(_), Some(_)) => return Err("pass --ready-port or --ready-cmd, not both".into()),

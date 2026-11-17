@@ -1095,8 +1095,10 @@ fn inject(root: &mut Root, app: &App, init: &[u8]) -> Result<String> {
         if !root.executable(path) {
             bail!("distro boot requires executable {path} in the image; install its init/service-manager packages first");
         }
-        if app.boot == BootProfile::Systemd {
-            inject_systemd(root)?;
+        match app.boot {
+            BootProfile::Systemd => inject_systemd(root)?,
+            BootProfile::Openrc => inject_openrc(root)?,
+            BootProfile::App => unreachable!(),
         }
     }
     for (dir, mode) in [("proc", 0o555), ("sys", 0o555), ("dev", 0o755), ("run", 0o755), ("tmp", 0o1777), ("mnt", 0o755), ("root", 0o700), ("sbin", 0o755)] {
@@ -1136,6 +1138,50 @@ fn inject(root: &mut Root, app: &App, init: &[u8]) -> Result<String> {
     root.secure_dir("etc/flexvm", 0o755)?;
     root.write_file("etc/flexvm/app.conf", conf.as_bytes(), 0o644)?;
     Ok(conf)
+}
+
+fn inject_openrc(root: &mut Root) -> Result<()> {
+    root.secure_dir("etc/init.d", 0o755)?;
+    root.secure_dir("etc/runlevels/default", 0o755)?;
+    root.write_file(
+        "etc/init.d/flexvm-runtime",
+        br#"#!/sbin/openrc-run
+description="FlexVM workload delegation"
+supervisor=supervise-daemon
+command=/sbin/flexvm-init
+command_args=--distro-runtime
+respawn_delay=1
+respawn_max=0
+# The runtime owns delegated children. Its stop hook cleans them without
+# killing the openrc-run process executing that hook in the supervisor group.
+rc_cgroup_cleanup=no
+cgroup2_set_limits() {
+    local unit=/sys/fs/cgroup/openrc.flexvm-runtime
+    mkdir -p "$unit/sup" || return
+    printf 0 > "$unit/sup/cgroup.procs" || return
+    # Preserve OpenRC's normal per-service resource settings at the unit root.
+    printf '%s\n' "${rc_cgroup_settings}" | while read -r key value; do
+        [ -n "$key" ] && [ -n "$value" ] || continue
+        case "$key" in */*|.|..) eerror "Invalid cgroup setting: $key"; return 1 ;; esac
+        [ -f "$unit/$key" ] || continue
+        printf '%s' "$value" > "$unit/$key" || return
+    done
+}
+stop_post() {
+    local group
+    for group in work check; do
+        [ ! -e "/sys/fs/cgroup/openrc.flexvm-runtime/$group/cgroup.kill" ] ||
+            printf 1 > "/sys/fs/cgroup/openrc.flexvm-runtime/$group/cgroup.kill" || return
+    done
+}
+depend() {
+    need localmount
+    after cgroups
+}
+"#,
+        0o755,
+    )?;
+    root.write_symlink("etc/runlevels/default/flexvm-runtime", "/etc/init.d/flexvm-runtime")
 }
 
 fn inject_systemd(root: &mut Root) -> Result<()> {

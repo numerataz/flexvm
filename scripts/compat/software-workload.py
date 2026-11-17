@@ -111,6 +111,19 @@ def exercise(args):
                 input=(args.output / name).read_bytes())
         if args.boot == 'systemd':
             cli('exec', NAME, 'systemd-run', '--unit=flexvm-state-probe', '--collect', '/state-probe')
+        elif args.boot == 'openrc':
+            cli('exec', NAME, '/bin/sh', '-ec', '''cat >/etc/init.d/flexvm-state-probe <<'SERVICE'
+#!/sbin/openrc-run
+supervisor=supervise-daemon
+command=/state-probe
+output_log=/var/log/flexvm-state-probe.log
+error_log=/var/log/flexvm-state-probe.log
+rc_cgroup_settings="memory.max 67108864
+pids.max 16"
+SERVICE
+chmod 755 /etc/init.d/flexvm-state-probe
+rc-service flexvm-state-probe start''')
+        if args.boot != 'app':
             cli('exec', NAME, '/bin/sh', '-ec', 'while [ ! -s /tmp/state-observation ]; do sleep .05; done')
         else:
             while 'STATE_WORKLOAD_BOOT' not in (args.output / 'guest.log').read_text(errors='replace'):
@@ -141,17 +154,21 @@ def exercise(args):
         if args.boot == 'systemd':
             journal = cli('exec', NAME, 'journalctl', '--unit=flexvm-state-probe', '--output=cat', '--no-pager')
             (args.output / 'guest.log').write_text(journal)
+        elif args.boot == 'openrc':
+            (args.output / 'guest.log').write_text(cli('exec', NAME, 'cat', '/var/log/flexvm-state-probe.log'))
         lines = (args.output / 'guest.log').read_text().splitlines()
         ticks = [int(line.split()[1]) for line in lines if line.startswith('STATE_TICK ')]
         if lines.count('STATE_WORKLOAD_BOOT') != 1 or not ticks or ticks != list(range(ticks[-1] + 1)):
             raise RuntimeError('foreground output rebooted, duplicated or skipped ticks')
-        if args.boot == 'systemd':
+        if args.boot != 'app':
             # A deliberately stopped exec service must not prevent the whole
             # distro from restoring or completing a normal OS power-off.
-            stopped = cli('exec', NAME, 'systemctl', 'stop', 'flexvm-runtime.service', check=False, result=True)
-            # systemctl itself occupies the unit being stopped, so systemd may
-            # terminate it along with the provider after accepting the request.
-            if stopped.returncode not in (0, 143):
+            command = ['systemctl', 'stop', 'flexvm-runtime.service'] if args.boot == 'systemd' else ['rc-service', 'flexvm-runtime', 'stop']
+            stopped = cli('exec', NAME, *command, check=False, result=True)
+            # The caller occupies the service being stopped. Systemd sends
+            # SIGTERM; OpenRC's successful stop hook uses cgroup.kill/SIGKILL.
+            stopped_codes = (0, 143) if args.boot == 'systemd' else (0, 137)
+            if stopped.returncode not in stopped_codes:
                 raise RuntimeError(f'could not stop distro runtime: {stopped.returncode}: {stopped.stderr}')
             cli('pause', NAME)
             cli('unpause', NAME)
@@ -196,7 +213,7 @@ def main():
     for name in ('bin', 'kernel', 'workload', 'output'):
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--image', default=IMAGE)
-    parser.add_argument('--boot', choices=('app', 'systemd'), default='app')
+    parser.add_argument('--boot', choices=('app', 'systemd', 'openrc'), default='app')
     parser.add_argument('--mem', type=int, default=2048)
     parser.add_argument('--timeout', type=int, default=1800)
     parser.add_argument('--require', action='append', default=[])
