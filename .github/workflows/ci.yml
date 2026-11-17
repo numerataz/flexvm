@@ -347,7 +347,7 @@ jobs:
       fail-fast: false
       matrix:
         arch: [x86_64, aarch64]
-        workload: [podman, namespace-sandboxes, containerd]
+        workload: [podman, namespace-sandboxes, containerd, rootless-docker]
         include:
           - { arch: x86_64, runner: ubuntu-24.04, qemu: qemu-system-x86 }
           - { arch: aarch64, runner: ubuntu-24.04-arm, qemu: qemu-system-arm }
@@ -358,7 +358,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends ${{ matrix.qemu }} strace build-essential flex bison bc libelf-dev libssl-dev dwarves xz-utils kmod pkg-config zlib1g-dev libzstd-dev
+          sudo apt-get install -y -q --no-install-recommends ${{ matrix.qemu }} strace build-essential flex bison bc libelf-dev libssl-dev dwarves xz-utils kmod pkg-config zlib1g-dev libzstd-dev squashfs-tools
       - name: Cache fixed x86 software CPU engine
         if: matrix.arch == 'x86_64'
         id: software-qemu
@@ -390,9 +390,18 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Build FlexVM
         run: cargo build --release -p flexvm
+      - name: Prepare the systemd image for rootless services
+        if: matrix.workload == 'rootless-docker'
+        run: |
+          scripts/fetch.sh --state "$RUNNER_TEMP/software-state"
+          sudo python3 scripts/test-image.py --state "$RUNNER_TEMP/software-state" "$RUNNER_TEMP/software-distro-image"
       - name: Guest workload and fresh-owner software restoration
         run: |
-          sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --workload "scripts/compat/workloads/${{ matrix.workload }}.sh" --require storage.fuse --output "$RUNNER_TEMP/software-workload" --timeout 1800
+          workload_args=()
+          if [ "${{ matrix.workload }}" = rootless-docker ]; then
+            workload_args=(--boot systemd --image "$RUNNER_TEMP/software-distro-image")
+          fi
+          sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --workload "scripts/compat/workloads/${{ matrix.workload }}.sh" "${workload_args[@]}" --require storage.fuse --output "$RUNNER_TEMP/software-workload" --timeout 1800
           cat "$RUNNER_TEMP/software-workload/report.json"
       - name: Upload software workload evidence
         if: always()
@@ -400,6 +409,7 @@ jobs:
         with:
           name: software-workload-${{ matrix.arch }}-${{ matrix.workload }}
           path: |
+            ${{ runner.temp }}/software-distro-image/source.sha256
             ${{ runner.temp }}/software-workload/*.json
             ${{ runner.temp }}/software-workload/*.log
             ${{ runner.temp }}/software-workload/*.strace

@@ -1322,6 +1322,15 @@ The official `docker:27-dind` image can run Docker inside a FlexVM guest,
 including `overlay2` storage and bridge networking. See
 [Docker inside a VM](docs/images.md#docker-inside-a-vm) for setup and the smoke test.
 
+Rootless Docker also runs as a normal systemd user service in a distro guest.
+The acceptance workload uses Docker 28.3.3, its upstream rootless installer,
+Buildx 0.28.0 and explicit `fuse-overlayfs` storage for the overlay-backed VM
+root. It checks delegated CPU/memory/PID controls, image pulls, builds with
+cache and secret mounts, networking, published ports and live containers
+through VM lifecycle operations. Guest packages, account/subordinate-ID
+setup and the full recipe are in
+[the rootless Docker workload](scripts/compat/workloads/rootless-docker.sh).
+
 ## Docker API
 
 `flexvm api` serves the Docker Engine API (v1.47; clients negotiate down to
