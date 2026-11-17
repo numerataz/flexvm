@@ -129,9 +129,9 @@ if [[ $CAPTURE_TCP == 1 ]]; then
     command -v tcpdump > /dev/null || die 'CAPTURE_TCP requires tcpdump'
     mkdir -p "$work/packets"
     for site in A B C lan; do
-        # tcpdump must be able to rotate files under the private mktemp directory.
-        ip netns exec "$P$site" tcpdump -Z root -n -i any -s 128 -U -C 8 -W 1 \
-            -w "$work/packets/$site.pcap" 'tcp port 19012 or icmp6' > "$work/packets/$site.log" 2>&1 &
+        # Open the output here so tcpdump may drop privileges while capturing.
+        ip netns exec "$P$site" tcpdump -n -i any -s 128 -U -c 60000 -w - 'tcp port 19012 or icmp6' \
+            > "$work/packets/$site.pcap" 2> "$work/packets/$site.log" &
         bg_pids+=("$!")
     done
 fi
