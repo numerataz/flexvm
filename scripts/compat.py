@@ -26,7 +26,9 @@ BASELINE |= {"cgroup.delegation", "storage.overlay", "storage.capacity", "securi
 
 
 class Failure(Exception):
-    pass
+    def __init__(self, message, *, stderr=None):
+        super().__init__(message)
+        self.stderr = stderr
 
 
 class Interrupted(Exception):
@@ -48,7 +50,7 @@ def command(argv, timeout=120, stdin=None):
         proc.communicate()
         raise
     if proc.returncode:
-        raise Failure(f"{shlex.join(map(str, argv))} exited {proc.returncode}\n{err[-4000:]}\n{out[-2000:]}")
+        raise Failure(f"{shlex.join(map(str, argv))} exited {proc.returncode}\n{err[-4000:]}\n{out[-2000:]}", stderr=err)
     return out
 
 
@@ -172,7 +174,25 @@ class Suite:
             self.host.call("rm", self.name)
             self.host.call("run", "-d", "--checkpoint", name, "--name", self.name, timeout=300)
         elif phase == "migration":
-            self.host.call("migrate", self.name, self.args.migration_to, timeout=300)
+            # A working guest may still be pulling cold checkpoint pages. This
+            # guard refuses before handoff, so only this response is safe to retry.
+            started, retries = time.monotonic(), 0
+            deadline = started + 300
+            busy = f"flexvm: vm {self.name} is still pulling its memory from its previous host or checkpoint"
+            while True:
+                attempted = time.monotonic()
+                remaining = deadline - attempted
+                if remaining <= 0:
+                    raise Failure(f"migration did not become ready within 300 seconds: {busy}")
+                try:
+                    self.host.call("migrate", self.name, self.args.migration_to, timeout=remaining)
+                    break
+                except Failure as error:
+                    if error.stderr is None or error.stderr.strip() != busy or time.monotonic() >= deadline:
+                        raise
+                    retries += 1
+                    time.sleep(min(.1, max(0, deadline - time.monotonic())))
+            self.report["migration_wait"] = {"paging_retries": retries, "elapsed_s": round(attempted - started, 3)}
             self.host = self.target
         self.verify(phase)
 
