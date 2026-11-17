@@ -3,6 +3,20 @@
 set -eux
 step=$1 nonce=$2 phase=$3
 base=/var/lib/flexvm-incus-$nonce
+diagnostics() {
+    status=$?
+    trap - 0
+    if [ "$status" -ne 0 ]; then
+        systemctl --no-pager -l status incus.service incus-startup.service || true
+        journalctl --no-pager -u incus.service -u incus-startup.service -n 80 || true
+        for instance in fc fc-clone; do
+            timeout 10 incus info --show-log "$instance" || true
+            timeout 10 incus exec "$instance" -- /bin/sh -c 'systemctl list-jobs; journalctl --no-pager -b -n 80; cat /etc/resolv.conf; ip route' || true
+        done
+    fi
+    exit "$status"
+}
+trap diagnostics 0
 leader() {
     incus query /1.0/instances/fc/state | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("metadata",d)["pid"])'
 }
@@ -12,7 +26,7 @@ prepare)
     apt-get update -qq
     apt-get install -y -qq --no-install-recommends incus incus-client dnsmasq-base iptables lxcfs curl python3 ca-certificates
     mkdir "$base"
-    systemctl start lxcfs.service incus.service
+    systemctl start lxcfs.service incus.service incus-startup.service
     incus admin init --minimal
     incus query /1.0/storage-pools/default | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("metadata",d)["driver"] == "dir"'
     incus network set incusbr0 ipv4.address 10.89.0.1/24
@@ -82,7 +96,7 @@ EOF
     dpkg-query -W incus incus-client
     ;;
 verify)
-    systemctl is-active --quiet incus.service lxcfs.service
+    systemctl is-active --quiet incus.service incus-startup.service lxcfs.service
     test "$(systemctl show --property=MainPID --value incus.service)" = "$(cat "$base/daemon")"
     python3 - "$base/daemon-stat" "/proc/$(cat "$base/daemon")/stat" <<'PYDAEMON'
 import pathlib, sys
