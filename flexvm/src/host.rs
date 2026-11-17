@@ -2462,6 +2462,41 @@ impl Host {
         Ok(self.held(&a) && (a.held >= gen || source()))
     }
 
+    /// Replace a stopped software VM's claim with the next route authorised
+    /// by its signed transfer receipt. It remains lent to the remote owner.
+    pub(crate) fn install_software_route(&self, lock: &Locked, ip: Ipv4Addr, gen: u64, rev: u64, via: Hop) -> Result<()> {
+        let address = self.addr(lock, ip)?;
+        if address.seen != gen
+            || address.lent != Some(gen)
+            || address.withdrawn
+            || address.rev > rev
+            || (address.rev == rev && address.hop() != Some(via))
+            || address.arriving.is_some()
+            || address.leaving.is_some()
+        {
+            bail!("software route was superseded or does not match an active loan");
+        }
+        if !self.route_check(ip, via)? {
+            bail!("software route next hop is not a configured peer");
+        }
+        if let Some(name) = address.holder.as_deref() {
+            let owner = address.holder_id.as_ref().ok_or("software route has an unidentified source owner")?;
+            if address.held != gen || PidFd::open(owner)?.is_some() {
+                bail!("software route still has a live or conflicting source holder");
+            }
+            if !self.observe_and(lock, ip, gen, rev, Some(via), |record| drop(let_go(record, name, Some(owner))))? {
+                bail!("software route was superseded while recording it");
+            }
+            self.unpublish(lock, ip, owner);
+        } else if !self.observe(lock, ip, gen, rev, Some(via))? {
+            bail!("software route was superseded while recording it");
+        }
+        if !self.reinstall(lock, ip, None)? {
+            bail!("software route could not be installed through its peer");
+        }
+        Ok(())
+    }
+
     /// Counts `dead` as gone even while its other threads still hold the name lock.
     pub fn reinstall(&self, l: &Locked, ip: Ipv4Addr, dead: Option<&Ident>) -> Result<bool> {
         let a = self.addr(l, ip)?;

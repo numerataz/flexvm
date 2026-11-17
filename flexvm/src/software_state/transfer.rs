@@ -18,6 +18,7 @@ use crate::{bail, util::Result};
 
 pub(crate) mod bundle;
 pub(crate) mod finalize;
+pub(crate) mod routing;
 
 const RECEIPT_DOMAIN: &[u8] = b"flexvm/software-retirement/v1\0";
 const ABORT_DOMAIN: &[u8] = b"flexvm/software-abort/v1\0";

@@ -93,6 +93,10 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      sign the destination's committed decision
   flexvm software-transfer finalize COMMIT-ACK --signing-key FILE
                                      record the completed outgoing handoff and sign its proof
+  flexvm software-transfer acknowledge-route OFFER --signing-key FILE
+                                     sign a routed software VM's active destination
+  flexvm software-transfer install-route ROUTE-ACK
+                                     install the signed peer route at the retired source
   flexvm software-transfer abort OFFER
                                      durably reject the prepared transfer
   flexvm software-transfer acknowledge-abort OFFER --signing-key FILE
@@ -674,8 +678,8 @@ fn check_applies(args: &Args) -> Result<()> {
                 (first.map(String::as_str), words, keys),
                 (Some("id"), 2, (false, false, false))
                     | (Some("prepare"), 3, (true, false, false))
-                    | (Some("commit" | "abort" | "recover" | "receive"), 3, (false, false, false))
-                    | (Some("acknowledge-abort" | "acknowledge-commit" | "finalize"), 3, (false, true, false))
+                    | (Some("commit" | "abort" | "recover" | "receive" | "install-route"), 3, (false, false, false))
+                    | (Some("acknowledge-abort" | "acknowledge-commit" | "acknowledge-route" | "finalize"), 3, (false, true, false))
                     | (Some("offer" | "send" | "activate"), 4, (false, false, false))
                     | (Some("retire"), 4, (false, true, true))
             ) {
@@ -849,6 +853,10 @@ fn real_main(args: &Args) -> Result<()> {
             Path::new(args.get("signing-key").unwrap()),
             args.get("destination-key").unwrap(),
         )?),
+        Some("software-transfer") if name == "acknowledge-route" => {
+            print(software_state::transfer::routing::acknowledge(&open_host(args)?, Path::new(pos[2]), Path::new(args.get("signing-key").unwrap()))?)
+        }
+        Some("software-transfer") if name == "install-route" => print(software_state::transfer::routing::install(&open_host(args)?, Path::new(pos[2]))?),
         Some("software-transfer") => {
             let path = state(args)?;
             host::host_dir(&path, 0o755)?;
