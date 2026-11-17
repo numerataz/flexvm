@@ -168,7 +168,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/software-qemu
-          key: software-qemu-x86_64-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch') }}
+          key: software-qemu-x86_64-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch', 'scripts/compat/parent-kvm/slot-map.h') }}
       - name: Install fixed x86 software CPU engine
         if: matrix.arch == 'x86_64'
         run: |
@@ -341,7 +341,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/software-qemu
-          key: software-qemu-x86_64-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch') }}
+          key: software-qemu-x86_64-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch', 'scripts/compat/parent-kvm/slot-map.h') }}
       - name: Install fixed x86 software CPU engine
         if: matrix.arch == 'x86_64'
         run: |
@@ -374,6 +374,10 @@ jobs:
           cat "$RUNNER_TEMP/parent-kvm-run/report.json"
           sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
             --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-scattered" --ram-pages 64
+          cat "$RUNNER_TEMP/parent-kvm-scattered/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
             --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-single-page" --ram-pages 1
           cat "$RUNNER_TEMP/parent-kvm-single-page/report.json"
           sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
@@ -383,7 +387,7 @@ jobs:
           if sudo python3 -c 'import fcntl, os; fd = os.open("/dev/kvm", os.O_RDWR); assert fcntl.ioctl(fd, 0xAE00) == 12; fcntl.ioctl(fd, 0xAE01, 0)' 2>/dev/null; then
             sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
               --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
-              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-worker" --parent-engine kvm --native-oracle
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-worker" --parent-engine kvm --native-oracle --ram-pages 64
             cat "$RUNNER_TEMP/parent-kvm-native-worker/report.json"
           fi
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
@@ -445,7 +449,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/software-qemu
-          key: software-qemu-x86_64-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch') }}
+          key: software-qemu-x86_64-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch', 'scripts/compat/parent-kvm/slot-map.h') }}
       - name: Install fixed x86 software CPU engine
         if: matrix.arch == 'x86_64'
         run: |

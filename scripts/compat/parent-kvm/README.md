@@ -9,9 +9,11 @@ I/O exit. The client changes a byte in shared RAM and updates the stopped
 child's registers, including its instruction pointer. A second `KVM_RUN`
 resumes the same child. It uses both updates to produce the next I/O byte.
 
-The module supports one VM, one vCPU and one pinned slot of one or two
-4 KiB pages. The child maps each page directly from its physical offset in
-the outer VM's memory file. The parent stops the child before acknowledging
+The module supports one VM, one vCPU and one pinned slot of up to 128 4 KiB
+pages. The parent validates the physical offsets and seals their ordered
+layout in a file. Both engines fill one contiguous address interval with
+shared mappings of the outer VM RAM and combine consecutive offsets into
+one mapping. The parent stops the child before acknowledging
 release of the slot. If it cannot confirm release, the pages stay pinned
 until the outer VM exits.
 The worker supports byte output to one port and a subset of x86 real-mode
@@ -40,3 +42,5 @@ With `--parent-engine kvm`, the parent runs the child vCPU through the host
 KVM device. The guest and client use the same interface and shared page.
 The default TCG run masks the host KVM device and exercises software execution.
 Add `--ram-pages 1` to run the same client with a single-page slot.
+Use `--ram-pages 64` to exercise a larger slot. The test checks the worker's
+actual address mappings and the child's writes at both ends of the slot.

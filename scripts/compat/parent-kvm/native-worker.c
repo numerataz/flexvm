@@ -12,6 +12,7 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include "slot-map.h"
 
 static void check(bool condition, const char *why)
 {
@@ -32,19 +33,15 @@ static unsigned long number(const char *text, unsigned long maximum)
 
 int main(int argc, char **argv)
 {
-    check(argc == 4 || argc == 5, "expected control fd, outer RAM fd, and one or two page offsets");
+    check(argc == 4, "expected control, outer RAM, and slot layout file descriptors");
     int control = (int)number(argv[1], INT_MAX);
     int outer_ram = (int)number(argv[2], INT_MAX);
-    size_t slot_bytes = (size_t)(argc - 3) * 4096;
-    unsigned char *slot = mmap(NULL, slot_bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    check(slot != MAP_FAILED, "reserve a contiguous address range for guest RAM");
-    for (int arg = 3; arg < argc; arg++) {
-        off_t offset = (off_t)number(argv[arg], LONG_MAX);
-        check(offset % 4096 == 0, "unaligned outer RAM offset");
-        void *address = slot + (arg - 3) * 4096;
-        check(mmap(address, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
-                   outer_ram, offset) == address, "map outer RAM page");
-    }
+    int layout = (int)number(argv[3], INT_MAX);
+    size_t slot_bytes;
+    void *slot = flexvm_map_slot(outer_ram, layout, &slot_bytes);
+    check(slot != MAP_FAILED, "map the parent RAM slot");
+    close(outer_ram);
+    close(layout);
 
     int kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     check(kvm >= 0 && ioctl(kvm, KVM_GET_API_VERSION, 0) == KVM_API_VERSION,

@@ -30,7 +30,13 @@ int main(void)
     check(syscall(SYS_finit_module, module, "", 0) == 0, "load provider");
     close(module);
     check(chmod("/kvm-run", 0700) == 0, "make the client executable");
-    const char *pages = access("/single-page", F_OK) == 0 ? "1" : "2";
+    int fixture = open("/ram-pages", O_RDONLY | O_CLOEXEC);
+    check(fixture >= 0, "open fixture configuration");
+    char pages[5];
+    ssize_t page_bytes = read(fixture, pages, sizeof(pages));
+    check(page_bytes > 0 && page_bytes < (ssize_t)sizeof(pages), "read fixture page count");
+    pages[page_bytes] = '\0';
+    close(fixture);
     pid_t child = fork();
     check(child >= 0, "fork the KVM client");
     if (child == 0) {
