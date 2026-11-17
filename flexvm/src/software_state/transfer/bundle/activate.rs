@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{bundle_name, Header, INCOMING};
 use crate::host::{Ident, NameLock, PidFd};
-use crate::software_state::transfer::{incoming_status, read_input, Offer, Status};
+use crate::software_state::transfer::{committed_return_fence, read_input, Offer};
 use crate::software_state::{
     open_pinned, parent_directory, parent_lock, present, private_directory, read_manifest, record, write_record, Consumed, Grant, Input, Manifest, Profile,
     Verified,
@@ -23,6 +23,8 @@ struct Decision {
     name: String,
     generation: u64,
     grant: Option<Grant>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    return_fence: Option<Offer>,
 }
 
 pub(crate) struct Activation<'a> {
@@ -37,11 +39,15 @@ fn decision_name(offer: &Offer) -> String {
     format!(".software-activation-v1-{}", offer.vm_id)
 }
 
-fn require_committed(state: &File, offer: &Offer) -> Result<()> {
-    if incoming_status(state, offer)? != Status::Committed {
-        bail!("software activation requires a committed destination transfer");
+/// Use only under the host transfer lock. A new outbound fence always
+/// supersedes an older inbound grant.
+pub(in crate::software_state::transfer) fn return_grant_generation(state: &File, outgoing: &Offer) -> Result<Option<u64>> {
+    let key = decision_name(outgoing);
+    if !present(state, &key)? {
+        return Ok(None);
     }
-    Ok(())
+    let decision = record::<Decision>(state, &key)?;
+    Ok(decision.grant.filter(|_| decision.return_fence.as_ref() == Some(outgoing)).map(|grant| grant.generation))
 }
 
 impl<'a> Activation<'a> {
@@ -52,20 +58,23 @@ impl<'a> Activation<'a> {
     fn prepare_offer(name: &'a NameLock, offer: Offer) -> Result<Self> {
         let state = parent_directory(name.state_path())?;
         let _transfer = parent_lock(&state, libc::LOCK_EX)?;
-        require_committed(&state, &offer)?;
+        let return_fence = committed_return_fence(&state, &offer)?;
         let key = decision_name(&offer);
         let previous = if present(&state, &key)? { Some(record::<Decision>(&state, &key)?) } else { None };
-        let floor = if let Some(previous) = &previous {
-            if previous.grant.is_some() {
-                bail!("software transfer already granted execution; this activation cannot be replayed");
+        let mut floor = offer.generation;
+        if let Some(previous) = &previous {
+            if previous.offer == offer {
+                if previous.grant.is_some() {
+                    bail!("software transfer already granted execution; this activation cannot be replayed");
+                }
+                if previous.name != name.name || previous.return_fence != return_fence {
+                    bail!("software activation is already bound to another offer or VM name");
+                }
+                floor = floor.max(previous.generation);
+            } else if !return_fence.as_ref().is_some_and(|fence| fence.generation > previous.generation) {
+                bail!("software activation cannot supersede the previous execution decision");
             }
-            if previous.offer != offer || previous.name != name.name {
-                bail!("software activation is already bound to another offer or VM name");
-            }
-            previous.generation
-        } else {
-            offer.generation
-        };
+        }
         let root = crate::host::fd_path(state.as_raw_fd()).join(INCOMING);
         let incoming = private_directory(&root)?;
         let directory = private_directory(&crate::host::fd_path(incoming.as_raw_fd()).join(bundle_name(&offer)))?;
@@ -76,7 +85,7 @@ impl<'a> Activation<'a> {
         let header = Header { offer: offer.clone(), manifest: read_manifest(&directory)? };
         header.check(&offer)?;
         let generation = floor.checked_add(1).ok_or("software activation generation exhausted")?;
-        let decision = Decision { offer, name: name.name.clone(), generation, grant: None };
+        let decision = Decision { offer, name: name.name.clone(), generation, grant: None, return_fence };
         write_record(&state, &key, &serde_json::to_vec(&decision)?, previous.is_some())?;
         Ok(Self { state, directory, header, decision, _name: name })
     }
@@ -101,7 +110,9 @@ impl<'a> Activation<'a> {
 
     pub(crate) fn grant(mut self, engine: Ident) -> Result<(u64, Consumed)> {
         let _transfer = parent_lock(&self.state, libc::LOCK_EX)?;
-        require_committed(&self.state, &self.decision.offer)?;
+        if committed_return_fence(&self.state, &self.decision.offer)? != self.decision.return_fence {
+            bail!("software activation outgoing handoff changed before the grant");
+        }
         let key = decision_name(&self.decision.offer);
         if record::<Decision>(&self.state, &key)? != self.decision {
             bail!("software activation preparation was superseded");

@@ -255,6 +255,14 @@ resuming. A retry before the grant uses the same destination name and a newer
 generation. The grant survives removal of the VM or its imported artifacts.
 After activation, ordinary destination `stop` and `start` use local checkpoints.
 
+To return to the previous host, repeat the same commands with source and
+destination reversed. The returning offer must advance the generation and
+use the host identity and signing key pinned by the last outbound handoff.
+Activate under a free name if the previous local checkpoint still holds its
+old name. That checkpoint stays fenced after the return. Only a checkpoint
+captured by the new local owner can start or transfer again. The current return
+protocol covers direct handoffs between the same pair of hosts.
+
 After load, use the guest agent to step CLOCK_REALTIME from the current host time.
 Do not reset CLOCK_MONOTONIC through the agent. Preserve the engine virtual clock
 and device timers through migration, and test nondecreasing monotonic time and
