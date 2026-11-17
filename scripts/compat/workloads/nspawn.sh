@@ -27,7 +27,10 @@ prepare)
     # connection timeout when one of a mirror's addresses does not answer.
     printf 'timeout = 15\ntries = 3\n' > "$base/wgetrc"
     export WGETRC="$base/wgetrc"
-    debootstrap --variant=minbase --include=systemd-sysv,dbus,python3,iproute2,ca-certificates noble "$root" "$mirror"
+    if ! debootstrap --variant=minbase --include=systemd-sysv,dbus,python3,iproute2,ca-certificates noble "$root" "$mirror"; then
+        tail -n 1000 "$root/debootstrap/debootstrap.log" >&2 || true
+        exit 1
+    fi
     rm -f "$root"/var/cache/apt/archives/*.deb
     mkdir -p "$root/etc/systemd/network" /etc/systemd/nspawn /etc/systemd/network
     cat > "$root/etc/systemd/network/10-host.network" <<'EOF'
