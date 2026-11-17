@@ -248,6 +248,13 @@ impl SocketRoot {
     }
 
     fn software_in(bases: &[PathBuf]) -> Result<Arc<Self>> {
+        Self::software_in_with(bases, |dir| {
+            let owner = SoftwareOwner { version: 1, owner: crate::host::Ident::me() };
+            crate::util::write_file(dir, "software-owner", &serde_json::to_vec(&owner)?, true).map_err(Into::into)
+        })
+    }
+
+    fn software_in_with(bases: &[PathBuf], mut publish: impl FnMut(&Path) -> Result<()>) -> Result<Arc<Self>> {
         let mut errors = Vec::new();
         for base in bases {
             let attempt = (|| -> Result<Arc<Self>> {
@@ -259,12 +266,16 @@ impl SocketRoot {
                 DirBuilder::new().mode(0o700).create(&dir)?;
                 let lease = open_software_dir(&dir)?;
                 crate::host::flock(&lease, libc::LOCK_SH)?;
+                // Collectors must not observe a new root before its owner record.
+                // No SocketRoot exists yet: its destructor would reacquire this
+                // base lock if publication failed while we still held it.
+                if let Err(error) = publish(&dir) {
+                    // No caller has received the root, so no child can exist.
+                    let _ = fs::remove_dir_all(&dir);
+                    return Err(error);
+                }
                 let root = Arc::new(Self { dir, next: AtomicU64::new(0), software_lease: Some(lease) });
-                // The root lease now protects initial owner publication. Release
-                // the base lock before any error can run the root destructor.
                 drop(creating);
-                let owner = SoftwareOwner { version: 1, owner: crate::host::Ident::me() };
-                crate::util::write_file(&root.dir, "software-owner", &serde_json::to_vec(&owner)?, true)?;
                 Ok(root)
             })();
             match attempt {
@@ -413,7 +424,14 @@ fn sweep_software_in(bases: &[PathBuf], selected: Option<&crate::host::Ident>) -
                     }
                     continue;
                 }
-                _ if selected.is_some() => return Err("cannot fence a software runtime with an unknown owner record".into()),
+                unknown if selected.is_some() => {
+                    let reason = match unknown {
+                        Ok(None) => "missing software-owner record".to_string(),
+                        Ok(Some(owner)) => format!("unsupported software-owner version {}", owner.version),
+                        Err(error) => error.to_string(),
+                    };
+                    return Err(format!("cannot fence a software runtime with an unknown owner record at {}: {reason}", entry.path().display()).into());
+                }
                 _ => continue,
             };
             if selected.is_some_and(|selected| *selected != owner.owner) {
@@ -573,6 +591,93 @@ mod tests {
         let mut selected = crate::host::Ident::me();
         selected.start += 1;
         assert!(sweep_software_in(&bases, Some(&selected)).is_err(), "unknown ownership cannot authorize name reuse");
+    }
+
+    #[test]
+    fn targeted_fencing_waits_for_initial_owner_publication() {
+        let temp = crate::test_util::TempDir::new("qpub");
+        let bases = [temp.join("s")];
+        let creator_bases = bases.clone();
+        let (publishing, published) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let creator = std::thread::spawn(move || {
+            SocketRoot::software_in_with(&creator_bases, |dir| {
+                publishing.send(()).unwrap();
+                released.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                let owner = SoftwareOwner { version: 1, owner: crate::host::Ident::me() };
+                crate::util::write_file(dir, "software-owner", &serde_json::to_vec(&owner)?, true).map_err(Into::into)
+            })
+            .map_err(|error| error.to_string())
+        });
+        if let Err(error) = published.recv_timeout(std::time::Duration::from_secs(5)) {
+            panic!("creator failed before publication gate ({error}): {:?}", creator.join().unwrap().map(|_| ()));
+        }
+        let base = File::open(&bases[0]).unwrap();
+        let excluded = crate::host::flock(&base, libc::LOCK_EX | libc::LOCK_NB).is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock);
+        drop(base);
+        let mut old_owner = crate::host::Ident::me();
+        old_owner.start += 1;
+        let (entered, entering) = std::sync::mpsc::channel();
+        let (finished, finishing) = std::sync::mpsc::channel();
+        let collector = std::thread::spawn(move || {
+            entered.send(()).unwrap();
+            finished.send(sweep_software_in(&bases, Some(&old_owner)).map_err(|error| error.to_string())).unwrap();
+        });
+        entering.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let early = finishing.recv_timeout(std::time::Duration::from_millis(100));
+        let blocked = matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout));
+        release.send(()).unwrap();
+        let root = creator.join().unwrap().unwrap();
+        let result = match early {
+            Ok(result) => result,
+            Err(_) => finishing.recv_timeout(std::time::Duration::from_secs(5)).unwrap(),
+        };
+        collector.join().unwrap();
+        assert!(root.dir.join("software-owner").is_file());
+        assert!(excluded && blocked, "fencing observed a partially published owner: {result:?}");
+        result.unwrap();
+    }
+
+    #[test]
+    fn failed_owner_publication_releases_base_and_removes_childless_root() {
+        let temp = crate::test_util::TempDir::new("qfail");
+        let bases = [temp.join("s")];
+        let worker_bases = bases.clone();
+        let (finished, finishing) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let error = SocketRoot::software_in_with(&worker_bases, |_| Err("injected owner publication failure".into())).err().unwrap();
+            finished.send(error.to_string()).unwrap();
+        });
+        assert!(finishing.recv_timeout(std::time::Duration::from_secs(5)).unwrap().contains("injected owner publication failure"));
+        worker.join().unwrap();
+        assert_eq!(fs::read_dir(&bases[0]).unwrap().count(), 0);
+        let mut selected = crate::host::Ident::me();
+        selected.start += 1;
+        sweep_software_in(&bases, Some(&selected)).unwrap();
+        let root = SocketRoot::software_in(&bases).unwrap();
+        assert!(root.dir.join("software-owner").is_file());
+    }
+
+    #[test]
+    fn unknown_owner_fencing_reports_root_and_reason_without_removing_it() {
+        let temp = crate::test_util::TempDir::new("qbad");
+        let bases = [temp.join("s")];
+        base_dir(&bases[0]).unwrap();
+        let root = bases[0].join(format!("{SOFTWARE_PREFIX}{}", "a".repeat(32)));
+        DirBuilder::new().mode(0o700).create(&root).unwrap();
+        let mut selected = crate::host::Ident::me();
+        selected.start += 1;
+        let record = root.join("software-owner");
+        for (bytes, reason) in [
+            (b"unknown owner format".to_vec(), "expected"),
+            (serde_json::to_vec(&SoftwareOwner { version: 2, owner: crate::host::Ident::me() }).unwrap(), "unsupported software-owner version 2"),
+        ] {
+            fs::write(&record, &bytes).unwrap();
+            let error = sweep_software_in(&bases, Some(&selected)).unwrap_err().to_string();
+            assert!(error.contains("unknown owner record") && error.contains(root.to_str().unwrap()) && error.contains(reason), "{error}");
+            sweep_software_in(&bases, None).unwrap();
+            assert_eq!(fs::read(&record).unwrap(), bytes);
+        }
     }
 
     #[test]
