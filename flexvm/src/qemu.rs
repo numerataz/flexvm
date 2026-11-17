@@ -18,7 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 use crate::host::{AddrClaim, Host, Ident};
-use crate::net::{self, VmAddr};
+use crate::net;
 use crate::socket::{SocketRoot, Sockets};
 use crate::util::{By, Result};
 use crate::{bail, guest, software_state, template, util, volume};
@@ -1203,6 +1203,11 @@ mod tests {
         let kernel_args = |profile: &software_state::Profile| profile.arguments.windows(2).find(|args| args[0] == "-append").unwrap()[1].clone();
         assert!(kernel_args(&private).ends_with(" flexvm.gateway4=10.0.2.2"));
         assert!(!kernel_args(&legacy).contains("flexvm.gateway4="));
+        let [routed] = <[_; 1]>::try_from(config.profiles_for_disk_ids(std::iter::empty(), true).unwrap()).unwrap();
+        assert_eq!(Network::from_profile(&routed), Some(Network::Routed));
+        assert!(!kernel_args(&routed).contains("flexvm.gateway4="));
+        assert!(routed.arguments.iter().any(|arg| arg == "tap,id=net,fd=@tap,vhost=off"));
+        assert!(routed.arguments.iter().any(|arg| arg.ends_with(",netdev=net,mac=06:00:ac:10:00:02")));
         let mut unknown = private.clone();
         let position = unknown.arguments.iter().position(|arg| arg == "-netdev").unwrap() + 1;
         unknown.arguments[position].push_str(",hostfwd=tcp::22-:22");

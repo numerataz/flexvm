@@ -235,6 +235,10 @@ jobs:
         run: |
           sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=250% python3 scripts/compat/managed-disk-transfer.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-managed-disks" --timeout 360
           cat "$RUNNER_TEMP/software-managed-disks/report.json"
+      - name: Routed software VM restore without virtualization devices
+        run: |
+          sudo systemd-run --scope --collect -p MemoryMax=5G -p MemorySwapMax=0 -p CPUQuota=250% python3 scripts/compat/routed-network.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-routed-network" --timeout 300
+          cat "$RUNNER_TEMP/software-routed-network/report.json"
       - name: Distro PID 1 and fresh-owner restore without virtualization devices
         run: |
           sudo python3 scripts/test-image.py --state "$RUNNER_TEMP/software-state" "$RUNNER_TEMP/software-systemd-image"
@@ -306,6 +310,9 @@ jobs:
             ${{ runner.temp }}/software-managed-disks/*.json
             ${{ runner.temp }}/software-managed-disks/*.log
             ${{ runner.temp }}/software-managed-disks/*.strace
+            ${{ runner.temp }}/software-routed-network/*.json
+            ${{ runner.temp }}/software-routed-network/*.log
+            ${{ runner.temp }}/software-routed-network/*.strace
             ${{ runner.temp }}/software-lifecycle/*.jsonl
             ${{ runner.temp }}/software-lifecycle/*.log
             ${{ runner.temp }}/software-lifecycle/*.strace
