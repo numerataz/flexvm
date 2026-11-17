@@ -693,7 +693,17 @@ how every process already picks up changes, so a command would only write
 the same JSON. `info` covers what a command added: the derived values and
 the warnings.
 
-### IPv6 addresses
+#### Routed software VMs
+
+Add `--network routed` to a named `flexvm software` VM to use the host's
+`vm_ips`, DNS and optional `vm_ipv6_prefix`. The software engine uses a
+TAP from `/dev/net/tun` and the host installs routes to the VM. QEMU
+handles the guest CPU and virtio networking in userspace. `flexvm stop` keeps
+the address reserved, and `flexvm start` restores the same addresses
+and TCP state through a new TAP on this host. Routed software VM
+checkpoints currently support local restore.
+
+## IPv6 addresses
 
 With `vm_ipv6_prefix` set, flexvm derives and reports
 each VM's IPv6 address, configures it in the guest, routes it to the VM's

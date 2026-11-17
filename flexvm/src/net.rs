@@ -123,7 +123,8 @@ pub const TAP_ADDR6: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
 /// A VM's addresses as its host routes them: its IPv4 address, and with `vm_ipv6_prefix` its IPv6
 /// one (`Config::vm_addr`), which goes wherever the IPv4 one does (the tap's guard, neighbour
 /// entry and route). Without an IPv6 address every helper does just what it does for the IPv4 one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct VmAddr {
     pub v4: Ipv4Addr,
     pub v6: Option<Ipv6Addr>,
@@ -165,7 +166,18 @@ pub fn create_tap_with(owner: &str, claim: impl FnOnce(&OwnedFd) -> Result<Strin
 }
 
 pub fn create_indexed_tap(owner: &str, claim: impl FnOnce(&OwnedFd) -> Result<String>) -> Result<(String, u32)> {
-    make_tap(owner, udev_monitor(), claim)
+    make_tap(owner, udev_monitor(), true, claim)
+}
+
+/// The TAP and its routes disappear when the owner and engine close their descriptors.
+pub fn open_software_tap(owner: &str, name: &str) -> Result<(OwnedFd, String, u32)> {
+    let mut retained = None;
+    let (name, index) = make_tap(owner, udev_monitor(), false, |fd| {
+        let name = free_tun(fd, name, TAP_FLAGS)?;
+        retained = Some(fd.try_clone()?);
+        Ok(name)
+    })?;
+    Ok((retained.ok_or("software TAP descriptor is missing")?, name, index))
 }
 
 /// Never a leaked tap of a dead process with this name, nor its routes.
@@ -223,7 +235,7 @@ fn free_name(name: &str, mut claim: impl FnMut(&str) -> std::io::Result<()>) -> 
 }
 
 /// `create_tap_with`, with `udev` (if any) handed to the tap's watcher (`keep_mac_from_udev`).
-fn make_tap(owner: &str, udev: Option<OwnedFd>, claim: impl FnOnce(&OwnedFd) -> Result<String>) -> Result<(String, u32)> {
+fn make_tap(owner: &str, udev: Option<OwnedFd>, persistent: bool, claim: impl FnOnce(&OwnedFd) -> Result<String>) -> Result<(String, u32)> {
     if owner.len() >= 256 {
         bail!("tap: owner {owner:?} is over 255 bytes (a shorter run directory)");
     }
@@ -237,7 +249,9 @@ fn make_tap(owner: &str, udev: Option<OwnedFd>, claim: impl FnOnce(&OwnedFd) -> 
     let mut alias = ifinfomsg(index);
     attr(&mut alias, IFLA_IFALIAS, owner.as_bytes());
     netlink(RTM_SETLINK, 0, &alias).map_err(|e| format!("tap {name}: its owner: {e}"))?;
-    crate::syscall_check!(unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETPERSIST, 1) } < 0, "create tap {name}");
+    if persistent {
+        crate::syscall_check!(unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETPERSIST, 1) } < 0, "create tap {name}");
+    }
     drop(fd);
     let made = (|| -> Result<()> {
         let mut addr = [&[libc::AF_INET as u8, 32, 0, RT_SCOPE_HOST][..], &index.to_ne_bytes()].concat();
@@ -2082,7 +2096,7 @@ mod tests {
             }
         }
         // Made with no watcher of its own; a udevd here is done with it before the test goes on.
-        make_tap("test", None, |fd| claim_tap(fd, &tap).map(|()| tap.clone()).map_err(Into::into)).unwrap();
+        make_tap("test", None, true, |fd| claim_tap(fd, &tap).map(|()| tap.clone()).map_err(Into::into)).unwrap();
         let _tap = TapGuard(&tap);
         let _ = std::process::Command::new("udevadm").args(["settle", "--timeout=10"]).status();
         let index = ifindex(&tap).unwrap();

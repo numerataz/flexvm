@@ -102,6 +102,13 @@ impl Disk {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutedNetwork {
+    pub address: crate::net::VmAddr,
+    pub generation: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -130,6 +137,8 @@ pub struct Manifest {
     pub firmware: BTreeMap<String, Artifact>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disks: Vec<Disk>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routed: Option<RoutedNetwork>,
     pub main: Main,
     pub image: crate::image::ImageMeta,
 }
@@ -170,6 +179,11 @@ impl Manifest {
             if !crate::volume::valid_id(&disk.volume_id) || !disk_ids.insert(&disk.volume_id) || disk.content.bytes % 512 != 0 {
                 bail!("software checkpoint has an invalid or repeated managed disk");
             }
+        }
+        if self.routed.is_some() != matches!(crate::qemu::Network::from_profile(&self.profile), Some(crate::qemu::Network::Routed))
+            || self.routed.is_some_and(|network| network.generation == 0)
+        {
+            bail!("software checkpoint has an invalid routed network identity");
         }
         self.main.validate(&self.image)?;
         self.image.check_kernel(&self.kernel.sha256)?;
@@ -829,7 +843,10 @@ pub fn describe(path: &Path, name: &str) -> Result<serde_json::Value> {
             argv: manifest.image.argv,
             ram_mib: manifest.memory_mib,
         },
-        ip: crate::qemu::Network::from_profile(&manifest.profile).map(crate::qemu::Network::ip),
+        ip: manifest
+            .routed
+            .map(|network| network.address.v4)
+            .or_else(|| crate::qemu::Network::from_profile(&manifest.profile).and_then(crate::qemu::Network::ip)),
         gen: manifest.identity_generation,
         vcpus: manifest.vcpus,
         max_mib: u64::from(manifest.memory_mib),
@@ -1119,6 +1136,7 @@ mod tests {
             state: blank,
             firmware: BTreeMap::new(),
             disks: Vec::new(),
+            routed: None,
             main: Main::App(Session { id: "saved-main".into(), offset: 19, claim: 2 }),
             image: serde_json::from_value(json!({"source":"local", "digest":"sha256:image", "config_digest":"sha256:config",
                 "app_conf":"", "argv":["/probe"], "warm":false}))

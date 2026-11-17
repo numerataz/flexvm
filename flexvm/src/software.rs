@@ -390,6 +390,7 @@ impl Owner {
                 state: blank,
                 firmware: std::collections::BTreeMap::new(),
                 disks: Vec::new(),
+                routed: None,
                 main: match &self.main_id {
                     Some(id) => software_state::Main::App(software_state::Session {
                         id: id.clone(),
@@ -596,6 +597,7 @@ fn serve(
             // STARTED was synchronized before this first guest instruction.
             // As with the ordinary start command, execution resumes even when
             // the source was paused before it was suspended.
+            machine.restore_route()?;
             machine.switch("cont", deadline).map_err(|error| format!("software destination CPU resume failed: {error}"))?;
             machine.resume_admission(resumed.generation, epoch, resumed.manifest.barrier_generation, resumed.manifest.barrier_sequence, deadline)?;
             let (main_id, reader, offset, claim) = match resumed.manifest.main.session() {
@@ -657,7 +659,7 @@ fn serve(
         },
         name: name.name.clone(),
         ident: Ident::me(),
-        ip: Some(machine.ip()),
+        ip: machine.ip(),
         gen: identity_generation,
         vcpus: config.vcpus,
         max_mib: u64::from(config.mem_mib),
@@ -783,6 +785,7 @@ fn serve(
     if result.is_ok() || crate::template::interrupted_signal().is_some() {
         if let Some(consumed) = &owner.consumed {
             consumed.finish(&owner.host.suspended(&owner.name.name)?)?;
+            owner.machine.release_routed_checkpoint();
         }
     }
     let entry = owner.entry.lock().unwrap().clone();
@@ -811,13 +814,14 @@ pub fn restore(host: Host, vm_name: &str, notify: Option<std::fs::File>) -> Resu
         setup_signals(processes.clone());
         let config = restore_config(&metadata);
         let _reservation = Reservation::new(&host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)?;
-        let profiles = config.profiles_for_disk_ids(metadata.disks.iter().map(|disk| disk.volume_id.as_str()))?;
+        let profiles = config.profiles_for_disk_ids(metadata.disks.iter().map(|disk| disk.volume_id.as_str()), metadata.routed.is_some())?;
         let verified = software_state::open(&path, profiles)?;
         let disks = verified.manifest.open_disks(&host.state)?;
         let manifest = verified.manifest.clone();
         let prepared = verified.prepare(&name, &software_state::host_id(&host.state)?)?;
         let generation = prepared.generation;
-        let machine = config.restore(verified, processes.clone(), disks)?;
+        let routed = manifest.routed.map(|network| qemu::Routed::restore(&host, vm_name, network)).transpose()?;
+        let machine = config.restore(verified, processes.clone(), disks, routed)?;
         let consumed = prepared.grant(processes.engine_ident()?)?;
         let meta = manifest.image.clone();
         serve(host, name, machine, processes, &config, &meta, Some(Resume { manifest, generation, consumed, notify }))
@@ -848,9 +852,10 @@ pub fn activate(host: Host, vm: &str, offer: &Path, trusted_engine: &Path) -> Re
     let processes = Arc::new(qemu::Processes::default());
     setup_signals(processes.clone());
     let _reservation = Reservation::new(&host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)?;
-    let verified = activation.verify_inputs(&config.profiles_for_disk_ids(manifest.disks.iter().map(|disk| disk.volume_id.as_str()))?, trusted_engine)?;
+    let verified =
+        activation.verify_inputs(&config.profiles_for_disk_ids(manifest.disks.iter().map(|disk| disk.volume_id.as_str()), false)?, trusted_engine)?;
     let disks = activation.adopt_disks()?;
-    let machine = config.restore(verified, processes.clone(), disks)?;
+    let machine = config.restore(verified, processes.clone(), disks, None)?;
     let (generation, consumed) = activation.grant(processes.engine_ident()?)?;
     let meta = manifest.image.clone();
     serve(host, name, machine, processes, &config, &meta, Some(Resume { manifest, generation, consumed, notify: None }))
