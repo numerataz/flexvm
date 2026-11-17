@@ -69,7 +69,8 @@ pub(crate) fn run(host: &Host, name: &str, timeout: Duration, ready: impl FnOnce
     queue.0.set_len(0)?;
     let (tap, _) = net::route_get(ip.into())?;
     let tap_index = net::ifindex(&tap)?;
-    if net::link_alias(tap_index)? != host::tap_alias(&host.run, &entry.ident) {
+    let alias = host::tap_alias(&host.run, &entry.ident);
+    if net::link_alias(tap_index)? != alias || address.v6.map(|ip| net::route_get(ip.into())).transpose()?.is_some_and(|(v6, _)| v6 != tap) {
         bail!("software packet hold source route does not point to the owner's TAP");
     }
     net::hold_fallback(true, address, tap_index)?;
@@ -83,39 +84,53 @@ pub(crate) fn run(host: &Host, name: &str, timeout: Duration, ready: impl FnOnce
 
     let ready = ready(json!({"status":"holding","address":address,"generation":generation,"revision":next}));
     let deadline = Instant::now() + timeout;
-    let lock = loop {
+    let (lock, current, forwarded) = loop {
         let finished = ready.is_err() || util::take_signal(&signals).is_some() || Instant::now() >= deadline;
-        if finished {
-            break host.lock()?;
-        }
-        if notified(&queue.0, &expected) {
-            break host.lock()?;
+        let notice = notified(&queue.0, &expected);
+        if finished || notice {
+            let lock = host.lock()?;
+            let current = host.addr(&lock, ip)?;
+            let forwarded = notified(&queue.0, &expected)
+                && current.seen == generation
+                && current.lent == Some(generation)
+                && current.rev == next
+                && current.holder.is_none()
+                && !current.withdrawn;
+            if finished || forwarded {
+                break (lock, current, forwarded);
+            }
         }
         std::thread::sleep(Duration::from_millis(50));
     };
 
+    let same_tap = net::link_alias(tap_index).is_ok_and(|current| current == alias);
+    let mut keep_fallback = false;
     let replay = (|| {
-        let current = host.addr(&lock, ip)?;
-        if notified(&queue.0, &expected)
-            && current.seen == generation
-            && current.lent == Some(generation)
-            && current.rev == next
-            && current.holder.is_none()
-            && !current.withdrawn
-            && host.reinstall(&lock, ip, None)?
-        {
+        if forwarded {
+            if !host.reinstall(&lock, ip, None)? {
+                bail!("software packet hold could not reinstall the signed peer route");
+            }
             return Ok(json!({"status":"forwarded","hold":holder.replay_routed(ip, next)?.json()}));
         }
-        if current.holder_id.as_ref() == Some(&entry.ident)
+        if same_tap
+            && current.holder_id.as_ref() == Some(&entry.ident)
+            && current.held == generation
+            && current.lent.is_none()
+            && !current.withdrawn
             && host.live(&lock, ip)?.and_then(|rev| rev.checked_add(1)) == Some(next)
-            && net::link_alias(tap_index).is_ok_and(|alias| alias == host::tap_alias(&host.run, &entry.ident))
         {
+            // If reinstalling the primary route fails, the fallback still
+            // serves the verified source when its hold device disappears.
+            keep_fallback = true;
             net::route(address, tap_index)?;
-            let _ = net::hold_fallback(false, address, tap_index);
+            keep_fallback = false;
             return Ok(json!({"status":"restored-source","hold":holder.replay_routed(ip, next)?.json()}));
         }
         Ok(json!({"status":"expired","hold":holder.forget(ip, next).json()}))
     })();
+    if same_tap && !keep_fallback {
+        let _ = net::hold_fallback(false, address, tap_index);
+    }
     if replay.is_err() {
         holder.forget(ip, next);
     }
