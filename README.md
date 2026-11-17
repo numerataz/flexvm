@@ -1331,6 +1331,15 @@ through VM lifecycle operations. Guest packages, account/subordinate-ID
 setup and the full recipe are in
 [the rootless Docker workload](scripts/compat/workloads/rootless-docker.sh).
 
+Standalone rootless containerd/nerdctl and BuildKit use their upstream user
+service installers too. The
+[rootless containerd workload](scripts/compat/workloads/rootless-containerd.sh)
+uses the pinned nerdctl-full 2.4.2 bundle, containerd's native snapshotter and
+BuildKit's FUSE overlay OCI worker. It verifies delegated container limits,
+networking, live containers and fresh builds with persistent cache/secret
+mount semantics through VM lifecycle transitions. BuildKit retains its normal
+process sandbox and runs in a resource-limited user unit.
+
 ## Docker API
 
 `flexvm api` serves the Docker Engine API (v1.47; clients negotiate down to
