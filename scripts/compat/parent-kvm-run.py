@@ -161,10 +161,13 @@ class KvmChild:
         self.connection.close()
         if self.process is not None:
             try:
-                self.process.wait(timeout=1)
+                return self.process.wait(timeout=1)
             except subprocess.TimeoutExpired:
                 stop_process(self.process)
-            self.process = None
+                return self.process.returncode
+            finally:
+                self.process = None
+        return None
 
 
 def doorbell_peer(server, memory, requests, replies):
@@ -259,7 +262,9 @@ def exercise(qemu, kernel, output, reject_close, parent_engine):
                 if reject_close:
                     status = -errno.EIO
                 else:
-                    child.close()
+                    result = child.close()
+                    if parent_engine == "kvm" and result != 0:
+                        raise RuntimeError(f"native parent worker shut down with status {result}")
             observed.append(opcode)
             struct.pack_into("<i", mapping, 20, status)
             struct.pack_into("<I", mapping, 12, pending)
@@ -357,11 +362,17 @@ def main():
                             Path(__file__).resolve(), "--worker", "--qemu", qemu, "--kernel", kernel,
                             "--output", output, "--parent-engine", args.parent_engine,
                             *(["--reject-close"] if args.reject_close else [])], 75, worker)
-        with trace.open(errors="replace") as lines:
-            devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}
+        lines = trace.read_text(errors="replace").splitlines()
+        devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}
         expected = {"/dev/kvm"} if args.parent_engine == "kvm" else set()
         if devices != expected:
             raise RuntimeError(f"unexpected virtualization device access: {sorted(devices)}")
+        if args.parent_engine == "kvm":
+            worker_path = f'execve("{output / "native-worker"}",'
+            workers = {line.split()[0] for line in lines if worker_path in line and line.endswith(" = 0")}
+            kvm_users = {line.split()[0] for line in lines if '"/dev/kvm"' in line}
+            if len(workers) != 1 or kvm_users != workers:
+                raise RuntimeError("only the native parent worker may use host KVM")
         report.update(json.loads(worker.read_text()), status="passed", host_device_access=bool(devices),
                       host_devices=sorted(devices))
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
