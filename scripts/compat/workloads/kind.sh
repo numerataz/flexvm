@@ -61,6 +61,13 @@ kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
 - role: control-plane
+  # kubeadm's default API bootstrap window can expire before a TCG control
+  # plane serves RBAC. Keep the stock bootstrap, with a bounded startup budget.
+  kubeadmConfigPatches:
+  - |
+    kind: InitConfiguration
+    timeouts:
+      kubernetesAPICall: 5m
   extraPortMappings:
   - containerPort: 30089
     hostPort: 18089

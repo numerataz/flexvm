@@ -55,6 +55,12 @@ prepare)
         k3s kubectl -n kube-system rollout status "deployment/$deployment" --timeout=300s
     done
     # Imported images are now in containerd; do not retain a redundant RAM-backed archive.
+    # Traefik readiness can precede its Gateway API CRD installer completing.
+    # Wait for stock bootstrap jobs before requesting the full OpenAPI schema.
+    for job in helm-install-traefik-crd helm-install-traefik helm-install-gateway-api-crd; do
+        k3s kubectl -n kube-system wait --for=create "job/$job" --timeout=300s
+        k3s kubectl -n kube-system wait --for=condition=complete "job/$job" --timeout=300s
+    done
     rm "$archive"
     python3 - "$nonce" "$image" > "$base/workload.json" <<'PY'
 import json, sys
@@ -95,7 +101,7 @@ items = [
 ]
 print(json.dumps(dict(apiVersion='v1', kind='List', items=items)))
 PY
-    k3s kubectl apply -f "$base/workload.json"
+    k3s kubectl --request-timeout=120s apply -f "$base/workload.json"
     k rollout status deployment/web --timeout=300s
     k3s kubectl get node flexvm-test -o json > "$base/node.json"
     k get pods -l app=web -o json > "$base/pods.json"
