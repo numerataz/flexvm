@@ -82,6 +82,27 @@ configures the container veth through normal systemd-networkd settings, leaving
 the outer guest's eth0 configuration intact. Root files remain part of saved VM
 RAM; this case does not supply durable disks or test LXC/Incus (#1325/#1329).
 
+## LXC system containers
+
+The `lxc` workload uses stock Ubuntu LXC, its Ubuntu common configuration,
+`lxc-net` bridge/NAT and a Noble systemd root filesystem built by debootstrap
+inside the owned guest. It first boots a privileged container and shuts it down
+through LXC, then shifts the fixture's UID/GID ownership into a normal user's
+subordinate range and launches an unprivileged container. Hard-linked inodes
+are shifted once and file modes are preserved.
+
+A normal lingering user manager owns the delegated `lxc-start -F` service.
+`lxc-attach` runs through that same user manager: it must move its own process
+into the container cgroup, which requires a common delegated ancestor. No
+manually owned guest cgroup tree or elevated LXC attach mode is used. This
+follows the [LXC delegation model](https://linuxcontainers.org/lxc/getting-started/).
+
+Checks retain the nested init PID, service start identity, machine ID, random
+RAM canary and advancing counter across the outer VM lifecycle. They verify
+real container CPU/memory/PID limits, user-manager execution, veth HTTP traffic,
+DNS and outbound HTTP. This does not establish Incus support or storage
+durability (#1325/#1329).
+
 ## Migration
 
 A configured local peer must use compatible CPU/kernel/Firecracker artifacts
