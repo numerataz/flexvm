@@ -347,7 +347,7 @@ jobs:
       fail-fast: false
       matrix:
         arch: [x86_64, aarch64]
-        workload: [podman, namespace-sandboxes, containerd, rootless-docker, rootless-containerd]
+        workload: [podman, namespace-sandboxes, containerd, rootless-docker, rootless-containerd, rootless-podman]
         include:
           - { arch: x86_64, runner: ubuntu-24.04, qemu: qemu-system-x86 }
           - { arch: aarch64, runner: ubuntu-24.04-arm, qemu: qemu-system-arm }
