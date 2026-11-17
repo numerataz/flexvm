@@ -1340,7 +1340,8 @@ mod tests {
         r.read_exact(&mut got).unwrap();
         let (second, mut peer2) = handler(&sessions, &statuses, "ATTACH s 0".into());
         assert!(first.join().unwrap().is_ok(), "the replaced handler ends");
-        assert_eq!(acked(&read_frames(&mut peer2, |f| acked(f).is_some())), Some(9));
+        // Reading the pipe can wake us before its writer publishes the new ACK.
+        assert_eq!(acked(&read_frames(&mut peer2, |f| acked(f) == Some(9))), Some(9));
         peer2.write_all(&data(6, b"world")).unwrap();
         assert_eq!(acked(&read_frames(&mut peer2, |f| acked(f) == Some(11))), Some(11));
         let mut rest = [0; 2];
