@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Software-check cancellation/report contracts with fake tools; no root or VM."""
 import json
+import io
 import os
 from pathlib import Path
 import platform
@@ -10,6 +11,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import tarfile
 import threading
 import time
 import unittest
@@ -188,7 +190,7 @@ class SoftwareCheck(unittest.TestCase):
     def test_c_checks_compile_with_strict_warnings(self):
         sources = ['software-init.c', 'nested-init.c']
         if platform.machine() == 'x86_64':
-            sources.append('kvm-abi.c')
+            sources.extend(('kvm-abi.c', 'kvm-tsc.c'))
         elif platform.machine() == 'aarch64':
             sources.append('kvm-arm.c')
         for source in sources:
@@ -196,6 +198,60 @@ class SoftwareCheck(unittest.TestCase):
                 subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', '-static', '-pthread',
                                 str(ROOT / source), '-o', str(self.root / source.removesuffix('.c'))],
                                check=True, capture_output=True, timeout=60)
+
+
+class LifecycleFailureState(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='flexvm lifecycle failure ')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.state = self.root / 'fixture'
+        (self.state / 'state/suspended/test').mkdir(parents=True)
+        self.out = self.root / 'evidence'
+        self.out.mkdir()
+        self.capture = runpy.run_path(str(ROOT / 'software-lifecycle.py'))['retain_failed_state']
+
+    def report(self):
+        return json.loads((self.out / 'failure-state.json').read_text())
+
+    def test_sparse_state_and_external_link_are_retained_without_following(self):
+        directory = self.state / 'state/suspended/test'
+        (directory / 'manifest.json').write_text('{"fixture": true}')
+        with (directory / 'state').open('wb') as stream:
+            stream.seek(64 << 20)
+            stream.write(b'checkpoint tail')
+        cache = self.state / 'state/images'
+        cache.mkdir()
+        with (cache / 'unused').open('wb') as stream:
+            stream.truncate((2 << 30) + 1)
+        (directory / 'external').symlink_to(self.root / 'missing-outside-target')
+        self.capture(self.state, self.out)
+        report = self.report()
+        self.assertEqual(report['status'], 'captured', report)
+        raw = subprocess.check_output(['zstd', '-dc', str(self.out / report['archive'])], timeout=5)
+        with tarfile.open(fileobj=io.BytesIO(raw)) as archive:
+            self.assertFalse(any(name.startswith('state/images') for name in archive.getnames()))
+            link = archive.getmember('state/suspended/test/external')
+            self.assertTrue(link.issym())
+            self.assertEqual(archive.extractfile('state/suspended/test/manifest.json').read(), b'{"fixture": true}')
+            stream = archive.extractfile('state/suspended/test/state')
+            stream.seek(64 << 20)
+            self.assertEqual(stream.read(), b'checkpoint tail')
+        self.assertLess(report['bytes'], 1 << 20)
+
+    def test_special_files_and_oversize_state_fail_without_an_archive(self):
+        fifo = self.state / 'state/fifo'
+        os.mkfifo(fifo)
+        self.capture(self.state, self.out)
+        self.assertIn('special file', self.report()['error'])
+        self.assertFalse((self.out / 'failure-state.tar.zst').exists())
+        fifo.unlink()
+        (self.out / 'failure-state.json').unlink()
+        with (self.state / 'state/oversize').open('wb') as stream:
+            stream.truncate((2 << 30) + 1)
+        self.capture(self.state, self.out)
+        self.assertIn('logical budget', self.report()['error'])
+        self.assertFalse((self.out / 'failure-state.tar.zst').exists())
 
 
 if __name__ == '__main__':
