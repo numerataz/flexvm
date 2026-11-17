@@ -111,6 +111,7 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      experimental foreground QEMU TCG execution without host KVM;
                                      --qemu PATH, --vsock-backend PATH, --mem MIB, --vcpus N,
                                      --timeout SECS (boot only); image env/workdir/user options apply
+                                     --disk VOLUME attaches a managed data disk (repeatable, requires --name)
   flexvm ps [-a] [-q] [--json] [-f, --filter KEY=VALUE]... [--format FORMAT]
                                      list running VMs (-a: stopped ones too; -q: names only);
                                      --filter name=PART|status=STATE|image=IMAGE|ip=IP (a key again:
@@ -524,7 +525,7 @@ const NAMES: usize = usize::MAX;
 
 /// Each command's words (itself included) at most, and its flags besides `GLOBAL`.
 const COMMANDS: &[(&str, usize, &[&str])] = &[
-    ("software", 2, &["name", "kernel", "qemu", "control", "vsock-backend", "mem", "vcpus", "timeout"]),
+    ("software", 2, &["name", "kernel", "qemu", "control", "vsock-backend", "mem", "vcpus", "timeout", "disk"]),
     (
         "run",
         2,
@@ -2441,6 +2442,9 @@ fn kernel_bundle(args: &Args, kernel: &Path, reviewed: bool) -> Result<Option<im
 /// with engine processes owned by this foreground command. Named VMs also expose
 /// live management and local suspend/restore; migration remains separate work.
 fn software(args: &Args, src: &str) -> Result<i32> {
+    if args.has("disk") && !args.has("name") {
+        bail!("--disk requires a named software VM");
+    }
     if args.get("name").is_some() {
         // A shell's background SIGINT/SIGQUIT disposition must not disable the
         // normal management kill operation on a named VM.
@@ -2508,9 +2512,16 @@ fn software(args: &Args, src: &str) -> Result<i32> {
         .transpose()?;
     let _reservation =
         named.as_ref().map(|(host, _)| software::Reservation::new(host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)).transpose()?;
+    let disks = if args.has("disk") {
+        let (host, _) = named.as_ref().ok_or("--disk requires a named software VM")?;
+        let catalog = volume::Catalog::open(&host.state)?;
+        args.all("disk").iter().map(|name| catalog.writer(name)).collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
     let machine = match modules {
-        Some(bundle) => config.boot_with_kernel(&rootfs, processes.clone(), bundle.kernel)?,
-        None => config.boot(&rootfs, processes.clone())?,
+        Some(bundle) => config.boot_with_kernel(&rootfs, processes.clone(), bundle.kernel, disks)?,
+        None => config.boot(&rootfs, processes.clone(), disks)?,
     };
     drop(_cache_lock);
     if let Some((host, lock)) = named {

@@ -234,6 +234,9 @@ pub(super) fn local_restart_floor(state: &File, manifest: &Manifest) -> Result<u
 
 fn retired_checkpoint(checkpoint: &File) -> Result<(Manifest, Retirement)> {
     let manifest = read_manifest(checkpoint)?;
+    if !manifest.disks.is_empty() {
+        bail!("software transfer needs managed disk transport support");
+    }
     let retirement = Retirement::of(&manifest)?;
     if present(checkpoint, "STARTED")? || present(checkpoint, "DISCARDED")? {
         bail!("software transfer needs an unconsumed checkpoint");

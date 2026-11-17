@@ -82,6 +82,19 @@ impl Main {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Disk {
+    pub volume_id: String,
+    pub content: Artifact,
+}
+
+impl Disk {
+    fn filename(&self) -> String {
+        format!("disk-{}", self.volume_id)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub format: u32,
     pub backend: String,
@@ -106,11 +119,29 @@ pub struct Manifest {
     pub rootfs: Artifact,
     pub state: Artifact,
     pub firmware: BTreeMap<String, Artifact>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disks: Vec<Disk>,
     pub main: Main,
     pub image: crate::image::ImageMeta,
 }
 
 impl Manifest {
+    pub fn open_disks(&self, state: &Path) -> Result<Vec<crate::volume::Writer>> {
+        if self.disks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let catalog = crate::volume::Catalog::open(state)?;
+        self.disks
+            .iter()
+            .map(|disk| {
+                let writer = catalog.writer(&disk.volume_id)?;
+                let _verified = Input::read(writer.file.try_clone()?, Some(&disk.content))
+                    .map_err(|error| format!("managed volume {} changed since checkpoint: {error}", disk.volume_id))?;
+                Ok(writer)
+            })
+            .collect()
+    }
+
     fn validate(&self) -> Result<()> {
         if [&self.vm_id, &self.snapshot_id, &self.host_id].iter().any(|id| id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()))
             || !self.terminal
@@ -123,10 +154,21 @@ impl Manifest {
         {
             bail!("software state has invalid ownership, session or barrier identity");
         }
-        if [&self.engine, &self.kernel, &self.rootfs, &self.state].into_iter().chain(self.firmware.values()).any(|artifact| {
-            artifact.bytes == 0 || artifact.sha256.len() != 64 || !artifact.sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        }) {
+        if [&self.engine, &self.kernel, &self.rootfs, &self.state]
+            .into_iter()
+            .chain(self.firmware.values())
+            .chain(self.disks.iter().map(|disk| &disk.content))
+            .any(|artifact| {
+                artifact.bytes == 0 || artifact.sha256.len() != 64 || !artifact.sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            })
+        {
             bail!("software state has an empty artifact or invalid content digest");
+        }
+        let mut disk_ids = std::collections::HashSet::new();
+        for disk in &self.disks {
+            if !crate::volume::valid_id(&disk.volume_id) || !disk_ids.insert(&disk.volume_id) || disk.content.bytes % 512 != 0 {
+                bail!("software checkpoint has an invalid or repeated managed disk");
+            }
         }
         self.main.validate(&self.image)?;
         self.image.check_kernel(&self.kernel.sha256)?;
@@ -385,6 +427,9 @@ fn open_pinned(dir: File, profiles: &[Profile]) -> Result<Verified> {
     let manifest = read_manifest(&dir)?;
     if !profiles.contains(&manifest.profile) {
         bail!("software state execution profile does not match");
+    }
+    for disk in &manifest.disks {
+        Input::read(member(&dir, &disk.filename())?, Some(&disk.content))?;
     }
     Ok(Verified {
         inputs: Inputs {
@@ -832,6 +877,27 @@ impl Staging {
         Ok(Self { path, state, committed: false, parent, directory })
     }
 
+    pub fn capture_disks(&self, disks: &[crate::volume::Writer]) -> Result<Vec<Disk>> {
+        disks
+            .iter()
+            .map(|disk| {
+                disk.file.sync_all()?;
+                let path = self.path.join(format!("disk-{}", disk.id));
+                let target = OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(path)?;
+                target.set_len(disk.size)?;
+                let before = Stamp::of(&disk.file.metadata()?);
+                crate::volume::copy_raw(&disk.file, &target, disk.size)?;
+                if before != Stamp::of(&disk.file.metadata()?) || before.2 != disk.size {
+                    bail!("managed disk changed while capturing its checkpoint");
+                }
+                let content = Input::read(target.try_clone()?, None)?.artifact;
+                target.set_permissions(fs::Permissions::from_mode(0o400))?;
+                target.sync_all()?;
+                Ok(Disk { volume_id: disk.id.clone(), content })
+            })
+            .collect()
+    }
+
     pub fn commit(self, destination: &Path, inputs: &Inputs, manifest: Manifest) -> Result<Published> {
         self.publish(destination, inputs, manifest, None)
     }
@@ -1051,11 +1117,42 @@ mod tests {
             rootfs: blank.clone(),
             state: blank,
             firmware: BTreeMap::new(),
+            disks: Vec::new(),
             main: Main::App(Session { id: "saved-main".into(), offset: 19, claim: 2 }),
             image: serde_json::from_value(json!({"source":"local", "digest":"sha256:image", "config_digest":"sha256:config",
                 "app_conf":"", "argv":["/probe"], "warm":false}))
             .unwrap(),
         }
+    }
+
+    #[test]
+    fn managed_disk_restore_requires_the_captured_contents_and_a_writer_lease() {
+        let root = TempDir::new("software-disk-capture");
+        let catalog = crate::volume::Catalog::open(&root).unwrap();
+        catalog.create("data", 1 << 20).unwrap();
+        let writer = catalog.writer("data").unwrap();
+        writer.file.write_all_at(b"before", 4096).unwrap();
+
+        let staging = Staging::new(&root).unwrap();
+        let mut manifest = manifest(Profile { architecture: std::env::consts::ARCH.into(), arguments: Vec::new() });
+        manifest.disks = staging.capture_disks(std::slice::from_ref(&writer)).unwrap();
+        let disk = &manifest.disks[0];
+        let captured = member(&staging.directory, &disk.filename()).unwrap();
+        let mut contents = [0; 6];
+        captured.read_exact_at(&mut contents, 4096).unwrap();
+        assert_eq!(&contents, b"before");
+
+        assert!(manifest.open_disks(&root).err().unwrap().to_string().contains("still in use"));
+        // There is no engine in this fixture. Release explicitly so an
+        // unrelated test fork cannot retain the original file description.
+        crate::host::flock(&writer.file, libc::LOCK_UN).unwrap();
+        let active = manifest.open_disks(&root).unwrap();
+        assert_eq!(active[0].id, disk.volume_id);
+        active[0].file.write_all_at(b"after!", 4096).unwrap();
+        crate::host::flock(&active[0].file, libc::LOCK_UN).unwrap();
+        assert!(manifest.open_disks(&root).err().unwrap().to_string().contains("changed since checkpoint"));
+        captured.read_exact_at(&mut contents, 4096).unwrap();
+        assert_eq!(&contents, b"before");
     }
 
     #[test]
