@@ -357,7 +357,7 @@ def main():
         if args.guest_tsc:
             expected.append("FLEXVM_SOFTWARE_GUEST_TSC_PASSED")
         if args.guest_kvm:
-            expected.append("PASS: 9 KVM ABI reference checks" if arch == "x86_64" else "FLEXVM_SOFTWARE_GUEST_KVM_PASSED")
+            expected.append("PASS: 10 KVM ABI reference checks" if arch == "x86_64" else "FLEXVM_SOFTWARE_GUEST_KVM_PASSED")
         if firecracker:
             expected += ["FLEXVM_SOFTWARE_INNER_BOOTED", "FLEXVM_SOFTWARE_INNER_COMPLETE",
                          "FLEXVM_SOFTWARE_GUEST_FIRECRACKER_PASSED"]
