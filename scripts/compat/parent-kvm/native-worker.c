@@ -73,6 +73,12 @@ int main(int argc, char **argv)
     ssize_t received;
     while ((received = read(control, request, sizeof(request))) != 0) {
         if (received < 0 && errno == EINTR) continue;
+        if (received == 1 && request[0] == 'G') {
+            check(ioctl(cpu, KVM_GET_REGS, &registers) == 0, "read host registers after exit");
+            check(write(control, &registers, sizeof(registers)) == (ssize_t)sizeof(registers),
+                  "return host registers to the parent");
+            continue;
+        }
         check(received == 1 && request[0] == 'R', "invalid run request");
         check(ioctl(cpu, KVM_RUN, 0) == 0, "run host vCPU");
         check(run->exit_reason == KVM_EXIT_IO && run->io.direction == KVM_EXIT_IO_OUT &&
