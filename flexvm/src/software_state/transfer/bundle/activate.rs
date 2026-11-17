@@ -48,6 +48,20 @@ pub(in crate::software_state::transfer) fn preceding_grant(state: &File, manifes
     Ok(decision.grant.filter(|grant| grant.generation <= manifest.owner_generation).map(|_| decision.offer))
 }
 
+pub(super) fn live_grant(state: &File, offer: &Offer) -> Result<bool> {
+    let key = decision_name(&offer.vm_id);
+    if !present(state, &key)? {
+        return Ok(false);
+    }
+    let decision = record::<Decision>(state, &key)?;
+    if decision.offer == *offer {
+        if let Some(grant) = decision.grant {
+            return Ok(PidFd::open(&grant.engine)?.is_some());
+        }
+    }
+    Ok(false)
+}
+
 /// Use only under the host transfer lock. A new outbound fence always
 /// supersedes an older inbound grant.
 pub(in crate::software_state::transfer) fn return_grant_generation(state: &File, outgoing: &Offer) -> Result<Option<u64>> {

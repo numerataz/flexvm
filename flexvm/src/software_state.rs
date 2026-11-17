@@ -915,6 +915,7 @@ pub fn sweep(state: &Path) -> Result<()> {
     let incoming = state.join(transfer::bundle::INCOMING);
     if incoming.exists() {
         sweep_directory(&incoming, true)?;
+        transfer::bundle::sweep_retired(state, &incoming)?;
     }
     Ok(())
 }
