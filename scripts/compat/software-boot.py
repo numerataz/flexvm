@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import platform
 import signal
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -55,7 +56,7 @@ def initramfs(init, kvm=None, files=None):
         for name, minor in (("null", 3), ("zero", 5), ("urandom", 9)):
             add("dev/" + name, 0o020600, major=1, minor=minor)
         for name, data in files.items():
-            add(name, 0o100755 if name == "firecracker" else 0o100600, data)
+            add(name, 0o100755 if name in ("firecracker", "kvm-tsc") else 0o100600, data)
     add("TRAILER!!!", 0)
     return archive
 
@@ -224,9 +225,14 @@ def checkpoint_run(cmd, isolated, out, timeout):
         evidence.update(status="passed", snapshot_bytes=snapshot.stat().st_size)
         return source + "\n" + target, evidence
     finally:
-        # The stream is test data; retain logs/reports, not hundreds of MiB of RAM.
-        snapshot.unlink(missing_ok=True)
-        runtime.cleanup()
+        # Main removes successful streams; failed streams remain available for replay.
+        evidence.setdefault("status", "incomplete")
+        try:
+            (out / "checkpoint-state.json").write_text(json.dumps(evidence, indent=2) + "\n")
+        except OSError as error:
+            print(f"checkpoint evidence: {error}")
+        finally:
+            runtime.cleanup()
 
 
 def main():
@@ -236,6 +242,7 @@ def main():
     parser.add_argument("--cc", default="cc")
     parser.add_argument("--guest-kvm", action="store_true", help="require ARM KVM execution inside software-emulated EL2")
     parser.add_argument("--guest-firecracker", type=Path, help="also boot an inner Linux VM with this unchanged ARM Firecracker binary (requires --guest-kvm)")
+    parser.add_argument("--guest-tsc", action="store_true", help="require x86 TSC initialization without hardware scaling")
     parser.add_argument("--checkpoint", action="store_true", help="cold-restore the outer software VM while the inner guest is running (requires --guest-firecracker)")
     parser.add_argument("--timeout", type=int, default=90)
     args = parser.parse_args()
@@ -248,6 +255,8 @@ def main():
         parser.error("--guest-firecracker requires --guest-kvm")
     if args.checkpoint and not args.guest_firecracker:
         parser.error("--checkpoint requires --guest-firecracker")
+    if args.guest_tsc and (arch != "x86_64" or not args.guest_kvm):
+        parser.error("--guest-tsc requires x86_64 and --guest-kvm")
     if args.timeout < 1:
         parser.error("timeout must be positive")
     kernel = args.kernel.resolve(strict=True)
@@ -276,6 +285,7 @@ def main():
         raise Interrupted(number)
 
     previous = {number: signal.signal(number, interrupted) for number in (signal.SIGINT, signal.SIGTERM)}
+    cmd = None
     try:
         init = out / "init"
         run([args.cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static",
@@ -288,7 +298,7 @@ def main():
             run([args.cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static", "-pthread",
                  str(ROOT / probe), "-o", str(test)], 60, out / "kvm-compile.log")
             nested = test.read_bytes()
-        files = None
+        files = {}
         if firecracker:
             inner = out / "inner-init"
             run([args.cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static",
@@ -302,6 +312,11 @@ def main():
             files = {"firecracker": firecracker.read_bytes(), "inner-kernel": kernel.read_bytes(),
                      "inner-initramfs.cpio": initramfs(inner.read_bytes(), files=gate),
                      "firecracker.json": json.dumps(config).encode()}
+        if args.guest_tsc:
+            test = out / "kvm-tsc"
+            run([args.cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static",
+                 str(ROOT / "kvm-tsc.c"), "-o", str(test)], 60, out / "tsc-compile.log")
+            files["kvm-tsc"] = test.read_bytes()
         archive.write_bytes(initramfs(init.read_bytes(), nested, files))
         blocked = out / "unusable-kvm"
         blocked.touch(mode=0o600)
@@ -335,8 +350,12 @@ def main():
         else:
             run(isolated(cmd, traces[0]), args.timeout, out / "guest.log")
             log = (out / "guest.log").read_text(errors="replace")
+        if args.guest_tsc:
+            report["tsc_initialization"] = True
         expected = ["FLEXVM_SOFTWARE_GUEST_BOOTED", "FLEXVM_SOFTWARE_GUEST_COMPLETE"]
         expected += [f"FLEXVM_SOFTWARE_GUEST_TICK {i}" for i in range(3)]
+        if args.guest_tsc:
+            expected.append("FLEXVM_SOFTWARE_GUEST_TSC_PASSED")
         if args.guest_kvm:
             expected.append("PASS: 9 KVM ABI reference checks" if arch == "x86_64" else "FLEXVM_SOFTWARE_GUEST_KVM_PASSED")
         if firecracker:
@@ -362,6 +381,31 @@ def main():
     finally:
         for number, handler in previous.items():
             signal.signal(number, handler)
+        snapshot = out / "checkpoint"
+        if args.checkpoint and snapshot.exists():
+            if report["status"] == "passed":
+                snapshot.unlink(missing_ok=True)
+            else:
+                try:
+                    shutil.copyfile(kernel, out / "replay-kernel")
+                    shutil.copyfile(out / "initramfs.cpio", out / "replay-initramfs.cpio")
+                    replay = list(cmd) if cmd else []
+                    for option, filename in [("-kernel", "replay-kernel"), ("-initrd", "replay-initramfs.cpio")]:
+                        if option in replay:
+                            replay[replay.index(option) + 1] = filename
+                    metadata = {"schema_version": 1, "arguments": replay,
+                                "incoming": "checkpoint", "release_input": "C\n",
+                                "kernel_sha256": digest(out / "replay-kernel"),
+                                "initramfs_sha256": digest(out / "replay-initramfs.cpio"),
+                                "checkpoint_sha256": digest(snapshot),
+                                "note": "Use a compatible QEMU build and firmware; wait for paused incoming state, continue via QMP, then send release_input."}
+                    engine = shutil.which(cmd[0]) if cmd else None
+                    if engine:
+                        metadata["qemu_sha256"] = digest(Path(engine))
+                    (out / "replay.json").write_text(json.dumps(metadata, indent=2) + "\n")
+                    report["failure_replay"] = "replay.json"
+                except Exception as error:
+                    report["failure_replay_error"] = f"{type(error).__name__}: {error}"
         report["elapsed_s"] = round(time.monotonic() - started, 3)
         report_path.write_text(json.dumps(report, indent=2) + "\n")
     print(f"{report['status'].upper()}: {report_path}")

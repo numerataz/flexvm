@@ -106,7 +106,7 @@ def exercise(args):
         gate = 'while [ ! -x /state-probe ]; do sleep .05; done; exec /state-probe'
         with (args.output / 'guest.log').open('w') as out, (args.output / 'owner.log').open('w') as err:
             owner = subprocess.Popen([*base, 'software', '--name', NAME, '--control', 'serial', '--kernel', str(args.kernel),
-                                      '--mem', str(args.mem), '--vcpus', '2', '--timeout', '120', '--boot', args.boot,
+                                      '--mem', str(args.mem), '--vcpus', str(args.vcpus), '--timeout', '120', '--boot', args.boot,
                                       *(['--entrypoint', '[]', args.image, '/bin/sh', '-ec', gate] if args.boot == 'app' else [args.image])], stdout=out, stderr=err, env=environment)
         ready()
         # Software management supports streaming exec. Transfer opaque guest
@@ -242,6 +242,7 @@ def main():
     parser.add_argument('--image', default=IMAGE)
     parser.add_argument('--boot', choices=('app', 'systemd', 'openrc'), default='app')
     parser.add_argument('--mem', type=int, default=2048)
+    parser.add_argument('--vcpus', type=int, default=2)
     parser.add_argument('--timeout', type=int, default=1800)
     parser.add_argument('--poweroff-timeout', type=int, default=30, help='bounded OS shutdown wait, within the overall test deadline')
     parser.add_argument('--require', action='append', default=[])
@@ -255,8 +256,8 @@ def main():
         return 0
     if os.geteuid() != 0:
         parser.error('run as root for private device masking and image preparation')
-    if not 1 <= args.timeout <= 3600 or not 512 <= args.mem <= 4096 or not 1 <= args.poweroff_timeout <= 300:
-        parser.error('--timeout must be 1..3600, --mem 512..4096 and --poweroff-timeout 1..300')
+    if not 1 <= args.timeout <= 3600 or not 512 <= args.mem <= 8192 or not 1 <= args.poweroff_timeout <= 300 or not 1 <= args.vcpus <= 8:
+        parser.error('--timeout must be 1..3600, --mem 512..8192 and --poweroff-timeout 1..300 and --vcpus 1..8')
     args.output.mkdir(parents=True, exist_ok=True)
     report_path = args.output / 'report.json'
     if report_path.exists():
@@ -270,6 +271,7 @@ def main():
               'scope': 'ordinary guest workload through software pause and fresh-owner stop/start',
               'binary_sha256': HELPERS['digest'](args.bin), 'kernel_sha256': HELPERS['digest'](args.kernel),
               'qemu_sha256': HELPERS['digest'](qemu), 'image': args.image, 'boot_profile': args.boot,
+              'vcpus': args.vcpus, 'memory_mib': args.mem, 'poweroff_timeout_s': args.poweroff_timeout,
               'workload': {'name': args.workload.name, 'sha256': HELPERS['digest'](args.workload)}}
     started = time.monotonic()
     def interrupted(number, _frame):
@@ -290,7 +292,7 @@ def main():
                        'for dev in /dev/kvm /dev/vhost-vsock; do if [ -e "$dev" ]; then mount --bind "$1" "$dev"; fi; done; shift; exec "$@"',
                        'sh', str(mask), 'strace', '-f', '-e', 'trace=file,init_module,finit_module,delete_module', '-o', str(trace),
                        sys.executable, str(Path(__file__).resolve()), '--worker', '--bin', str(args.bin), '--kernel', str(args.kernel),
-                       '--workload', str(args.workload), '--image', args.image, '--mem', str(args.mem), '--output', str(args.output),
+                       '--workload', str(args.workload), '--image', args.image, '--mem', str(args.mem), '--vcpus', str(args.vcpus), '--output', str(args.output),
                        '--state', state, '--timeout', str(args.timeout), '--boot', args.boot, '--poweroff-timeout', str(args.poweroff_timeout)]
             for required in args.require:
                 command.extend(['--require', required])

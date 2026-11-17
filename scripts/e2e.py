@@ -517,6 +517,63 @@ def md5(host, vm):
     return must(host, vm, "md5sum /tmp/data").split()[0]
 
 
+def save_distro_failure(vm):
+    """Capture the failed distro before its finally block removes the VMs."""
+    try:
+        destination = tempfile.mkdtemp(prefix="distro-failure-", dir=args.log_dir)
+        report = {"vm": vm, "hosts": {}, "errors": []}
+        for host in (A, B):
+            details = report["hosts"][host.label] = {"threads": {}}
+            try:
+                result = host.cli("ps", "-a", "--json", timeout=5, check=False)
+                details["registry"] = {"status": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
+                entry = next((item for item in json.loads(result.stdout) if item["name"] == vm), None)
+                details["entry"] = entry
+                if entry and entry.get("pid"):
+                    pid = entry["pid"]
+                    def identity(process):
+                        with open(f"/proc/{process}/stat") as source:
+                            fields = source.read().rsplit(")", 1)[1].split()
+                        return int(fields[1]), int(fields[19])
+                    if identity(pid)[1] == entry.get("start"):
+                        processes = [(pid, entry["start"])]
+                        child = entry.get("firecracker")
+                        if child:
+                            parent, start = identity(child)
+                            if parent == pid:
+                                processes.append((child, start))
+                        for process, start in processes:
+                            captured = {}
+                            for task in sorted(os.listdir(f"/proc/{process}/task"))[:256]:
+                                captured[task] = {}
+                                for name in ("comm", "status", "wchan", "stack"):
+                                    try:
+                                        with open(f"/proc/{process}/task/{task}/{name}") as source:
+                                            captured[task][name] = source.read(16384)
+                                    except OSError as error:
+                                        captured[task][name] = str(error)
+                            if identity(process)[1] == start:
+                                details["threads"][str(process)] = captured
+            except Exception as error:
+                report["errors"].append(f"{host.label} processes: {type(error).__name__}: {error}")
+            try:
+                host.save_logs(destination)
+            except Exception as error:
+                report["errors"].append(f"{host.label} logs: {type(error).__name__}: {error}")
+            try:
+                journal = host.exec(vm, "journalctl --no-pager -n 200 -u flexvm-runtime.service "
+                                    "-u flexvm-runtime-restart-probe.service; systemctl show "
+                                    "flexvm-runtime.service flexvm-runtime-restart-probe.service", timeout=3)
+                details["guest_journal"] = {"status": journal[0], "stdout": journal[1], "stderr": journal[2]}
+            except Exception as error:
+                report["errors"].append(f"{host.label} journal: {type(error).__name__}: {error}")
+        with open(os.path.join(destination, "report.json"), "x") as output:
+            json.dump(report, output, indent=2)
+        print(f"distro failure evidence before cleanup: {destination}", flush=True)
+    except Exception as error:
+        print(f"distro failure evidence: {type(error).__name__}: {error}", flush=True)
+
+
 def marker(host, vm):
     """Starts a guest process counting up in /tmp/count; returns (pid, start time)."""
     # Written to a temporary file and renamed, so a read never sees it empty or half written.
@@ -2475,7 +2532,7 @@ def kernel_modules():
 @contextlib.contextmanager
 def workload_test_egress():
     """The coordinator owns temporary egress rules, even if a worker is killed."""
-    workloads = {"podman", "namespace_sandboxes", "containerd", "distro_openrc", "distro_openrc_pressure", "user_sessions", "rootless_docker", "rootless_containerd", "rootless_podman", "nspawn", "lxc", "incus"}
+    workloads = {"podman", "namespace_sandboxes", "containerd", "distro_openrc", "distro_openrc_pressure", "user_sessions", "rootless_docker", "rootless_containerd", "rootless_podman", "nspawn", "lxc", "k3s", "kind", "incus"}
     if args.worker or args.selftest or args.no_kvm or os.geteuid() != 0 or not workloads.intersection(args.cases or CASES) or kvm_unusable():
         yield
         return
@@ -2815,8 +2872,14 @@ def distro_systemd():
         host = B
         observe("migration")
         old = execute("systemctl show --property=MainPID --value flexvm-runtime.service")[1].strip()
-        restart = "for i in $(seq 1 8); do systemctl restart flexvm-runtime.service || exit; done; touch /run/flexvm-restarts-done"
-        execute("systemd-run --unit=flexvm-runtime-restart-probe --collect --no-block /bin/sh -ec " + shlex.quote(restart), False)
+        restart = ("for i in $(seq 1 8); do echo FLEXVM_RESTART_BEGIN_$i; "
+                   "if systemctl restart flexvm-runtime.service; then echo FLEXVM_RESTART_END_$i; "
+                   "else result=$?; echo FLEXVM_RESTART_FAILED_${i}_STATUS_$result; "
+                   "systemctl status --no-pager flexvm-runtime.service; exit $result; fi; "
+                   "done; touch /run/flexvm-restarts-done; echo FLEXVM_RESTART_COMPLETE")
+        execute("systemd-run --unit=flexvm-runtime-restart-probe --collect --no-block "
+                "--property=StandardOutput=journal+console --property=StandardError=journal+console "
+                "/bin/sh -ec " + shlex.quote(restart), False)
         check("distro: repeated runtime restart restores exec", wait_for(lambda: execute("test -f /run/flexvm-restarts-done", False)[0] == 0, 30))
         check("distro: runtime provider replaced", execute("systemctl show --property=MainPID --value flexvm-runtime.service")[1].strip() not in ("", "0", old))
         observe("runtime restart")
@@ -2846,6 +2909,9 @@ def distro_systemd():
         host.cli("kill", "--signal", "TERM", vm)
         check("distro: guest shutdown records successful exit", wait_for(lambda: host.ps().get(vm, {}).get("state") == "exited", 30), host.ps().get(vm))
         check("distro: poweroff status is zero", host.ps()[vm].get("status") == 0, host.ps()[vm])
+    except BaseException:
+        save_distro_failure(vm)
+        raise
     finally:
         A.rm(vm, force=True, check=False)
         B.rm(vm, force=True, check=False)
@@ -2865,6 +2931,20 @@ def nspawn():
 def lxc():
     """A systemd OS in stock privileged and user-launched LXC containers."""
     compat_workload("lxc", boot="systemd")
+
+
+@case
+@needs_kvm
+def k3s():
+    """Stock Kubernetes services, ingress, volume data and live pod identities."""
+    compat_workload("k3s", boot="systemd", memory_mib=4096)
+
+
+@case
+@needs_kvm
+def kind():
+    """Stock kind in Docker with real Kubernetes services, volume data and pod identity."""
+    compat_workload("kind", boot="systemd", memory_mib=6144)
 
 
 @case
@@ -3528,6 +3608,7 @@ def faults(template=None, scenarios=None):
     p = subprocess.Popen([sys.executable, os.path.join(ROOT, "scripts", "faults.py"), "--a", A.addr, "--b", B.addr,
                           "--a-state", A.state_dir, "--a-run", A.run_dir, "--b-state", B.state_dir, "--b-run", B.run_dir,
                           "--a-listen-log", A.log, "--b-listen-log", B.log,
+                          "--failure-dir", os.path.join(args.log_dir, "fault-failures"),
                           "--a-ips", f"{A.net}.2-{A.net}.60", "--b-ips", f"{B.net}.2-{B.net}.60",
                           *listeners, *(["--no-skips"] if args.no_skips else []), "--bin", BIN, "--template", template,
                           "--ckpt-dir", os.path.join(WORK, "faults-ckpt"), *image, *scenarios.split()], env=env, start_new_session=True)
@@ -3710,7 +3791,7 @@ def worker():
 # runs, as e2e.py's summary prints them): --split balances by these, the long ones start first, and
 # the short ones go in batches of about BATCH_S (each batch is a worker, with hosts of its own).
 # Unlisted ones count as 2 s.
-COST = {"incus": 180, "lxc": 180, "nspawn": 180, "rootless_podman": 180, "rootless_containerd": 180, "rootless_docker": 180, "user_sessions": 180, "distro_openrc": 160, "distro_openrc_pressure": 160, "distro_bad_init": 10, "distro_pressure": 80, "distro_systemd": 40, "guest_poweroff": 10, "containerd": 180, "namespace_sandboxes": 180, "podman": 180, "faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "ipv6_taps": 10, "nettest_ipv6": 30, "docker_api": 15, "restart_policy": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
+COST = {"incus": 180, "kind": 180, "k3s": 180, "lxc": 180, "nspawn": 180, "rootless_podman": 180, "rootless_containerd": 180, "rootless_docker": 180, "user_sessions": 180, "distro_openrc": 160, "distro_openrc_pressure": 160, "distro_bad_init": 10, "distro_pressure": 80, "distro_systemd": 40, "guest_poweroff": 10, "containerd": 180, "namespace_sandboxes": 180, "podman": 180, "faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "ipv6_taps": 10, "nettest_ipv6": 30, "docker_api": 15, "restart_policy": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
         "faults/cow_grow": 65, "faults/reconcile_kill": 64, "faults/target_renamed": 40, "faults/plug_race": 45, "faults/guest_hang": 44,
         "faults/exec_pause_grace": 42, "faults/exec_ckpt_stalled": 115, "faults/route_abort": 35, "faults/unplug_collapsed": 30,
         "faults/arrival_grew": 25, "faults/pause_resume": 24, "faults/evict_latency": 25, "faults/mem_high": 25, "faults/target_killed": 25,

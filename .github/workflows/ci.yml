@@ -123,6 +123,8 @@ jobs:
               exit 1
               ;;
           esac
+      - name: Failure capture compression
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends zstd
       - name: Compatibility harness tests
         run: |
           python3 scripts/compat/test_harness.py
@@ -158,7 +160,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends ${{ matrix.qemu }} strace build-essential flex bison bc libelf-dev libssl-dev dwarves xz-utils kmod pkg-config zlib1g-dev libzstd-dev squashfs-tools
+          sudo apt-get install -y -q --no-install-recommends ${{ matrix.qemu }} strace zstd build-essential flex bison bc libelf-dev libssl-dev dwarves xz-utils kmod pkg-config zlib1g-dev libzstd-dev squashfs-tools
       - name: Cache fixed x86 software CPU engine
         if: matrix.arch == 'x86_64'
         id: software-qemu
@@ -182,7 +184,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/software-state/artifacts
-          key: software-kernel-${{ matrix.arch }}-${{ hashFiles('scripts/build-kernel.sh', 'scripts/package-kernel-modules.sh', 'scripts/fetch.sh', 'scripts/versions.sh', 'scripts/checksums.sha256', 'kernel/config/*', 'kernel/features*.config', 'kernel/source.env') }}
+          key: software-kernel-${{ matrix.arch }}-${{ hashFiles('scripts/build-kernel.sh', 'scripts/package-kernel-modules.sh', 'scripts/fetch.sh', 'scripts/versions.sh', 'scripts/checksums.sha256', 'kernel/config/*', 'kernel/features*.config', 'kernel/source.env', 'kernel/patches/*', 'scripts/apply-kernel-patches.sh') }}
       - name: Fetch or build the reviewed kernel
         run: ./scripts/fetch.sh --kernel --state "$RUNNER_TEMP/software-state"
       - name: Fetch the unchanged hypervisor
@@ -191,6 +193,9 @@ jobs:
         run: |
           sudo python3 scripts/compat/software-boot.py --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-boot" ${{ matrix.extra }} --guest-firecracker "$RUNNER_TEMP/software-state/artifacts/firecracker"
           cat "$RUNNER_TEMP/software-boot/report.json"
+      - name: TSC initialization without hardware scaling
+        if: matrix.arch == 'x86_64'
+        run: sudo python3 scripts/compat/software-boot.py --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-tsc" --guest-kvm --guest-tsc
       - name: Save software kernel
         if: success() && steps.software-kernel.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -264,6 +269,9 @@ jobs:
             ${{ runner.temp }}/software-distro/*.json
             ${{ runner.temp }}/software-distro/*.log
             ${{ runner.temp }}/software-distro/*.strace
+            ${{ runner.temp }}/software-tsc/*.json
+            ${{ runner.temp }}/software-tsc/*.log
+            ${{ runner.temp }}/software-tsc/*.strace
             ${{ runner.temp }}/software-boot/report.json
             ${{ runner.temp }}/software-boot/guest.log
             ${{ runner.temp }}/software-boot/files.strace
@@ -272,6 +280,11 @@ jobs:
             ${{ runner.temp }}/software-boot/compile.log
             ${{ runner.temp }}/software-boot/kvm-compile.log
             ${{ runner.temp }}/software-boot/inner-compile.log
+            ${{ runner.temp }}/software-boot/checkpoint-state.json
+            ${{ runner.temp }}/software-boot/checkpoint
+            ${{ runner.temp }}/software-boot/replay.json
+            ${{ runner.temp }}/software-boot/replay-kernel
+            ${{ runner.temp }}/software-boot/replay-initramfs.cpio
             ${{ runner.temp }}/software-agent/report.json
             ${{ runner.temp }}/software-agent/guest.log
             ${{ runner.temp }}/software-agent/files.strace
@@ -286,11 +299,15 @@ jobs:
             ${{ runner.temp }}/software-owner/*.log
             ${{ runner.temp }}/software-owner/*.strace
             ${{ runner.temp }}/software-lifecycle/*.json
+            ${{ runner.temp }}/software-lifecycle/*.jsonl
             ${{ runner.temp }}/software-lifecycle/*.log
             ${{ runner.temp }}/software-lifecycle/*.strace
+            ${{ runner.temp }}/software-lifecycle/failure-state.tar.zst
             ${{ runner.temp }}/software-nested-lifecycle/*.json
+            ${{ runner.temp }}/software-nested-lifecycle/*.jsonl
             ${{ runner.temp }}/software-nested-lifecycle/*.log
             ${{ runner.temp }}/software-nested-lifecycle/*.strace
+            ${{ runner.temp }}/software-nested-lifecycle/failure-state.tar.zst
             ${{ runner.temp }}/software-kvm/*.json
             ${{ runner.temp }}/software-kvm/*.log
             ${{ runner.temp }}/software-kvm/*.strace
@@ -339,7 +356,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/software-state/artifacts
-          key: module-artifacts-${{ matrix.arch }}-${{ hashFiles('scripts/build-kernel.sh', 'scripts/package-kernel-modules.sh', 'scripts/fetch.sh', 'scripts/versions.sh', 'scripts/checksums.sha256', 'kernel/config/*', 'kernel/features*.config', 'kernel/source.env') }}
+          key: module-artifacts-${{ matrix.arch }}-${{ hashFiles('scripts/build-kernel.sh', 'scripts/package-kernel-modules.sh', 'scripts/fetch.sh', 'scripts/versions.sh', 'scripts/checksums.sha256', 'kernel/config/*', 'kernel/features*.config', 'kernel/source.env', 'kernel/patches/*', 'scripts/apply-kernel-patches.sh') }}
       - name: Fetch matching kernel, runtime modules and SDK
         run: scripts/fetch.sh --kernel-sdk --state "$RUNNER_TEMP/software-state"
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
@@ -366,12 +383,12 @@ jobs:
   software-workloads:
     name: guest workload without KVM (${{ matrix.arch }}, ${{ matrix.workload }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: ${{ (matrix.workload == 'k3s' || matrix.workload == 'kind') && 80 || 45 }}
     strategy:
       fail-fast: false
       matrix:
         arch: [x86_64, aarch64]
-        workload: [podman, namespace-sandboxes, containerd, rootless-docker, rootless-containerd, rootless-podman, nspawn, lxc, incus]
+        workload: [podman, namespace-sandboxes, containerd, rootless-docker, rootless-containerd, rootless-podman, nspawn, lxc, k3s, kind, incus]
         include:
           - { arch: x86_64, runner: ubuntu-24.04, qemu: qemu-system-x86 }
           - { arch: aarch64, runner: ubuntu-24.04-arm, qemu: qemu-system-arm }
@@ -405,7 +422,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/software-state/artifacts
-          key: workload-artifacts-${{ matrix.arch }}-${{ hashFiles('scripts/build-kernel.sh', 'scripts/package-kernel-modules.sh', 'scripts/fetch.sh', 'scripts/versions.sh', 'scripts/checksums.sha256', 'kernel/config/*', 'kernel/features*.config', 'kernel/source.env') }}
+          key: workload-artifacts-${{ matrix.arch }}-${{ hashFiles('scripts/build-kernel.sh', 'scripts/package-kernel-modules.sh', 'scripts/fetch.sh', 'scripts/versions.sh', 'scripts/checksums.sha256', 'kernel/config/*', 'kernel/features*.config', 'kernel/source.env', 'kernel/patches/*', 'scripts/apply-kernel-patches.sh') }}
       - name: Fetch matching kernel and runtime modules
         run: scripts/fetch.sh --kernel --state "$RUNNER_TEMP/software-state"
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
@@ -415,20 +432,33 @@ jobs:
       - name: Build FlexVM
         run: cargo build --release -p flexvm
       - name: Prepare the systemd image for distro workloads
-        if: startsWith(matrix.workload, 'rootless-') || matrix.workload == 'nspawn' || matrix.workload == 'lxc' || matrix.workload == 'incus'
+        if: startsWith(matrix.workload, 'rootless-') || matrix.workload == 'nspawn' || matrix.workload == 'lxc' || matrix.workload == 'k3s' || matrix.workload == 'kind' || matrix.workload == 'incus'
         run: |
           scripts/fetch.sh --state "$RUNNER_TEMP/software-state"
           sudo python3 scripts/test-image.py --state "$RUNNER_TEMP/software-state" "$RUNNER_TEMP/software-distro-image"
       - name: Guest workload and fresh-owner software restoration
         run: |
           workload_args=()
-          if [[ "${{ matrix.workload }}" == rootless-* || "${{ matrix.workload }}" == nspawn || "${{ matrix.workload }}" == lxc || "${{ matrix.workload }}" == incus ]]; then
+          memory_limit=6G
+          cpu_quota=200%
+          workload_timeout=1800
+          if [[ "${{ matrix.workload }}" == rootless-* || "${{ matrix.workload }}" == nspawn || "${{ matrix.workload }}" == lxc || "${{ matrix.workload }}" == k3s || "${{ matrix.workload }}" == kind || "${{ matrix.workload }}" == incus ]]; then
             workload_args=(--boot systemd --image "$RUNNER_TEMP/software-distro-image")
+          fi
+          if [[ "${{ matrix.workload }}" == k3s || "${{ matrix.workload }}" == kind ]]; then
+            workload_memory=4096
+            if [[ "${{ matrix.workload }}" == kind ]]; then
+              workload_memory=6144
+              memory_limit=10G
+            fi
+            workload_args+=(--mem "$workload_memory" --vcpus 4 --poweroff-timeout 180)
+            cpu_quota=400%
+            workload_timeout=3600
           fi
           if [[ "${{ matrix.workload }}" == incus ]]; then
             workload_args+=(--mem 3072 --poweroff-timeout 180)
           fi
-          sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --workload "scripts/compat/workloads/${{ matrix.workload }}.sh" "${workload_args[@]}" --require storage.fuse --output "$RUNNER_TEMP/software-workload" --timeout 1800
+          sudo systemd-run --scope --collect -p "MemoryMax=$memory_limit" -p MemorySwapMax=0 -p "CPUQuota=$cpu_quota" python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --workload "scripts/compat/workloads/${{ matrix.workload }}.sh" "${workload_args[@]}" --require storage.fuse --output "$RUNNER_TEMP/software-workload" --timeout "$workload_timeout"
           cat "$RUNNER_TEMP/software-workload/report.json"
       - name: Upload software workload evidence
         if: always()
