@@ -517,6 +517,63 @@ def md5(host, vm):
     return must(host, vm, "md5sum /tmp/data").split()[0]
 
 
+def save_distro_failure(vm):
+    """Capture the failed distro before its finally block removes the VMs."""
+    try:
+        destination = tempfile.mkdtemp(prefix="distro-failure-", dir=args.log_dir)
+        report = {"vm": vm, "hosts": {}, "errors": []}
+        for host in (A, B):
+            details = report["hosts"][host.label] = {"threads": {}}
+            try:
+                result = host.cli("ps", "-a", "--json", timeout=5, check=False)
+                details["registry"] = {"status": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
+                entry = next((item for item in json.loads(result.stdout) if item["name"] == vm), None)
+                details["entry"] = entry
+                if entry and entry.get("pid"):
+                    pid = entry["pid"]
+                    def identity(process):
+                        with open(f"/proc/{process}/stat") as source:
+                            fields = source.read().rsplit(")", 1)[1].split()
+                        return int(fields[1]), int(fields[19])
+                    if identity(pid)[1] == entry.get("start"):
+                        processes = [(pid, entry["start"])]
+                        child = entry.get("firecracker")
+                        if child:
+                            parent, start = identity(child)
+                            if parent == pid:
+                                processes.append((child, start))
+                        for process, start in processes:
+                            captured = {}
+                            for task in sorted(os.listdir(f"/proc/{process}/task"))[:256]:
+                                captured[task] = {}
+                                for name in ("comm", "status", "wchan", "stack"):
+                                    try:
+                                        with open(f"/proc/{process}/task/{task}/{name}") as source:
+                                            captured[task][name] = source.read(16384)
+                                    except OSError as error:
+                                        captured[task][name] = str(error)
+                            if identity(process)[1] == start:
+                                details["threads"][str(process)] = captured
+            except Exception as error:
+                report["errors"].append(f"{host.label} processes: {type(error).__name__}: {error}")
+            try:
+                host.save_logs(destination)
+            except Exception as error:
+                report["errors"].append(f"{host.label} logs: {type(error).__name__}: {error}")
+            try:
+                journal = host.exec(vm, "journalctl --no-pager -n 200 -u flexvm-runtime.service "
+                                    "-u flexvm-runtime-restart-probe.service; systemctl show "
+                                    "flexvm-runtime.service flexvm-runtime-restart-probe.service", timeout=3)
+                details["guest_journal"] = {"status": journal[0], "stdout": journal[1], "stderr": journal[2]}
+            except Exception as error:
+                report["errors"].append(f"{host.label} journal: {type(error).__name__}: {error}")
+        with open(os.path.join(destination, "report.json"), "x") as output:
+            json.dump(report, output, indent=2)
+        print(f"distro failure evidence before cleanup: {destination}", flush=True)
+    except Exception as error:
+        print(f"distro failure evidence: {type(error).__name__}: {error}", flush=True)
+
+
 def marker(host, vm):
     """Starts a guest process counting up in /tmp/count; returns (pid, start time)."""
     # Written to a temporary file and renamed, so a read never sees it empty or half written.
@@ -2815,8 +2872,14 @@ def distro_systemd():
         host = B
         observe("migration")
         old = execute("systemctl show --property=MainPID --value flexvm-runtime.service")[1].strip()
-        restart = "for i in $(seq 1 8); do systemctl restart flexvm-runtime.service || exit; done; touch /run/flexvm-restarts-done"
-        execute("systemd-run --unit=flexvm-runtime-restart-probe --collect --no-block /bin/sh -ec " + shlex.quote(restart), False)
+        restart = ("for i in $(seq 1 8); do echo FLEXVM_RESTART_BEGIN_$i; "
+                   "if systemctl restart flexvm-runtime.service; then echo FLEXVM_RESTART_END_$i; "
+                   "else result=$?; echo FLEXVM_RESTART_FAILED_${i}_STATUS_$result; "
+                   "systemctl status --no-pager flexvm-runtime.service; exit $result; fi; "
+                   "done; touch /run/flexvm-restarts-done; echo FLEXVM_RESTART_COMPLETE")
+        execute("systemd-run --unit=flexvm-runtime-restart-probe --collect --no-block "
+                "--property=StandardOutput=journal+console --property=StandardError=journal+console "
+                "/bin/sh -ec " + shlex.quote(restart), False)
         check("distro: repeated runtime restart restores exec", wait_for(lambda: execute("test -f /run/flexvm-restarts-done", False)[0] == 0, 30))
         check("distro: runtime provider replaced", execute("systemctl show --property=MainPID --value flexvm-runtime.service")[1].strip() not in ("", "0", old))
         observe("runtime restart")
@@ -2846,6 +2909,9 @@ def distro_systemd():
         host.cli("kill", "--signal", "TERM", vm)
         check("distro: guest shutdown records successful exit", wait_for(lambda: host.ps().get(vm, {}).get("state") == "exited", 30), host.ps().get(vm))
         check("distro: poweroff status is zero", host.ps()[vm].get("status") == 0, host.ps()[vm])
+    except BaseException:
+        save_distro_failure(vm)
+        raise
     finally:
         A.rm(vm, force=True, check=False)
         B.rm(vm, force=True, check=False)
@@ -3542,6 +3608,7 @@ def faults(template=None, scenarios=None):
     p = subprocess.Popen([sys.executable, os.path.join(ROOT, "scripts", "faults.py"), "--a", A.addr, "--b", B.addr,
                           "--a-state", A.state_dir, "--a-run", A.run_dir, "--b-state", B.state_dir, "--b-run", B.run_dir,
                           "--a-listen-log", A.log, "--b-listen-log", B.log,
+                          "--failure-dir", os.path.join(args.log_dir, "fault-failures"),
                           "--a-ips", f"{A.net}.2-{A.net}.60", "--b-ips", f"{B.net}.2-{B.net}.60",
                           *listeners, *(["--no-skips"] if args.no_skips else []), "--bin", BIN, "--template", template,
                           "--ckpt-dir", os.path.join(WORK, "faults-ckpt"), *image, *scenarios.split()], env=env, start_new_session=True)
@@ -3770,13 +3837,14 @@ BATCH_S = 20
 SELFTEST_SKIP_NAME = "wildcard_listen"
 
 
-def faults_scenarios():
-    """{scenario: whether it needs KVM} of faults.py's SCENARIOS, less its BENCHMARKS: whether its function is
-    tagged @needs_kvm (a wrapped one's, as in no_evict(f), is f's). Read from faults.py's source: it cannot be
-    imported without its hosts."""
+def faults_scenarios(tag="needs_kvm"):
+    """Whether each scenario has `tag` (default @needs_kvm), excluding benchmarks.
+    A wrapped scenario inherits its underlying function's tags. Read the source:
+    faults.py cannot be imported without creating its hosts.
+    """
     import ast
     tree = ast.parse(open(os.path.join(ROOT, "scripts", "faults.py")).read())
-    tagged = {n.name for n in tree.body if isinstance(n, ast.FunctionDef) and any(getattr(d, "id", None) == "needs_kvm" for d in n.decorator_list)}
+    tagged = {n.name for n in tree.body if isinstance(n, ast.FunctionDef) and any(getattr(d, "id", None) == tag for d in n.decorator_list)}
     fn = lambda v: v.id if isinstance(v, ast.Name) else fn(v.args[0]) if isinstance(v, ast.Call) and v.args else None
     dicts = {t.id: {k.arg: fn(k.value) for k in n.value.keywords} for n in tree.body if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call)
              and getattr(n.value.func, "id", None) == "dict" for t in n.targets if isinstance(t, ast.Name)}
@@ -3865,6 +3933,7 @@ def main():
         assert c in CASES, f"unknown case {c}; have {', '.join(CASES)}"
     scenarios = args.faults.split() if "faults" in selected else []
     kvm = faults_scenarios()
+    exclusive_names = {f"faults/{name}" for name, tagged in faults_scenarios("host_exclusive").items() if tagged}
     # Without KVM, only what needs none (the self-test checks that selection).
     why = None if args.selftest else "--no-kvm" if args.no_kvm else kvm_unusable()
     if why and args.require_kvm:
@@ -3937,6 +4006,8 @@ def main():
             return [w[0] for w in batch]
 
     spawned = []
+    active_selftest = []
+    resource_overlaps = []
 
     def own(name):
         return name.startswith("faults/") and name.split("/", 1)[1] in LISTENER_FAULTS
@@ -3953,7 +4024,15 @@ def main():
                     f"[print(f'scenario {{x}}: ' + ('SKIPPED (selftest)' if x == {SELFTEST_SKIP_NAME!r} else 'ok') + ' in 0.0 s') for x in s]; "
                     "json.dump([[x, 'PASS', 0.0] for x in c] + ([['faults', 'PASS', 0.0]] if s else []), open(res, 'w'))")
             cmd = [sys.executable, "-c", fake, json.dumps([cases, scens, res])]
-        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True, env=ENV)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True, env=ENV)
+        if args.selftest:
+            exclusive = any(f"faults/{name}" in exclusive_names for name in scens)
+            with lock:
+                live = [(child, alone) for child, alone in active_selftest if child.poll() is None]
+                if live and (exclusive or any(alone for _, alone in live)):
+                    resource_overlaps.append((cases, scens))
+                active_selftest.append((process, exclusive))
+        return process
 
     def run_batch(i, label, batch, port, net_a, net_b):
         """Runs one batch in a worker; returns its results."""
@@ -4042,7 +4121,29 @@ def main():
         builders.append(threading.Thread(target=build, args=(APP, *APP_OPTS), kwargs={"image": True}))
     runners = [threading.Thread(target=lane, args=(i, *l), daemon=True) for i, l in enumerate(lanes())]
     try:
-        for t in builders + runners:
+        for t in builders:
+            t.start()
+        exclusive_work = [item for item in work if item[0] in exclusive_names]
+        if exclusive_work:
+            # Template builds also run VMs. Finish them before reserving the host,
+            # then run each contiguous-memory fixture before ordinary workers.
+            for t in builders:
+                t.join()
+            for index, item in enumerate(exclusive_work, 1):
+                name, dependencies, _ = item
+                label = f"host-exclusive.{index}"
+                work.remove(item)
+                if not dependencies <= built:
+                    say(f"FAIL {name}: its template failed")
+                    summary.append((name, "FAIL", 0.0, label))
+                    continue
+                try:
+                    got = run_batch(0, label, [name], *lanes()[0])
+                except Exception as error:
+                    say(f"[{label}] FAIL batch: {type(error).__name__}: {error}")
+                    got = [(name, "FAIL", 0.0, label)]
+                summary.extend(got)
+        for t in runners:
             t.start()
         for t in builders + runners:
             t.join()
@@ -4081,6 +4182,13 @@ def main():
         print(f"selftest: failed {bad}, expected {want}; skipped {sorted(r[0] for r in skipped)}, expected {want_skip}")
         mixed = [b for b in spawned if len({s in LISTENER_FAULTS for s in b[1]}) > 1]
         print(f"selftest: batches mixing listener-owning scenarios with others: {mixed}")
+        isolated = [index for index, (_, scens) in enumerate(spawned)
+                    if any(f"faults/{name}" in exclusive_names for name in scens)]
+        expected_isolated = sum(name in exclusive_names for name, _, _ in scheduled)
+        isolated_first = isolated == list(range(expected_isolated)) and all(
+            not spawned[index][0] and len(spawned[index][1]) == 1 for index in isolated)
+        print(f"selftest: host-exclusive singleton batches first: {isolated_first}")
+        print(f"selftest: host-exclusive batches overlapping other workers: {resource_overlaps}")
         # CI runs only the shards: a scenario in none of them never runs.
         unsharded, unknown = shard_coverage()
         print(f"selftest: faults.py scenarios in no shard: {unsharded}; shards' names that are no scenario: {unknown}")
@@ -4096,7 +4204,7 @@ def main():
         probe = kvm_unusable("/dev/null"), kvm_unusable(os.path.join(WORK, "no-such-kvm"))
         print(f"selftest: without KVM, {len(out)} left out, running {runs}: {'as tagged' if selection else 'WRONG'}; "
               f"unusable KVM: {probe}")
-        return 0 if (bad == want and len(summary) == len(scheduled) + len(builders) and not mixed
+        return 0 if (bad == want and len(summary) == len(scheduled) + len(builders) and not mixed and not resource_overlaps and isolated_first
                      and sorted(r[0] for r in skipped) == want_skip and not unsharded and not unknown
                      and selection and all(probe)) else 1
     return 1 if failed else 0
