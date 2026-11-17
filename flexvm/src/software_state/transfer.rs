@@ -281,6 +281,17 @@ fn require_unchanged_return_fence(state: &File, journal: &Journal) -> Result<()>
     Ok(())
 }
 
+pub(crate) fn active_routed_loan(state: &Path, manifest: &Manifest) -> Result<bool> {
+    let Some(network) = manifest.routed else { return Ok(false) };
+    let state = parent_directory(state)?;
+    let _transfer = parent_lock(&state, libc::LOCK_EX)?;
+    let Some(fence) = read_fence(&state, &manifest.vm_id)? else { return Ok(false) };
+    if fence.offer.routed.is_some_and(|outgoing| outgoing.address == network.address && outgoing.generation == network.generation) {
+        return fence.active(&state);
+    }
+    Ok(false)
+}
+
 fn read_fence(state: &File, vm_id: &str) -> Result<Option<SourceFence>> {
     let path = source_record(&vm_id.to_ascii_lowercase());
     if present(state, &path)? {
@@ -356,15 +367,14 @@ pub(crate) fn offer(host: &Host, vm: &str, destination: &str) -> Result<serde_js
     Ok(serde_json::to_value(offer)?)
 }
 
-/// The name lock and the software transfer lock are held by the caller. The
-/// native address loan outlives the stopped VM's address holder.
-fn lend_routed_address(host: &Host, vm: &str, network: RoutedNetwork, destination: &str) -> Result<()> {
+/// An existing native loan can be reused only by an exact retry or a
+/// reissued transfer whose prior software loan was explicitly aborted.
+fn check_routed_loan(host: &Host, lock: &crate::host::Locked, vm: &str, network: RoutedNetwork, retry_owned_loan: bool) -> Result<()> {
     let ip = network.address.v4;
     if host.config_now().vm_addr(ip) != network.address {
         bail!("software transfer routed address no longer matches the source network");
     }
-    let lock = host.lock()?;
-    let address = host.addr(&lock, ip)?;
+    let address = host.addr(lock, ip)?;
     let owner = address.holder_id.as_ref().ok_or("software transfer source address has no recorded owner")?;
     if address.holder.as_deref() != Some(vm)
         || address.seen != network.generation
@@ -374,11 +384,10 @@ fn lend_routed_address(host: &Host, vm: &str, network: RoutedNetwork, destinatio
         || Some(address.rev) != network.revision
         || address.arriving.is_some()
         || address.leaving.is_some()
-        || address.lent.is_some_and(|generation| generation != network.generation)
+        || address.lent.is_some_and(|generation| !retry_owned_loan || generation != network.generation)
     {
         bail!("software transfer routed source no longer owns the exact address revision");
     }
-    host.lend(&lock, ip, network.generation, 0, destination)?;
     Ok(())
 }
 
@@ -424,48 +433,62 @@ fn issue_with_host(
         disks: manifest.disks.clone(),
     };
     let previous = read_fence(state, &fence.offer.vm_id)?;
-    match &previous {
-        Some(existing)
-            if existing.offer == fence.offer
-                && existing.source_key == fence.source_key
-                && existing.destination_key == fence.destination_key
-                && existing.disks == fence.disks
-                && !existing.recovered =>
-        {
-            if !existing.active(state)? {
-                bail!("software transfer already returned to this source");
-            }
-            state.sync_all()?
+    let exact_retry = previous.as_ref().filter(|existing| {
+        existing.offer == fence.offer
+            && existing.source_key == fence.source_key
+            && existing.destination_key == fence.destination_key
+            && existing.disks == fence.disks
+            && !existing.recovered
+    });
+    if let Some(existing) = exact_retry {
+        if !existing.active(state)? {
+            bail!("software transfer already returned to this source");
         }
-        _ => {
-            let floor = local_restart_floor(state, &manifest)?;
-            if fence.offer.generation <= floor || previous.as_ref().is_some_and(|existing| fence.offer.transfer_id == existing.offer.transfer_id) {
-                bail!("software VM already has a newer or conflicting transfer fence");
-            }
-            let _writers = if fence.disks.is_empty() {
-                Vec::new()
-            } else {
-                let catalog = crate::volume::Catalog::from_state(state.try_clone()?)?;
-                fence
-                    .disks
-                    .iter()
-                    .map(|disk| {
-                        require_local_disk(state, &disk.volume_id)?;
-                        disk.verify_writer(catalog.writer_for_retirement(&disk.volume_id)?)
-                    })
-                    .collect::<Result<Vec<_>>>()?
-            };
-            let bytes = serde_json::to_vec(&fence)?;
-            if bytes.len() > 8192 {
-                bail!("software transfer source fence is too large");
-            }
-            write_record(state, &path, &bytes, previous.is_some())?;
+    } else {
+        let floor = local_restart_floor(state, &manifest)?;
+        if fence.offer.generation <= floor || previous.as_ref().is_some_and(|existing| fence.offer.transfer_id == existing.offer.transfer_id) {
+            bail!("software VM already has a newer or conflicting transfer fence");
         }
     }
-    // No signed receipt escapes until both the software fence and network
-    // reservation are durable. An exact retry repairs an interrupted write.
-    if let (Some(network), Some((host, name))) = (fence.offer.routed, location) {
-        lend_routed_address(host, name, network, &fence.offer.destination_host)?;
+
+    let _writers = if exact_retry.is_some() || fence.disks.is_empty() {
+        Vec::new()
+    } else {
+        let catalog = crate::volume::Catalog::from_state(state.try_clone()?)?;
+        fence
+            .disks
+            .iter()
+            .map(|disk| {
+                require_local_disk(state, &disk.volume_id)?;
+                disk.verify_writer(catalog.writer_for_retirement(&disk.volume_id)?)
+            })
+            .collect::<Result<Vec<_>>>()?
+    };
+    let loan = match (fence.offer.routed, location) {
+        (Some(network), Some((host, name))) => {
+            // Check the native claim before creating the fence. Hold its lock
+            // through publication, after disk verification has finished.
+            let lock = host.lock()?;
+            let retry_owned_loan = exact_retry.is_some() || previous.as_ref().is_some_and(|old| old.recovered && old.offer.routed == Some(network));
+            check_routed_loan(host, &lock, name, network, retry_owned_loan)?;
+            Some((host, lock, network))
+        }
+        _ => None,
+    };
+
+    if exact_retry.is_some() {
+        state.sync_all()?;
+    } else {
+        let bytes = serde_json::to_vec(&fence)?;
+        if bytes.len() > 8192 {
+            bail!("software transfer source fence is too large");
+        }
+        write_record(state, &path, &bytes, previous.is_some())?;
+    }
+    // No signed receipt escapes until both records are durable. An exact
+    // retry can repair a fence whose address loan did not finish publishing.
+    if let Some((host, lock, network)) = loan {
+        host.lend(&lock, network.address.v4, network.generation, 0, &fence.offer.destination_host)?;
     }
     signed_receipt(fence.offer, key, RECEIPT_DOMAIN)
 }
@@ -693,16 +716,22 @@ mod tests {
         claim.keep();
         let record = host.state.join("addrs").join(network.address.v4.to_string());
         let mut address: crate::host::Addr = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
-        assert!(lend_routed_address(&host, "source", network, "remote").is_err(), "an active owner cannot be retired by this process");
+        let check = |name, network, retry| {
+            let lock = host.lock().unwrap();
+            check_routed_loan(&host, &lock, name, network, retry)
+        };
+        assert!(check("source", network, false).is_err(), "an active owner cannot be retired by this process");
         address.holder_id.as_mut().unwrap().start = 0;
         fs::write(&record, serde_json::to_vec(&address).unwrap()).unwrap();
 
-        assert!(lend_routed_address(&host, "wrong-vm", network, "remote").is_err());
-        assert!(lend_routed_address(&host, "source", RoutedNetwork { revision: Some(9), ..network }, "remote").is_err());
+        assert!(check("wrong-vm", network, false).is_err());
+        assert!(check("source", RoutedNetwork { revision: Some(9), ..network }, false).is_err());
         assert_eq!(host.addr(&host.lock().unwrap(), network.address.v4).unwrap().lent, None);
 
-        lend_routed_address(&host, "source", network, "remote").unwrap();
-        lend_routed_address(&host, "source", network, "remote").unwrap();
+        check("source", network, false).unwrap();
+        host.lend(&host.lock().unwrap(), network.address.v4, network.generation, 0, "remote").unwrap();
+        assert!(check("source", network, false).is_err(), "a new transfer cannot reuse another loan");
+        check("source", network, true).unwrap();
         let lock = host.lock().unwrap();
         let lent = host.addr(&lock, network.address.v4).unwrap();
         assert_eq!(lent.lent, Some(network.generation));

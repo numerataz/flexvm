@@ -852,10 +852,11 @@ pub fn activate(host: Host, vm: &str, offer: &Path, trusted_engine: &Path) -> Re
     let processes = Arc::new(qemu::Processes::default());
     setup_signals(processes.clone());
     let _reservation = Reservation::new(&host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)?;
-    let verified =
-        activation.verify_inputs(&config.profiles_for_disk_ids(manifest.disks.iter().map(|disk| disk.volume_id.as_str()), false)?, trusted_engine)?;
+    let profiles = config.profiles_for_disk_ids(manifest.disks.iter().map(|disk| disk.volume_id.as_str()), manifest.routed.is_some())?;
+    let verified = activation.verify_inputs(&profiles, trusted_engine)?;
+    let routed = manifest.routed.map(|network| qemu::Routed::arrive(&host, vm, network, activation.returns_routed_address())).transpose()?;
     let disks = activation.adopt_disks()?;
-    let machine = config.restore(verified, processes.clone(), disks, None)?;
+    let machine = config.restore(verified, processes.clone(), disks, routed)?;
     let (generation, consumed) = activation.grant(processes.engine_ident()?)?;
     let meta = manifest.image.clone();
     serve(host, name, machine, processes, &config, &meta, Some(Resume { manifest, generation, consumed, notify: None }))

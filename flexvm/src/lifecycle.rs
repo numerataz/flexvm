@@ -1168,18 +1168,45 @@ pub fn remove_debris(host: &Host, name: &str) -> Result<()> {
 /// claim finishes that).
 pub fn revoke(host: &Host, name: &str) -> Result<Result<()>> {
     let dir = host.suspended(name)?;
-    let (ip, gen) = if crate::software_state::identifies(&dir) {
-        crate::software_state::metadata(&dir)
-            .ok()
-            .and_then(|manifest| manifest.routed)
-            .map_or((None, None), |network| (Some(network.address.v4), Some(network.generation)))
+    let software = crate::software_state::identifies(&dir);
+    let routed = if software {
+        match crate::software_state::metadata(&dir) {
+            Ok(manifest) if manifest.routed.is_some() => {
+                let active = crate::software_state::transfer::active_routed_loan(&host.state, &manifest)?;
+                manifest.routed.map(|network| (network, active))
+            }
+            _ => None,
+        }
     } else {
-        (read_manifest(&dir).ok().map(|m| m.ip), read_gen(&dir))
+        None
     };
+    let legacy = (!software).then(|| (read_manifest(&dir).ok().map(|m| m.ip), read_gen(&dir)));
     mark_durably(&dir, DISCARDED).map_err(|e| format!("discarding the checkpoint of {name}: {e}"))?;
     // DISCARDED already prevents resume; failed cleanup leaves only debris for the name's next holder.
     delete_consumed(name, &dir);
-    Ok(free_address(host, name, ip, gen))
+    Ok(match (routed, legacy) {
+        (Some((network, active)), _) => free_routed_address(host, name, network, active),
+        (None, Some((ip, gen))) => free_address(host, name, ip, gen),
+        (None, None) => Ok(()),
+    })
+}
+
+fn free_routed_address(host: &Host, name: &str, network: crate::software_state::RoutedNetwork, active_loan: bool) -> Result<()> {
+    let ip = network.address.v4;
+    let lock = host.lock()?;
+    let address = host.addr(&lock, ip)?;
+    if address.holder.as_deref() != Some(name) || address.held != network.generation {
+        // An old checkpoint may outlive the address's next owner.
+        return Ok(());
+    }
+    if active_loan && address.lent == Some(network.generation) {
+        return host.release(&lock, ip, name, None);
+    }
+    host.withdraw_noted(&lock, ip, network.generation)?;
+    host.release(&lock, ip, name, None)?;
+    drop(lock);
+    host.deliver_withdrawals();
+    Ok(())
 }
 
 fn free_address(host: &Host, name: &str, ip: Option<Ipv4Addr>, gen: Option<u64>) -> Result<()> {
