@@ -27,8 +27,9 @@ sudo python3 scripts/compat/parent-kvm-run.py \
 
 On a host with working KVM, add `--native-oracle` to run the same client binary
 against the host kernel before starting the software-only proof. The report
-records first-run and warm re-entry durations. The parent waits for the QEMU
-stop event, and the guest uses an MSI-X interrupt to receive the reply.
+records first-run and warm re-entry durations. The TCG worker sends the
+port byte over its run socket after stopping the vCPU. The guest uses an
+MSI-X interrupt to receive the parent's reply.
 
 With `--parent-engine kvm`, the parent runs the child vCPU through the host
 KVM device. The guest and client use the same interface and shared page.

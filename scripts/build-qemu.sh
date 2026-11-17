@@ -23,7 +23,8 @@ patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-svm-restore.patch"
 patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-svm-feature-control.patch"
 patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-port-output-stop.patch"
 patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-shared-ram.patch"
-./configure --prefix="$prefix" --target-list=x86_64-softmmu --with-pkgversion=flexvm-tcg-nested-4 \
+patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-run-control.patch"
+./configure --prefix="$prefix" --target-list=x86_64-softmmu --with-pkgversion=flexvm-tcg-nested-5 \
   --disable-docs --disable-tools --disable-guest-agent --disable-werror \
   --disable-download --disable-gtk --disable-sdl --disable-vnc \
   --disable-opengl --disable-curses --enable-slirp --enable-seccomp

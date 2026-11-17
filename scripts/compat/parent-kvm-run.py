@@ -42,123 +42,97 @@ def stop_process(process):
     process.wait()
 
 
-class ExitMonitor(HELPERS["QMP"]):
-    def __init__(self, path, process, deadline):
-        self.stops = 0
-        super().__init__(path, process, deadline)
-
-    def receive(self):
-        self.socket.settimeout(self.remaining())
-        line = self.stream.readline()
-        if not line:
-            raise RuntimeError("child QMP disconnected")
-        message = json.loads(line)
-        if "error" in message:
-            raise RuntimeError(f"child QMP error: {message['error']}")
-        if message.get("event") == "STOP":
-            self.stops += 1
-        return message
-
-    def reply(self):
-        while True:
-            message = self.receive()
-            if "event" not in message:
-                return message
-
-    def wait_stop(self):
-        while not self.stops:
-            if "event" not in self.receive():
-                raise RuntimeError("unexpected child QMP reply while waiting for STOP")
-        if self.stops != 1:
-            raise RuntimeError("child reported multiple stop events for one run")
-        self.stops = 0
-
-
-class TcgChild:
-    def __init__(self, qemu, output, socket_path, outer_ram, offset):
-        self.process = None
-        self.monitor = None
-        self.port = output / "port-io.bin"
-        self.memory = outer_ram
-        self.offset = offset
+class RunChannel:
+    def __init__(self, connection):
+        self.connection = connection
         self.exits = []
         self.timings = []
         try:
-            slot = (f"memory-backend-file,id=slot,mem-path=/proc/self/fd/{self.memory},"
-                    f"share=on,size=4K,offset={self.offset}")
-            command = [
-                qemu, *QEMU_OPTIONS, "-machine", "pc,accel=tcg", "-m", "16", "-serial", "none",
-                "-object", slot, "-device", "flexvm-shared-ram,memdev=slot",
-                "-bios", output / "reset.rom", "-S", "-qmp", f"unix:{socket_path},server=on,wait=off",
-                "-chardev", f"file,id=port,path={self.port}",
-                "-device", "isa-debugcon,iobase=0x30,chardev=port,stop-on-write=on",
-            ]
-            with (output / "child.log").open("wb") as log:
-                self.process = subprocess.Popen(command, pass_fds=(self.memory,), stdout=log, stderr=log)
-            self.monitor = ExitMonitor(socket_path, self.process, time.monotonic() + 3)
-        except BaseException:
-            self.close()
-            raise
-
-    def run(self):
-        started = time.monotonic()
-        self.monitor.deadline = started + 3
-        if self.exits:
-            if self.monitor.ask("query-status")["running"] or self.port.read_bytes() != bytes(self.exits):
-                raise RuntimeError("child progressed while the KVM client was stopped")
-            if os.pread(self.memory, 1, self.offset + 0x22) != b"\0":
-                raise RuntimeError("child wrote its second result while stopped")
-        self.monitor.ask("cont")
-        self.monitor.wait_stop()
-        exits = self.port.read_bytes()
-        if exits[:-1] != bytes(self.exits) or len(exits) != len(self.exits) + 1:
-            raise RuntimeError("child did not produce exactly one byte per run")
-        self.exits.append(exits[-1])
-        self.timings.append(round((time.monotonic() - started) * 1000, 3))
-        return exits[-1]
-
-    def close(self):
-        try:
-            if self.monitor is not None:
-                self.monitor.close()
-        finally:
-            self.monitor = None
-            if self.process is not None:
-                stop_process(self.process)
-                self.process = None
-
-
-class KvmChild:
-    def __init__(self, output, outer_ram, offset):
-        self.process = None
-        self.offset = offset
-        self.exits = []
-        self.timings = []
-        self.connection, worker = socket.socketpair(type=socket.SOCK_SEQPACKET)
-        self.connection.settimeout(3)
-        try:
-            with worker, (output / "child.log").open("wb") as log:
-                control = worker.fileno()
-                command = [output / "native-worker", str(control), str(outer_ram), str(offset)]
-                self.process = subprocess.Popen(command, pass_fds=(control, outer_ram), stdout=log, stderr=log)
+            self.connection.settimeout(3)
             if self.connection.recv(2) != b"R":
-                raise RuntimeError("native parent worker did not report readiness")
+                raise RuntimeError("parent worker did not report readiness")
         except BaseException:
-            self.close()
+            self.connection.close()
             raise
 
     def run(self):
         started = time.monotonic()
+        if select.select([self.connection], [], [], 0)[0]:
+            raise RuntimeError("child replied before its next run request")
         self.connection.sendall(b"R")
         output = self.connection.recv(2)
         if len(output) != 1:
-            raise RuntimeError("native parent worker did not return one I/O byte")
+            raise RuntimeError("parent worker did not return one I/O byte")
         self.exits.append(output[0])
         self.timings.append(round((time.monotonic() - started) * 1000, 3))
         return output[0]
 
     def close(self):
         self.connection.close()
+
+
+class TcgChild:
+    def __init__(self, qemu, output, socket_path, outer_ram, offset):
+        self.process = None
+        self.channel = None
+        self.memory = outer_ram
+        self.offset = offset
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener, (output / "child.log").open("wb") as log:
+                listener.bind(str(socket_path))
+                listener.listen(1)
+                listener.settimeout(3)
+                slot = (f"memory-backend-file,id=slot,mem-path=/proc/self/fd/{outer_ram},"
+                        f"share=on,size=4K,offset={offset}")
+                command = [
+                    qemu, *QEMU_OPTIONS, "-machine", "pc,accel=tcg", "-m", "16", "-serial", "none",
+                    "-object", slot, "-device", "flexvm-shared-ram,memdev=slot",
+                    "-bios", output / "reset.rom", "-S", "-chardev", f"socket,id=port,path={socket_path}",
+                    "-device", "isa-debugcon,iobase=0x30,chardev=port,run-control=on",
+                ]
+                self.process = subprocess.Popen(command, pass_fds=(outer_ram,), stdout=log, stderr=log)
+                connection, _ = listener.accept()
+                self.channel = RunChannel(connection)
+        except BaseException:
+            self.close()
+            raise
+
+    def run(self):
+        if self.channel.exits and os.pread(self.memory, 1, self.offset + 0x22) != b"\0":
+            raise RuntimeError("child wrote its second result while stopped")
+        return self.channel.run()
+
+    def close(self):
+        if self.channel is not None:
+            self.channel.close()
+        if self.process is not None:
+            stop_process(self.process)
+            self.process = None
+
+
+class KvmChild:
+    def __init__(self, output, outer_ram, offset):
+        self.process = None
+        self.channel = None
+        self.offset = offset
+        connection, worker = socket.socketpair(type=socket.SOCK_SEQPACKET)
+        try:
+            with worker, (output / "child.log").open("wb") as log:
+                control = worker.fileno()
+                command = [output / "native-worker", str(control), str(outer_ram), str(offset)]
+                self.process = subprocess.Popen(command, pass_fds=(control, outer_ram), stdout=log, stderr=log)
+            self.channel = RunChannel(connection)
+        except BaseException:
+            connection.close()
+            self.close()
+            raise
+
+    def run(self):
+        return self.channel.run()
+
+    def close(self):
+        if self.channel is not None:
+            self.channel.close()
         if self.process is not None:
             try:
                 return self.process.wait(timeout=1)
@@ -270,7 +244,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine):
             struct.pack_into("<I", mapping, 12, pending)
             os.eventfd_write(replies, 1)
         guest = (output / "outer.log").read_text(errors="replace")
-        if (outer.wait() != 0 or tuple(observed) != expected or child is None or tuple(child.exits) != IO_VALUES
+        if (outer.wait() != 0 or tuple(observed) != expected or child is None or tuple(child.channel.exits) != IO_VALUES
                 or "PASS /dev/kvm returned two port I/O exits" not in guest
                 or "PASS parent KVM guest shutdown" not in guest):
             raise RuntimeError(f"parent execution proof failed; commands={observed}, see outer.log")
@@ -282,10 +256,10 @@ def exercise(qemu, kernel, output, reject_close, parent_engine):
     return {
         "guest_path": "/dev/kvm", "guest_vmx": False, "guest_svm": False,
         "parent_accelerator": parent_engine, "parent_commands": observed, "transport": "eventfd and MSI-X",
-        "io_values": child.exits, "child_memory_write_visible": True, "same_child_worker": True,
+        "io_values": child.channel.exits, "child_memory_write_visible": True, "same_child_worker": True,
         "page_alias": True, "mapped_page_bytes": PAGE_SIZE,
         "worker_stopped_before_close_reply": not reject_close, "page_retained_on_rejected_close": retained,
-        "client_run_ns": client_timings(guest), "worker_run_ms": child.timings,
+        "client_run_ns": client_timings(guest), "worker_run_ms": child.channel.timings, "worker_control": "direct socket",
     }
 
 
