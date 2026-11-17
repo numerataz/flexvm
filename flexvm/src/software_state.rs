@@ -601,6 +601,14 @@ impl Prepared<'_> {
 
 impl Drop for Consumed {
     fn drop(&mut self) {
+        self.release_replaced_inputs();
+    }
+}
+
+impl Consumed {
+    /// Release exchanged inputs before reporting retirement, even when a
+    /// finishing control request still holds a reference to the owner.
+    pub fn release_replaced_inputs(&self) {
         // The live engine still uses verified files from its consumed bundle.
         // Keep them linked through rollback; unlinking changes their metadata
         // and would invalidate subsequent captures from the same owner.
@@ -608,7 +616,7 @@ impl Drop for Consumed {
             return;
         }
         let Ok(pinned) = self.directory.metadata() else { return };
-        for (parent, name) in self.replaced.get_mut().unwrap().drain(..) {
+        for (parent, name) in self.replaced.lock().unwrap().drain(..) {
             let Ok(_removing) = parent_lock(&parent, libc::LOCK_EX) else { continue };
             let Ok(Some(_records)) = records_exclusive(&self.directory) else { continue };
             let path = crate::host::fd_path(parent.as_raw_fd()).join(name);
@@ -621,9 +629,7 @@ impl Drop for Consumed {
             }
         }
     }
-}
 
-impl Consumed {
     /// An orderly workload exit or explicit kill must not masquerade as a
     /// failed restore. Invalidate only this owner's still-selected input bundle.
     pub fn finish(&self, path: &Path) -> Result<()> {
@@ -1371,6 +1377,32 @@ mod tests {
             sweep(&root).unwrap();
             !hidden.exists()
         });
+    }
+
+    #[test]
+    fn retirement_releases_exchanged_inputs_while_an_owner_reference_remains() {
+        let root = TempDir::new("software-retirement-inputs");
+        let (path, profile) = checkpoint(&root);
+        let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let name = host.take_name("vm", false).unwrap();
+        let verified = open(&path, &profile).unwrap();
+        let mut consumed = verified.prepare(&name, &verified.manifest.host_id).unwrap().grant(crate::host::Ident::me()).unwrap();
+        let hidden = root.join(format!("{STAGING_PREFIX}{}", "d".repeat(32)));
+        fs::rename(&path, &hidden).unwrap();
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("replacement"), b"new checkpoint").unwrap();
+        consumed.replaced.lock().unwrap().push((parent_directory(&root).unwrap(), hidden.file_name().unwrap().into()));
+        consumed.release_replaced_inputs();
+        assert!(hidden.join("kernel").exists(), "live engine still needs its inputs");
+        // A reused PID is proof that the recorded engine has retired.
+        consumed.grant.engine.start += 1;
+        let consumed = std::sync::Arc::new(consumed);
+        let finishing_request = consumed.clone();
+        consumed.release_replaced_inputs();
+        assert!(!hidden.exists(), "cleanup must not wait for the last owner reference");
+        assert_eq!(fs::read(path.join("replacement")).unwrap(), b"new checkpoint");
+        finishing_request.release_replaced_inputs();
+        assert_eq!(std::sync::Arc::strong_count(&consumed), 2);
     }
 
     #[test]

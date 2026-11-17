@@ -406,6 +406,9 @@ impl Owner {
             let previous = self.consumed.as_ref().filter(|_| checkpoint.exists());
             let published = self.machine.checkpoint(staging, &checkpoint, manifest, previous, Instant::now() + Duration::from_secs(600))?;
             self.machine.retire(&published)?;
+            if let Some(consumed) = &self.consumed {
+                consumed.release_replaced_inputs();
+            }
             self.suspended.store(true, Ordering::SeqCst);
             self.ended.store(true, Ordering::SeqCst);
             self.publish_state("suspended")?;
