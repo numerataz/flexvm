@@ -485,9 +485,10 @@ prerequisite for the local software checkpoint path described below. Vsock remai
 the default for unnamed commands; named software owners use serial control.
 
 `scripts/compat/software-kvm.py` runs real KVM clients inside an ordinary OCI
-image using the software CLI and serial agent transport. On x86 it runs all nine
-KVM ABI reference checks, including coherent/concurrent caller RAM, ioeventfd,
-descriptor lifetime and vCPU state. ARM runs its architecture-specific KVM probe.
+image using the software CLI and serial agent transport. On x86 it runs eleven
+KVM ABI reference checks, including run-page cancellation, coherent caller RAM,
+ioeventfd, descriptor lifetime and vCPU state. ARM runs its architecture-specific
+KVM probe, including run-page cancellation.
 The same VM then runs an unchanged, pinned Firecracker binary, which boots an
 inner Linux guest, runs independent timer ticks and exits successfully. ARM uses
 PSCI power-off; x86 requests i8042 reset because Firecracker has no ACPI power-off
