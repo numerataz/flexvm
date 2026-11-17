@@ -4,6 +4,7 @@ set -eux
 step=$1 nonce=$2 phase=$3
 base=/var/lib/flexvm-k3s-$nonce
 image=public.ecr.aws/docker/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662
+policy=IfNotPresent
 k() { k3s kubectl -n flexvm-compat "$@"; }
 trap 'result=$?; if [ "$result" -ne 0 ]; then
     systemctl --no-pager -l status k3s.service || true
@@ -62,9 +63,31 @@ prepare)
         k3s kubectl -n kube-system wait --for=condition=complete "job/$job" --timeout=300s
     done
     rm "$archive"
-    python3 - "$nonce" "$image" > "$base/workload.json" <<'PY'
+    if [ -e /nested-input/busybox.tar ] || [ -e /nested-input/busybox.json ]; then
+        python3 - "$image" <<'PYFIXTURE'
+from pathlib import Path
+import hashlib, json, platform, re, sys
+root = Path('/nested-input')
+metadata = json.loads((root / 'busybox.json').read_text())
+assert metadata['source'] == sys.argv[1], metadata
+assert metadata['architecture'] == {'x86_64': 'amd64', 'aarch64': 'arm64'}[platform.machine()], metadata
+assert metadata['tag'] == 'docker.io/flexvm/busybox:compat', metadata
+assert hashlib.sha256((root / 'busybox.tar').read_bytes()).hexdigest() == metadata['archive_sha256']
+assert re.fullmatch(r'sha256:[0-9a-f]{64}', metadata['config_digest'])
+print(metadata['config_digest'])
+PYFIXTURE
+
+        k3s ctr --namespace k8s.io images import /nested-input/busybox.tar
+        image=docker.io/flexvm/busybox:compat
+        policy=Never
+        k3s crictl inspecti "$image" > "$base/fixture-image.json"
+        k3s ctr --namespace k8s.io images export "$base/imported-image.tar" "$image"
+        python3 /nested-input/verify-fixture-import.py --archive "$base/imported-image.tar" --metadata /nested-input/busybox.json
+        rm "$base/imported-image.tar"
+    fi
+    python3 - "$nonce" "$image" "$policy" > "$base/workload.json" <<'PY'
 import json, sys
-nonce, image = sys.argv[1:]
+nonce, image, policy = sys.argv[1:]
 script = '''
 test -f /data/index.html || printf %s "$NONCE" > /data/index.html
 cookie=$(cat /proc/sys/kernel/random/uuid)
@@ -77,7 +100,7 @@ while :; do
     sleep .1
 done
 '''
-container = dict(name='web', image=image, imagePullPolicy='IfNotPresent', command=['sh', '-ec', script],
+container = dict(name='web', image=image, imagePullPolicy=policy, command=['sh', '-ec', script],
     env=[dict(name='NONCE', value=nonce)], ports=[dict(containerPort=8080)],
     securityContext=dict(allowPrivilegeEscalation=False, capabilities=dict(drop=['ALL'])),
     resources=dict(requests=dict(cpu='10m', memory='16Mi'), limits=dict(cpu='100m', memory='64Mi')),

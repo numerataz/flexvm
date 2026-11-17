@@ -2992,6 +2992,11 @@ def containerd():
 def compat_workload(workload, boot="app", memory_mib=2048):
     output = os.path.join(args.log_dir, workload + "-compat")
     previous_dns = [(host, json.load(open(os.path.join(host.state_dir, "host.json"))).get("dns")) for host in (A, B)]
+    fixture_args = []
+    if workload in ("kind", "k3s") and ENV.get("FLEXVM_WORKLOAD_FIXTURE"):
+        for name in ("busybox.tar", "busybox.json"):
+            fixture_args.extend(["--seed", os.path.join(ENV["FLEXVM_WORKLOAD_FIXTURE"], name), "/nested-input/" + name])
+        fixture_args.extend(["--seed", os.path.join(ROOT, "scripts/compat/verify-fixture-import.py"), "/nested-input/verify-fixture-import.py"])
     try:
         for host, _ in previous_dns:
             host.configure(dns=ENV["FLEXVM_TEST_DNS"].split())
@@ -3003,7 +3008,7 @@ def compat_workload(workload, boot="app", memory_mib=2048):
             "--phases", "run,suspend,checkpoint,migration", "--migration-to", B.addr,
             "--to-state", B.state_dir, "--to-run", B.run_dir,
             "--vcpus", "2", "--memory-mib", str(memory_mib), "--require", "storage.fuse",
-            "--output", output,
+            "--output", output, *fixture_args,
         ], check=True, timeout=1500, env=ENV)
     finally:
         for host, dns in previous_dns:
