@@ -2,7 +2,7 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -50,6 +50,74 @@ fn capacity(bytes: u64) -> Result<()> {
         bail!("volume size must be a multiple of 512 bytes, from 512 bytes to 8 TiB");
     }
     Ok(())
+}
+
+fn copy_sparse(source: &File, target: &File, size: u64) -> Result<()> {
+    let mut buffer = vec![0; 1 << 20];
+    let mut offset = 0;
+    let mut seek_holes = true;
+    while offset < size {
+        let end = if seek_holes {
+            let data = unsafe { libc::lseek(source.as_raw_fd(), offset as libc::off_t, libc::SEEK_DATA) };
+            if data < 0 {
+                let error = std::io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(libc::ENXIO) => break,
+                    Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS) => {
+                        seek_holes = false;
+                        continue;
+                    }
+                    _ => return Err(error.into()),
+                }
+            }
+            let hole = unsafe { libc::lseek(source.as_raw_fd(), data, libc::SEEK_HOLE) };
+            if hole < 0 {
+                let error = std::io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS) => {
+                        seek_holes = false;
+                        continue;
+                    }
+                    _ => return Err(error.into()),
+                }
+            }
+            if data < offset as libc::off_t || data as u64 >= size || hole <= data {
+                bail!("invalid source volume extent");
+            }
+            offset = data as u64;
+            (hole as u64).min(size)
+        } else {
+            size
+        };
+        while offset < end {
+            let bytes = (end - offset).min(buffer.len() as u64) as usize;
+            source.read_exact_at(&mut buffer[..bytes], offset)?;
+            // Also preserve sparsity when a filesystem reports holes as data.
+            if buffer[..bytes].iter().any(|byte| *byte != 0) {
+                target.write_all_at(&buffer[..bytes], offset)?;
+            }
+            offset += bytes as u64;
+        }
+    }
+    Ok(())
+}
+
+fn copy_raw(source: &File, target: &File, size: u64) -> Result<()> {
+    loop {
+        if unsafe { libc::ioctl(target.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) } == 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            Some(libc::EBADF | libc::EINVAL | libc::ENOTTY | libc::EOPNOTSUPP | libc::EXDEV | libc::ENOSYS | libc::EPERM) => break,
+            _ => return Err(error.into()),
+        }
+    }
+    // A failed optional clone must not leave data in holes of the fallback copy.
+    target.set_len(0)?;
+    target.set_len(size)?;
+    copy_sparse(source, target, size)
 }
 
 fn make_directory(parent: &File, name: &std::ffi::CStr) -> Result<()> {
@@ -114,10 +182,10 @@ impl Catalog {
     }
 
     // Locks the stable catalog directory inode. It is never unlinked by catalog operations.
-    fn lock(&self, how: i32) -> Result<File> {
+    fn lock(&self, how: i32) -> Result<crate::host::Flock> {
         let lock: File = util::open_dir_at(self.directory.as_raw_fd(), c".")?.into();
         crate::host::flock(&lock, how | libc::LOCK_NB).map_err(|error| format!("volume catalog is busy: {error}"))?;
-        Ok(lock)
+        Ok(crate::host::Flock(lock))
     }
 
     fn read(&self, id: &str) -> Result<(Info, File, File)> {
@@ -208,11 +276,30 @@ impl Catalog {
     }
 
     pub fn create(&self, name: &str, size: u64) -> Result<Info> {
+        let _catalog = self.lock(libc::LOCK_EX)?;
+        self.create_locked(name, size, |_| Ok(()))
+    }
+
+    pub fn clone_volume(&self, source: &str, name: &str) -> Result<Info> {
+        let _catalog = self.lock(libc::LOCK_EX)?;
+        let info = self.find(source)?;
+        let (_, _, disk) = self.read(&info.metadata.id)?;
+        crate::host::flock(&disk, libc::LOCK_EX | libc::LOCK_NB).map_err(|error| format!("source volume is still in use: {error}"))?;
+        self.create_locked(name, info.metadata.capacity_bytes, |target| {
+            copy_raw(&disk, target, info.metadata.capacity_bytes)?;
+            if disk.metadata()?.len() != info.metadata.capacity_bytes {
+                bail!("source volume capacity changed during clone");
+            }
+            Ok(())
+        })
+    }
+
+    // The caller holds the catalog mutation lock through population and publication.
+    fn create_locked(&self, name: &str, size: u64, populate: impl FnOnce(&File) -> Result<()>) -> Result<Info> {
         if !valid_name(name) {
             bail!("volume names must be 1–63 ASCII letters/digits/._-, start with a letter or digit, and not be a 32-digit hexadecimal identifier");
         }
         capacity(size)?;
-        let _catalog = self.lock(libc::LOCK_EX)?;
         self.recover()?;
         if self.volumes()?.iter().any(|v| v.metadata.name == name) {
             bail!("volume {name:?} already exists");
@@ -225,6 +312,10 @@ impl Catalog {
         let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL;
         let disk = member(&dir, "disk.raw", flags)?;
         disk.set_len(size)?;
+        populate(&disk)?;
+        if disk.metadata()?.len() != size {
+            bail!("new volume capacity differs from its declared capacity");
+        }
         disk.sync_all()?;
         let mut record = member(&dir, "metadata.json", flags)?;
         record.write_all(&serde_json::to_vec(&metadata)?)?;
@@ -286,6 +377,60 @@ mod tests {
     }
 
     #[test]
+    fn catalog_operation_unlocks_before_an_inherited_child_execs() {
+        use crate::test_util::JoinWithin;
+        const CHILD: &str = "FLEXVM_TEST_CATALOG_FORK";
+        if std::env::var_os(CHILD).is_none() {
+            let status = crate::test_util::status(
+                Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "volume::tests::catalog_operation_unlocks_before_an_inherited_child_execs"])
+                    .env(CHILD, "1"),
+            )
+            .unwrap();
+            assert!(status.success(), "catalog fork helper: {status}");
+            return;
+        }
+        // Isolate the fork from other tests, and release its pre-exec gate even
+        // if the parent's assertion unwinds.
+        struct Release(std::os::unix::net::UnixStream);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = self.0.write_all(b"r");
+            }
+        }
+        let state = crate::test_util::TempDir::new("volume-catalog-fork");
+        let catalog = Catalog::open(&state).unwrap();
+        let operation = catalog.lock(libc::LOCK_EX).unwrap();
+        let (parent, child) = std::os::unix::net::UnixStream::pair().unwrap();
+        parent.set_read_timeout(Some(crate::test_util::WAIT)).unwrap();
+        child.set_read_timeout(Some(crate::test_util::WAIT)).unwrap();
+        let mut release = Release(parent);
+        let spawner = std::thread::spawn(move || {
+            let fd = child.as_raw_fd();
+            let mut command = Command::new("true");
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::write(fd, b"f".as_ptr().cast(), 1) != 1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let mut byte = 0u8;
+                    if libc::read(fd, (&mut byte as *mut u8).cast(), 1) != 1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            command.status()
+        });
+        release.0.read_exact(&mut [0]).unwrap();
+        drop(operation);
+        let result = catalog.create("after-fork", 512);
+        drop(release);
+        assert!(spawner.join_within().unwrap().unwrap().success());
+        result.unwrap();
+    }
+
+    #[test]
     fn inherited_disk_lock_survives_owner_descriptor_close() {
         let state = crate::test_util::TempDir::new("volume-lease");
         let catalog = Catalog::open(&state).unwrap();
@@ -304,11 +449,81 @@ mod tests {
         assert_eq!(&ready, b".");
         drop(disk);
         assert!(catalog.remove("busy").unwrap_err().to_string().contains("still in use"));
+        assert!(catalog.clone_volume("busy", "blocked-copy").unwrap_err().to_string().contains("still in use"));
         assert_eq!(catalog.inspect("busy").unwrap().metadata.id, id);
         child.stdin.take().unwrap().write_all(b"release\n").unwrap();
         crate::test_util::wait_until("volume lease helper exit", || child.try_wait().unwrap().is_some());
         assert!(child.wait().unwrap().success());
         catalog.remove("busy").unwrap();
+    }
+
+    #[test]
+    fn sparse_clone_has_independent_identity_and_retained_bytes() {
+        let state = crate::test_util::TempDir::new("volume-clone");
+        let catalog = Catalog::open(&state).unwrap();
+        let id = catalog.create("original", 1 << 30).unwrap().metadata.id;
+        let (_, _, source) = catalog.read(&id).unwrap();
+        source.write_all_at(b"first", 4096).unwrap();
+        source.write_all_at(b"last", (1 << 30) - 4).unwrap();
+        source.sync_all().unwrap();
+        let cloned = catalog.clone_volume(&id, "copy").unwrap();
+        assert_ne!(cloned.metadata.id, id);
+        assert_eq!(cloned.metadata.capacity_bytes, 1 << 30);
+        assert!(cloned.allocated_bytes < 16 << 20, "sparse clone allocated {}", cloned.allocated_bytes);
+        let (_, _, copy) = catalog.read(&cloned.metadata.id).unwrap();
+        assert_ne!(source.metadata().unwrap().ino(), copy.metadata().unwrap().ino());
+        let mut bytes = [0; 5];
+        copy.read_exact_at(&mut bytes, 4096).unwrap();
+        assert_eq!(&bytes, b"first");
+        copy.write_all_at(b"clone", 4096).unwrap();
+        source.write_all_at(b"orig", (1 << 30) - 4).unwrap();
+        copy.sync_all().unwrap();
+        source.sync_all().unwrap();
+        source.read_exact_at(&mut bytes, 4096).unwrap();
+        assert_eq!(&bytes, b"first");
+        let mut tail = [0; 4];
+        copy.read_exact_at(&mut tail, (1 << 30) - 4).unwrap();
+        assert_eq!(&tail, b"last");
+        drop((source, copy, catalog));
+        let catalog = Catalog::open(&state).unwrap();
+        assert_eq!(catalog.inspect("copy").unwrap().metadata.id, cloned.metadata.id);
+        assert!(catalog.clone_volume("original", "copy").is_err());
+        assert!(catalog.clone_volume("original", "../outside").is_err());
+        catalog.remove("original").unwrap();
+        let (_, _, copy) = catalog.read(&cloned.metadata.id).unwrap();
+        copy.read_exact_at(&mut bytes, 4096).unwrap();
+        assert_eq!(&bytes, b"clone");
+    }
+
+    #[test]
+    fn sparse_copy_fallback_preserves_holes_and_unpublished_failures_recover() {
+        let state = crate::test_util::TempDir::new("volume-copy");
+        let catalog = Catalog::open(&state).unwrap();
+        let id = catalog.create("source", 32 << 20).unwrap().metadata.id;
+        let (_, _, source) = catalog.read(&id).unwrap();
+        source.write_all_at(b"head", 0).unwrap();
+        source.write_all_at(b"tail", (32 << 20) - 4).unwrap();
+        source.sync_all().unwrap();
+        let _catalog = catalog.lock(libc::LOCK_EX).unwrap();
+        let copy = catalog.create_locked("fallback", 32 << 20, |target| copy_sparse(&source, target, 32 << 20)).unwrap();
+        assert!(copy.allocated_bytes < 4 << 20);
+        let (_, _, target) = catalog.read(&copy.metadata.id).unwrap();
+        let mut bytes = [0; 4];
+        target.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(&bytes, b"head");
+        target.read_exact_at(&mut bytes, (32 << 20) - 4).unwrap();
+        assert_eq!(&bytes, b"tail");
+        target.read_exact_at(&mut bytes, 16 << 20).unwrap();
+        assert_eq!(bytes, [0; 4]);
+        let failed = catalog.create_locked("incomplete", 32 << 20, |target| {
+            target.write_all_at(b"partial", 0)?;
+            Err("injected copy failure".into())
+        });
+        assert!(failed.is_err());
+        assert!(catalog.find("incomplete").is_err());
+        catalog.recover().unwrap();
+        assert!(!entries(&catalog.directory).unwrap().iter().any(|n| n.starts_with(".creating-")));
+        catalog.create_locked("incomplete", 512, |_| Ok(())).unwrap();
     }
 
     #[test]
@@ -338,6 +553,7 @@ mod tests {
         fs::remove_file(&raw).unwrap();
         std::os::unix::fs::symlink(&outside, &raw).unwrap();
         assert!(catalog.inspect("data").is_err());
+        assert!(catalog.clone_volume("data", "forged-copy").is_err());
         assert!(catalog.remove("data").is_err());
         assert_eq!(fs::read(&outside).unwrap(), b"do not change");
         fs::remove_file(&raw).unwrap();
