@@ -2474,7 +2474,7 @@ def kernel_modules():
 @contextlib.contextmanager
 def workload_test_egress():
     """The coordinator owns temporary egress rules, even if a worker is killed."""
-    workloads = {"podman", "namespace_sandboxes", "containerd", "distro_openrc", "distro_openrc_pressure", "user_sessions", "rootless_docker"}
+    workloads = {"podman", "namespace_sandboxes", "containerd", "distro_openrc", "distro_openrc_pressure", "user_sessions", "rootless_docker", "rootless_containerd"}
     if args.worker or args.selftest or args.no_kvm or os.geteuid() != 0 or not workloads.intersection(args.cases or CASES) or kvm_unusable():
         yield
         return
@@ -2847,6 +2847,13 @@ def distro_systemd():
 def rootless_docker():
     """Stock rootless Docker and its integrated BuildKit across the native VM lifecycle."""
     compat_workload("rootless-docker", boot="systemd")
+
+
+@case
+@needs_kvm
+def rootless_containerd():
+    """Upstream rootless containerd and standalone BuildKit across the native VM lifecycle."""
+    compat_workload("rootless-containerd", boot="systemd")
 
 
 @case
