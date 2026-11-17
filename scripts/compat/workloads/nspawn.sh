@@ -16,10 +16,10 @@ case $step in
 prepare)
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
-    apt-get install -y -qq --no-install-recommends systemd-container debootstrap ubuntu-keyring dbus iptables curl
+    apt-get install -y -qq --no-install-recommends systemd-container debootstrap ubuntu-keyring ca-certificates dbus iptables curl
     case $(dpkg --print-architecture) in
-        amd64) mirror=http://archive.ubuntu.com/ubuntu ;;
-        arm64) mirror=http://ports.ubuntu.com/ubuntu-ports ;;
+        amd64) mirror=https://archive.ubuntu.com/ubuntu ;;
+        arm64) mirror=https://ports.ubuntu.com/ubuntu-ports ;;
         *) exit 2 ;;
     esac
     mkdir -p "$base" /var/lib/machines
