@@ -98,9 +98,20 @@ class Suite:
                                        "sha256": hashlib.sha256(self.workload.encode()).hexdigest()}
 
     def workload_step(self, step, phase="run"):
-        return self.host.call("exec", "-i", self.name, "sh", "-s", "--", step, self.nonce, phase,
-                              stdin=self.workload, timeout=900 if step == "prepare" else 180,
-                              output=self.output / f"{step}-{phase}")
+        def run(action, timeout):
+            return self.host.call("exec", "-i", self.name, "sh", "-s", "--", action, self.nonce, phase,
+                                  stdin=self.workload, timeout=timeout,
+                                  output=self.output / f"{action}-{phase}")
+
+        try:
+            return run(step, 900 if step == "prepare" else 180)
+        except (Failure, subprocess.TimeoutExpired):
+            if self.args.workload_diagnostics and step == "verify":
+                try:
+                    run("diagnose", 30)
+                except (Failure, subprocess.TimeoutExpired, OSError) as error:
+                    self.report["workload_diagnostics_error"] = str(error)
+            raise
 
     def exec(self, *argv, **kw):
         return self.host.call("exec", self.name, *argv, **kw)
@@ -259,6 +270,8 @@ def parse_args(argv=None):
     p.add_argument("--image", default="ubuntu:24.04")
     p.add_argument("--boot", choices=("app", "systemd", "openrc"), default="app", help="init profile for an owned VM")
     p.add_argument("--workload", type=Path, help="guest shell script: prepare/verify NONCE PHASE; runs only in an owned VM")
+    p.add_argument("--workload-diagnostics", action="store_true",
+                   help="run the workload's diagnose action after failed verification")
     p.add_argument('--seed', nargs=2, action='append', default=[], metavar=('SOURCE', 'DEST'))
     p.add_argument("--vm", help="probe an existing VM without changing its lifecycle")
     p.add_argument("--case", dest="cases", action="append", choices=("capabilities", "namespaces"))
@@ -283,6 +296,8 @@ def parse_args(argv=None):
     args.cases = args.cases or (["capabilities"] if args.vm else ["capabilities", "namespaces"])
     if not args.phases or args.phases[0] != "run" or len(set(args.phases)) != len(args.phases) or set(args.phases) - {"run", "suspend", "checkpoint", "migration"}:
         p.error("phases must start with run and contain each supported phase at most once")
+    if args.workload_diagnostics and not args.workload:
+        p.error("--workload-diagnostics requires --workload")
     if args.vm and args.workload:
         p.error("--workload requires an isolated owned VM")
     if args.vm and (args.phases != ["run"] or "namespaces" in args.cases):

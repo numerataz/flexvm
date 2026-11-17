@@ -3009,6 +3009,7 @@ def compat_workload(workload, boot="app", memory_mib=2048):
             "--to-state", B.state_dir, "--to-run", B.run_dir,
             "--vcpus", "2", "--memory-mib", str(memory_mib), "--require", "storage.fuse",
             "--output", output, *fixture_args,
+            *(["--workload-diagnostics"] if workload == "kind" else []),
         ], check=True, timeout=1500, env=ENV)
     finally:
         for host, dns in previous_dns:

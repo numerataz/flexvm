@@ -31,6 +31,15 @@ diagnostics() {
 }
 trap diagnostics 0
 case $step in
+diagnose)
+    # The host can request this after a timed-out verify connection is gone.
+    k --request-timeout=4s get pods -l app=web -o wide || true
+    k --request-timeout=4s describe pods -l app=web || true
+    timeout 6 docker exec fvkind-control-plane journalctl --no-pager -u kubelet -n 80 || true
+    timeout 6 docker exec fvkind-control-plane sh -c '
+        cat /sys/fs/cgroup/cpu.stat /sys/fs/cgroup/memory.events
+        crictl ps -a' || true
+    ;;
 prepare)
     export DEBIAN_FRONTEND=noninteractive
     mkdir -p "$base" /var/lib/docker /var/lib/containerd
