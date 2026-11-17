@@ -1,0 +1,604 @@
+diff --git a/src/firecracker/swagger/firecracker.yaml b/src/firecracker/swagger/firecracker.yaml
+index 7dfcd1fee..8d08513a4 100644
+--- a/src/firecracker/swagger/firecracker.yaml
++++ b/src/firecracker/swagger/firecracker.yaml
+@@ -1217,6 +1217,15 @@ definitions:
+     properties:
+       drive_id:
+         type: string
++      serial:
++        type: string
++        minLength: 1
++        maxLength: 20
++        pattern: '^[A-Za-z0-9._-]+$'
++        description:
++          Optional stable guest-visible serial for virtio block devices. Preserved
++          across backing-file updates and snapshot restore. If omitted, the
++          legacy host-inode-derived identity is used. Unsupported for vhost-user.
+       partuuid:
+         type: string
+         description:
+diff --git a/src/vmm/src/builder.rs b/src/vmm/src/builder.rs
+index acd7d7f69..776c58f7e 100644
+--- a/src/vmm/src/builder.rs
++++ b/src/vmm/src/builder.rs
+@@ -940,6 +940,7 @@ pub(crate) mod tests {
+             block_files.push(TempFile::new().unwrap());
+ 
+             let block_device_config = BlockDeviceConfig {
++                serial: None,
+                 drive_id: String::from(&custom_block_cfg.drive_id),
+                 partuuid: custom_block_cfg.partuuid,
+                 is_root_device: custom_block_cfg.is_root_device,
+diff --git a/src/vmm/src/device_manager/mod.rs b/src/vmm/src/device_manager/mod.rs
+index 1b6274170..2ab6955ff 100644
+--- a/src/vmm/src/device_manager/mod.rs
++++ b/src/vmm/src/device_manager/mod.rs
+@@ -968,6 +968,7 @@ pub(crate) mod tests {
+ 
+     fn make_hotplug_block_cfg(drive_id: &str, f: &TempFile, is_root: bool) -> BlockDeviceConfig {
+         BlockDeviceConfig {
++            serial: None,
+             drive_id: drive_id.to_string(),
+             partuuid: None,
+             is_root_device: is_root,
+diff --git a/src/vmm/src/devices/virtio/block/vhost_user/device.rs b/src/vmm/src/devices/virtio/block/vhost_user/device.rs
+index 6f27639f3..1af6ede78 100644
+--- a/src/vmm/src/devices/virtio/block/vhost_user/device.rs
++++ b/src/vmm/src/devices/virtio/block/vhost_user/device.rs
+@@ -67,7 +67,7 @@ impl TryFrom<&BlockDeviceConfig> for VhostUserBlockConfig {
+     type Error = VhostUserBlockError;
+ 
+     fn try_from(value: &BlockDeviceConfig) -> Result<Self, Self::Error> {
+-        if let (Some(socket), None, None, None, None, None, None, None) = (
++        if let (Some(socket), None, None, None, None, None, None, None, None) = (
+             &value.socket,
+             &value.is_read_only,
+             &value.discard,
+@@ -76,6 +76,7 @@ impl TryFrom<&BlockDeviceConfig> for VhostUserBlockConfig {
+             &value.file_engine_type,
+             &value.blk_size,
+             &value.topology,
++            &value.serial,
+         ) {
+             Ok(Self {
+                 drive_id: value.drive_id.clone(),
+@@ -95,6 +96,7 @@ impl From<VhostUserBlockConfig> for BlockDeviceConfig {
+     fn from(value: VhostUserBlockConfig) -> Self {
+         Self {
+             drive_id: value.drive_id,
++            serial: None,
+             partuuid: value.partuuid,
+             is_root_device: value.is_root_device,
+             cache_type: value.cache_type,
+@@ -413,6 +415,7 @@ mod tests {
+     #[test]
+     fn test_from_config() {
+         let block_config = BlockDeviceConfig {
++            serial: None,
+             drive_id: "".to_string(),
+             partuuid: None,
+             is_root_device: false,
+@@ -431,6 +434,7 @@ mod tests {
+         VhostUserBlockConfig::try_from(&block_config).unwrap();
+ 
+         let block_config = BlockDeviceConfig {
++            serial: None,
+             drive_id: "".to_string(),
+             partuuid: None,
+             is_root_device: false,
+@@ -449,6 +453,7 @@ mod tests {
+         VhostUserBlockConfig::try_from(&block_config).unwrap_err();
+ 
+         let block_config = BlockDeviceConfig {
++            serial: None,
+             drive_id: "".to_string(),
+             partuuid: None,
+             is_root_device: false,
+diff --git a/src/vmm/src/devices/virtio/block/virtio/device.rs b/src/vmm/src/devices/virtio/block/virtio/device.rs
+index 78c1adde8..3f0714a45 100644
+--- a/src/vmm/src/devices/virtio/block/virtio/device.rs
++++ b/src/vmm/src/devices/virtio/block/virtio/device.rs
+@@ -132,6 +132,22 @@ impl DiskProperties {
+         Ok(())
+     }
+ 
++    pub(super) fn serial_id(
++        serial: &str,
++    ) -> Result<[u8; VIRTIO_BLK_ID_BYTES as usize], VirtioBlockError> {
++        if serial.is_empty()
++            || serial.len() > VIRTIO_BLK_ID_BYTES as usize
++            || !serial
++                .bytes()
++                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
++        {
++            return Err(VirtioBlockError::InvalidSerial);
++        }
++        let mut id = [0; VIRTIO_BLK_ID_BYTES as usize];
++        id[..serial.len()].copy_from_slice(serial.as_bytes());
++        Ok(id)
++    }
++
+     fn build_device_id(disk_file: &File) -> Result<String, VirtioBlockError> {
+         let blk_metadata = disk_file
+             .metadata()
+@@ -301,6 +317,9 @@ unsafe impl ByteValued for ConfigSpace {}
+ pub struct VirtioBlockConfig {
+     /// Unique identifier of the drive.
+     pub drive_id: String,
++    /// Stable guest-visible serial; omitted configurations retain their legacy ID.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub serial: Option<String>,
+     /// Part-UUID. Represents the unique id of the boot partition of this device. It is
+     /// optional and it will be used only if the `is_root_device` field is true.
+     pub partuuid: Option<String>,
+@@ -339,6 +358,7 @@ impl TryFrom<&BlockDeviceConfig> for VirtioBlockConfig {
+         if let (Some(path_on_host), None) = (&value.path_on_host, &value.socket) {
+             Ok(Self {
+                 drive_id: value.drive_id.clone(),
++                serial: value.serial.clone(),
+                 partuuid: value.partuuid.clone(),
+                 is_root_device: value.is_root_device,
+                 cache_type: value.cache_type,
+@@ -361,6 +381,7 @@ impl From<VirtioBlockConfig> for BlockDeviceConfig {
+     fn from(value: VirtioBlockConfig) -> Self {
+         Self {
+             drive_id: value.drive_id,
++            serial: value.serial,
+             partuuid: value.partuuid,
+             is_root_device: value.is_root_device,
+             cache_type: value.cache_type,
+@@ -394,6 +415,7 @@ pub struct VirtioBlock {
+ 
+     // Implementation specific fields.
+     pub id: String,
++    pub serial: Option<String>,
+     pub partuuid: Option<String>,
+     pub cache_type: CacheType,
+     pub root_device: bool,
+@@ -431,11 +453,19 @@ impl VirtioBlock {
+             return Err(VirtioBlockError::DiscardAsyncUnsupported);
+         }
+ 
+-        let disk_properties = DiskProperties::new(
++        let serial_id = config
++            .serial
++            .as_deref()
++            .map(DiskProperties::serial_id)
++            .transpose()?;
++        let mut disk_properties = DiskProperties::new(
+             config.path_on_host,
+             config.is_read_only,
+             config.file_engine_type,
+         )?;
++        if let Some(id) = serial_id {
++            disk_properties.image_id = id;
++        }
+ 
+         let rate_limiter = config
+             .rate_limiter
+@@ -496,6 +526,7 @@ impl VirtioBlock {
+             device_state: DeviceState::Inactive,
+ 
+             id: config.drive_id.clone(),
++            serial: config.serial,
+             partuuid: config.partuuid,
+             cache_type: config.cache_type,
+             root_device: config.is_root_device,
+@@ -512,6 +543,7 @@ impl VirtioBlock {
+     pub fn config(&self) -> VirtioBlockConfig {
+         let rl: RateLimiterConfig = (&self.rate_limiter).into();
+         VirtioBlockConfig {
++            serial: self.serial.clone(),
+             drive_id: self.id.clone(),
+             path_on_host: self.disk.file_path.clone(),
+             is_root_device: self.root_device,
+@@ -709,7 +741,15 @@ impl VirtioBlock {
+ 
+     /// Update the backing file and the config space of the block device.
+     pub fn update_disk_image(&mut self, disk_image_path: String) -> Result<(), VirtioBlockError> {
++        let serial_id = self
++            .serial
++            .as_deref()
++            .map(DiskProperties::serial_id)
++            .transpose()?;
+         self.disk.update(disk_image_path, self.read_only)?;
++        if let Some(id) = serial_id {
++            self.disk.image_id = id;
++        }
+         self.config_space.capacity = self.disk.nsectors.to_le(); // virtio_block_config_space();
+ 
+         // Kick the driver to pick up the changes. (But only if the device is already activated).
+@@ -917,6 +957,7 @@ mod tests {
+     #[test]
+     fn test_from_config() {
+         let block_config = BlockDeviceConfig {
++            serial: None,
+             drive_id: "".to_string(),
+             partuuid: None,
+             is_root_device: false,
+@@ -935,6 +976,7 @@ mod tests {
+         VirtioBlockConfig::try_from(&block_config).unwrap();
+ 
+         let block_config = BlockDeviceConfig {
++            serial: None,
+             drive_id: "".to_string(),
+             partuuid: None,
+             is_root_device: false,
+@@ -953,6 +995,7 @@ mod tests {
+         VirtioBlockConfig::try_from(&block_config).unwrap_err();
+ 
+         let block_config = BlockDeviceConfig {
++            serial: None,
+             drive_id: "".to_string(),
+             partuuid: None,
+             is_root_device: false,
+@@ -1032,6 +1075,7 @@ mod tests {
+         f.as_file().set_len(0x1000).unwrap();
+         let path = f.as_path().to_str().unwrap().to_string();
+         let config = VirtioBlockConfig {
++            serial: None,
+             drive_id: "discard_feature".to_string(),
+             path_on_host: path.clone(),
+             is_root_device: false,
+@@ -1060,6 +1104,7 @@ mod tests {
+         assert_eq!(block.config_space.discard_sector_alignment, 8);
+ 
+         let async_config = VirtioBlockConfig {
++            serial: None,
+             drive_id: "discard_async_unsupported".to_string(),
+             path_on_host: path,
+             is_root_device: false,
+@@ -1080,6 +1125,7 @@ mod tests {
+         let f = TempFile::new().unwrap();
+         f.as_file().set_len(0x1000).unwrap();
+         let read_only_config = VirtioBlockConfig {
++            serial: None,
+             drive_id: "discard_read_only_unsupported".to_string(),
+             path_on_host: f.as_path().to_str().unwrap().to_string(),
+             is_root_device: false,
+@@ -1103,6 +1149,7 @@ mod tests {
+         let f = TempFile::new().unwrap();
+         f.as_file().set_len(0x1000).unwrap();
+         let config = VirtioBlockConfig {
++            serial: None,
+             drive_id: "discard_negotiation".to_string(),
+             path_on_host: f.as_path().to_str().unwrap().to_string(),
+             is_root_device: false,
+diff --git a/src/vmm/src/devices/virtio/block/virtio/mod.rs b/src/vmm/src/devices/virtio/block/virtio/mod.rs
+index df69437f5..06ff2fd32 100644
+--- a/src/vmm/src/devices/virtio/block/virtio/mod.rs
++++ b/src/vmm/src/devices/virtio/block/virtio/mod.rs
+@@ -50,6 +50,8 @@ pub enum VirtioBlockError {
+     GuestMemory(GuestMemoryError),
+     /// The data length is invalid.
+     InvalidDataLength,
++    /// Disk serial must contain 1 to 20 ASCII letters, digits, dots, underscores or hyphens.
++    InvalidSerial,
+     /// The requested operation would cause a seek beyond disk end.
+     InvalidOffset,
+     /// Discard is not supported with the async IO engine.
+diff --git a/src/vmm/src/devices/virtio/block/virtio/persist.rs b/src/vmm/src/devices/virtio/block/virtio/persist.rs
+index 493c487bb..c6c81e4cb 100644
+--- a/src/vmm/src/devices/virtio/block/virtio/persist.rs
++++ b/src/vmm/src/devices/virtio/block/virtio/persist.rs
+@@ -54,6 +54,8 @@ impl From<FileEngineTypeState> for FileEngineType {
+ #[derive(Debug, Clone, Serialize, Deserialize)]
+ pub struct VirtioBlockState {
+     id: String,
++    #[serde(default)]
++    serial: Option<String>,
+     partuuid: Option<String>,
+     cache_type: CacheType,
+     root_device: bool,
+@@ -75,6 +77,7 @@ impl Persist<'_> for VirtioBlock {
+         // Save device state.
+         VirtioBlockState {
+             id: self.id.clone(),
++            serial: self.serial.clone(),
+             partuuid: self.partuuid.clone(),
+             cache_type: self.cache_type,
+             root_device: self.root_device,
+@@ -96,11 +99,19 @@ impl Persist<'_> for VirtioBlock {
+         let rate_limiter = RateLimiter::restore((), &state.rate_limiter_state)
+             .map_err(VirtioBlockError::RateLimiter)?;
+ 
+-        let disk_properties = DiskProperties::new(
++        let serial_id = state
++            .serial
++            .as_deref()
++            .map(DiskProperties::serial_id)
++            .transpose()?;
++        let mut disk_properties = DiskProperties::new(
+             state.disk_path.clone(),
+             is_read_only,
+             state.file_engine_type.into(),
+         )?;
++        if let Some(id) = serial_id {
++            disk_properties.image_id = id;
++        }
+ 
+         let queue_evts = [EventFd::new(libc::EFD_NONBLOCK).map_err(VirtioBlockError::EventFd)?];
+ 
+@@ -136,6 +147,7 @@ impl Persist<'_> for VirtioBlock {
+             device_state: DeviceState::Inactive,
+ 
+             id: state.id.clone(),
++            serial: state.serial.clone(),
+             partuuid: state.partuuid.clone(),
+             cache_type: state.cache_type,
+             root_device: state.root_device,
+@@ -165,6 +177,7 @@ mod tests {
+         f.as_file().set_len(0x1000).unwrap();
+ 
+         let config = VirtioBlockConfig {
++            serial: None,
+             drive_id: "test".to_string(),
+             path_on_host: f.as_path().to_str().unwrap().to_string(),
+             is_root_device: false,
+@@ -202,6 +215,63 @@ mod tests {
+         assert_eq!(FileEngineTypeState::default(), FileEngineTypeState::Sync);
+     }
+ 
++    #[test]
++    fn configured_serial_survives_backing_update_and_restore() {
++        let first = TempFile::new().unwrap();
++        let second = TempFile::new().unwrap();
++        first.as_file().set_len(0x1000).unwrap();
++        second.as_file().set_len(0x1000).unwrap();
++        let serial = "fv-0123456789abcdef";
++        let config = crate::vmm_config::drive::BlockDeviceConfig {
++            drive_id: "data".into(),
++            serial: Some(serial.into()),
++            path_on_host: Some(first.as_path().to_str().unwrap().into()),
++            ..Default::default()
++        };
++        let mut block = VirtioBlock::new(VirtioBlockConfig::try_from(&config).unwrap()).unwrap();
++        let expected = DiskProperties::serial_id(serial).unwrap();
++        assert_eq!(block.disk.image_id, expected);
++        block
++            .update_disk_image(second.as_path().to_str().unwrap().into())
++            .unwrap();
++        assert_eq!(block.disk.image_id, expected);
++        let bytes = bitcode::serialize(&block.save()).unwrap();
++        let state = bitcode::deserialize(&bytes).unwrap();
++        let restored =
++            VirtioBlock::restore(BlockConstructorArgs { mem: default_mem() }, &state).unwrap();
++        assert_eq!(restored.disk.image_id, expected);
++        assert_eq!(restored.config().serial.as_deref(), Some(serial));
++        assert_eq!(restored.disk.file_path, second.as_path().to_str().unwrap());
++    }
++
++    #[test]
++    fn invalid_serial_is_rejected_before_opening_the_backing_file() {
++        for serial in [
++            "",
++            "abcdefghijklmnopqrstu",
++            "slash/name",
++            "white space",
++            "nonascii-\u{00e9}",
++        ] {
++            let config = crate::vmm_config::drive::BlockDeviceConfig {
++                drive_id: "data".into(),
++                serial: Some(serial.into()),
++                path_on_host: Some("/no/such/backing/file".into()),
++                ..Default::default()
++            };
++            let error =
++                VirtioBlock::new(VirtioBlockConfig::try_from(&config).unwrap()).unwrap_err();
++            assert!(
++                matches!(error, VirtioBlockError::InvalidSerial),
++                "{serial:?}: {error}"
++            );
++        }
++        assert_eq!(
++            DiskProperties::serial_id("abcdefghijklmnopqrst").unwrap(),
++            *b"abcdefghijklmnopqrst"
++        );
++    }
++
+     #[test]
+     fn test_persistence() {
+         // We create the backing file here so that it exists for the whole lifetime of the test.
+@@ -209,6 +279,7 @@ mod tests {
+         f.as_file().set_len(0x1000).unwrap();
+ 
+         let config = VirtioBlockConfig {
++            serial: None,
+             drive_id: "test".to_string(),
+             path_on_host: f.as_path().to_str().unwrap().to_string(),
+             is_root_device: false,
+diff --git a/src/vmm/src/devices/virtio/block/virtio/test_utils.rs b/src/vmm/src/devices/virtio/block/virtio/test_utils.rs
+index 43dab818d..207b86019 100644
+--- a/src/vmm/src/devices/virtio/block/virtio/test_utils.rs
++++ b/src/vmm/src/devices/virtio/block/virtio/test_utils.rs
+@@ -38,6 +38,7 @@ pub fn default_block(file_engine_type: FileEngineType) -> VirtioBlock {
+ /// Create a default Block instance using file at the specified path to be used in tests.
+ pub fn default_block_with_path(path: String, file_engine_type: FileEngineType) -> VirtioBlock {
+     let config = VirtioBlockConfig {
++        serial: None,
+         drive_id: "test".to_string(),
+         path_on_host: path,
+         is_root_device: false,
+diff --git a/src/vmm/src/resources.rs b/src/vmm/src/resources.rs
+index 55f784a8d..8a76466ef 100644
+--- a/src/vmm/src/resources.rs
++++ b/src/vmm/src/resources.rs
+@@ -614,6 +614,7 @@ mod tests {
+         let tmp_file = TempFile::new().unwrap();
+         (
+             BlockDeviceConfig {
++                serial: None,
+                 drive_id: "block1".to_string(),
+                 partuuid: Some("0eaa91a0-01".to_string()),
+                 is_root_device: false,
+diff --git a/src/vmm/src/vmm_config/drive.rs b/src/vmm/src/vmm_config/drive.rs
+index 014b69acd..7b077f59d 100644
+--- a/src/vmm/src/vmm_config/drive.rs
++++ b/src/vmm/src/vmm_config/drive.rs
+@@ -36,6 +36,9 @@ pub enum DriveError {
+ pub struct BlockDeviceConfig {
+     /// Unique identifier of the drive.
+     pub drive_id: String,
++    /// Stable guest-visible virtio block serial, independent of the backing inode.
++    #[serde(default, skip_serializing_if = "Option::is_none")]
++    pub serial: Option<String>,
+     /// Part-UUID. Represents the unique id of the boot partition of this device. It is
+     /// optional and it will be used only if the `is_root_device` field is true.
+     pub partuuid: Option<String>,
+@@ -211,6 +214,7 @@ mod tests {
+     impl Clone for BlockDeviceConfig {
+         fn clone(&self) -> Self {
+             BlockDeviceConfig {
++                serial: self.serial.clone(),
+                 drive_id: self.drive_id.clone(),
+                 partuuid: self.partuuid.clone(),
+                 is_root_device: self.is_root_device,
+@@ -241,6 +245,7 @@ mod tests {
+         let dummy_path = dummy_file.as_path().to_str().unwrap().to_string();
+         let dummy_id = String::from("1");
+         let dummy_block_device = BlockDeviceConfig {
++            serial: None,
+             drive_id: dummy_id.clone(),
+             partuuid: None,
+             is_root_device: false,
+@@ -278,6 +283,7 @@ mod tests {
+         let dummy_path = dummy_file.as_path().to_str().unwrap().to_string();
+ 
+         let dummy_block_device = BlockDeviceConfig {
++            serial: None,
+             drive_id: String::from("1"),
+             partuuid: None,
+             is_root_device: true,
+@@ -313,6 +319,7 @@ mod tests {
+         let dummy_path = dummy_file.as_path().to_str().unwrap().to_string();
+ 
+         let dummy_block_device = BlockDeviceConfig {
++            serial: None,
+             drive_id: String::from("1"),
+             partuuid: None,
+             is_root_device: true,
+@@ -345,6 +352,7 @@ mod tests {
+         let dummy_file_1 = TempFile::new().unwrap();
+         let dummy_path_1 = dummy_file_1.as_path().to_str().unwrap().to_string();
+         let root_block_device_1 = BlockDeviceConfig {
++            serial: None,
+             drive_id: String::from("1"),
+             partuuid: None,
+             is_root_device: true,
+@@ -364,6 +372,7 @@ mod tests {
+         let dummy_file_2 = TempFile::new().unwrap();
+         let dummy_path_2 = dummy_file_2.as_path().to_str().unwrap().to_string();
+         let root_block_device_2 = BlockDeviceConfig {
++            serial: None,
+             drive_id: String::from("2"),
+             partuuid: None,
+             is_root_device: true,
+@@ -394,6 +403,7 @@ mod tests {
+         let dummy_file_1 = TempFile::new().unwrap();
+         let dummy_path_1 = dummy_file_1.as_path().to_str().unwrap().to_string();
+         let root_block_device = BlockDeviceConfig {
++            serial: None,
+             drive_id: String::from("1"),
+             partuuid: None,
+             is_root_device: true,
+@@ -413,6 +423,7 @@ mod tests {
+         let dummy_file_2 = TempFile::new().unwrap();
+         let dummy_path_2 = dummy_file_2.as_path().to_str().unwrap().to_string();
+         let dummy_block_dev_2 = BlockDeviceConfig {
++            serial: None,
+             drive_id: String::from("2"),
+             partuuid: None,
+             is_root_device: false,
+@@ -432,6 +443,7 @@ mod tests {
+         let dummy_file_3 = TempFile::new().unwrap();
+         let dummy_path_3 = dummy_file_3.as_path().to_str().unwrap().to_string();
+         let dummy_block_dev_3 = BlockDeviceConfig {
++            serial: None,
+             drive_id: String::from("3"),
+             partuuid: None,
+             is_root_device: false,
+@@ -476,6 +488,7 @@ mod tests {
+         let dummy_file_1 = TempFile::new().unwrap();
+         let dummy_path_1 = dummy_file_1.as_path().to_str().unwrap().to_string();
+         let root_block_device = BlockDeviceConfig {
++            serial: None,
+             drive_id: String::from("1"),
+             partuuid: None,
+             is_root_device: true,
+@@ -495,6 +508,7 @@ mod tests {
+         let dummy_file_2 = TempFile::new().unwrap();
+         let dummy_path_2 = dummy_file_2.as_path().to_str().unwrap().to_string();
+         let dummy_block_dev_2 = BlockDeviceConfig {
++            serial: None,
+             drive_id: String::from("2"),
+             partuuid: None,
+             is_root_device: false,
+@@ -514,6 +528,7 @@ mod tests {
+         let dummy_file_3 = TempFile::new().unwrap();
+         let dummy_path_3 = dummy_file_3.as_path().to_str().unwrap().to_string();
+         let dummy_block_dev_3 = BlockDeviceConfig {
++            serial: None,
+             drive_id: String::from("3"),
+             partuuid: None,
+             is_root_device: false,
+@@ -559,6 +574,7 @@ mod tests {
+         let dummy_file_1 = TempFile::new().unwrap();
+         let dummy_path_1 = dummy_file_1.as_path().to_str().unwrap().to_string();
+         let root_block_device = BlockDeviceConfig {
++            serial: None,
+             drive_id: String::from("1"),
+             partuuid: None,
+             is_root_device: true,
+@@ -578,6 +594,7 @@ mod tests {
+         let dummy_file_2 = TempFile::new().unwrap();
+         let dummy_path_2 = dummy_file_2.as_path().to_str().unwrap().to_string();
+         let mut dummy_block_device_2 = BlockDeviceConfig {
++            serial: None,
+             drive_id: String::from("2"),
+             partuuid: None,
+             is_root_device: false,
+@@ -653,6 +670,7 @@ mod tests {
+         );
+ 
+         let root_block_device = BlockDeviceConfig {
++            serial: None,
+             drive_id: String::from("1"),
+             partuuid: None,
+             is_root_device: true,
+@@ -672,6 +690,7 @@ mod tests {
+         let mut root_block_device_old = root_block_device;
+         root_block_device_old.is_root_device = false;
+         let root_block_device_new = BlockDeviceConfig {
++            serial: None,
+             drive_id: String::from("2"),
+             partuuid: Some("0eaa91a0-01".to_string()),
+             is_root_device: true,
+@@ -701,6 +720,7 @@ mod tests {
+         let dummy_file = TempFile::new().unwrap();
+ 
+         let dummy_block_device = BlockDeviceConfig {
++            serial: None,
+             drive_id: String::from("1"),
+             partuuid: None,
+             is_root_device: true,
+@@ -739,6 +759,7 @@ mod tests {
+ 
+         let block_id = "test_id";
+         let config = BlockDeviceConfig {
++            serial: None,
+             drive_id: block_id.to_string(),
+             partuuid: None,
+             is_root_device: true,
+diff --git a/src/vmm/tests/integration_tests.rs b/src/vmm/tests/integration_tests.rs
+index 8aa0f469a..55dd47ef1 100644
+--- a/src/vmm/tests/integration_tests.rs
++++ b/src/vmm/tests/integration_tests.rs
+@@ -494,6 +494,7 @@ fn test_preboot_load_snap_disallowed_after_boot_resources() {
+     verify_load_snap_disallowed_after_boot_resources(req, "ConfigureBootSource");
+ 
+     let config = BlockDeviceConfig {
++        serial: None,
+         drive_id: String::new(),
+         partuuid: None,
+         is_root_device: false,

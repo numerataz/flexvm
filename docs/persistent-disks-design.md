@@ -145,3 +145,19 @@ retirement, transfer and destination grant. Verify that every outcome preserves
 exactly one writer and the matching RAM/disk generation, including after restart.
 Run software tests with host virtualization unavailable, native tests with KVM,
 and request Agy review before merging implementation changes.
+
+## Current foundation
+
+`firecracker/0009-stable-block-serial.patch` adds an optional 1–20 byte ASCII
+virtio block serial. Configured serials survive replacing the host backing inode
+and device-state serialization; absent serials retain Firecracker's legacy
+identity behavior. The API rejects serials on vhost-user drives. The existing
+FlexVM block-device restore rejection stays in place.
+
+`scripts/compat/native-block-boot.py` cold-boots a small native Linux guest with
+one private raw disk. It verifies seed reads, an explicitly configured serial,
+guest writes, a successful host backing-file flush with Writeback caching, and
+actual OS poweroff. CI boots separate backing files with the same serial.
+This verifies the device foundation; it does not expose managed volumes or
+verify checkpoint consistency, crash recovery or disk migration. Those remain
+required by #1329 and the stages above.

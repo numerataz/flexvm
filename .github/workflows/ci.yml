@@ -541,13 +541,16 @@ jobs:
           ./scripts/build-firecracker.sh
           # For this runner's arch (x86_64, or aarch64-unknown-linux-musl on the arm runner).
           file "$STATE/artifacts/firecracker" | grep -q "$([ "$(uname -m)" = aarch64 ] && echo 'ARM aarch64' || echo 'x86-64')"
-      - name: Firecracker ACPI power-off unit tests
+      - name: Firecracker power-off, stable disk serial and confinement tests
         if: runner.arch == 'X64' && steps.keys.outputs.fc-build == 'true' && steps.fc-cache.outputs.cache-hit != 'true'
         run: |
           export CFLAGS_x86_64_unknown_linux_musl="-idirafter $PWD/build/musl-kheaders"
           cd build/firecracker-src
           cargo test --locked --target x86_64-unknown-linux-musl -p vmm --lib acpi_power
           cargo test --locked --target x86_64-unknown-linux-musl -p vmm --lib acpi::x86_64::tests
+          cargo test --locked --release --target x86_64-unknown-linux-musl -p vmm --lib configured_serial_survives_backing_update_and_restore
+          cargo test --locked --release --target x86_64-unknown-linux-musl -p vmm --lib invalid_serial_is_rejected_before_opening_the_backing_file
+          cargo test --locked --release --target x86_64-unknown-linux-musl -p vmm --lib persist::tests::test_check_
 
       - name: Save Firecracker
         if: steps.keys.outputs.fc-build == 'true' && steps.fc-cache.outputs.cache-hit != 'true'
@@ -598,6 +601,25 @@ jobs:
             ${{ env.STATE }}/artifacts/kernel-sdk.tar.gz.sha256
             ${{ env.STATE }}/artifacts/base.squashfs
           key: ${{ steps.dl-cache.outputs.cache-primary-key }}
+
+      - name: Native cold block boot and host flush
+        if: env.KVM == 'true' && (matrix.shard == 'pr 1/4' || matrix.shard == 'heavy')
+        run: |
+          sudo apt-get install -y -q --no-install-recommends strace
+          for boot in first second; do
+            sudo python3 scripts/compat/native-block-boot.py --firecracker "$STATE/artifacts/firecracker" --kernel "$STATE/artifacts/vmlinux" --serial fv0123456789abcdef01 --output "$RUNNER_TEMP/native-block-$boot"
+          done
+      - name: Upload native block evidence
+        if: always() && env.KVM == 'true' && (matrix.shard == 'pr 1/4' || matrix.shard == 'heavy')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-block-cold-boot-${{ runner.arch }}
+          path: |
+            ${{ runner.temp }}/native-block-*/report.json
+            ${{ runner.temp }}/native-block-*/console.log
+            ${{ runner.temp }}/native-block-*/compile.log
+            ${{ runner.temp }}/native-block-*/io.strace.*
+          if-no-files-found: error
 
       # The test image (scripts/test-image.py: the base root filesystem as an OCI layout), which
       # e2e.py pulls its templates from; it makes it when the cache has none. flexvm embeds flexvm-init.
