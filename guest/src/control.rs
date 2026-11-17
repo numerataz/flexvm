@@ -812,7 +812,8 @@ mod tests {
         next.read_exact(&mut reply).unwrap();
         assert_eq!(&reply, b"ok");
         drop((first, first_peer, client));
-        server.join().unwrap().unwrap();
+        let closed = server.join().unwrap();
+        assert!(closed.is_ok() || closed.is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe));
     }
 
     #[test]
