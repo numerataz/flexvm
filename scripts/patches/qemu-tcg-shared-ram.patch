@@ -6,7 +6,7 @@
  system_ss.add(when: 'CONFIG_ISA_TESTDEV', if_true: files('pc-testdev.c'))
 --- /dev/null
 +++ b/hw/misc/flexvm-shared-ram.c
-@@ -0,0 +1,87 @@
+@@ -0,0 +1,93 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +#include "qemu/osdep.h"
 +#include "qapi/error.h"
@@ -25,6 +25,7 @@
 +    HostMemoryBackend *backend;
 +    MemoryRegion alias;
 +    Error *migration_blocker;
++    uint64_t address;
 +};
 +
 +static void flexvm_shared_ram_realize(DeviceState *dev, Error **errp)
@@ -34,6 +35,11 @@
 +
 +    if (!s->backend || host_memory_backend_is_mapped(s->backend)) {
 +        error_setg(errp, "flexvm-shared-ram needs an unused memdev");
++        return;
++    }
++    if (s->address < 4096 || s->address > UINT64_MAX - 4096 ||
++        s->address % 4096) {
++        error_setg(errp, "flexvm-shared-ram needs a page-aligned RAM address");
 +        return;
 +    }
 +    memory = host_memory_backend_get_memory(s->backend);
@@ -48,10 +54,9 @@
 +        return;
 +    }
 +
-+    /* The x86 run fixture starts in real mode at guest address 0x1000. */
 +    memory_region_init_alias(&s->alias, OBJECT(dev), "flexvm.shared-ram",
 +                             memory, 0, 4096);
-+    memory_region_add_subregion_overlap(get_system_memory(), 0x1000,
++    memory_region_add_subregion_overlap(get_system_memory(), s->address,
 +                                        &s->alias, 1);
 +    host_memory_backend_set_mapped(s->backend, true);
 +}
@@ -67,6 +72,7 @@
 +}
 +
 +static const Property flexvm_shared_ram_properties[] = {
++    DEFINE_PROP_UINT64("addr", FlexvmSharedRam, address, 0x1000),
 +    DEFINE_PROP_LINK("memdev", FlexvmSharedRam, backend, TYPE_MEMORY_BACKEND,
 +                     HostMemoryBackend *),
 +};

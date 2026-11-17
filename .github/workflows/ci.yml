@@ -374,6 +374,10 @@ jobs:
           cat "$RUNNER_TEMP/parent-kvm-run/report.json"
           sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
             --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-single-page" --ram-pages 1
+          cat "$RUNNER_TEMP/parent-kvm-single-page/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
             --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-reject-close" --reject-close
           cat "$RUNNER_TEMP/parent-kvm-reject-close/report.json"
           if sudo python3 -c 'import fcntl, os; fd = os.open("/dev/kvm", os.O_RDWR); assert fcntl.ioctl(fd, 0xAE00) == 12; fcntl.ioctl(fd, 0xAE01, 0)' 2>/dev/null; then
@@ -404,6 +408,9 @@ jobs:
             ${{ runner.temp }}/parent-kvm-run/*.json
             ${{ runner.temp }}/parent-kvm-run/*.log
             ${{ runner.temp }}/parent-kvm-run/*.strace
+            ${{ runner.temp }}/parent-kvm-single-page/*.json
+            ${{ runner.temp }}/parent-kvm-single-page/*.log
+            ${{ runner.temp }}/parent-kvm-single-page/*.strace
             ${{ runner.temp }}/parent-kvm-reject-close/*.json
             ${{ runner.temp }}/parent-kvm-reject-close/*.log
             ${{ runner.temp }}/parent-kvm-reject-close/*.strace

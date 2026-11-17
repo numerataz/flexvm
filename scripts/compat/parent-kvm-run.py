@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a TCG or hardware KVM worker against a pinned page in shared outer RAM."""
+"""Run a parent worker against a pinned KVM memory slot in shared outer RAM."""
 import argparse
 from contextlib import ExitStack
 import errno
@@ -72,24 +72,26 @@ class RunChannel:
 
 
 class TcgChild:
-    def __init__(self, qemu, output, socket_path, outer_ram, offset):
+    def __init__(self, qemu, output, socket_path, outer_ram, offsets):
         self.process = None
         self.channel = None
         self.memory = outer_ram
-        self.offset = offset
+        self.offsets = offsets
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener, (output / "child.log").open("wb") as log:
                 listener.bind(str(socket_path))
                 listener.listen(1)
                 listener.settimeout(3)
-                slot = (f"memory-backend-file,id=slot,mem-path=/proc/self/fd/{outer_ram},"
-                        f"share=on,size=4K,offset={offset}")
                 command = [
                     qemu, *QEMU_OPTIONS, "-machine", "pc,accel=tcg", "-m", "16", "-serial", "none",
-                    "-object", slot, "-device", "flexvm-shared-ram,memdev=slot",
                     "-bios", output / "reset.rom", "-S", "-chardev", f"socket,id=port,path={socket_path}",
                     "-device", "isa-debugcon,iobase=0x30,chardev=port,run-control=on",
                 ]
+                for index, offset in enumerate(offsets):
+                    backing = (f"memory-backend-file,id=slot{index},mem-path=/proc/self/fd/{outer_ram},"
+                               f"share=on,size=4K,offset={offset}")
+                    command.extend(["-object", backing, "-device",
+                                    f"flexvm-shared-ram,memdev=slot{index},addr={(index + 1) * PAGE_SIZE}"])
                 self.process = subprocess.Popen(command, pass_fds=(outer_ram,), stdout=log, stderr=log)
                 connection, _ = listener.accept()
                 self.channel = RunChannel(connection)
@@ -98,7 +100,7 @@ class TcgChild:
             raise
 
     def run(self):
-        if self.channel.exits and os.pread(self.memory, 1, self.offset + 0x22) != b"\0":
+        if self.channel.exits and os.pread(self.memory, 1, self.offsets[-1] + 0x22) != b"\0":
             raise RuntimeError("child wrote its second result while stopped")
         return self.channel.run()
 
@@ -111,15 +113,15 @@ class TcgChild:
 
 
 class KvmChild:
-    def __init__(self, output, outer_ram, offset):
+    def __init__(self, output, outer_ram, offsets):
         self.process = None
         self.channel = None
-        self.offset = offset
+        self.offsets = offsets
         connection, worker = socket.socketpair(type=socket.SOCK_SEQPACKET)
         try:
             with worker, (output / "child.log").open("wb") as log:
                 control = worker.fileno()
-                command = [output / "native-worker", str(control), str(outer_ram), str(offset)]
+                command = [output / "native-worker", str(control), str(outer_ram), *map(str, offsets)]
                 self.process = subprocess.Popen(command, pass_fds=(control, outer_ram), stdout=log, stderr=log)
             self.channel = RunChannel(connection)
         except BaseException:
@@ -159,7 +161,7 @@ def doorbell_peer(server, memory, requests, replies):
         raise
 
 
-def exercise(qemu, kernel, output, reject_close, parent_engine):
+def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages):
     reset = bytearray(64 << 10)
     # The reset vector far-jumps to 0000:1000, the client's guest RAM.
     reset[0xfff0:0xfff5] = bytes.fromhex("ea00100000")
@@ -179,7 +181,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine):
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 3)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 4)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
         os.ftruncate(outer_ram, OUTER_RAM_SIZE)
@@ -215,21 +217,24 @@ def exercise(qemu, kernel, output, reject_close, parent_engine):
             pending, complete, opcode, _, length = struct.unpack_from("<IIIII", mapping, 8)
             if pending != complete + 1 or len(observed) >= len(expected) or opcode != expected[len(observed)]:
                 raise RuntimeError(f"unexpected doorbell request {pending}, command {opcode}")
-            offset, = struct.unpack_from("<Q", mapping, 32)
+            slots = struct.unpack_from("<QQ", mapping, 32)
             status = 0
             if opcode == RUN:
-                if length != PAGE_SIZE or offset % PAGE_SIZE or not MIB <= offset <= OUTER_RAM_SIZE - PAGE_SIZE:
-                    raise RuntimeError("registered page is outside the outer VM RAM")
+                offsets = slots[:ram_pages]
+                if length != ram_pages * PAGE_SIZE or any(slots[ram_pages:]) or len(set(offsets)) != ram_pages:
+                    raise RuntimeError("unexpected physical page list for the registered slot")
+                if any(offset % PAGE_SIZE or not MIB <= offset <= OUTER_RAM_SIZE - PAGE_SIZE for offset in offsets):
+                    raise RuntimeError("registered pages are outside the outer VM RAM")
                 if child is None:
                     if parent_engine == "kvm":
-                        child = KvmChild(output, outer_ram, offset)
+                        child = KvmChild(output, outer_ram, offsets)
                     else:
-                        child = TcgChild(qemu, output, control / "child.sock", outer_ram, offset)
+                        child = TcgChild(qemu, output, control / "child.sock", outer_ram, offsets)
                     cleanup.callback(child.close)
-                if child.offset != offset:
-                    raise RuntimeError("the registered page changed between runs")
+                if child.offsets != offsets:
+                    raise RuntimeError("the registered pages changed between runs")
                 struct.pack_into("<I", mapping, 28, child.run())
-            elif length or offset:
+            elif length or any(slots):
                 raise RuntimeError(f"unexpected memory argument for command {opcode}")
             elif opcode == CLOSE_CPU:
                 # The guest can unpin its page as soon as it sees this reply.
@@ -248,7 +253,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine):
                 or "PASS /dev/kvm returned two port I/O exits" not in guest
                 or "PASS parent KVM guest shutdown" not in guest):
             raise RuntimeError(f"parent execution proof failed; commands={observed}, see outer.log")
-        retained = "retaining a RAM page until the enclosing VM exits" in guest
+        retained = "retaining registered RAM until the enclosing VM exits" in guest
         if retained != reject_close:
             raise RuntimeError("unexpected guest RAM pin disposition")
         if reject_close and (child.process is None or child.process.poll() is not None):
@@ -257,7 +262,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine):
         "guest_path": "/dev/kvm", "guest_vmx": False, "guest_svm": False,
         "parent_accelerator": parent_engine, "parent_commands": observed, "transport": "eventfd and MSI-X",
         "io_values": child.channel.exits, "child_memory_write_visible": True, "same_child_worker": True,
-        "page_alias": True, "mapped_page_bytes": PAGE_SIZE,
+        "page_alias": True, "mapped_page_bytes": ram_pages * PAGE_SIZE, "outer_page_offsets": child.offsets,
         "worker_stopped_before_close_reply": not reject_close, "page_retained_on_rejected_close": retained,
         "client_run_ns": client_timings(guest), "worker_run_ms": child.channel.timings, "worker_control": "direct socket",
     }
@@ -278,6 +283,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--native-oracle", action="store_true")
     parser.add_argument("--parent-engine", choices=("tcg", "kvm"), default="tcg")
+    parser.add_argument("--ram-pages", type=int, choices=(1, 2), default=2)
     parser.add_argument("--reject-close", action="store_true", help="verify page retention when the parent refuses close")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -286,7 +292,7 @@ def main():
     if os.geteuid() != 0 or platform.machine() != "x86_64":
         parser.error("run as root on x86_64")
     if args.worker:
-        print(json.dumps(exercise(qemu, kernel, output, args.reject_close, args.parent_engine)))
+        print(json.dumps(exercise(qemu, kernel, output, args.reject_close, args.parent_engine, args.ram_pages)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -311,12 +317,15 @@ def main():
                            20, output / f"{source}.log")
         report.update(client_sha256=HELPERS["digest"](client), module_sha256=HELPERS["digest"](module / "flexvm-pvkvm.ko"))
         if args.native_oracle:
-            HELPERS["run"]([client], 8, output / "native-kvm.log")
+            HELPERS["run"]([client, str(args.ram_pages)], 8, output / "native-kvm.log")
             report["same_client_passed_native_kvm"] = True
             report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
-        image = HELPERS["initramfs"](init.read_bytes(), files={
+        files = {
             "kvm-run": client.read_bytes(), "flexvm-pvkvm.ko": (module / "flexvm-pvkvm.ko").read_bytes(),
-        })
+        }
+        if args.ram_pages == 1:
+            files["single-page"] = b""
+        image = HELPERS["initramfs"](init.read_bytes(), files=files)
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
         worker = output / "worker.log"
@@ -335,6 +344,7 @@ def main():
                             "strace", "-f", "-e", "trace=file", "-o", trace, sys.executable,
                             Path(__file__).resolve(), "--worker", "--qemu", qemu, "--kernel", kernel,
                             "--output", output, "--parent-engine", args.parent_engine,
+                            "--ram-pages", str(args.ram_pages),
                             *(["--reject-close"] if args.reject_close else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}

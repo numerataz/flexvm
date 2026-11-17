@@ -8,10 +8,11 @@ client opens `/dev/kvm`, creates a VM and vCPU, maps `kvm_run`, and gets a port
 I/O exit. A second `KVM_RUN` resumes the same child. The child reads a byte
 the client changed while it was paused and reports it on the next I/O exit.
 
-The module supports one VM, one vCPU and one pinned 4 KiB RAM page. The
-child maps that page directly from the outer VM's memory file. The parent
-stops the child before acknowledging release of the page. If it cannot
-confirm the release, the page stays pinned until the outer VM exits.
+The module supports one VM, one vCPU and one pinned slot of one or two
+4 KiB pages. The child maps each page directly from its physical offset in
+the outer VM's memory file. The parent stops the child before acknowledging
+release of the slot. If it cannot confirm release, the pages stay pinned
+until the outer VM exits.
 The worker supports byte output to one port with a fixed entry point.
 Full register state, memory invalidation, interrupts, and checkpointing
 remain part of [issue #1501](https://github.com/numerataz/flexvm/issues/1501).
@@ -34,3 +35,4 @@ MSI-X interrupt to receive the parent's reply.
 With `--parent-engine kvm`, the parent runs the child vCPU through the host
 KVM device. The guest and client use the same interface and shared page.
 The default TCG run masks the host KVM device and exercises software execution.
+Add `--ram-pages 1` to run the same client with a single-page slot.

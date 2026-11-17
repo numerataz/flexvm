@@ -3,7 +3,7 @@
 #define FLEXVM_PVKVM_MAILBOX_H
 
 #define PVKVM_MAGIC        0x4d564b46
-#define PVKVM_VERSION      3
+#define PVKVM_VERSION      4
 #define PVKVM_MAGIC_AT     0
 #define PVKVM_VERSION_AT   4
 #define PVKVM_REQUEST_AT   8
@@ -14,6 +14,7 @@
 #define PVKVM_IO_VALUE_AT  28
 #define PVKVM_RAM_ADDRESS_AT 32
 #define PVKVM_MEMORY_LEN   4096
+#define PVKVM_MAX_PAGES    2
 #define PVKVM_GUEST_START  4096
 #define PVKVM_IO_PORT      0x30
 #define PVKVM_IVPOSITION_AT 8
