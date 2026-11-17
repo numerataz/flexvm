@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a TCG worker against a pinned KVM client page in shared outer RAM."""
+"""Run a TCG or hardware KVM worker against a pinned page in shared outer RAM."""
 import argparse
 from contextlib import ExitStack
 import errno
@@ -74,7 +74,7 @@ class ExitMonitor(HELPERS["QMP"]):
         self.stops = 0
 
 
-class Child:
+class TcgChild:
     def __init__(self, qemu, output, socket_path, outer_ram, offset):
         self.process = None
         self.monitor = None
@@ -128,6 +128,45 @@ class Child:
                 self.process = None
 
 
+class KvmChild:
+    def __init__(self, output, outer_ram, offset):
+        self.process = None
+        self.offset = offset
+        self.exits = []
+        self.timings = []
+        self.connection, worker = socket.socketpair(type=socket.SOCK_SEQPACKET)
+        self.connection.settimeout(3)
+        try:
+            with worker, (output / "child.log").open("wb") as log:
+                control = worker.fileno()
+                command = [output / "native-worker", str(control), str(outer_ram), str(offset)]
+                self.process = subprocess.Popen(command, pass_fds=(control, outer_ram), stdout=log, stderr=log)
+            if self.connection.recv(2) != b"R":
+                raise RuntimeError("native parent worker did not report readiness")
+        except BaseException:
+            self.close()
+            raise
+
+    def run(self):
+        started = time.monotonic()
+        self.connection.sendall(b"R")
+        output = self.connection.recv(2)
+        if len(output) != 1:
+            raise RuntimeError("native parent worker did not return one I/O byte")
+        self.exits.append(output[0])
+        self.timings.append(round((time.monotonic() - started) * 1000, 3))
+        return output[0]
+
+    def close(self):
+        self.connection.close()
+        if self.process is not None:
+            try:
+                self.process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                stop_process(self.process)
+            self.process = None
+
+
 def doorbell_peer(server, memory, requests, replies):
     peer, _ = server.accept()
     try:
@@ -143,7 +182,7 @@ def doorbell_peer(server, memory, requests, replies):
         raise
 
 
-def exercise(qemu, kernel, output, reject_close):
+def exercise(qemu, kernel, output, reject_close, parent_engine):
     reset = bytearray(64 << 10)
     # The reset vector far-jumps to 0000:1000, the client's guest RAM.
     reset[0xfff0:0xfff5] = bytes.fromhex("ea00100000")
@@ -205,7 +244,10 @@ def exercise(qemu, kernel, output, reject_close):
                 if length != PAGE_SIZE or offset % PAGE_SIZE or not MIB <= offset <= OUTER_RAM_SIZE - PAGE_SIZE:
                     raise RuntimeError("registered page is outside the outer VM RAM")
                 if child is None:
-                    child = Child(qemu, output, control / "child.sock", outer_ram, offset)
+                    if parent_engine == "kvm":
+                        child = KvmChild(output, outer_ram, offset)
+                    else:
+                        child = TcgChild(qemu, output, control / "child.sock", outer_ram, offset)
                     cleanup.callback(child.close)
                 if child.offset != offset:
                     raise RuntimeError("the registered page changed between runs")
@@ -234,7 +276,7 @@ def exercise(qemu, kernel, output, reject_close):
             raise RuntimeError("rejected close did not retain the child until enclosing cleanup")
     return {
         "guest_path": "/dev/kvm", "guest_vmx": False, "guest_svm": False,
-        "parent_accelerator": "tcg", "parent_commands": observed, "transport": "eventfd and MSI-X",
+        "parent_accelerator": parent_engine, "parent_commands": observed, "transport": "eventfd and MSI-X",
         "io_values": child.exits, "child_memory_write_visible": True, "same_child_worker": True,
         "page_alias": True, "mapped_page_bytes": PAGE_SIZE,
         "worker_stopped_before_close_reply": not reject_close, "page_retained_on_rejected_close": retained,
@@ -256,6 +298,7 @@ def main():
     parser.add_argument("--kernel-build", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--native-oracle", action="store_true")
+    parser.add_argument("--parent-engine", choices=("tcg", "kvm"), default="tcg")
     parser.add_argument("--reject-close", action="store_true", help="verify page retention when the parent refuses close")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -264,7 +307,7 @@ def main():
     if os.geteuid() != 0 or platform.machine() != "x86_64":
         parser.error("run as root on x86_64")
     if args.worker:
-        print(json.dumps(exercise(qemu, kernel, output, args.reject_close)))
+        print(json.dumps(exercise(qemu, kernel, output, args.reject_close, args.parent_engine)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -281,7 +324,10 @@ def main():
         HELPERS["run"](["make", "-j2", "-C", args.kernel_build.resolve(strict=True), f"M={module}", "modules"],
                        120, output / "module-build.log")
         client, init = output / "client", output / "init"
-        for source, binary in (("kvm-run.c", client), ("init.c", init)):
+        programs = [("kvm-run.c", client), ("init.c", init)]
+        if args.parent_engine == "kvm":
+            programs.append(("native-worker.c", output / "native-worker"))
+        for source, binary in programs:
             HELPERS["run"](["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static", SOURCES / source, "-o", binary],
                            20, output / f"{source}.log")
         report.update(client_sha256=HELPERS["digest"](client), module_sha256=HELPERS["digest"](module / "flexvm-pvkvm.ko"))
@@ -297,22 +343,27 @@ def main():
         worker = output / "worker.log"
         setup = """
             for path in /dev/kvm /dev/vhost-vsock /dev/vhost-net; do
+                if [ "$path" = /dev/kvm ] && [ "$2" = kvm ]; then continue; fi
                 if [ -e "$path" ]; then mount --bind "$1" "$path"; fi
             done
-            shift
+            shift 2
             exec "$@"
         """
         with tempfile.TemporaryDirectory(prefix="flexvm-parent-kvm-") as scratch:
             mask = Path(scratch) / "mask"
             mask.touch(mode=0o600)
-            HELPERS["run"](["unshare", "--mount", "--propagation", "private", "sh", "-ec", setup, "sh", mask,
+            HELPERS["run"](["unshare", "--mount", "--propagation", "private", "sh", "-ec", setup, "sh", mask, args.parent_engine,
                             "strace", "-f", "-e", "trace=file", "-o", trace, sys.executable,
                             Path(__file__).resolve(), "--worker", "--qemu", qemu, "--kernel", kernel,
-                            "--output", output, *(["--reject-close"] if args.reject_close else [])], 75, worker)
+                            "--output", output, "--parent-engine", args.parent_engine,
+                            *(["--reject-close"] if args.reject_close else [])], 75, worker)
         with trace.open(errors="replace") as lines:
-            if any(f'"{device}"' in line for line in lines for device in DEVICES):
-                raise RuntimeError("host virtualization device access under the mask")
-        report.update(json.loads(worker.read_text()), status="passed", host_device_access=False)
+            devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}
+        expected = {"/dev/kvm"} if args.parent_engine == "kvm" else set()
+        if devices != expected:
+            raise RuntimeError(f"unexpected virtualization device access: {sorted(devices)}")
+        report.update(json.loads(worker.read_text()), status="passed", host_device_access=bool(devices),
+                      host_devices=sorted(devices))
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         report.update(status="failed", error=str(error))
     report_path.write_text(json.dumps(report, indent=2) + "\n")
