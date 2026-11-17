@@ -10,6 +10,8 @@ import re
 import runpy
 import shutil
 import signal
+import shlex
+import stat
 import subprocess
 import sys
 import tempfile
@@ -22,6 +24,28 @@ ENGINE_GONE = runpy.run_path(str(ROOT / 'software-modules.py'))['engine_gone']
 BASELINE = runpy.run_path(str(ROOT.parent / 'compat.py'))['BASELINE']
 IMAGE = 'public.ecr.aws/docker/library/ubuntu@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8'
 NAME = 'workload-test'
+
+
+def seed_files(values):
+    """Bound local regular-file inputs before reading them or starting a VM."""
+    files, destinations, total = [], set(), 0
+    for source, destination in values:
+        source = Path(source).resolve(strict=True)
+        info = source.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 256 * 1024 * 1024:
+            raise ValueError(f'seed must be a regular file of at most 256 MiB: {source}')
+        path = Path(destination)
+        if not destination.startswith('/nested-input/') or '..' in path.parts or destination.endswith('/'):
+            raise ValueError('seed destination must be a file beneath /nested-input/')
+        destination = str(path)
+        if destination in destinations:
+            raise ValueError(f'duplicate seed destination: {destination}')
+        destinations.add(destination)
+        total += info.st_size
+        if total > 512 * 1024 * 1024:
+            raise ValueError('combined seed inputs exceed 512 MiB')
+        files.append((source, destination))
+    return files
 
 
 def exercise(args):
@@ -114,6 +138,17 @@ def exercise(args):
         for name in ('guest-probe', 'state-probe'):
             cli('exec', '-i', NAME, '/bin/sh', '-ec', f'cat >/{name}.tmp; chmod 755 /{name}.tmp; mv /{name}.tmp /{name}',
                 input=(args.output / name).read_bytes())
+        evidence['seed_files'] = []
+        for source, destination in seed_files(args.seed):
+            quoted, parent = shlex.quote(destination), shlex.quote(str(Path(destination).parent))
+            cli('exec', '-i', NAME, '/bin/sh', '-ec',
+                f'mkdir -p {parent}; cat >{quoted}.tmp; chmod 755 {quoted}.tmp; mv {quoted}.tmp {quoted}',
+                input=source.read_bytes())
+            expected = HELPERS['digest'](source)
+            actual = cli('exec', NAME, 'sha256sum', destination).split()[0]
+            if actual != expected:
+                raise RuntimeError(f'seed digest changed: {destination}')
+            evidence['seed_files'].append({'destination': destination, 'sha256': expected})
         if args.boot == 'systemd':
             cli('exec', NAME, 'systemd-run', '--unit=flexvm-state-probe', '--collect', '/state-probe')
         elif args.boot == 'openrc':
@@ -246,11 +281,17 @@ def main():
     parser.add_argument('--timeout', type=int, default=1800)
     parser.add_argument('--poweroff-timeout', type=int, default=30, help='bounded OS shutdown wait, within the overall test deadline')
     parser.add_argument('--require', action='append', default=[])
+    parser.add_argument('--seed', nargs=2, action='append', default=[], metavar=('SOURCE', 'DEST'),
+                        help='stream a regular input file beneath /nested-input/ before preparation')
     parser.add_argument('--worker', action='store_true', help=argparse.SUPPRESS)
     parser.add_argument('--state', type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     args.bin, args.kernel, args.workload = (path.resolve(strict=True) for path in (args.bin, args.kernel, args.workload))
     args.output = args.output.resolve()
+    try:
+        args.seed = seed_files(args.seed)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
     if args.worker:
         exercise(args)
         return 0
@@ -294,6 +335,8 @@ def main():
                        sys.executable, str(Path(__file__).resolve()), '--worker', '--bin', str(args.bin), '--kernel', str(args.kernel),
                        '--workload', str(args.workload), '--image', args.image, '--mem', str(args.mem), '--vcpus', str(args.vcpus), '--output', str(args.output),
                        '--state', state, '--timeout', str(args.timeout), '--boot', args.boot, '--poweroff-timeout', str(args.poweroff_timeout)]
+            for source, destination in args.seed:
+                command.extend(['--seed', str(source), destination])
             for required in args.require:
                 command.extend(['--require', required])
             try:

@@ -388,7 +388,7 @@ jobs:
       fail-fast: false
       matrix:
         arch: [x86_64, aarch64]
-        workload: [podman, namespace-sandboxes, containerd, rootless-docker, rootless-containerd, rootless-podman, nspawn, lxc, k3s, kind, incus]
+        workload: [podman, namespace-sandboxes, containerd, rootless-docker, rootless-containerd, rootless-podman, nspawn, lxc, k3s, kind, incus, nested-flexvm]
         include:
           - { arch: x86_64, runner: ubuntu-24.04, qemu: qemu-system-x86 }
           - { arch: aarch64, runner: ubuntu-24.04-arm, qemu: qemu-system-arm }
@@ -432,17 +432,25 @@ jobs:
       - name: Build FlexVM
         run: cargo build --release -p flexvm
       - name: Prepare the systemd image for distro workloads
-        if: startsWith(matrix.workload, 'rootless-') || matrix.workload == 'nspawn' || matrix.workload == 'lxc' || matrix.workload == 'k3s' || matrix.workload == 'kind' || matrix.workload == 'incus'
+        if: startsWith(matrix.workload, 'rootless-') || matrix.workload == 'nspawn' || matrix.workload == 'lxc' || matrix.workload == 'k3s' || matrix.workload == 'kind' || matrix.workload == 'incus' || matrix.workload == 'nested-flexvm'
         run: |
           scripts/fetch.sh --state "$RUNNER_TEMP/software-state"
           sudo python3 scripts/test-image.py --state "$RUNNER_TEMP/software-state" "$RUNNER_TEMP/software-distro-image"
+      - name: Prepare the portable nested FlexVM CLI and child image
+        if: matrix.workload == 'nested-flexvm'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends musl-tools
+          rustup target add "${{ matrix.arch }}-unknown-linux-musl"
+          cargo build --locked --release -p flexvm --target "${{ matrix.arch }}-unknown-linux-musl"
+          python3 scripts/compat/nested-flexvm-inputs.py --output "$RUNNER_TEMP/nested-inputs"
       - name: Guest workload and fresh-owner software restoration
         run: |
           workload_args=()
           memory_limit=6G
           cpu_quota=200%
           workload_timeout=1800
-          if [[ "${{ matrix.workload }}" == rootless-* || "${{ matrix.workload }}" == nspawn || "${{ matrix.workload }}" == lxc || "${{ matrix.workload }}" == k3s || "${{ matrix.workload }}" == kind || "${{ matrix.workload }}" == incus ]]; then
+          if [[ "${{ matrix.workload }}" == rootless-* || "${{ matrix.workload }}" == nspawn || "${{ matrix.workload }}" == lxc || "${{ matrix.workload }}" == k3s || "${{ matrix.workload }}" == kind || "${{ matrix.workload }}" == incus || "${{ matrix.workload }}" == nested-flexvm ]]; then
             workload_args=(--boot systemd --image "$RUNNER_TEMP/software-distro-image")
           fi
           if [[ "${{ matrix.workload }}" == k3s || "${{ matrix.workload }}" == kind ]]; then
@@ -457,6 +465,14 @@ jobs:
           fi
           if [[ "${{ matrix.workload }}" == incus ]]; then
             workload_args+=(--mem 3072 --poweroff-timeout 180)
+          fi
+          if [[ "${{ matrix.workload }}" == nested-flexvm ]]; then
+            workload_args+=(--mem 2048 --vcpus 1 --require virtualization.kvm)
+            workload_args+=(--seed "target/${{ matrix.arch }}-unknown-linux-musl/release/flexvm" /nested-input/flexvm)
+            for artifact in firecracker vmlinux kernel-modules.tar.gz; do
+              workload_args+=(--seed "$RUNNER_TEMP/software-state/artifacts/$artifact" "/nested-input/$artifact")
+            done
+            workload_args+=(--seed "$RUNNER_TEMP/nested-inputs/child.tar" /nested-input/child.tar)
           fi
           sudo systemd-run --scope --collect -p "MemoryMax=$memory_limit" -p MemorySwapMax=0 -p "CPUQuota=$cpu_quota" python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --workload "scripts/compat/workloads/${{ matrix.workload }}.sh" "${workload_args[@]}" --require storage.fuse --output "$RUNNER_TEMP/software-workload" --timeout "$workload_timeout"
           cat "$RUNNER_TEMP/software-workload/report.json"
