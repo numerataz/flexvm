@@ -96,7 +96,7 @@ impl Routed {
             let lock = host.lock()?;
             host.claim_new_in(&lock, &config, name, None)?
         };
-        let network = software_state::RoutedNetwork { address: config.vm_addr(claim.ip), generation: claim.gen };
+        let network = software_state::RoutedNetwork { address: config.vm_addr(claim.ip), generation: claim.gen, revision: Some(claim.rev) };
         Self::prepare(host, &config, claim, network, false)
     }
 
@@ -110,6 +110,9 @@ impl Routed {
             let address = host.addr(&lock, network.address.v4)?;
             if address.holder.as_deref() != Some(name) || address.held != network.generation {
                 bail!("software checkpoint no longer holds its routed address");
+            }
+            if network.revision.is_some_and(|revision| revision > address.rev) {
+                bail!("software checkpoint's routed revision was never published here");
             }
             host.claim_incoming(&lock, name, network.address.v4, network.generation, None)?
         };
@@ -942,7 +945,10 @@ impl Machine {
         // checkpoint boundary. Keep the writer leases through publication.
         manifest.disks = staging.capture_disks(&self.disks)?;
         manifest.profile = self.profile.clone();
-        manifest.routed = self.routed.as_ref().map(|routed| routed.network);
+        manifest.routed = self.routed.as_ref().map(|routed| {
+            let revision = routed.claim.as_ref().map(|claim| claim.rev);
+            software_state::RoutedNetwork { revision, ..routed.network }
+        });
         manifest.engine_version = self.engine_version.clone();
         let inputs = self.inputs.as_ref().ok_or("software engine has no pinned inputs")?;
         match previous {

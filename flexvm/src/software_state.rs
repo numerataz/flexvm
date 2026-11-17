@@ -107,6 +107,8 @@ impl Disk {
 pub struct RoutedNetwork {
     pub address: crate::net::VmAddr,
     pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
