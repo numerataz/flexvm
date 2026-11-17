@@ -2574,14 +2574,14 @@ def distro_systemd():
             return result
 
         def identity():
-            code = ('import json,pathlib; p=pathlib.Path; '
-                    'print(json.dumps(dict(init=p("/proc/1/comm").read_text().strip(), '
+            code = ('import json,os,pathlib; p=pathlib.Path; '
+                    'print(json.dumps(dict(init=p("/proc/1/comm").read_text().strip(), executable=os.readlink("/proc/1/exe"), '
                     'start=p("/proc/1/stat").read_text().rsplit(")",1)[1].split()[19], '
                     'machine=p("/etc/machine-id").read_text().strip())))')
             return json.loads(execute("python3 -c " + shlex.quote(code))[1])
 
         original = identity()
-        check("distro: real systemd PID 1", original["init"] == "systemd", original)
+        check("distro: real systemd PID 1", original["init"] == "systemd" and original["executable"].endswith("/systemd"), original)
         A.run(clone, template=tag)
         other = A.exec(clone, "cat /etc/machine-id")[1].strip()
         check("distro: fresh clone machine identity", len(other) == 32 and other != original["machine"], (original, other))
