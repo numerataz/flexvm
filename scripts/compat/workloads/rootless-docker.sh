@@ -49,6 +49,7 @@ prepare)
     tar -xzf "$base/docker.tgz" -C /usr/local/bin --strip-components=1
     tar -xzf "$base/extras.tgz" -C /usr/local/bin --strip-components=1
     install -m 755 "$base/buildx" /usr/local/lib/docker/cli-plugins/docker-buildx
+    rm "$base/docker.tgz" "$base/extras.tgz" "$base/buildx"
     useradd -m -s /bin/sh "$user"
     uid=$(id -u "$user")
     printf '%s\n' "$uid" > "$base/uid"
