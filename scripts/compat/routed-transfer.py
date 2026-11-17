@@ -3,6 +3,7 @@
 import argparse
 from contextlib import contextmanager
 import base64
+import ipaddress
 import os
 import json
 from pathlib import Path
@@ -40,7 +41,8 @@ with socket.create_connection((sys.argv[1], 28143), timeout=15) as connection:
 UDP_CLIENT = """
 import socket, sys
 payload = b'one-shot-udp-during-software-checkpoint'
-with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as connection:
+family = socket.AF_INET6 if ':' in sys.argv[1] else socket.AF_INET
+with socket.socket(family, socket.SOCK_DGRAM) as connection:
     connection.settimeout(105)
     connection.sendto(payload, (sys.argv[1], 28143))
     print("sent", flush=True)
@@ -74,12 +76,14 @@ def configured_peers(enabled, timeout):
             prefix = ["nsenter", "--net", "-t", str(process.pid)]
             address = f"198.18.0.{index}"
             other = f"198.18.0.{3 - index}:7150"
+            address6 = f"fd40:20::{index}"
             sp.run(["ip", "link", "set", interface, "netns", str(process.pid)], check=True, timeout=10)
             for words in (["ip", "link", "set", "lo", "up"], ["ip", "link", "set", interface, "up"],
                           ["ip", "address", "add", address + "/30", "dev", interface],
+                          ["ip", "-6", "address", "add", address6 + "/64", "dev", interface, "nodad"],
                           ["sysctl", "-qw", "net.ipv4.ip_forward=1"]):
                 sp.run([*prefix, *words], check=True, timeout=10)
-            routes[site] = (prefix, address, other)
+            routes[site] = (prefix, address, other, address6)
         yield routes
     finally:
         for _, process in namespaces:
@@ -98,13 +102,12 @@ def exercise(binary, kernel, output, engine, root, arch, network):
     for site, pool in [('a', '192.0.2.60-192.0.2.61'), ('b', '192.0.2.80-192.0.2.81')]:
         state = root / site
         state.mkdir()
-        config = {"vm_ips": pool, "cluster_ips": "192.0.2.0/24", "announce_dev": "none"}
+        config = {"vm_ips": pool, "cluster_ips": "192.0.2.0/24", "announce_dev": "none", "vm_ipv6_prefix": "2001:db8:0:1::/96"}
         prefix = []
         if network:
-            prefix, address, other = network[site]
-            config.update(listen=f"{address}:7150", underlay=address, peers=[other])
-        else:
-            config["vm_ipv6_prefix"] = "2001:db8:0:1::/96"
+            prefix, address, other, address6 = network[site]
+            peer6 = network["b" if site == "a" else "a"][3]
+            config.update(listen=f"{address}:7150", underlay=[address, address6], peers=[other], peer_underlays={other: [peer6]})
         (state / "host.json").write_text(json.dumps(config))
         bases[site] = [*prefix, binary, "--state", state, "--run", root / f"{site}-run"]
     a, b = bases['a'], bases['b']
@@ -172,21 +175,22 @@ def exercise(binary, kernel, output, engine, root, arch, network):
         owner, entry = launch(receiver, other, "software-transfer", "activate", offer, other, "--qemu", engine, *options)
         if network:
             source_site = "a" if sender is a else "b"
-            ip = proposed["routed"]["address"]["v4"]
-            wanted = network[receiver_site][1]
+            destinations = proposed["routed"]["address"]
+            gateways = [(destinations["v4"], network[receiver_site][1]), (destinations["v6"], network[receiver_site][3])]
             until = time.monotonic() + 12
             while time.monotonic() < until:
-                if any(entry.get("gateway") == wanted for entry in routes(source_site, ip)):
+                if all(any(entry.get("gateway") == wanted for entry in routes(source_site, ip)) for ip, wanted in gateways):
                     break
                 time.sleep(.1)
             else:
-                raise RuntimeError(f"{source_site} did not install the signed route to {wanted}")
+                raise RuntimeError(f"{source_site} did not install the signed routes: {gateways}")
         transfer(receiver, "activate", offer, other + "-replay", "--qemu", engine, failure="already granted")
         return owner, entry, proposed["routed"], received["bytes"]
 
     def routes(site, ip):
         prefix = network[site][0] if network else []
-        return json.loads(sp.check_output([*prefix, "ip", "-j", "-4", "route", "show", "exact", ip + "/32"], timeout=5))
+        family, width = ("-6", "/128") if ":" in ip else ("-4", "/32")
+        return json.loads(sp.check_output([*prefix, "ip", "-j", family, "route", "show", "exact", ip + width], timeout=5))
 
     def client_line(process):
         with selectors.DefaultSelector() as selector:
@@ -250,7 +254,7 @@ def exercise(binary, kernel, output, engine, root, arch, network):
                 spawn(peer, site + "-listener", "listen")
             until = time.monotonic() + 12
             for site in ("a", "b"):
-                prefix, address, other = network[site]
+                prefix, address, other, _ = network[site]
                 while time.monotonic() < until:
                     probe = sp.run([*prefix, sys.executable, "-c",
                                     "import socket,sys; socket.create_connection((sys.argv[1], 7150), 1).close()",
@@ -263,6 +267,7 @@ def exercise(binary, kernel, output, engine, root, arch, network):
         a_key, b_key = key('a'), key('b')
         first, initial = launch(a,'source','software','--name','source','--network','routed','--qemu',engine,'--kernel',kernel,output/'fixture.tar')
         ip = initial['ip']
+        address6 = str(ipaddress.IPv6Address(int(ipaddress.IPv6Address("2001:db8:0:1::")) | int(ipaddress.IPv4Address(ip))))
         held_packets = None
         with connection(ip) as tcp:
             echo(tcp,b'routed-connection-before-transfer')
@@ -272,23 +277,33 @@ def exercise(binary, kernel, output, engine, root, arch, network):
                 assert cancelled.wait(timeout=5) == 0
                 cancelled.stdout.close()
                 echo(tcp,b'routed-connection-after-hold-expiry')
+                killed = hold_route("hold-killed")
+                killed.kill()
+                assert killed.wait(timeout=5) == -signal.SIGKILL
+                killed.stdout.close()
+                echo(tcp,b'routed-connection-after-hold-kill')
                 hold = hold_route("hold-outbound")
             stop(a,'source',first)
             if network:
-                with (output / "udp-client.log").open("wb") as log:
-                    udp = sp.Popen([*network["a"][0], sys.executable, "-c", UDP_CLIENT, ip],
-                                   stdout=sp.PIPE, stderr=log, text=True, bufsize=1)
-                owners.append(udp)
-                assert client_line(udp) == "sent"
+                datagrams = []
+                for family, address in ((4, ip), (6, address6)):
+                    with (output / f"udp-client-{family}.log").open("wb") as log:
+                        udp = sp.Popen([*network["a"][0], sys.executable, "-c", UDP_CLIENT, address],
+                                       stdout=sp.PIPE, stderr=log, text=True, bufsize=1)
+                    datagrams.append(udp)
+                    owners.append(udp)
+                    assert client_line(udp) == "sent"
             peer, moved, outbound, sent = move(a,b,'source','peer',a_key,b_key)
             if network:
                 held = json.loads(client_line(hold))
                 assert held["status"] == "forwarded", held
                 held_packets = held["hold"]
-                assert held_packets["packets"] >= 1 and held_packets["dropped"] == 0, held
-                assert client_line(udp) == "received"
-                assert udp.wait(timeout=5) == 0 and hold.wait(timeout=5) == 0
-                udp.stdout.close()
+                assert held_packets["packets"] >= 2 and held_packets["dropped"] == 0, held
+                for udp in datagrams:
+                    assert client_line(udp) == "received"
+                    assert udp.wait(timeout=5) == 0
+                    udp.stdout.close()
+                assert hold.wait(timeout=5) == 0
                 hold.stdout.close()
             assert moved['ip'] == ip and moved['gen'] == initial['gen']
             assert addr_record('a',ip)['lent'] == outbound['generation']
@@ -304,12 +319,12 @@ def exercise(binary, kernel, output, engine, root, arch, network):
             echo(tcp,b'same-routed-connection-returned')
         cli(a,'rm','-f','returned')
         returned.wait(timeout=12)
-        assert not routes("a", ip)
+        assert not routes("a", ip) and not routes("a", address6)
         if network:
             until = time.monotonic() + 20
             while time.monotonic() < until:
                 old = addr_record("b", ip)
-                if old["withdrawn"] and old["lent"] is None and not routes("b", ip):
+                if old["withdrawn"] and old["lent"] is None and not routes("b", ip) and not routes("b", address6):
                     break
                 time.sleep(.1)
             else:

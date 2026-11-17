@@ -1064,7 +1064,7 @@ pub fn hold_fallback(add: bool, ip: VmAddr, ifindex: u32) -> Result<()> {
         let mut route = dev_route_msg(dst, ifindex);
         attr(&mut route, libc::RTA_PRIORITY, &2048_u32.to_ne_bytes());
         if add {
-            netlink(RTM_NEWROUTE, NLM_F_CREATE | libc::NLM_F_EXCL, &route)
+            netlink(RTM_NEWROUTE, NLM_F_CREATE | NLM_F_REPLACE, &route)
         } else {
             netlink(RTM_DELROUTE, 0, &route)
         }
