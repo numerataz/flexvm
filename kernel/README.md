@@ -40,3 +40,10 @@ tag; see [Releasing the artifacts](../README.md#releasing-the-artifacts).
 
 The numbered patches in this directory target the **host** kernel for performance
 experiments. The guest build does not apply them.
+
+Guest source patches are listed in [`patches/series`](patches/series) and applied by
+`scripts/apply-kernel-patches.sh`. They are included in the build and release
+identities and retained in the SDK alongside its matching prepared headers.
+See [nested TSC initialization](../docs/kernel-tsc.md) for the first guest patch
+and its deterministic software execution regression. The top-level numbered
+`kernel/*.patch` files remain host performance experiments.

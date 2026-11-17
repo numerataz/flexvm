@@ -21,8 +21,9 @@ source "$root/scripts/versions.sh"
 # shellcheck source=../kernel/source.env
 source "$root/kernel/source.env"
 LINUX_SOURCE_SHA256=$(pinned "$LINUX_SOURCE_URL")
-inputs=(scripts/build-kernel.sh scripts/package-kernel-modules.sh kernel/source.env "kernel/config/$ARCH.config" kernel/features.config "kernel/features-$ARCH.config")
-key=$({ (cd "$root" && sha256sum "${inputs[@]}"); printf '%s\n' "$LINUX_SOURCE_SHA256"; } | sha256sum | cut -d' ' -f1)
+inputs=(scripts/build-kernel.sh scripts/package-kernel-modules.sh scripts/apply-kernel-patches.sh kernel/patches/series kernel/source.env "kernel/config/$ARCH.config" kernel/features.config "kernel/features-$ARCH.config")
+for patch in "$root"/kernel/patches/*.patch; do inputs+=("${patch#"$root"/}"); done
+key=$({ (cd "$root" && sha256sum "${inputs[@]}") || exit; printf '%s\n' "$LINUX_SOURCE_SHA256"; } | sha256sum | cut -d' ' -f1)
 identity="build:linux-$LINUX_VERSION-$ARCH-$key"
 if [ "$mode" = key ]; then echo "$identity"; exit 0; fi
 if [ "$ARCH" != "$(uname -m)" ]; then echo "kernel builds must be native, not $ARCH on $(uname -m)" >&2; exit 1; fi
@@ -88,6 +89,7 @@ if ! printf '%s  %s\n' "$LINUX_SOURCE_SHA256" "$archive" | sha256sum --check --s
 fi
 src=$build/linux-$LINUX_VERSION
 if [ ! -f "$src/Makefile" ]; then tar -xJf "$archive" -C "$build"; fi
+"$root/scripts/apply-kernel-patches.sh" "$src"
 cp "$root/kernel/config/$ARCH.config" "$src/.config"
 # Apply explicit values with the kernel's own config editor, then verify olddefconfig
 # retained every requested feature; an unavailable symbol is a build failure.
