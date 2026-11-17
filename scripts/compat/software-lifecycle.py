@@ -146,29 +146,64 @@ def exercise(args):
 
         cli('rm', '-f', 'state-test', pending=True)
         owner, entry = launch(*boot, workload_log='transfer-workload.log')
-        observation()
+        before = observation()
         cli('stop', 'state-test')
         if owner.wait(timeout=10) != 0:
             raise RuntimeError('transfer source owner did not retire')
         engine_gone(entry['backend']['process'])
 
+        def key_pair(secret):
+            subprocess.run(['openssl', 'genpkey', '-algorithm', 'Ed25519', '-outform', 'DER', '-out', secret], check=True, timeout=10)
+            secret.chmod(0o600)
+            public_der = subprocess.check_output(['openssl', 'pkey', '-inform', 'DER', '-in', secret, '-pubout', '-outform', 'DER'], timeout=10)
+            return base64.b64encode(public_der[-32:]).decode()
+
         secret = args.state / 'signing-key.der'
-        subprocess.run(['openssl', 'genpkey', '-algorithm', 'Ed25519', '-outform', 'DER', '-out', secret], check=True, timeout=10)
-        secret.chmod(0o600)
-        public_der = subprocess.check_output(['openssl', 'pkey', '-inform', 'DER', '-in', secret, '-pubout', '-outform', 'DER'], timeout=10)
-        public_key = base64.b64encode(public_der[-32:]).decode()
+        public_key = key_pair(secret)
+        destination_secret = args.state / 'destination-key.der'
+        destination_key = key_pair(destination_secret)
         offer = args.state / 'offer.json'
-        offer.write_text(cli('software-transfer', 'offer', 'state-test', destination('id')['host_id']))
-        if destination('prepare', offer, '--source-key', public_key)['status'] != 'pending':
-            raise RuntimeError('transfer destination did not prepare')
         receipt = args.state / 'receipt.json'
-        retire = ('software-transfer', 'retire', 'state-test', offer, '--signing-key', secret)
-        receipt.write_text(cli(*retire))
-        if json.loads(cli(*retire)) != json.loads(receipt.read_text()) or destination('commit', receipt)['status'] != 'committed':
-            raise RuntimeError('transfer receipt retry or destination commit failed')
-        refused = subprocess.run([*base, 'start', 'state-test'], capture_output=True, text=True, timeout=30)
-        if refused.returncode == 0 or 'source cannot restart' not in refused.stderr or live() is not None:
-            raise RuntimeError(f'transfer source restarted or failed for another reason: {refused}')
+        target_id = destination('id')['host_id']
+
+        def prepare_and_retire():
+            proposal = cli('software-transfer', 'offer', 'state-test', target_id)
+            offer.write_text(proposal)
+            if destination('prepare', offer, '--source-key', public_key)['status'] != 'pending':
+                raise RuntimeError('transfer destination did not prepare')
+            retire = ('software-transfer', 'retire', 'state-test', offer, '--signing-key', secret, '--destination-key', destination_key)
+            receipt.write_text(cli(*retire))
+            if json.loads(cli(*retire)) != json.loads(receipt.read_text()):
+                raise RuntimeError('transfer receipt retry changed the signed offer')
+            return json.loads(proposal)['generation']
+
+        def require_refused(*words, error):
+            refused = subprocess.run([*base, *words], capture_output=True, text=True, timeout=30)
+            if refused.returncode == 0 or error not in refused.stderr:
+                raise RuntimeError(f'transfer operation was accepted or failed for another reason: {refused}')
+
+        aborted_generation = prepare_and_retire()
+        require_refused('start', 'state-test', error='source cannot restart')
+        ack = args.state / 'abort-receipt.json'
+        ack.write_text(json.dumps(destination('acknowledge-abort', offer, '--signing-key', destination_secret)))
+        if json.loads(cli('software-transfer', 'recover', ack))['status'] != 'recovered':
+            raise RuntimeError('the source rejected the signed abort')
+        cli('start', 'state-test', env=owner_environment())
+        after = advancing_observation()
+        if after[:3] != before[:3] or after[3] < before[3]:
+            raise RuntimeError('transfer recovery lost the source workload identity')
+        cli('stop', 'state-test')
+        checkpoint = args.state / 'state' / 'suspended' / 'state-test' / 'manifest.json'
+        if json.loads(checkpoint.read_text())['owner_generation'] <= aborted_generation:
+            raise RuntimeError('recovered owner did not advance the fenced generation')
+
+        prepare_and_retire()
+        require_refused('software-transfer', 'recover', ack, error='does not match a source fence')
+        if destination('commit', receipt)['status'] != 'committed':
+            raise RuntimeError('transfer destination did not commit')
+        require_refused('start', 'state-test', error='source cannot restart')
+        if live() is not None:
+            raise RuntimeError('the committed transfer source is running')
         cli('rm', '-f', 'state-test')
 
     evidence = {'cycles': []}

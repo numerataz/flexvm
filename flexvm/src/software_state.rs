@@ -558,7 +558,7 @@ impl Verified {
         }
         let host = parent_directory(name.state_path())?;
         let _transfer = parent_lock(&host, libc::LOCK_EX)?;
-        transfer::check_local_restart(&host, &self.manifest.vm_id)?;
+        let floor = transfer::local_restart_floor(&host, &self.manifest)?;
         if present(dir, "DISCARDED")? {
             bail!("software checkpoint was discarded");
         }
@@ -584,7 +584,7 @@ impl Verified {
             bail!("retired software source engine is still alive");
         }
         let highest = if present(dir, "HIGHEST")? { record::<u64>(dir, "HIGHEST")? } else { self.manifest.owner_generation };
-        let generation = highest.max(self.manifest.owner_generation).checked_add(1).ok_or("software owner generation exhausted")?;
+        let generation = highest.max(self.manifest.owner_generation).max(floor).checked_add(1).ok_or("software owner generation exhausted")?;
         write_record(dir, "HIGHEST", &serde_json::to_vec(&generation)?, true)?;
         Ok(Prepared { directory: dir.try_clone()?, manifest: self.manifest.clone(), generation, name })
     }
@@ -594,8 +594,8 @@ impl Prepared<'_> {
     pub fn grant(self, engine: crate::host::Ident) -> Result<Consumed> {
         let host = parent_directory(self.name.state_path())?;
         let _transfer = parent_lock(&host, libc::LOCK_EX)?;
-        transfer::check_local_restart(&host, &self.manifest.vm_id)?;
-        if record::<u64>(&self.directory, "HIGHEST")? != self.generation {
+        let floor = transfer::local_restart_floor(&host, &self.manifest)?;
+        if self.generation <= floor || record::<u64>(&self.directory, "HIGHEST")? != self.generation {
             bail!("software owner preparation was superseded");
         }
         if present(&self.directory, "DISCARDED")? {

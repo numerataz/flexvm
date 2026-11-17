@@ -13,6 +13,7 @@ use crate::host::{Host, PidFd};
 use crate::{bail, util::Result};
 
 const RECEIPT_DOMAIN: &[u8] = b"flexvm/software-retirement/v1\0";
+const ABORT_DOMAIN: &[u8] = b"flexvm/software-abort/v1\0";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -40,8 +41,8 @@ impl Offer {
         Ok(())
     }
 
-    fn signing_message(&self) -> Result<Vec<u8>> {
-        let mut message = RECEIPT_DOMAIN.to_vec();
+    fn signing_message(&self, domain: &[u8]) -> Result<Vec<u8>> {
+        let mut message = domain.to_vec();
         serde_json::to_writer(&mut message, self)?;
         Ok(message)
     }
@@ -108,7 +109,9 @@ fn transition(state: &Path, offer: Offer, action: Action) -> Result<Status> {
             }
             let key = decode::<32>(&current.source_key, "source public key")?;
             let signature = decode::<64>(&signature, "retirement signature")?;
-            UnparsedPublicKey::new(&ED25519, key).verify(&current.offer.signing_message()?, &signature).map_err(|_| "invalid software retirement signature")?;
+            UnparsedPublicKey::new(&ED25519, key)
+                .verify(&current.offer.signing_message(RECEIPT_DOMAIN)?, &signature)
+                .map_err(|_| "invalid software retirement signature")?;
             current.status = Status::Committed;
             current
         }
@@ -134,18 +137,33 @@ fn transition(state: &Path, offer: Offer, action: Action) -> Result<Status> {
 struct SourceFence {
     offer: Offer,
     source_key: String,
+    destination_key: String,
+    recovered: bool,
 }
 
 fn source_record(vm_id: &str) -> String {
     format!(".software-transfer-source-v1-{vm_id}")
 }
 
-/// Call under the state parent's exclusive lock, also taken by local grants.
-pub(super) fn check_local_restart(state: &File, vm_id: &str) -> Result<()> {
-    if present(state, &source_record(&vm_id.to_ascii_lowercase()))? {
+fn read_fence(state: &File, vm_id: &str) -> Result<Option<SourceFence>> {
+    let path = source_record(&vm_id.to_ascii_lowercase());
+    if present(state, &path)? {
+        Ok(Some(record(state, &path)?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Call under the state parent's exclusive lock, also taken by issuance.
+pub(super) fn local_restart_floor(state: &File, manifest: &Manifest) -> Result<u64> {
+    let Some(fence) = read_fence(state, &manifest.vm_id)? else { return Ok(0) };
+    if !fence.recovered {
         bail!("software VM retired for transfer; its source cannot restart it");
     }
-    Ok(())
+    if manifest.owner_generation <= fence.offer.generation && Retirement::of(manifest)?.manifest_sha256 != fence.offer.manifest_sha256 {
+        bail!("software checkpoint predates the recovered transfer generation");
+    }
+    Ok(fence.offer.generation)
 }
 
 fn retired_checkpoint(checkpoint: &File) -> Result<(Manifest, Retirement)> {
@@ -178,20 +196,23 @@ pub(crate) fn offer(host: &Host, vm: &str, destination: &str) -> Result<serde_js
     if manifest.host_id != local_host {
         bail!("software checkpoint does not belong to this source host");
     }
-    check_local_restart(&state, &manifest.vm_id)?;
+    let floor = local_restart_floor(&state, &manifest)?;
     let offer = Offer {
         vm_id: manifest.vm_id,
         source_host: local_host,
         destination_host: destination.into(),
         transfer_id: crate::util::random_hex(16)?,
         manifest_sha256: retirement.manifest_sha256,
-        generation: proposed_generation(&checkpoint, manifest.owner_generation)?,
+        generation: proposed_generation(&checkpoint, floor.max(manifest.owner_generation))?,
     };
     offer.validate()?;
     Ok(serde_json::to_value(offer)?)
 }
 
-fn issue(state: &File, checkpoint: &File, offer: Offer, key: &Ed25519KeyPair) -> Result<Receipt> {
+fn issue(state: &File, checkpoint: &File, offer: Offer, key: &Ed25519KeyPair, destination_key: &str) -> Result<Receipt> {
+    if decode::<32>(destination_key, "destination public key")?.as_slice() == key.public_key().as_ref() {
+        bail!("software transfer source and destination signing keys must differ");
+    }
     offer.validate()?;
     let local_host = host_id_in(state)?;
     let _transfer = parent_lock(state, libc::LOCK_EX)?;
@@ -205,23 +226,25 @@ fn issue(state: &File, checkpoint: &File, offer: Offer, key: &Ed25519KeyPair) ->
         bail!("transfer offer does not match the retired software checkpoint");
     }
     let path = source_record(&offer.vm_id);
-    let fence = SourceFence { offer, source_key: STANDARD.encode(key.public_key()) };
-    if present(state, &path)? {
-        if record::<SourceFence>(state, &path)? != fence {
-            bail!("software VM is already fenced for a different transfer or signing key");
-        }
-        // Retry a fence whose rename completed before its parent fsync did.
-        state.sync_all()?;
-    } else {
-        write_record(state, &path, &serde_json::to_vec(&fence)?, false)?;
+    let fence = SourceFence { offer, source_key: STANDARD.encode(key.public_key()), destination_key: destination_key.into(), recovered: false };
+    let previous = read_fence(state, &fence.offer.vm_id)?;
+    if previous.as_ref().is_some_and(|existing| existing.recovered) {
+        local_restart_floor(state, &manifest)?;
     }
-    let signature = STANDARD.encode(key.sign(&fence.offer.signing_message()?));
-    Ok(Receipt { offer: fence.offer, signature })
+    match &previous {
+        Some(existing) if existing == &fence => state.sync_all()?,
+        Some(existing)
+            if !existing.recovered || fence.offer.generation <= existing.offer.generation || fence.offer.transfer_id == existing.offer.transfer_id =>
+        {
+            bail!("software VM already has a newer or conflicting transfer fence");
+        }
+        _ => write_record(state, &path, &serde_json::to_vec(&fence)?, previous.is_some())?,
+    }
+    signed_receipt(fence.offer, key, RECEIPT_DOMAIN)
 }
 
-pub(crate) fn retire(host: &Host, vm: &str, input: &Path, signing_key: &Path) -> Result<serde_json::Value> {
-    let offer = read_input(input)?;
-    let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(signing_key)?;
+fn signing_key(path: &Path) -> Result<Ed25519KeyPair> {
+    let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
         bail!("software transfer signing key must be a private regular file owned by this user");
@@ -231,11 +254,56 @@ pub(crate) fn retire(host: &Host, vm: &str, input: &Path, signing_key: &Path) ->
     if encoded.len() > 1024 {
         bail!("software transfer signing key is too large");
     }
-    let key = Ed25519KeyPair::from_pkcs8_maybe_unchecked(&encoded).map_err(|_| "invalid Ed25519 PKCS#8 DER signing key")?;
+    Ed25519KeyPair::from_pkcs8_maybe_unchecked(&encoded).map_err(|_| "invalid Ed25519 PKCS#8 DER signing key".into())
+}
+
+fn signed_receipt(offer: Offer, key: &Ed25519KeyPair, domain: &[u8]) -> Result<Receipt> {
+    let signature = STANDARD.encode(key.sign(&offer.signing_message(domain)?));
+    Ok(Receipt { offer, signature })
+}
+
+pub(crate) fn retire(host: &Host, vm: &str, input: &Path, key_file: &Path, destination_key: &str) -> Result<serde_json::Value> {
+    let offer = read_input(input)?;
+    let key = signing_key(key_file)?;
     let _name = host.take_name(vm, true)?;
     let state = parent_directory(&host.state)?;
     let checkpoint = private_directory(&host.suspended(vm)?)?;
-    Ok(serde_json::to_value(issue(&state, &checkpoint, offer, &key)?)?)
+    Ok(serde_json::to_value(issue(&state, &checkpoint, offer, &key, destination_key)?)?)
+}
+
+pub(crate) fn acknowledge_abort(state: &Path, input: &Path, key_file: &Path) -> Result<serde_json::Value> {
+    let offer: Offer = read_input(input)?;
+    let key = signing_key(key_file)?;
+    transition(state, offer.clone(), Action::Abort)?;
+    Ok(serde_json::to_value(signed_receipt(offer, &key, ABORT_DOMAIN)?)?)
+}
+
+fn recover_source(state: &File, receipt: Receipt) -> Result<()> {
+    receipt.offer.validate()?;
+    if receipt.offer.source_host != host_id_in(state)? {
+        bail!("abort acknowledgment does not name this source host");
+    }
+    let _transfer = parent_lock(state, libc::LOCK_EX)?;
+    let Some(mut fence) = read_fence(state, &receipt.offer.vm_id)?.filter(|record| record.offer == receipt.offer) else {
+        bail!("abort acknowledgment does not match a source fence");
+    };
+    let key = decode::<32>(&fence.destination_key, "destination public key")?;
+    let signature = decode::<64>(&receipt.signature, "abort signature")?;
+    UnparsedPublicKey::new(&ED25519, key)
+        .verify(&receipt.offer.signing_message(ABORT_DOMAIN)?, &signature)
+        .map_err(|_| "invalid software transfer abort signature")?;
+    if fence.recovered {
+        state.sync_all()?;
+    } else {
+        fence.recovered = true;
+        write_record(state, &source_record(&fence.offer.vm_id), &serde_json::to_vec(&fence)?, true)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn recover(state: &Path, input: &Path) -> Result<serde_json::Value> {
+    recover_source(&parent_directory(state)?, read_input(input)?)?;
+    Ok(serde_json::json!({"status": "recovered"}))
 }
 
 fn matching(previous: &Option<Journal>, offer: &Offer) -> Result<Journal> {
@@ -302,7 +370,7 @@ mod tests {
     }
 
     fn sign(key: &Ed25519KeyPair, offer: &Offer) -> Action {
-        Action::Commit(STANDARD.encode(key.sign(&offer.signing_message().unwrap())))
+        Action::Commit(STANDARD.encode(key.sign(&offer.signing_message(RECEIPT_DOMAIN).unwrap())))
     }
 
     #[test]
@@ -413,7 +481,8 @@ mod tests {
             ..offer(&target)
         };
         let signer = key(1);
-        assert!(issue(&local, &checkpoint, outgoing.clone(), &signer).unwrap_err().to_string().contains("still alive"));
+        let destination_key = STANDARD.encode(key(4).public_key());
+        assert!(issue(&local, &checkpoint, outgoing.clone(), &signer, &destination_key).unwrap_err().to_string().contains("still alive"));
         assert!(!present(&local, &source_record(&outgoing.vm_id)).unwrap());
 
         manifest.source_owner = manifest.source_engine.clone();
@@ -422,17 +491,66 @@ mod tests {
         let name = host.take_name("vm", true).unwrap();
         let verified = super::super::open(&path, &profile).unwrap();
         let prepared = verified.prepare(&name, &manifest.host_id).unwrap();
-        assert!(issue(&local, &checkpoint, outgoing.clone(), &signer).is_err(), "a superseded generation cannot be issued");
+        assert!(issue(&local, &checkpoint, outgoing.clone(), &signer, &destination_key).is_err(), "a superseded generation cannot be issued");
 
         outgoing.generation = prepared.generation + 1;
         transition(&target, outgoing.clone(), public_key(&signer)).unwrap();
-        let first = issue(&local, &checkpoint, outgoing.clone(), &signer).unwrap();
-        let replay = issue(&parent_directory(&host.state).unwrap(), &checkpoint, outgoing.clone(), &signer).unwrap();
+        let first = issue(&local, &checkpoint, outgoing.clone(), &signer, &destination_key).unwrap();
+        let replay = issue(&parent_directory(&host.state).unwrap(), &checkpoint, outgoing.clone(), &signer, &destination_key).unwrap();
         assert_eq!(first.signature, replay.signature);
-        assert!(issue(&local, &checkpoint, outgoing.clone(), &key(2)).is_err());
-        assert!(issue(&local, &checkpoint, Offer { transfer_id: "66".repeat(16), ..outgoing.clone() }, &signer).is_err());
+        assert!(issue(&local, &checkpoint, outgoing.clone(), &key(2), &destination_key).is_err());
+        assert!(issue(&local, &checkpoint, Offer { transfer_id: "66".repeat(16), ..outgoing.clone() }, &signer, &destination_key).is_err());
         assert!(prepared.grant(crate::host::Ident::me()).err().unwrap().to_string().contains("cannot restart"));
         assert!(verified.prepare(&name, &manifest.host_id).err().unwrap().to_string().contains("cannot restart"));
         assert_eq!(transition(&target, first.offer, Action::Commit(first.signature)).unwrap(), Status::Committed);
+    }
+
+    #[test]
+    fn signed_abort_allows_only_a_newer_local_grant_and_cannot_be_replayed() {
+        let root = TempDir::new("transfer-recovery");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let target = TempDir::new("transfer-abort-target");
+        let (path, profile) = super::super::tests::checkpoint(&root);
+        let checkpoint = private_directory(&path).unwrap();
+        let mut manifest = read_manifest(&checkpoint).unwrap();
+        manifest.host_id = host_id(&host.state).unwrap();
+        manifest.source_owner = manifest.source_engine.clone();
+        rewrite_manifest(&checkpoint, &manifest);
+
+        let source = parent_directory(&host.state).unwrap();
+        let sender = key(1);
+        let receiver = key(2);
+        let receiver_key = STANDARD.encode(receiver.public_key());
+        let outgoing = Offer {
+            source_host: manifest.host_id.clone(),
+            vm_id: manifest.vm_id.clone(),
+            manifest_sha256: Retirement::of(&manifest).unwrap().manifest_sha256,
+            generation: manifest.owner_generation + 1,
+            ..offer(&target)
+        };
+        transition(&target, outgoing.clone(), public_key(&sender)).unwrap();
+        let retired = issue(&source, &checkpoint, outgoing.clone(), &sender, &receiver_key).unwrap();
+        assert!(recover_source(&source, signed_receipt(outgoing.clone(), &sender, ABORT_DOMAIN).unwrap()).is_err());
+        assert!(recover_source(&source, signed_receipt(outgoing.clone(), &receiver, RECEIPT_DOMAIN).unwrap()).is_err());
+        assert!(local_restart_floor(&source, &manifest).is_err());
+
+        transition(&target, outgoing.clone(), Action::Abort).unwrap();
+        assert!(transition(&target, retired.offer, Action::Commit(retired.signature)).is_err());
+        for _ in 0..2 {
+            recover_source(&source, signed_receipt(outgoing.clone(), &receiver, ABORT_DOMAIN).unwrap()).unwrap();
+        }
+        let changed = Manifest { paused: !manifest.paused, ..manifest.clone() };
+        assert!(local_restart_floor(&source, &changed).is_err());
+        assert!(issue(&source, &checkpoint, outgoing.clone(), &sender, &receiver_key).is_err());
+
+        let name = host.take_name("vm", true).unwrap();
+        let verified = super::super::open(&path, &profile).unwrap();
+        let prepared = verified.prepare(&name, &manifest.host_id).unwrap();
+        assert_eq!(prepared.generation, outgoing.generation + 1);
+        let next = Offer { transfer_id: "66".repeat(16), generation: prepared.generation + 1, ..outgoing.clone() };
+        transition(&target, next.clone(), public_key(&sender)).unwrap();
+        issue(&source, &checkpoint, next, &sender, &receiver_key).unwrap();
+        assert!(recover_source(&source, signed_receipt(outgoing, &receiver, ABORT_DOMAIN).unwrap()).is_err());
+        assert!(prepared.grant(crate::host::Ident::me()).err().unwrap().to_string().contains("cannot restart"));
     }
 }

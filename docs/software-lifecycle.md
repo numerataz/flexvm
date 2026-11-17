@@ -195,16 +195,21 @@ checkpoint and the next generation. On the destination, use
 `prepare OFFER --source-key KEY` with the source's trusted 32-byte Ed25519
 public key in standard padded base64.
 
-On the source, `retire VM OFFER --signing-key FILE` checks that the exact
-checkpoint is retired and that neither its owner nor engine is still alive.
+On the source, `retire VM OFFER --signing-key FILE --destination-key KEY`
+pins the destination's separately configured Ed25519 public key. It checks
+that the exact checkpoint is retired and that neither its owner nor engine is still alive.
 It writes a durable restart fence keyed by VM identity before returning the
 signed receipt. The private key must be a private, locally owned regular file
 containing Ed25519 PKCS#8 DER. Keep the source checkpoint for receipt retries
 and artifact transfer. Retirement blocks local starts, including grants that
-were prepared before the fence was written. Recovery after destination abort
-requires the authenticated acknowledgment and generation rules above. Until
-that recovery and destination activation are available, exercise retirement
-only with disposable software VMs.
+were prepared before the fence was written. If the destination aborts, run `acknowledge-abort OFFER --signing-key FILE`
+there. It durably rejects the offer before signing the acknowledgment with the
+destination key. Its message uses the same offer encoding with the separate
+domain `flexvm/software-abort/v1` followed by a NUL. Run
+`recover ABORT-RECEIPT` at the source. A valid acknowledgment for the exact
+fence permits restart above that transfer generation. A recovered source
+retains the generation floor, and a previous acknowledgment cannot release a
+newer fence. Use disposable VMs until destination activation is available.
 
 An offer is a JSON object with these fields in wire order:
 

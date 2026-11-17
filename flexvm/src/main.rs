@@ -83,7 +83,7 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
   flexvm software-transfer id        show the local software host identity
   flexvm software-transfer offer VM DESTINATION
                                      identify a stopped VM and its intended destination
-  flexvm software-transfer retire VM OFFER --signing-key FILE
+  flexvm software-transfer retire VM OFFER --signing-key FILE --destination-key KEY
                                      fence local restart and sign a retirement receipt
   flexvm software-transfer prepare OFFER --source-key KEY
                                      record an incoming transfer and its base64 Ed25519 public key
@@ -91,6 +91,10 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      verify source retirement and commit the destination journal
   flexvm software-transfer abort OFFER
                                      durably reject the prepared transfer
+  flexvm software-transfer acknowledge-abort OFFER --signing-key FILE
+                                     write the abort and sign its acknowledgment
+  flexvm software-transfer recover ABORT-RECEIPT
+                                     authorize the source at a higher generation
   flexvm software --kernel FILE [OPTIONS] IMAGE [CMD...]
                                      --kernel-sdk: matching native module build inputs;
                                      --kernel-modules FILE: custom runtime or SDK bundle
@@ -552,7 +556,7 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("rm", NAMES, &["force"]),
     ("volume", NAMES, &["size"]),
     ("checkpoint", NAMES, &["stop", "incremental", "quiet", "format", "filter", "force", "older-than", "output", "input", "name", "sha256"]),
-    ("software-transfer", 4, &["source-key", "signing-key"]),
+    ("software-transfer", 4, &["source-key", "signing-key", "destination-key"]),
     ("migrate", 3, &[]),
     ("reclaim", 2, &["force"]),
     ("listen", 2, &[]),
@@ -640,17 +644,17 @@ fn check_applies(args: &Args) -> Result<()> {
         }
         "software-transfer" => {
             let words = args.positional.len();
-            let source_key = args.has("source-key");
-            let signing_key = args.has("signing-key");
+            let keys = (args.has("source-key"), args.has("signing-key"), args.has("destination-key"));
             if !matches!(
-                (first.map(String::as_str), words, source_key, signing_key),
-                (Some("id"), 2, false, false)
-                    | (Some("prepare"), 3, true, false)
-                    | (Some("commit" | "abort"), 3, false, false)
-                    | (Some("offer"), 4, false, false)
-                    | (Some("retire"), 4, false, true)
+                (first.map(String::as_str), words, keys),
+                (Some("id"), 2, (false, false, false))
+                    | (Some("prepare"), 3, (true, false, false))
+                    | (Some("commit" | "abort" | "recover"), 3, (false, false, false))
+                    | (Some("acknowledge-abort"), 3, (false, true, false))
+                    | (Some("offer"), 4, (false, false, false))
+                    | (Some("retire"), 4, (false, true, true))
             ) {
-                bail!("software-transfer needs id, offer VM DESTINATION, prepare OFFER --source-key KEY, retire VM OFFER --signing-key FILE, commit RECEIPT or abort OFFER");
+                bail!("invalid software-transfer arguments (see flexvm --help)");
             }
         }
         "checkpoint" => {
@@ -805,12 +809,22 @@ fn real_main(args: &Args) -> Result<()> {
         }
         Some("pull") => pull(args, name),
         Some("software-transfer") if name == "offer" => print(software_state::transfer::offer(&open_host(args)?, pos[2], pos[3])?),
-        Some("software-transfer") if name == "retire" => {
-            print(software_state::transfer::retire(&open_host(args)?, pos[2], Path::new(pos[3]), Path::new(args.get("signing-key").unwrap()))?)
-        }
+        Some("software-transfer") if name == "retire" => print(software_state::transfer::retire(
+            &open_host(args)?,
+            pos[2],
+            Path::new(pos[3]),
+            Path::new(args.get("signing-key").unwrap()),
+            args.get("destination-key").unwrap(),
+        )?),
         Some("software-transfer") => {
             let path = state(args)?;
             host::host_dir(&path, 0o755)?;
+            if name == "acknowledge-abort" {
+                return print(software_state::transfer::acknowledge_abort(&path, Path::new(pos[2]), Path::new(args.get("signing-key").unwrap()))?);
+            }
+            if name == "recover" {
+                return print(software_state::transfer::recover(&path, Path::new(pos[2]))?);
+            }
             print(software_state::transfer::command(&path, name, Path::new(arg2.unwrap_or("")), args.get("source-key"))?)
         }
         Some("software") => util::exit(software(args, name)?),
