@@ -42,8 +42,8 @@ def exercise(binary, kernel, output, root, engine, arch):
         return next((entry for entry in entries if entry["name"] == name and entry["state"] == status), None)
 
     def route(addr):
-        mask = "/128" if ":" in addr else "/32"
-        return json.loads(sp.check_output(["ip", "-j", "route", "show", "exact", addr + mask], timeout=10))
+        family, mask = ("-6", "/128") if ":" in addr else ("-4", "/32")
+        return json.loads(sp.check_output(["ip", "-j", family, "route", "show", "exact", addr + mask], timeout=10))
 
     def launch(label, name, *args):
         with (output / f"{label}-owner.log").open("wb") as log:
