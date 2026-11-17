@@ -3528,6 +3528,7 @@ def faults(template=None, scenarios=None):
     p = subprocess.Popen([sys.executable, os.path.join(ROOT, "scripts", "faults.py"), "--a", A.addr, "--b", B.addr,
                           "--a-state", A.state_dir, "--a-run", A.run_dir, "--b-state", B.state_dir, "--b-run", B.run_dir,
                           "--a-listen-log", A.log, "--b-listen-log", B.log,
+                          "--failure-dir", os.path.join(args.log_dir, "fault-failures"),
                           "--a-ips", f"{A.net}.2-{A.net}.60", "--b-ips", f"{B.net}.2-{B.net}.60",
                           *listeners, *(["--no-skips"] if args.no_skips else []), "--bin", BIN, "--template", template,
                           "--ckpt-dir", os.path.join(WORK, "faults-ckpt"), *image, *scenarios.split()], env=env, start_new_session=True)

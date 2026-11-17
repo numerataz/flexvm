@@ -248,6 +248,11 @@ jobs:
             ${{ runner.temp }}/software-boot/compile.log
             ${{ runner.temp }}/software-boot/kvm-compile.log
             ${{ runner.temp }}/software-boot/inner-compile.log
+            ${{ runner.temp }}/software-boot/checkpoint-state.json
+            ${{ runner.temp }}/software-boot/checkpoint
+            ${{ runner.temp }}/software-boot/replay.json
+            ${{ runner.temp }}/software-boot/replay-kernel
+            ${{ runner.temp }}/software-boot/replay-initramfs.cpio
             ${{ runner.temp }}/software-agent/report.json
             ${{ runner.temp }}/software-agent/guest.log
             ${{ runner.temp }}/software-agent/files.strace
