@@ -550,7 +550,16 @@ jobs:
           cargo test --locked --target x86_64-unknown-linux-musl -p vmm --lib acpi::x86_64::tests
           cargo test --locked --release --target x86_64-unknown-linux-musl -p vmm --lib configured_serial_survives_backing_update_and_restore
           cargo test --locked --release --target x86_64-unknown-linux-musl -p vmm --lib invalid_serial_is_rejected_before_opening_the_backing_file
-          cargo test --locked --release --target x86_64-unknown-linux-musl -p vmm --lib persist::tests::test_check_
+          # Confinement fixtures create TAP devices: build as the runner, run as root.
+          cargo test --locked --release --target x86_64-unknown-linux-musl -p vmm --lib --no-run --message-format=json > "$RUNNER_TEMP/firecracker-unit-tests.json"
+          python3 - "$RUNNER_TEMP/firecracker-unit-tests.json" <<'PY'
+          import json, subprocess, sys
+          artifacts = [json.loads(line) for line in open(sys.argv[1])]
+          binaries = [item['executable'] for item in artifacts if item.get('reason') == 'compiler-artifact'
+                      and item.get('target', {}).get('name') == 'vmm' and item.get('executable')]
+          assert len(binaries) == 1, binaries
+          subprocess.run(['sudo', binaries[0], 'persist::tests::test_check_', '--test-threads=1'], check=True)
+          PY
 
       - name: Save Firecracker
         if: steps.keys.outputs.fc-build == 'true' && steps.fc-cache.outputs.cache-hit != 'true'
