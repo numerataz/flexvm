@@ -80,10 +80,11 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
       --checkpoint NAME|ID           start it from a stored checkpoint instead of IMAGE (its name and
                                      address unless --name and --ip IP|auto), or from a checkpoint
                                      directory (a path, with a '/'); --paused holds it until unpause
-  flexvm software --kernel FILE [OPTIONS] IMAGE [CMD...]
+  flexvm software [--kernel FILE] [OPTIONS] IMAGE [CMD...]
                                      --kernel-sdk: matching native module build inputs;
                                      --kernel-modules FILE: custom runtime or SDK bundle
                                      experimental foreground QEMU TCG execution without host KVM;
+                                     defaults to the installed, verified kernel and runtime modules;
                                      --qemu PATH, --vsock-backend PATH, --mem MIB, --vcpus N,
                                      --timeout SECS (boot only); image env/workdir/user options apply
   flexvm ps [-a] [-q] [--json] [-f, --filter KEY=VALUE]... [--format FORMAT]
@@ -2313,14 +2314,14 @@ fn kernel_bundle(args: &Args, kernel: &Path, reviewed: bool) -> Result<Option<im
     if let Some(custom) = args.get("kernel-modules") {
         let bundle = image::KernelBundle::open(kernel, Path::new(custom), None)?;
         if reviewed {
-            artifacts::KERNEL.check_digest(&bundle.kernel.artifact.sha256)?;
+            artifacts::KERNEL.check_opened(kernel, &bundle.kernel.artifact.sha256)?;
         }
         return Ok(Some(bundle));
     }
     let development = args.has("kernel-sdk");
     let asset = if development { &artifacts::KERNEL_SDK } else { &artifacts::MODULES };
-    let kernel = kernel.canonicalize()?;
-    let adjacent = kernel.with_file_name(asset.name);
+    let canonical_kernel = kernel.canonicalize()?;
+    let adjacent = canonical_kernel.with_file_name(asset.name);
     let state_kernel = paths(args)?.kernel;
     let state_artifacts = state_kernel.parent().ok_or("kernel has no artifact directory")?;
     let authenticated = reviewed || !adjacent.exists() || state_artifacts.canonicalize().is_ok_and(|directory| adjacent.parent() == Some(directory.as_path()));
@@ -2334,12 +2335,12 @@ fn kernel_bundle(args: &Args, kernel: &Path, reviewed: bool) -> Result<Option<im
     if authenticated {
         artifacts::ensure(&[(&selected, asset)])?;
     }
-    let bundle = image::KernelBundle::open(&kernel, &selected, Some(development))?;
+    let bundle = image::KernelBundle::open(&canonical_kernel, &selected, Some(development))?;
     if authenticated {
-        asset.check_digest(&bundle.identity().bundle_sha256)?;
+        asset.check_opened(&selected, &bundle.identity().bundle_sha256)?;
     }
     if reviewed {
-        artifacts::KERNEL.check_digest(&bundle.kernel.artifact.sha256)?;
+        artifacts::KERNEL.check_opened(kernel, &bundle.kernel.artifact.sha256)?;
     }
     Ok(Some(bundle))
 }
@@ -2372,9 +2373,17 @@ fn software(args: &Args, src: &str) -> Result<i32> {
     if args.get("name").is_some() && control != qemu::Control::Serial {
         bail!("named software VMs require --control serial");
     }
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("software image preparation currently requires root");
+    }
+    let kernel = args.get("kernel").map_or_else(|| paths(args).map(|paths| paths.kernel), |kernel| Ok(PathBuf::from(kernel)))?;
+    let installed = !args.has("kernel");
+    if installed {
+        artifacts::ensure(&[(&kernel, &artifacts::KERNEL)])?;
+    }
     let config = qemu::Config {
         control,
-        kernel: PathBuf::from(args.get("kernel").ok_or("software needs --kernel FILE (with virtio PCI on x86_64)")?),
+        kernel,
         qemu: args.get("qemu").map(String::from).unwrap_or_else(|| format!("qemu-system-{}", std::env::consts::ARCH)),
         vsock_backend: args.get("vsock-backend").unwrap_or("vhost-device-vsock").into(),
         mem_mib: args.parse_or("mem", 512)?,
@@ -2382,9 +2391,6 @@ fn software(args: &Args, src: &str) -> Result<i32> {
         boot_timeout: Duration::from_secs(args.parse_or("timeout", 90)?),
     };
     config.validate()?;
-    if unsafe { libc::geteuid() } != 0 {
-        bail!("software image preparation currently requires root");
-    }
     let processes = std::sync::Arc::new(qemu::Processes::default());
     let stopping = processes.clone();
     let signals: &[i32] = if args.get("name").is_some() { &[libc::SIGINT, libc::SIGQUIT, libc::SIGHUP] } else { &[libc::SIGINT, libc::SIGTERM, libc::SIGHUP] };
@@ -2400,7 +2406,7 @@ fn software(args: &Args, src: &str) -> Result<i32> {
         opts.cmd = Some(args.rest.clone());
     }
     let init = args.get("init").map(PathBuf::from);
-    let modules = kernel_bundle(args, &config.kernel, false)?;
+    let modules = kernel_bundle(args, &config.kernel, installed)?;
     let (rootfs, meta, _reserved, _cache_lock) = image::prepare(&state(args)?.join("images"), init.as_deref(), &opts, modules.as_ref())?;
     if meta.argv.is_empty() {
         bail!("software execution needs an image command or CMD");
