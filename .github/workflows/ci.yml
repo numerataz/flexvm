@@ -178,6 +178,11 @@ jobs:
           fi
           sudo ln -sf "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" /usr/local/bin/qemu-system-x86_64
           sudo qemu-system-x86_64 --version
+      - name: Shared RAM across separate software CPU workers
+        if: matrix.arch == 'x86_64'
+        run: |
+          sudo python3 scripts/compat/software-parent-ram.py --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --output "$RUNNER_TEMP/software-parent-ram"
+          cat "$RUNNER_TEMP/software-parent-ram/report.json"
       - name: Software state directory
         run: sudo install -d -o "$(id -u)" -g "$(id -g)" "$RUNNER_TEMP/software-state/artifacts"
       - name: Cache kernel
@@ -273,6 +278,9 @@ jobs:
             ${{ runner.temp }}/software-tsc/*.json
             ${{ runner.temp }}/software-tsc/*.log
             ${{ runner.temp }}/software-tsc/*.strace
+            ${{ runner.temp }}/software-parent-ram/*.json
+            ${{ runner.temp }}/software-parent-ram/*.log
+            ${{ runner.temp }}/software-parent-ram/*.strace
             ${{ runner.temp }}/software-boot/report.json
             ${{ runner.temp }}/software-boot/guest.log
             ${{ runner.temp }}/software-boot/files.strace
