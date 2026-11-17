@@ -795,6 +795,28 @@ mod tests {
     }
 
     #[test]
+    fn a_full_dispatch_queue_resets_new_opens_and_recovers_after_draining() {
+        let (host, guest) = UnixStream::pair().unwrap();
+        let client = Client::connect(host).unwrap();
+        let (incoming, requests) = mpsc::sync_channel::<UnixStream>(1);
+        let server = std::thread::spawn(move || serve(File::from(OwnedFd::from(guest)), incoming));
+        let first = client.open(Instant::now() + Duration::from_secs(3)).unwrap();
+        let error = client.open(Instant::now() + Duration::from_secs(3)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        let first_peer = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+        let mut next = client.open(Instant::now() + Duration::from_secs(3)).unwrap();
+        let mut peer = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+        next.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        peer.write_all(b"ok").unwrap();
+        let mut reply = [0; 2];
+        next.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"ok");
+        drop((first, first_peer, client));
+        let closed = server.join().unwrap();
+        assert!(closed.is_ok() || closed.is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe));
+    }
+
+    #[test]
     fn timed_out_opens_release_capacity_when_the_peer_resumes() {
         let (host, guest) = UnixStream::pair().unwrap();
         let client = Client::connect(host).unwrap();
@@ -814,7 +836,19 @@ mod tests {
                 }
             }
         });
-        let mut live = client.open(Instant::now() + Duration::from_secs(3)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut live = loop {
+            match client.open(deadline) {
+                Ok(live) => break live,
+                // The delayed peer can fill its ordered dispatch queue before
+                // the handler drains canceled requests. A reset is transient;
+                // recovery must still finish within the original deadline.
+                Err(error) if matches!(error.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::WouldBlock) && Instant::now() < deadline => {
+                    std::thread::yield_now();
+                }
+                Err(error) => panic!("capacity did not recover: {error}"),
+            }
+        };
         live.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
         live.write_all(b"x").unwrap();
         let mut reply = [0; 2];
