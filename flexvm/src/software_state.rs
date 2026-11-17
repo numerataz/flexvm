@@ -32,6 +32,12 @@ pub struct Profile {
     pub arguments: Vec<String>,
 }
 
+impl AsRef<[Profile]> for Profile {
+    fn as_ref(&self) -> &[Profile] {
+        std::slice::from_ref(self)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Session {
@@ -368,11 +374,11 @@ pub fn metadata(path: &Path) -> Result<Manifest> {
     read_manifest(&private_directory(path)?)
 }
 
-pub fn open(path: &Path, profile: &Profile) -> Result<Verified> {
+pub fn open(path: &Path, profiles: impl AsRef<[Profile]>) -> Result<Verified> {
     let dir = private_directory(path)?;
     crate::host::flock(&dir, libc::LOCK_SH)?;
     let manifest = read_manifest(&dir)?;
-    if manifest.profile != *profile {
+    if !profiles.as_ref().contains(&manifest.profile) {
         bail!("software state execution profile does not match");
     }
     Ok(Verified {
@@ -746,7 +752,7 @@ pub fn describe(path: &Path, name: &str) -> Result<serde_json::Value> {
             argv: manifest.image.argv,
             ram_mib: manifest.memory_mib,
         },
-        ip: Some("169.254.1.2".parse()?),
+        ip: crate::qemu::Network::from_profile(&manifest.profile).map(crate::qemu::Network::ip),
         gen: manifest.identity_generation,
         vcpus: manifest.vcpus,
         max_mib: u64::from(manifest.memory_mib),
@@ -1199,6 +1205,8 @@ mod tests {
         let mut other = profile.clone();
         other.arguments.push("changed-device".into());
         assert!(open(&path, &other).err().unwrap().to_string().contains("profile does not match"));
+        assert!(open(&path, [other.clone(), profile.clone()]).is_ok(), "an exact approved legacy profile remains readable");
+        assert!(open(&path, [other.clone(), other]).err().unwrap().to_string().contains("profile does not match"));
         let file = path.join("manifest.json");
         let mut changed: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
         changed["format"] = json!(2);

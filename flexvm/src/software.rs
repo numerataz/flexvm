@@ -652,7 +652,7 @@ fn serve(
         },
         name: name.name.clone(),
         ident: Ident::me(),
-        ip: Some("169.254.1.2".parse()?),
+        ip: Some(machine.ip()),
         gen: identity_generation,
         vcpus: config.vcpus,
         max_mib: u64::from(config.mem_mib),
@@ -814,7 +814,7 @@ pub fn restore(host: Host, vm_name: &str, notify: Option<std::fs::File>) -> Resu
             boot_timeout: Duration::from_secs(120),
         };
         let _reservation = Reservation::new(&host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)?;
-        let verified = software_state::open(&path, &config.profile()?)?;
+        let verified = software_state::open(&path, config.profiles()?)?;
         let manifest = verified.manifest.clone();
         let prepared = verified.prepare(&name, &software_state::host_id(&host.state)?)?;
         let generation = prepared.generation;

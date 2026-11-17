@@ -82,15 +82,28 @@ fn ipv6_sysctls() -> io::Result<()> {
     Ok(())
 }
 
+fn gateway4(cmdline: &str) -> io::Result<Ipv4Addr> {
+    let mut values = cmdline.split_whitespace().filter_map(|arg| arg.strip_prefix("flexvm.gateway4="));
+    let gateway = match values.next() {
+        Some(value) => value.parse::<Ipv4Addr>().map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid IPv4 gateway"))?,
+        None => GATEWAY,
+    };
+    if values.next().is_some() || gateway.is_unspecified() || gateway.is_multicast() || gateway.is_loopback() || gateway.is_broadcast() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid or repeated IPv4 gateway"));
+    }
+    Ok(gateway)
+}
+
 pub fn setup() -> io::Result<()> {
+    let gateway = gateway4(&std::fs::read_to_string("/proc/cmdline")?)?;
     let s = Sock(unsafe { std::os::fd::FromRawFd::from_raw_fd(os(libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0))?) });
     let ipv6 = ipv6_sysctls();
     link_up(&s, "lo")?;
     link_up(&s, IFACE)?;
-    add_route(&s, GATEWAY, Ipv4Addr::BROADCAST, None)?;
-    add_route(&s, Ipv4Addr::UNSPECIFIED, Ipv4Addr::UNSPECIFIED, Some(GATEWAY))?;
+    add_route(&s, gateway, Ipv4Addr::BROADCAST, None)?;
+    add_route(&s, Ipv4Addr::UNSPECIFIED, Ipv4Addr::UNSPECIFIED, Some(gateway))?;
     let mut arp: libc::arpreq = unsafe { std::mem::zeroed() };
-    (arp.arp_pa, arp.arp_ha.sa_family, arp.arp_flags) = (sockaddr(GATEWAY), libc::ARPHRD_ETHER, libc::ATF_PERM | libc::ATF_COM);
+    (arp.arp_pa, arp.arp_ha.sa_family, arp.arp_flags) = (sockaddr(gateway), libc::ARPHRD_ETHER, libc::ATF_PERM | libc::ATF_COM);
     for (d, s) in arp.arp_ha.sa_data.iter_mut().zip(GATEWAY_MAC) {
         *d = s as libc::c_char;
     }
@@ -314,6 +327,15 @@ fn matching_ack(mut data: &[u8], seq: u32) -> Option<io::Result<()>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gateway_override_is_explicit_and_native_default_is_unchanged() {
+        assert_eq!(gateway4("quiet console=ttyS0").unwrap(), GATEWAY);
+        assert_eq!(gateway4("quiet flexvm.gateway4=10.0.2.2").unwrap(), Ipv4Addr::new(10, 0, 2, 2));
+        for value in ["", "no", "0.0.0.0", "127.0.0.1", "224.0.0.1", "255.255.255.255", "10.0.2.2 flexvm.gateway4=10.0.2.2"] {
+            assert!(gateway4(&format!("flexvm.gateway4={value}")).is_err(), "{value}");
+        }
+    }
 
     #[test]
     fn resolv_conf_is_replaced_atomically_and_unchanged_content_is_skipped() {

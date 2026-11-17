@@ -28,6 +28,48 @@ pub enum Control {
     Serial,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Network {
+    Private,
+    Legacy,
+}
+
+impl Network {
+    fn netdev(self) -> &'static str {
+        match self {
+            Self::Private => "user,id=net,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15,ipv6=off",
+            Self::Legacy => "user,id=net,net=169.254.0.0/16,host=169.254.1.1,dns=169.254.1.3,dhcpstart=169.254.1.2,ipv6=off",
+        }
+    }
+
+    pub fn ip(self) -> std::net::Ipv4Addr {
+        match self {
+            Self::Private => std::net::Ipv4Addr::new(10, 0, 2, 15),
+            Self::Legacy => std::net::Ipv4Addr::new(169, 254, 1, 2),
+        }
+    }
+
+    fn dns(self) -> &'static str {
+        match self {
+            Self::Private => "10.0.2.3",
+            Self::Legacy => "169.254.1.3",
+        }
+    }
+
+    fn kernel_arg(self) -> &'static str {
+        match self {
+            Self::Private => " flexvm.gateway4=10.0.2.2",
+            Self::Legacy => "",
+        }
+    }
+
+    /// Metadata only; execution still requires equality with a full locally built profile.
+    pub fn from_profile(profile: &software_state::Profile) -> Option<Self> {
+        let value = profile.arguments.windows(2).find(|args| args[0] == "-netdev")?.get(1)?;
+        [Self::Private, Self::Legacy].into_iter().find(|network| network.netdev() == value)
+    }
+}
+
 pub struct Config {
     pub control: Control,
     pub kernel: PathBuf,
@@ -210,6 +252,7 @@ struct Endpoints<'a> {
 pub struct Machine {
     inputs: Option<software_state::Inputs>,
     profile: software_state::Profile,
+    network: Network,
     engine_version: Value,
     capture: Mutex<Capture>,
     processes: Arc<Processes>,
@@ -269,7 +312,7 @@ impl Config {
         Ok(())
     }
 
-    fn command(&self, engine: &Path, kernel: &Path, rootfs: &Path, endpoints: &Endpoints<'_>) -> Result<Command> {
+    fn command(&self, engine: &Path, kernel: &Path, rootfs: &Path, endpoints: &Endpoints<'_>, network: Network) -> Result<Command> {
         let arch = std::env::consts::ARCH;
         let (board, cpu, console, block, vsock, nic) = match arch {
             // TCG implements AMD SVM: the ordinary guest Linux KVM driver
@@ -289,7 +332,12 @@ impl Config {
         let control_arg = if self.control == Control::Serial { " flexvm.control=serial" } else { "" };
         cmd.arg("-kernel").arg(kernel).args([
             "-append",
-            &format!("console={console} quiet panic=1 root=/dev/vda ro init=/sbin/flexvm-init flexvm.tmpfs_mib={}{}", self.mem_mib, control_arg),
+            &format!(
+                "console={console} quiet panic=1 root=/dev/vda ro init=/sbin/flexvm-init flexvm.tmpfs_mib={}{}{}",
+                self.mem_mib,
+                control_arg,
+                network.kernel_arg()
+            ),
         ]);
         cmd.args([
             "-blockdev",
@@ -306,21 +354,23 @@ impl Config {
             cmd.args(["-chardev", &format!("socket,id=control,path={},server=on,wait=off", endpoints.control.display())]);
             cmd.args(["-device", &format!("virtserialport,bus=controlbus.0,chardev=control,name={}", control::PORT_NAME)]);
         }
-        // Match the agent's existing static gateway and /32 configuration.
-        cmd.args([
-            "-netdev",
-            "user,id=net,net=169.254.0.0/16,host=169.254.1.1,dns=169.254.1.3,dhcpstart=169.254.1.2,ipv6=off",
-            "-device",
-            &format!("{nic},netdev=net"),
-        ]);
+        cmd.args(["-netdev", network.netdev(), "-device", &format!("{nic},netdev=net")]);
         cmd.args(["-qmp", &format!("unix:{},server=on,wait=off", endpoints.api.display())]);
         Ok(cmd)
     }
 
     pub fn profile(&self) -> Result<software_state::Profile> {
+        self.profile_for(Network::Private)
+    }
+
+    pub fn profiles(&self) -> Result<[software_state::Profile; 2]> {
+        Ok([self.profile()?, self.profile_for(Network::Legacy)?])
+    }
+
+    fn profile_for(&self, network: Network) -> Result<software_state::Profile> {
         let endpoints =
             Endpoints { api: Path::new("@qmp"), control: Path::new("@control"), backend: Path::new("@vsock-backend"), firmware: Path::new("@firmware") };
-        let command = self.command(Path::new("@engine"), Path::new("@kernel"), Path::new("@rootfs"), &endpoints)?;
+        let command = self.command(Path::new("@engine"), Path::new("@kernel"), Path::new("@rootfs"), &endpoints, network)?;
         Ok(software_state::Profile {
             architecture: std::env::consts::ARCH.into(),
             arguments: command
@@ -332,12 +382,12 @@ impl Config {
 
     pub fn boot(&self, rootfs: &Path, processes: Arc<Processes>) -> Result<Machine> {
         let inputs = software_state::Inputs::open(&self.qemu, &self.kernel, rootfs)?;
-        self.launch(inputs, processes, None)
+        self.launch(inputs, processes, None, Network::Private)
     }
 
     pub fn boot_with_kernel(&self, rootfs: &Path, processes: Arc<Processes>, kernel: software_state::Input) -> Result<Machine> {
         let inputs = software_state::Inputs::with_kernel(&self.qemu, kernel, rootfs)?;
-        self.launch(inputs, processes, None)
+        self.launch(inputs, processes, None, Network::Private)
     }
 
     /// Load state into a fresh engine, with CPUs paused and public admission closed.
@@ -345,24 +395,28 @@ impl Config {
         if self.control != Control::Serial {
             bail!("software restore requires serial control");
         }
-        if self.profile()? != verified.manifest.profile {
+        let network = if self.profile_for(Network::Private)? == verified.manifest.profile {
+            Network::Private
+        } else if self.profile_for(Network::Legacy)? == verified.manifest.profile {
+            Network::Legacy
+        } else {
             bail!("software restore configuration changed after artifact validation");
-        }
+        };
         verified.state.unchanged()?;
         let machine = self
-            .launch(verified.inputs, processes, Some((&verified.state.file, &verified.manifest.engine_version)))
+            .launch(verified.inputs, processes, Some((&verified.state.file, &verified.manifest.engine_version)), network)
             .map_err(|error| format!("software incoming engine load failed: {error}"))?;
         verified.state.unchanged()?;
         Ok(machine)
     }
 
-    fn launch(&self, inputs: software_state::Inputs, processes: Arc<Processes>, incoming: Option<(&File, &Value)>) -> Result<Machine> {
+    fn launch(&self, inputs: software_state::Inputs, processes: Arc<Processes>, incoming: Option<(&File, &Value)>, network: Network) -> Result<Machine> {
         // Restore uses pinned artifacts and does not require the original input paths.
         self.validate_limits()?;
         inputs.engine.unchanged()?;
         inputs.kernel.unchanged()?;
         inputs.rootfs.unchanged()?;
-        let profile = self.profile()?;
+        let profile = self.profile_for(network)?;
         let root = SocketRoot::software()?;
         *processes.runtime.lock().unwrap() = Some(Arc::downgrade(&root));
         let sockets = root.allocate()?;
@@ -375,6 +429,7 @@ impl Config {
         let mut machine = Machine {
             inputs: Some(inputs),
             profile,
+            network,
             engine_version: Value::Null,
             capture: Mutex::default(),
             processes,
@@ -407,7 +462,7 @@ impl Config {
                 }
             }
             let endpoints = Endpoints { api: &machine.sockets.api, control: &machine.sockets.vsock, backend: &machine.sockets.uffd, firmware: &firmware };
-            let mut cmd = self.command(&engine, &kernel, &rootfs, &endpoints)?;
+            let mut cmd = self.command(&engine, &kernel, &rootfs, &endpoints, network)?;
             if incoming.is_some() {
                 cmd.args(["-incoming", "defer", "-S"]);
             }
@@ -481,7 +536,7 @@ impl Config {
             }
             crate::info!("software: configuring guest network and clock");
             let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-            let line = format!("START 169.254.1.2 {}.{:09} 169.254.1.3", now.as_secs(), now.subsec_nanos());
+            let line = format!("START {} {}.{:09} {}", network.ip(), now.as_secs(), now.subsec_nanos(), network.dns());
             if machine.message(&line, deadline)? != b"ok" {
                 bail!("software guest rejected network/clock setup");
             }
@@ -587,6 +642,10 @@ impl Qmp {
 }
 
 impl Machine {
+    pub fn ip(&self) -> std::net::Ipv4Addr {
+        self.network.ip()
+    }
+
     /// The caller owns the admission/CPU boundary and the output artifact. A
     /// failed export does not authorize source resume: cancel and verify first.
     pub fn save(&self, state: &File, deadline: Instant) -> Result<()> {
@@ -937,6 +996,30 @@ mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
 
+    #[test]
+    fn new_network_is_private_and_legacy_profiles_keep_the_original_command() {
+        let config = Config {
+            control: Control::Serial,
+            kernel: PathBuf::new(),
+            qemu: String::new(),
+            vsock_backend: String::new(),
+            mem_mib: 512,
+            vcpus: 1,
+            boot_timeout: Duration::from_secs(120),
+        };
+        let [private, legacy] = config.profiles().unwrap();
+        assert_eq!(private, config.profile().unwrap());
+        assert_eq!(Network::from_profile(&private), Some(Network::Private));
+        assert_eq!(Network::from_profile(&legacy), Some(Network::Legacy));
+        let kernel_args = |profile: &software_state::Profile| profile.arguments.windows(2).find(|args| args[0] == "-append").unwrap()[1].clone();
+        assert!(kernel_args(&private).ends_with(" flexvm.gateway4=10.0.2.2"));
+        assert!(!kernel_args(&legacy).contains("flexvm.gateway4="));
+        let mut unknown = private.clone();
+        let position = unknown.arguments.iter().position(|arg| arg == "-netdev").unwrap() + 1;
+        unknown.arguments[position].push_str(",hostfwd=tcp::22-:22");
+        assert_eq!(Network::from_profile(&unknown), None);
+    }
+
     fn qmp_peer(listener: UnixListener) -> UnixStream {
         let (mut stream, _) = listener.accept().unwrap();
         stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -1073,7 +1156,7 @@ mod tests {
         published.retire().unwrap();
         drop(machine);
         assert!(!old_engine.alive());
-        let verified = software_state::open(&checkpoint, &config.profile().unwrap()).unwrap();
+        let verified = software_state::open(&checkpoint, config.profile().unwrap()).unwrap();
         fs::rename(&checkpoint, dir.join("saved-artifacts")).unwrap();
         fs::DirBuilder::new().mode(0o700).create(&checkpoint).unwrap();
         config.kernel = PathBuf::from("/missing-original-kernel");
@@ -1219,6 +1302,7 @@ mod tests {
         Machine {
             inputs: None,
             profile: software_state::Profile { architecture: std::env::consts::ARCH.into(), arguments: Vec::new() },
+            network: Network::Private,
             engine_version: Value::Null,
             capture: Mutex::default(),
             processes: Arc::new(Processes::default()),
