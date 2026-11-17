@@ -20,6 +20,15 @@ struct Metadata {
     id: String,
     name: String,
     capacity_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    software_import: Option<ImportId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ImportId {
+    pub vm_id: String,
+    pub transfer_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -210,7 +219,11 @@ impl Catalog {
             bail!("volume metadata is too large");
         }
         let metadata: Metadata = serde_json::from_slice(&bytes)?;
-        if metadata.schema_version != 1 || metadata.id != id || !valid_name(&metadata.name) {
+        if metadata.schema_version != 1
+            || metadata.id != id
+            || !valid_name(&metadata.name)
+            || metadata.software_import.as_ref().is_some_and(|offer| !valid_id(&offer.vm_id) || !valid_id(&offer.transfer_id))
+        {
             bail!("unsupported or inconsistent volume metadata");
         }
         capacity(metadata.capacity_bytes)?;
@@ -326,7 +339,65 @@ impl Catalog {
         })
     }
 
-    // The caller holds the catalog mutation lock through population and publication.
+    pub(crate) fn check_adoption(&self, id: &str, offer: &ImportId, returning: bool) -> Result<()> {
+        let _catalog = self.lock(libc::LOCK_SH)?;
+        if let Some(volume) = self.volumes()?.into_iter().find(|info| info.metadata.id == id) {
+            if volume.metadata.software_import.as_ref() != Some(offer) && !returning {
+                bail!("imported volume {id} conflicts with an existing catalog volume");
+            }
+        }
+        Ok(())
+    }
+
+    /// The caller has reserved this disk in the destination execution journal.
+    /// Reuse only an exact prior import or the VM's fenced catalog copy on return.
+    pub(crate) fn adopt(&self, id: &str, size: u64, input: &File, offer: &ImportId, returning: bool) -> Result<Writer> {
+        if !valid_id(id) {
+            bail!("invalid imported volume identity");
+        }
+        capacity(size)?;
+        let _catalog = self.lock(libc::LOCK_EX)?;
+        self.recover()?;
+        let volumes = self.volumes()?;
+        let current = volumes.iter().find(|info| info.metadata.id == id);
+        let mut old = None;
+        let name = if let Some(current) = current {
+            let (info, dir, disk) = self.read(id)?;
+            crate::host::flock(&disk, libc::LOCK_EX | libc::LOCK_NB).map_err(|error| format!("managed volume {id} is still in use: {error}"))?;
+            if info.metadata.software_import.as_ref() == Some(offer) {
+                self.directory.sync_all()?;
+                return Ok(Writer { id: id.into(), size: info.metadata.capacity_bytes, file: disk });
+            }
+            if !returning || entries(&dir)?.iter().any(|name| !MEMBERS.contains(&name.as_str())) {
+                bail!("imported volume {id} conflicts with an existing catalog volume");
+            }
+            old = Some(disk);
+            current.metadata.name.clone()
+        } else {
+            let name = format!("software-{id}");
+            if volumes.iter().any(|v| v.metadata.name == name) {
+                bail!("imported volume name {name:?} already exists");
+            }
+            name
+        };
+        let staging = format!(".creating-v1-{}", util::random_hex(16)?);
+        let metadata = Metadata { schema_version: 1, id: id.into(), name, capacity_bytes: size, software_import: Some(offer.clone()) };
+        let file = self.build_locked(&staging, &metadata, |target| copy_raw(input, target, size))?;
+        crate::host::flock(&file, libc::LOCK_EX | libc::LOCK_NB)?;
+        if let Some(old) = old {
+            let staging_name = util::cname(&staging);
+            let id_name = util::cname(id);
+            let dir = self.directory.as_raw_fd();
+            util::check(unsafe { libc::renameat2(dir, staging_name.as_ptr(), dir, id_name.as_ptr(), libc::RENAME_EXCHANGE) })?;
+            self.directory.sync_all()?;
+            drop(old);
+            self.cleanup(&staging)?;
+        } else {
+            rename(&self.directory, &staging, id)?;
+        }
+        Ok(Writer { id: id.into(), size, file })
+    }
+
     fn create_locked(&self, name: &str, size: u64, populate: impl FnOnce(&File) -> Result<()>) -> Result<Info> {
         if !valid_name(name) {
             bail!("volume names must be 1–63 ASCII letters/digits/._-, start with a letter or digit, and not be a 32-digit hexadecimal identifier");
@@ -338,23 +409,29 @@ impl Catalog {
         }
         let id = util::random_hex(16)?;
         let staging = format!(".creating-v1-{id}");
-        util::check(unsafe { libc::mkdirat(self.directory.as_raw_fd(), util::cname(&staging).as_ptr(), 0o700) })?;
-        let metadata = Metadata { schema_version: 1, id: id.clone(), name: name.into(), capacity_bytes: size };
-        let dir = directory(&self.directory, &staging)?;
+        let metadata = Metadata { schema_version: 1, id: id.clone(), name: name.into(), capacity_bytes: size, software_import: None };
+        self.build_locked(&staging, &metadata, populate)?;
+        rename(&self.directory, &staging, &id)?;
+        Ok(self.read(&id)?.0)
+    }
+
+    // The caller holds the catalog mutation lock through population and publication.
+    fn build_locked(&self, staging: &str, metadata: &Metadata, populate: impl FnOnce(&File) -> Result<()>) -> Result<File> {
+        util::check(unsafe { libc::mkdirat(self.directory.as_raw_fd(), util::cname(staging).as_ptr(), 0o700) })?;
+        let dir = directory(&self.directory, staging)?;
         let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL;
         let disk = member(&dir, "disk.raw", flags)?;
-        disk.set_len(size)?;
+        disk.set_len(metadata.capacity_bytes)?;
         populate(&disk)?;
-        if disk.metadata()?.len() != size {
+        if disk.metadata()?.len() != metadata.capacity_bytes {
             bail!("new volume capacity differs from its declared capacity");
         }
         disk.sync_all()?;
         let mut record = member(&dir, "metadata.json", flags)?;
-        record.write_all(&serde_json::to_vec(&metadata)?)?;
+        record.write_all(&serde_json::to_vec(metadata)?)?;
         record.sync_all()?;
         dir.sync_all()?;
-        rename(&self.directory, &staging, &id)?;
-        Ok(self.read(&id)?.0)
+        Ok(disk)
     }
 
     pub fn remove(&self, name: &str) -> Result<()> {
@@ -383,6 +460,30 @@ mod tests {
     use std::io::{Seek, SeekFrom};
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn imported_volumes_reuse_their_offer_and_atomically_replace_a_fenced_return() {
+        let root = crate::test_util::TempDir::new("volume-import");
+        let catalog = Catalog::open(&root).unwrap();
+        let id = catalog.create("database", 512).unwrap().metadata.id;
+        let payload = File::options().read(true).write(true).create_new(true).open(root.join("payload")).unwrap();
+        payload.set_len(512).unwrap();
+        payload.write_all_at(b"from-peer", 0).unwrap();
+        let tag = ImportId { vm_id: "11".repeat(16), transfer_id: "22".repeat(16) };
+        assert!(catalog.check_adoption(&id, &tag, false).is_err());
+        assert!(catalog.adopt(&id, 512, &payload, &tag, false).is_err());
+        let writer = catalog.adopt(&id, 512, &payload, &tag, true).unwrap();
+        let inode = writer.file.metadata().unwrap().ino();
+        let mut bytes = [0; 9];
+        writer.file.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(&bytes, b"from-peer");
+        assert!(catalog.writer("database").is_err());
+        crate::host::flock(&writer.file, libc::LOCK_UN).unwrap();
+        catalog.check_adoption(&id, &tag, false).unwrap();
+        assert_eq!(catalog.adopt(&id, 512, &payload, &tag, false).unwrap().file.metadata().unwrap().ino(), inode);
+        let unrelated = ImportId { vm_id: "33".repeat(16), transfer_id: "44".repeat(16) };
+        assert!(catalog.check_adoption(&id, &unrelated, false).is_err());
+    }
 
     #[test]
     fn retained_sparse_volume_has_stable_identity_and_data() {

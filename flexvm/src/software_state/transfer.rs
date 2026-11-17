@@ -187,6 +187,11 @@ impl<'a> DiskAdmission<'a> {
 /// Call while holding the software state lock. Retirement records the entire
 /// disk set atomically before releasing any of their per-file writer leases.
 fn require_local_disk(state: &File, volume_id: &str) -> Result<()> {
+    bundle::activate::require_disk_not_reserved(state, volume_id, None)?;
+    require_disk_source(state, volume_id, None)
+}
+
+fn require_disk_source(state: &File, volume_id: &str, allowed_return: Option<&Offer>) -> Result<()> {
     for entry in fs::read_dir(crate::host::fd_path(state.as_raw_fd()))? {
         let entry = entry?;
         let name = entry.file_name();
@@ -195,7 +200,7 @@ fn require_local_disk(state: &File, volume_id: &str) -> Result<()> {
             continue;
         }
         let fence = record::<SourceFence>(state, name)?;
-        if !fence.recovered && fence.disks.iter().any(|disk| disk.volume_id == volume_id) {
+        if !fence.recovered && Some(&fence.offer) != allowed_return && fence.disks.iter().any(|disk| disk.volume_id == volume_id) {
             let returned = bundle::activate::return_grant_generation(state, &fence.offer)?;
             if returned.is_none_or(|generation| generation <= fence.offer.generation) {
                 bail!("managed volume {volume_id} is fenced by software VM transfer");
