@@ -365,11 +365,12 @@ fn lend_routed_address(host: &Host, vm: &str, network: RoutedNetwork, destinatio
     }
     let lock = host.lock()?;
     let address = host.addr(&lock, ip)?;
+    let owner = address.holder_id.as_ref().ok_or("software transfer source address has no recorded owner")?;
     if address.holder.as_deref() != Some(vm)
         || address.seen != network.generation
         || address.held != network.generation
         || !address.current(network.generation)
-        || address.holder_id.as_ref() == Some(&crate::host::Ident::me())
+        || PidFd::open(owner)?.is_some()
         || Some(address.rev) != network.revision
         || address.arriving.is_some()
         || address.leaving.is_some()
