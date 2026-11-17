@@ -89,6 +89,15 @@ accelerator; TCG's architectural SVM/NPT state uses its existing serialization.
 ARM uses Cortex-A72 with EL2;
 the max/VHE cold-restore failure remains a documented profile limitation.
 
+The x86 guest kernel also provides correlated `KVM_CLOCK_REALTIME` data when a VM
+cannot use KVM's master TSC clock. It samples raw and realtime clocks together,
+retains the existing boot and VM offsets, and leaves the host-TSC and stable-TSC
+flags clear on that fallback path. This lets unchanged clients request realtime
+clock adjustment during snapshot restore without forcing an unsuitable TSC
+clocksource. `software-boot.py --guest-kvm --guest-clock` verifies the fallback
+with a fresh VM that has no vCPUs, then checks elapsed-realtime adjustment through
+`KVM_SET_CLOCK`. The x86 software CI checkpoint job includes this regression.
+
 ## Ownership and guest requests
 
 A VM owner serializes start, pause, resume, checkpoint, transfer and destruction

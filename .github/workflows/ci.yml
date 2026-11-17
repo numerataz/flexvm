@@ -195,7 +195,7 @@ jobs:
           cat "$RUNNER_TEMP/software-boot/report.json"
       - name: TSC initialization without hardware scaling
         if: matrix.arch == 'x86_64'
-        run: sudo python3 scripts/compat/software-boot.py --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-tsc" --guest-kvm --guest-tsc
+        run: sudo python3 scripts/compat/software-boot.py --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-tsc" --guest-kvm --guest-tsc --guest-clock
       - name: Save software kernel
         if: success() && steps.software-kernel.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
