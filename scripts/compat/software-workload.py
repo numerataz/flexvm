@@ -78,9 +78,13 @@ def exercise(args):
         raise RuntimeError('foreground canary did not make fresh progress')
 
     def step(action, phase):
-        output = cli('exec', '-i', NAME, '/bin/sh', '-s', '--', action, nonce, phase, input=workload)
-        (args.output / f'{action}-{phase}.log').write_text(output)
-        return output
+        completed = cli('exec', '-i', NAME, '/bin/sh', '-s', '--', action, nonce, phase,
+                        input=workload, check=False, result=True)
+        (args.output / f'{action}-{phase}.log').write_text(completed.stdout)
+        (args.output / f'{action}-{phase}.stderr.log').write_text(completed.stderr)
+        if completed.returncode:
+            raise RuntimeError(f'workload {action}-{phase} exited {completed.returncode}; see its stdout/stderr logs')
+        return completed.stdout
 
     def verify(phase, before):
         capabilities = json.loads(cli('exec', NAME, '/guest-probe'))
