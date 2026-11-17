@@ -1,0 +1,148 @@
+--- a/qapi/misc-i386.json
++++ b/qapi/misc-i386.json
+@@ -470,3 +470,57 @@
+ ##
+ { 'command': 'xen-event-inject',
+   'data': { 'port': 'uint32' } }
++
++##
++# @FlexvmX86Segment:
++#
++# An x86 segment cache exported by the experimental FlexVM worker.
++#
++# @selector: The segment selector.
++# @base: The cached segment base.
++# @limit: The cached effective segment limit.
++# @flags: The cached x86 descriptor flags.
++##
++{ 'struct': 'FlexvmX86Segment',
++  'data': { 'selector': 'uint16', 'base': 'uint64',
++            'limit': 'uint32', 'flags': 'uint32' } }
++
++##
++# @FlexvmX86SpecialRegisters:
++#
++# Live x86 special registers from a stopped worker vCPU.
++#
++# @segments: CS, DS, ES, FS, GS, SS, TR, and LDT, in that order.
++# @gdt-base: The GDT base.
++# @gdt-limit: The GDT limit.
++# @idt-base: The IDT base.
++# @idt-limit: The IDT limit.
++# @cr0: The CR0 register.
++# @cr2: The CR2 register.
++# @cr3: The CR3 register.
++# @cr4: The CR4 register.
++# @cr8: The APIC task priority register in CR8 units.
++# @efer: The EFER register.
++# @apic-base: The APIC base MSR.
++##
++{ 'struct': 'FlexvmX86SpecialRegisters',
++  'data': { 'segments': [ 'FlexvmX86Segment' ],
++            'gdt-base': 'uint64', 'gdt-limit': 'uint16',
++            'idt-base': 'uint64', 'idt-limit': 'uint16',
++            'cr0': 'uint64', 'cr2': 'uint64', 'cr3': 'uint64',
++            'cr4': 'uint64', 'cr8': 'uint64', 'efer': 'uint64',
++            'apic-base': 'uint64' } }
++
++##
++# @x-flexvm-query-x86-sregs:
++#
++# Query special registers from the experimental FlexVM TCG worker.
++#
++# Features:
++#
++# @unstable: Experimental FlexVM worker protocol.
++#
++# Returns: Special registers of the single stopped vCPU.
++##
++{ 'command': 'x-flexvm-query-x86-sregs',
++  'returns': 'FlexvmX86SpecialRegisters', 'features': [ 'unstable' ] }
+--- a/stubs/meson.build
++++ b/stubs/meson.build
+@@ -78,6 +78,7 @@
+   stub_ss.add(files('xen-hw-stub.c'))
+   stub_ss.add(files('monitor-arm-gic.c'))
+   stub_ss.add(files('monitor-i386-rtc.c'))
++  stub_ss.add(files('monitor-i386-flexvm.c'))
+   stub_ss.add(files('monitor-i386-sev.c'))
+   stub_ss.add(files('monitor-i386-sgx.c'))
+   stub_ss.add(files('monitor-i386-xen.c'))
+--- a/target/i386/monitor.c
++++ b/target/i386/monitor.c
+@@ -31,6 +31,11 @@
+ #include "qapi/error.h"
+ #include "qapi/qapi-commands-misc.h"
+ #include "system/memory.h"
++#include "qapi/qapi-commands-misc-i386.h"
++#include "qapi/util.h"
++#include "hw/i386/apic.h"
++#include "system/runstate.h"
++#include "system/tcg.h"
+
+ /* Perform linear address sign extension */
+ static hwaddr addr_canonical(CPUArchState *env, hwaddr addr)
+@@ -640,3 +645,49 @@
+ {
+     return monitor_defs;
+ }
++
++FlexvmX86SpecialRegisters *qmp_x_flexvm_query_x86_sregs(Error **errp)
++{
++    CPUState *cpu = first_cpu;
++    X86CPU *x86;
++    CPUX86State *env;
++    FlexvmX86SpecialRegisters *result;
++    FlexvmX86SegmentList **tail;
++
++    if (!cpu || CPU_NEXT(cpu) || !tcg_enabled() ||
++        !runstate_check(RUN_STATE_PAUSED)) {
++        error_setg(errp, "FlexVM requires one paused x86 TCG vCPU");
++        return NULL;
++    }
++    x86 = X86_CPU(cpu);
++    env = &x86->env;
++    result = g_new0(FlexvmX86SpecialRegisters, 1);
++    tail = &result->segments;
++    const SegmentCache *segments[] = {
++        &env->segs[R_CS], &env->segs[R_DS], &env->segs[R_ES],
++        &env->segs[R_FS], &env->segs[R_GS], &env->segs[R_SS],
++        &env->tr, &env->ldt,
++    };
++
++    for (size_t i = 0; i < ARRAY_SIZE(segments); i++) {
++        const SegmentCache *cache = segments[i];
++        FlexvmX86Segment *segment = g_new(FlexvmX86Segment, 1);
++        segment->selector = cache->selector;
++        segment->base = cache->base;
++        segment->limit = cache->limit;
++        segment->flags = cache->flags;
++        QAPI_LIST_APPEND(tail, segment);
++    }
++    result->gdt_base = env->gdt.base;
++    result->gdt_limit = env->gdt.limit;
++    result->idt_base = env->idt.base;
++    result->idt_limit = env->idt.limit;
++    result->cr0 = env->cr[0];
++    result->cr2 = env->cr[2];
++    result->cr3 = env->cr[3];
++    result->cr4 = env->cr[4];
++    result->cr8 = cpu_get_apic_tpr(x86->apic_state);
++    result->efer = env->efer;
++    result->apic_base = cpu_get_apic_base(x86->apic_state);
++    return result;
++}
+--- /dev/null
++++ b/stubs/monitor-i386-flexvm.c
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qapi/qapi-commands-misc-i386.h"
++
++FlexvmX86SpecialRegisters *qmp_x_flexvm_query_x86_sregs(Error **errp)
++{
++    error_setg(errp, "FlexVM special registers require an x86 worker");
++    return NULL;
++}

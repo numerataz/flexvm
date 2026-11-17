@@ -99,7 +99,7 @@ static int request(struct pvkvm *provider, enum pvkvm_command command,
 	wmb();
 	writel(seq, m + PVKVM_REQUEST_AT);
 	writel(PVKVM_HOST_VECTOR, provider->doorbell + PVKVM_DOORBELL_AT);
-	if (command == PVKVM_RUN || command == PVKVM_GET_REGS)
+	if (command == PVKVM_RUN || command == PVKVM_GET_REGS || command == PVKVM_GET_SREGS)
 		waited = wait_event_interruptible_timeout(provider->replied,
 				atomic_read(&provider->interrupt_count) != interrupts &&
 				readl(m + PVKVM_REPLY_AT) == seq, 5 * HZ);
@@ -230,6 +230,20 @@ unlock:
 	return result;
 }
 
+static int read_stopped_registers(struct pvkvm *p, enum pvkvm_command command,
+				  void *registers, size_t size)
+{
+	int result = mutex_lock_interruptible(&p->lock);
+
+	if (result)
+		return result;
+	result = request(p, command, NULL, NULL);
+	if (!result)
+		memcpy_fromio(registers, p->mailbox + PVKVM_REGISTERS_AT, size);
+	mutex_unlock(&p->lock);
+	return result;
+}
+
 static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct pvcpu *cpu = file->private_data;
@@ -245,7 +259,7 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	result = mutex_lock_interruptible(&cpu->execution);
 	if (result)
 		return -EINTR;
-	if (cpu->ran && (cmd == KVM_GET_SREGS || cmd == KVM_SET_SREGS)) {
+	if (cpu->ran && cmd == KVM_SET_SREGS) {
 		mutex_unlock(&cpu->execution);
 		return -EOPNOTSUPP;
 	}
@@ -253,14 +267,7 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case KVM_GET_REGS:
 		regs = cpu->regs;
 		if (cpu->ran) {
-			if (mutex_lock_interruptible(&p->lock)) {
-				result = -EINTR;
-				break;
-			}
-			result = request(p, PVKVM_GET_REGS, NULL, NULL);
-			if (!result)
-				memcpy_fromio(&regs, p->mailbox + PVKVM_REGISTERS_AT, sizeof(regs));
-			mutex_unlock(&p->lock);
+			result = read_stopped_registers(p, PVKVM_GET_REGS, &regs, sizeof(regs));
 			if (result)
 				break;
 		}
@@ -299,7 +306,13 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		result = 0;
 		break;
 	case KVM_GET_SREGS:
-		result = copy_to_user(uarg, &cpu->sregs, sizeof(cpu->sregs)) ? -EFAULT : 0;
+		sregs = cpu->sregs;
+		if (cpu->ran) {
+			result = read_stopped_registers(p, PVKVM_GET_SREGS, &sregs, sizeof(sregs));
+			if (result)
+				break;
+		}
+		result = copy_to_user(uarg, &sregs, sizeof(sregs)) ? -EFAULT : 0;
 		break;
 	case KVM_SET_SREGS:
 		if (copy_from_user(&sregs, uarg, sizeof(sregs))) {

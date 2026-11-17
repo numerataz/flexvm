@@ -85,6 +85,9 @@ int main(int argc, char **argv)
         check(munmap((void *)scratch, scratch_bytes) == 0, "release intervening pages");
     const unsigned char code[] = {
         0xba, 0, pages, 0x8e, 0xda,   /* mov dx, pages * 0x100; mov ds, dx */
+        0x66, 0x0f, 0x01, 0x16, 0x00, 0x01, /* lgdt ds:[0x100] with a 32-bit base */
+        0x66, 0xbb, 0xef, 0xcd, 0xab, 0x89,  /* mov ebx, 0x89abcdef */
+        0x0f, 0x22, 0xd3,                    /* mov cr2, ebx */
         0x2e, 0xc6, 0x06, 0x90, 0x10, 0x57, /* mov byte cs:[0x1090], 0x57 */
         0xc6, 0x06, 0x80, 0x00, 0x56, /* mov byte ds:[0x80], 0x56 */
         0xb9, 0x57, 0x13,             /* mov cx, 0x1357 */
@@ -101,6 +104,8 @@ int main(int argc, char **argv)
     memcpy(ram + 0x10, code, sizeof(code));
     memcpy(ram + 0x40, resumed, sizeof(resumed));
     unsigned char *data = ram + ram_bytes - 4096;
+    const unsigned char gdtr[] = {0x2f, 0x00, 0x80, 0x34, 0x12, 0x00};
+    memcpy(data + 0x100, gdtr, sizeof(gdtr));
     int cpu = ioctl(vm, KVM_CREATE_VCPU, 0);
     check(cpu >= 0 && (fcntl(cpu, F_GETFD) & FD_CLOEXEC), "vCPU file descriptor");
     check(ioctl(vm, KVM_CREATE_VCPU, 0) == -1 && errno == EEXIST, "reject duplicate vCPU");
@@ -123,6 +128,11 @@ int main(int argc, char **argv)
     unsigned long long first = timed_run(cpu);
     check_output(run, size, 0x42);
     check_registers(cpu, 0x42, 0x1357);
+    check(ioctl(cpu, KVM_GET_SREGS, &sregs) == 0, "read actual special registers after exit");
+    check(sregs.ds.selector == pages * 0x100 && sregs.ds.base == pages * 4096 &&
+          sregs.ds.limit == 0xffff && sregs.ds.present && !sregs.ds.unusable &&
+          sregs.gdt.base == 0x123480 && sregs.gdt.limit == 0x2f && sregs.cr2 == 0x89abcdef,
+          "observed segment cache, descriptor table, and control register match child instructions");
     check(ram[0x90] == 0x57 && data[0x80] == 0x56 && data[0x82] == 0,
           "child wrote the first and last slots and stopped after its first output");
     data[0x81] = 0x52;

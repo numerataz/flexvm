@@ -3,7 +3,7 @@
 #define FLEXVM_PVKVM_MAILBOX_H
 
 #define PVKVM_MAGIC        0x4d564b46
-#define PVKVM_VERSION      7
+#define PVKVM_VERSION      8
 #define PVKVM_MAGIC_AT     0
 #define PVKVM_VERSION_AT   4
 #define PVKVM_REQUEST_AT   8
@@ -31,6 +31,7 @@ enum pvkvm_command {
 	PVKVM_RUN,
 	PVKVM_GET_REGS,
 	PVKVM_SET_REGS,
+	PVKVM_GET_SREGS,
 };
 
 #endif

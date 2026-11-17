@@ -82,6 +82,12 @@ int main(int argc, char **argv)
                   "return host registers to the parent");
             continue;
         }
+        if (received == 1 && request[0] == 'X') {
+            check(ioctl(cpu, KVM_GET_SREGS, &segments) == 0, "read host special registers after exit");
+            check(write(control, &segments, sizeof(segments)) == (ssize_t)sizeof(segments),
+                  "return host special registers to the parent");
+            continue;
+        }
         check(received == 1 && request[0] == 'R', "invalid run request");
         check(ioctl(cpu, KVM_RUN, 0) == 0, "run host vCPU");
         check(run->exit_reason == KVM_EXIT_IO && run->io.direction == KVM_EXIT_IO_OUT &&
