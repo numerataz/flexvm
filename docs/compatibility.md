@@ -136,6 +136,29 @@ drivers and do not select a fallback snapshotter. Guest RAM includes the PVC
 data during saved-state operations; destroying the VM removes it. Durable
 writable disks remain tracked in #1329. These are single-node acceptance cases.
 
+## Incus system containers
+
+The `incus` workload installs stock Ubuntu Incus/LXCFS and ordinary network
+helpers inside the owned systemd guest. Minimal Incus initialization uses a
+managed bridge and the [directory storage driver](https://linuxcontainers.org/incus/docs/main/reference/storage_dir/).
+It launches an official Debian 13 unprivileged instance and records the resolved
+image fingerprint and installed runtime versions. CPU limits request an explicit
+`50ms/100ms` quota; a percentage allowance alone does not establish a hard quota.
+
+Preparation exercises a managed custom data volume, stopped-instance snapshots,
+clone startup/data access/deletion and snapshot restoration. The original stays
+stopped while its clone uses the same data volume. The live instance and Incus
+daemon then retain their process identities through outer VM lifecycle changes,
+while a nested systemd service retains its machine ID, start identity, random RAM
+canary and advancing counter. Tests check kernel container/service CPU/memory/PID
+limits, managed bridge HTTP, DNS, outbound HTTP and root/volume markers.
+
+Incus snapshots in this case capture container files; outer FlexVM checkpoints
+preserve the running daemon and instance RAM. Directory storage and its image
+cache still live in the outer guest's RAM-backed writable root. Persistence
+after destroying the outer VM remains part of #1329. This case does not test
+Incus virtual-machine instances or every storage backend.
+
 ## Migration
 
 A configured local peer must use compatible CPU/kernel/Firecracker artifacts
