@@ -66,6 +66,22 @@ creation, enforced seccomp filtering, BPF map creation, perf events, pidfds,
 memfds, io_uring, nftables/conntrack queries, legacy iptables and KVM VM creation.
 They test individual facilities, not every operation a runtime might need.
 
+## System containers
+
+The `nspawn` workload uses stock Ubuntu `systemd-container`, machined and a
+Noble root filesystem built by debootstrap inside the owned guest. It first boots
+an OS without user namespace isolation and verifies graceful `machinectl poweroff`,
+then starts it with `PrivateUsers=pick` and shifted filesystem ownership. This
+exercises a root-launched, user-namespaced system container; it does not establish
+that an unprivileged caller can launch nspawn. See the [systemd documentation](https://www.freedesktop.org/software/systemd/man/255/systemd-nspawn.html).
+
+The live nested systemd service retains its process start identity, random RAM
+canary and machine ID across the outer VM lifecycle. Tests verify CPU/memory/PID
+limits, machined execution, veth traffic, DNS and outbound HTTP. The fixture
+configures the container veth through normal systemd-networkd settings, leaving
+the outer guest's eth0 configuration intact. Root files remain part of saved VM
+RAM; this case does not supply durable disks or test LXC/Incus (#1325/#1329).
+
 ## Migration
 
 A configured local peer must use compatible CPU/kernel/Firecracker artifacts

@@ -347,7 +347,7 @@ jobs:
       fail-fast: false
       matrix:
         arch: [x86_64, aarch64]
-        workload: [podman, namespace-sandboxes, containerd, rootless-docker, rootless-containerd, rootless-podman]
+        workload: [podman, namespace-sandboxes, containerd, rootless-docker, rootless-containerd, rootless-podman, nspawn]
         include:
           - { arch: x86_64, runner: ubuntu-24.04, qemu: qemu-system-x86 }
           - { arch: aarch64, runner: ubuntu-24.04-arm, qemu: qemu-system-arm }
@@ -390,15 +390,15 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Build FlexVM
         run: cargo build --release -p flexvm
-      - name: Prepare the systemd image for rootless services
-        if: startsWith(matrix.workload, 'rootless-')
+      - name: Prepare the systemd image for distro workloads
+        if: startsWith(matrix.workload, 'rootless-') || matrix.workload == 'nspawn'
         run: |
           scripts/fetch.sh --state "$RUNNER_TEMP/software-state"
           sudo python3 scripts/test-image.py --state "$RUNNER_TEMP/software-state" "$RUNNER_TEMP/software-distro-image"
       - name: Guest workload and fresh-owner software restoration
         run: |
           workload_args=()
-          if [[ "${{ matrix.workload }}" == rootless-* ]]; then
+          if [[ "${{ matrix.workload }}" == rootless-* || "${{ matrix.workload }}" == nspawn ]]; then
             workload_args=(--boot systemd --image "$RUNNER_TEMP/software-distro-image")
           fi
           sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --workload "scripts/compat/workloads/${{ matrix.workload }}.sh" "${workload_args[@]}" --require storage.fuse --output "$RUNNER_TEMP/software-workload" --timeout 1800

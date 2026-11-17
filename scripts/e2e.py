@@ -2475,7 +2475,7 @@ def kernel_modules():
 @contextlib.contextmanager
 def workload_test_egress():
     """The coordinator owns temporary egress rules, even if a worker is killed."""
-    workloads = {"podman", "namespace_sandboxes", "containerd", "distro_openrc", "distro_openrc_pressure", "user_sessions", "rootless_docker", "rootless_containerd", "rootless_podman"}
+    workloads = {"podman", "namespace_sandboxes", "containerd", "distro_openrc", "distro_openrc_pressure", "user_sessions", "rootless_docker", "rootless_containerd", "rootless_podman", "nspawn"}
     if args.worker or args.selftest or args.no_kvm or os.geteuid() != 0 or not workloads.intersection(args.cases or CASES) or kvm_unusable():
         yield
         return
@@ -2851,6 +2851,13 @@ def distro_systemd():
         B.rm(vm, force=True, check=False)
         A.rm(clone, force=True, check=False)
         clear_checkpoints(A, B)
+
+
+@case
+@needs_kvm
+def nspawn():
+    """Boot a user-namespaced systemd OS with stock nspawn/machined through VM lifecycle."""
+    compat_workload("nspawn", boot="systemd")
 
 
 @case
@@ -3689,7 +3696,7 @@ def worker():
 # runs, as e2e.py's summary prints them): --split balances by these, the long ones start first, and
 # the short ones go in batches of about BATCH_S (each batch is a worker, with hosts of its own).
 # Unlisted ones count as 2 s.
-COST = {"rootless_podman": 180, "rootless_containerd": 180, "rootless_docker": 180, "user_sessions": 180, "distro_openrc": 160, "distro_openrc_pressure": 160, "distro_bad_init": 10, "distro_pressure": 80, "distro_systemd": 40, "guest_poweroff": 10, "containerd": 180, "namespace_sandboxes": 180, "podman": 180, "faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "ipv6_taps": 10, "nettest_ipv6": 30, "docker_api": 15, "restart_policy": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
+COST = {"nspawn": 180, "rootless_podman": 180, "rootless_containerd": 180, "rootless_docker": 180, "user_sessions": 180, "distro_openrc": 160, "distro_openrc_pressure": 160, "distro_bad_init": 10, "distro_pressure": 80, "distro_systemd": 40, "guest_poweroff": 10, "containerd": 180, "namespace_sandboxes": 180, "podman": 180, "faults/exec_background": 110, "faults/exec_stalled_cap": 140, "containers": 15, "ipv6_taps": 10, "nettest_ipv6": 30, "docker_api": 15, "restart_policy": 15, "faults/reboot": 40, "faults/mem_refused_fill": 92, "faults/arrival_overtaken": 78,
         "faults/cow_grow": 65, "faults/reconcile_kill": 64, "faults/target_renamed": 40, "faults/plug_race": 45, "faults/guest_hang": 44,
         "faults/exec_pause_grace": 42, "faults/exec_ckpt_stalled": 115, "faults/route_abort": 35, "faults/unplug_collapsed": 30,
         "faults/arrival_grew": 25, "faults/pause_resume": 24, "faults/evict_latency": 25, "faults/mem_high": 25, "faults/target_killed": 25,
