@@ -381,7 +381,7 @@ def exercise(args):
             for name in (remote, 'received-again'):
                 subprocess.run([*destination_base, 'rm', '-f', name], capture_output=True, timeout=20)
             subprocess.run([*intermediary_base, 'rm', '-f', 'third-host'], capture_output=True, timeout=20)
-            cli('rm', '-f', 'returned-test', 'returned-via-third')
+            cli('rm', '-f', 'returned-test', 'returned-via-third', pending=True)
         cli('rm', '-f', 'state-test')
 
     evidence = {'cycles': []}
