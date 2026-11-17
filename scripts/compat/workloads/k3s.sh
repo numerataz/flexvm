@@ -94,7 +94,7 @@ items = [
         spec=dict(replicas=2, selector=dict(matchLabels=dict(app='web')),
             template=dict(metadata=dict(labels=dict(app='web')), spec=pod))),
     dict(apiVersion='v1', kind='Service', metadata=dict(name='web', namespace='flexvm-compat'),
-        spec=dict(type='NodePort', selector=dict(app='web'), ports=[dict(port=8080, targetPort=8080, nodePort=30089)])),
+        spec=dict(type='NodePort', selector=dict(app='web'), ports=[dict(port=8080, targetPort=8080)])),
     dict(apiVersion='networking.k8s.io/v1', kind='Ingress', metadata=dict(name='web', namespace='flexvm-compat'),
         spec=dict(ingressClassName='traefik', rules=[dict(host='flexvm.test', http=dict(paths=[
             dict(path='/', pathType='Prefix', backend=backend)]))])),
@@ -103,6 +103,7 @@ print(json.dumps(dict(apiVersion='v1', kind='List', items=items)))
 PY
     k3s kubectl --request-timeout=120s apply -f "$base/workload.json"
     k rollout status deployment/web --timeout=300s
+    k get service web -o jsonpath='{.spec.ports[0].nodePort}' > "$base/node-port"
     k3s kubectl get node flexvm-test -o json > "$base/node.json"
     k get pods -l app=web -o json > "$base/pods.json"
     for pod in $(k get pods -l app=web -o jsonpath='{.items[*].metadata.name}'); do
@@ -159,8 +160,12 @@ PY
     peer=$(k get pod "$second" -o jsonpath='{.status.podIP}')
     test "$(k exec "$first" -- wget -qO- "http://$peer:8080")" = "$nonce"
     k exec "$first" -- wget -qO /dev/null http://example.com
+    node_port=$(cat "$base/node-port")
+    case $node_port in ''|*[!0-9]*) exit 1 ;; esac
+    test "$node_port" -ge 30000 && test "$node_port" -le 32767
+    test "$(k get service web -o jsonpath='{.spec.ports[0].nodePort}')" = "$node_port"
     node_ip=$(ip -4 -o addr show dev eth0 | awk '{split($4, a, "/"); print a[1]; exit}')
-    test "$(curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 "http://$node_ip:30089")" = "$nonce"
+    test "$(curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 "http://$node_ip:$node_port")" = "$nonce"
     test "$(curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 -H 'Host: flexvm.test' "http://$node_ip/")" = "$nonce"
     printf 'K3S_PHASE_OK %s\n' "$phase"
     ;;
