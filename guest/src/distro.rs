@@ -20,6 +20,7 @@ struct Broker {
     gate: Mutex<Option<UnixStream>>,
 }
 static BROKER: OnceLock<Broker> = OnceLock::new();
+static INIT_FAILURE: Mutex<Option<String>> = Mutex::new(None);
 
 pub(crate) fn is_broker() -> bool {
     BROKER.get().is_some()
@@ -61,18 +62,24 @@ pub(crate) fn boot(profile: BootProfile) -> io::Result<()> {
     crate::mount("", "/", "", libc::MS_REC | libc::MS_PRIVATE, "")?;
     os(unsafe { libc::umount2(c"/sys/fs/cgroup".as_ptr(), libc::MNT_DETACH) })?;
     crate::mount("cgroup2", mem::CGROUP_ROOT, "cgroup2", libc::MS_NOSUID | libc::MS_NOEXEC | libc::MS_NODEV, "nsdelegate,memory_recursiveprot")?;
-    fs::create_dir_all("/sys/fs/cgroup/init.scope")?;
-    fs::write("/sys/fs/cgroup/init.scope/cgroup.procs", "0")?;
-    mem::enable_controllers(mem::CGROUP_ROOT)?;
+    // systemd creates init.scope and enables its own subtree controllers.
+    // The bootstrap owns only the outer pressure boundary and broker tree.
     parent.write_all(b"R")?;
     // Templates and standby VMs remain here. No real init/service identity has
     // started until the owner supplies per-VM settings and releases this gate.
     parent.set_read_timeout(None)?;
     receive(&mut parent, b'G')?;
-    drop(parent);
-    let environment = crate::app::distro_environment(&fs::read_to_string(ENVIRONMENT)?)?;
-    let error = Command::new(init_path(profile)?).current_dir("/").env_clear().envs(environment).exec();
-    Err(error)
+    // CLOEXEC closes this gate on successful exec. A failed exec reports its
+    // cause to the still-responsive broker instead of waiting out readiness.
+    let result = (|| {
+        let environment = crate::app::distro_environment(&fs::read_to_string(ENVIRONMENT)?)?;
+        Err(Command::new(init_path(profile)?).current_dir("/").env_clear().envs(environment).exec())
+    })();
+    if let Err(error) = &result {
+        let message = format!("distro init exec failed: {error}");
+        let _ = parent.write_all(&message.as_bytes()[..message.len().min(1024)]);
+    }
+    result
 }
 
 fn receive(stream: &mut UnixStream, expected: u8) -> io::Result<()> {
@@ -105,13 +112,19 @@ pub(crate) fn broker(descriptor: i32) -> io::Result<()> {
     mem::start_distro()
 }
 
-fn atomic_file(path: &str, bytes: &[u8], mode: u32) -> io::Result<()> {
+pub(crate) fn atomic_file(path: &str, bytes: &[u8], mode: u32) -> io::Result<()> {
     let temporary = format!("{path}.flexvm-new");
     let _ = fs::remove_file(&temporary);
     let mut file = File::options().write(true).create_new(true).open(&temporary)?;
     file.set_permissions(fs::Permissions::from_mode(mode))?;
     file.write_all(bytes)?;
-    fs::rename(&temporary, path)
+    let renamed = fs::rename(&temporary, path);
+    if renamed.as_ref().is_err_and(|error| error.raw_os_error() == Some(libc::EBUSY)) {
+        let result = crate::rewrite_bound_file(std::path::Path::new(path), bytes);
+        let _ = fs::remove_file(&temporary);
+        return result;
+    }
+    renamed
 }
 
 /// Idempotent across an APP retry: a released gate never assigns a new identity.
@@ -136,17 +149,31 @@ pub(crate) fn release(environment: &str) -> io::Result<bool> {
         atomic_file("/var/lib/dbus/machine-id", identity.as_bytes(), 0o444)?;
     }
     gate.write_all(b"G")?;
-    held.take();
+    let stream = held.take().unwrap();
+    std::thread::Builder::new().name("distro-init-result".into()).spawn(move || {
+        let mut message = String::new();
+        match stream.take(1024).read_to_string(&mut message) {
+            Ok(_) if message.is_empty() => (), // successful exec closed the CLOEXEC gate
+            result => {
+                let failure = result.err().map_or(message, |error| format!("distro init result: {error}"));
+                *INIT_FAILURE.lock().unwrap() = Some(failure);
+            }
+        }
+    })?;
     Ok(true)
 }
 
-pub(crate) fn status() -> &'static str {
+pub(crate) fn status() -> String {
+    if let Some(error) = &*INIT_FAILURE.lock().unwrap() {
+        return format!("failed {error}");
+    }
     match BROKER.get() {
         None => "idle",
         Some(broker) if broker.gate.lock().unwrap().is_some() => "idle",
         Some(_) if runtime::distro_context().is_ok_and(|context| context.is_some()) => "running 1",
         Some(_) => "starting 1",
     }
+    .into()
 }
 
 fn peer_unit(stream: &UnixStream) -> io::Result<String> {

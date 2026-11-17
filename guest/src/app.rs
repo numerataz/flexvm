@@ -108,7 +108,7 @@ pub fn handle(verb: &str, arg: &str, out: &File, statuses: &Statuses) -> io::Res
     }
     let reply = match verb {
         "APP" => start(arg, statuses),
-        "APPSTATUS" if crate::distro::is_broker() => Ok(crate::distro::status().into()),
+        "APPSTATUS" if crate::distro::is_broker() => Ok(crate::distro::status()),
         "APPSTATUS" => Ok(APP.lock().unwrap().status()),
         "CHECK" => check(arg, statuses),
         "SIGNAL" => signal(arg, statuses),
@@ -259,6 +259,7 @@ pub(crate) fn exec_command(e: &crate::proto::Exec) -> io::Result<(Command, Conf)
     // there but unreadable (a dangling link too) fails the exec: read as empty, a numeric user's group would become 0.
     let read = |p: &str| match e.user.as_ref().map(|_| crate::runtime::root_file(p, (libc::O_NONBLOCK | libc::O_NOCTTY) as u64).and_then(crate::read_etc_file))
     {
+        Some(Err(err)) if err.kind() == io::ErrorKind::WouldBlock => Err(err),
         Some(Err(err)) if err.kind() != io::ErrorKind::NotFound || crate::runtime::root_file(p, (libc::O_PATH | libc::O_NOFOLLOW) as u64).is_ok() => {
             Err(cannot_run(126, format!("cannot read {p}: {err}")))
         }
@@ -407,6 +408,9 @@ fn exec_conf(mut c: Conf, e: &crate::proto::Exec, passwd: &str, group: &str) -> 
         terminal_env(&mut c);
     }
     let cwd = crate::runtime::root_file(&c.cwd, libc::O_PATH as u64).and_then(|file| file.metadata());
+    if cwd.as_ref().is_err_and(|error| error.kind() == io::ErrorKind::WouldBlock) {
+        return Err(cwd.unwrap_err());
+    }
     if !cwd.as_ref().is_ok_and(|m| m.is_dir()) {
         let why = cwd.map_or_else(|e| e.to_string(), |_| "not a directory".into());
         return Err(cannot_run(126, format!("cannot change to directory {}: {why}", c.cwd)));
@@ -425,7 +429,7 @@ fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
     let c = config()?;
     let mut cg = match CheckGroup::new() {
         Ok(g) => Some(g),
-        Err(_) if c.uid == 0 => None,
+        Err(_) if c.uid == 0 && !crate::distro::is_broker() => None,
         Err(e) => return Err(io::Error::other(format!("cannot contain a non-root readiness check: {e}"))),
     };
     let mut cmd = command(c, &["/bin/sh", "-c", &String::from_utf8_lossy(&bytes)]);
@@ -442,7 +446,10 @@ fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
         confine_check(&mut cmd);
     }
     credentials(&mut cmd, c, true);
-    let (child, _, token) = spawn_watched(&mut cmd, statuses, false).map_err(|e| io::Error::new(e.kind(), format!("cannot run /bin/sh: {e}")))?;
+    let (child, _, token) = spawn_watched(&mut cmd, statuses, false).map_err(|e| {
+        let hint = if crate::distro::is_broker() && e.kind() == io::ErrorKind::WouldBlock { crate::proto::TRY_AGAIN } else { "" };
+        io::Error::new(e.kind(), format!("cannot run /bin/sh: {e}{hint}"))
+    })?;
     let pid = child.id() as i32;
     let code = wait_exit(statuses, token, Some(deadline));
     // Kill whatever is left, the leader included if it timed out. Without a cgroup only its session
@@ -521,7 +528,13 @@ impl CheckGroup {
         {
             let mut live = CHECK_GROUPS.lock().unwrap();
             sweep_check_groups(&parent, &live);
-            std::fs::create_dir(&dir).map_err(|e| io::Error::other(format!("create {dir}: {e}")))?;
+            std::fs::create_dir(&dir).map_err(|e| {
+                if context.is_some() && matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENODEV)) {
+                    io::Error::new(io::ErrorKind::WouldBlock, format!("distro runtime changed before check{}", crate::proto::TRY_AGAIN))
+                } else {
+                    io::Error::other(format!("create {dir}: {e}"))
+                }
+            })?;
             live.push(dir.clone());
         }
         let mut group = Self::from_dir(dir)?;
@@ -548,6 +561,16 @@ impl CheckGroup {
 
     /// Done only once the group is removed: until then the drop tries again.
     fn cleanup(&mut self) -> io::Result<()> {
+        match self.cleanup_present() {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                self.finished();
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    fn cleanup_present(&mut self) -> io::Result<()> {
         self.tried = true;
         std::fs::write(format!("{}/cgroup.kill", self.dir), "1")?;
         // Reading through the polled fd rearms its POLLPRI, so a change after the read still wakes the poll.

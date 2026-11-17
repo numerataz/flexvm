@@ -2359,6 +2359,9 @@ impl Proc {
         let mut w = &c;
         let vm = self.vm();
         let input = req["op"] == "stdin";
+        if vm.template.meta.image.as_ref().is_some_and(|image| !image.boot.is_app()) {
+            return drop(send_json(&mut w, &json!({"ok": false, "error": format!("distro PID 1 has no app terminal; use flexvm exec -it {} sh", vm.name)})));
+        }
         if !self.spec.lock().unwrap().has_app(vm.template.meta.image.as_ref()) {
             let e = format!("vm {} has no app to attach to (its image has no entrypoint or command); flexvm exec -it {} sh", vm.name, vm.name);
             return drop(send_json(&mut w, &json!({"ok": false, "error": e})));

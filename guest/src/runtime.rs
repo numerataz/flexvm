@@ -52,7 +52,7 @@ pub(crate) fn begin_distro() {
 pub(crate) fn distro_context() -> io::Result<Option<Arc<DistroContext>>> {
     match &*DISTRO.read().unwrap() {
         DistroState::Disabled => Ok(None),
-        DistroState::Waiting => Err(io::Error::new(io::ErrorKind::WouldBlock, "distro runtime service is not ready")),
+        DistroState::Waiting => Err(io::Error::new(io::ErrorKind::WouldBlock, format!("distro runtime service is not ready{}", crate::proto::TRY_AGAIN))),
         DistroState::Ready(context) => Ok(Some(context.clone())),
     }
 }
@@ -146,7 +146,12 @@ pub fn enter(cmd: &mut Command) -> io::Result<()> {
             cmd.pre_exec(move || {
                 let _keep_alive = &retained;
                 if libc::write(work, b"0".as_ptr().cast(), 1) != 1 {
-                    return Err(io::Error::last_os_error());
+                    let error = io::Error::last_os_error();
+                    return Err(if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ENODEV)) {
+                        io::Error::from_raw_os_error(libc::EAGAIN)
+                    } else {
+                        error
+                    });
                 }
                 Ok(())
             });
@@ -208,6 +213,13 @@ fn open_root_file(root: &File, path: &str, flags: u64) -> io::Result<File> {
     let how = OpenHow { flags: flags | libc::O_CLOEXEC as u64, mode: 0, resolve: 0x10 }; // RESOLVE_IN_ROOT
     let fd = os(unsafe { libc::syscall(libc::SYS_openat2, root.as_raw_fd(), path.as_ptr(), &how, std::mem::size_of::<OpenHow>()) })?;
     Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(fd as i32) })
+}
+
+pub(crate) fn init_etc() -> io::Result<File> {
+    if crate::distro::is_broker() {
+        return open_root_file(&File::open("/proc/1/root")?, "/etc", libc::O_DIRECTORY as u64);
+    }
+    File::open("/etc")
 }
 
 pub(crate) fn root_file(path: &str, flags: u64) -> io::Result<File> {

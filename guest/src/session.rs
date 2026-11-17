@@ -801,6 +801,9 @@ fn open_attempt<'a>(
                 let (mut child, exited, token) = spawn.take().expect("session spawned once")(&mut cmd, statuses, true).map_err(|e| {
                     let program = cmd.get_program().to_string_lossy().into_owned();
                     match (&spec, e.kind()) {
+                        (_, io::ErrorKind::WouldBlock) if crate::distro::is_broker() => {
+                            io::Error::new(e.kind(), format!("distro runtime changed before exec: {e}{}", crate::proto::TRY_AGAIN))
+                        }
                         // The directory was checked: not found is the program (or its interpreter).
                         (Some(_), io::ErrorKind::NotFound) => cannot_run(127, format!("cannot run {program}: {e}")),
                         (Some(_), _) => cannot_run(126, format!("cannot run {program}: {e}")),

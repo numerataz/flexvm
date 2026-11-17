@@ -90,7 +90,7 @@ pub(crate) fn enable_controllers(dir: &str) -> io::Result<()> {
 }
 
 /// PID 1 calls this before starting threads or creating its cgroup namespace.
-/// Keep /vm's controllers disabled until PID 1 has moved to init.scope.
+/// Leave /vm's subtree controllers for the distro's service manager.
 pub(crate) fn prepare_distro() -> io::Result<()> {
     std::fs::write("/proc/sys/vm/overcommit_memory", "1")?;
     std::fs::create_dir_all(CGROUP_ROOT)?;

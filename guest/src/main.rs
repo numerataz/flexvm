@@ -891,7 +891,12 @@ fn set_hostname(name: &str) -> io::Result<()> {
         return Err(io::Error::other(format!("bad hostname {name:?}")));
     }
     os(unsafe { libc::sethostname(name.as_ptr().cast(), name.len()) })?;
-    let _ = name_in_hosts(std::path::Path::new("/etc/hosts"), name);
+    let etc = runtime::init_etc()?;
+    let directory = format!("/proc/self/fd/{}", etc.as_raw_fd());
+    let _ = name_in_hosts(&std::path::Path::new(&directory).join("hosts"), name);
+    if distro::is_broker() {
+        distro::atomic_file(&format!("{directory}/hostname"), format!("{name}\n").as_bytes(), 0o644)?;
+    }
     Ok(())
 }
 
@@ -931,12 +936,29 @@ fn name_in_hosts(hosts: &std::path::Path, name: &str) -> io::Result<()> {
         t.write_all(new.as_bytes())?;
         std::os::unix::fs::fchown(&t, Some(meta.uid()), Some(meta.gid()))?;
         t.set_permissions(meta.permissions())?;
-        std::fs::rename(&tmp, hosts)
+        match std::fs::rename(&tmp, hosts) {
+            Err(error) if error.raw_os_error() == Some(libc::EBUSY) => {
+                let result = rewrite_bound_file(hosts, new.as_bytes());
+                let _ = std::fs::remove_file(&tmp);
+                result
+            }
+            result => result,
+        }
     })();
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     res
+}
+
+/// A bind-mounted configuration file cannot be replaced with rename. Pin and
+/// validate the existing regular file before reopening it for an in-place write.
+fn rewrite_bound_file(path: &std::path::Path, bytes: &[u8]) -> io::Result<()> {
+    let file = File::options().read(true).custom_flags(libc::O_PATH | libc::O_NOFOLLOW).open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("configuration target is not a regular file"));
+    }
+    File::options().write(true).truncate(true).open(format!("/proc/self/fd/{}", file.as_raw_fd()))?.write_all(bytes)
 }
 
 /// `hosts` with its 127.0.1.1 lines (or a new one) naming `name` alone.

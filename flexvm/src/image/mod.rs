@@ -1146,6 +1146,7 @@ fn inject_systemd(root: &mut Root) -> Result<()> {
         br#"[Unit]
 Description=FlexVM workload delegation
 After=local-fs.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=notify

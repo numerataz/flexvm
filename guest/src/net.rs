@@ -5,6 +5,7 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -131,7 +132,8 @@ pub fn configure(ip: Ipv4Addr, ip6: Option<Ipv6Addr>, dns: &[&str]) -> io::Resul
     let route = |kind| request(fd, kind, route_flags(kind), &default_route6(ifindex));
     update_addresses(&mut a, ip, ip6, |kind, ip| address_request(fd, ifindex, kind, ip), route)?;
     if !dns.is_empty() {
-        resolv_conf(std::path::Path::new("/etc"), dns)?;
+        let etc = crate::runtime::init_etc()?;
+        resolv_conf(std::path::Path::new(&format!("/proc/self/fd/{}/.", etc.as_raw_fd())), dns)?;
     }
     Ok(())
 }
