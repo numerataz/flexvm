@@ -1,0 +1,24 @@
+From: FlexVM maintainers
+Subject: [PATCH] KVM: x86: initialize the TSC multiplier before setting its rate
+
+A newly allocated vCPU has zero TSC scaling ratios. The initial frequency
+request can fail, or select software catchup, without setting a multiplier
+when hardware TSC scaling is unavailable. vCPU creation intentionally does
+not reject that frequency, so initialize a safe unity multiplier first.
+This preserves subsequent KVM_SET_TSC_KHZ validation and valid scaling.
+
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -12035,6 +12035,12 @@
+ 	kvm_xen_init_vcpu(vcpu);
+ 	kvm_vcpu_mtrr_init(vcpu);
+ 	vcpu_load(vcpu);
++	/*
++	 * Initial frequency setup can fail or select catchup without writing a
++	 * multiplier. Keep the TSC running even without hardware scaling.
++	 */
++	kvm_vcpu_write_tsc_multiplier(vcpu,
++				    kvm_caps.default_tsc_scaling_ratio);
+ 	kvm_set_tsc_khz(vcpu, vcpu->kvm->arch.default_tsc_khz);
+ 	kvm_vcpu_reset(vcpu, false);
+ 	kvm_init_mmu(vcpu);
