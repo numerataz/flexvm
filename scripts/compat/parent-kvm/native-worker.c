@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 static void check(bool condition, const char *why)
@@ -65,14 +66,19 @@ int main(int argc, char **argv)
     segments.cs.base = 0;
     segments.cs.selector = 0;
     check(ioctl(cpu, KVM_SET_SREGS, &segments) == 0, "select real-mode code segment");
-    struct kvm_regs registers = {.rip = 4096, .rflags = 2};
-    check(ioctl(cpu, KVM_SET_REGS, &registers) == 0, "set host entry registers");
+    struct kvm_regs registers;
 
     check(write(control, "R", 1) == 1, "announce worker readiness");
-    unsigned char request[2];
+    unsigned char request[1 + sizeof(registers)];
     ssize_t received;
-    while ((received = read(control, request, sizeof(request))) != 0) {
+    while ((received = recv(control, request, sizeof(request), MSG_TRUNC)) != 0) {
         if (received < 0 && errno == EINTR) continue;
+        if (received == sizeof(request) && request[0] == 'S') {
+            memcpy(&registers, request + 1, sizeof(registers));
+            check(ioctl(cpu, KVM_SET_REGS, &registers) == 0, "write host registers");
+            check(write(control, "S", 1) == 1, "acknowledge host register write");
+            continue;
+        }
         if (received == 1 && request[0] == 'G') {
             check(ioctl(cpu, KVM_GET_REGS, &registers) == 0, "read host registers after exit");
             check(write(control, &registers, sizeof(registers)) == (ssize_t)sizeof(registers),
