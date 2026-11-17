@@ -31,6 +31,10 @@ formats are preserved and cause an error. Versioned `.creating-v1-` and
 protocol changes. Catalog operations never follow member symlinks or accept
 hardlinked backing files.
 
+Catalog operation locks are explicitly released when an operation ends, even
+if an unrelated child has inherited its descriptor before exec. Raw disk writer
+leases remain separate and survive until their inherited descriptors close.
+
 This lock is one prerequisite for future VM attachment. Durable migration
 ownership, checkpoint references and the engine's inherited-descriptor lifecycle
 must also be integrated before attached disks can use this catalog. The full

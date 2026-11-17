@@ -182,10 +182,10 @@ impl Catalog {
     }
 
     // Locks the stable catalog directory inode. It is never unlinked by catalog operations.
-    fn lock(&self, how: i32) -> Result<File> {
+    fn lock(&self, how: i32) -> Result<crate::host::Flock> {
         let lock: File = util::open_dir_at(self.directory.as_raw_fd(), c".")?.into();
         crate::host::flock(&lock, how | libc::LOCK_NB).map_err(|error| format!("volume catalog is busy: {error}"))?;
-        Ok(lock)
+        Ok(crate::host::Flock(lock))
     }
 
     fn read(&self, id: &str) -> Result<(Info, File, File)> {
@@ -374,6 +374,60 @@ mod tests {
         drop(disk);
         catalog.remove(&id).unwrap();
         assert!(catalog.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn catalog_operation_unlocks_before_an_inherited_child_execs() {
+        use crate::test_util::JoinWithin;
+        const CHILD: &str = "FLEXVM_TEST_CATALOG_FORK";
+        if std::env::var_os(CHILD).is_none() {
+            let status = crate::test_util::status(
+                Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "volume::tests::catalog_operation_unlocks_before_an_inherited_child_execs"])
+                    .env(CHILD, "1"),
+            )
+            .unwrap();
+            assert!(status.success(), "catalog fork helper: {status}");
+            return;
+        }
+        // Isolate the fork from other tests, and release its pre-exec gate even
+        // if the parent's assertion unwinds.
+        struct Release(std::os::unix::net::UnixStream);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = self.0.write_all(b"r");
+            }
+        }
+        let state = crate::test_util::TempDir::new("volume-catalog-fork");
+        let catalog = Catalog::open(&state).unwrap();
+        let operation = catalog.lock(libc::LOCK_EX).unwrap();
+        let (parent, child) = std::os::unix::net::UnixStream::pair().unwrap();
+        parent.set_read_timeout(Some(crate::test_util::WAIT)).unwrap();
+        child.set_read_timeout(Some(crate::test_util::WAIT)).unwrap();
+        let mut release = Release(parent);
+        let spawner = std::thread::spawn(move || {
+            let fd = child.as_raw_fd();
+            let mut command = Command::new("true");
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::write(fd, b"f".as_ptr().cast(), 1) != 1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let mut byte = 0u8;
+                    if libc::read(fd, (&mut byte as *mut u8).cast(), 1) != 1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            command.status()
+        });
+        release.0.read_exact(&mut [0]).unwrap();
+        drop(operation);
+        let result = catalog.create("after-fork", 512);
+        drop(release);
+        assert!(spawner.join_within().unwrap().unwrap().success());
+        result.unwrap();
     }
 
     #[test]
