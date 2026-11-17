@@ -1465,9 +1465,10 @@ def guest_poweroff():
             finally:
                 os.close(fd)
         finally:
-            A.kill(vm, check=False)
-            B.kill(vm, check=False)
+            A.rm(vm, force=True, check=False)
+            B.rm(vm, force=True, check=False)
             clear_checkpoints(A, B)
+            check(f"{phase}: no VM records left", vm not in A.ps() and vm not in B.ps())
 
 
 @case
