@@ -129,6 +129,7 @@ jobs:
         run: |
           python3 scripts/compat/test_harness.py
           python3 scripts/compat/test_software.py
+          python3 scripts/compat/test_workload_fixture.py
       - name: e2e scheduler self-test
         # Fake templates and workers, one of which cannot be spawned: its cases must fail.
         run: python3 scripts/e2e.py --selftest --log-dir "$RUNNER_TEMP/e2e-selftest"
@@ -436,6 +437,25 @@ jobs:
         run: |
           scripts/fetch.sh --state "$RUNNER_TEMP/software-state"
           sudo python3 scripts/test-image.py --state "$RUNNER_TEMP/software-state" "$RUNNER_TEMP/software-distro-image"
+      - name: Restore immutable workload fixture
+        if: (matrix.workload == 'kind' || matrix.workload == 'k3s')
+        id: workload-fixture-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/workload-fixture-cache
+          key: busybox-fixture-v1-${{ runner.arch }}-${{ hashFiles('scripts/compat/workload-fixture.py') }}
+      - name: Verify and export immutable workload fixture
+        if: (matrix.workload == 'kind' || matrix.workload == 'k3s')
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends skopeo
+          python3 scripts/compat/workload-fixture.py --cache "$RUNNER_TEMP/workload-fixture-cache/oci" --output "$RUNNER_TEMP/workload-fixture"
+      - name: Save verified workload fixture
+        if: (matrix.workload == 'kind' || matrix.workload == 'k3s') && steps.workload-fixture-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/workload-fixture-cache
+          key: ${{ steps.workload-fixture-cache.outputs.cache-primary-key }}
       - name: Guest workload and fresh-owner software restoration
         run: |
           workload_args=()
@@ -458,6 +478,12 @@ jobs:
           if [[ "${{ matrix.workload }}" == incus ]]; then
             workload_args+=(--mem 3072 --poweroff-timeout 180)
           fi
+          if [[ "${{ matrix.workload }}" == kind || "${{ matrix.workload }}" == k3s ]]; then
+            for name in busybox.tar busybox.json; do
+              workload_args+=(--seed "$RUNNER_TEMP/workload-fixture/$name" "/nested-input/$name")
+            done
+            workload_args+=(--seed scripts/compat/verify-fixture-import.py /nested-input/verify-fixture-import.py)
+          fi
           sudo systemd-run --scope --collect -p "MemoryMax=$memory_limit" -p MemorySwapMax=0 -p "CPUQuota=$cpu_quota" python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --workload "scripts/compat/workloads/${{ matrix.workload }}.sh" "${workload_args[@]}" --require storage.fuse --output "$RUNNER_TEMP/software-workload" --timeout "$workload_timeout"
           cat "$RUNNER_TEMP/software-workload/report.json"
       - name: Upload software workload evidence
@@ -467,6 +493,7 @@ jobs:
           name: software-workload-${{ matrix.arch }}-${{ matrix.workload }}
           path: |
             ${{ runner.temp }}/software-distro-image/source.sha256
+            ${{ runner.temp }}/workload-fixture/*.json
             ${{ runner.temp }}/software-workload/*.json
             ${{ runner.temp }}/software-workload/*.log
             ${{ runner.temp }}/software-workload/*.strace
@@ -743,6 +770,25 @@ jobs:
       # A scenario that finds the runner lacks what it tests (cgroup v2, THP, IPv6, a template's room)
       # is a SKIP, which fails every shard (--no-skips). A KVM job fails if KVM is unusable after all
       # (--require-kvm); one without runs only what needs no KVM (--no-kvm: what is not tagged @needs_kvm).
+      - name: Restore immutable workload fixture
+        if: env.KVM == 'true'
+        id: workload-fixture-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/workload-fixture-cache
+          key: busybox-fixture-v1-${{ runner.arch }}-${{ hashFiles('scripts/compat/workload-fixture.py') }}
+      - name: Verify and export immutable workload fixture
+        if: env.KVM == 'true'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends skopeo
+          python3 scripts/compat/workload-fixture.py --cache "$RUNNER_TEMP/workload-fixture-cache/oci" --output "$RUNNER_TEMP/workload-fixture"
+      - name: Save verified workload fixture
+        if: env.KVM == 'true' && steps.workload-fixture-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/workload-fixture-cache
+          key: ${{ steps.workload-fixture-cache.outputs.cache-primary-key }}
       - name: End-to-end tests
         env:
           SHARD: ${{ matrix.shard }}
@@ -751,7 +797,7 @@ jobs:
           set -- $SHARD
           jobs=4; if [ "$1" = heavy ]; then jobs=1; fi
           kvm=--require-kvm; if [ "$KVM" != true ]; then kvm=--no-kvm; fi
-          sudo python3 -u scripts/e2e.py --shard "$1" ${2:+--split "$2"} --jobs "$jobs" --no-skips "$kvm" --image "$E2E_IMAGE" --image-cache "$RUNNER_TEMP/image-cache" --test-image "/var/lib/flexvm-test-image" --log-dir "$RUNNER_TEMP/e2e-logs"
+          sudo env FLEXVM_WORKLOAD_FIXTURE="$RUNNER_TEMP/workload-fixture" python3 -u scripts/e2e.py --shard "$1" ${2:+--split "$2"} --jobs "$jobs" --no-skips "$kvm" --image "$E2E_IMAGE" --image-cache "$RUNNER_TEMP/image-cache" --test-image "/var/lib/flexvm-test-image" --log-dir "$RUNNER_TEMP/e2e-logs"
       - name: Test image made
         id: test-image-made
         if: always() && steps.test-image-cache.outputs.cache-hit != 'true'
@@ -792,7 +838,9 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: compatibility-${{ runner.arch }}-${{ strategy.job-index }}
-          path: ${{ runner.temp }}/e2e-logs/**/*-compat/report.json
+          path: |
+            ${{ runner.temp }}/e2e-logs/**/*-compat/report.json
+            ${{ runner.temp }}/workload-fixture/*.json
           if-no-files-found: ignore
 
       - name: Upload logs
