@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise software suspend and fresh-owner restore with host virtualization devices masked."""
 import argparse
+import base64
 import fcntl
 import json
 import os
@@ -44,9 +45,9 @@ def exercise(args):
     def live():
         return next((e for e in json.loads(cli('ps', '--json')) if e['name'] == 'state-test'), None)
 
-    def launch(*words):
+    def launch(*words, workload_log="workload.log"):
         env = owner_environment()
-        with (args.output / 'workload.log').open('ab') as out, (args.output / f'owner-{len(owners)}.log').open('wb') as err:
+        with (args.output / workload_log).open('ab') as out, (args.output / f'owner-{len(owners)}.log').open('wb') as err:
             proc = subprocess.Popen([*base, *words], stdout=out, stderr=err, env=env)
         owners.append(proc)
         while time.monotonic() < deadline:
@@ -134,10 +135,45 @@ def exercise(args):
         finally:
             os.close(pidfd)
 
+    boot = ('software', '--name', 'state-test', '--control', 'serial', '--kernel', str(args.kernel),
+            '--mem', '512', '--vcpus', '2' if args.firecracker else '1', str(args.output / 'image.tar'))
+
+    def transfer_retirement():
+        target = [str(args.bin), '--state', str(args.state / 'target'), 'software-transfer']
+
+        def destination(*words):
+            return json.loads(subprocess.check_output([*target, *words], timeout=max(.1, deadline - time.monotonic())))
+
+        cli('rm', '-f', 'state-test', pending=True)
+        owner, entry = launch(*boot, workload_log='transfer-workload.log')
+        observation()
+        cli('stop', 'state-test')
+        if owner.wait(timeout=10) != 0:
+            raise RuntimeError('transfer source owner did not retire')
+        engine_gone(entry['backend']['process'])
+
+        secret = args.state / 'signing-key.der'
+        subprocess.run(['openssl', 'genpkey', '-algorithm', 'Ed25519', '-outform', 'DER', '-out', secret], check=True, timeout=10)
+        secret.chmod(0o600)
+        public_der = subprocess.check_output(['openssl', 'pkey', '-inform', 'DER', '-in', secret, '-pubout', '-outform', 'DER'], timeout=10)
+        public_key = base64.b64encode(public_der[-32:]).decode()
+        offer = args.state / 'offer.json'
+        offer.write_text(cli('software-transfer', 'offer', 'state-test', destination('id')['host_id']))
+        if destination('prepare', offer, '--source-key', public_key)['status'] != 'pending':
+            raise RuntimeError('transfer destination did not prepare')
+        receipt = args.state / 'receipt.json'
+        retire = ('software-transfer', 'retire', 'state-test', offer, '--signing-key', secret)
+        receipt.write_text(cli(*retire))
+        if json.loads(cli(*retire)) != json.loads(receipt.read_text()) or destination('commit', receipt)['status'] != 'committed':
+            raise RuntimeError('transfer receipt retry or destination commit failed')
+        refused = subprocess.run([*base, 'start', 'state-test'], capture_output=True, text=True, timeout=30)
+        if refused.returncode == 0 or 'source cannot restart' not in refused.stderr or live() is not None:
+            raise RuntimeError(f'transfer source restarted or failed for another reason: {refused}')
+        cli('rm', '-f', 'state-test')
+
     evidence = {'cycles': []}
     try:
-        owner, entry = launch('software', '--name', 'state-test', '--control', 'serial', '--kernel', str(args.kernel),
-                              '--mem', '512', '--vcpus', '2' if args.firecracker else '1', str(args.output / 'image.tar'))
+        owner, entry = launch(*boot)
         first = observation()
         identity = entry['gen']
         nested_identity = nested_observation() if args.firecracker else None
@@ -287,6 +323,9 @@ def exercise(args):
             if lines.count('NESTED_INNER_BOOT') != 1 or lines.count('NESTED_INNER_READY') != 1:
                 raise RuntimeError('nested Firecracker guest booted repeatedly or never completed startup')
             evidence['nested_firecracker'] = {'boots': 1, 'identity': nested_identity[:8], 'cpu_and_timer_restore': 'passed'}
+        else:
+            transfer_retirement()
+            evidence['source_transfer_retirement'] = 'passed'
         evidence.update(status='passed', boots=1, delivered_ticks=len(ticks))
         (args.output / 'owner.json').write_text(json.dumps(evidence, indent=2) + '\n')
     finally:
