@@ -1120,6 +1120,9 @@ pub fn read_owner(dir: &Path) -> Option<crate::host::Ident> {
 }
 
 pub fn read_gen(dir: &Path) -> Option<u64> {
+    if crate::software_state::identifies(dir) {
+        return crate::software_state::metadata(dir).ok()?.routed.map(|network| network.generation);
+    }
     std::fs::read_to_string(dir.join(GEN)).ok()?.trim().parse().ok()
 }
 
@@ -1165,7 +1168,14 @@ pub fn remove_debris(host: &Host, name: &str) -> Result<()> {
 /// claim finishes that).
 pub fn revoke(host: &Host, name: &str) -> Result<Result<()>> {
     let dir = host.suspended(name)?;
-    let (ip, gen) = (read_manifest(&dir).ok().map(|m| m.ip), read_gen(&dir));
+    let (ip, gen) = if crate::software_state::identifies(&dir) {
+        crate::software_state::metadata(&dir)
+            .ok()
+            .and_then(|manifest| manifest.routed)
+            .map_or((None, None), |network| (Some(network.address.v4), Some(network.generation)))
+    } else {
+        (read_manifest(&dir).ok().map(|m| m.ip), read_gen(&dir))
+    };
     mark_durably(&dir, DISCARDED).map_err(|e| format!("discarding the checkpoint of {name}: {e}"))?;
     // DISCARDED already prevents resume; failed cleanup leaves only debris for the name's next holder.
     delete_consumed(name, &dir);

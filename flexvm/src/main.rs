@@ -111,6 +111,7 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      experimental foreground QEMU TCG execution without host KVM;
                                      --qemu PATH, --vsock-backend PATH, --mem MIB, --vcpus N,
                                      --timeout SECS (boot only); image env/workdir/user options apply
+                                     --network private|routed (routed requires --name)
                                      --disk VOLUME attaches a managed data disk (repeatable, requires --name)
   flexvm ps [-a] [-q] [--json] [-f, --filter KEY=VALUE]... [--format FORMAT]
                                      list running VMs (-a: stopped ones too; -q: names only);

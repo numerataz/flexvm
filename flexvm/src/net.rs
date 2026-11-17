@@ -123,7 +123,8 @@ pub const TAP_ADDR6: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
 /// A VM's addresses as its host routes them: its IPv4 address, and with `vm_ipv6_prefix` its IPv6
 /// one (`Config::vm_addr`), which goes wherever the IPv4 one does (the tap's guard, neighbour
 /// entry and route). Without an IPv6 address every helper does just what it does for the IPv4 one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct VmAddr {
     pub v4: Ipv4Addr,
     pub v6: Option<Ipv6Addr>,

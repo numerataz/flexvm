@@ -11,6 +11,7 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -36,7 +37,7 @@ pub enum Control {
 pub enum Network {
     Private,
     Legacy,
-    Routed(VmAddr),
+    Routed,
 }
 
 impl Network {
@@ -44,15 +45,15 @@ impl Network {
         match self {
             Self::Private => "user,id=net,net=10.0.2.0/24,host=10.0.2.2,dns=10.0.2.3,dhcpstart=10.0.2.15,ipv6=off",
             Self::Legacy => "user,id=net,net=169.254.0.0/16,host=169.254.1.1,dns=169.254.1.3,dhcpstart=169.254.1.2,ipv6=off",
-            Self::Routed(_) => "tap,id=net,fd=@tap,vhost=off",
+            Self::Routed => "tap,id=net,fd=@tap,vhost=off",
         }
     }
 
-    pub fn ip(self) -> std::net::Ipv4Addr {
+    pub fn ip(self) -> Option<std::net::Ipv4Addr> {
         match self {
-            Self::Private => std::net::Ipv4Addr::new(10, 0, 2, 15),
-            Self::Legacy => std::net::Ipv4Addr::new(169, 254, 1, 2),
-            Self::Routed(address) => address.v4,
+            Self::Private => Some(std::net::Ipv4Addr::new(10, 0, 2, 15)),
+            Self::Legacy => Some(std::net::Ipv4Addr::new(169, 254, 1, 2)),
+            Self::Routed => None,
         }
     }
 
@@ -60,52 +61,97 @@ impl Network {
         match self {
             Self::Private => "10.0.2.3",
             Self::Legacy => "169.254.1.3",
-            Self::Routed(_) => "",
+            Self::Routed => "",
         }
     }
 
     fn kernel_arg(self) -> &'static str {
         match self {
             Self::Private => " flexvm.gateway4=10.0.2.2",
-            Self::Legacy | Self::Routed(_) => "",
+            Self::Legacy | Self::Routed => "",
         }
     }
 
     /// Metadata only; execution still requires equality with a full locally built profile.
     pub fn from_profile(profile: &software_state::Profile) -> Option<Self> {
         let value = profile.arguments.windows(2).find(|args| args[0] == "-netdev")?.get(1)?;
-        [Self::Private, Self::Legacy].into_iter().find(|network| network.netdev() == value)
+        [Self::Private, Self::Legacy, Self::Routed].into_iter().find(|network| network.netdev() == value)
     }
 }
 
 pub struct Routed {
     tap: OwnedFd,
     index: u32,
-    address: VmAddr,
+    network: software_state::RoutedNetwork,
     dns: Vec<IpAddr>,
     host: Host,
-    claim: AddrClaim,
+    claim: Option<AddrClaim>,
+    keep: AtomicBool,
 }
 
 impl Routed {
     pub fn new(host: &Host, name: &str) -> Result<Self> {
         let config = host.config_now();
-        let owner = Ident::me();
         let claim = {
             let lock = host.lock()?;
             host.claim_new_in(&lock, &config, name, None)?
         };
-        let address = config.vm_addr(claim.ip);
+        let network = software_state::RoutedNetwork { address: config.vm_addr(claim.ip), generation: claim.gen };
+        Self::prepare(host, &config, claim, network, false)
+    }
+
+    pub fn restore(host: &Host, name: &str, network: software_state::RoutedNetwork) -> Result<Self> {
+        let config = host.config_now();
+        if config.vm_addr(network.address.v4) != network.address {
+            bail!("software routed address no longer matches the host network");
+        }
+        let claim = {
+            let lock = host.lock()?;
+            let address = host.addr(&lock, network.address.v4)?;
+            if address.holder.as_deref() != Some(name) || address.held != network.generation {
+                bail!("software checkpoint no longer holds its routed address");
+            }
+            host.claim_incoming(&lock, name, network.address.v4, network.generation, None)?
+        };
+        Self::prepare(host, &config, claim, network, true)
+    }
+
+    fn prepare(host: &Host, config: &crate::host::Config, claim: AddrClaim, network: software_state::RoutedNetwork, keep: bool) -> Result<Self> {
+        let owner = Ident::me();
         let alias = crate::host::tap_alias(&host.run, &owner);
-        let (tap, name, index) = net::open_software_tap(&alias, &format!("fsw{:x}", owner.pid))?;
-        net::neighbour(address, &name)?;
-        Ok(Self { tap, index, address, dns: config.guest_dns(), host: host.clone(), claim })
+        let tap = (|| {
+            let (tap, name, index) = net::open_software_tap(&alias, &format!("fsw{:x}", owner.pid))?;
+            net::neighbour(network.address, &name)?;
+            Ok((tap, index))
+        })();
+        let (tap, index) = match tap {
+            Ok(tap) => tap,
+            Err(error) => {
+                if keep {
+                    claim.keep();
+                }
+                return Err(error);
+            }
+        };
+        Ok(Self { tap, index, network, dns: config.guest_dns(), host: host.clone(), claim: Some(claim), keep: AtomicBool::new(keep) })
     }
 
     fn publish(&self) -> Result<()> {
-        let lock = self.host.fence(self.claim.ip, self.claim.gen)?;
-        net::route(self.address, self.index)?;
-        self.host.publish_live(&lock, self.claim.ip, self.claim.gen, self.claim.rev)
+        let claim = self.claim.as_ref().ok_or("software routed guest has no address claim")?;
+        let lock = self.host.fence(claim.ip, claim.gen)?;
+        net::route(self.network.address, self.index)?;
+        self.host.publish_live(&lock, claim.ip, claim.gen, claim.rev)
+    }
+}
+
+impl Drop for Routed {
+    fn drop(&mut self) {
+        if !*self.keep.get_mut() {
+            return;
+        }
+        if let Some(claim) = self.claim.take() {
+            claim.keep();
+        }
     }
 }
 
@@ -406,7 +452,7 @@ impl Config {
             cmd.args(["-device", &format!("virtserialport,bus=controlbus.0,chardev=control,name={}", control::PORT_NAME)]);
         }
         match network {
-            Network::Routed(_) => {
+            Network::Routed => {
                 let backend = endpoints.tap.map_or_else(|| network.netdev().to_owned(), |fd| format!("tap,id=net,fd={fd},vhost=off"));
                 cmd.args(["-netdev", &backend, "-device", &format!("{nic},netdev=net,mac={}", net::mac_string(&net::GUEST_MAC))]);
             }
@@ -432,9 +478,10 @@ impl Config {
         ids.map(|id| (id, PathBuf::from(format!("@disk:{id}")))).collect()
     }
 
-    pub fn profiles_for_disk_ids<'a>(&self, ids: impl Iterator<Item = &'a str>) -> Result<[software_state::Profile; 2]> {
+    pub fn profiles_for_disk_ids<'a>(&self, ids: impl Iterator<Item = &'a str>, routed: bool) -> Result<Vec<software_state::Profile>> {
         let disks = Self::disk_profile(ids);
-        Ok([self.profile_for(Network::Private, &disks)?, self.profile_for(Network::Legacy, &disks)?])
+        let networks: &[Network] = if routed { &[Network::Routed] } else { &[Network::Private, Network::Legacy] };
+        networks.iter().map(|network| self.profile_for(*network, &disks)).collect()
     }
 
     fn profile_for(&self, network: Network, disks: &[(&str, PathBuf)]) -> Result<software_state::Profile> {
@@ -457,7 +504,7 @@ impl Config {
 
     pub fn boot(&self, rootfs: &Path, processes: Arc<Processes>, disks: Vec<volume::Writer>, routed: Option<Routed>) -> Result<Machine> {
         let inputs = software_state::Inputs::open(&self.qemu, &self.kernel, rootfs)?;
-        let network = routed.as_ref().map_or(Network::Private, |routed| Network::Routed(routed.address));
+        let network = if routed.is_some() { Network::Routed } else { Network::Private };
         self.launch(inputs, processes, None, network, disks, routed)
     }
 
@@ -470,26 +517,29 @@ impl Config {
         routed: Option<Routed>,
     ) -> Result<Machine> {
         let inputs = software_state::Inputs::with_kernel(&self.qemu, kernel, rootfs)?;
-        let network = routed.as_ref().map_or(Network::Private, |routed| Network::Routed(routed.address));
+        let network = if routed.is_some() { Network::Routed } else { Network::Private };
         self.launch(inputs, processes, None, network, disks, routed)
     }
 
     /// Load state into a fresh engine, with CPUs paused and public admission closed.
-    pub fn restore(&self, verified: software_state::Verified, processes: Arc<Processes>, disks: Vec<volume::Writer>) -> Result<Machine> {
+    pub fn restore(
+        &self,
+        verified: software_state::Verified,
+        processes: Arc<Processes>,
+        disks: Vec<volume::Writer>,
+        routed: Option<Routed>,
+    ) -> Result<Machine> {
         if self.control != Control::Serial {
             bail!("software restore requires serial control");
         }
-        let [private, legacy] = self.profiles_for_disk_ids(disks.iter().map(|disk| disk.id.as_str()))?;
-        let network = if private == verified.manifest.profile {
-            Network::Private
-        } else if legacy == verified.manifest.profile {
-            Network::Legacy
-        } else {
+        let network = Network::from_profile(&verified.manifest.profile).ok_or("software restore has an unknown network profile")?;
+        let disk_profile = Self::disk_profile(disks.iter().map(|disk| disk.id.as_str()));
+        if self.profile_for(network, &disk_profile)? != verified.manifest.profile || verified.manifest.routed != routed.as_ref().map(|routed| routed.network) {
             bail!("software restore configuration changed after artifact validation");
-        };
+        }
         verified.state.unchanged()?;
         let machine = self
-            .launch(verified.inputs, processes, Some((&verified.state.file, &verified.manifest.engine_version)), network, disks, None)
+            .launch(verified.inputs, processes, Some((&verified.state.file, &verified.manifest.engine_version)), network, disks, routed)
             .map_err(|error| format!("software incoming engine load failed: {error}"))?;
         verified.state.unchanged()?;
         Ok(machine)
@@ -646,16 +696,16 @@ impl Config {
             let clock = format!("{}.{:09}", now.as_secs(), now.subsec_nanos());
             let line = match &machine.routed {
                 Some(routed) => {
-                    let mut line = match routed.address.v6 {
-                        Some(ip6) => format!("START6 {} {ip6} {clock}", routed.address.v4),
-                        None => format!("START {} {clock}", routed.address.v4),
+                    let mut line = match routed.network.address.v6 {
+                        Some(ip6) => format!("START6 {} {ip6} {clock}", routed.network.address.v4),
+                        None => format!("START {} {clock}", routed.network.address.v4),
                     };
                     for dns in &routed.dns {
                         write!(line, " {dns}")?;
                     }
                     line
                 }
-                None => format!("START {} {clock} {}", network.ip(), network.dns()),
+                None => format!("START {} {clock} {}", network.ip().ok_or("missing software routed network")?, network.dns()),
             };
             let reply = machine.message(&line, deadline)?;
             if reply != b"ok" {
@@ -766,12 +816,16 @@ impl Qmp {
 }
 
 impl Machine {
-    pub fn has_routed_network(&self) -> bool {
-        self.routed.is_some()
+    pub fn ip(&self) -> Option<std::net::Ipv4Addr> {
+        self.routed.as_ref().map(|routed| routed.network.address.v4).or_else(|| self.network.ip())
     }
 
-    pub fn ip(&self) -> std::net::Ipv4Addr {
-        self.network.ip()
+    pub fn restore_route(&self) -> Result<()> {
+        if let Some(routed) = &self.routed {
+            routed.publish()?;
+            routed.keep.store(false, Ordering::Relaxed);
+        }
+        Ok(())
     }
 
     /// The caller owns the admission/CPU boundary and the output artifact. A
@@ -883,6 +937,7 @@ impl Machine {
         // checkpoint boundary. Keep the writer leases through publication.
         manifest.disks = staging.capture_disks(&self.disks)?;
         manifest.profile = self.profile.clone();
+        manifest.routed = self.routed.as_ref().map(|routed| routed.network);
         manifest.engine_version = self.engine_version.clone();
         let inputs = self.inputs.as_ref().ok_or("software engine has no pinned inputs")?;
         match previous {
@@ -894,6 +949,9 @@ impl Machine {
     pub fn retire(&self, published: &software_state::Published) -> Result<()> {
         if published.manifest.source_engine != self.processes.engine_ident()? {
             bail!("software checkpoint belongs to another engine");
+        }
+        if let Some(routed) = &self.routed {
+            routed.keep.store(true, Ordering::Relaxed);
         }
         self.processes.stop();
         published.retire()
@@ -1278,6 +1336,7 @@ mod tests {
             state: blank,
             firmware: std::collections::BTreeMap::new(),
             disks: Vec::new(),
+            routed: None,
             main: software_state::Main::App(software_state::Session { id: id.clone(), offset: 0, claim: 0 }),
             image: meta,
         };
@@ -1294,7 +1353,7 @@ mod tests {
         config.kernel = PathBuf::from("/missing-original-kernel");
         config.qemu = "/missing-original-engine".into();
         let target = Arc::new(Processes::default());
-        let machine = config.restore(verified, target, Vec::new()).unwrap();
+        let machine = config.restore(verified, target, Vec::new(), None).unwrap();
         machine.switch("cont", deadline).unwrap();
         machine.reconnect_control(deadline).unwrap();
         assert_eq!(machine.message("PING", deadline).unwrap(), b"pong");
