@@ -24,7 +24,8 @@
 #      MAX_UDP_LOSS (default 0), PORT (listeners, default 7070), WORK (keep logs under this
 #      directory, default /tmp), TEMPLATE (default small: the test image, see scripts/faults.py),
 #      V6 (default 0), NET6 (default fd5e::), PREFIX6 (default fd5e:0:0:1::),
-#      STALL_SLACK_MS (default 0; a loaded host's scheduling, beside a short downtime)
+#      STALL_SLACK_MS (default 0; a loaded host's scheduling, beside a short downtime),
+#      CAPTURE_TCP (default 0; keep TCP and neighbour-discovery captures on failure)
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -42,6 +43,7 @@ PORT=${PORT:-7070}
 V6=${V6:-0}
 NET6=${NET6:-fd5e::}
 PREFIX6=${PREFIX6:-fd5e:0:0:1::}
+CAPTURE_TCP=${CAPTURE_TCP:-0}
 if [[ $V6 == 1 ]]; then
     host_A=[${NET6}1]:$PORT
     host_B=[${NET6}2]:$PORT
@@ -123,6 +125,15 @@ for spec in A:1 B:2 C:10; do
 done
 # The client resolves the VMs' prefix on the LAN (proxy NDP answers), as it does their IPv4 addresses.
 [[ $V6 != 1 ]] || ip -n "${P}C" -6 route add "$PREFIX6/96" dev eth0
+if [[ $CAPTURE_TCP == 1 ]]; then
+    command -v tcpdump > /dev/null || die 'CAPTURE_TCP requires tcpdump'
+    mkdir -p "$work/packets"
+    for site in A B C lan; do
+        ip netns exec "$P$site" tcpdump -n -i any -s 128 -U -C 8 -W 1 \
+            -w "$work/packets/$site.pcap" 'tcp port 19012 or icmp6' > "$work/packets/$site.log" 2>&1 &
+        bg_pids+=("$!")
+    done
+fi
 start_listener() {
     local ns=$1 dir=$2 listen=$3 peer=$4 ips=$5
     mkdir -p "$dir/state" "$dir/run"
