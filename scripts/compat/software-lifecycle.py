@@ -148,8 +148,8 @@ def exercise(args):
 
         cli('rm', '-f', 'state-test', pending=True)
         owner, entry = launch(*boot, workload_log='transfer-workload.log')
-        nested_before = nested_mode('spin') if args.firecracker else None
         before = observation()
+        nested_before = nested_mode('spin') if args.firecracker else None
         cli('stop', 'state-test')
         if owner.wait(timeout=10) != 0:
             raise RuntimeError('transfer source owner did not retire')
