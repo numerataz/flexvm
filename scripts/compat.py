@@ -35,11 +35,12 @@ class Interrupted(Exception):
     pass
 
 
-def command(argv, timeout=120, stdin=None):
+def command(argv, timeout=120, stdin=None, output=None):
     """Bound and reap the whole host CLI process group, including on interruption."""
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                             errors="replace", start_new_session=True)
+    out = err = ""
     try:
         out, err = proc.communicate(stdin, timeout=timeout)
     except BaseException:
@@ -47,8 +48,12 @@ def command(argv, timeout=120, stdin=None):
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
-        proc.communicate()
+        out, err = proc.communicate()
         raise
+    finally:
+        if output is not None:
+            Path(str(output) + ".stdout.log").write_text(out)
+            Path(str(output) + ".stderr.log").write_text(err)
     if proc.returncode:
         raise Failure(f"{shlex.join(map(str, argv))} exited {proc.returncode}\n{err[-4000:]}\n{out[-2000:]}", stderr=err)
     return out
@@ -92,7 +97,8 @@ class Suite:
 
     def workload_step(self, step, phase="run"):
         return self.host.call("exec", "-i", self.name, "sh", "-s", "--", step, self.nonce, phase,
-                              stdin=self.workload, timeout=900 if step == "prepare" else 180)
+                              stdin=self.workload, timeout=900 if step == "prepare" else 180,
+                              output=self.output / f"{step}-{phase}")
 
     def exec(self, *argv, **kw):
         return self.host.call("exec", self.name, *argv, **kw)
