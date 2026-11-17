@@ -4,7 +4,7 @@
 use std::ffi::CString;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::net::UnixStream;
@@ -153,7 +153,7 @@ pub fn enter(cmd: &mut Command) -> io::Result<()> {
                         error
                     });
                 }
-                Ok(())
+                reset_oom_score()
             });
         }
         return enter_in(cmd, &context.namespaces);
@@ -169,10 +169,18 @@ pub(crate) fn enter_check(cmd: &mut Command, context: &Arc<DistroContext>) -> io
     unsafe {
         cmd.pre_exec(move || {
             let _keep_alive = &retained;
-            Ok(())
+            reset_oom_score()
         });
     }
     enter_in(cmd, &context.namespaces)
+}
+
+/// Only the broker keeps its OOM protection. Open after fork: a proc descriptor
+/// opened in the parent would adjust the broker instead of its command child.
+fn reset_oom_score() -> io::Result<()> {
+    let fd = os(unsafe { libc::open(c"/proc/self/oom_score_adj".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) })?;
+    let mut file = unsafe { File::from_raw_fd(fd) };
+    file.write_all(b"0")
 }
 
 fn enter_in(cmd: &mut Command, ns: &Namespaces) -> io::Result<()> {
@@ -239,6 +247,61 @@ pub(crate) fn root_file(path: &str, flags: u64) -> io::Result<File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires root for OOM protection and mount/cgroup namespace entry"]
+    fn distro_commands_do_not_inherit_broker_oom_immunity() {
+        const CHILD: &str = "FLEXVM_TEST_DISTRO_OOM_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args(["--ignored", "--exact", "runtime::tests::distro_commands_do_not_inherit_broker_oom_immunity"])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        // Isolate the process-wide protection and runtime registration from
+        // other tests. Use real namespace entry and the actual spawn hooks.
+        std::fs::write("/proc/self/oom_score_adj", "-1000").unwrap();
+        let mut app = Command::new("/bin/cat");
+        app.arg("/proc/self/oom_score_adj");
+        enter(&mut app).unwrap();
+        assert_eq!(app.output().unwrap().stdout, b"-1000\n", "app-mode policy must remain unchanged");
+        let context = Arc::new(DistroContext {
+            namespaces: Namespaces {
+                mount: File::open("/proc/self/ns/mnt").unwrap(),
+                cgroup: File::open("/proc/self/ns/cgroup").unwrap(),
+                root: File::open("/").unwrap(),
+            },
+            work: File::options().write(true).open("/dev/null").unwrap(),
+            checks: File::open("/").unwrap(),
+            _unit: File::open("/").unwrap(),
+        });
+        *DISTRO.write().unwrap() = DistroState::Ready(context.clone());
+        for check in [false, true] {
+            for uid in [0, 65534] {
+                let mut cmd = Command::new("/bin/cat");
+                cmd.arg("/proc/self/oom_score_adj");
+                if check {
+                    enter_check(&mut cmd, &context).unwrap();
+                } else {
+                    enter(&mut cmd).unwrap();
+                }
+                unsafe {
+                    cmd.pre_exec(move || {
+                        os(libc::setgid(uid))?;
+                        os(libc::setuid(uid))?;
+                        Ok(())
+                    });
+                }
+                let output = cmd.output().unwrap();
+                assert!(output.status.success(), "check={check}, uid={uid}: {output:?}");
+                assert_eq!(output.stdout, b"0\n", "check={check}, uid={uid}");
+                assert_eq!(std::fs::read_to_string("/proc/self/oom_score_adj").unwrap(), "-1000\n", "the broker must stay protected");
+            }
+        }
+    }
 
     #[test]
     #[ignore = "requires root to enter mount/cgroup namespaces"]

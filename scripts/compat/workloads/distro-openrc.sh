@@ -28,6 +28,7 @@ prepare)
     test "$(wc -c < "$base/bus")" = 33
     ;;
 verify)
+    test "$(cat /proc/self/oom_score_adj)" = 0
     test "$(identity)" = "$(cat "$base/identity")"
     rc-service flexvm-runtime status
     rc-service flexvm-state-probe status

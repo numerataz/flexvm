@@ -410,16 +410,17 @@ class Host:
         left += [f"checkpoint name {c}" for c in sorted(os.listdir(names))] if os.path.isdir(names) else []
         return left
 
-    def save_logs(self):
+    def save_logs(self, directory=None):
         """Copies the VM and Firecracker logs out of the run directory."""
+        directory = directory or args.log_dir
         for log in glob.glob(f"{self.run_dir}/**/*.log", recursive=True) + glob.glob(f"{self.run_dir}/**/*.log.1", recursive=True):
             if not os.path.exists(log):  # a link to a log not made yet (NAME.log.1 before a rotation)
                 continue
-            dest = os.path.join(args.log_dir, f"run-{self.label}", os.path.relpath(log, self.run_dir))
+            dest = os.path.join(directory, f"run-{self.label}", os.path.relpath(log, self.run_dir))
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             shutil.copy(log, dest)
         for vm, text in self.removed_logs.items():
-            dest = os.path.join(args.log_dir, f"run-{self.label}", "vms", f"{vm}.log.removed")
+            dest = os.path.join(directory, f"run-{self.label}", "vms", f"{vm}.log.removed")
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             with open(dest, "w") as f:
                 f.write(text)
@@ -2747,6 +2748,11 @@ def distro_systemd():
         def execute(command, check_code=True):
             result = host.exec(vm, command, timeout=60)
             if check_code:
+                if result[0] != 0:
+                    try:
+                        host.save_logs(os.path.join(args.log_dir, "distro-exec-failure"))
+                    except OSError as error:
+                        print(f"distro failure log capture: {error}", flush=True)
                 check("distro exec", result[0] == 0, result)
             return result
 
@@ -2759,6 +2765,11 @@ def distro_systemd():
 
         original = identity()
         check("distro: real systemd PID 1", original["init"] == "systemd" and original["executable"].endswith("/systemd"), original)
+        execute('test "$(cat /proc/self/oom_score_adj)" = 0; '
+                'broker=$(pgrep -f "^@flexvm-broker --distro-broker [0-9]+$"); '
+                'test "$(cat /proc/$broker/oom_score_adj)" = -1000')
+        user = host.cli("exec", "-u", "nobody", vm, "cat", "/proc/self/oom_score_adj")
+        check("distro: ordinary non-root exec OOM policy", user.stdout.strip() == "0", (user.stdout, user.stderr))
         A.run(clone, template=tag)
         other = A.exec(clone, "cat /etc/machine-id")[1].strip()
         check("distro: fresh clone machine identity", len(other) == 32 and other != original["machine"], (original, other))

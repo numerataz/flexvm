@@ -19,6 +19,7 @@ prepare)
     test "$(systemctl show --property=Delegate --value flexvm-runtime.service)" = yes
     ;;
 verify)
+    test "$(cat /proc/self/oom_score_adj)" = 0
     test "$(identity)" = "$(cat "$base/identity")"
     systemctl is-active --quiet flexvm-state-probe.service flexvm-runtime.service
     test "$(systemctl show --property=Delegate --value flexvm-runtime.service)" = yes
