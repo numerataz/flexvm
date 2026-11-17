@@ -407,6 +407,7 @@ impl Owner {
             let published = self.machine.checkpoint(staging, &checkpoint, manifest, previous, Instant::now() + Duration::from_secs(600))?;
             self.machine.retire(&published)?;
             if let Some(consumed) = &self.consumed {
+                consumed.complete_import();
                 consumed.release_replaced_inputs();
             }
             self.suspended.store(true, Ordering::SeqCst);

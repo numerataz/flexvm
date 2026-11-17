@@ -265,7 +265,7 @@ pub(in crate::software_state) fn sweep_retired(state: &Path, incoming: &Path) ->
         }
         let obsolete = read_incoming(&state, &offer)?
             .is_some_and(|journal| journal.offer.generation > offer.generation || journal.offer == offer && journal.status == Status::Aborted);
-        if !obsolete || activate::live_grant(&state, &offer)? {
+        if !activate::reclaimable(&state, &offer, obsolete)? {
             continue;
         }
         let pinned = directory.metadata()?;

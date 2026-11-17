@@ -348,6 +348,15 @@ def exercise(args):
             restored = json.loads((destination_state / 'suspended' / remote / 'manifest.json').read_text())
             if restored['host_id'] != target_id or restored['owner_generation'] <= json.loads(offer.read_text())['generation']:
                 raise RuntimeError('destination checkpoint lacked its local host identity or newer generation')
+            activated_offer = json.loads(offer.read_text())
+            imported = destination_state / 'software-incoming' / f"{activated_offer['vm_id']}-{activated_offer['transfer_id']}"
+            if not imported.is_dir():
+                raise RuntimeError('destination import disappeared before collection')
+            target_cli('debug', 'gc')
+            if imported.exists():
+                raise RuntimeError('collection retained a cleanly retired import')
+            denied_activation('already granted execution', vm='duplicate')
+            evidence['retired_import_collection'] = 'passed'
             target_cli('start', remote)
             activated_state = destination_progress(activated_state)
             target_cli('stop', remote)
