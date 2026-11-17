@@ -72,6 +72,30 @@ jobs:
           # The native QEMU/OCI restore proof requires explicit external artifacts;
           # software-lifecycle.py exercises that real path in the software jobs.
           cargo test -p flexvm -p flexvm-init --config "target.$host.runner=\"sudo -E\"" -- --ignored --skip qemu::tests::real_agent_cold_restore_preserves_process_ram_and_sessions
+      - name: Storage CLI clones without virtualization devices
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends strace
+          cargo build --locked -p flexvm
+          for mode in host scan; do
+            mode_args=()
+            if [ "$mode" = scan ]; then mode_args=(--scan-fallback); fi
+            sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/volume-clone.py --bin target/debug/flexvm --output "$RUNNER_TEMP/volume-clone-$mode" "${mode_args[@]}"
+          done
+      - name: Storage CLI filesystem reflinks without virtualization devices
+        if: runner.arch == 'X64'
+        run: |
+          sudo apt-get install -y -q --no-install-recommends btrfs-progs
+          sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/volume-clone.py --bin target/debug/flexvm --btrfs --output "$RUNNER_TEMP/volume-clone-btrfs"
+      - name: Upload storage CLI evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: volume-clones-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/volume-clone-*/report.json
+            ${{ runner.temp }}/volume-clone-*/*.strace
+          if-no-files-found: warn
       # The semver artifacts release (vMAJOR.MINOR.PATCH; what `cargo build` users download) must be built
       # from this checkout's inputs (scripts/pin-artifacts.sh --inputs): a change to them bumps ARTIFACTS_TAG
       # in the same change, or fails here, PR or main. --check also validates the semver tag format.
@@ -99,6 +123,8 @@ jobs:
               exit 1
               ;;
           esac
+      - name: Failure capture compression
+        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends zstd
       - name: Compatibility harness tests
         run: |
           python3 scripts/compat/test_harness.py
@@ -134,7 +160,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends ${{ matrix.qemu }} strace build-essential flex bison bc libelf-dev libssl-dev dwarves xz-utils kmod pkg-config zlib1g-dev libzstd-dev squashfs-tools
+          sudo apt-get install -y -q --no-install-recommends ${{ matrix.qemu }} strace zstd build-essential flex bison bc libelf-dev libssl-dev dwarves xz-utils kmod pkg-config zlib1g-dev libzstd-dev squashfs-tools
       - name: Cache fixed x86 software CPU engine
         if: matrix.arch == 'x86_64'
         id: software-qemu
@@ -254,6 +280,11 @@ jobs:
             ${{ runner.temp }}/software-boot/compile.log
             ${{ runner.temp }}/software-boot/kvm-compile.log
             ${{ runner.temp }}/software-boot/inner-compile.log
+            ${{ runner.temp }}/software-boot/checkpoint-state.json
+            ${{ runner.temp }}/software-boot/checkpoint
+            ${{ runner.temp }}/software-boot/replay.json
+            ${{ runner.temp }}/software-boot/replay-kernel
+            ${{ runner.temp }}/software-boot/replay-initramfs.cpio
             ${{ runner.temp }}/software-agent/report.json
             ${{ runner.temp }}/software-agent/guest.log
             ${{ runner.temp }}/software-agent/files.strace
@@ -268,11 +299,15 @@ jobs:
             ${{ runner.temp }}/software-owner/*.log
             ${{ runner.temp }}/software-owner/*.strace
             ${{ runner.temp }}/software-lifecycle/*.json
+            ${{ runner.temp }}/software-lifecycle/*.jsonl
             ${{ runner.temp }}/software-lifecycle/*.log
             ${{ runner.temp }}/software-lifecycle/*.strace
+            ${{ runner.temp }}/software-lifecycle/failure-state.tar.zst
             ${{ runner.temp }}/software-nested-lifecycle/*.json
+            ${{ runner.temp }}/software-nested-lifecycle/*.jsonl
             ${{ runner.temp }}/software-nested-lifecycle/*.log
             ${{ runner.temp }}/software-nested-lifecycle/*.strace
+            ${{ runner.temp }}/software-nested-lifecycle/failure-state.tar.zst
             ${{ runner.temp }}/software-kvm/*.json
             ${{ runner.temp }}/software-kvm/*.log
             ${{ runner.temp }}/software-kvm/*.strace
