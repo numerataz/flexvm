@@ -72,6 +72,30 @@ jobs:
           # The native QEMU/OCI restore proof requires explicit external artifacts;
           # software-lifecycle.py exercises that real path in the software jobs.
           cargo test -p flexvm -p flexvm-init --config "target.$host.runner=\"sudo -E\"" -- --ignored --skip qemu::tests::real_agent_cold_restore_preserves_process_ram_and_sessions
+      - name: Storage CLI clones without virtualization devices
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends strace
+          cargo build --locked -p flexvm
+          for mode in host scan; do
+            mode_args=()
+            if [ "$mode" = scan ]; then mode_args=(--scan-fallback); fi
+            sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/volume-clone.py --bin target/debug/flexvm --output "$RUNNER_TEMP/volume-clone-$mode" "${mode_args[@]}"
+          done
+      - name: Storage CLI filesystem reflinks without virtualization devices
+        if: runner.arch == 'X64'
+        run: |
+          sudo apt-get install -y -q --no-install-recommends btrfs-progs
+          sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/volume-clone.py --bin target/debug/flexvm --btrfs --output "$RUNNER_TEMP/volume-clone-btrfs"
+      - name: Upload storage CLI evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: volume-clones-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/volume-clone-*/report.json
+            ${{ runner.temp }}/volume-clone-*/*.strace
+          if-no-files-found: warn
       # The semver artifacts release (vMAJOR.MINOR.PATCH; what `cargo build` users download) must be built
       # from this checkout's inputs (scripts/pin-artifacts.sh --inputs): a change to them bumps ARTIFACTS_TAG
       # in the same change, or fails here, PR or main. --check also validates the semver tag format.
