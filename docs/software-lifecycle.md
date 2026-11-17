@@ -266,3 +266,17 @@ changing the guest address or silently dropping connections is insufficient.
 
 Close #1358/#1327 only after their complete acceptance criteria pass. Narrow
 milestones and engine experiments must leave those issues open.
+
+## Software guest addresses
+
+New software guests use private IPv4 `10.0.2.15/32`, gateway `10.0.2.2` and
+DNS `10.0.2.3` on the isolated QEMU user network. The bootstrap receives its
+IPv4 gateway through an explicit kernel argument. Native VM networking keeps
+its existing gateway.
+
+Saved guests from the original software profile retain address `169.254.1.2`,
+gateway `169.254.1.1` and DNS `169.254.1.3`. Restore accepts only complete
+canonical profiles generated locally for these two layouts. It rebuilds the
+engine command from the matched layout and fresh host endpoints, preserving
+the selected layout on subsequent captures. Manifest arguments are never
+executed directly. Active and saved guest metadata report the selected address.
