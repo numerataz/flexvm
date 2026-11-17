@@ -38,6 +38,14 @@ int main(void) {
             for (;;) pause();
         }
     }
+    if (access("/kvm-tsc", F_OK) == 0) {
+        char *const argv[] = {"/kvm-tsc", NULL};
+        if (execute(argv[0], argv) < 0) {
+            puts("FLEXVM_SOFTWARE_GUEST_TSC_FAILED");
+            for (;;) pause();
+        }
+        puts("FLEXVM_SOFTWARE_GUEST_TSC_PASSED");
+    }
     if (access("/firecracker", F_OK) == 0) {
         char *const argv[] = {"/firecracker", "--no-api", "--config-file", "/firecracker.json", NULL};
         if (mount("proc", "/proc", "proc", 0, NULL) < 0 ||

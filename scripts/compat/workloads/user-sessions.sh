@@ -52,7 +52,7 @@ EOF
         if [ -s "/run/user/$uid/session-probe.json" ]; then break; fi
         sleep .1
     done
-    cp "/run/user/$uid/session-probe.json" "$base/initial"
+    cat "/run/user/$uid/session-probe.json" > "$base/initial"
     bus_id > "$base/bus"
     test "$(wc -c < "$base/bus")" = 33
     systemctl show --property=MainPID --value "user@$uid.service" > "$base/manager"

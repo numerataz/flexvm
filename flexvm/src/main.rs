@@ -35,6 +35,7 @@ mod uffd;
 mod util;
 mod vm;
 mod vmproc;
+mod volume;
 
 use std::io::{BufReader, IsTerminal, Read, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd};
@@ -113,6 +114,11 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
   flexvm kill -s SIGNAL NAME...      send SIGNAL (TERM, HUP, 9, ...) to the VM's app instead
   flexvm rm [-f] NAME...             remove a stopped VM (suspended, quarantined, exited, failed or lost);
                                      -f: a running one too
+  flexvm volume create NAME --size BYTES
+                                     create an unattached sparse raw volume (512-byte multiple)
+  flexvm volume ls                   list volume IDs, names, logical and allocated bytes as JSON
+  flexvm volume inspect NAME|ID      inspect a volume (VM attachment is not implemented yet)
+  flexvm volume rm NAME|ID           remove an unused volume; refuses a held disk lock
   flexvm checkpoint create VM [NAME] [--stop] [--incremental]
                                      store the VM's state in STATE/checkpoints, named NAME if given;
                                      --incremental: as a delta on its last stored checkpoint
@@ -533,6 +539,7 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("unpause", NAMES, &[]),
     ("kill", NAMES, &["signal"]),
     ("rm", NAMES, &["force"]),
+    ("volume", NAMES, &["size"]),
     ("checkpoint", NAMES, &["stop", "incremental", "quiet", "format", "filter", "force", "older-than", "output", "input", "name", "sha256"]),
     ("migrate", 3, &[]),
     ("reclaim", 2, &["force"]),
@@ -605,6 +612,18 @@ fn check_applies(args: &Args) -> Result<()> {
             };
             if !(least..=most).contains(&args.positional.len()) {
                 bail!("debug {op} takes {words}");
+            }
+        }
+        "volume" => {
+            let words = args.positional.len();
+            let valid = match first.map(String::as_str) {
+                Some("create") => words == 3 && args.get("size").is_some(),
+                Some("inspect" | "rm") => words == 3 && !args.has("size"),
+                Some("ls") => words == 2 && !args.has("size"),
+                _ => false,
+            };
+            if !valid {
+                bail!("volume needs create NAME --size BYTES, inspect NAME|ID, ls, or rm NAME|ID");
             }
         }
         "checkpoint" => {
@@ -713,7 +732,7 @@ fn paths(args: &Args) -> Result<Paths> {
     Ok(Paths::new(&state(args)?))
 }
 
-/// Commands that only read the state, so they run on any host: every other one may start a VM or a
+/// Commands that read state or manage metadata without VM pages, so they run on any host: every other one may start a VM or a
 /// pager (`run`, `pull`, `listen`, `api`, a restart's) or act on one, and is refused on a host whose
 /// pages they cannot work in (`util::check_page_size`).
 fn reads_only(args: &Args) -> bool {
@@ -723,7 +742,10 @@ fn reads_only(args: &Args) -> bool {
     let words: Vec<&str> = args.positional.iter().take(2).map(String::as_str).collect();
     matches!(
         words[..],
-        [] | ["ps" | "images" | "inspect" | "logs" | "info" | "version" | "wait" | "login" | "logout", ..] | ["checkpoint", "ls"] | ["system", "df"]
+        [] | ["ps" | "images" | "inspect" | "logs" | "info" | "version" | "wait" | "login" | "logout", ..]
+            | ["checkpoint", "ls"]
+            | ["system", "df"]
+            | ["volume", ..]
     )
 }
 
@@ -743,6 +765,16 @@ fn real_main(args: &Args) -> Result<()> {
         Some("restart-due") => {
             let host = open_host(args)?;
             restart::due(&host, name, |n| start(&host, args, n))
+        }
+        Some("volume") => {
+            let catalog = volume::Catalog::open(&state(args)?)?;
+            match name {
+                "create" => print(json!(catalog.create(arg2.unwrap(), args.get("size").unwrap().parse().map_err(|_| "volume --size needs a byte count")?)?)),
+                "ls" => print(json!(catalog.list()?)),
+                "inspect" => print(json!(catalog.inspect(arg2.unwrap())?)),
+                "rm" => catalog.remove(arg2.unwrap()),
+                _ => unreachable!("checked volume subcommand"),
+            }
         }
         Some("pull") => pull(args, name),
         Some("software") => util::exit(software(args, name)?),
