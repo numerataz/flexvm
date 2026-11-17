@@ -121,8 +121,10 @@ The native `k3s` and `kind` cases exercise run, suspend/resume, checkpoint/resto
 and migration. The software workload matrix runs both on x86_64 and aarch64
 with host virtualization devices masked and traced, exercising pause/unpause,
 fresh-emulator stop/start, restoration with the management service stopped and
-completed OS poweroff. Software Kubernetes fixtures allocate four vCPUs and
-4 GiB RAM with a bounded one-hour workload deadline. Failed workload stdout,
+completed OS poweroff. Software Kubernetes fixtures allocate four vCPUs, with
+4 GiB RAM for K3s and 6 GiB for kind, and a bounded one-hour workload deadline.
+Their host memory scopes allow 6 GiB and 10 GiB respectively, including CPU-engine
+and backing-file cache overhead. Failed workload stdout,
 stderr and available shutdown console logs remain in the artifacts.
 
 The current guest root is a RAM-backed union filesystem. These fixtures mount

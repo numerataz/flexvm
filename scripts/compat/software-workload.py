@@ -256,8 +256,8 @@ def main():
         return 0
     if os.geteuid() != 0:
         parser.error('run as root for private device masking and image preparation')
-    if not 1 <= args.timeout <= 3600 or not 512 <= args.mem <= 4096 or not 1 <= args.poweroff_timeout <= 300 or not 1 <= args.vcpus <= 8:
-        parser.error('--timeout must be 1..3600, --mem 512..4096 and --poweroff-timeout 1..300 and --vcpus 1..8')
+    if not 1 <= args.timeout <= 3600 or not 512 <= args.mem <= 8192 or not 1 <= args.poweroff_timeout <= 300 or not 1 <= args.vcpus <= 8:
+        parser.error('--timeout must be 1..3600, --mem 512..8192 and --poweroff-timeout 1..300 and --vcpus 1..8')
     args.output.mkdir(parents=True, exist_ok=True)
     report_path = args.output / 'report.json'
     if report_path.exists():

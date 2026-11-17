@@ -398,17 +398,23 @@ jobs:
       - name: Guest workload and fresh-owner software restoration
         run: |
           workload_args=()
+          memory_limit=6G
           cpu_quota=200%
           workload_timeout=1800
           if [[ "${{ matrix.workload }}" == rootless-* || "${{ matrix.workload }}" == nspawn || "${{ matrix.workload }}" == lxc || "${{ matrix.workload }}" == k3s || "${{ matrix.workload }}" == kind ]]; then
             workload_args=(--boot systemd --image "$RUNNER_TEMP/software-distro-image")
           fi
           if [[ "${{ matrix.workload }}" == k3s || "${{ matrix.workload }}" == kind ]]; then
-            workload_args+=(--mem 4096 --vcpus 4 --poweroff-timeout 180)
+            workload_memory=4096
+            if [[ "${{ matrix.workload }}" == kind ]]; then
+              workload_memory=6144
+              memory_limit=10G
+            fi
+            workload_args+=(--mem "$workload_memory" --vcpus 4 --poweroff-timeout 180)
             cpu_quota=400%
             workload_timeout=3600
           fi
-          sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p "CPUQuota=$cpu_quota" python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --workload "scripts/compat/workloads/${{ matrix.workload }}.sh" "${workload_args[@]}" --require storage.fuse --output "$RUNNER_TEMP/software-workload" --timeout "$workload_timeout"
+          sudo systemd-run --scope --collect -p "MemoryMax=$memory_limit" -p MemorySwapMax=0 -p "CPUQuota=$cpu_quota" python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --workload "scripts/compat/workloads/${{ matrix.workload }}.sh" "${workload_args[@]}" --require storage.fuse --output "$RUNNER_TEMP/software-workload" --timeout "$workload_timeout"
           cat "$RUNNER_TEMP/software-workload/report.json"
       - name: Upload software workload evidence
         if: always()

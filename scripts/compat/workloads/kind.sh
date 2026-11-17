@@ -8,12 +8,28 @@ image=flexvm/busybox:compat
 node_image=kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
 kubectl() { docker exec fvkind-control-plane kubectl --kubeconfig=/etc/kubernetes/admin.conf "$@"; }
 k() { kubectl -n flexvm-compat "$@"; }
-trap 'result=$?; if [ "$result" -ne 0 ]; then
-    systemctl --no-pager -l status docker.service || true
-    docker ps -a || true
-    kubectl --request-timeout=5s get pods -A -o wide || true
-    kubectl --request-timeout=5s get events -A --sort-by=.lastTimestamp | tail -15 || true
-fi; exit "$result"' 0
+diagnostics() {
+    result=$?
+    trap - 0
+    if [ "$result" -ne 0 ]; then
+        systemctl --no-pager -l status docker.service || true
+        docker ps -a || true
+        dmesg | tail -80 || true
+        free -m || true
+        timeout 15 docker logs --tail 80 fvkind-control-plane || true
+        timeout 15 docker exec fvkind-control-plane sh -c '
+            journalctl --no-pager -u kubelet -u containerd -n 80
+            cat /sys/fs/cgroup/memory.events
+            crictl ps -a
+            for component in etcd kube-apiserver; do
+                for id in $(crictl ps -a --name "$component" -q | head -2); do crictl logs --tail 50 "$id"; done
+            done' || true
+        kubectl --request-timeout=5s get pods -A -o wide || true
+        kubectl --request-timeout=5s get events -A --sort-by=.lastTimestamp | tail -15 || true
+    fi
+    exit "$result"
+}
+trap diagnostics 0
 case $step in
 prepare)
     export DEBIAN_FRONTEND=noninteractive
@@ -51,7 +67,7 @@ nodes:
     listenAddress: "127.0.0.1"
     protocol: TCP
 EOF
-    kind create cluster --name fvkind --image "$node_image" --config "$base/kind.yaml" --wait 600s
+    kind create cluster --retain --name fvkind --image "$node_image" --config "$base/kind.yaml" --wait 600s
     # Export only the pulled platform; Docker 29 can otherwise export an
     # index referencing other platforms whose content was never downloaded.
     docker image save --platform "linux/$arch" -o "$base/busybox.tar" "$image"
