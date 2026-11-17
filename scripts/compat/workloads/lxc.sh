@@ -12,12 +12,12 @@ case $step in
 prepare)
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
-    apt-get install -y -qq --no-install-recommends lxc lxc-templates debootstrap ubuntu-keyring uidmap \
+    apt-get install -y -qq --no-install-recommends lxc lxc-templates debootstrap ubuntu-keyring ca-certificates uidmap \
         dbus dbus-user-session libpam-systemd passwd dnsmasq-base iptables curl python3
     root=/var/lib/lxc/fvpriv/rootfs
     case $(dpkg --print-architecture) in
-        amd64) mirror=http://archive.ubuntu.com/ubuntu ;;
-        arm64) mirror=http://ports.ubuntu.com/ubuntu-ports ;;
+        amd64) mirror=https://archive.ubuntu.com/ubuntu ;;
+        arm64) mirror=https://ports.ubuntu.com/ubuntu-ports ;;
         *) exit 2 ;;
     esac
     mkdir -p "$base" /var/lib/machines
@@ -25,7 +25,10 @@ prepare)
     # connection timeout when one of a mirror's addresses does not answer.
     printf 'timeout = 15\ntries = 3\n' > "$base/wgetrc"
     export WGETRC="$base/wgetrc"
-    debootstrap --variant=minbase --include=systemd-sysv,dbus,python3,iproute2,ca-certificates noble "$root" "$mirror"
+    if ! debootstrap --variant=minbase --include=systemd-sysv,dbus,python3,iproute2,ca-certificates noble "$root" "$mirror"; then
+        tail -n 1000 "$root/debootstrap/debootstrap.log" >&2 || true
+        exit 1
+    fi
     rm -f "$root"/var/cache/apt/archives/*.deb
 
     mkdir -p "$root/etc/systemd/network"
