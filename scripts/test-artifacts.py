@@ -18,7 +18,7 @@ class Pins(unittest.TestCase):
         self.root = Path(self.temp.name)
         for name in ('scripts', 'firecracker', '.github', 'flexvm', 'guest'):
             (self.root / name).mkdir()
-        for name in ('versions.sh', 'fetch.sh', 'pin-artifacts.sh', 'release-assets.sh', 'build-firecracker.sh', 'build-kernel.sh', 'package-kernel-modules.sh'):
+        for name in ('versions.sh', 'fetch.sh', 'pin-artifacts.sh', 'release-assets.sh', 'build-firecracker.sh', 'build-kernel.sh', 'package-kernel-modules.sh', 'apply-kernel-patches.sh'):
             shutil.copy2(ROOT / 'scripts' / name, self.root / 'scripts' / name)
         shutil.copytree(ROOT / 'kernel', self.root / 'kernel')
         shutil.copytree(ROOT / 'firecracker', self.root / 'firecracker', dirs_exist_ok=True)
@@ -152,6 +152,43 @@ class Pins(unittest.TestCase):
         for data in ('', self.source_pin * 2, f'bad {self.source_url}\n'):
             self.checksums.write_text(data)
             self.assertNotEqual(self.run_script('build-kernel.sh', '--key').returncode, 0)
+
+    def test_kernel_patch_identity_and_reuse(self):
+        first = self.run_script('build-kernel.sh', '--key')
+        original = self.run_script('pin-artifacts.sh', '--inputs')
+        patch = self.root / 'kernel/patches/0001-kvm-initialize-tsc-multiplier.patch'
+        patch.write_text(patch.read_text() + '\n')
+        self.assertNotEqual(first.stdout, self.run_script('build-kernel.sh', '--key').stdout)
+        self.assertNotEqual(original.stdout, self.run_script('pin-artifacts.sh', '--inputs').stdout)
+        series = self.root / 'kernel/patches/series'
+        ordered = series.read_text()
+        series.write_text(ordered + ordered)
+        invalid = self.root / 'invalid-linux'
+        invalid.mkdir()
+        (invalid / 'Makefile').touch()
+        self.assertNotEqual(self.run_script('apply-kernel-patches.sh', str(invalid)).returncode, 0)
+        series.write_text(ordered)
+        extra = self.root / 'kernel/patches/.unrecorded'
+        extra.touch()
+        self.assertNotEqual(self.run_script('apply-kernel-patches.sh', str(invalid)).returncode, 0)
+        extra.unlink()
+        source = self.root / 'linux'
+        source.mkdir()
+        (source / 'Makefile').touch()
+        target = source / 'arch/x86/kvm/x86.c'
+        target.parent.mkdir(parents=True)
+        target.write_text('\tkvm_xen_init_vcpu(vcpu);\n\tkvm_vcpu_mtrr_init(vcpu);\n'
+                          '\tvcpu_load(vcpu);\n'
+                          '\tkvm_set_tsc_khz(vcpu, vcpu->kvm->arch.default_tsc_khz);\n'
+                          '\tkvm_vcpu_reset(vcpu, false);\n\tkvm_init_mmu(vcpu);\n')
+        applied = self.run_script('apply-kernel-patches.sh', str(source))
+        self.assertEqual(applied.returncode, 0, applied.stderr + applied.stdout)
+        reused = self.run_script('apply-kernel-patches.sh', str(source))
+        self.assertEqual(reused.returncode, 0, reused.stderr + reused.stdout)
+        target.write_text(target.read_text().replace('default_tsc_scaling_ratio', 'incorrect_ratio'))
+        self.assertNotEqual(self.run_script('apply-kernel-patches.sh', str(source)).returncode, 0)
+        patch.write_text(patch.read_text() + '\n')
+        self.assertNotEqual(self.run_script('apply-kernel-patches.sh', str(source)).returncode, 0)
 
     def test_unknown_arch(self):
         for arch in ('arm64', 'x86_64 aarch64', 'x86'):

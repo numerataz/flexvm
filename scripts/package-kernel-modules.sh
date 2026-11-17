@@ -49,6 +49,7 @@ trap 'exit 143' TERM
 mkdir -p "$work/source"
 tar -xJf "$archive" -C "$work/source"
 pristine=$work/source/linux-$LINUX_VERSION
+"$root/scripts/apply-kernel-patches.sh" "$pristine"
 # Generated inputs alone cannot account for edits to a source header. Reject a
 # modified build tree instead of shipping clean source for a different kernel.
 check_sources() {
@@ -147,7 +148,7 @@ def keep(directory, names):
             path.unlink()
 keep(build, {'.config', 'Module.symvers', 'System.map', 'vmlinux', 'Makefile',
              'Kbuild', 'Kconfig', 'COPYING', 'LICENSES', 'README',
-             'include', 'scripts', 'arch', 'tools'})
+             'include', 'scripts', 'arch', 'tools', '.flexvm-patches'})
 keep(build / 'arch', {arch})
 keep(build / 'tools', {'Makefile', 'build', 'include', 'scripts', 'arch',
                        'objtool', 'bpf', 'lib'})
