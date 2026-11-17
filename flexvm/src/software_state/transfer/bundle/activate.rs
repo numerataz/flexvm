@@ -204,6 +204,10 @@ impl<'a> Activation<'a> {
         &self.header.manifest
     }
 
+    pub(in crate::software_state::transfer) fn offer(&self) -> &Offer {
+        &self.decision.offer
+    }
+
     pub(crate) fn returns_routed_address(&self) -> bool {
         self.decision.return_fence.as_ref().is_some_and(|previous| previous.routed.is_some())
     }
