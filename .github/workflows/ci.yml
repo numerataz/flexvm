@@ -498,7 +498,7 @@ jobs:
           path: |
             ${{ env.STATE }}/artifacts/firecracker
             ${{ env.STATE }}/artifacts/firecracker.sha256
-          key: firecracker-${{ steps.keys.outputs.env }}-${{ steps.keys.outputs.fc }}-${{ hashFiles('firecracker/*.patch', 'scripts/build-firecracker.sh', 'scripts/versions.sh') }}
+          key: firecracker-s5-tests-v1-${{ steps.keys.outputs.env }}-${{ steps.keys.outputs.fc }}-${{ hashFiles('firecracker/*.patch', 'scripts/build-firecracker.sh', 'scripts/versions.sh') }}
       - name: Build Firecracker
         if: steps.keys.outputs.fc-build == 'true' && steps.fc-cache.outputs.cache-hit != 'true'
         run: |
@@ -507,6 +507,14 @@ jobs:
           ./scripts/build-firecracker.sh
           # For this runner's arch (x86_64, or aarch64-unknown-linux-musl on the arm runner).
           file "$STATE/artifacts/firecracker" | grep -q "$([ "$(uname -m)" = aarch64 ] && echo 'ARM aarch64' || echo 'x86-64')"
+      - name: Firecracker ACPI power-off unit tests
+        if: runner.arch == 'X64' && steps.keys.outputs.fc-build == 'true' && steps.fc-cache.outputs.cache-hit != 'true'
+        run: |
+          export CFLAGS_x86_64_unknown_linux_musl="-idirafter $PWD/build/musl-kheaders"
+          cd build/firecracker-src
+          cargo test --locked --target x86_64-unknown-linux-musl -p vmm --lib acpi_power
+          cargo test --locked --target x86_64-unknown-linux-musl -p vmm --lib acpi::x86_64::tests
+
       - name: Save Firecracker
         if: steps.keys.outputs.fc-build == 'true' && steps.fc-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
