@@ -517,6 +517,63 @@ def md5(host, vm):
     return must(host, vm, "md5sum /tmp/data").split()[0]
 
 
+def save_distro_failure(vm):
+    """Capture the failed distro before its finally block removes the VMs."""
+    try:
+        destination = tempfile.mkdtemp(prefix="distro-failure-", dir=args.log_dir)
+        report = {"vm": vm, "hosts": {}, "errors": []}
+        for host in (A, B):
+            details = report["hosts"][host.label] = {"threads": {}}
+            try:
+                result = host.cli("ps", "-a", "--json", timeout=5, check=False)
+                details["registry"] = {"status": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
+                entry = next((item for item in json.loads(result.stdout) if item["name"] == vm), None)
+                details["entry"] = entry
+                if entry and entry.get("pid"):
+                    pid = entry["pid"]
+                    def identity(process):
+                        with open(f"/proc/{process}/stat") as source:
+                            fields = source.read().rsplit(")", 1)[1].split()
+                        return int(fields[1]), int(fields[19])
+                    if identity(pid)[1] == entry.get("start"):
+                        processes = [(pid, entry["start"])]
+                        child = entry.get("firecracker")
+                        if child:
+                            parent, start = identity(child)
+                            if parent == pid:
+                                processes.append((child, start))
+                        for process, start in processes:
+                            captured = {}
+                            for task in sorted(os.listdir(f"/proc/{process}/task"))[:256]:
+                                captured[task] = {}
+                                for name in ("comm", "status", "wchan", "stack"):
+                                    try:
+                                        with open(f"/proc/{process}/task/{task}/{name}") as source:
+                                            captured[task][name] = source.read(16384)
+                                    except OSError as error:
+                                        captured[task][name] = str(error)
+                            if identity(process)[1] == start:
+                                details["threads"][str(process)] = captured
+            except Exception as error:
+                report["errors"].append(f"{host.label} processes: {type(error).__name__}: {error}")
+            try:
+                host.save_logs(destination)
+            except Exception as error:
+                report["errors"].append(f"{host.label} logs: {type(error).__name__}: {error}")
+            try:
+                journal = host.exec(vm, "journalctl --no-pager -n 200 -u flexvm-runtime.service "
+                                    "-u flexvm-runtime-restart-probe.service; systemctl show "
+                                    "flexvm-runtime.service flexvm-runtime-restart-probe.service", timeout=3)
+                details["guest_journal"] = {"status": journal[0], "stdout": journal[1], "stderr": journal[2]}
+            except Exception as error:
+                report["errors"].append(f"{host.label} journal: {type(error).__name__}: {error}")
+        with open(os.path.join(destination, "report.json"), "x") as output:
+            json.dump(report, output, indent=2)
+        print(f"distro failure evidence before cleanup: {destination}", flush=True)
+    except Exception as error:
+        print(f"distro failure evidence: {type(error).__name__}: {error}", flush=True)
+
+
 def marker(host, vm):
     """Starts a guest process counting up in /tmp/count; returns (pid, start time)."""
     # Written to a temporary file and renamed, so a read never sees it empty or half written.
@@ -2815,8 +2872,14 @@ def distro_systemd():
         host = B
         observe("migration")
         old = execute("systemctl show --property=MainPID --value flexvm-runtime.service")[1].strip()
-        restart = "for i in $(seq 1 8); do systemctl restart flexvm-runtime.service || exit; done; touch /run/flexvm-restarts-done"
-        execute("systemd-run --unit=flexvm-runtime-restart-probe --collect --no-block /bin/sh -ec " + shlex.quote(restart), False)
+        restart = ("for i in $(seq 1 8); do echo FLEXVM_RESTART_BEGIN_$i; "
+                   "if systemctl restart flexvm-runtime.service; then echo FLEXVM_RESTART_END_$i; "
+                   "else result=$?; echo FLEXVM_RESTART_FAILED_${i}_STATUS_$result; "
+                   "systemctl status --no-pager flexvm-runtime.service; exit $result; fi; "
+                   "done; touch /run/flexvm-restarts-done; echo FLEXVM_RESTART_COMPLETE")
+        execute("systemd-run --unit=flexvm-runtime-restart-probe --collect --no-block "
+                "--property=StandardOutput=journal+console --property=StandardError=journal+console "
+                "/bin/sh -ec " + shlex.quote(restart), False)
         check("distro: repeated runtime restart restores exec", wait_for(lambda: execute("test -f /run/flexvm-restarts-done", False)[0] == 0, 30))
         check("distro: runtime provider replaced", execute("systemctl show --property=MainPID --value flexvm-runtime.service")[1].strip() not in ("", "0", old))
         observe("runtime restart")
@@ -2846,6 +2909,9 @@ def distro_systemd():
         host.cli("kill", "--signal", "TERM", vm)
         check("distro: guest shutdown records successful exit", wait_for(lambda: host.ps().get(vm, {}).get("state") == "exited", 30), host.ps().get(vm))
         check("distro: poweroff status is zero", host.ps()[vm].get("status") == 0, host.ps()[vm])
+    except BaseException:
+        save_distro_failure(vm)
+        raise
     finally:
         A.rm(vm, force=True, check=False)
         B.rm(vm, force=True, check=False)

@@ -38,3 +38,24 @@ passes and do not create replay input copies. Failure retention does not change
 execution deadlines or turn a failed/interrupted run into a pass. The native
 restore stalls in #1417 and nested software watchdog issue #1423 remain separate
 correctness investigations.
+
+The native `distro_systemd` case also captures before removing its VMs: registry
+entries, PID/start-validated owner and VMM thread states, host logs, and a bounded
+best-effort runtime/restart-service journal request. Its eight restart attempts
+emit begin/end/failure markers to the journal and console, distinguishing a
+failed service restart from a completed restart whose exec transport is lost.
+The original 30-second readiness check remains unchanged; evidence capture
+happens after a failed assertion and cannot make it pass.
+
+A failed `software-lifecycle.py` worker additionally retains its private fixture
+state in `failure-state.tar.zst` before temporary-directory cleanup, including
+checkpoint inputs, manifests and ownership markers. The redundant `state/images`
+cache is excluded; checkpoint bundles already contain their root filesystem.
+Single-threaded fast zstd and large tar records limit copy/tracer overhead.
+The capture has a 2 GiB logical input budget, 65,536-entry budget and separate 30-second diagnostic copy
+budget; special files are refused and symlinks are archived without following
+them. `failure-state.json` records the archive digest or capture failure. Original
+execution deadlines and failure results are unchanged. Verify checkpoint digests
+and completeness before replay: the archive is best-effort diagnostic state,
+not a grant of production restore authority. This named lifecycle uses serial
+control; #1450 tracks its missing FENCE reply separately.
