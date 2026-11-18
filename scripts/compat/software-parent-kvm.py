@@ -3,6 +3,7 @@
 import argparse
 import json
 from pathlib import Path
+import re
 import runpy
 import tempfile
 import time
@@ -18,10 +19,12 @@ def main():
     for name in ("bin", "kernel", "firecracker", "qemu", "bundle", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--engine", choices=("auto", "tcg", "kvm"), default="tcg")
-    parser.add_argument("--pause", action="store_true", help="pause and resume the first nested VM through the public command")
+    lifecycle = parser.add_mutually_exclusive_group()
+    lifecycle.add_argument("--pause", action="store_true", help="pause and resume the first nested VM through the public command")
+    lifecycle.add_argument("--suspend", action="store_true", help="stop and restore the first nested VM through the public command")
     args = parser.parse_args()
-    if args.pause and args.engine != "tcg":
-        parser.error("--pause requires the TCG parent provider")
+    if (args.pause or args.suspend) and args.engine != "tcg":
+        parser.error("--pause and --suspend require the TCG parent provider")
     binary, kernel, firecracker, qemu, bundle = (
         path.resolve(strict=True) for path in (args.bin, args.kernel, args.firecracker, args.qemu, args.bundle)
     )
@@ -42,11 +45,14 @@ def main():
         "network-interfaces": [{"iface_id": "eth0", "host_dev_name": "flexvmtap", "guest_mac": "02:00:00:00:00:02"}],
     }
     archive = output / "image.tar"
+    inner_files = {"firecracker-network": b""}
+    if args.suspend:
+        inner_files["firecracker-checkpoint"] = b""
     image(archive, "amd64", {
         "kvm-workload": (app.read_bytes(), 0o755),
         "firecracker": (firecracker.read_bytes(), 0o755),
         "firecracker-kernel": (kernel.read_bytes(), 0o600),
-        "firecracker-initrd": (HELPERS["initramfs"](init.read_bytes(), files={"firecracker-network": b""}), 0o600),
+        "firecracker-initrd": (HELPERS["initramfs"](init.read_bytes(), files=inner_files), 0o600),
         "firecracker-network": (b"", 0o600),
         "firecracker.json": (json.dumps(config).encode(), 0o600),
         "etc/passwd": (b"root:x:0:0:root:/root:/bin/sh\n", 0o644),
@@ -64,19 +70,21 @@ def main():
     with tempfile.TemporaryDirectory(prefix="flexvm-software-parent-", dir="/var/lib") as state:
         mask = Path(state) / "mask"
         mask.touch(mode=0o600)
+        prefix = ["unshare", "--mount", "--propagation", "private", "sh", "-ec", setup, "sh", mask, args.engine,
+                  "strace", "-f", "-e", "trace=file", "-o"]
         command = [
-            "unshare", "--mount", "--propagation", "private", "sh", "-ec", setup, "sh", mask, args.engine,
-            "strace", "-f", "-e", "trace=file", "-o", trace,
-            binary, "software", "--kernel", kernel, "--qemu", qemu, "--state", state, "--verbose",
-            "--parent-kvm-bundle", bundle, "--parent-kvm-engine", args.engine, "--parent-kvm-mem", "128",
-            "--mem", "512",
+            *prefix, trace, binary, "software", "--kernel", kernel, "--qemu", qemu, "--state", state, "--verbose",
+            "--parent-kvm-bundle", bundle, "--parent-kvm-engine", args.engine, "--parent-kvm-mem", "128", "--mem", "512",
         ]
         during = None
         if args.pause:
             name = "parent-kvm-pause"
             command.extend(["--name", name])
             during = lambda proc, deadline: pause_nested(proc, deadline, binary, state, name, output, log)
-        HELPERS["run"]([*command, archive], 180, log, during=during)
+        if args.suspend:
+            suspend_nested(command, prefix, archive, binary, state, output, log)
+        else:
+            HELPERS["run"]([*command, archive], 180, log, during=during)
     transcript = log.read_text(errors="replace")
     for marker in ("FLEXVM_SOFTWARE_INNER_CPU 0", "FLEXVM_SOFTWARE_INNER_CPU 1", "FLEXVM_SOFTWARE_INNER_COMPLETE",
                    "PASS Firecracker network echo"):
@@ -84,7 +92,13 @@ def main():
             raise RuntimeError(f"expected two occurrences of {marker}; see {log}")
     if "PASS parent KVM device reuse" not in transcript:
         raise RuntimeError(f"parent device reuse failed; see {log}")
-    lines = trace.read_text(errors="replace").splitlines()
+    if args.suspend:
+        before = re.findall(r"FLEXVM_SOFTWARE_INNER_CANARY ([0-9a-f]{16})", transcript)
+        after = re.findall(r"FLEXVM_SOFTWARE_INNER_RESTORED ([0-9a-f]{16})", transcript)
+        if len(before) != 2 or before != after:
+            raise RuntimeError(f"the x86 hierarchy lost its memory canary; see {log}")
+    traces = [trace, output / "target.strace"] if args.suspend else [trace]
+    lines = [line for path in traces for line in path.read_text(errors="replace").splitlines()]
     devices = {device for device in DEVICES if any(f'"{device}"' in line for line in lines)}
     expected = {"/dev/kvm"} if args.engine in ("auto", "kvm") else set()
     if devices != expected:
@@ -94,23 +108,47 @@ def main():
         users = {line.split()[0] for line in lines if '"/dev/kvm"' in line}
         # The startup probe uses the original bundle path, then the broker
         # uses its private bundle reference for actual child execution.
-        probes = {line.split()[0] for line in lines if f'execve("{bundle / "native-worker"}",' in line}
+        probes = {line.split()[0] for line in lines
+                  if 'native-worker",' in line and '"--supported-cpuid"' in line and "execve(" in line and '/provider/native-worker"' not in line}
         workers -= probes
         expected_workers = len(workers) >= 2 if args.engine == "kvm" else not workers
         if len(probes) != 1 or not expected_workers or users != workers | probes:
             raise RuntimeError("only the expected native worker processes may access host KVM")
     report = {"status": "passed", "engine": "tcg" if args.engine == "auto" else args.engine, "selection": args.engine,
               "nested_vcpus": 2, "nested_starts": 2, "firecracker_sha256": HELPERS["digest"](firecracker),
-              "host_virtualization_devices": sorted(devices), "paused_hierarchy": args.pause}
+              "host_virtualization_devices": sorted(devices), "paused_hierarchy": args.pause, "restored_hierarchy": args.suspend}
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+
+
+def wait_nested_window(proc, deadline, log, marker):
+    while not re.search(marker, log.read_text(errors="replace")):
+        if proc.poll() is not None or time.monotonic() >= deadline:
+            raise RuntimeError("the nested x86 guest did not reach its checkpoint window")
+        time.sleep(.01)
+
+
+def suspend_nested(command, prefix, archive, binary, state, output, log):
+    name = "parent-kvm-suspend"
+    source, target = output / "source.log", output / "target.log"
+
+    def stop(proc, deadline):
+        wait_nested_window(proc, deadline, source, r"FLEXVM_SOFTWARE_INNER_CANARY [0-9a-f]{16}")
+        HELPERS["run"]([binary, "stop", "--state", state, name], 90, output / "stop.log")
+
+    try:
+        HELPERS["run"]([*command, "--name", name, archive], 180, source, during=stop)
+        checkpoint = Path(state) / "suspended" / name
+        manifest = json.loads((checkpoint / "manifest.json").read_text())
+        if not (checkpoint / "RETIRED").is_file() or manifest["parent"]["child_memory_mib"] != 128:
+            raise RuntimeError("the x86 owner did not retire a complete hierarchy")
+        HELPERS["run"]([*prefix, output / "target.strace", binary, "start", "-a", "--state", state, name], 150, target)
+    finally:
+        log.write_bytes(b"".join(part.read_bytes() for part in (source, target) if part.exists()))
 
 
 def pause_nested(proc, deadline, binary, state, name, output, log):
     marker = "FLEXVM_SOFTWARE_INNER_TICK 0"
-    while marker not in log.read_text(errors="replace"):
-        if proc.poll() is not None or time.monotonic() >= deadline:
-            raise RuntimeError("the nested x86 guest did not reach its pause window")
-        time.sleep(.01)
+    wait_nested_window(proc, deadline, log, marker)
     HELPERS["run"]([binary, "pause", "--state", state, name], 15, output / "pause.log")
     paused = log.read_text(errors="replace").split(marker, 1)[-1]
     if "software: parent KVM vCPUs quiesced" not in paused:

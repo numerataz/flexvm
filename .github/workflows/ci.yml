@@ -673,6 +673,7 @@ jobs:
           }
           run_public_parent tcg
           run_public_parent tcg tcg --pause
+          run_public_parent tcg tcg --suspend
           if [ -x "$RUNNER_TEMP/parent-kvm-firecracker-kvm-2/provider/native-worker" ]; then
             run_public_parent kvm
             run_public_parent auto kvm

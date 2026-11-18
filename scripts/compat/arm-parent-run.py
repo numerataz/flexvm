@@ -14,7 +14,6 @@ import runpy
 import select
 import shutil
 import socket
-import stat
 import struct
 import subprocess
 import tempfile
@@ -365,63 +364,25 @@ def serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, cr
             os.close(exited)
 
 
-def state_fds(fds, *, writing=False):
-    identities = set()
-    for fd in fds:
-        mode = os.fstat(fd)
-        identity = mode.st_dev, mode.st_ino
-        access = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE
-        if not stat.S_ISREG(mode.st_mode) or identity in identities or os.lseek(fd, 0, os.SEEK_CUR):
-            raise RuntimeError("ARM checkpoint needs distinct regular files positioned at zero")
-        if (writing and access == os.O_RDONLY) or (not writing and access == os.O_WRONLY):
-            raise RuntimeError("ARM checkpoint file access mode is invalid")
-        identities.add(identity)
-    return fds
-
-
+state_fds = PARENT["state_fds"]
+restore_interrupts = PARENT["restore_interrupts"]
+transfer = PARENT["transfer_state"]
 IDLE_WORKER_STATE = b"FLEXVM ARM no nested worker\n"
 
 
 def capture_state(outer, qmp, irq_fds, worker, fds):
-    outer_fd, child_fd, metadata = state_fds(fds, writing=True)
     if worker is not None and worker.proc is None:
         raise RuntimeError("ARM checkpoint cannot capture a worker that is still starting")
-    if any(os.fstat(fd).st_size for fd in fds):
-        raise RuntimeError("ARM checkpoint output files must be empty")
-    monitor = PARENT["HELPERS"]["QMP"](qmp, outer, time.monotonic() + 30)
-    try:
-        monitor.ask("stop")
-        if monitor.ask("query-status")["status"] != "paused":
-            raise RuntimeError("ARM checkpoint could not pause the outer VM")
-        pending = {}
-        for gsi, fd in enumerate(irq_fds):
-            try:
-                pending[gsi] = os.eventfd_read(fd)
-            except BlockingIOError:
-                pass
+
+    def capture_worker(fd):
         if worker is None:
-            if os.write(child_fd, IDLE_WORKER_STATE) != len(IDLE_WORKER_STATE):
+            if os.write(fd, IDLE_WORKER_STATE) != len(IDLE_WORKER_STATE):
                 raise RuntimeError("short ARM idle worker state write")
-        else:
-            worker.capture(child_fd)
-        record = json.dumps({"version": 1, "worker": worker.profile() if worker else None, "pending": pending}).encode()
-        if os.write(metadata, record) != len(record):
-            raise RuntimeError("short ARM checkpoint metadata write")
-        transfer(monitor, outer_fd)
-    finally:
-        monitor.close()
-    return pending
+            return None
+        worker.capture(fd)
+        return worker.profile()
 
-
-def restore_interrupts(irq_fds, pending):
-    for gsi, count in pending.items():
-        index = int(gsi)
-        if not 0 <= index < len(irq_fds) or not 0 < count < (1 << 64) - 1:
-            raise RuntimeError("invalid ARM checkpoint pending interrupt")
-        os.eventfd_write(irq_fds[index], count)
-
-
-transfer = PARENT["transfer_state"]
+    return PARENT["capture_hierarchy"](outer, qmp, irq_fds, fds, capture_worker)
 
 
 def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=None, frontend=None,

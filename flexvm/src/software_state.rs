@@ -139,7 +139,7 @@ impl Manifest {
             bail!("software state has invalid ownership, session or barrier identity");
         }
         if let Some(parent) = &self.parent {
-            if self.profile.architecture != "aarch64"
+            if !matches!(self.profile.architecture.as_str(), "aarch64" | "x86_64")
                 || !(1..=self.memory_mib.min(256)).contains(&parent.child_memory_mib)
                 || parent.frontend.bytes > (4 << 20) + 512
                 || parent.broker.bytes > 2 << 20
