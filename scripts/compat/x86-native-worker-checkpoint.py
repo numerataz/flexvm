@@ -10,6 +10,7 @@ import runpy
 import select
 import shutil
 import struct
+import time
 
 PARENT = runpy.run_path(str(Path(__file__).with_name("parent-kvm-run.py")))
 BASE = 0x1000
@@ -68,7 +69,7 @@ def boot(output, binary, ram, offset):
                     struct.unpack_from("<i", mailbox, lane + 12)[0] != status):
                 raise RuntimeError("unexpected native worker run reply")
 
-        yield child, begin, finish
+        yield child, begin, finish, interrupts
 
 
 def main():
@@ -90,7 +91,7 @@ def main():
         for ram in (source, target):
             fcntl.fcntl(ram, fcntl.F_ADD_SEALS, fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
         os.pwrite(source, PROGRAM, 0)
-        with boot(args.output / "source", args.worker, source, 0) as (child, begin, finish):
+        with boot(args.output / "source", args.worker, source, 0) as (child, begin, finish, interrupts):
             regs = [0] * 18
             regs[16:] = [BASE, 2]
             child.set_registers(0, PARENT["REGISTERS"].pack(*regs))
@@ -109,12 +110,18 @@ def main():
             finish(2, -errno.EINTR, hold=True)
             child.freeze_run_control(True)
             original = child.registers(0)
+            child.checkpoint_interrupts(False)
+            os.eventfd_write(interrupts[6], 1)
+            pending_irq = os.eventfd_read(interrupts[6])
+            if pending_irq != 1:
+                raise RuntimeError("source IRQFD credit was consumed after detaching")
             child.checkpoint_file(state)
 
         os.pwrite(target, os.pread(source, page, 0), page)
         os.pwrite(target, CONTINUE, page + len(PROGRAM) - 2)
-        with boot(args.output / "target", args.worker, target, page) as (child, begin, finish):
+        with boot(args.output / "target", args.worker, target, page) as (child, begin, finish, interrupts):
             child.freeze_run_control(True)
+            child.checkpoint_interrupts(False)
             fresh = child.registers(0)
             bad = memfd(owned, "x86-native-invalid-state", os.fstat(state).st_size)
             os.pwrite(bad, os.pread(state, os.fstat(state).st_size, 0), 0)
@@ -136,6 +143,22 @@ def main():
                 raise RuntimeError("native target did not recover the source VM clock")
             if child.access_msrs(0, [(index, 0) for index, _ in configured_msrs], False) != configured_msrs:
                 raise RuntimeError("native target did not recover the configured MSR")
+            if child.irqchip(0)[9] & (1 << 6):
+                raise RuntimeError("restoring the worker injected the saved credit early")
+            child.checkpoint_interrupts(True)
+            os.eventfd_write(interrupts[6], pending_irq)
+            deadline = time.monotonic() + 2
+            # KVM's IRQFD may deliver through a queued kernel work item.
+            while not child.irqchip(0)[9] & (1 << 6):
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("the transferred IRQFD credit did not reach the PIC")
+                time.sleep(.002)
+            try:
+                os.eventfd_read(interrupts[6])
+            except BlockingIOError:
+                pass
+            else:
+                raise RuntimeError("reattached IRQFD did not consume the pending interrupt")
             child.freeze_run_control(False)
             begin(1)
             finish(1)
@@ -143,7 +166,7 @@ def main():
             finish(2)
             if child.lanes.written_pio != [(PORT, 1, b"\x22"), (PORT, 4, struct.pack("<I", VALUE))]:
                 raise RuntimeError(f"native target lost CPU or CPUID state: {child.lanes.written_pio!r}")
-    print("PASS native x86 worker restored registers, CPUID, clock and MSRs on different parent RAM")
+    print("PASS native x86 worker restored registers, CPUID, clock, MSRs and a pending IRQ on different parent RAM")
 
 
 if __name__ == "__main__":
