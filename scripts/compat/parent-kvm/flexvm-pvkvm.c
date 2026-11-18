@@ -1430,6 +1430,8 @@ static long device_capability(unsigned long capability)
 		return 1;
 	case KVM_CAP_NR_MEMSLOTS:
 		return PVKVM_MAX_SLOTS;
+	case KVM_CAP_ADJUST_CLOCK:
+		return KVM_CLOCK_REALTIME;
 	case KVM_CAP_NR_VCPUS:
 	case KVM_CAP_MAX_VCPUS:
 		return PVKVM_MAX_CPUS;
@@ -1819,6 +1821,36 @@ out:
 	return result;
 }
 
+static long vm_clock(struct pvvm *vm, bool write, struct kvm_clock_data __user *user)
+{
+	struct pvkvm *p = vm->provider;
+	struct kvm_clock_data clock;
+	int result;
+
+	if (write) {
+		if (copy_from_user(&clock, user, sizeof(clock)))
+			return -EFAULT;
+		if (clock.flags & ~(KVM_CLOCK_TSC_STABLE | KVM_CLOCK_REALTIME | KVM_CLOCK_HOST_TSC))
+			return -EINVAL;
+	}
+	result = mutex_lock_interruptible(&p->lock);
+	if (result)
+		return result;
+	if (p->dead) {
+		result = -ENODEV;
+	} else {
+		if (write)
+			memcpy_toio(p->mailbox + PVKVM_CLOCK_AT, &clock, sizeof(clock));
+		result = request(p, write ? PVKVM_SET_CLOCK : PVKVM_GET_CLOCK, NULL, NULL);
+		if (!result && !write)
+			memcpy_fromio(&clock, p->mailbox + PVKVM_CLOCK_AT, sizeof(clock));
+	}
+	mutex_unlock(&p->lock);
+	if (!result && !write && copy_to_user(user, &clock, sizeof(clock)))
+		return -EFAULT;
+	return result;
+}
+
 static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct pvvm *vm = file->private_data;
@@ -1853,6 +1885,8 @@ static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return access_pit_state(vm, cmd == KVM_SET_PIT2, (void __user *)arg);
 	if (cmd == KVM_SET_TSS_ADDR)
 		return set_tss_address(vm, arg);
+	if (cmd == KVM_GET_CLOCK || cmd == KVM_SET_CLOCK)
+		return vm_clock(vm, cmd == KVM_SET_CLOCK, (void __user *)arg);
 	if (cmd != KVM_SET_USER_MEMORY_REGION)
 		return -ENOTTY;
 	if (copy_from_user(&memory, (void __user *)arg, sizeof(memory)))
@@ -2058,8 +2092,10 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	BUILD_BUG_ON(sizeof(struct kvm_xsave) != PVKVM_XSAVE_BYTES);
 	BUILD_BUG_ON(PVKVM_XSAVE_AT + PVKVM_XSAVE_BYTES > PVKVM_VCPU_EVENTS_AT);
 	BUILD_BUG_ON(sizeof(struct kvm_vcpu_events) != PVKVM_VCPU_EVENTS_BYTES);
+	BUILD_BUG_ON(PVKVM_VCPU_EVENTS_AT + PVKVM_VCPU_EVENTS_BYTES > PVKVM_CLOCK_AT);
+	BUILD_BUG_ON(sizeof(struct kvm_clock_data) != PVKVM_CLOCK_BYTES);
 	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
-	    pci_resource_len(dev, 2) < PVKVM_VCPU_EVENTS_AT + PVKVM_VCPU_EVENTS_BYTES)
+	    pci_resource_len(dev, 2) < PVKVM_CLOCK_AT + PVKVM_CLOCK_BYTES)
 		return -ENODEV;
 	result = pcim_enable_device(dev);
 	if (result)

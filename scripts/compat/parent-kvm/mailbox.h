@@ -3,7 +3,7 @@
 #define FLEXVM_PVKVM_MAILBOX_H
 
 #define PVKVM_MAGIC        0x4d564b46
-#define PVKVM_VERSION      34
+#define PVKVM_VERSION      35
 #define PVKVM_MAGIC_AT     0
 #define PVKVM_VERSION_AT   4
 #define PVKVM_REQUEST_AT   8
@@ -48,6 +48,8 @@
 #define PVKVM_XSAVE_BYTES     4096
 #define PVKVM_VCPU_EVENTS_AT  0x89000
 #define PVKVM_VCPU_EVENTS_BYTES 64
+#define PVKVM_CLOCK_AT        0x89100
+#define PVKVM_CLOCK_BYTES     48
 #define PVKVM_IOAPIC_GPA     0xfec00000ULL
 #define PVKVM_GSI_COUNT      24
 #define PVKVM_REGISTERS_AT   64
@@ -129,6 +131,8 @@ enum pvkvm_command {
 	PVKVM_SET_XSAVE,
 	PVKVM_GET_VCPU_EVENTS,
 	PVKVM_SET_VCPU_EVENTS,
+	PVKVM_GET_CLOCK,
+	PVKVM_SET_CLOCK,
 };
 
 #endif
