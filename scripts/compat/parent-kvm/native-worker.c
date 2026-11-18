@@ -12,6 +12,7 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include "mailbox.h"
 #include "slot-map.h"
 
 static void check(bool condition, const char *why)
@@ -33,16 +34,10 @@ static unsigned long number(const char *text, unsigned long maximum)
 
 int main(int argc, char **argv)
 {
-    check(argc == 5, "expected control, outer RAM, slot layout, and guest slot address");
+    check(argc >= 6 && (argc - 3) % 3 == 0 &&
+          (argc - 3) / 3 <= PVKVM_MAX_SLOTS, "expected control, outer RAM, and slot triples");
     int control = (int)number(argv[1], INT_MAX);
     int outer_ram = (int)number(argv[2], INT_MAX);
-    int layout = (int)number(argv[3], INT_MAX);
-    uint64_t guest_phys_addr = number(argv[4], UINT32_MAX);
-    size_t slot_bytes;
-    void *slot = flexvm_map_slot(outer_ram, layout, &slot_bytes);
-    check(slot != MAP_FAILED, "map the parent RAM slot");
-    close(outer_ram);
-    close(layout);
 
     int kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     check(kvm >= 0 && ioctl(kvm, KVM_GET_API_VERSION, 0) == KVM_API_VERSION,
@@ -51,10 +46,21 @@ int main(int argc, char **argv)
     check(bytes >= (int)sizeof(struct kvm_run), "KVM run mapping size");
     int vm = ioctl(kvm, KVM_CREATE_VM, 0);
     check(vm >= 0, "create host VM");
-    struct kvm_userspace_memory_region memory = {
-        .guest_phys_addr = guest_phys_addr, .memory_size = slot_bytes, .userspace_addr = (uintptr_t)slot,
-    };
-    check(ioctl(vm, KVM_SET_USER_MEMORY_REGION, &memory) == 0, "register shared page");
+    for (int arg = 3; arg < argc; arg += 3) {
+        int layout = (int)number(argv[arg], INT_MAX);
+        uint64_t gpa = number(argv[arg + 1], UINT32_MAX);
+        uint32_t id = number(argv[arg + 2], PVKVM_MAX_SLOTS - 1);
+        size_t slot_bytes;
+        void *slot = flexvm_map_slot(outer_ram, layout, &slot_bytes);
+        check(slot != MAP_FAILED, "map a parent RAM slot");
+        close(layout);
+        struct kvm_userspace_memory_region memory = {
+            .slot = id, .guest_phys_addr = gpa, .memory_size = slot_bytes,
+            .userspace_addr = (uintptr_t)slot,
+        };
+        check(ioctl(vm, KVM_SET_USER_MEMORY_REGION, &memory) == 0, "register a shared RAM slot");
+    }
+    close(outer_ram);
     int cpu = ioctl(vm, KVM_CREATE_VCPU, 0);
     check(cpu >= 0, "create host vCPU");
     struct kvm_run *run = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, cpu, 0);
