@@ -175,12 +175,18 @@ static void check_gic_checkpoint(int source, int target, struct result *result)
     struct flexvm_arm_request bind = {.command = FLEXVM_ARM_BIND_IRQFD, .gsi = 3};
     ASSERT(event >= 0 && pass_descriptors(source, bind, &event, 1) == 0 && eventfd_write(event, 1) == 0);
 
-    // The kernel queues IRQFD injection. Wait while the source stays fenced.
-    ASSERT(poll(NULL, 0, 50) == 0);
+    struct flexvm_arm_request irq_mode = {.command = FLEXVM_ARM_IRQFD_MODE};
+    ASSERT(!exchange(source, irq_mode, result).status);
+    eventfd_t credit;
+    ASSERT(eventfd_write(event, 1) == 0 && eventfd_read(event, &credit) == 0 && credit == 1);
+    ASSERT(!exchange(target, irq_mode, result).status);
     int gic = memfd_create("arm-native-gic-checkpoint", MFD_CLOEXEC);
     ASSERT(gic >= 0);
     struct flexvm_arm_request save = {.command = FLEXVM_ARM_SAVE_GIC};
-    ASSERT(pass_descriptors(source, save, &gic, 1) == 0 && close(event) == 0);
+    ASSERT(pass_descriptors(source, save, &gic, 1) == 0);
+    irq_mode.gsi = 1;
+    ASSERT(!exchange(source, irq_mode, result).status && eventfd_write(event, credit) == 0);
+    ASSERT(eventfd_read(event, &credit) == -1 && errno == EAGAIN && close(event) == 0);
     // Read GICD_ISPENDR1 and GITS_CBASER through the target's actual MMIO mappings.
     const uint32_t probe[] = {
         0xd2a7ffe6, 0xb94204c1, 0xd2a20000, 0xb9000001,
@@ -216,7 +222,14 @@ static void check_gic_checkpoint(int source, int target, struct result *result)
     ASSERT(!reply.status && reply.exit_reason == KVM_EXIT_MMIO && reply.mmio.is_write &&
            reply.mmio.address == 0x10000008 && reply.mmio.length == sizeof(cbaser) &&
            (cbaser & UINT64_C(0x8000fffffffff000)) == UINT64_C(0x8000000040010000));
+    int stopped = memfd_create("arm-stopped-output", MFD_CLOEXEC);
+    struct flexvm_arm_request save_core = {.command = FLEXVM_ARM_SAVE_CORE};
+    ASSERT(stopped >= 0 && pass_descriptors(target, save_core, &stopped, 1) == -EBUSY);
+    send_run(lane, (struct flexvm_arm_request){.command = FLEXVM_ARM_SETTLE_WRITE});
+    ASSERT(!read_reply(lane).status);
+    ASSERT(pass_descriptors(target, save_core, &stopped, 1) == 0 && close(stopped) == 0);
     ASSERT(close(lane) == 0);
+    puts("PASS native ARM checkpoint drained MMIO and transferred IRQFD ownership");
     puts("PASS native ARM ITS restored the guest command queue base");
     puts("PASS native ARM GICv3 restored a pending IRQFD interrupt");
 }

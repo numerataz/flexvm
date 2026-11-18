@@ -26,6 +26,8 @@ struct arm_cpu {
     int fd;
     struct kvm_run *run;
     uint32_t pending_read;
+    bool pending_write;
+    bool deferred_exit;
     int initialized;
     uint32_t id;
     int lane;
@@ -40,7 +42,8 @@ struct arm_vm {
     size_t run_bytes;
     struct arm_cpu cpus[FLEXVM_ARM_MAX_CPUS];
     int vgic[2];
-    bool wired_irqs[FLEXVM_ARM_GSI_COUNT];
+    int irq_fds[FLEXVM_ARM_GSI_COUNT];
+    bool irqfds_attached;
     struct {
         uint64_t address;
         size_t bytes;
@@ -115,33 +118,21 @@ static int create_cpu(struct arm_vm *vm, uint32_t id)
     return 0;
 }
 
-static int run_cpu(struct arm_cpu *cpu, const struct flexvm_arm_request *request, struct flexvm_arm_reply *reply)
+static int run_exit(struct arm_cpu *cpu, struct flexvm_arm_reply *reply)
 {
     struct kvm_run *run = cpu->run;
-    if (cpu->pending_read)
-        memcpy(run->mmio.data, request->completion, cpu->pending_read);
-    __atomic_store_n(&run->immediate_exit, 0, __ATOMIC_RELAXED);
-    atomic_signal_fence(memory_order_seq_cst);
-    active_sequence = request->sequence;
-    if (active_sequence && (stop_requested || active_sequence == cancelled_sequence))
-        __atomic_store_n(&run->immediate_exit, 1, __ATOMIC_RELAXED);
-    int status = ioctl_result(ioctl(cpu->fd, KVM_RUN, 0));
-    active_sequence = 0;
-    /* KVM completes the previous userspace read before an interrupted run. */
-    if (!status || status == -EINTR || status == -EAGAIN)
-        cpu->pending_read = 0;
-    if (status)
-        return status;
     if (run->exit_reason == KVM_EXIT_MMIO) {
         if (!run->mmio.len || run->mmio.len > sizeof(run->mmio.data))
             return -EIO;
         reply->mmio.address = run->mmio.phys_addr;
         reply->mmio.length = run->mmio.len;
         reply->mmio.is_write = run->mmio.is_write;
-        if (run->mmio.is_write)
+        if (run->mmio.is_write) {
             memcpy(reply->mmio.data, run->mmio.data, run->mmio.len);
-        else
+            cpu->pending_write = true;
+        } else {
             cpu->pending_read = run->mmio.len;
+        }
     } else if (run->exit_reason == KVM_EXIT_SYSTEM_EVENT) {
         if (run->system_event.ndata > sizeof(reply->event.data) / sizeof(reply->event.data[0]))
             return -EIO;
@@ -155,6 +146,51 @@ static int run_cpu(struct arm_cpu *cpu, const struct flexvm_arm_request *request
     reply->exit_reason = run->exit_reason;
     return 0;
 }
+
+static int run_cpu(struct arm_cpu *cpu, const struct flexvm_arm_request *request, struct flexvm_arm_reply *reply)
+{
+    struct kvm_run *run = cpu->run;
+    if (cpu->deferred_exit) {
+        cpu->deferred_exit = false;
+        return run_exit(cpu, reply);
+    }
+    if (cpu->pending_read)
+        memcpy(run->mmio.data, request->completion, cpu->pending_read);
+    __atomic_store_n(&run->immediate_exit, 0, __ATOMIC_RELAXED);
+    atomic_signal_fence(memory_order_seq_cst);
+    active_sequence = request->sequence;
+    if (active_sequence && (stop_requested || active_sequence == cancelled_sequence))
+        __atomic_store_n(&run->immediate_exit, 1, __ATOMIC_RELAXED);
+    int status = ioctl_result(ioctl(cpu->fd, KVM_RUN, 0));
+    active_sequence = 0;
+    /* KVM completes the previous userspace read before an interrupted run. */
+    if (!status || status == -EINTR || status == -EAGAIN) {
+        cpu->pending_read = 0;
+        cpu->pending_write = false;
+    }
+    return status ? status : run_exit(cpu, reply);
+}
+
+static int settle_write(struct arm_cpu *cpu)
+{
+    if (cpu->pending_read || cpu->deferred_exit)
+        return -EAGAIN;
+    if (!cpu->pending_write)
+        return 0;
+    __atomic_store_n(&cpu->run->immediate_exit, 1, __ATOMIC_RELAXED);
+    int status = ioctl_result(ioctl(cpu->fd, KVM_RUN, 0));
+    __atomic_store_n(&cpu->run->immediate_exit, 0, __ATOMIC_RELAXED);
+    if (!status) {
+        cpu->deferred_exit = true;
+        cpu->pending_write = false;
+        return -EAGAIN;
+    }
+    if (status != -EINTR)
+        return status;
+    cpu->pending_write = false;
+    return 0;
+}
+
 
 static int complete_read(struct arm_cpu *cpu, const struct flexvm_arm_request *request)
 {
@@ -181,6 +217,8 @@ static int request_cpu(struct arm_cpu *cpu, const struct flexvm_arm_request *req
         if (!status) {
             cpu->initialized = 1;
             cpu->pending_read = 0;
+            cpu->pending_write = false;
+            cpu->deferred_exit = false;
         }
         return status;
     }
@@ -261,17 +299,47 @@ static int device_ioctl(struct arm_vm *vm, const struct flexvm_arm_request *requ
     return status;
 }
 
-static int bind_irqfd(struct arm_vm *vm, uint32_t gsi, int fd)
+static int change_irqfd(struct arm_vm *vm, uint32_t gsi, int fd, bool attach)
 {
-    if (gsi >= FLEXVM_ARM_GSI_COUNT)
+    struct kvm_irqfd irq = {.fd = fd, .gsi = gsi, .flags = attach ? 0 : KVM_IRQFD_FLAG_DEASSIGN};
+    return ioctl_result(ioctl(vm->fd, KVM_IRQFD, &irq));
+}
+
+static int bind_irqfd(struct arm_vm *vm, uint32_t gsi, int *fd)
+{
+    if (gsi >= FLEXVM_ARM_GSI_COUNT || !vm->irqfds_attached)
         return -EINVAL;
-    if (vm->wired_irqs[gsi])
+    if (vm->irq_fds[gsi] >= 0)
         return 0;
-    struct kvm_irqfd irq = {.fd = fd, .gsi = gsi};
-    int status = ioctl_result(ioctl(vm->fd, KVM_IRQFD, &irq));
-    if (!status)
-        vm->wired_irqs[gsi] = true;
+    int status = change_irqfd(vm, gsi, *fd, true);
+    if (!status) {
+        vm->irq_fds[gsi] = *fd;
+        *fd = -1;
+    }
     return status;
+}
+
+static int set_irqfd_mode(struct arm_vm *vm, uint32_t mode)
+{
+    if (mode > 1)
+        return -EINVAL;
+    bool attach = mode;
+    if (attach == vm->irqfds_attached)
+        return 0;
+    for (uint32_t gsi = 0; gsi < FLEXVM_ARM_GSI_COUNT; gsi++) {
+        int fd = vm->irq_fds[gsi];
+        int status = fd < 0 ? 0 : change_irqfd(vm, gsi, fd, attach);
+        if (!status)
+            continue;
+        while (gsi > 0) {
+            fd = vm->irq_fds[--gsi];
+            if (fd >= 0)
+                check(!change_irqfd(vm, gsi, fd, !attach), "rollback ARM IRQFD transition");
+        }
+        return status;
+    }
+    vm->irqfds_attached = attach;
+    return 0;
 }
 
 static int register_ram(struct arm_vm *vm, const struct flexvm_arm_request *request, int ram, int layout)
@@ -378,11 +446,17 @@ static void *serve_lane(void *opaque)
             break;
         const struct flexvm_arm_request *request = &packet.request;
         struct flexvm_arm_reply reply = {0};
-        if (!packet.well_formed || packet.count || request->reserved ||
-            (request->command != FLEXVM_ARM_RUN && request->command != FLEXVM_ARM_COMPLETE_READ) ||
-            request->cpu != cpu->id ||
-            request->sequence != previous + 1 || request->sequence > INT_MAX) {
+        bool settling = request->command == FLEXVM_ARM_SETTLE_WRITE;
+        if (!packet.well_formed || packet.count || request->reserved || request->cpu != cpu->id ||
+            (settling && request->sequence) ||
+            (!settling && ((request->command != FLEXVM_ARM_RUN && request->command != FLEXVM_ARM_COMPLETE_READ) ||
+                           request->sequence != previous + 1 || request->sequence > INT_MAX))) {
             reply.status = -EPROTO;
+        } else if (settling) {
+            int lock = pthread_mutex_lock(&cpu->execution);
+            reply.status = lock ? -lock : settle_write(cpu);
+            if (!lock)
+                pthread_mutex_unlock(&cpu->execution);
         } else {
             previous = request->sequence;
             atomic_store(&cpu->admitted, previous);
@@ -488,14 +562,20 @@ static int checkpoint_core(struct arm_vm *vm, const struct flexvm_arm_request *r
     if (!status) {
         struct arm_cpu *cpu = &vm->cpus[request->cpu];
         bool gic = request->command == FLEXVM_ARM_SAVE_GIC || request->command == FLEXVM_ARM_RESTORE_GIC;
-        if (!gic && !cpu->initialized)
+        bool irq_mode = request->command == FLEXVM_ARM_IRQFD_MODE;
+        if (!gic && !irq_mode && !cpu->initialized)
             status = -ENOEXEC;
         for (unsigned int id = 0; !status && id < FLEXVM_ARM_MAX_CPUS; id++) {
             const struct arm_cpu *peer = &vm->cpus[id];
-            if (peer->pending_read || atomic_load(&peer->admitted) != atomic_load(&peer->completed))
+            if (peer->pending_read || peer->pending_write || peer->deferred_exit ||
+                atomic_load(&peer->admitted) != atomic_load(&peer->completed))
                 status = -EBUSY;
         }
-        if (!status && gic) {
+        if (!status && irq_mode) {
+            status = set_irqfd_mode(vm, request->gsi);
+        } else if (!status && gic && vm->irqfds_attached) {
+            status = -EBUSY;
+        } else if (!status && gic) {
             int cpus[FLEXVM_ARM_MAX_CPUS];
             for (unsigned int id = 0; id < FLEXVM_ARM_MAX_CPUS; id++)
                 cpus[id] = vm->cpus[id].fd;
@@ -554,14 +634,14 @@ static void serve(struct arm_vm *vm, int control)
         } else if (request->command == FLEXVM_ARM_REGISTER_RAM) {
             reply.status = vm->lanes_opened ? -EBUSY : register_ram(vm, request, packet.descriptors[0], packet.descriptors[1]);
         } else if (request->command == FLEXVM_ARM_BIND_IRQFD) {
-            reply.status = bind_irqfd(vm, request->gsi, packet.descriptors[0]);
+            reply.status = bind_irqfd(vm, request->gsi, &packet.descriptors[0]);
         } else if (request->command >= FLEXVM_ARM_CREATE_DEVICE && request->command <= FLEXVM_ARM_HAS_DEVICE_ATTR) {
             reply.status = device_ioctl(vm, request, &reply);
         } else if (request->command == FLEXVM_ARM_PREFERRED_TARGET) {
             reply.status = ioctl_result(ioctl(vm->fd, KVM_ARM_PREFERRED_TARGET, &reply.init));
         } else if (request->cpu >= FLEXVM_ARM_MAX_CPUS) {
             reply.status = -EINVAL;
-        } else if (request->command >= FLEXVM_ARM_SAVE_CORE && request->command <= FLEXVM_ARM_RESTORE_GIC) {
+        } else if (request->command >= FLEXVM_ARM_SAVE_CORE && request->command <= FLEXVM_ARM_IRQFD_MODE) {
             reply.status = checkpoint_core(vm, request, packet.descriptors[0], list);
         } else if (request->command == FLEXVM_ARM_CREATE_VCPU) {
             reply.status = create_cpu(vm, request->cpu);
@@ -643,6 +723,9 @@ int main(int argc, char **argv)
         atomic_init(&cpu->completed, 0);
         check(pthread_mutex_init(&cpu->execution, NULL) == 0, "initialize ARM vCPU lock");
     }
+    for (unsigned int gsi = 0; gsi < FLEXVM_ARM_GSI_COUNT; gsi++)
+        vm.irq_fds[gsi] = -1;
+    vm.irqfds_attached = true;
     check(send(control, &startup, sizeof(startup), MSG_NOSIGNAL) == sizeof(startup), "announce the ARM VM");
     serve(&vm, control);
     return 0;
