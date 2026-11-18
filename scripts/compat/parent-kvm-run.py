@@ -668,6 +668,38 @@ def capture_hierarchy(outer, qmp, irq_fds, descriptors, capture_worker):
 
 
 X86_IDLE_WORKER_STATE = b"FLEXVM x86 no nested worker\n"
+X86_INITIAL_WORKER_STATE = b"FLEXVM x86 worker has not run\n"
+X86_STAGED_RECORDS = {
+    "sregs": SPECIAL_REGISTERS_SIZE,
+    "debugregs": DEBUGREGS.size,
+    "xcrs": XCRS.size,
+    "xsave": XSAVE_SIZE,
+    "events": VCPU_EVENTS_SIZE,
+}
+X86_STAGED_IRQ_LIMIT = 4096
+
+
+def verify_worker_marker(fd, marker):
+    if os.fstat(fd).st_size != len(marker) or os.pread(fd, len(marker), 0) != marker:
+        raise RuntimeError("invalid x86 worker checkpoint marker")
+
+
+def write_worker_marker(fd, marker):
+    if os.write(fd, marker) != len(marker):
+        raise RuntimeError("short x86 worker checkpoint marker write")
+
+
+def staged_records(record, ids, length):
+    result = {}
+    for index, encoded in record:
+        if type(index) is not int or index not in ids or index in result:
+            raise RuntimeError("invalid x86 staged checkpoint register owner")
+        value = bytes.fromhex(encoded)
+        if len(value) != length:
+            raise RuntimeError("invalid x86 staged checkpoint register size")
+        result[index] = value
+    return result
+
 
 class TcgChild:
     def __init__(self, qemu, output, control, outer_ram, layouts, slots, cpu_count, mmio_base, pit_flags, irq_fds,
@@ -1879,6 +1911,10 @@ def exercise(
     open_cpus = set()
     started_cpus = set()
     reset_registers = {}
+    staged_cpu_records = {
+        "sregs": reset_registers, "debugregs": staged_debugregs, "xcrs": staged_xcrs,
+        "xsave": staged_xsave, "events": staged_vcpu_events,
+    }
     special = None
     supported_cpuid = []
     child = None
@@ -1969,10 +2005,20 @@ def exercise(
 
         def capture(worker, descriptors):
             def capture_worker(descriptor):
-                if worker is None:
-                    if os.write(descriptor, X86_IDLE_WORKER_STATE) != len(X86_IDLE_WORKER_STATE):
-                        raise RuntimeError("short x86 idle worker state write")
+                if not active_vm:
+                    write_worker_marker(descriptor, X86_IDLE_WORKER_STATE)
                     return None
+                if worker is None:
+                    write_worker_marker(descriptor, X86_INITIAL_WORKER_STATE)
+                    clock = None if staged_clock is None else CLOCK_DATA.unpack(staged_clock_record(staged_clock))[0]
+                    return {
+                        "initial": True, "cpus": sorted(open_cpus), "irqchip": irqchip_created, "pit": pit_flags,
+                        "tss": tss_gpa, "clock": clock, "pit-state": None if staged_pit is None else staged_pit.hex(),
+                        "irqchips": [(index, data.hex()) for index, data in staged_irqchips.items()],
+                        "irq-levels": staged_irq_levels, "mp": list(staged_mp_states.items()),
+                        "registers": {key: [(cpu, data.hex()) for cpu, data in records.items()]
+                                      for key, records in staged_cpu_records.items()},
+                    }
                 slot_bytes = sum(len(slot.offsets) * PAGE_SIZE for slot in slots)
                 if read_registered_slots(mapping, slot_bytes, ram_pages, outer_ram_size) != slots:
                     raise RuntimeError("x86 checkpoint RAM slots changed during execution")
@@ -2003,23 +2049,54 @@ def exercise(
             finally:
                 monitor.close()
             if profile is None:
-                if (os.fstat(worker_fd).st_size != len(X86_IDLE_WORKER_STATE) or
-                        os.pread(worker_fd, len(X86_IDLE_WORKER_STATE), 0) != X86_IDLE_WORKER_STATE):
-                    raise RuntimeError("invalid x86 idle worker state")
+                verify_worker_marker(worker_fd, X86_IDLE_WORKER_STATE)
             else:
-                worker_cpus = profile["cpus"]
                 irqchip_created, pit_flags, tss_gpa = profile["irqchip"], profile["pit"], profile["tss"]
-                if (worker_cpus not in (1, 2) or type(irqchip_created) is not bool or
-                        pit_flags not in (None, 0, KVM_PIT_SPEAKER_DUMMY) or
-                        (tss_gpa is not None and (not 0 <= tss_gpa <= 0xffffd000 or tss_gpa % PAGE_SIZE))):
+                if (type(irqchip_created) is not bool or pit_flags not in (None, 0, KVM_PIT_SPEAKER_DUMMY) or
+                        (pit_flags is not None and not irqchip_created) or
+                        (tss_gpa is not None and tss_gpa != FIRECRACKER_TSS_GPA)):
                     raise RuntimeError("invalid x86 checkpoint worker topology")
-                slots = read_registered_slots(mapping, profile["slot_bytes"], ram_pages, outer_ram_size)
-                child = start_child(parent_engine, qemu, output, control, outer_ram, slots,
-                                    worker_cpus, FIRECRACKER_NET_MMIO_BASE, irqchip_created, pit_flags, irq_fds, tss_gpa,
-                                    fixture_checks, parallel, checkpoint=True, incoming=(worker_fd, profile["engine"]))
                 active_vm = True
-                open_cpus.update(range(worker_cpus))
-                started_cpus.update(open_cpus)
+                if profile.get("initial") is True:
+                    verify_worker_marker(worker_fd, X86_INITIAL_WORKER_STATE)
+                    cpus = profile["cpus"]
+                    if any(type(cpu) is not int or not 0 <= cpu < cpu_count for cpu in cpus) or len(cpus) != len(set(cpus)):
+                        raise RuntimeError("invalid x86 checkpoint initial vCPU topology")
+                    open_cpus.update(cpus)
+                    for key, length in X86_STAGED_RECORDS.items():
+                        staged_cpu_records[key].update(staged_records(profile["registers"][key], open_cpus, length))
+                    for cpu, states in profile["mp"]:
+                        if (cpu not in open_cpus or cpu in staged_mp_states or not 1 <= len(states) <= 2 or
+                                any(type(state) is not int or not 0 <= state <= 0xffffffff for state in states)):
+                            raise RuntimeError("invalid x86 checkpoint initial MP state")
+                        staged_mp_states[cpu] = tuple(states)
+                    if profile["clock"] is not None:
+                        if type(profile["clock"]) is not int or not 0 <= profile["clock"] < 1 << 64:
+                            raise RuntimeError("invalid x86 checkpoint initial clock")
+                        staged_clock = (profile["clock"], time.monotonic_ns())
+                    if profile["pit-state"] is not None:
+                        staged_pit = bytes.fromhex(profile["pit-state"])
+                        if pit_flags is None or len(staged_pit) != PIT_STATE_SIZE:
+                            raise RuntimeError("invalid x86 checkpoint initial PIT")
+                    staged_irqchips.update(staged_records(profile["irqchips"], range(len(IRQCHIP_PAYLOAD_SIZES)), IRQCHIP_SIZE))
+                    for index, image in staged_irqchips.items():
+                        if not irqchip_created or IRQCHIP_HEADER.unpack_from(image)[0] != index:
+                            raise RuntimeError("invalid x86 checkpoint initial interrupt controller")
+                    levels = profile["irq-levels"]
+                    if (len(levels) > X86_STAGED_IRQ_LIMIT or (levels and not irqchip_created) or
+                            any(type(line) is not int or not 0 <= line < GSI_COUNT or level not in (0, 1) for line, level in levels)):
+                        raise RuntimeError("invalid x86 checkpoint initial IRQ levels")
+                    staged_irq_levels.extend(levels)
+                else:
+                    worker_cpus = profile["cpus"]
+                    if worker_cpus not in (1, 2):
+                        raise RuntimeError("invalid x86 checkpoint worker vCPU topology")
+                    slots = read_registered_slots(mapping, profile["slot_bytes"], ram_pages, outer_ram_size)
+                    child = start_child(parent_engine, qemu, output, control, outer_ram, slots,
+                                        worker_cpus, FIRECRACKER_NET_MMIO_BASE, irqchip_created, pit_flags, irq_fds, tss_gpa,
+                                        fixture_checks, parallel, checkpoint=True, incoming=(worker_fd, profile["engine"]))
+                    open_cpus.update(range(worker_cpus))
+                    started_cpus.update(open_cpus)
             restore_interrupts(irq_fds, record["pending"])
             restore_inputs.close()
             gate.phase = "frozen"
@@ -2057,7 +2134,8 @@ def exercise(
                     os.eventfd_read(cancellations)
                 if gate:
                     active_ready = lanes and started_cpus == open_cpus == set(range(len(lanes.connections)))
-                    capturable = parent_engine == "tcg" and (not active_vm or active_ready)
+                    unstarted = child is None and len(staged_irq_levels) <= X86_STAGED_IRQ_LIMIT
+                    capturable = parent_engine == "tcg" and (not active_vm or unstarted or active_ready)
                     if gate.service(readable, child, capture if capturable else None, rollback):
                         return 0
                 held = gate is not None and gate.phase != "running"
@@ -2504,11 +2582,8 @@ def exercise(
                 mapping[MSR_AT:MSR_AT + len(record)] = record
             elif opcode == CLOSE_CPU:
                 open_cpus.remove(cpu)
-                staged_mp_states.pop(cpu, None)
-                staged_xcrs.pop(cpu, None)
-                staged_xsave.pop(cpu, None)
-                staged_vcpu_events.pop(cpu, None)
-                baseline_vcpu_events.pop(cpu, None)
+                for records in (*staged_cpu_records.values(), staged_mp_states, baseline_vcpu_events):
+                    records.pop(cpu, None)
                 if not open_cpus:
                     # The guest can unpin its pages after the last CPU closes.
                     if reject_close:

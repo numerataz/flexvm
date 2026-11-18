@@ -14,6 +14,9 @@
 
 #include "firecracker-net.h"
 #include <linux/if_tun.h>
+#ifdef FLEXVM_PARENT_KVM_APP
+#include <linux/kvm.h>
+#endif
 
 static void check(bool valid, const char *why)
 {
@@ -83,7 +86,45 @@ static void run_firecracker(void)
     }
 }
 
-#ifndef FLEXVM_PARENT_KVM_APP
+#ifdef FLEXVM_PARENT_KVM_APP
+static void checkpoint_initial_worker(void)
+{
+    int kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
+    check(kvm >= 0, "open parent KVM for initial-state checkpoint");
+    int vm = ioctl(kvm, KVM_CREATE_VM, 0);
+    check(vm >= 0 && ioctl(vm, KVM_CREATE_IRQCHIP, 0) == 0, "create initial nested VM and interrupt controller");
+    int cpu0 = ioctl(vm, KVM_CREATE_VCPU, 0);
+    int cpu1 = ioctl(vm, KVM_CREATE_VCPU, 1);
+    check(cpu0 >= 0 && cpu1 >= 0, "open two nested vCPUs before running");
+    struct kvm_debugregs debug;
+    check(ioctl(cpu0, KVM_GET_DEBUGREGS, &debug) == 0, "read reset debug registers");
+    debug.db[0] = 0x1357000;
+    check(ioctl(cpu0, KVM_SET_DEBUGREGS, &debug) == 0, "stage a debug register");
+    struct kvm_mp_state mp = {.mp_state = KVM_MP_STATE_HALTED};
+    check(ioctl(cpu0, KVM_SET_MP_STATE, &mp) == 0, "stage nested MP state");
+    struct kvm_clock_data clock = {.clock = 1000000000000ULL};
+    check(ioctl(vm, KVM_SET_CLOCK, &clock) == 0, "stage the nested VM clock");
+
+    puts("FLEXVM_X86_PARENT_INITIAL");
+    fflush(stdout);
+    sleep(6);
+
+    memset(&debug, 0, sizeof(debug));
+    check(ioctl(cpu0, KVM_GET_DEBUGREGS, &debug) == 0 && debug.db[0] == 0x1357000,
+          "restore the staged debug register");
+    check(ioctl(cpu0, KVM_GET_MP_STATE, &mp) == 0 && mp.mp_state == KVM_MP_STATE_HALTED,
+          "restore the staged MP state");
+    check(ioctl(cpu1, KVM_GET_MP_STATE, &mp) == 0 && mp.mp_state == KVM_MP_STATE_UNINITIALIZED,
+          "restore the second vCPU's uninitialized MP state");
+    check(ioctl(vm, KVM_GET_CLOCK, &clock) == 0 && clock.clock >= 1000000000000ULL,
+          "restore the staged VM clock");
+    close(cpu1);
+    close(cpu0);
+    close(vm);
+    close(kvm);
+    puts("PASS x86 parent KVM staged worker state");
+}
+#else
 static void run_kvm_client(void)
 {
     check(chmod("/kvm-run", 0700) == 0, "make the client executable");
@@ -177,6 +218,8 @@ int main(void)
         fflush(stdout);
         sleep(6);
     }
+    if (access("/firecracker-initial-checkpoint", F_OK) == 0)
+        checkpoint_initial_worker();
     run_firecracker();
     run_firecracker();
     puts("PASS parent KVM device reuse");

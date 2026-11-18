@@ -23,8 +23,9 @@ def main():
     lifecycle.add_argument("--pause", action="store_true", help="pause and resume the first nested VM through the public command")
     lifecycle.add_argument("--suspend", action="store_true", help="stop and restore the first nested VM through the public command")
     lifecycle.add_argument("--suspend-idle", action="store_true", help="stop and restore before starting the first nested VM")
+    lifecycle.add_argument("--suspend-initial", action="store_true", help="stop and restore a nested VM before its first run")
     args = parser.parse_args()
-    suspend = args.suspend or args.suspend_idle
+    suspend = args.suspend or args.suspend_idle or args.suspend_initial
     if (args.pause or suspend) and args.engine != "tcg":
         parser.error("--pause and --suspend require the TCG parent provider")
     binary, kernel, firecracker, qemu, bundle = (
@@ -62,6 +63,8 @@ def main():
     }
     if args.suspend_idle:
         files["firecracker-idle-checkpoint"] = (b"", 0o600)
+    if args.suspend_initial:
+        files["firecracker-initial-checkpoint"] = (b"", 0o600)
     image(archive, "amd64", files)
     setup = """
         for device in /dev/kvm /dev/vhost-net /dev/vhost-vsock; do
@@ -87,7 +90,8 @@ def main():
             command.extend(["--name", name])
             during = lambda proc, deadline: pause_nested(proc, deadline, binary, state, name, output, log)
         if suspend:
-            suspend_nested(command, prefix, archive, binary, state, output, log, idle=args.suspend_idle)
+            suspend_nested(command, prefix, archive, binary, state, output, log,
+                           idle=args.suspend_idle, initial=args.suspend_initial)
         else:
             HELPERS["run"]([*command, archive], 180, log, during=during)
     transcript = log.read_text(errors="replace")
@@ -97,6 +101,8 @@ def main():
             raise RuntimeError(f"expected two occurrences of {marker}; see {log}")
     if "PASS parent KVM device reuse" not in transcript:
         raise RuntimeError(f"parent device reuse failed; see {log}")
+    if args.suspend_initial and "PASS x86 parent KVM staged worker state" not in transcript:
+        raise RuntimeError(f"the x86 hierarchy did not restore staged worker state; see {log}")
     if args.suspend:
         before = re.findall(r"FLEXVM_SOFTWARE_INNER_CANARY ([0-9a-f]{16})", transcript)
         after = re.findall(r"FLEXVM_SOFTWARE_INNER_RESTORED ([0-9a-f]{16})", transcript)
@@ -122,7 +128,7 @@ def main():
     report = {"status": "passed", "engine": "tcg" if args.engine == "auto" else args.engine, "selection": args.engine,
               "nested_vcpus": 2, "nested_starts": 2, "firecracker_sha256": HELPERS["digest"](firecracker),
               "host_virtualization_devices": sorted(devices), "paused_hierarchy": args.pause, "restored_hierarchy": suspend,
-              "restored_idle": args.suspend_idle}
+              "restored_idle": args.suspend_idle, "restored_initial": args.suspend_initial}
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
 
 
@@ -133,11 +139,12 @@ def wait_nested_window(proc, deadline, log, marker):
         time.sleep(.01)
 
 
-def suspend_nested(command, prefix, archive, binary, state, output, log, *, idle):
+def suspend_nested(command, prefix, archive, binary, state, output, log, *, idle, initial):
     name = "parent-kvm-suspend"
     source, target = output / "source.log", output / "target.log"
 
-    marker = "FLEXVM_X86_PARENT_IDLE" if idle else r"FLEXVM_SOFTWARE_INNER_CANARY [0-9a-f]{16}"
+    marker = next((name for selected, name in ((idle, "FLEXVM_X86_PARENT_IDLE"), (initial, "FLEXVM_X86_PARENT_INITIAL"))
+                   if selected), r"FLEXVM_SOFTWARE_INNER_CANARY [0-9a-f]{16}")
 
     def stop(proc, deadline):
         wait_nested_window(proc, deadline, source, marker)
@@ -149,10 +156,10 @@ def suspend_nested(command, prefix, archive, binary, state, output, log, *, idle
         manifest = json.loads((checkpoint / "manifest.json").read_text())
         if not (checkpoint / "RETIRED").is_file() or manifest["parent"]["child_memory_mib"] != 128:
             raise RuntimeError("the x86 owner did not retire a complete hierarchy")
-        if idle:
-            worker = (checkpoint / "parent-worker").read_bytes()
-            if worker != b"FLEXVM x86 no nested worker\n":
-                raise RuntimeError("the x86 idle checkpoint contains nested worker state")
+        if idle or initial:
+            expected = b"FLEXVM x86 worker has not run\n" if initial else b"FLEXVM x86 no nested worker\n"
+            if (checkpoint / "parent-worker").read_bytes() != expected:
+                raise RuntimeError("the x86 checkpoint has an unexpected nested worker marker")
         HELPERS["run"]([*prefix, output / "target.strace", binary, "start", "-a", "--state", state, name], 150, target)
     finally:
         log.write_bytes(b"".join(part.read_bytes() for part in (source, target) if part.exists()))
