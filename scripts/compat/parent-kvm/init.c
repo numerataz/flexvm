@@ -40,8 +40,6 @@ static void serve_guest_network(void)
         perror("Firecracker network echo");
         _exit(1);
     }
-    puts("PASS Firecracker network echo");
-    fflush(NULL);
     _exit(0);
 }
 
@@ -153,9 +151,11 @@ int main(void)
     int status;
     check(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status),
           "KVM client exit");
-    if (echo > 0)
+    if (echo > 0) {
         check(waitpid(echo, &status, 0) == echo && WIFEXITED(status) && !WEXITSTATUS(status),
               "Firecracker network echo exit");
+        puts("PASS Firecracker network echo");
+    }
     puts("PASS parent KVM guest shutdown");
     fflush(NULL);
     reboot(RB_POWER_OFF);
