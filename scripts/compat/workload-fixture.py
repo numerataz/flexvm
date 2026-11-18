@@ -16,6 +16,7 @@ import tempfile
 
 SOURCE = 'public.ecr.aws/docker/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662'
 PIN = SOURCE.split('@')[1]
+BUSYBOX_DOWNLOAD = 'docker.io/library/busybox@' + PIN
 TAG = 'docker.io/flexvm/busybox:compat'
 LIMIT = 64 << 20
 
@@ -155,11 +156,11 @@ def prepare(cache, output, arch):
         if not cache.exists():
             with tempfile.TemporaryDirectory(prefix='.' + cache.name + '-', dir=cache.parent) as temporary:
                 stage = Path(temporary) / 'oci'
-                upstream = subprocess.check_output(['skopeo', 'inspect', '--raw', 'docker://' + SOURCE], timeout=120)
+                upstream = subprocess.check_output(['skopeo', 'inspect', '--raw', 'docker://' + BUSYBOX_DOWNLOAD], timeout=120)
                 if digest(upstream) != PIN:
                     raise ValueError('downloaded fixture index differs from the pin')
                 subprocess.run(['skopeo', 'copy', '--preserve-digests', '--override-os', 'linux', '--override-arch', arch,
-                                'docker://' + SOURCE, f'oci:{stage}:fixture'], check=True, timeout=180)
+                                'docker://' + BUSYBOX_DOWNLOAD, f'oci:{stage}:fixture'], check=True, timeout=180)
                 (stage / 'upstream-index.json').write_bytes(upstream)
                 validate_cache(stage, arch)
                 stage.rename(cache)
