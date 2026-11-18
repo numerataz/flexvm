@@ -67,78 +67,7 @@ class Lane:
     completion_only: bool = False
 
 
-class CheckpointGate:
-    def __init__(self, listener):
-        self.listener = listener
-        self.client = None
-        self.phase = "running"
-        self.captured_interrupts = {}
-
-    def descriptor(self):
-        return self.client if self.client is not None else self.listener
-
-    def service(self, ready, worker, capture, rollback):
-        if self.descriptor() not in ready:
-            return False
-        if self.client is None:
-            self.client, _ = self.listener.accept()
-            return False
-        request, fds, flags, _ = socket.recv_fds(self.client, 16, 3, socket.MSG_CMSG_CLOEXEC)
-        with ExitStack() as descriptors:
-            for fd in fds:
-                descriptors.callback(os.close, fd)
-                os.set_inheritable(fd, False)
-            if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
-                raise RuntimeError("truncated ARM checkpoint request")
-            return self.handle(request, fds, worker, capture, rollback)
-
-    def handle(self, request, fds, worker, capture, rollback):
-        if not request:
-            self.close()
-            if self.phase != "running":
-                # The requester may have committed a captured VM elsewhere.
-                # Unwind the broker and both owned emulators on disconnect.
-                raise RuntimeError("ARM checkpoint owner disconnected")
-        elif request == b"freeze" and not fds and self.phase == "running":
-            self.phase = "freezing"
-        elif request == b"ready" and not fds and self.phase == "frozen":
-            self.client.sendall(b"ok")
-        elif request == b"check-save" and not fds and self.phase == "frozen":
-            self.client.sendall(b"ok" if worker is None or worker.proc else b"nested worker is still starting")
-        elif request == b"thaw" and not fds and self.phase == "frozen":
-            if worker:
-                worker.freeze_run_control(False)
-            self.phase = "running"
-            self.client.sendall(b"ok")
-        elif request == b"save" and len(fds) == 3 and self.phase == "frozen":
-            self.captured_interrupts = capture(worker, fds)
-            self.phase = "captured"
-            self.client.sendall(b"ok")
-        elif request == b"rollback" and not fds and self.phase == "captured":
-            rollback(worker, self.captured_interrupts)
-            self.captured_interrupts = {}
-            self.phase = "running"
-            self.client.sendall(b"ok")
-        elif request == b"retire" and not fds and self.phase == "captured":
-            return True
-        else:
-            self.client.sendall(b"invalid checkpoint command")
-        return False
-
-    def finish_freeze(self, worker):
-        if self.phase != "freezing":
-            return
-        if worker:
-            if worker.read_width or any(lane.live is not None for lane in worker.lanes.values()):
-                return
-            worker.freeze_run_control(True)
-        self.phase = "frozen"
-        self.client.sendall(b"ok")
-
-    def close(self):
-        if self.client is not None:
-            self.client.close()
-            self.client = None
+CheckpointGate = PARENT["CheckpointGate"]
 
 
 class NativeArm:

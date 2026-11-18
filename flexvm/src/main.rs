@@ -2356,9 +2356,6 @@ fn kernel_bundle(args: &Args, kernel: &Path, reviewed: bool) -> Result<Option<im
 fn software(args: &Args, src: &str) -> Result<i32> {
     let mem_mib = args.parse_or("mem", 512)?;
     let parent_kvm = if let Some(bundle) = args.get("parent-kvm-bundle") {
-        if args.get("name").is_some() && !cfg!(target_arch = "aarch64") {
-            bail!("named parent KVM VMs require an ARM TCG worker with hierarchy pause support");
-        }
         Some(qemu::ParentKvm {
             bundle: std::fs::canonicalize(bundle).map_err(|error| format!("parent KVM bundle {bundle:?}: {error}"))?,
             engine: args.get("parent-kvm-engine").unwrap_or("auto").into(),
