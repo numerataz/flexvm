@@ -9,6 +9,7 @@ import runpy
 import select
 import socket
 import struct
+import sys
 import tempfile
 import time
 
@@ -22,15 +23,32 @@ def main():
     for argument in ("qemu", "kernel", "bundle", "output"):
         parser.add_argument("--" + argument, type=Path, required=True)
     parser.add_argument("--cc", default="cc")
+    parser.add_argument("--native", action="store_true", help="run the KVM ABI client through a native ARM child")
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir()
     init = output / "init"
-    HELPERS["run"]([args.cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static",
-                    ROOT / "parent-kvm/arm-frontend-probe.c", "-o", init], 30, output / "build.log")
+    cc = [args.cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static"]
+    flags = ["-DFLEXVM_ARM_NATIVE_TEST"] if args.native else []
+    HELPERS["run"]([*cc, *flags, ROOT / "parent-kvm/arm-frontend-probe.c", "-o", init], 30, output / "build.log")
     module = (args.bundle / "flexvm-pvkvm.ko").read_bytes()
+    abi = None
+    if args.native:
+        client = output / "abi-client"
+        HELPERS["run"]([*cc, ROOT / "kvm-arm.c", "-o", client], 30, output / "abi-build.log")
+        abi = client.read_bytes()
     cpio = output / "initramfs"
-    cpio.write_bytes(HELPERS["initramfs"](init.read_bytes(), files={"flexvm-pvkvm.ko": module}))
+    cpio.write_bytes(HELPERS["initramfs"](init.read_bytes(), kvm=abi, files={"flexvm-pvkvm.ko": module}))
+    if args.native:
+        log = output / "guest.log"
+        HELPERS["run"]([
+            sys.executable, ROOT / "arm-parent-run.py", "--qemu", args.qemu, "--kernel", args.kernel,
+            "--initrd", cpio, "--worker", args.bundle / "native-worker",
+        ], 120, log)
+        if "PASS ARM parent-owned KVM device ran the unmodified ABI client" not in log.read_text(errors="replace"):
+            raise RuntimeError(f"ARM native worker acceptance failed; see {log}")
+        print("PASS ARM parent-owned KVM ABI execution")
+        return
 
     with ExitStack() as resources:
         runtime = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix="flexvm-arm-front-")))

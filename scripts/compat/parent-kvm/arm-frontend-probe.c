@@ -8,6 +8,7 @@
 #include <sys/mount.h>
 #include <sys/reboot.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static void check(int ok, const char *why)
@@ -29,17 +30,30 @@ int main(void)
     int kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     check(kvm >= 0, "open ARM parent KVM device");
     check(ioctl(kvm, KVM_GET_API_VERSION, 0) == 12, "ARM KVM version");
-    check(ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_ARM_VM_IPA_SIZE) == 48, "negotiated ARM IPA");
+    int ipa_bits = ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_ARM_VM_IPA_SIZE);
+    check(ipa_bits >= 32 && ipa_bits <= 52, "negotiated ARM IPA");
     check(ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_ONE_REG) == 1, "ARM register support");
     check(ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_ARM_PSCI_0_2) == 1, "ARM PSCI capability");
     check(ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_SET_TSS_ADDR) == 0, "ARM capability selection");
     check(ioctl(kvm, KVM_CREATE_VM, 31) == -1 && errno == EINVAL, "invalid ARM VM type");
-    int vm = ioctl(kvm, KVM_CREATE_VM, 48);
+    int vm = ioctl(kvm, KVM_CREATE_VM, ipa_bits);
     check(vm >= 0, "open ARM parent VM");
-    check(ioctl(kvm, KVM_CREATE_VM, 48) == -1 && errno == EBUSY, "ARM parent single VM admission");
+    check(ioctl(kvm, KVM_CREATE_VM, ipa_bits) == -1 && errno == EBUSY, "ARM parent single VM admission");
     check(close(vm) == 0, "close ARM parent VM");
     close(kvm);
     puts("PASS ARM parent KVM frontend loaded and negotiated Linux ABI");
+#ifdef FLEXVM_ARM_NATIVE_TEST
+    pid_t child = fork();
+    check(child >= 0, "fork ARM KVM ABI client");
+    if (!child) {
+        execl("/kvm-abi", "kvm-abi", NULL);
+        _exit(127);
+    }
+    int status;
+    check(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "ARM KVM ABI client");
+    puts("PASS ARM parent-owned KVM device ran the unmodified ABI client");
+#endif
     reboot(RB_POWER_OFF);
     return 0;
 }

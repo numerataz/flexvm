@@ -1381,7 +1381,7 @@ def staged_clock_record(anchor, restore=False):
     return CLOCK_DATA.pack(value, 0 if restore else CLOCK_REALTIME, time.time_ns(), 0)
 
 
-def read_registered_slots(mailbox, registered_bytes, max_pages, outer_bytes):
+def read_registered_slots(mailbox, registered_bytes, max_pages, outer_bytes, *, outer_ram_base=0, min_gpa=0):
     count, = struct.unpack_from("<I", mailbox, 32)
     if not 0 < count <= MAX_SLOTS or registered_bytes % PAGE_SIZE:
         raise RuntimeError("invalid registered RAM slot count or size")
@@ -1392,19 +1392,21 @@ def read_registered_slots(mailbox, registered_bytes, max_pages, outer_bytes):
     slots = []
     used_ids, used_offsets = set(), set()
     offset_position = RAM_ADDRESS_AT
+    minimum_offset = 0 if outer_ram_base else MIB
     for index in range(count):
         identifier, pages, gpa = struct.unpack_from("<IIQ", mailbox, 640 + index * 16)
         end = gpa + pages * PAGE_SIZE
         if (identifier >= MAX_SLOTS or identifier in used_ids or not 0 < pages <= remaining or
-                gpa % PAGE_SIZE or end > PC_HIGH_RAM_LIMIT or
+                gpa % PAGE_SIZE or gpa < min_gpa or end > PC_HIGH_RAM_LIMIT or
                 any(gpa < slot.gpa + len(slot.offsets) * PAGE_SIZE and slot.gpa < end for slot in slots)):
             raise RuntimeError("invalid or overlapping guest RAM slot")
         used_ids.add(identifier)
         remaining -= pages
-        offsets = struct.unpack_from(f"<{pages}Q", mailbox, offset_position)
+        physical = struct.unpack_from(f"<{pages}Q", mailbox, offset_position)
+        offsets = tuple(address - outer_ram_base for address in physical)
         offset_position += 8 * pages
         for offset in offsets:
-            if (offset % PAGE_SIZE or not MIB <= offset <= outer_bytes - PAGE_SIZE or
+            if (offset % PAGE_SIZE or not minimum_offset <= offset <= outer_bytes - PAGE_SIZE or
                     offset in used_offsets):
                 raise RuntimeError("registered slot page is outside outer RAM or repeated")
             used_offsets.add(offset)
