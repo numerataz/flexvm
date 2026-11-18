@@ -68,25 +68,34 @@ static void supported_cpuid(void)
     close(kvm);
 }
 
-static void reset_state(unsigned int id, bool irqchip, unsigned long operation)
+static void reset_state(unsigned int id, bool irqchip, unsigned long operation,
+                        const unsigned int *mp_states, unsigned int count)
 {
     union {
         struct kvm_lapic_state lapic;
         struct kvm_sregs sregs;
         struct kvm_debugregs debugregs;
+        struct kvm_mp_state mp;
     } state;
     size_t length = sizeof(state.sregs);
     if (operation == KVM_GET_LAPIC)
         length = sizeof(state.lapic);
     if (operation == KVM_GET_DEBUGREGS)
         length = sizeof(state.debugregs);
+    if (operation == KVM_GET_MP_STATE)
+        length = sizeof(state.mp);
     int kvm = host_kvm();
     int vm = ioctl(kvm, KVM_CREATE_VM, 0);
     check(vm >= 0, "create a host reset-state VM");
     if (irqchip)
         check(ioctl(vm, KVM_CREATE_IRQCHIP, 0) == 0, "create a host IRQ controller");
     int cpu = ioctl(vm, KVM_CREATE_VCPU, id);
-    check(cpu >= 0 && ioctl(cpu, operation, &state) == 0, "read the host reset state");
+    check(cpu >= 0, "create the host reset vCPU");
+    for (unsigned int i = 0; i < count; i++) {
+        state.mp.mp_state = mp_states[i];
+        check(ioctl(cpu, KVM_SET_MP_STATE, &state.mp) == 0, "install the staged host MP state");
+    }
+    check(ioctl(cpu, operation, &state) == 0, "read the host reset state");
     check(write(STDOUT_FILENO, &state, length) == (ssize_t)length, "write the host reset record");
     close(cpu);
     close(vm);
@@ -169,15 +178,24 @@ int main(int argc, char **argv)
         return 0;
     }
     if (argc == 3 && !strcmp(argv[1], "--reset-lapic")) {
-        reset_state(number(argv[2], PVKVM_MAX_CPUS - 1), true, KVM_GET_LAPIC);
+        reset_state(number(argv[2], PVKVM_MAX_CPUS - 1), true, KVM_GET_LAPIC, NULL, 0);
         return 0;
     }
     if (argc == 4 && !strcmp(argv[1], "--reset-sregs")) {
-        reset_state(number(argv[2], PVKVM_MAX_CPUS - 1), number(argv[3], 1), KVM_GET_SREGS);
+        reset_state(number(argv[2], PVKVM_MAX_CPUS - 1), number(argv[3], 1), KVM_GET_SREGS, NULL, 0);
         return 0;
     }
     if (argc == 3 && !strcmp(argv[1], "--reset-debugregs")) {
-        reset_state(number(argv[2], PVKVM_MAX_CPUS - 1), false, KVM_GET_DEBUGREGS);
+        reset_state(number(argv[2], PVKVM_MAX_CPUS - 1), false, KVM_GET_DEBUGREGS, NULL, 0);
+        return 0;
+    }
+    if (argc >= 4 && argc <= 6 && !strcmp(argv[1], "--reset-mp")) {
+        unsigned int states[2];
+        unsigned int count = argc - 4;
+
+        for (unsigned int i = 0; i < count; i++)
+            states[i] = number(argv[i + 4], KVM_MP_STATE_AP_RESET_HOLD);
+        reset_state(number(argv[2], PVKVM_MAX_CPUS - 1), number(argv[3], 1), KVM_GET_MP_STATE, states, count);
         return 0;
     }
     if (argc == 2 && !strcmp(argv[1], "--reset-irqchips")) {
@@ -326,6 +344,21 @@ int main(int argc, char **argv)
             memcpy(&debug, request + 2, sizeof(debug));
             check(ioctl(cpu, KVM_SET_DEBUGREGS, &debug) == 0, "restore live host debug registers");
             check(write(control, "I", 1) == 1, "acknowledge the host debug registers");
+            continue;
+        }
+        if ((received == 2 && request[0] == 'p') ||
+            (received == 2 + sizeof(struct kvm_mp_state) && request[0] == 'q')) {
+            struct {
+                int32_t status;
+                struct kvm_mp_state state;
+            } reply = {0};
+            bool write_state = request[0] == 'q';
+
+            if (write_state)
+                memcpy(&reply.state, request + 2, sizeof(reply.state));
+            if (ioctl(cpu, write_state ? KVM_SET_MP_STATE : KVM_GET_MP_STATE, &reply.state) < 0)
+                reply.status = -errno;
+            check(write(control, &reply, sizeof(reply)) == sizeof(reply), "return the host MP state result");
             continue;
         }
         if (received == 2 + sizeof(struct kvm_irq_level) && request[0] == 'L') {

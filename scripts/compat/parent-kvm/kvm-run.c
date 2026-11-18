@@ -670,6 +670,39 @@ static void set_irq_line(int vm, unsigned int gsi, unsigned int level)
     check(ioctl(vm, KVM_IRQ_LINE, &irq) == 0, "set the parent IRQ line");
 }
 
+static unsigned int read_mp_state(int cpu)
+{
+    struct kvm_mp_state state;
+
+    check(ioctl(cpu, KVM_GET_MP_STATE, &state) == 0, "read actual vCPU multiprocessing state");
+    return state.mp_state;
+}
+
+static void set_mp_state(int cpu, unsigned int value)
+{
+    struct kvm_mp_state state = {.mp_state = value};
+
+    check(ioctl(cpu, KVM_SET_MP_STATE, &state) == 0, "set vCPU multiprocessing state");
+}
+
+static void stage_mp_state(int kvm, int cpu, uint64_t gpa)
+{
+    struct kvm_mp_state invalid = {.mp_state = KVM_MP_STATE_STOPPED};
+    struct kvm_regs original, after_sipi;
+
+    check(ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_MP_STATE) > 0, "check x86 MP state support");
+    check(read_mp_state(cpu) == KVM_MP_STATE_RUNNABLE, "read the reset BSP state");
+    check(ioctl(cpu, KVM_SET_MP_STATE, &invalid) == -1 && errno == EINVAL, "reject non-x86 MP state");
+    set_mp_state(cpu, KVM_MP_STATE_HALTED);
+    check(read_mp_state(cpu) == KVM_MP_STATE_HALTED, "read the staged halted state");
+    check(ioctl(cpu, KVM_GET_REGS, &original) == 0 && original.rip, "record registers before the staged SIPI");
+    set_mp_state(cpu, KVM_MP_STATE_SIPI_RECEIVED);
+    check(read_mp_state(cpu) == KVM_MP_STATE_RUNNABLE, "consume a staged SIPI before starting the vCPU");
+    check(ioctl(cpu, KVM_GET_REGS, &after_sipi) == 0 && !after_sipi.rip, "observe the staged startup offset");
+    check(ioctl(cpu, KVM_SET_REGS, &original) == 0, "replace the consumed startup offset before entry");
+    select_segments(cpu, true, false, gpa, false);
+}
+
 static struct kvm_irqchip read_irqchip(int vm, unsigned int id)
 {
     struct kvm_irqchip chip = {.chip_id = id};
@@ -1095,6 +1128,66 @@ static void test_irqfd(int vm, int cpu, struct kvm_run *run, int size, unsigned 
     puts("PASS KVM_IRQFD woke an active run and honored deassignment and pending signals");
 }
 
+struct mp_wakeup {
+    unsigned char *marker;
+    int event;
+};
+
+static void *wake_mp_state(void *opaque)
+{
+    const struct mp_wakeup *wakeup = opaque;
+    const struct timespec delay = {.tv_nsec = 20000000};
+
+    check(nanosleep(&delay, NULL) == 0, "wait for the halted vCPU");
+    check(__atomic_load_n(wakeup->marker, __ATOMIC_RELAXED) == 0, "halted vCPU has not executed");
+    check(eventfd_write(wakeup->event, 1) == 0, "signal the halted vCPU");
+    return NULL;
+}
+
+static void test_mp_state(int vm, int cpu, struct kvm_run *run, int size, unsigned char *ram, unsigned char *data,
+                          uint64_t gpa, uint64_t data_address)
+{
+    const unsigned char program[] = {
+        0xfe, 0x87, 0xfa, 0, 0, 0,     /* inc byte [edi+0xfa] */
+        0xb0, 0x7e, 0xe6, 0x30, 0xf4,
+    };
+    const struct kvm_regs regs = {
+        .rcx = 0x7e01, .rsp = gpa + 0xf00, .rdi = data_address,
+        .rip = gpa + IRQFD_ENTRY_OFFSET, .rflags = 0x202,
+    };
+    int event = eventfd(0, EFD_CLOEXEC);
+    struct kvm_irqfd irq = {.fd = event, .gsi = PIC_GSI};
+    const struct mp_wakeup wakeup = {.marker = data + 0xfa, .event = event};
+    pthread_t thread;
+
+    check(event >= 0 && ioctl(vm, KVM_IRQFD, &irq) == 0, "connect the MP state wakeup IRQ");
+    memcpy(ram + IRQFD_ENTRY_OFFSET, program, sizeof(program));
+    check(ioctl(cpu, KVM_SET_REGS, &regs) == 0, "configure the stopped vCPU for an external wakeup");
+    set_mp_state(cpu, KVM_MP_STATE_UNINITIALIZED);
+    check(read_mp_state(cpu) == KVM_MP_STATE_UNINITIALIZED, "report the live uninitialized state");
+    set_mp_state(cpu, KVM_MP_STATE_INIT_RECEIVED);
+    check(read_mp_state(cpu) == KVM_MP_STATE_INIT_RECEIVED, "report the live INIT-received state");
+    set_mp_state(cpu, KVM_MP_STATE_AP_RESET_HOLD);
+    check(read_mp_state(cpu) == KVM_MP_STATE_AP_RESET_HOLD, "report a live reset hold");
+    set_mp_state(cpu, KVM_MP_STATE_HALTED);
+    check(read_mp_state(cpu) == KVM_MP_STATE_HALTED, "report the live halted state");
+    check(pthread_create(&thread, NULL, wake_mp_state, (void *)&wakeup) == 0, "start the IRQ wakeup thread");
+    timed_run(cpu);
+    check(pthread_join(thread, NULL) == 0, "join the IRQ wakeup thread");
+    check_output(run, size, 0x7e);
+    check_registers(cpu, 0x7e, 0x7e01, gpa + IRQFD_ENTRY_OFFSET);
+    check(read_mp_state(cpu) == KVM_MP_STATE_RUNNABLE && data[0xf8] == 2 && data[0xfa] == 1,
+          "real IRQ woke the vCPU and delivered its guest handler");
+    close(event);
+    set_mp_state(cpu, KVM_MP_STATE_SIPI_RECEIVED);
+    check(read_mp_state(cpu) == KVM_MP_STATE_RUNNABLE, "consume a restored startup IPI");
+    struct kvm_regs startup;
+
+    check(ioctl(cpu, KVM_GET_REGS, &startup) == 0 && startup.rip == 0,
+          "the startup IPI selected the architectural entry offset");
+    puts("PASS real IRQ woke a vCPU restored to KVM_MP_STATE_HALTED");
+}
+
 struct interrupt_test {
     uint32_t *counter;
     uint32_t baseline;
@@ -1172,6 +1265,7 @@ int main(int argc, char **argv)
     bool pit = false;
     bool pit_state = false;
     bool debugregs = false;
+    bool mp_state = false;
     bool irqfd = false;
     bool zero_slot = false;
     bool tss = false;
@@ -1210,6 +1304,8 @@ int main(int argc, char **argv)
             pit_state = true;
         else if (!debugregs && !strcmp(argv[i], "debugregs"))
             debugregs = true;
+        else if (!mp_state && !strcmp(argv[i], "mp-state"))
+            mp_state = true;
         else if (!irqfd && !strcmp(argv[i], "irqfd"))
             irqfd = true;
         else if (!zero_slot && !strcmp(argv[i], "zero-slot"))
@@ -1249,6 +1345,8 @@ int main(int argc, char **argv)
           "test a single protected-mode PIC vCPU");
     check(!pit || irqchip, "test the PIT with a PIC vCPU");
     check(!pit_state || pit, "PIT_STATE2 requires the PIT fixture");
+    check(!mp_state || (irqchip && !pit && !irqfd && !irqchip_state),
+          "use a separate PIC fixture for MP state");
     check(!debugregs || (protected_mode && !two_vcpus && !zero_slot && !long_mode &&
                          !mmio && !irqchip && !cpuid), "use the single-vCPU protected debug fixture");
     check(!irqfd || (irqchip && !pit), "test IRQFD in a separate PIC vCPU run");
@@ -1601,6 +1699,8 @@ int main(int argc, char **argv)
     select_segments(cpu, protected_mode, long_mode, gpa, pvh);
     if (debugregs)
         stage_debugregs(kvm, cpu, gpa);
+    if (mp_state)
+        stage_mp_state(kvm, cpu, gpa);
     if (fpu)
         prepare_fpu(cpu);
     if (msrs)
@@ -1769,6 +1869,8 @@ int main(int argc, char **argv)
             test_irqfd(vm, cpu, run, size, ram, data, gpa, data_address);
         if (irqchip_state)
             test_ioapic(vm, cpu, run, size, ram, data, gpa, data_address);
+        if (mp_state)
+            test_mp_state(vm, cpu, run, size, ram, data, gpa, data_address);
         close(vm);
     }
     if (tss)

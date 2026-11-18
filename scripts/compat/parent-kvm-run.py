@@ -43,7 +43,7 @@ EFER_LONG_MODE_ENABLE = 1 << 8
 (OPEN_VM, CLOSE_VM, OPEN_CPU, CLOSE_CPU, RUN, GET_REGS, SET_REGS, GET_SREGS,
  GET_FPU, SET_FPU, GET_MSRS, SET_MSRS, GET_SUPPORTED_CPUID, CREATE_IRQCHIP, SET_IRQ_LINE,
  CREATE_PIT, SET_TSS_ADDR, GET_LAPIC, SET_LAPIC, COMPLETE_READ, GET_IRQCHIP, SET_IRQCHIP,
- GET_PIT, SET_PIT, GET_DEBUGREGS, SET_DEBUGREGS) = range(1, 27)
+ GET_PIT, SET_PIT, GET_DEBUGREGS, SET_DEBUGREGS, GET_MP_STATE, SET_MP_STATE) = range(1, 29)
 FPU_VALID_AT = 48
 FPU_AT = 768
 FPU_SIZE = 416
@@ -77,6 +77,11 @@ PIT_STATE_SIZE = 112
 DEBUGREGS_AT = 0x87400
 DEBUGREGS = struct.Struct("<6Q80x")
 DEBUGREGS_FIELDS = ("dr0", "dr1", "dr2", "dr3", "dr6", "dr7")
+MP_STATE_AT = 0x87480
+MP_STATE = struct.Struct("<I")
+MP_STATE_REPLY = struct.Struct("<iI")
+MP_RUNNABLE = 0
+MP_SIPI_RECEIVED = 4
 PIO_WRITES = ((0x3f8, 1, b"L"), (0x2f8, 2, b"\xcd\xab"),
               (0xcf8, 4, b"\x00\x00\x00\x80"), (0x3f8, 1, b"vmio"))
 PIO_READS = ((0x3fd, 1, b"\x60"), (0x2f8, 2, b"\x67\x45"),
@@ -498,6 +503,9 @@ class TcgChild:
                 for cpu in range(cpu_count):
                     self.debugger.select_cpu(cpu)
                     self.debugger.write(18, 4, 0)  # Real-mode code segment with zero base.
+                    status, _ = self.mp_state(cpu, None if irq_fds else MP_RUNNABLE)
+                    if status:
+                        raise RuntimeError("TCG could not initialize the vCPU multiprocessing state")
         except BaseException:
             self.close()
             raise
@@ -597,6 +605,13 @@ class TcgChild:
     def set_debugregs(self, cpu, record):
         state = dict(zip(DEBUGREGS_FIELDS, DEBUGREGS.unpack(record), strict=True))
         self.special_command("x-flexvm-access-x86-debugregs", {"cpu-index": cpu, "state": state})
+
+    def mp_state(self, cpu, state=None):
+        args = {"cpu-index": cpu}
+        if state is not None:
+            args["state"] = state
+        result = self.special_command("x-flexvm-access-x86-mp-state", args)
+        return result["status"], result["state"]
 
     def pulse_irq(self, gsi):
         self.special_command("x-flexvm-pulse-x86-gsi", {"gsi": gsi})
@@ -765,6 +780,17 @@ class KvmChild:
         self.channel.connection.sendall(bytes((ord("I"), cpu)) + record)
         if self.channel.connection.recv(2) != b"I":
             raise RuntimeError("native parent worker did not acknowledge the debug registers")
+
+    def mp_state(self, cpu, state=None):
+        if state is None:
+            request = bytes((ord("p"), cpu))
+        else:
+            request = bytes((ord("q"), cpu)) + MP_STATE.pack(state)
+        self.channel.connection.sendall(request)
+        result = self.channel.connection.recv(MP_STATE_REPLY.size + 1)
+        if len(result) != MP_STATE_REPLY.size:
+            raise RuntimeError("native parent worker returned an invalid MP state")
+        return MP_STATE_REPLY.unpack(result)
 
     def close(self):
         if self.channel is not None:
@@ -950,6 +976,22 @@ def reset_debugregs(engine, qemu, output, control, cpu_count, cpu):
         return pack_debugregs(monitor.ask("x-flexvm-access-x86-debugregs", {"cpu-index": cpu}))
 
 
+def unstarted_mp_state(engine, qemu, output, control, cpu_count, cpu, irqchip, staged):
+    if engine == "kvm":
+        command = [output / "native-worker", "--reset-mp", str(cpu), str(int(irqchip)), *map(str, staged)]
+        native = subprocess.run(command, capture_output=True, timeout=3)
+        if native.returncode or len(native.stdout) != MP_STATE.size:
+            raise RuntimeError(f"native MP state query failed: {native.stderr.decode(errors='replace')}")
+        return MP_STATE.unpack(native.stdout)[0]
+    with model_monitor(qemu, output, control, cpu_count, "mp-state") as monitor:
+        args = {"cpu-index": cpu}
+        for initial in staged if irqchip else (MP_RUNNABLE,):
+            result = monitor.ask("x-flexvm-access-x86-mp-state", {**args, "state": initial})
+            if result["status"]:
+                raise RuntimeError("TCG rejected a staged MP state")
+        return monitor.ask("x-flexvm-access-x86-mp-state", args)["state"]
+
+
 def read_slot_table(mailbox, ram_pages, outer_bytes, protected_entry, split_slot, zero_slot):
     first_gpa = PROTECTED_GPA if protected_entry else PAGE_SIZE
     if zero_slot:
@@ -1031,7 +1073,7 @@ def verify_slot_spans(pid, slots):
 def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry,
              split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs, cpuid, mmio, mmio_read,
              ioeventfd, irqchip, pit, irqfd, zero_slot, tss, lapic, pio, complete_read, pio_boundary, pvh,
-             irqchip_state, pit_state, debugregs):
+             irqchip_state, pit_state, debugregs, mp_state):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
@@ -1053,6 +1095,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
     expected.extend((OPEN_CPU, GET_SREGS) * cpu_count)
     if debugregs:
         expected.extend((GET_DEBUGREGS, SET_DEBUGREGS, GET_DEBUGREGS))
+    if mp_state:
+        expected.extend((GET_MP_STATE, SET_MP_STATE, GET_MP_STATE, SET_MP_STATE, GET_MP_STATE))
     if lapic:
         expected.append(GET_LAPIC)
     expected_counters = []
@@ -1116,6 +1160,11 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         expected.extend((SET_REGS, RUN, GET_REGS) * 2)
         expected_counters.extend((0x5432, 0x5432))
         expected_io.extend(((0, 0x6c), (0, 0x6c)))
+    if mp_state:
+        expected.extend((SET_REGS, *((SET_MP_STATE, GET_MP_STATE) * 4), RUN, GET_REGS, GET_MP_STATE,
+                         SET_MP_STATE, GET_MP_STATE, GET_REGS))
+        expected_counters.extend((0x7e01, 0x7e01))
+        expected_io.append((0, 0x7e))
     if debugregs:
         expected.extend((SET_REGS, RUN, GET_REGS, GET_DEBUGREGS, SET_DEBUGREGS, GET_DEBUGREGS))
         expected_counters.append(0x7654)
@@ -1138,6 +1187,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
     pit_flags = None
     staged_pit = None
     staged_debugregs = {}
+    staged_mp_states = {}
     tss_gpa = None
     irq_levels = []
     expected_irq_levels = IRQ_LEVELS + ([(6, 1), (6, 0)] if irqchip_state else []) if irqchip else []
@@ -1163,7 +1213,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 30)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 31)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
         os.ftruncate(outer_ram, outer_ram_size)
@@ -1221,7 +1271,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 raise RuntimeError(f"unexpected doorbell request {pending}, command {opcode}")
             cpu, = struct.unpack_from("<I", mapping, 44)
             cpu_commands = (CLOSE_CPU, RUN, GET_REGS, GET_SREGS, SET_REGS, GET_FPU, SET_FPU, GET_MSRS, SET_MSRS,
-                            GET_LAPIC, SET_LAPIC, COMPLETE_READ, GET_DEBUGREGS, SET_DEBUGREGS)
+                            GET_LAPIC, SET_LAPIC, COMPLETE_READ, GET_DEBUGREGS, SET_DEBUGREGS,
+                            GET_MP_STATE, SET_MP_STATE)
             if opcode in cpu_commands and cpu not in open_cpus:
                 raise RuntimeError(f"command {opcode} requested unopened vCPU {cpu}")
             status = 0
@@ -1330,6 +1381,28 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                     else:
                         record = reset_debugregs(parent_engine, qemu, output, control, cpu_count, cpu)
                     mapping[DEBUGREGS_AT:end] = record
+            elif opcode in (GET_MP_STATE, SET_MP_STATE):
+                if length:
+                    raise RuntimeError("unexpected memory argument for MP state")
+                if opcode == SET_MP_STATE:
+                    state, = MP_STATE.unpack_from(mapping, MP_STATE_AT)
+                    if child is None:
+                        previous = staged_mp_states.get(cpu, ())
+                        # Preserve the pending SIPI across subsequent MP state writes.
+                        retain_sipi = state != MP_SIPI_RECEIVED and MP_SIPI_RECEIVED in previous
+                        staged_mp_states[cpu] = (MP_SIPI_RECEIVED, state) if retain_sipi else (state,)
+                    else:
+                        status, _ = child.mp_state(cpu, state)
+                else:
+                    if child is None:
+                        state = unstarted_mp_state(parent_engine, qemu, output, control, cpu_count,
+                                                   cpu, irqchip_created, staged_mp_states.get(cpu, ()))
+                        if cpu in staged_mp_states:
+                            staged_mp_states[cpu] = (state,)
+                    else:
+                        status, state = child.mp_state(cpu)
+                    if not status:
+                        MP_STATE.pack_into(mapping, MP_STATE_AT, state)
             elif opcode == RUN:
                 if child is None:
                     if length != slot_size or len(open_cpus) != cpu_count:
@@ -1345,6 +1418,11 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                         child.set_pit_state(staged_pit)
                     for id, record in staged_debugregs.items():
                         child.set_debugregs(id, record)
+                    for id, states in staged_mp_states.items():
+                        for state in states:
+                            status, _ = child.mp_state(id, state)
+                            if status:
+                                raise RuntimeError(f"parent worker rejected staged MP state with error {status}")
                     for line, level in staged_irq_levels:
                         child.set_irq(line, level)
                 elif length:
@@ -1447,6 +1525,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 mapping[MSR_AT:MSR_AT + len(record)] = record
             elif opcode == CLOSE_CPU:
                 open_cpus.remove(cpu)
+                staged_mp_states.pop(cpu, None)
                 if not open_cpus:
                     # The guest can unpin its pages after the last CPU closes.
                     if reject_close:
@@ -1480,6 +1559,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 or pit and "PASS PIT woke the halted vCPU" not in guest
                 or pit_state and "PASS restored live PIT state woke the halted vCPU" not in guest
                 or debugregs and "PASS staged hardware breakpoint and live debug registers" not in guest
+                or mp_state and "PASS real IRQ woke a vCPU restored to KVM_MP_STATE_HALTED" not in guest
                 or irqfd and "PASS KVM_IRQFD woke an active run and honored deassignment and pending signals" not in guest
                 or zero_slot and "PASS zero-based RAM shared every tested page across the legacy PC region" not in guest
                 or tss and "PASS child ran with Firecracker's three-page TSS reservation" not in guest
@@ -1496,6 +1576,9 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         if irqfd and parent_engine == "tcg":
             if len(pulses) != 2 or pulses[0] != (3, True) or pulses[1][0] != 3:
                 raise RuntimeError(f"unexpected TCG interrupt doorbells: {pulses}")
+        elif mp_state and parent_engine == "tcg":
+            if pulses != [(3, True)]:
+                raise RuntimeError(f"unexpected MP state wakeup IRQ: {pulses}")
         elif pulses:
             raise RuntimeError(f"unexpected TCG interrupt doorbells: {pulses}")
         retained = "retaining registered RAM until the enclosing VM exits" in guest
@@ -1526,6 +1609,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         "pit_flags": pit_flags,
         "pit_state": pit_state,
         "debugregs": debugregs,
+        "mp_state": mp_state,
         "irqfd": irqfd,
         "tcg_irqfd_pulses": pulses,
         "zero_based_ram": zero_slot,
@@ -1579,6 +1663,7 @@ def main():
     parser.add_argument("--pit", action="store_true", help="program a PIT interrupt that wakes a halted worker")
     parser.add_argument("--pit-state", action="store_true", help="restore timer state and verify a real wakeup")
     parser.add_argument("--debugregs", action="store_true", help="verify staged debug registers and a hardware breakpoint")
+    parser.add_argument("--mp-state", action="store_true", help="restore a halted vCPU and wake it through an IRQ")
     parser.add_argument("--irqfd", action="store_true", help="wake an active run through KVM_IRQFD")
     parser.add_argument("--zero-slot", action="store_true", help="share RAM at GPA zero across the PC legacy region")
     parser.add_argument("--tss", action="store_true", help="reserve Firecracker's x86 TSS address")
@@ -1601,8 +1686,10 @@ def main():
             parser.error("--pvh needs at least 8192 pages for the kernel entry point")
     if args.pit_state:
         args.pit = True
-    if args.pit or args.irqfd or args.tss or args.lapic or args.irqchip_state:
+    if args.pit or args.irqfd or args.tss or args.lapic or args.irqchip_state or args.mp_state:
         args.irqchip = True
+    if args.mp_state and (args.pit or args.irqfd or args.irqchip_state):
+        parser.error("--mp-state uses its own PIC interrupt fixture")
     if args.pit and args.irqfd:
         parser.error("--pit and --irqfd use separate fixtures")
     if args.irqchip_state and (args.pit or args.irqfd):
@@ -1651,7 +1738,8 @@ def main():
                                   2 if args.two_vcpus else 1, args.long_mode, args.fpu, args.msrs, args.cpuid,
                                   args.mmio_write, args.mmio_read, args.ioeventfd, args.irqchip, args.pit,
                                   args.irqfd, args.zero_slot, args.tss, args.lapic, args.pio, args.complete_read,
-                                  args.pio_boundary, args.pvh, args.irqchip_state, args.pit_state, args.debugregs)))
+                                  args.pio_boundary, args.pvh, args.irqchip_state, args.pit_state, args.debugregs,
+                                  args.mp_state)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -1723,6 +1811,8 @@ def main():
                 oracle.append("pit-state")
             if args.debugregs:
                 oracle.append("debugregs")
+            if args.mp_state:
+                oracle.append("mp-state")
             HELPERS["run"](oracle, 14 if args.interrupt_run else 8, output / "native-kvm.log")
             report["same_client_passed_native_kvm"] = True
             report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
@@ -1776,6 +1866,8 @@ def main():
             files["pit-state"] = b""
         if args.debugregs:
             files["debugregs"] = b""
+        if args.mp_state:
+            files["mp-state"] = b""
         image = HELPERS["initramfs"](init.read_bytes(), files=files)
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
@@ -1820,6 +1912,7 @@ def main():
                             *(["--irqchip-state"] if args.irqchip_state else []),
                             *(["--pit-state"] if args.pit_state else []),
                             *(["--debugregs"] if args.debugregs else []),
+                            *(["--mp-state"] if args.mp_state else []),
                             *(["--reject-close"] if args.reject_close else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}
@@ -1832,6 +1925,7 @@ def main():
             kvm_users = {line.split()[0] for line in lines if '"/dev/kvm"' in line}
             reset_queries = 2 if args.two_vcpus else 1
             model_queries = sum((args.cpuid, args.lapic, args.irqchip_state, args.debugregs)) + 2 * int(args.pit_state)
+            model_queries += 3 * int(args.mp_state)
             if len(workers) != 1 + model_queries + reset_queries or kvm_users != workers:
                 raise RuntimeError("only the native parent worker may use host KVM")
         report.update(json.loads(worker.read_text()), status="passed", host_device_access=bool(devices),
