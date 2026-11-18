@@ -61,6 +61,56 @@ class Lane:
     sequence: int = 0
     live: tuple[int, int] | None = None
     cancelled: bool = False
+    checkpoint_cancelled: bool = False
+    completion_only: bool = False
+
+
+class CheckpointGate:
+    def __init__(self, listener):
+        self.listener = listener
+        self.client = None
+        self.phase = "running"
+
+    def descriptor(self):
+        return self.client if self.client is not None else self.listener
+
+    def service(self, ready, worker):
+        if self.descriptor() not in ready:
+            return
+        if self.client is None:
+            self.client, _ = self.listener.accept()
+            return
+        request = self.client.recv(16)
+        if not request:
+            self.close()
+            if self.phase != "running":
+                # The requester may have committed a captured VM elsewhere.
+                # Unwind the broker and both owned emulators on disconnect.
+                raise RuntimeError("ARM checkpoint owner disconnected")
+        elif request == b"freeze" and self.phase == "running":
+            self.phase = "freezing"
+        elif request == b"thaw" and self.phase == "frozen":
+            if worker:
+                worker.freeze_run_control(False)
+            self.phase = "running"
+            self.client.sendall(b"ok")
+        else:
+            self.client.sendall(b"invalid checkpoint command")
+
+    def finish_freeze(self, worker):
+        if self.phase != "freezing":
+            return
+        if worker:
+            if worker.read_width or any(lane.live is not None for lane in worker.lanes.values()):
+                return
+            worker.freeze_run_control(True)
+        self.phase = "frozen"
+        self.client.sendall(b"ok")
+
+    def close(self):
+        if self.client is not None:
+            self.client.close()
+            self.client = None
 
 
 class NativeArm:
@@ -175,7 +225,13 @@ def register_slots(child, mailbox, total, outer_ram, outer_bytes, max_pages):
             os.close(fd)
 
 
-def service_lanes(worker, cpus, mailbox, replies, ready):
+def acknowledge_lane(mailbox, replies, offset, issued, status):
+    struct.pack_into("<i", mailbox, offset + 12, status)
+    struct.pack_into("<I", mailbox, offset + 4, issued)
+    os.eventfd_write(replies, 1)
+
+
+def service_lanes(worker, cpus, mailbox, replies, ready, *, hold=False):
     for cpu, lane in worker.lanes.items():
         offset = PARENT["LANES_AT"] + cpu * LANE_STRIDE
         seq, ack, operation, _, cancelled = struct.unpack_from("<IIIiI", mailbox, offset)
@@ -184,7 +240,10 @@ def service_lanes(worker, cpus, mailbox, replies, ready):
             if issued != seq or operation != op or cancelled > issued:
                 raise RuntimeError("ARM frontend changed a running request")
             if lane.socket in ready:
-                status, reason, payload = worker.run_reply(cpu, op, cancelled == issued)
+                worker_op = PARENT["COMPLETE_READ"] if lane.completion_only else op
+                status, reason, payload = worker.run_reply(cpu, worker_op, cancelled == issued or lane.checkpoint_cancelled)
+                if lane.completion_only and not status:
+                    status = -errno.EINTR
                 if not status and op == PARENT["RUN"]:
                     if reason == PARENT["KVM_EXIT_MMIO"]:
                         address, length, writing, data = struct.unpack_from("<QII8s", payload)
@@ -196,24 +255,31 @@ def service_lanes(worker, cpus, mailbox, replies, ready):
                         raise RuntimeError(f"unsupported ARM KVM exit {reason}")
                     target = offset + PARENT["LANE_EXIT"]
                     mailbox[target:target + len(record)] = record
-                struct.pack_into("<i", mailbox, offset + 12, status)
-                struct.pack_into("<I", mailbox, offset + 4, issued)
-                os.eventfd_write(replies, 1)
+                acknowledge_lane(mailbox, replies, offset, issued, status)
                 lane.live = None
-                lane.cancelled = False
-            elif op == PARENT["RUN"] and cancelled == issued and not lane.cancelled:
+                lane.cancelled = lane.checkpoint_cancelled = lane.completion_only = False
+            elif (op == PARENT["RUN"] and not lane.completion_only and not lane.cancelled and
+                  (cancelled == issued or hold)):
                 worker.cancel(cpu)
                 lane.cancelled = True
+                lane.checkpoint_cancelled = hold
             continue
         if seq == ack:
             continue
         if cpu not in cpus or seq != ack + 1 or cancelled > seq or operation not in (PARENT["RUN"], PARENT["COMPLETE_READ"]):
             raise RuntimeError("invalid ARM vCPU request")
+        worker_op = operation
+        if hold and operation == PARENT["RUN"]:
+            if cpu not in worker.read_width:
+                acknowledge_lane(mailbox, replies, offset, seq, -errno.EINTR)
+                continue
+            lane.completion_only = True
+            worker_op = PARENT["COMPLETE_READ"]
         lane.sequence += 1
         completion = offset + PARENT["LANE_COMPLETION"] + 8
-        worker.run_request(cpu, operation, mailbox[completion:completion + 8])
+        worker.run_request(cpu, worker_op, mailbox[completion:completion + 8])
         lane.live = (seq, operation)
-        if operation == PARENT["RUN"] and cancelled == seq:
+        if worker_op == PARENT["RUN"] and cancelled == seq:
             worker.cancel(cpu)
             lane.cancelled = True
 
@@ -256,7 +322,8 @@ def arm_ioctl(worker, mailbox, command, cpu, irq_fds):
     return status
 
 
-def serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, create_worker, outer_ram, outer_bytes, max_pages):
+def serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, create_worker, outer_ram, outer_bytes, max_pages,
+                   gate=None):
     worker = None
     vm_open = False
     cpus = set()
@@ -265,16 +332,24 @@ def serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, cr
     try:
         while True:
             lanes = [lane.socket for lane in worker.lanes.values() if lane.live] if worker else []
-            interrupts = worker.irq_descriptors() if worker else ()
-            readable, _, _ = select.select([exited, requests, cancellations, *lanes, *interrupts], [], [])
+            interrupts = worker.irq_descriptors() if worker and (not gate or gate.phase != "frozen") else ()
+            owner = [gate.descriptor()] if gate else []
+            readable, _, _ = select.select([exited, requests, cancellations, *lanes, *interrupts, *owner], [], [])
             if exited in readable:
                 return outer.wait()
             for fd in (requests, cancellations):
                 if fd in readable:
                     os.eventfd_read(fd)
+            if gate:
+                gate.service(readable, worker)
+            hold = gate is not None and gate.phase != "running"
             if worker:
-                service_lanes(worker, cpus, mailbox, replies, readable)
-                worker.dispatch_irqs(readable)
+                service_lanes(worker, cpus, mailbox, replies, readable, hold=hold)
+                if not gate or gate.phase != "frozen":
+                    worker.dispatch_irqs(readable)
+            if hold:
+                gate.finish_freeze(worker)
+                continue
             seq, ack, command, _, length = struct.unpack_from("<IIIII", mailbox, 8)
             if seq == ack:
                 continue
@@ -335,7 +410,7 @@ def serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, cr
 
 
 def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=None, frontend=None,
-               engine="kvm", tcg_qemu=None, emulator_fd=None):
+               engine="kvm", tcg_qemu=None, emulator_fd=None, checkpoint=False):
     ipa_bits = None
     if engine != "tcg":
         try:
@@ -362,6 +437,13 @@ def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=
             runtime = control
             runtime.mkdir(mode=0o700)
             resources.callback(shutil.rmtree, runtime)
+        gate = None
+        if checkpoint:
+            listener = resources.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET))
+            listener.bind(str(runtime / "checkpoint"))
+            listener.listen(1)
+            gate = CheckpointGate(listener)
+            resources.callback(gate.close)
         doorbell = runtime / "doorbell"
         server = resources.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
         server.bind(str(doorbell))
@@ -415,9 +497,9 @@ def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=
             tcg_worker = runpy.run_path(str(ROOT / "arm-tcg-worker.py"), init_globals=setup)["TcgArm"]
 
             def create_worker(vm_type):
-                return tcg_worker(tcg_qemu, runtime, vm_type)
+                return tcg_worker(tcg_qemu, runtime, vm_type, checkpoint=checkpoint)
         return serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, create_worker,
-                              memory, outer_bytes, max_pages)
+                              memory, outer_bytes, max_pages, gate=gate)
 
 
 def main():
@@ -427,9 +509,12 @@ def main():
     engine = parser.add_mutually_exclusive_group(required=True)
     engine.add_argument("--worker", type=Path)
     engine.add_argument("--tcg", action="store_true")
+    parser.add_argument("--checkpoint-control", type=Path)
     parser.add_argument("--mem", type=int, default=256)
     parser.add_argument("--child-mem", type=int, default=128)
     args = parser.parse_args()
+    if args.checkpoint_control and not args.tcg:
+        parser.error("checkpoint control requires the ARM TCG worker")
     if args.worker and platform.machine() != "aarch64":
         parser.error("the native ARM parent requires an aarch64 Linux host")
     if not 128 <= args.mem <= 3072 or not 1 <= args.child_mem <= min(args.mem, 256):
@@ -444,7 +529,7 @@ def main():
     ]
     worker = args.worker.resolve(strict=True) if args.worker else None
     return launch_arm(command, worker, args.mem, args.child_mem, engine="tcg" if args.tcg else "kvm",
-                      tcg_qemu=command[0])
+                      tcg_qemu=command[0], control=args.checkpoint_control, checkpoint=bool(args.checkpoint_control))
 
 
 if __name__ == "__main__":

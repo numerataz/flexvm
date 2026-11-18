@@ -4,8 +4,10 @@ import argparse
 import json
 from pathlib import Path
 import runpy
+import socket
 import sys
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parent
 HELPERS = runpy.run_path(str(ROOT / "software-boot.py"))
@@ -19,7 +21,10 @@ def main():
     parser.add_argument("--engine", choices=("auto", "tcg", "kvm"), default="kvm")
     parser.add_argument("--vcpus", type=int, choices=(1, 2), default=2)
     parser.add_argument("--cc", default="cc")
+    parser.add_argument("--freeze", action="store_true", help="freeze and thaw the direct ARM TCG run lanes")
     args = parser.parse_args()
+    if args.freeze and (args.bin or args.engine != "tcg"):
+        parser.error("--freeze requires the standalone ARM TCG broker")
     if args.engine == "auto" and not args.bin:
         parser.error("--engine auto requires --bin")
     output = args.output.resolve()
@@ -28,7 +33,10 @@ def main():
     outer, inner = output / "outer-init", output / "inner-init"
     mode = ["-DFLEXVM_ARM_FIRECRACKER_APP"] if args.bin else []
     HELPERS["run"]([*cc, *mode, ROOT / "parent-kvm/arm-firecracker-init.c", "-o", outer], 30, output / "outer-build.log")
-    HELPERS["run"]([*cc, f"-DFLEXVM_ARM_TEST_CPUS={args.vcpus}", ROOT / "parent-kvm/arm-block-init.c", "-o", inner],
+    inner_flags = [f"-DFLEXVM_ARM_TEST_CPUS={args.vcpus}"]
+    if args.freeze:
+        inner_flags.append("-DFLEXVM_ARM_TEST_CHECKPOINT")
+    HELPERS["run"]([*cc, *inner_flags, ROOT / "parent-kvm/arm-block-init.c", "-o", inner],
                    30, output / "inner-build.log")
     kernel = args.kernel.resolve(strict=True)
     config = {
@@ -65,10 +73,18 @@ def main():
         files["tmp/drive"] = b"ARM outer persistent marker\0".ljust(1 << 20, b"\0")
         cpio.write_bytes(HELPERS["initramfs"](outer.read_bytes(), files=files))
         options = ["--tcg"] if args.engine == "tcg" else ["--worker", args.bundle / "native-worker"]
-        HELPERS["run"]([
+        command = [
             sys.executable, ROOT / "arm-parent-run.py", "--qemu", args.qemu, "--kernel", kernel,
             "--initrd", cpio, "--mem", "384", *options,
-        ], 180, log)
+        ]
+        if args.freeze:
+            with tempfile.TemporaryDirectory(prefix="flexvm-arm-freeze-") as directory:
+                runtime = Path(directory) / "parent"
+                command.extend(["--checkpoint-control", runtime])
+                HELPERS["run"](command, 180, log,
+                               during=lambda proc, deadline: freeze_and_thaw(proc, deadline, runtime, log))
+        else:
+            HELPERS["run"](command, 180, log)
     lines = log.read_text(errors="replace").splitlines()
     markers = (
         *(f"FLEXVM_ARM_INNER_CPU {cpu}" for cpu in range(args.vcpus)),
@@ -76,6 +92,8 @@ def main():
         "PASS ARM Firecracker architected timer",
         "PASS stock ARM Firecracker used the parent-owned KVM device",
     )
+    if args.freeze:
+        markers += ("PASS ARM Firecracker resumed after checkpoint freeze",)
     for marker in markers:
         if lines.count(marker) != 1:
             raise RuntimeError(f"missing or repeated {marker}; see {log}")
@@ -84,6 +102,28 @@ def main():
               "arm_timer": "passed", "firecracker_sha256": HELPERS["digest"](args.firecracker)}
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print("PASS stock ARM Firecracker executes through the parent KVM device")
+
+
+def freeze_and_thaw(proc, deadline, runtime, log):
+    while "ARM Firecracker checkpoint window" not in log.read_text(errors="replace"):
+        if proc.poll() is not None or time.monotonic() >= deadline:
+            raise RuntimeError("ARM nested guest did not enter the checkpoint window")
+        time.sleep(.01)
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as control:
+        control.settimeout(min(8, deadline - time.monotonic()))
+        control.connect(str(runtime / "checkpoint"))
+
+        def ask(request):
+            control.sendall(request)
+            reply = control.recv(64)
+            if reply != b"ok":
+                raise RuntimeError(f"ARM checkpoint control refused {request!r}: {reply!r}")
+
+        ask(b"freeze")
+        time.sleep(6)
+        if proc.poll() is not None or "PASS ARM Firecracker resumed after checkpoint freeze" in log.read_text(errors="replace"):
+            raise RuntimeError("the nested guest advanced while its vCPUs were fenced")
+        ask(b"thaw")
 
 
 if __name__ == "__main__":

@@ -32,11 +32,12 @@ SYSTEM_EVENT = 24
 
 
 class TcgArm:
-    def __init__(self, qemu, runtime, vm_type):
+    def __init__(self, qemu, runtime, vm_type, *, checkpoint=False):
         if vm_type and not 32 <= vm_type <= 40:
             raise OSError(errno.EINVAL, "unsupported ARM TCG VM type")
         self.qemu = qemu
         self.runtime = runtime
+        self.checkpoint = checkpoint
         self.lanes = {}
         self.channels = {}
         self.cpus = {}
@@ -211,7 +212,10 @@ class TcgArm:
         ]
         descriptors = []
         for slot, address, ram, layout in self.slots:
-            command.extend(["-device", f"flexvm-shared-ram,id=slot{slot},ram-fd={ram},layout-fd={layout},addr={address}"])
+            device = f"flexvm-shared-ram,id=slot{slot},ram-fd={ram},layout-fd={layout},addr={address}"
+            if self.checkpoint:
+                device += ",external-ram-state=on"
+            command.extend(["-device", device])
             descriptors.extend((ram, layout))
         with ExitStack() as listeners:
             sockets = []
@@ -224,7 +228,10 @@ class TcgArm:
                 sockets.append((cpu, listener))
                 command.extend(["-chardev", f"socket,id=r{cpu},path={path}"])
             second = ",parallel-chardev=r1" if len(self.cpus) == 2 else ""
-            command.extend(["-device", f"flexvm-mmio-run,chardev=r0,addr={MMIO_FIRST},size={MMIO_LAST - MMIO_FIRST}{second}"])
+            device = f"flexvm-mmio-run,chardev=r0,addr={MMIO_FIRST},size={MMIO_LAST - MMIO_FIRST}{second}"
+            if self.checkpoint:
+                device += ",checkpoint-control=on"
+            command.extend(["-device", device])
             self.proc = PARENT["spawn_owned"](command, pass_fds=descriptors, stdout=2)
             for cpu, listener in sockets:
                 channel = PARENT["RunChannel"](listener.accept()[0])
@@ -239,6 +246,10 @@ class TcgArm:
             })
             if self.powered[cpu] != (cpu == 0):
                 self.ask("x-flexvm-arm-mp-state", {"cpu-index": cpu, "runnable": self.powered[cpu]})
+
+    def freeze_run_control(self, frozen):
+        if self.qmp and self.proc.poll() is None:
+            self.ask("x-flexvm-freeze-run-control", {"frozen": frozen})
 
     def irq_descriptors(self):
         return self.irq_by_fd if self.proc and self.proc.poll() is None else ()

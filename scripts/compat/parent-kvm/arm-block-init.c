@@ -43,6 +43,11 @@ int main(void)
           memcmp(data, written, sizeof(written)) == 0, "read back written virtio block marker");
     close(block);
     puts("PASS ARM Firecracker virtio block read, write and flush");
+#ifdef FLEXVM_ARM_TEST_CHECKPOINT
+    puts("ARM Firecracker checkpoint window");
+    sleep(5);
+    puts("PASS ARM Firecracker resumed after checkpoint freeze");
+#endif
     sleep(1);
     puts("PASS ARM Firecracker architected timer");
     reboot(RB_POWER_OFF);
