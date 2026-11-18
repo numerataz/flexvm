@@ -1,0 +1,187 @@
+--- a/hw/char/debugcon.c
++++ b/hw/char/debugcon.c
+@@ -27,6 +27,7 @@
+ #include "qemu/osdep.h"
+ #include "qapi/error.h"
+ #include "hw/core/cpu.h"
++#include "qemu/bswap.h"
+ #include "qemu/error-report.h"
+ #include "qemu/module.h"
+ #include "chardev/char-fe.h"
+@@ -34,25 +35,30 @@
+ #include "hw/qdev-properties.h"
+ #include "hw/qdev-properties-system.h"
+ #include "qom/object.h"
++#include "system/address-spaces.h"
+ #include "system/runstate.h"
+
+ #define TYPE_ISA_DEBUGCON_DEVICE "isa-debugcon"
++#define DEBUGCON_MMIO_SIZE 4096
++#define DEBUGCON_EXIT_MAX 18
+ OBJECT_DECLARE_SIMPLE_TYPE(ISADebugconState, ISA_DEBUGCON_DEVICE)
+
+ //#define DEBUG_DEBUGCON
+
+ typedef struct DebugconState {
+     MemoryRegion io;
++    MemoryRegion mmio;
+     CharFrontend chr;
+     uint32_t readback;
+     bool stop_on_write;
+     bool run_control;
+     bool run_active;
+     bool run_failed;
+-    bool output_pending;
+     bool cancel_pending;
+     CPUState *run_cpu;
+-    uint8_t output;
++    uint64_t mmio_base;
++    uint8_t output[DEBUGCON_EXIT_MAX];
++    unsigned int output_length;
+     VMChangeStateEntry *run_state;
+ } DebugconState;
+
+@@ -83,7 +89,7 @@
+     DebugconState *s = opaque;
+
+     if (len == 1 && buf[0] == 'I') {
+-        if (s->run_active && !s->run_failed && !s->output_pending) {
++        if (s->run_active && !s->run_failed && !s->output_length) {
+             s->cancel_pending = true;
+             vm_stop(RUN_STATE_PAUSED);
+         }
+@@ -127,20 +133,33 @@
+
+     s->run_active = false;
+     if (!s->run_failed && state == RUN_STATE_PAUSED &&
+-        (s->output_pending || s->cancel_pending)) {
+-        uint8_t reply[2] = {
+-            s->output_pending ? 'O' : 'I',
+-            s->output_pending ? s->output : 0,
+-        };
+-        if (qemu_chr_fe_write(&s->chr, reply, sizeof(reply)) != sizeof(reply)) {
++        (s->output_length || s->cancel_pending)) {
++        static const uint8_t interrupted[] = {'I', 0};
++        const uint8_t *reply = s->output_length ? s->output : interrupted;
++        int bytes = s->output_length ? s->output_length : sizeof(interrupted);
++
++        if (qemu_chr_fe_write(&s->chr, reply, bytes) != bytes) {
+             error_report("debugcon run control could not deliver the stopped exit");
+             s->run_failed = true;
+         }
+     }
+-    s->output_pending = false;
++    s->output_length = 0;
+     s->cancel_pending = false;
+ }
+
++static void debugcon_stop_at_exit(DebugconState *s, const uint8_t *reply,
++                                  unsigned int bytes)
++{
++    if (s->run_active && !s->run_failed && !s->output_length &&
++        current_cpu == s->run_cpu) {
++        memcpy(s->output, reply, bytes);
++        s->output_length = bytes;
++    } else {
++        s->run_failed = true;
++    }
++    vm_stop(RUN_STATE_PAUSED);
++}
++
+ static void debugcon_ioport_write(void *opaque, hwaddr addr, uint64_t val,
+                                   unsigned width)
+ {
+@@ -152,14 +171,8 @@
+ #endif
+
+     if (s->run_control) {
+-        if (s->run_active && !s->run_failed && !s->output_pending &&
+-            current_cpu == s->run_cpu) {
+-            s->output = ch;
+-            s->output_pending = true;
+-        } else {
+-            s->run_failed = true;
+-        }
+-        vm_stop(RUN_STATE_PAUSED);
++        const uint8_t reply[] = {'O', ch};
++        debugcon_stop_at_exit(s, reply, sizeof(reply));
+         return;
+     }
+
+@@ -195,6 +208,33 @@
+     .endianness = DEVICE_LITTLE_ENDIAN,
+ };
+
++static bool debugcon_mmio_accepts(void *opaque, hwaddr address, unsigned width,
++                                   bool is_write, MemTxAttrs attrs)
++{
++    return is_write;
++}
++
++static void debugcon_mmio_write(void *opaque, hwaddr address, uint64_t value,
++                                 unsigned width)
++{
++    DebugconState *s = opaque;
++    uint8_t reply[DEBUGCON_EXIT_MAX] = {'M', width};
++
++    stq_le_p(reply + 2, s->mmio_base + address);
++    stq_le_p(reply + 10, value);
++    debugcon_stop_at_exit(s, reply, sizeof(reply));
++}
++
++static const MemoryRegionOps debugcon_mmio_ops = {
++    .write = debugcon_mmio_write,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 8,
++    .valid.accepts = debugcon_mmio_accepts,
++    .impl.min_access_size = 1,
++    .impl.max_access_size = 8,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
+ static void debugcon_realize_core(DebugconState *s, Error **errp)
+ {
+     if (!qemu_chr_fe_backend_connected(&s->chr)) {
+@@ -224,6 +264,11 @@
+     DebugconState *s = &isa->state;
+     Error *err = NULL;
+
++    if (s->mmio_base && (!s->run_control ||
++                        s->mmio_base % DEBUGCON_MMIO_SIZE)) {
++        error_setg(errp, "debugcon MMIO requires run control and a page address");
++        return;
++    }
+     debugcon_realize_core(s, &err);
+     if (err != NULL) {
+         error_propagate(errp, err);
+@@ -233,6 +278,12 @@
+                           TYPE_ISA_DEBUGCON_DEVICE, 1);
+     memory_region_add_subregion(isa_address_space_io(d),
+                                 isa->iobase, &s->io);
++    if (s->mmio_base) {
++        memory_region_init_io(&s->mmio, OBJECT(dev), &debugcon_mmio_ops, s,
++                              "flexvm-mmio", DEBUGCON_MMIO_SIZE);
++        memory_region_add_subregion(get_system_memory(), s->mmio_base,
++                                    &s->mmio);
++    }
+ }
+
+ static void debugcon_isa_unrealize(DeviceState *dev)
+@@ -240,6 +291,9 @@
+     DebugconState *s = &ISA_DEBUGCON_DEVICE(dev)->state;
+
+     if (s->run_state) {
++        if (s->mmio_base) {
++            memory_region_del_subregion(get_system_memory(), &s->mmio);
++        }
+         qemu_chr_fe_set_handlers(&s->chr, NULL, NULL, NULL, NULL,
+                                  NULL, NULL, false);
+         qemu_del_vm_change_state_handler(s->run_state);
+@@ -253,6 +307,7 @@
+     DEFINE_PROP_UINT32("readback", ISADebugconState, state.readback, 0xe9),
+     DEFINE_PROP_BOOL("stop-on-write", ISADebugconState, state.stop_on_write, false),
+     DEFINE_PROP_BOOL("run-control", ISADebugconState, state.run_control, false),
++    DEFINE_PROP_UINT64("mmio-base", ISADebugconState, state.mmio_base, 0),
+ };
+
+ static void debugcon_isa_class_initfn(ObjectClass *klass, const void *data)

@@ -80,6 +80,11 @@ the child checks that each CPU sees different results for the same indexed
 CPUID function. The TCG worker uses the installed table for its responses
 and applies vendor-specific out-of-range behavior. It computes OSXSAVE,
 OSPKE, and the active XSAVE area size from the running CPU's state.
+Add `--mmio-write` in a separate long-mode run to return MMIO writes from
+a device page. The client writes through a virtual alias and checks each
+physical address, width and byte sequence. A shared-memory marker shows that
+the worker stopped at each exit and continued from the same instruction stream.
+MMIO read completion remains part of #1501.
 The worker uses one host mapping per consecutive extent. Highly fragmented
 slots can reach the host's mapping limit. A failed mapping releases the
 partially mapped worker span.
