@@ -2,10 +2,12 @@
 """Restore a stopped x86 worker onto freshly owned parent RAM."""
 import argparse
 from contextlib import contextmanager, ExitStack
+import errno
 import fcntl
 import os
 from pathlib import Path
 import runpy
+import select
 import struct
 import tempfile
 import time
@@ -61,6 +63,93 @@ def worker(qemu, state, ram, offset, incoming=None):
         yield child, run
 
 
+def settle_run_lanes(child, registers):
+    lanes = child.lanes
+    mailbox = bytearray(PARENT["MAILBOX_SIZE"])
+    offset = PARENT["LANES_AT"]
+    replies = os.eventfd(0, os.EFD_CLOEXEC | os.EFD_NONBLOCK)
+    try:
+        def service(*, hold=False, ready=()):
+            lanes.service(mailbox, ready, {0}, {0}, replies, hold=hold)
+
+        def issue(sequence):
+            struct.pack_into("<I", mailbox, offset, sequence)
+            struct.pack_into("<I", mailbox, offset + 8, PARENT["RUN"])
+
+        def acknowledged(sequence, status):
+            if os.eventfd_read(replies) != 1 or struct.unpack_from("<I", mailbox, offset + 4)[0] != sequence:
+                raise RuntimeError("x86 checkpoint lost its run-lane acknowledgment")
+            if struct.unpack_from("<i", mailbox, offset + 12)[0] != status:
+                raise RuntimeError("x86 checkpoint reported the wrong run-lane status")
+
+        def finish(*, hold=False):
+            ready, _, _ = select.select(lanes.descriptors(), (), (), 5)
+            if not ready:
+                raise RuntimeError("x86 checkpoint did not receive a run-lane reply")
+            service(hold=hold, ready=ready)
+
+        def provide_input(value):
+            PARENT["COMPLETION_RECORD"].pack_into(mailbox, offset + PARENT["LANE_COMPLETION"], 1, 0, bytes(8))
+            mailbox[offset + PARENT["LANE_PIO"]] = value
+
+        def clear_input():
+            PARENT["COMPLETION_RECORD"].pack_into(mailbox, offset + PARENT["LANE_COMPLETION"], 0, 0, bytes(8))
+
+        # Cancel a live run that already carried a read completion to the worker.
+        spin = list(registers)
+        spin[16] = BASE + 0x100
+        child.set_registers(0, PARENT["REGISTERS"].pack(*spin))
+        issue(1)
+        service()
+        finish()
+        acknowledged(1, 0)
+        issue(2)
+        provide_input(73)
+        service()
+        if lanes.checkpoint_ready():
+            raise RuntimeError("active x86 run lane was reported as fenced")
+        service(hold=True)
+        finish(hold=True)
+        acknowledged(2, -errno.EINTR)
+        if PARENT["REGISTERS"].unpack(child.registers(0))[0] & 0xff != 73:
+            raise RuntimeError("x86 cancellation dropped an already submitted port read")
+
+        child.set_registers(0, PARENT["REGISTERS"].pack(*registers))
+        issue(3)
+        clear_input()
+        service()
+        finish()
+        acknowledged(3, 0)
+        if lanes.checkpoint_ready():
+            raise RuntimeError("x86 port read was reported as complete")
+        try:
+            child.freeze_run_control(True)
+        except RuntimeError as error:
+            if "pending execution or I/O" not in str(error):
+                raise
+        else:
+            raise RuntimeError("checkpoint accepted a pending x86 port read")
+
+        # Complete the existing read during the fence, without new execution.
+        issue(4)
+        provide_input(41)
+        service(hold=True)
+        finish(hold=True)
+        acknowledged(4, -errno.EINTR)
+        if not lanes.checkpoint_ready():
+            raise RuntimeError("the completed x86 port read retained a live lane")
+
+        # Keep rejecting new KVM_RUN requests while the owner is fenced.
+        issue(5)
+        clear_input()
+        service(hold=True)
+        acknowledged(5, -errno.EINTR)
+        if not lanes.checkpoint_ready():
+            raise RuntimeError("held x86 KVM_RUN started another run")
+    finally:
+        os.close(replies)
+
+
 def exercise(qemu):
     with ExitStack() as resources:
         state = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix="flexvm-x86-checkpoint-")))
@@ -73,24 +162,15 @@ def exercise(qemu):
             fcntl.fcntl(ram, fcntl.F_ADD_SEALS, SIZE_SEALS)
         start, destination = 2 * PAGE, PAGE
         os.pwrite(source, PROGRAM, start)
+        os.pwrite(source, bytes.fromhex("ba0005 ec ebfe"), start + 0x100)
         marker = os.urandom(32)
         os.pwrite(source, marker, start + DATA + 32)
         snapshot = resources.enter_context(tempfile.TemporaryFile())
         with worker(qemu, state, source, start) as (child, run):
             registers = [0] * 18
             registers[16:18] = [BASE, 2]
-            child.set_registers(0, PARENT["REGISTERS"].pack(*registers))
             child.set_cpuid(0, [(CPUID_LEAF, 0, 0, CPUID_VALUE, 0, 0, 0)])
-            if run().is_write:
-                raise RuntimeError("expected a live x86 port read")
-            try:
-                child.freeze_run_control(True)
-            except RuntimeError as error:
-                if "pending execution or I/O" not in str(error):
-                    raise
-            else:
-                raise RuntimeError("checkpoint accepted a pending x86 port read")
-            child.complete_read(0, b"\x29")
+            settle_run_lanes(child, registers)
             result = run()
             if not result.is_write or result.data != b"\x2a":
                 raise RuntimeError("x86 worker did not finish its completed input")
