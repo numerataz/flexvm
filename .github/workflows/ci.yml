@@ -353,11 +353,11 @@ jobs:
             sudo ln -sf "$engine" /usr/local/bin/qemu-system-x86_64
           fi
           "$engine" --version
-      - name: ARM worker reads and writes shared guest RAM without KVM
+      - name: ARM TCG worker shares guest RAM and forwards MMIO without KVM
         if: matrix.arch == 'aarch64'
         run: |
           trace="$RUNNER_TEMP/arm-parent-shared-ram.strace"
-          strace -f -e trace=file -o "$trace" python3 scripts/compat/arm-shared-ram.py \
+          strace -f -e trace=file -o "$trace" python3 scripts/compat/arm-shared-ram.py --mmio-run \
             --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64"
           if grep -F '"/dev/kvm"' "$trace"; then exit 1; fi
       - name: Kernel artifact directory
