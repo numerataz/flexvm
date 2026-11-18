@@ -36,6 +36,7 @@ MAX_SLOT_PAGES = 65536
 PROTECTED_GPA = 16 * MIB
 SPLIT_GPA = 512 * MIB
 MAX_SLOTS = 8
+PC_HIGH_RAM_LIMIT = 0xc0000000
 TEST_INTERRUPTS = 3
 CR0_PAGING = 1 << 31
 CR4_PAE = 1 << 5
@@ -110,6 +111,7 @@ EVENT_SMM = 8
 CLOCK_AT = 0x89100
 CLOCK_DATA = struct.Struct("<QI4xQQ16x")
 CLOCK_REALTIME = 4
+RAM_LIMIT_AT = 0x89130
 PIO_WRITES = ((0x3f8, 1, b"L"), (0x2f8, 2, b"\xcd\xab"),
               (0xcf8, 4, b"\x00\x00\x00\x80"), (0x3f8, 1, b"vmio"))
 PIO_READS = ((0x3fd, 1, b"\x60"), (0x2f8, 2, b"\x67\x45"),
@@ -1343,24 +1345,26 @@ def staged_clock_record(anchor, restore=False):
     return CLOCK_DATA.pack(value, 0 if restore else CLOCK_REALTIME, time.time_ns(), 0)
 
 
-def read_slot_table(mailbox, ram_pages, outer_bytes, protected_entry, split_slot, zero_slot):
-    first_gpa = PROTECTED_GPA if protected_entry else PAGE_SIZE
-    if zero_slot:
-        first_gpa = 0
-    expected = [(0, ram_pages, first_gpa)]
-    if split_slot:
-        first_pages = ram_pages // 2
-        expected = [(0, first_pages, first_gpa), (5, ram_pages - first_pages, SPLIT_GPA)]
+def read_registered_slots(mailbox, registered_bytes, max_pages, outer_bytes):
     count, = struct.unpack_from("<I", mailbox, 32)
-    if count != len(expected) or count > MAX_SLOTS:
-        raise RuntimeError("unexpected number of registered RAM slots")
+    if not 0 < count <= MAX_SLOTS or registered_bytes % PAGE_SIZE:
+        raise RuntimeError("invalid registered RAM slot count or size")
+    remaining = registered_bytes // PAGE_SIZE
+    if not 0 < remaining <= max_pages <= MAX_SLOT_PAGES:
+        raise RuntimeError("registered RAM exceeds the parent memory limit")
+
     slots = []
-    used_offsets = set()
+    used_ids, used_offsets = set(), set()
     offset_position = RAM_ADDRESS_AT
-    for index, record in enumerate(expected):
+    for index in range(count):
         identifier, pages, gpa = struct.unpack_from("<IIQ", mailbox, 640 + index * 16)
-        if (identifier, pages, gpa) != record:
-            raise RuntimeError("unexpected guest physical slot layout")
+        end = gpa + pages * PAGE_SIZE
+        if (identifier >= MAX_SLOTS or identifier in used_ids or not 0 < pages <= remaining or
+                gpa % PAGE_SIZE or end > PC_HIGH_RAM_LIMIT or
+                any(gpa < slot.gpa + len(slot.offsets) * PAGE_SIZE and slot.gpa < end for slot in slots)):
+            raise RuntimeError("invalid or overlapping guest RAM slot")
+        used_ids.add(identifier)
+        remaining -= pages
         offsets = struct.unpack_from(f"<{pages}Q", mailbox, offset_position)
         offset_position += 8 * pages
         for offset in offsets:
@@ -1369,7 +1373,21 @@ def read_slot_table(mailbox, ram_pages, outer_bytes, protected_entry, split_slot
                 raise RuntimeError("registered slot page is outside outer RAM or repeated")
             used_offsets.add(offset)
         slots.append(SlotLayout(identifier, gpa, offsets))
+    if remaining:
+        raise RuntimeError("registered RAM slot sizes do not match the request")
     return slots
+
+
+def check_fixture_slots(slots, ram_pages, protected_entry, split_slot, zero_slot):
+    first_gpa = PROTECTED_GPA if protected_entry else PAGE_SIZE
+    if zero_slot:
+        first_gpa = 0
+    expected = [(0, ram_pages, first_gpa)]
+    if split_slot:
+        first_pages = ram_pages // 2
+        expected = [(0, first_pages, first_gpa), (5, ram_pages - first_pages, SPLIT_GPA)]
+    if [(slot.identifier, len(slot.offsets), slot.gpa) for slot in slots] != expected:
+        raise RuntimeError("unexpected guest physical fixture slot layout")
 
 
 def start_child(engine, qemu, output, control, outer_ram, slots, cpu_count, mmio_base, irqchip, pit_flags, irq_fds, tss_gpa,
@@ -1425,7 +1443,7 @@ def verify_slot_spans(pid, slots):
 def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry,
              split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs, cpuid, mmio, mmio_read,
              ioeventfd, irqchip, pit, irqfd, zero_slot, tss, lapic, pio, complete_read, pio_boundary, pvh,
-             irqchip_state, pit_state, debugregs, mp_state, xcrs, xsave, vcpu_events, clock, firecracker):
+             irqchip_state, pit_state, debugregs, mp_state, xcrs, xsave, vcpu_events, clock, firecracker, memory_quota):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
@@ -1600,6 +1618,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
         struct.pack_into("<II", mapping, 0, 0x4d564b46, 36)
+        if firecracker or memory_quota:
+            struct.pack_into("<I", mapping, RAM_LIMIT_AT, ram_pages)
         if parallel:
             struct.pack_into("<I", mapping, FEATURES_AT, PARALLEL_RUN)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
@@ -1905,9 +1925,11 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 if parallel != (opcode == PREPARE_RUN):
                     raise RuntimeError("run command does not match the negotiated transport")
                 if child is None:
-                    if length != slot_size or len(open_cpus) != cpu_count:
-                        raise RuntimeError("unexpected total size of registered RAM")
-                    slots = read_slot_table(mapping, ram_pages, outer_ram_size, protected_entry, split_slot, zero_slot)
+                    if len(open_cpus) != cpu_count:
+                        raise RuntimeError("registered RAM requires the configured vCPUs")
+                    slots = read_registered_slots(mapping, length, ram_pages, outer_ram_size)
+                    if not firecracker:
+                        check_fixture_slots(slots, ram_pages, protected_entry, split_slot, zero_slot)
                     mmio_base = FIRECRACKER_NET_MMIO_BASE if firecracker else MMIO_BASE if mmio else None
                     child = start_child(parent_engine, qemu, output, control, outer_ram, slots,
                                         cpu_count, mmio_base, irqchip_created, pit_flags, irq_fds, tss_gpa,
@@ -2067,6 +2089,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
             struct.pack_into("<I", mapping, 12, pending)
             os.eventfd_write(replies, 1)
         guest = (output / "outer.log").read_text(errors="replace")
+        if memory_quota and "PASS parent memory quota before page pinning" not in guest:
+            raise RuntimeError("the guest did not reject an over-quota slot before pinning")
         if firecracker:
             if parallel and child is not None:
                 pio_writes = child.lanes.written_pio
@@ -2088,6 +2112,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 "firecracker": True, "nested_network": True, "guest_path": "/dev/kvm",
                 "guest_vmx": False, "guest_svm": False,
                 "parent_accelerator": parent_engine, "vcpu_count": cpu_count, "mapped_extents": extents,
+                "mapped_page_count": sum(len(slot.offsets) for slot in slots),
                 "run_count": child.lanes.run_count if parallel else observed.count(RUN),
                 "max_in_flight": child.lanes.max_in_flight if parallel else 1,
                 "control_commands": [op for op in observed if op != RUN],
@@ -2211,6 +2236,10 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--firecracker", type=Path, help="boot the kernel through an unchanged Firecracker binary")
     parser.add_argument("--firecracker-vcpus", type=int, choices=(1, 2), default=1)
+    parser.add_argument("--firecracker-memory", type=int, default=128, metavar="MIB",
+                        help="memory limit and Firecracker RAM size, from 96 to 256 MiB")
+    parser.add_argument("--memory-quota", action="store_true",
+                        help="check that an oversized slot is rejected before pinning")
     parser.add_argument("--native-oracle", action="store_true")
     parser.add_argument("--parent-engine", choices=("tcg", "kvm"), default="tcg")
     parser.add_argument("--ram-pages", type=int, default=2, help=f"number of pages from 1 to {MAX_SLOT_PAGES}")
@@ -2247,14 +2276,18 @@ def main():
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     firecracker = args.firecracker is not None
-    if args.firecracker_vcpus > 1 and not firecracker:
-        parser.error("--firecracker-vcpus requires --firecracker")
+    if (args.firecracker_vcpus > 1 or args.firecracker_memory != 128) and not firecracker:
+        parser.error("Firecracker vCPU and memory options require --firecracker")
     if firecracker:
         if args.native_oracle or args.reject_close or (args.two_vcpus and args.firecracker_vcpus == 1):
             parser.error("--firecracker needs a normal parent boot")
+        if not 96 <= args.firecracker_memory <= MAX_SLOT_PAGES * PAGE_SIZE // MIB:
+            parser.error("--firecracker-memory must be between 96 and 256 MiB")
         args.pvh = True
-        args.ram_pages = 32768
+        args.ram_pages = args.firecracker_memory * MIB // PAGE_SIZE
         args.two_vcpus = args.firecracker_vcpus > 1
+    if args.memory_quota and (firecracker or args.split_slot or args.ram_pages >= MAX_SLOT_PAGES):
+        parser.error("--memory-quota needs a single synthetic slot below the protocol limit")
     if args.mmio_read or args.ioeventfd:
         args.mmio_write = True
     if args.pio_boundary:
@@ -2331,7 +2364,7 @@ def main():
                                   args.mmio_write, args.mmio_read, args.ioeventfd, args.irqchip, args.pit,
                                   args.irqfd, args.zero_slot, args.tss, args.lapic, args.pio, args.complete_read,
                                   args.pio_boundary, args.pvh, args.irqchip_state, args.pit_state, args.debugregs,
-                                  args.mp_state, args.xcrs, args.xsave, args.vcpu_events, args.clock, firecracker)))
+                                  args.mp_state, args.xcrs, args.xsave, args.vcpu_events, args.clock, firecracker, args.memory_quota)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -2420,6 +2453,8 @@ def main():
             "kvm-run": client.read_bytes(), "flexvm-pvkvm.ko": (module / "flexvm-pvkvm.ko").read_bytes(),
             "ram-pages": str(args.ram_pages).encode("ascii"),
         }
+        if args.memory_quota:
+            files["parent-memory-quota"] = b""
         if args.protected_entry:
             files["split-slot" if args.split_slot else "protected-entry"] = b""
         if args.interrupt_run:
@@ -2552,9 +2587,10 @@ def main():
                             *(["--xsave"] if args.xsave else []),
                             *(["--vcpu-events"] if args.vcpu_events else []),
                             *(["--clock"] if args.clock else []),
+                            *(["--memory-quota"] if args.memory_quota else []),
                             *(["--reject-close"] if args.reject_close else []),
-                            *(["--firecracker", args.firecracker, "--firecracker-vcpus", str(args.firecracker_vcpus)]
-                              if firecracker else [])], 75, worker)
+                            *(["--firecracker", args.firecracker, "--firecracker-vcpus", str(args.firecracker_vcpus),
+                               "--firecracker-memory", str(args.firecracker_memory)] if firecracker else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}
         expected = {"/dev/kvm"} if args.parent_engine == "kvm" else set()

@@ -1906,6 +1906,17 @@ int main(int argc, char **argv)
     check(size >= (int)sizeof(struct kvm_run), "run mapping size");
     int vm = ioctl(kvm, KVM_CREATE_VM, 0);
     check(vm >= 0 && (fcntl(vm, F_GETFD) & FD_CLOEXEC), "VM file descriptor");
+    if (getenv("FLEXVM_TEST_PARENT_MEMORY_QUOTA")) {
+        /* Point outside the VMM mappings to prove quota validation precedes GUP. */
+        const struct kvm_userspace_memory_region oversized = {
+            .slot = 0, .guest_phys_addr = 0,
+            .memory_size = (count + 1) * PVKVM_GUEST_PAGE_SIZE,
+            .userspace_addr = PVKVM_GUEST_PAGE_SIZE,
+        };
+        check(ioctl(vm, KVM_SET_USER_MEMORY_REGION, &oversized) == -1 && errno == ENOSPC,
+              "reject a slot above the configured parent RAM quota");
+        puts("PASS parent memory quota before page pinning");
+    }
     check(ioctl(vm, KVM_CHECK_EXTENSION, KVM_CAP_USER_MEMORY) == 1,
           "query the VM's memory capability");
     if (clock)

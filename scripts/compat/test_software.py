@@ -51,6 +51,29 @@ with patch('os.geteuid', return_value=0):
 '''
 
 
+class ParentMemorySlots(unittest.TestCase):
+    def test_registration_validates_each_slot_before_mapping(self):
+        protocol = runpy.run_path(str(ROOT / "parent-kvm-run.py"))
+        mailbox = bytearray(protocol["MAILBOX_SIZE"])
+        pages = protocol["RAM_ADDRESS_AT"]
+        struct.pack_into("<I", mailbox, 32, 2)
+        struct.pack_into("<IIQIIQ", mailbox, 640, 1, 2, 0, 6, 1, 0x8000)
+        struct.pack_into("<3Q", mailbox, pages, 0x100000, 0x102000, 0x101000)
+        parse = protocol["read_registered_slots"]
+        slots = parse(mailbox, 3 * 4096, 3, 2 * 1024 * 1024)
+        self.assertEqual([(slot.identifier, slot.gpa, len(slot.offsets)) for slot in slots],
+                         [(1, 0, 2), (6, 0x8000, 1)])
+        with self.assertRaisesRegex(RuntimeError, "parent memory limit"):
+            parse(mailbox, 3 * 4096, 2, 2 * 1024 * 1024)
+        struct.pack_into("<Q", mailbox, 664, 0x1000)
+        with self.assertRaisesRegex(RuntimeError, "overlapping"):
+            parse(mailbox, 3 * 4096, 3, 2 * 1024 * 1024)
+        struct.pack_into("<Q", mailbox, 664, 0x8000)
+        struct.pack_into("<Q", mailbox, pages + 16, 0x100000)
+        with self.assertRaisesRegex(RuntimeError, "outside outer RAM or repeated"):
+            parse(mailbox, 3 * 4096, 3, 2 * 1024 * 1024)
+
+
 class ParentRunLanes(unittest.TestCase):
     def test_parallel_stream_acks_do_not_wait_for_a_second_byte(self):
         protocol = runpy.run_path(str(ROOT / "parent-kvm-run.py"))
