@@ -394,7 +394,7 @@ jobs:
           cat "$RUNNER_TEMP/parent-kvm-smp/report.json"
           sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
             --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
-            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-long" --ram-pages 64 --split-slot --long-mode
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-long" --ram-pages 64 --split-slot --long-mode --fpu
           cat "$RUNNER_TEMP/parent-kvm-long/report.json"
           sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
             --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
@@ -423,7 +423,7 @@ jobs:
             cat "$RUNNER_TEMP/parent-kvm-native-smp/report.json"
             sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
               --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
-              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-long" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --long-mode
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-long" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --long-mode --fpu
             cat "$RUNNER_TEMP/parent-kvm-native-long/report.json"
           fi
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09

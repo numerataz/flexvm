@@ -3,7 +3,7 @@
 #define FLEXVM_PVKVM_MAILBOX_H
 
 #define PVKVM_MAGIC        0x4d564b46
-#define PVKVM_VERSION      14
+#define PVKVM_VERSION      15
 #define PVKVM_MAGIC_AT     0
 #define PVKVM_VERSION_AT   4
 #define PVKVM_REQUEST_AT   8
@@ -15,9 +15,12 @@
 #define PVKVM_SLOT_COUNT_AT  32
 #define PVKVM_CANCEL_AT      40
 #define PVKVM_CPU_AT         44
+#define PVKVM_FPU_VALID_AT   48
 #define PVKVM_SLOT_TABLE_AT  640
 #define PVKVM_SLOT_RECORD_SIZE 16
-#define PVKVM_RAM_ADDRESS_AT 1024
+#define PVKVM_FPU_AT         768
+#define PVKVM_FPU_BYTES      416
+#define PVKVM_RAM_ADDRESS_AT 1280
 #define PVKVM_REGISTERS_AT   64
 #define PVKVM_INITIAL_SREGISTERS_AT 256
 #define PVKVM_GUEST_PAGE_SIZE 4096
@@ -45,6 +48,8 @@ enum pvkvm_command {
 	PVKVM_GET_REGS,
 	PVKVM_SET_REGS,
 	PVKVM_GET_SREGS,
+	PVKVM_GET_FPU,
+	PVKVM_SET_FPU,
 };
 
 #endif

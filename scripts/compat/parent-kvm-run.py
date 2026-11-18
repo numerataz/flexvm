@@ -40,7 +40,11 @@ CR0_PAGING = 1 << 31
 CR4_PAE = 1 << 5
 EFER_LONG_MODE_ACTIVE = 1 << 10
 EFER_LONG_MODE_ENABLE = 1 << 8
-OPEN_VM, CLOSE_VM, OPEN_CPU, CLOSE_CPU, RUN, GET_REGS, SET_REGS, GET_SREGS = range(1, 9)
+OPEN_VM, CLOSE_VM, OPEN_CPU, CLOSE_CPU, RUN, GET_REGS, SET_REGS, GET_SREGS, GET_FPU, SET_FPU = range(1, 11)
+FPU_VALID_AT = 48
+FPU_AT = 768
+FPU_SIZE = 416
+RAM_ADDRESS_AT = 1280
 # Linux's x86 struct kvm_regs.
 REGISTERS = struct.Struct("<18Q")
 SEGMENT = struct.Struct("<QIH9Bx")
@@ -314,6 +318,16 @@ class TcgChild:
             arguments["page-table-root"] = controls[2]
         self.special_command("x-flexvm-set-x86-protected-entry", arguments)
 
+    def floating_point(self, cpu):
+        snapshot = self.special_command("x-flexvm-query-x86-fpu", {"cpu-index": cpu})
+        record = bytes.fromhex(snapshot["record"])
+        if len(record) != FPU_SIZE:
+            raise RuntimeError("TCG parent worker did not return a floating-point record")
+        return record
+
+    def set_floating_point(self, cpu, record):
+        self.special_command("x-flexvm-set-x86-fpu", {"cpu-index": cpu, "record": record.hex()})
+
     def close(self):
         try:
             if self.special_monitor is not None:
@@ -387,6 +401,18 @@ class KvmChild:
         if self.channel.connection.recv(2) != b"P":
             raise RuntimeError("native parent worker did not acknowledge protected entry")
 
+    def floating_point(self, cpu):
+        self.channel.connection.sendall(bytes((ord("F"), cpu)))
+        record = self.channel.connection.recv(FPU_SIZE + 1)
+        if len(record) != FPU_SIZE:
+            raise RuntimeError("native parent worker did not return a floating-point record")
+        return record
+
+    def set_floating_point(self, cpu, record):
+        self.channel.connection.sendall(bytes((ord("W"), cpu)) + record)
+        if self.channel.connection.recv(2) != b"W":
+            raise RuntimeError("native parent worker did not acknowledge the floating-point write")
+
     def close(self):
         if self.channel is not None:
             self.channel.close()
@@ -428,7 +454,7 @@ def read_slot_table(mailbox, ram_pages, outer_bytes, protected_entry, split_slot
         raise RuntimeError("unexpected number of registered RAM slots")
     slots = []
     used_offsets = set()
-    offset_position = 1024
+    offset_position = RAM_ADDRESS_AT
     for index, record in enumerate(expected):
         identifier, pages, gpa = struct.unpack_from("<IIQ", mailbox, 640 + index * 16)
         if (identifier, pages, gpa) != record:
@@ -488,7 +514,7 @@ def verify_slot_spans(pid, slots):
 
 
 def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry,
-             split_slot, interrupt_run, cpu_count, long_mode):
+             split_slot, interrupt_run, cpu_count, long_mode, fpu):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
@@ -500,7 +526,12 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         expected.extend((RUN, GET_REGS, GET_REGS, CLOSE_CPU))
         expected_counters.extend((0x3344, 0x1357))
         expected_io.append((1, 0x56))
-    expected.extend((SET_REGS, GET_REGS, *((RUN, GET_REGS) * expected_interruptions), RUN, GET_REGS, CLOSE_CPU, CLOSE_VM))
+    if fpu:
+        expected.extend((GET_FPU, SET_FPU))
+    expected.extend((SET_REGS, GET_REGS, *((RUN, GET_REGS) * expected_interruptions), RUN, GET_REGS))
+    if fpu:
+        expected.append(GET_FPU)
+    expected.extend((CLOSE_CPU, CLOSE_VM))
     expected_counters.extend((*([0x3579] * (1 + expected_interruptions)), 0x2468))
     expected_io.append((0, 0xa7))
     if reject_close:
@@ -525,7 +556,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 14)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 15)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
         os.ftruncate(outer_ram, outer_ram_size)
@@ -574,7 +605,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
             if pending != complete + 1 or len(observed) >= len(expected) or opcode != expected[len(observed)]:
                 raise RuntimeError(f"unexpected doorbell request {pending}, command {opcode}")
             cpu, = struct.unpack_from("<I", mapping, 44)
-            if opcode in (CLOSE_CPU, RUN, GET_REGS, GET_SREGS, SET_REGS) and cpu not in open_cpus:
+            if opcode in (CLOSE_CPU, RUN, GET_REGS, GET_SREGS, SET_REGS, GET_FPU, SET_FPU) and cpu not in open_cpus:
                 raise RuntimeError(f"command {opcode} requested unopened vCPU {cpu}")
             status = 0
             if opcode == OPEN_CPU:
@@ -596,6 +627,11 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                         state = read_protected_entry(mapping, slots, long_mode)
                         child.set_protected_entry(cpu, state)
                     child.set_registers(cpu, mapping[64:64 + REGISTERS.size])
+                    fpu_valid, = struct.unpack_from("<I", mapping, FPU_VALID_AT)
+                    if fpu_valid != int(fpu):
+                        raise RuntimeError("unexpected staged floating-point state")
+                    if fpu_valid:
+                        child.set_floating_point(cpu, mapping[FPU_AT:FPU_AT + FPU_SIZE])
                     started_cpus.add(cpu)
                 value = child.run(cpu, RunCancellation(cancellations, mapping, pending, deadline))
                 if value is None:
@@ -623,6 +659,10 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 control_state = CONTROL_REGISTERS.unpack_from(registers, 8 * SEGMENT.size + 2 * DESCRIPTOR_TABLE.size)
                 special.update(cr0=control_state[0], cr2=control_state[1], cr3=control_state[2],
                                cr4=control_state[3], efer=control_state[5])
+            elif opcode == GET_FPU:
+                mapping[FPU_AT:FPU_AT + FPU_SIZE] = child.floating_point(cpu)
+            elif opcode == SET_FPU:
+                child.set_floating_point(cpu, mapping[FPU_AT:FPU_AT + FPU_SIZE])
             elif opcode == CLOSE_CPU:
                 open_cpus.remove(cpu)
                 if not open_cpus:
@@ -643,6 +683,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 or interrupt_run and "PASS stopped and resumed the same running child" not in guest
                 or cpu_count == 2 and "PASS two vCPUs kept independent state in one child" not in guest
                 or long_mode and "PASS x86-64 child used guest page tables and a virtual RAM alias" not in guest
+                or fpu and "PASS x87 and XMM state reached the parent worker" not in guest
                 or "PASS /dev/kvm returned two port I/O exits" not in guest
                 or "PASS parent KVM guest shutdown" not in guest):
             raise RuntimeError(f"parent execution proof failed; commands={observed}, see outer.log")
@@ -662,6 +703,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         "parent_accelerator": parent_engine, "parent_commands": observed, "transport": "eventfd and MSI-X",
         "io_values": child.channel.exits, "child_memory_write_visible": True, "same_child_worker": True,
         "vcpu_io_events": io_events, "vcpu_count": cpu_count,
+        "floating_point": fpu,
         "register_counters": counters,
         "interrupted_runs": len(child.channel.interruptions),
         "interrupted_run_ms": child.channel.interruptions,
@@ -695,9 +737,12 @@ def main():
     parser.add_argument("--interrupt-run", action="store_true", help="interrupt live child execution before resuming")
     parser.add_argument("--two-vcpus", action="store_true", help="run two vCPUs serially with shared child RAM")
     parser.add_argument("--long-mode", action="store_true", help="enter x86-64 mode with client-supplied page tables")
+    parser.add_argument("--fpu", action="store_true", help="exercise x87 and XMM state in long mode")
     parser.add_argument("--reject-close", action="store_true", help="verify page retention when the parent refuses close")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.fpu and not args.long_mode:
+        parser.error("--fpu requires long mode")
     if args.long_mode:
         if args.two_vcpus or args.ram_pages < (8 if args.split_slot else 4):
             parser.error("--long-mode requires one vCPU and four pages in the low slot")
@@ -719,7 +764,7 @@ def main():
     if args.worker:
         print(json.dumps(exercise(qemu, kernel, output, args.reject_close, args.parent_engine, args.ram_pages,
                                   args.protected_entry, args.split_slot, args.interrupt_run,
-                                  2 if args.two_vcpus else 1, args.long_mode)))
+                                  2 if args.two_vcpus else 1, args.long_mode, args.fpu)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -753,6 +798,8 @@ def main():
                 oracle.append("smp")
             if args.long_mode:
                 oracle.append("long")
+            if args.fpu:
+                oracle.append("fpu")
             HELPERS["run"](oracle, 14 if args.interrupt_run else 8, output / "native-kvm.log")
             report["same_client_passed_native_kvm"] = True
             report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
@@ -768,6 +815,8 @@ def main():
             files["two-vcpus"] = b""
         if args.long_mode:
             files["long-mode"] = b""
+        if args.fpu:
+            files["floating-point"] = b""
         image = HELPERS["initramfs"](init.read_bytes(), files=files)
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
@@ -793,6 +842,7 @@ def main():
                             *(["--interrupt-run"] if args.interrupt_run else []),
                             *(["--two-vcpus"] if args.two_vcpus else []),
                             *(["--long-mode"] if args.long_mode else []),
+                            *(["--fpu"] if args.fpu else []),
                             *(["--reject-close"] if args.reject_close else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}

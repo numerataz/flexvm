@@ -96,9 +96,12 @@ int main(int argc, char **argv)
     check(sigemptyset(&action.sa_mask) == 0 && sigaction(SIGRTMIN, &action, NULL) == 0,
           "install the native run interrupt handler");
     struct kvm_regs registers;
+    struct kvm_fpu fpu;
+    _Static_assert(sizeof(fpu) == PVKVM_FPU_BYTES && sizeof(fpu) >= sizeof(segments),
+                   "native worker control record size");
 
     check(write(control, "R", 1) == 1, "announce worker readiness");
-    unsigned char request[2 + sizeof(segments)];
+    unsigned char request[2 + sizeof(fpu)];
     ssize_t received;
     while ((received = recv(control, request, sizeof(request), MSG_TRUNC)) != 0) {
         if (received < 0 && errno == EINTR) continue;
@@ -111,7 +114,7 @@ int main(int argc, char **argv)
             check(write(control, "S", 1) == 1, "acknowledge host register write");
             continue;
         }
-        if (received == sizeof(request) && request[0] == 'P') {
+        if (received == 2 + sizeof(segments) && request[0] == 'P') {
             struct kvm_sregs setup;
             memcpy(&setup, request + 2, sizeof(setup));
             check(ioctl(cpu, KVM_GET_SREGS, &segments) == 0, "read host protected-entry baseline");
@@ -140,6 +143,17 @@ int main(int argc, char **argv)
             check(ioctl(cpu, KVM_GET_SREGS, &segments) == 0, "read host special registers after exit");
             check(write(control, &segments, sizeof(segments)) == (ssize_t)sizeof(segments),
                   "return host special registers to the parent");
+            continue;
+        }
+        if (received == 2 && request[0] == 'F') {
+            check(ioctl(cpu, KVM_GET_FPU, &fpu) == 0, "read host floating-point registers");
+            check(write(control, &fpu, sizeof(fpu)) == (ssize_t)sizeof(fpu), "return host floating-point state");
+            continue;
+        }
+        if (received == 2 + sizeof(fpu) && request[0] == 'W') {
+            memcpy(&fpu, request + 2, sizeof(fpu));
+            check(ioctl(cpu, KVM_SET_FPU, &fpu) == 0, "write host floating-point registers");
+            check(write(control, "W", 1) == 1, "acknowledge host floating-point write");
             continue;
         }
         uint32_t sequence;
