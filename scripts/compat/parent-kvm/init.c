@@ -40,7 +40,7 @@ int main(void)
     pid_t child = fork();
     check(child >= 0, "fork the KVM client");
     if (child == 0) {
-        char *arguments[12] = {"kvm-run", pages};
+        char *arguments[13] = {"kvm-run", pages};
         unsigned int next = 2;
         if (access("/split-slot", F_OK) == 0)
             arguments[next++] = "split";
@@ -62,6 +62,8 @@ int main(void)
             arguments[next++] = "mmio";
         if (access("/mmio-read", F_OK) == 0)
             arguments[next++] = "mmio-read";
+        if (access("/ioeventfd", F_OK) == 0)
+            arguments[next++] = "ioeventfd";
         execv("/kvm-run", arguments);
         _exit(127);
     }
