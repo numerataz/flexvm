@@ -30,12 +30,45 @@ static void expired(int sig) {
     _exit(1);
 }
 
+static uint64_t core_id(size_t offset) {
+    return KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | (offset / sizeof(uint32_t));
+}
+
+static uint64_t get_core(int cpu, size_t offset) {
+    uint64_t value;
+    struct kvm_one_reg reg = {.id = core_id(offset), .addr = (uintptr_t)&value};
+    REQUIRE(ioctl(cpu, KVM_GET_ONE_REG, &reg) == 0);
+    return value;
+}
+
 static void set_core(int cpu, size_t offset, uint64_t value) {
-    struct kvm_one_reg reg = {
-        .id = KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | (offset / sizeof(uint32_t)),
-        .addr = (uintptr_t)&value,
-    };
+    struct kvm_one_reg reg = {.id = core_id(offset), .addr = (uintptr_t)&value};
     REQUIRE(ioctl(cpu, KVM_SET_ONE_REG, &reg) == 0);
+}
+
+static void check_register_list(int cpu) {
+    struct kvm_reg_list header = {0};
+    REQUIRE(ioctl(cpu, KVM_GET_REG_LIST, &header) == -1 && errno == E2BIG);
+    REQUIRE(header.n >= 34 && header.n <= 4096);
+    size_t count = header.n;
+    struct kvm_reg_list *list = malloc(sizeof(*list) + count * sizeof(list->reg[0]));
+    REQUIRE(list != NULL);
+    list->n = count;
+    REQUIRE(ioctl(cpu, KVM_GET_REG_LIST, list) == 0 && list->n == count);
+    uint64_t required[] = {
+        core_id(offsetof(struct kvm_regs, regs.pc)),
+        core_id(offsetof(struct kvm_regs, regs.pstate)),
+        core_id(offsetof(struct kvm_regs, regs.regs[0])),
+        core_id(offsetof(struct kvm_regs, regs.regs[1])),
+    };
+    for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); i++) {
+        size_t occurrences = 0;
+        for (size_t j = 0; j < count; j++)
+            occurrences += list->reg[j] == required[i];
+        REQUIRE(occurrences == 1);
+    }
+    free(list);
+    puts("PASS: ARM KVM enumerates the core registers");
 }
 
 static void run(int cpu) {
@@ -61,6 +94,7 @@ int main(void) {
     int cpu = ioctl(vm, KVM_CREATE_VCPU, 0);
     REQUIRE(cpu >= 0);
     REQUIRE(ioctl(cpu, KVM_ARM_VCPU_INIT, &init) == 0);
+    check_register_list(cpu);
 
     const size_t size = 0x10000;
     uint32_t *ram = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -81,6 +115,9 @@ int main(void) {
     set_core(cpu, offsetof(struct kvm_regs, regs.pc), 0x40000000);
     set_core(cpu, offsetof(struct kvm_regs, regs.pstate), 0x3c5); // EL1h, interrupts masked
     set_core(cpu, offsetof(struct kvm_regs, regs.regs[0]), 0x10000000);
+    REQUIRE(get_core(cpu, offsetof(struct kvm_regs, regs.pc)) == 0x40000000);
+    REQUIRE(get_core(cpu, offsetof(struct kvm_regs, regs.pstate)) == 0x3c5);
+    REQUIRE(get_core(cpu, offsetof(struct kvm_regs, regs.regs[0])) == 0x10000000);
     int run_size = ioctl(kvm, KVM_GET_VCPU_MMAP_SIZE, 0);
     REQUIRE(run_size >= (int)sizeof(struct kvm_run));
     struct kvm_run *state = mmap(NULL, (size_t)run_size, PROT_READ | PROT_WRITE, MAP_SHARED, cpu, 0);
@@ -91,6 +128,7 @@ int main(void) {
     uint32_t value;
     memcpy(&value, state->mmio.data, sizeof(value));
     REQUIRE(value == 0x4d);
+    REQUIRE(get_core(cpu, offsetof(struct kvm_regs, regs.regs[1])) == value);
     puts("PASS: ARM KVM vCPU executes and returns a correct MMIO exit");
     run(cpu);
     REQUIRE(state->exit_reason == KVM_EXIT_SYSTEM_EVENT);

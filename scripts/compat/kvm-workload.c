@@ -27,6 +27,10 @@ int main(void) {
     char *const abi[] = {"/kvm-abi", NULL};
     if (execute(abi) < 0) return 1;
     puts("FLEXVM_SOFTWARE_KVM_API_PASSED");
+#if defined(__aarch64__)
+    char *const worker[] = {"/test-arm-native", "/arm-native-worker", NULL};
+    if (execute(worker) < 0) return 1;
+#endif
     char *const firecracker[] = {"/firecracker", "--no-api", "--config-file", "/firecracker.json", NULL};
     if (execute(firecracker) < 0) return 1;
     puts("FLEXVM_SOFTWARE_KVM_FIRECRACKER_PASSED");

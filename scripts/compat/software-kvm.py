@@ -75,8 +75,11 @@ def main():
     previous = {number: signal.signal(number, interrupted) for number in (signal.SIGINT, signal.SIGTERM)}
     state = None
     try:
-        for source, name in (('kvm-abi.c' if arch == 'x86_64' else 'kvm-arm.c', 'kvm-abi'),
-                             ('nested-init.c', 'inner-init'), ('kvm-workload.c', 'kvm-workload')):
+        programs = [('kvm-abi.c' if arch == 'x86_64' else 'kvm-arm.c', 'kvm-abi'),
+                    ('nested-init.c', 'inner-init'), ('kvm-workload.c', 'kvm-workload')]
+        arm_worker = [('parent-kvm/arm-native-worker.c', 'arm-native-worker'),
+                      ('parent-kvm/test-arm-native.c', 'test-arm-native')] if arch == 'aarch64' else []
+        for source, name in programs + arm_worker:
             HELPERS['run']([args.cc, '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', '-static', '-pthread',
                             str(ROOT / source), '-o', str(out / name)], 60, out / (name + '-compile.log'))
         config = {'boot-source': {'kernel_image_path': '/inner-kernel', 'initrd_path': '/inner-initramfs.cpio',
@@ -89,6 +92,8 @@ def main():
                  'inner-initramfs.cpio': (HELPERS['initramfs']((out / 'inner-init').read_bytes()), 0o600),
                  'firecracker.json': (json.dumps(config).encode(), 0o600),
                  'etc/passwd': (b'root:x:0:0:root:/root:/bin/sh\n', 0o644), 'etc/group': (b'root:x:0:\n', 0o644)}
+        for _, name in arm_worker:
+            files[name] = ((out / name).read_bytes(), 0o755)
         image(archive, 'amd64' if arch == 'x86_64' else 'arm64', files)
         report.update(kvm_abi_sha256=HELPERS['digest'](out / 'kvm-abi'), workload_sha256=HELPERS['digest'](out / 'kvm-workload'))
         state = tempfile.TemporaryDirectory(prefix='flexvm-software-kvm-', dir='/var/lib')
@@ -117,6 +122,11 @@ def main():
         abi_marker = 'PASS: 10 KVM ABI reference checks' if arch == 'x86_64' else 'FLEXVM_SOFTWARE_GUEST_KVM_PASSED'
         if abi_marker not in lines:
             raise RuntimeError('missing successful KVM ABI report; see guest.log')
+        if arm_worker:
+            marker = 'PASS native ARM worker VM, vCPU initialization, register state, MMIO, shared page, and PSCI'
+            if lines.count(marker) != 1:
+                raise RuntimeError('missing successful native ARM worker report; see guest.log')
+            report['arm_native_worker'] = 'passed'
         traced = trace.read_text(errors='replace')
         if any(f'"{dev}"' in traced for dev in ('/dev/kvm', '/dev/vhost-vsock')):
             raise RuntimeError('host virtualization device access; see files.strace')
