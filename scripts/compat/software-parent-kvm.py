@@ -20,8 +20,6 @@ def main():
     parser.add_argument("--engine", choices=("auto", "tcg", "kvm"), default="tcg")
     parser.add_argument("--pause", action="store_true", help="pause and resume the first nested VM through the public command")
     args = parser.parse_args()
-    if args.pause and args.engine != "tcg":
-        parser.error("--pause requires the TCG parent provider")
     binary, kernel, firecracker, qemu, bundle = (
         path.resolve(strict=True) for path in (args.bin, args.kernel, args.firecracker, args.qemu, args.bundle)
     )
