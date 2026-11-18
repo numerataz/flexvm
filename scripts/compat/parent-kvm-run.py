@@ -43,7 +43,8 @@ EFER_LONG_MODE_ENABLE = 1 << 8
 (OPEN_VM, CLOSE_VM, OPEN_CPU, CLOSE_CPU, RUN, GET_REGS, SET_REGS, GET_SREGS,
  GET_FPU, SET_FPU, GET_MSRS, SET_MSRS, GET_SUPPORTED_CPUID, CREATE_IRQCHIP, SET_IRQ_LINE,
  CREATE_PIT, SET_TSS_ADDR, GET_LAPIC, SET_LAPIC, COMPLETE_READ, GET_IRQCHIP, SET_IRQCHIP,
- GET_PIT, SET_PIT, GET_DEBUGREGS, SET_DEBUGREGS, GET_MP_STATE, SET_MP_STATE) = range(1, 29)
+ GET_PIT, SET_PIT, GET_DEBUGREGS, SET_DEBUGREGS, GET_MP_STATE, SET_MP_STATE,
+ GET_XCRS, SET_XCRS) = range(1, 31)
 FPU_VALID_AT = 48
 FPU_AT = 768
 FPU_SIZE = 416
@@ -59,7 +60,7 @@ CPUID_HEADER = struct.Struct("<II")
 CPUID_ENTRY = struct.Struct("<7I12x")
 CPUID_BYTES = CPUID_HEADER.size + CPUID_ENTRY.size * CPUID_MAX
 CPUID_FIELDS = ("function", "index", "indexed", "eax", "ebx", "ecx", "edx")
-TCG_CHILD_CPU = "qemu64"
+TCG_CHILD_CPU = "qemu64,+xsave"
 KVM_EXIT_IO = 2
 KVM_EXIT_MMIO = 6
 IO_PORT = 0x30
@@ -82,6 +83,9 @@ MP_STATE = struct.Struct("<I")
 MP_STATE_REPLY = struct.Struct("<iI")
 MP_RUNNABLE = 0
 MP_SIPI_RECEIVED = 4
+XCRS_AT = 0x87500
+XCRS = struct.Struct("<4IQ368x")
+IOCTL_RESULT = struct.Struct("<i")
 PIO_WRITES = ((0x3f8, 1, b"L"), (0x2f8, 2, b"\xcd\xab"),
               (0xcf8, 4, b"\x00\x00\x00\x80"), (0x3f8, 1, b"vmio"))
 PIO_READS = ((0x3fd, 1, b"\x60"), (0x2f8, 2, b"\x67\x45"),
@@ -613,6 +617,17 @@ class TcgChild:
         result = self.special_command("x-flexvm-access-x86-mp-state", args)
         return result["status"], result["state"]
 
+    def xcrs(self, cpu):
+        state = self.special_command("x-flexvm-access-x86-xcr0", {"cpu-index": cpu})
+        return pack_xcrs(state["value"])
+
+    def set_xcrs(self, cpu, record):
+        count, flags, index, reserved, value = XCRS.unpack(record)
+        if (count, flags, index, reserved) != (1, 0, 0, 0):
+            raise RuntimeError("invalid canonical XCR state")
+        state = self.special_command("x-flexvm-access-x86-xcr0", {"cpu-index": cpu, "value": value})
+        return state["status"]
+
     def pulse_irq(self, gsi):
         self.special_command("x-flexvm-pulse-x86-gsi", {"gsi": gsi})
 
@@ -791,6 +806,20 @@ class KvmChild:
         if len(result) != MP_STATE_REPLY.size:
             raise RuntimeError("native parent worker returned an invalid MP state")
         return MP_STATE_REPLY.unpack(result)
+
+    def xcrs(self, cpu):
+        self.channel.connection.sendall(bytes((ord("s"), cpu)))
+        result = self.channel.connection.recv(XCRS.size + 1)
+        if len(result) != XCRS.size:
+            raise RuntimeError("native parent worker returned an invalid XCR image")
+        return result
+
+    def set_xcrs(self, cpu, record):
+        self.channel.connection.sendall(bytes((ord("t"), cpu)) + record)
+        result = self.channel.connection.recv(IOCTL_RESULT.size + 1)
+        if len(result) != IOCTL_RESULT.size:
+            raise RuntimeError("native parent worker returned an invalid XCR write result")
+        return IOCTL_RESULT.unpack(result)[0]
 
     def close(self):
         if self.channel is not None:
@@ -992,6 +1021,21 @@ def unstarted_mp_state(engine, qemu, output, control, cpu_count, cpu, irqchip, s
         return monitor.ask("x-flexvm-access-x86-mp-state", args)["state"]
 
 
+def pack_xcrs(xcr0):
+    return XCRS.pack(1, 0, 0, 0, xcr0)
+
+
+def reset_xcrs(engine, qemu, output, control, cpu_count, cpu):
+    if engine == "kvm":
+        native = subprocess.run([output / "native-worker", "--reset-xcrs", str(cpu)],
+                                capture_output=True, timeout=3)
+        if native.returncode or len(native.stdout) != XCRS.size:
+            raise RuntimeError(f"native XCR query failed: {native.stderr.decode(errors='replace')}")
+        return native.stdout
+    with model_monitor(qemu, output, control, cpu_count, "xcrs") as monitor:
+        return pack_xcrs(monitor.ask("x-flexvm-access-x86-xcr0", {"cpu-index": cpu})["value"])
+
+
 def read_slot_table(mailbox, ram_pages, outer_bytes, protected_entry, split_slot, zero_slot):
     first_gpa = PROTECTED_GPA if protected_entry else PAGE_SIZE
     if zero_slot:
@@ -1073,7 +1117,7 @@ def verify_slot_spans(pid, slots):
 def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry,
              split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs, cpuid, mmio, mmio_read,
              ioeventfd, irqchip, pit, irqfd, zero_slot, tss, lapic, pio, complete_read, pio_boundary, pvh,
-             irqchip_state, pit_state, debugregs, mp_state):
+             irqchip_state, pit_state, debugregs, mp_state, xcrs):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
@@ -1097,6 +1141,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         expected.extend((GET_DEBUGREGS, SET_DEBUGREGS, GET_DEBUGREGS))
     if mp_state:
         expected.extend((GET_MP_STATE, SET_MP_STATE, GET_MP_STATE, SET_MP_STATE, GET_MP_STATE))
+    if xcrs:
+        expected.extend((GET_XCRS, SET_XCRS, GET_XCRS))
     if lapic:
         expected.append(GET_LAPIC)
     expected_counters = []
@@ -1169,6 +1215,10 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         expected.extend((SET_REGS, RUN, GET_REGS, GET_DEBUGREGS, SET_DEBUGREGS, GET_DEBUGREGS))
         expected_counters.append(0x7654)
         expected_io.append((0, 0x7d))
+    if xcrs:
+        expected.extend((SET_REGS, RUN, GET_REGS, GET_XCRS, SET_XCRS, GET_XCRS, RUN, GET_REGS))
+        expected_counters.extend((0x7a11, 0x7a11))
+        expected_io.extend(((0, 0x7f), (0, 0x7f)))
     expected.extend((CLOSE_CPU, CLOSE_VM))
     if reject_close:
         expected = expected[:-1]
@@ -1188,6 +1238,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
     staged_pit = None
     staged_debugregs = {}
     staged_mp_states = {}
+    staged_xcrs = {}
     tss_gpa = None
     irq_levels = []
     expected_irq_levels = IRQ_LEVELS + ([(6, 1), (6, 0)] if irqchip_state else []) if irqchip else []
@@ -1213,7 +1264,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 31)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 32)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
         os.ftruncate(outer_ram, outer_ram_size)
@@ -1272,7 +1323,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
             cpu, = struct.unpack_from("<I", mapping, 44)
             cpu_commands = (CLOSE_CPU, RUN, GET_REGS, GET_SREGS, SET_REGS, GET_FPU, SET_FPU, GET_MSRS, SET_MSRS,
                             GET_LAPIC, SET_LAPIC, COMPLETE_READ, GET_DEBUGREGS, SET_DEBUGREGS,
-                            GET_MP_STATE, SET_MP_STATE)
+                            GET_MP_STATE, SET_MP_STATE, GET_XCRS, SET_XCRS)
             if opcode in cpu_commands and cpu not in open_cpus:
                 raise RuntimeError(f"command {opcode} requested unopened vCPU {cpu}")
             status = 0
@@ -1403,6 +1454,24 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                         status, state = child.mp_state(cpu)
                     if not status:
                         MP_STATE.pack_into(mapping, MP_STATE_AT, state)
+            elif opcode in (GET_XCRS, SET_XCRS):
+                if length:
+                    raise RuntimeError("unexpected memory argument for XCRs")
+                end = XCRS_AT + XCRS.size
+                if opcode == SET_XCRS:
+                    record = mapping[XCRS_AT:end]
+                    if cpu in started_cpus:
+                        status = child.set_xcrs(cpu, record)
+                    else:
+                        staged_xcrs[cpu] = record
+                else:
+                    if cpu in started_cpus:
+                        record = child.xcrs(cpu)
+                    elif cpu in staged_xcrs:
+                        record = staged_xcrs[cpu]
+                    else:
+                        record = reset_xcrs(parent_engine, qemu, output, control, cpu_count, cpu)
+                    mapping[XCRS_AT:end] = record
             elif opcode == RUN:
                 if child is None:
                     if length != slot_size or len(open_cpus) != cpu_count:
@@ -1433,6 +1502,10 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                         raise RuntimeError("unexpected staged CPUID table")
                     if cpuid_valid:
                         child.set_cpuid(cpu, unpack_cpuid(mapping[CPUID_AT:CPUID_AT + CPUID_BYTES]))
+                    if cpu in staged_xcrs:
+                        xcr_status = child.set_xcrs(cpu, staged_xcrs.pop(cpu))
+                        if xcr_status:
+                            raise RuntimeError(f"parent worker rejected staged XCRs with error {xcr_status}")
                     if protected_entry:
                         state = read_protected_entry(mapping, slots, long_mode, pvh, reset_registers[cpu])
                         child.set_protected_entry(cpu, state)
@@ -1526,6 +1599,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
             elif opcode == CLOSE_CPU:
                 open_cpus.remove(cpu)
                 staged_mp_states.pop(cpu, None)
+                staged_xcrs.pop(cpu, None)
                 if not open_cpus:
                     # The guest can unpin its pages after the last CPU closes.
                     if reject_close:
@@ -1560,6 +1634,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 or pit_state and "PASS restored live PIT state woke the halted vCPU" not in guest
                 or debugregs and "PASS staged hardware breakpoint and live debug registers" not in guest
                 or mp_state and "PASS real IRQ woke a vCPU restored to KVM_MP_STATE_HALTED" not in guest
+                or xcrs and "PASS guest XGETBV and XSETBV used the actual parent XCR0" not in guest
                 or irqfd and "PASS KVM_IRQFD woke an active run and honored deassignment and pending signals" not in guest
                 or zero_slot and "PASS zero-based RAM shared every tested page across the legacy PC region" not in guest
                 or tss and "PASS child ran with Firecracker's three-page TSS reservation" not in guest
@@ -1610,6 +1685,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         "pit_state": pit_state,
         "debugregs": debugregs,
         "mp_state": mp_state,
+        "xcrs": xcrs,
         "irqfd": irqfd,
         "tcg_irqfd_pulses": pulses,
         "zero_based_ram": zero_slot,
@@ -1664,6 +1740,7 @@ def main():
     parser.add_argument("--pit-state", action="store_true", help="restore timer state and verify a real wakeup")
     parser.add_argument("--debugregs", action="store_true", help="verify staged debug registers and a hardware breakpoint")
     parser.add_argument("--mp-state", action="store_true", help="restore a halted vCPU and wake it through an IRQ")
+    parser.add_argument("--xcrs", action="store_true", help="verify real XGETBV and XSETBV with VMM-restored XCR0")
     parser.add_argument("--irqfd", action="store_true", help="wake an active run through KVM_IRQFD")
     parser.add_argument("--zero-slot", action="store_true", help="share RAM at GPA zero across the PC legacy region")
     parser.add_argument("--tss", action="store_true", help="reserve Firecracker's x86 TSS address")
@@ -1686,6 +1763,8 @@ def main():
             parser.error("--pvh needs at least 8192 pages for the kernel entry point")
     if args.pit_state:
         args.pit = True
+    if args.xcrs:
+        args.cpuid = True
     if args.pit or args.irqfd or args.tss or args.lapic or args.irqchip_state or args.mp_state:
         args.irqchip = True
     if args.mp_state and (args.pit or args.irqfd or args.irqchip_state):
@@ -1728,6 +1807,9 @@ def main():
     if args.debugregs and (not args.protected_entry or args.two_vcpus or args.zero_slot or args.long_mode or
                            args.mmio_write or args.irqchip or args.cpuid):
         parser.error("--debugregs requires the single-vCPU protected-mode fixture")
+    if args.xcrs and (not args.protected_entry or args.two_vcpus or args.zero_slot or args.long_mode or
+                       args.mmio_write or args.irqchip):
+        parser.error("--xcrs requires the single-vCPU protected-mode fixture")
     qemu, kernel = (path.resolve(strict=True) for path in (args.qemu, args.kernel))
     output = args.output.resolve()
     if os.geteuid() != 0 or platform.machine() != "x86_64":
@@ -1739,7 +1821,7 @@ def main():
                                   args.mmio_write, args.mmio_read, args.ioeventfd, args.irqchip, args.pit,
                                   args.irqfd, args.zero_slot, args.tss, args.lapic, args.pio, args.complete_read,
                                   args.pio_boundary, args.pvh, args.irqchip_state, args.pit_state, args.debugregs,
-                                  args.mp_state)))
+                                  args.mp_state, args.xcrs)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -1813,6 +1895,8 @@ def main():
                 oracle.append("debugregs")
             if args.mp_state:
                 oracle.append("mp-state")
+            if args.xcrs:
+                oracle.append("xcrs")
             HELPERS["run"](oracle, 14 if args.interrupt_run else 8, output / "native-kvm.log")
             report["same_client_passed_native_kvm"] = True
             report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
@@ -1868,6 +1952,8 @@ def main():
             files["debugregs"] = b""
         if args.mp_state:
             files["mp-state"] = b""
+        if args.xcrs:
+            files["xcrs"] = b""
         image = HELPERS["initramfs"](init.read_bytes(), files=files)
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
@@ -1913,6 +1999,7 @@ def main():
                             *(["--pit-state"] if args.pit_state else []),
                             *(["--debugregs"] if args.debugregs else []),
                             *(["--mp-state"] if args.mp_state else []),
+                            *(["--xcrs"] if args.xcrs else []),
                             *(["--reject-close"] if args.reject_close else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}
@@ -1924,8 +2011,8 @@ def main():
             workers = {line.split()[0] for line in lines if worker_path in line and line.endswith(" = 0")}
             kvm_users = {line.split()[0] for line in lines if '"/dev/kvm"' in line}
             reset_queries = 2 if args.two_vcpus else 1
-            model_queries = sum((args.cpuid, args.lapic, args.irqchip_state, args.debugregs)) + 2 * int(args.pit_state)
-            model_queries += 3 * int(args.mp_state)
+            model_queries = sum((args.cpuid, args.lapic, args.irqchip_state, args.debugregs, args.xcrs))
+            model_queries += 2 * int(args.pit_state) + 3 * int(args.mp_state)
             if len(workers) != 1 + model_queries + reset_queries or kvm_users != workers:
                 raise RuntimeError("only the native parent worker may use host KVM")
         report.update(json.loads(worker.read_text()), status="passed", host_device_access=bool(devices),

@@ -63,6 +63,7 @@
 #define DEBUG_IDTR_OFFSET 0x540
 #define DEBUG_TARGET_OFFSET (DEBUG_ENTRY_OFFSET + 7)
 #define DEBUG_DR1_GUEST_VALUE 0x3399
+#define XCRS_ENTRY_OFFSET 0xe00
 #define MMIO_BASE 0xd0000000ULL
 #define MMIO_FIRST_VALUE 0x5a443322U
 #define MMIO_SECOND_VALUE 0xaabbccddeeff0011ULL
@@ -703,6 +704,82 @@ static void stage_mp_state(int kvm, int cpu, uint64_t gpa)
     select_segments(cpu, true, false, gpa, false);
 }
 
+static struct kvm_xcrs read_xcrs(int cpu)
+{
+    struct kvm_xcrs state;
+
+    check(ioctl(cpu, KVM_GET_XCRS, &state) == 0 && state.nr_xcrs == 1 &&
+          state.xcrs[0].xcr == 0 && !state.flags, "read the actual XCR0");
+    return state;
+}
+
+static void stage_xcrs(int kvm, int cpu)
+{
+    check(ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_XCRS) > 0, "check XCR support");
+    struct kvm_xcrs state = read_xcrs(cpu);
+
+    check(state.xcrs[0].value == 1, "read XCR0 reset to x87 only");
+    state.xcrs[0].value = 4;
+    check(ioctl(cpu, KVM_SET_XCRS, &state) == -1 && errno == EINVAL,
+          "reject enabling YMM without x87 and SSE");
+    state.nr_xcrs = 2;
+    state.xcrs[1] = (struct kvm_xcr){.xcr = 0, .value = 0};
+    state.xcrs[0].value = 3;
+    check(ioctl(cpu, KVM_SET_XCRS, &state) == 0, "stage the first XCR0 entry");
+    check(read_xcrs(cpu).xcrs[0].value == 3, "read the staged XCR0");
+}
+
+static void test_xcrs(int cpu, struct kvm_run *run, int size, unsigned char *ram, unsigned char *data,
+                      uint64_t gpa, uint64_t data_address)
+{
+    const unsigned char initial[] = {
+        0x0f, 0x20, 0xe0,                 /* mov eax, cr4 */
+        0x0d, 0, 0, 0x04, 0,            /* set CR4.OSXSAVE */
+        0x0f, 0x22, 0xe0,                 /* mov cr4, eax */
+        0x31, 0xc9, 0x0f, 0x01, 0xd0,    /* xor ecx, ecx; xgetbv */
+        0x89, 0x87, 0xe8, 0, 0, 0,       /* store the staged XCR0 */
+        0xb8, 1, 0, 0, 0,
+        0x0f, 0x01, 0xd1,                 /* xsetbv to x87 only */
+    };
+    const unsigned char restored[] = {
+        0x31, 0xc9, 0x0f, 0x01, 0xd0,    /* xor ecx, ecx; xgetbv */
+        0x89, 0x87, 0xec, 0, 0, 0,       /* store the live XCR0 */
+    };
+    const unsigned char checkpoint[] = {
+        0xb9, 0x11, 0x7a, 0, 0,          /* mov ecx, 0x7a11 */
+        0xb0, 0x7f, 0xe6, 0x30,
+    };
+    unsigned char *entry = ram + XCRS_ENTRY_OFFSET;
+    const struct kvm_regs regs = {
+        .rsp = gpa + 0xf00, .rdi = data_address,
+        .rip = gpa + XCRS_ENTRY_OFFSET, .rflags = 2,
+    };
+
+    memcpy(entry, initial, sizeof(initial));
+    memcpy(entry + sizeof(initial), checkpoint, sizeof(checkpoint));
+    memcpy(entry + sizeof(initial) + sizeof(checkpoint), restored, sizeof(restored));
+    memcpy(entry + sizeof(initial) + sizeof(checkpoint) + sizeof(restored), checkpoint, sizeof(checkpoint));
+    entry[sizeof(initial) + 2 * sizeof(checkpoint) + sizeof(restored)] = 0xf4;
+    check(ioctl(cpu, KVM_SET_REGS, &regs) == 0, "start the guest XCR program");
+    timed_run(cpu);
+    check_output(run, size, 0x7f);
+    check_registers(cpu, 0x7f, 0x7a11, gpa + XCRS_ENTRY_OFFSET);
+    uint32_t observed;
+    memcpy(&observed, data + 0xe8, sizeof(observed));
+    struct kvm_xcrs state = read_xcrs(cpu);
+
+    check(observed == 3 && state.xcrs[0].value == 1, "observe the staged and guest-modified XCR0");
+    state.xcrs[0].value = 3;
+    check(ioctl(cpu, KVM_SET_XCRS, &state) == 0, "restore live XCR0");
+    check(read_xcrs(cpu).xcrs[0].value == 3, "read the live restored XCR0");
+    timed_run(cpu);
+    check_output(run, size, 0x7f);
+    check_registers(cpu, 0x7f, 0x7a11, gpa + XCRS_ENTRY_OFFSET);
+    memcpy(&observed, data + 0xec, sizeof(observed));
+    check(observed == 3, "guest XGETBV observed the live restored value");
+    puts("PASS guest XGETBV and XSETBV used the actual parent XCR0");
+}
+
 static struct kvm_irqchip read_irqchip(int vm, unsigned int id)
 {
     struct kvm_irqchip chip = {.chip_id = id};
@@ -1266,6 +1343,7 @@ int main(int argc, char **argv)
     bool pit_state = false;
     bool debugregs = false;
     bool mp_state = false;
+    bool xcrs = false;
     bool irqfd = false;
     bool zero_slot = false;
     bool tss = false;
@@ -1306,6 +1384,8 @@ int main(int argc, char **argv)
             debugregs = true;
         else if (!mp_state && !strcmp(argv[i], "mp-state"))
             mp_state = true;
+        else if (!xcrs && !strcmp(argv[i], "xcrs"))
+            xcrs = true;
         else if (!irqfd && !strcmp(argv[i], "irqfd"))
             irqfd = true;
         else if (!zero_slot && !strcmp(argv[i], "zero-slot"))
@@ -1347,6 +1427,8 @@ int main(int argc, char **argv)
     check(!pit_state || pit, "PIT_STATE2 requires the PIT fixture");
     check(!mp_state || (irqchip && !pit && !irqfd && !irqchip_state),
           "use a separate PIC fixture for MP state");
+    check(!xcrs || (cpuid && !two_vcpus && protected_mode && !irqchip && !long_mode && !mmio),
+          "use a single protected vCPU with CPUID and XSAVE support");
     check(!debugregs || (protected_mode && !two_vcpus && !zero_slot && !long_mode &&
                          !mmio && !irqchip && !cpuid), "use the single-vCPU protected debug fixture");
     check(!irqfd || (irqchip && !pit), "test IRQFD in a separate PIC vCPU run");
@@ -1701,6 +1783,8 @@ int main(int argc, char **argv)
         stage_debugregs(kvm, cpu, gpa);
     if (mp_state)
         stage_mp_state(kvm, cpu, gpa);
+    if (xcrs)
+        stage_xcrs(kvm, cpu);
     if (fpu)
         prepare_fpu(cpu);
     if (msrs)
@@ -1881,6 +1965,8 @@ int main(int argc, char **argv)
         puts("PASS MMIO writes returned physical addresses and exact data");
     if (debugregs)
         test_debugregs(cpu, run, size, ram, data, gpa, data_address);
+    if (xcrs)
+        test_xcrs(cpu, run, size, ram, data, gpa, data_address);
     munmap(run, size);
     close(cpu);
     munmap(ram, ram_bytes);
