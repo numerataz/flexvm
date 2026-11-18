@@ -119,6 +119,10 @@ Add `--lapic` to read the reset xAPIC image, stage LINT0 and LINT1 before
 the first run, and update the stopped controller. The guest receives a PIC
 interrupt through the installed state, then changes LINT1 through MMIO.
 The test checks that restoring ICR contents does not send an interrupt.
+Add `--pio` to exercise VMM-owned x86 ports. The client gets the port,
+direction, width, count, and data in its mapped run area. It supplies bytes
+for scalar and repeated input before re-entering the vCPU. The test also
+checks that the configured PIC and PIT still handle their own ports.
 The worker uses one host mapping per consecutive extent. Highly fragmented
 slots can reach the host's mapping limit. A failed mapping releases the
 partially mapped worker span.
