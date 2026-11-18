@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Experimental x86 proof for a KVM client and a parent CPU worker.
- * One VM, one vCPU, pinned RAM slots, and port-output exits.
+ * One VM, pinned RAM slots, serialized vCPUs, and port-output exits.
  */
 #include <linux/anon_inodes.h>
 #include <linux/atomic.h>
@@ -53,7 +53,9 @@ struct pvvm {
 	struct pvslot slots[PVKVM_MAX_SLOTS];
 	unsigned int total_pages;
 	bool slots_exposed;
-	bool cpu_open;
+	bool topology_frozen;
+	unsigned long created_cpus;
+	unsigned long open_cpus;
 };
 
 struct run_page {
@@ -67,6 +69,7 @@ struct pvcpu {
 	struct run_page *page;
 	struct kvm_regs regs;
 	struct kvm_sregs sregs;
+	unsigned int id;
 	bool ran;
 };
 
@@ -203,6 +206,17 @@ static bool close_object(struct pvkvm *p, enum pvkvm_command command)
 	return false;
 }
 
+static int request_for_cpu(struct pvcpu *cpu, enum pvkvm_command command,
+			   const struct pvvm *memory, u8 *output)
+{
+	struct pvkvm *p = cpu->vm->provider;
+
+	if (p->dead)
+		return -ENODEV;
+	writel(cpu->id, p->mailbox + PVKVM_CPU_AT);
+	return request(p, command, memory, output);
+}
+
 static void provider_free(struct kref *ref)
 {
 	kfree(container_of(ref, struct pvkvm, refs));
@@ -250,9 +264,11 @@ static int cpu_release(struct inode *inode, struct file *file)
 	struct pvkvm *p = vm->provider;
 
 	mutex_lock(&p->lock);
-	if (close_object(p, PVKVM_CLOSE_VCPU))
+	vm->open_cpus &= ~BIT(cpu->id);
+	if (request_for_cpu(cpu, PVKVM_CLOSE_VCPU, NULL, NULL))
+		p->dead = true;
+	else if (!vm->open_cpus)
 		vm->slots_exposed = false;
-	vm->cpu_open = false;
 	mutex_unlock(&p->lock);
 	kref_put(&vm->refs, vm_free);
 	vfree(cpu->page);
@@ -291,6 +307,7 @@ static int run_cpu(struct pvcpu *cpu)
 {
 	struct pvvm *vm = cpu->vm;
 	struct pvkvm *p = vm->provider;
+	const struct pvvm *memory;
 	int result;
 
 	result = mutex_lock_interruptible(&p->lock);
@@ -313,12 +330,14 @@ static int run_cpu(struct pvcpu *cpu)
 		result = -EINVAL;
 		goto unlock;
 	}
+	memory = vm->slots_exposed ? NULL : vm;
 	vm->slots_exposed = true;
+	vm->topology_frozen = true;
 	if (!cpu->ran) {
 		memcpy_toio(p->mailbox + PVKVM_REGISTERS_AT, &cpu->regs, sizeof(cpu->regs));
 		memcpy_toio(p->mailbox + PVKVM_INITIAL_SREGISTERS_AT, &cpu->sregs, sizeof(cpu->sregs));
 	}
-	result = request(p, PVKVM_RUN, cpu->ran ? NULL : vm, &cpu->page->data);
+	result = request_for_cpu(cpu, PVKVM_RUN, memory, &cpu->page->data);
 	if (!result || result == -EINTR)
 		cpu->ran = true;
 unlock:
@@ -326,14 +345,15 @@ unlock:
 	return result;
 }
 
-static int read_stopped_registers(struct pvkvm *p, enum pvkvm_command command,
+static int read_stopped_registers(struct pvcpu *cpu, enum pvkvm_command command,
 				  void *registers, size_t size)
 {
+	struct pvkvm *p = cpu->vm->provider;
 	int result = mutex_lock_interruptible(&p->lock);
 
 	if (result)
 		return result;
-	result = request(p, command, NULL, NULL);
+	result = request_for_cpu(cpu, command, NULL, NULL);
 	if (!result)
 		memcpy_fromio(registers, p->mailbox + PVKVM_REGISTERS_AT, size);
 	mutex_unlock(&p->lock);
@@ -363,7 +383,7 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case KVM_GET_REGS:
 		regs = cpu->regs;
 		if (cpu->ran) {
-			result = read_stopped_registers(p, PVKVM_GET_REGS, &regs, sizeof(regs));
+			result = read_stopped_registers(cpu, PVKVM_GET_REGS, &regs, sizeof(regs));
 			if (result)
 				break;
 		}
@@ -393,7 +413,7 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 				result = -ENODEV;
 			} else {
 				memcpy_toio(p->mailbox + PVKVM_REGISTERS_AT, &regs, sizeof(regs));
-				result = request(p, PVKVM_SET_REGS, NULL, NULL);
+				result = request_for_cpu(cpu, PVKVM_SET_REGS, NULL, NULL);
 			}
 			mutex_unlock(&p->lock);
 			if (result)
@@ -405,7 +425,7 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case KVM_GET_SREGS:
 		sregs = cpu->sregs;
 		if (cpu->ran) {
-			result = read_stopped_registers(p, PVKVM_GET_SREGS, &sregs, sizeof(sregs));
+			result = read_stopped_registers(cpu, PVKVM_GET_SREGS, &sregs, sizeof(sregs));
 			if (result)
 				break;
 		}
@@ -465,7 +485,7 @@ static int new_cpu(struct pvvm *vm, unsigned long id)
 	struct pvcpu *cpu;
 	int fd;
 
-	if (id)
+	if (id >= PVKVM_MAX_CPUS)
 		return -EINVAL;
 	cpu = kzalloc(sizeof(*cpu), GFP_KERNEL);
 	if (!cpu)
@@ -476,18 +496,26 @@ static int new_cpu(struct pvvm *vm, unsigned long id)
 		return -ENOMEM;
 	}
 	cpu->vm = vm;
+	cpu->id = id;
 	cpu->regs.rip = 0xfff0;
 	cpu->regs.rflags = 2;
 	cpu->sregs = reset_sregs;
 	mutex_init(&cpu->execution);
 	mutex_lock(&p->lock);
-	fd = vm->cpu_open ? -EEXIST : request(p, PVKVM_CREATE_VCPU, 0, NULL);
+	if (vm->created_cpus & BIT(id))
+		fd = -EEXIST;
+	else if (vm->topology_frozen)
+		fd = -EBUSY;
+	else
+		fd = request_for_cpu(cpu, PVKVM_CREATE_VCPU, NULL, NULL);
 	if (!fd) {
 		fd = anon_inode_getfd("flexvm-vcpu", &cpu_fops, cpu, O_RDWR | O_CLOEXEC);
 		if (fd < 0) {
-			close_object(p, PVKVM_CLOSE_VCPU);
+			if (request_for_cpu(cpu, PVKVM_CLOSE_VCPU, NULL, NULL))
+				p->dead = true;
 		} else {
-			vm->cpu_open = true;
+			vm->created_cpus |= BIT(id);
+			vm->open_cpus |= BIT(id);
 			kref_get(&vm->refs);
 		}
 	}
@@ -499,14 +527,18 @@ static int new_cpu(struct pvvm *vm, unsigned long id)
 	return fd;
 }
 
-static long memory_capability(unsigned long capability)
+static long device_capability(unsigned long capability)
 {
 	switch (capability) {
 	case KVM_CAP_USER_MEMORY:
 	case KVM_CAP_CHECK_EXTENSION_VM:
+	case KVM_CAP_IMMEDIATE_EXIT:
 		return 1;
 	case KVM_CAP_NR_MEMSLOTS:
 		return PVKVM_MAX_SLOTS;
+	case KVM_CAP_NR_VCPUS:
+	case KVM_CAP_MAX_VCPUS:
+		return PVKVM_MAX_CPUS;
 	default:
 		return 0;
 	}
@@ -553,7 +585,7 @@ static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	if (cmd == KVM_CREATE_VCPU)
 		return new_cpu(vm, arg);
 	if (cmd == KVM_CHECK_EXTENSION)
-		return memory_capability(arg);
+		return device_capability(arg);
 	if (cmd != KVM_SET_USER_MEMORY_REGION)
 		return -ENOTTY;
 	if (copy_from_user(&memory, (void __user *)arg, sizeof(memory)))
@@ -653,7 +685,7 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case KVM_GET_VCPU_MMAP_SIZE:
 		return PAGE_SIZE;
 	case KVM_CHECK_EXTENSION:
-		return memory_capability(arg);
+		return device_capability(arg);
 	case KVM_CREATE_VM:
 		return new_vm(file->private_data, arg);
 	default:

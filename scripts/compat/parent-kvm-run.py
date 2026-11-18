@@ -36,7 +36,6 @@ PROTECTED_GPA = 16 * MIB
 SPLIT_GPA = 512 * MIB
 MAX_SLOTS = 8
 TEST_INTERRUPTS = 3
-IO_VALUES = (0x42, 0xa7)
 OPEN_VM, CLOSE_VM, OPEN_CPU, CLOSE_CPU, RUN, GET_REGS, SET_REGS, GET_SREGS = range(1, 9)
 # Linux's x86 struct kvm_regs. The fixture runs in real mode.
 REGISTERS = struct.Struct("<18Q")
@@ -51,7 +50,7 @@ GDB_REGISTERS = (
 )
 QEMU_OPTIONS = [
     "-nodefaults", "-display", "none", "-monitor", "none", "-nic", "none",
-    "-smp", "1", "-no-reboot", "-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
+    "-no-reboot", "-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
 ]
 
 
@@ -171,6 +170,7 @@ class RunChannel:
 class RegisterChannel:
     def __init__(self, path):
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.cpu = None
         try:
             self.socket.settimeout(1)
             self.socket.connect(str(path))
@@ -205,6 +205,12 @@ class RegisterChannel:
             raise RuntimeError(f"QEMU did not return a {size}-byte register for {index}")
         return int.from_bytes(bytes.fromhex(value.decode("ascii")), "little")
 
+    def select_cpu(self, cpu):
+        if self.cpu != cpu:
+            if self.exchange(f"Hg{cpu + 1:x}") != b"OK":
+                raise RuntimeError(f"QEMU rejected debugger vCPU {cpu}")
+            self.cpu = cpu
+
     def write(self, index, size, value):
         encoded = value.to_bytes(size, "little").hex()
         if self.exchange(f"P{index:x}={encoded}") != b"OK":
@@ -216,7 +222,7 @@ class RegisterChannel:
 
 
 class TcgChild:
-    def __init__(self, qemu, output, socket_path, outer_ram, layouts, slots):
+    def __init__(self, qemu, output, socket_path, outer_ram, layouts, slots, cpu_count):
         self.process = None
         self.channel = None
         self.debugger = None
@@ -231,7 +237,7 @@ class TcgChild:
                 listener.listen(1)
                 listener.settimeout(3)
                 command = [
-                    qemu, *QEMU_OPTIONS, "-machine", "pc,accel=tcg", "-m", "16", "-serial", "none",
+                    qemu, *QEMU_OPTIONS, "-machine", "pc,accel=tcg", "-m", "16", "-smp", str(cpu_count), "-serial", "none",
                     "-bios", output / "reset.rom", "-S", "-chardev", f"socket,id=port,path={socket_path}",
                     "-chardev", f"socket,id=regs,path={debugger_path},server=on,wait=off",
                     "-gdb", "chardev:regs",
@@ -248,23 +254,28 @@ class TcgChild:
                 description = self.debugger.exchange("qXfer:features:read:target.xml:0,fff")
                 if b'<xi:include href="i386-64bit.xml"/>' not in description:
                     raise RuntimeError("unexpected QEMU register layout")
-                self.debugger.write(18, 4, 0)  # Real-mode code segment with zero base.
+                for cpu in range(cpu_count):
+                    self.debugger.select_cpu(cpu)
+                    self.debugger.write(18, 4, 0)  # Real-mode code segment with zero base.
         except BaseException:
             self.close()
             raise
 
-    def run(self, cancellation):
+    def run(self, cpu, cancellation):
         if self.channel.exits and os.pread(self.memory, 1, self.data_offset) != b"\0":
             raise RuntimeError("child wrote its second result while stopped")
-        return self.channel.run(b"R", cancellation, lambda: self.channel.connection.sendall(b"I"))
+        request = bytes((ord("R") + cpu,))
+        return self.channel.run(request, cancellation, lambda: self.channel.connection.sendall(b"I"))
 
-    def registers(self):
+    def registers(self, cpu):
+        self.debugger.select_cpu(cpu)
         registers = [0] * 18
         for peer_index, index, size in GDB_REGISTERS:
             registers[index] = self.debugger.read(peer_index, size)
         return REGISTERS.pack(*registers)
 
-    def set_registers(self, record):
+    def set_registers(self, cpu, record):
+        self.debugger.select_cpu(cpu)
         registers = REGISTERS.unpack(record)
         for peer_index, index, size in GDB_REGISTERS:
             self.debugger.write(peer_index, size, registers[index])
@@ -276,12 +287,12 @@ class TcgChild:
         self.special_monitor.deadline = deadline
         return self.special_monitor.ask(operation, arguments)
 
-    def special_registers(self):
-        return pack_special_registers(self.special_command("x-flexvm-query-x86-sregs"))
+    def special_registers(self, cpu):
+        return pack_special_registers(self.special_command("x-flexvm-query-x86-sregs", {"cpu-index": cpu}))
 
-    def set_protected_entry(self, record):
+    def set_protected_entry(self, cpu, record):
         base, limit = DESCRIPTOR_TABLE.unpack_from(record, 8 * SEGMENT.size)
-        self.special_command("x-flexvm-set-x86-protected-entry", {"gdt-base": base, "gdt-limit": limit})
+        self.special_command("x-flexvm-set-x86-protected-entry", {"cpu-index": cpu, "gdt-base": base, "gdt-limit": limit})
 
     def close(self):
         try:
@@ -300,7 +311,7 @@ class TcgChild:
 
 
 class KvmChild:
-    def __init__(self, output, outer_ram, layouts, slots):
+    def __init__(self, output, outer_ram, layouts, slots, cpu_count):
         self.process = None
         self.channel = None
         self.sigqueue = ctypes.CDLL(None, use_errno=True).sigqueue
@@ -310,7 +321,7 @@ class KvmChild:
         try:
             with worker, (output / "child.log").open("wb") as log:
                 control = worker.fileno()
-                command = [output / "native-worker", str(control), str(outer_ram)]
+                command = [output / "native-worker", str(control), str(outer_ram), str(cpu_count)]
                 for slot, layout in zip(slots, layouts, strict=True):
                     command.extend(map(str, (layout, slot.gpa, slot.identifier)))
                 self.process = subprocess.Popen(command, pass_fds=(control, outer_ram, *layouts), stdout=log, stderr=log)
@@ -320,11 +331,11 @@ class KvmChild:
             self.close()
             raise
 
-    def run(self, cancellation):
+    def run(self, cpu, cancellation):
         sequence = cancellation.sequence
         if not 0 < sequence < 1 << 31:
             raise RuntimeError("invalid native cancellation sequence")
-        return self.channel.run(struct.pack("<cI", b"R", sequence), cancellation,
+        return self.channel.run(struct.pack("<cBI", b"R", cpu, sequence), cancellation,
                                 lambda: self.interrupt(sequence))
 
     def interrupt(self, sequence):
@@ -332,27 +343,27 @@ class KvmChild:
             code = ctypes.get_errno()
             raise OSError(code, os.strerror(code))
 
-    def registers(self):
-        self.channel.connection.sendall(b"G")
+    def registers(self, cpu):
+        self.channel.connection.sendall(bytes((ord("G"), cpu)))
         registers = self.channel.connection.recv(REGISTERS.size + 1)
         if len(registers) != REGISTERS.size:
             raise RuntimeError("native parent worker did not return a register record")
         return registers
 
-    def set_registers(self, record):
-        self.channel.connection.sendall(b"S" + record)
+    def set_registers(self, cpu, record):
+        self.channel.connection.sendall(bytes((ord("S"), cpu)) + record)
         if self.channel.connection.recv(2) != b"S":
             raise RuntimeError("native parent worker did not acknowledge the register write")
 
-    def special_registers(self):
-        self.channel.connection.sendall(b"X")
+    def special_registers(self, cpu):
+        self.channel.connection.sendall(bytes((ord("X"), cpu)))
         registers = self.channel.connection.recv(SPECIAL_REGISTERS_SIZE + 1)
         if len(registers) != SPECIAL_REGISTERS_SIZE:
             raise RuntimeError("native parent worker did not return a special register record")
         return registers
 
-    def set_protected_entry(self, record):
-        self.channel.connection.sendall(b"P" + record)
+    def set_protected_entry(self, cpu, record):
+        self.channel.connection.sendall(bytes((ord("P"), cpu)) + record)
         if self.channel.connection.recv(2) != b"P":
             raise RuntimeError("native parent worker did not acknowledge protected entry")
 
@@ -413,7 +424,7 @@ def read_slot_table(mailbox, ram_pages, outer_bytes, protected_entry, split_slot
     return slots
 
 
-def start_child(engine, qemu, output, control, outer_ram, slots):
+def start_child(engine, qemu, output, control, outer_ram, slots, cpu_count):
     with ExitStack() as manifests:
         layouts = []
         for slot in slots:
@@ -426,8 +437,8 @@ def start_child(engine, qemu, output, control, outer_ram, slots):
                         fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SEAL)
             layouts.append(manifest)
         if engine == "kvm":
-            return KvmChild(output, outer_ram, layouts, slots)
-        return TcgChild(qemu, output, control / "child.sock", outer_ram, layouts, slots)
+            return KvmChild(output, outer_ram, layouts, slots, cpu_count)
+        return TcgChild(qemu, output, control / "child.sock", outer_ram, layouts, slots, cpu_count)
 
 
 def verify_slot_spans(pid, slots):
@@ -456,17 +467,28 @@ def verify_slot_spans(pid, slots):
     return extents
 
 
-def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry, split_slot, interrupt_run):
+def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry, split_slot, interrupt_run, cpu_count):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
-    expected = (OPEN_VM, OPEN_CPU, RUN, GET_REGS, GET_SREGS, SET_REGS, GET_REGS, RUN, GET_REGS, CLOSE_CPU, CLOSE_VM)
     expected_interruptions = TEST_INTERRUPTS if interrupt_run else 0
-    expected = (*expected[:7], *((RUN, GET_REGS) * expected_interruptions), *expected[7:])
+    expected = [OPEN_VM, *([OPEN_CPU] * cpu_count), RUN, GET_REGS, GET_SREGS]
+    expected_counters = [0x1357]
+    expected_io = [(0, 0x42)]
+    if cpu_count == 2:
+        expected.extend((RUN, GET_REGS, GET_REGS, CLOSE_CPU))
+        expected_counters.extend((0x3344, 0x1357))
+        expected_io.append((1, 0x56))
+    expected.extend((SET_REGS, GET_REGS, *((RUN, GET_REGS) * expected_interruptions), RUN, GET_REGS, CLOSE_CPU, CLOSE_VM))
+    expected_counters.extend((*([0x3579] * (1 + expected_interruptions)), 0x2468))
+    expected_io.append((0, 0xa7))
     if reject_close:
         expected = expected[:-1]
     observed = []
     counters = []
+    io_events = []
+    open_cpus = set()
+    started_cpus = set()
     special = None
     child = None
     slot_size = ram_pages * PAGE_SIZE
@@ -482,7 +504,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 12)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 13)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
         os.ftruncate(outer_ram, outer_ram_size)
@@ -497,7 +519,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         cleanup.callback(os.close, unused_vector)
         command = [
             qemu, *QEMU_OPTIONS, "-machine", "q35,accel=tcg,memory-backend=outer-ram",
-            "-cpu", "max,vmx=off,svm=off", "-m", str(outer_mib),
+            "-cpu", "max,vmx=off,svm=off", "-m", str(outer_mib), "-smp", "1",
             "-object", f"memory-backend-file,id=outer-ram,mem-path=/proc/self/fd/{outer_ram},share=on,size={outer_mib}M",
             "-serial", "stdio", "-kernel", kernel, "-initrd", output / "initramfs",
             "-append", "console=ttyS0 loglevel=5 panic=1 rdinit=/init",
@@ -530,39 +552,46 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
             pending, complete, opcode, _, length = struct.unpack_from("<IIIII", mapping, 8)
             if pending != complete + 1 or len(observed) >= len(expected) or opcode != expected[len(observed)]:
                 raise RuntimeError(f"unexpected doorbell request {pending}, command {opcode}")
+            cpu, = struct.unpack_from("<I", mapping, 44)
+            if opcode in (CLOSE_CPU, RUN, GET_REGS, GET_SREGS, SET_REGS) and cpu not in open_cpus:
+                raise RuntimeError(f"command {opcode} requested unopened vCPU {cpu}")
             status = 0
-            if opcode == RUN:
+            if opcode == OPEN_CPU:
+                if length or cpu >= cpu_count or cpu in open_cpus:
+                    raise RuntimeError(f"invalid request to create vCPU {cpu}")
+                open_cpus.add(cpu)
+            elif opcode == RUN:
                 if child is None:
-                    if length != slot_size:
+                    if length != slot_size or len(open_cpus) != cpu_count:
                         raise RuntimeError("unexpected total size of registered RAM")
                     slots = read_slot_table(mapping, ram_pages, outer_ram_size, protected_entry, split_slot)
-                    if protected_entry:
-                        state = read_protected_entry(mapping, slots[0].gpa, len(slots[0].offsets) * PAGE_SIZE)
-                    else:
-                        state = None
-                    child = start_child(parent_engine, qemu, output, control, outer_ram, slots)
+                    child = start_child(parent_engine, qemu, output, control, outer_ram, slots, cpu_count)
                     cleanup.callback(child.close)
                     extents = verify_slot_spans(child.process.pid, slots)
-                    if state is not None:
-                        child.set_protected_entry(state)
-                    child.set_registers(mapping[64:64 + REGISTERS.size])
                 elif length:
                     raise RuntimeError("unexpected slot registration after the first run")
-                value = child.run(RunCancellation(cancellations, mapping, pending, deadline))
+                if cpu not in started_cpus:
+                    if protected_entry:
+                        state = read_protected_entry(mapping, slots[0].gpa, len(slots[0].offsets) * PAGE_SIZE)
+                        child.set_protected_entry(cpu, state)
+                    child.set_registers(cpu, mapping[64:64 + REGISTERS.size])
+                    started_cpus.add(cpu)
+                value = child.run(cpu, RunCancellation(cancellations, mapping, pending, deadline))
                 if value is None:
                     status = -errno.EINTR
                 else:
+                    io_events.append((cpu, value))
                     struct.pack_into("<I", mapping, 28, value)
             elif length:
                 raise RuntimeError(f"unexpected memory argument for command {opcode}")
             elif opcode == GET_REGS:
-                registers = child.registers()
+                registers = child.registers(cpu)
                 mapping[64:64 + REGISTERS.size] = registers
                 counters.append(REGISTERS.unpack(registers)[2])
             elif opcode == SET_REGS:
-                child.set_registers(mapping[64:64 + REGISTERS.size])
+                child.set_registers(cpu, mapping[64:64 + REGISTERS.size])
             elif opcode == GET_SREGS:
-                registers = child.special_registers()
+                registers = child.special_registers(cpu)
                 mapping[64:64 + SPECIAL_REGISTERS_SIZE] = registers
                 special = {
                     "cs_selector": SEGMENT.unpack_from(registers)[2],
@@ -572,22 +601,24 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 control_state = CONTROL_REGISTERS.unpack_from(registers, 8 * SEGMENT.size + 2 * DESCRIPTOR_TABLE.size)
                 special.update(cr0=control_state[0], cr2=control_state[1])
             elif opcode == CLOSE_CPU:
-                # The guest can unpin its page as soon as it sees this reply.
-                if reject_close:
-                    status = -errno.EIO
-                else:
-                    result = child.close()
-                    if parent_engine == "kvm" and result != 0:
-                        raise RuntimeError(f"native parent worker shut down with status {result}")
+                open_cpus.remove(cpu)
+                if not open_cpus:
+                    # The guest can unpin its pages after the last CPU closes.
+                    if reject_close:
+                        status = -errno.EIO
+                    else:
+                        result = child.close()
+                        if parent_engine == "kvm" and result != 0:
+                            raise RuntimeError(f"native parent worker shut down with status {result}")
             observed.append(opcode)
             struct.pack_into("<i", mapping, 20, status)
             struct.pack_into("<I", mapping, 12, pending)
             os.eventfd_write(replies, 1)
         guest = (output / "outer.log").read_text(errors="replace")
-        expected_counters = [0x1357, *([0x3579] * (1 + expected_interruptions)), 0x2468]
-        if (outer.wait() != 0 or tuple(observed) != expected or child is None or tuple(child.channel.exits) != IO_VALUES
+        if (outer.wait() != 0 or observed != expected or child is None or io_events != expected_io
                 or len(child.channel.interruptions) != expected_interruptions or counters != expected_counters
                 or interrupt_run and "PASS stopped and resumed the same running child" not in guest
+                or cpu_count == 2 and "PASS two vCPUs kept independent state in one child" not in guest
                 or "PASS /dev/kvm returned two port I/O exits" not in guest
                 or "PASS parent KVM guest shutdown" not in guest):
             raise RuntimeError(f"parent execution proof failed; commands={observed}, see outer.log")
@@ -606,6 +637,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         "guest_slots": [{"id": slot.identifier, "gpa": slot.gpa, "pages": len(slot.offsets)} for slot in slots],
         "parent_accelerator": parent_engine, "parent_commands": observed, "transport": "eventfd and MSI-X",
         "io_values": child.channel.exits, "child_memory_write_visible": True, "same_child_worker": True,
+        "vcpu_io_events": io_events, "vcpu_count": cpu_count,
         "register_counters": counters,
         "interrupted_runs": len(child.channel.interruptions),
         "interrupted_run_ms": child.channel.interruptions,
@@ -637,6 +669,7 @@ def main():
     parser.add_argument("--protected-entry", action="store_true", help="execute a 32-bit child above 16 MiB")
     parser.add_argument("--split-slot", action="store_true", help="divide memory between two discontiguous GPAs")
     parser.add_argument("--interrupt-run", action="store_true", help="interrupt live child execution before resuming")
+    parser.add_argument("--two-vcpus", action="store_true", help="run two vCPUs serially with shared child RAM")
     parser.add_argument("--reject-close", action="store_true", help="verify page retention when the parent refuses close")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -648,13 +681,15 @@ def main():
         parser.error("--split-slot requires protected mode and at least two pages")
     if args.interrupt_run and not args.protected_entry:
         parser.error("--interrupt-run requires protected mode")
+    if args.two_vcpus and not args.protected_entry:
+        parser.error("--two-vcpus requires protected mode")
     qemu, kernel = (path.resolve(strict=True) for path in (args.qemu, args.kernel))
     output = args.output.resolve()
     if os.geteuid() != 0 or platform.machine() != "x86_64":
         parser.error("run as root on x86_64")
     if args.worker:
         print(json.dumps(exercise(qemu, kernel, output, args.reject_close, args.parent_engine, args.ram_pages,
-                                  args.protected_entry, args.split_slot, args.interrupt_run)))
+                                  args.protected_entry, args.split_slot, args.interrupt_run, 2 if args.two_vcpus else 1)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -684,6 +719,8 @@ def main():
                 oracle.append("split" if args.split_slot else "protected")
             if args.interrupt_run:
                 oracle.append("interrupt")
+            if args.two_vcpus:
+                oracle.append("smp")
             HELPERS["run"](oracle, 14 if args.interrupt_run else 8, output / "native-kvm.log")
             report["same_client_passed_native_kvm"] = True
             report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
@@ -695,6 +732,8 @@ def main():
             files["split-slot" if args.split_slot else "protected-entry"] = b""
         if args.interrupt_run:
             files["interrupt-run"] = b""
+        if args.two_vcpus:
+            files["two-vcpus"] = b""
         image = HELPERS["initramfs"](init.read_bytes(), files=files)
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
@@ -718,6 +757,7 @@ def main():
                             *(["--protected-entry"] if args.protected_entry else []),
                             *(["--split-slot"] if args.split_slot else []),
                             *(["--interrupt-run"] if args.interrupt_run else []),
+                            *(["--two-vcpus"] if args.two_vcpus else []),
                             *(["--reject-close"] if args.reject_close else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}
