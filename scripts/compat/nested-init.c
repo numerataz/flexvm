@@ -38,10 +38,23 @@ int main(void) {
     if (console > 2) close(console);
     setvbuf(stdout, NULL, _IONBF, 0);
     puts("FLEXVM_SOFTWARE_INNER_BOOTED");
-    cpu_set_t online;
-    if (sched_getaffinity(0, sizeof(online), &online) == 0)
-        printf("FLEXVM_SOFTWARE_INNER_CPUS %d\n", CPU_COUNT(&online));
     if (access("/firecracker-network", F_OK) == 0) {
+        cpu_set_t online;
+        if (sched_getaffinity(0, sizeof(online), &online) < 0)
+            return 1;
+        for (int id = 0; id < CPU_SETSIZE; id++) {
+            if (CPU_ISSET(id, &online)) {
+                cpu_set_t selected;
+                CPU_ZERO(&selected);
+                CPU_SET(id, &selected);
+                if (sched_setaffinity(0, sizeof(selected), &selected) < 0 || sched_getcpu() != id)
+                    return 1;
+                printf("FLEXVM_SOFTWARE_INNER_CPU %d\n", id);
+            }
+        }
+        if (sched_setaffinity(0, sizeof(online), &online) < 0)
+            return 1;
+        printf("FLEXVM_SOFTWARE_INNER_CPUS %d\n", CPU_COUNT(&online));
         if (check_network() < 0) {
             perror("inner Firecracker network");
             return 1;

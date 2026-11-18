@@ -46,7 +46,14 @@ EFER_LONG_MODE_ENABLE = 1 << 8
  CREATE_PIT, SET_TSS_ADDR, GET_LAPIC, SET_LAPIC, COMPLETE_READ, GET_IRQCHIP, SET_IRQCHIP,
  GET_PIT, SET_PIT, GET_DEBUGREGS, SET_DEBUGREGS, GET_MP_STATE, SET_MP_STATE,
  GET_XCRS, SET_XCRS, GET_XSAVE, SET_XSAVE, GET_VCPU_EVENTS, SET_VCPU_EVENTS,
- GET_CLOCK, SET_CLOCK) = range(1, 37)
+ GET_CLOCK, SET_CLOCK, PREPARE_RUN) = range(1, 38)
+FEATURES_AT = 60
+PARALLEL_RUN = 1
+LANES_AT = 0x90000
+LANE_STRIDE = 0x2000
+LANE_EXIT = 32
+LANE_COMPLETION = 64
+LANE_PIO = 0x1000
 FPU_VALID_AT = 48
 FPU_AT = 768
 FPU_SIZE = 416
@@ -203,14 +210,14 @@ def coalesce_pio(records):
     return tuple(groups)
 
 
-def read_completion(mailbox, pending, pio_reads, mmio_reads):
-    size, reserved, value = COMPLETION_RECORD.unpack_from(mailbox, COMPLETION_AT)
+def read_completion(mailbox, pending, pio_reads, mmio_reads, completion_at=COMPLETION_AT, pio_at=PIO_DATA_AT):
+    size, reserved, value = COMPLETION_RECORD.unpack_from(mailbox, completion_at)
     if reserved or size != (len(pending.data) if pending else 0):
         raise RuntimeError("guest changed the outstanding I/O read size")
     if pending is None:
         return b""
     if pending.reason == KVM_EXIT_IO:
-        completion = mailbox[PIO_DATA_AT:PIO_DATA_AT + size]
+        completion = mailbox[pio_at:pio_at + size]
         pio_reads.append((pending.address, pending.width, completion))
     else:
         completion = value[:size]
@@ -323,6 +330,27 @@ def stop_process(process):
     process.wait()
 
 
+def decode_run_exit(output):
+    if len(output) == 2 and output[0] == ord("O"):
+        result = RunExit(KVM_EXIT_IO, IO_PORT, output[1:])
+    elif len(output) >= PIO_HEADER.size and output[0] in (ord("U"), ord("V")):
+        operation, width, port, count = PIO_HEADER.unpack_from(output)
+        length = pio_size(width, count)
+        is_write = operation == b"U"
+        payload = output[PIO_HEADER.size:]
+        if len(payload) != (length if is_write else 0):
+            raise RuntimeError("invalid worker port I/O payload")
+        result = RunExit(KVM_EXIT_IO, port, payload if is_write else bytes(length), is_write, count)
+    elif len(output) == MMIO_WIRE.size and output[0] in (ord("M"), ord("Q")):
+        operation, length, address, data = MMIO_WIRE.unpack(output)
+        if length not in (1, 2, 4, 8):
+            raise RuntimeError("invalid worker MMIO access width")
+        result = RunExit(KVM_EXIT_MMIO, address, data[:length], operation == b"M")
+    else:
+        raise RuntimeError("parent worker did not return a recognized stopped exit")
+    return result
+
+
 class RunChannel:
     def __init__(self, connection, irq_fds=(), pulse_irq=None):
         self.connection = connection
@@ -395,23 +423,7 @@ class RunChannel:
         if output == b"I\0" and interrupted:
             self.interruptions.append(round((time.monotonic() - started) * 1000, 3))
             return None
-        if len(output) == 2 and output[0] == ord("O"):
-            result = RunExit(KVM_EXIT_IO, IO_PORT, output[1:])
-        elif len(output) >= PIO_HEADER.size and output[0] in (ord("U"), ord("V")):
-            operation, width, port, count = PIO_HEADER.unpack_from(output)
-            length = pio_size(width, count)
-            is_write = operation == b"U"
-            payload = output[PIO_HEADER.size:]
-            if len(payload) != (length if is_write else 0):
-                raise RuntimeError("invalid worker port I/O payload")
-            result = RunExit(KVM_EXIT_IO, port, payload if is_write else bytes(length), is_write, count)
-        elif len(output) == MMIO_WIRE.size and output[0] in (ord("M"), ord("Q")):
-            operation, length, address, data = MMIO_WIRE.unpack(output)
-            if length not in (1, 2, 4, 8):
-                raise RuntimeError("invalid worker MMIO access width")
-            result = RunExit(KVM_EXIT_MMIO, address, data[:length], operation == b"M")
-        else:
-            raise RuntimeError("parent worker did not return a recognized stopped exit")
+        result = decode_run_exit(output)
         if result.reason == KVM_EXIT_IO and result.address == IO_PORT and result.is_write and result.width == 1:
             self.exits.extend(result.data)
         self.timings.append(round((time.monotonic() - started) * 1000, 3))
@@ -685,28 +697,130 @@ class TcgChild:
                 self.process = None
 
 
+class NativeRunLanes:
+    def __init__(self, control, sockets):
+        self.control = control
+        self.connections = [RunChannel(connection) for connection in sockets]
+        self.live = {}
+        self.cancelling = set()
+        self.pending_inputs = {}
+        self.read_pio = []
+        self.written_pio = []
+        self.read_mmio = []
+        self.written_mmio = []
+        self.run_count = 0
+        self.max_in_flight = 0
+
+    def descriptors(self):
+        return [self.connections[cpu].connection for cpu in self.live]
+
+    def service(self, mailbox, ready, open_cpus, started_cpus, replies):
+        for cpu, channel in enumerate(self.connections):
+            offset = LANES_AT + cpu * LANE_STRIDE
+            seq, completed, command, _, cancelled = struct.unpack_from("<IIIiI", mailbox, offset)
+            if cpu in self.live:
+                if self.live[cpu] != (seq, command) or cancelled > seq:
+                    raise RuntimeError("parallel vCPU changed an outstanding run")
+                if channel.connection in ready:
+                    self.complete(cpu, channel.read_exit(), cancelled, mailbox, offset, replies)
+                elif command == RUN and seq == cancelled:
+                    self.cancel(cpu, seq)
+                continue
+            if seq == completed:
+                continue
+            if (cpu not in open_cpus or cpu not in started_cpus or seq != completed + 1 or
+                    command not in (RUN, COMPLETE_READ) or cancelled > seq):
+                raise RuntimeError("invalid parallel vCPU request")
+            completion = read_completion(mailbox, self.pending_inputs.pop(cpu, None), self.read_pio,
+                                         self.read_mmio, offset + LANE_COMPLETION, offset + LANE_PIO)
+            if command == COMPLETE_READ:
+                if not completion:
+                    raise RuntimeError("parallel completion needs outstanding I/O")
+                request = struct.pack("<cB", b"E", cpu) + completion
+            else:
+                self.run_count += 1
+                request = struct.pack("<cBI", b"R", cpu, seq) + completion
+            channel.connection.sendall(request)
+            self.live[cpu] = (seq, command)
+            self.max_in_flight = max(self.max_in_flight, len(self.live))
+            if command == RUN and seq == cancelled:
+                self.cancel(cpu, seq)
+
+    def cancel(self, cpu, seq):
+        if cpu not in self.cancelling:
+            self.control.sendall(struct.pack("<cBI", b"I", cpu, seq))
+            self.cancelling.add(cpu)
+
+    def complete(self, cpu, packet, cancelled, mailbox, offset, replies):
+        seq, command = self.live.pop(cpu)
+        self.cancelling.discard(cpu)
+        status = 0
+        if command == COMPLETE_READ:
+            if packet != b"E":
+                raise RuntimeError("invalid parallel read completion response")
+        elif packet == b"I\0" and cancelled == seq:
+            status = -errno.EINTR
+        elif packet == b"A\0":
+            status = -errno.EAGAIN
+        else:
+            result = decode_run_exit(packet)
+            if not result.is_write:
+                self.pending_inputs[cpu] = result
+            elif result.reason == KVM_EXIT_IO:
+                self.written_pio.append((result.address, result.width, result.data))
+                pio = offset + LANE_PIO
+                mailbox[pio:pio + len(result.data)] = result.data
+            else:
+                self.written_mmio.append((result.address, result.data))
+            exit_at = offset + LANE_EXIT
+            mailbox[exit_at:exit_at + EXIT_RECORD.size] = result.record()
+        struct.pack_into("<i", mailbox, offset + 12, status)
+        struct.pack_into("<I", mailbox, offset + 4, seq)
+        os.eventfd_write(replies, 1)
+
+    def close(self):
+        for channel in self.connections:
+            channel.close()
+
+
 class KvmChild:
-    def __init__(self, output, outer_ram, layouts, slots, cpu_count, irqchip, pit_flags, irq_fds, tss_gpa):
+    def __init__(self, output, outer_ram, layouts, slots, cpu_count, irqchip, pit_flags, irq_fds, tss_gpa, parallel):
         self.process = None
         self.channel = None
+        self.lanes = None
         self.sigqueue = ctypes.CDLL(None, use_errno=True).sigqueue
         self.sigqueue.argtypes = (ctypes.c_int, ctypes.c_int, SignalValue)
         self.sigqueue.restype = ctypes.c_int
         connection, worker = socket.socketpair(type=socket.SOCK_SEQPACKET)
+        sockets = []
         try:
-            with worker, (output / "child.log").open("wb") as log:
+            with ExitStack() as workers:
+                workers.enter_context(worker)
+                log = workers.enter_context((output / "child.log").open("wb"))
+                fds = []
+                if parallel:
+                    for _ in range(cpu_count):
+                        parent, lane = socket.socketpair(type=socket.SOCK_SEQPACKET)
+                        sockets.append(parent)
+                        fds.append(workers.enter_context(lane).fileno())
                 control = worker.fileno()
                 pit_request = 0 if pit_flags is None else pit_flags + 1
                 tss_request = 0xffffffff if tss_gpa is None else tss_gpa
                 command = [output / "native-worker", str(control), str(outer_ram), str(cpu_count),
                            str(int(irqchip)), str(pit_request), str(tss_request), *map(str, irq_fds)]
+                if fds:
+                    command.extend(["--run-sockets", *map(str, fds)])
                 for slot, layout in zip(slots, layouts, strict=True):
                     command.extend(map(str, (layout, slot.gpa, slot.identifier)))
-                self.process = subprocess.Popen(command, pass_fds=(control, outer_ram, *irq_fds, *layouts),
+                self.process = subprocess.Popen(command, pass_fds=(control, outer_ram, *irq_fds, *fds, *layouts),
                                                 stdout=log, stderr=log)
             self.channel = RunChannel(connection)
+            if sockets:
+                self.lanes = NativeRunLanes(connection, sockets)
         except BaseException:
             connection.close()
+            for parent in sockets:
+                parent.close()
             self.close()
             raise
 
@@ -891,6 +1005,8 @@ class KvmChild:
     def close(self):
         if self.channel is not None:
             self.channel.close()
+        if self.lanes is not None:
+            self.lanes.close()
         if self.process is not None:
             try:
                 return self.process.wait(timeout=1)
@@ -1228,7 +1344,7 @@ def read_slot_table(mailbox, ram_pages, outer_bytes, protected_entry, split_slot
 
 
 def start_child(engine, qemu, output, control, outer_ram, slots, cpu_count, mmio_base, irqchip, pit_flags, irq_fds, tss_gpa,
-                fixture_checks):
+                fixture_checks, parallel):
     if not irqchip:
         irq_fds = ()
     if tss_gpa is not None and any(slot.gpa < tss_gpa + 3 * PAGE_SIZE and
@@ -1246,7 +1362,7 @@ def start_child(engine, qemu, output, control, outer_ram, slots, cpu_count, mmio
                         fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SEAL)
             layouts.append(manifest)
         if engine == "kvm":
-            return KvmChild(output, outer_ram, layouts, slots, cpu_count, irqchip, pit_flags, irq_fds, tss_gpa)
+            return KvmChild(output, outer_ram, layouts, slots, cpu_count, irqchip, pit_flags, irq_fds, tss_gpa, parallel)
         return TcgChild(qemu, output, control / "child.sock", outer_ram, layouts, slots, cpu_count, mmio_base,
                         pit_flags, irq_fds, fixture_checks)
 
@@ -1441,6 +1557,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
     supported_cpuid = []
     child = None
     slot_size = ram_pages * PAGE_SIZE
+    parallel = firecracker and cpu_count > 1
     outer_mib = max(384 if firecracker else 192, (slot_size + MIB - 1) // MIB + 128)
     outer_ram_size = outer_mib * MIB
     with ExitStack() as cleanup:
@@ -1453,7 +1570,9 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 35)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 36)
+        if parallel:
+            struct.pack_into("<I", mapping, FEATURES_AT, PARALLEL_RUN)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
         os.ftruncate(outer_ram, outer_ram_size)
@@ -1487,12 +1606,27 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         deadline = time.monotonic() + 60
         while True:
             descriptors = [exited, requests, cancellations]
+            lanes = child.lanes if parallel and child is not None and child.process is not None else None
             if child is not None and child.process is not None:
                 descriptors.extend(child.channel.gsi_by_fd)
+            if lanes:
+                descriptors.extend(lanes.descriptors())
             readable, _, _ = select.select(descriptors, [], [], max(0, deadline - time.monotonic()))
             if exited in readable:
                 break
-            if cancellations in readable and requests not in readable:
+            if parallel:
+                if not readable:
+                    raise TimeoutError("parallel guest did not shut down")
+                if requests in readable:
+                    os.eventfd_read(requests)
+                if cancellations in readable:
+                    os.eventfd_read(cancellations)
+                if lanes:
+                    lanes.service(mapping, readable, open_cpus, started_cpus, replies)
+                request_seq, reply_seq = struct.unpack_from("<II", mapping, 8)
+                if requests not in readable or request_seq == reply_seq:
+                    continue
+            if not parallel and cancellations in readable and requests not in readable:
                 # The ordinary I/O exit can win a race with the cancel doorbell.
                 os.eventfd_read(cancellations)
                 complete, = struct.unpack_from("<I", mapping, 12)
@@ -1504,14 +1638,14 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 continue
             if requests not in readable:
                 raise TimeoutError("outer guest did not shut down")
-            if os.eventfd_read(requests) != 1:
+            if not parallel and os.eventfd_read(requests) != 1:
                 raise RuntimeError("multiple outstanding doorbell requests")
             pending, complete, opcode, _, length = struct.unpack_from("<IIIII", mapping, 8)
             if (pending != complete + 1 or
                     (not firecracker and (len(observed) >= len(expected) or opcode != expected[len(observed)]))):
                 raise RuntimeError(f"unexpected doorbell request {pending}, command {opcode}")
             cpu, = struct.unpack_from("<I", mapping, 44)
-            cpu_commands = (CLOSE_CPU, RUN, GET_REGS, GET_SREGS, SET_REGS, GET_FPU, SET_FPU, GET_MSRS, SET_MSRS,
+            cpu_commands = (CLOSE_CPU, RUN, PREPARE_RUN, GET_REGS, GET_SREGS, SET_REGS, GET_FPU, SET_FPU, GET_MSRS, SET_MSRS,
                             GET_LAPIC, SET_LAPIC, COMPLETE_READ, GET_DEBUGREGS, SET_DEBUGREGS,
                             GET_MP_STATE, SET_MP_STATE, GET_XCRS, SET_XCRS, GET_XSAVE, SET_XSAVE,
                             GET_VCPU_EVENTS, SET_VCPU_EVENTS)
@@ -1736,7 +1870,9 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                         status, record = child.vcpu_events(cpu)
                     if not status:
                         mapping[VCPU_EVENTS_AT:end] = record
-            elif opcode == RUN:
+            elif opcode in (RUN, PREPARE_RUN):
+                if parallel != (opcode == PREPARE_RUN):
+                    raise RuntimeError("run command does not match the negotiated transport")
                 if child is None:
                     if length != slot_size or len(open_cpus) != cpu_count:
                         raise RuntimeError("unexpected total size of registered RAM")
@@ -1744,7 +1880,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                     mmio_base = FIRECRACKER_NET_MMIO_BASE if firecracker else MMIO_BASE if mmio else None
                     child = start_child(parent_engine, qemu, output, control, outer_ram, slots,
                                         cpu_count, mmio_base, irqchip_created, pit_flags, irq_fds, tss_gpa,
-                                        not firecracker)
+                                        not firecracker, parallel)
                     cleanup.callback(child.close)
                     extents = verify_slot_spans(child.process.pid, slots)
                     if staged_clock is not None:
@@ -1804,48 +1940,49 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                     if lapic_valid:
                         child.set_lapic(cpu, mapping[LAPIC_AT:LAPIC_AT + LAPIC_SIZE])
                     started_cpus.add(cpu)
-                completion = read_completion(mapping, pending_read, pio_reads, completed_reads)
-                pending_read = None
-                try:
-                    result = child.run(cpu, RunCancellation(cancellations, mapping, pending, deadline), completion)
-                except TimeoutError as error:
-                    raise TimeoutError(f"KVM_RUN {pending} on vCPU {cpu} stopped responding; "
-                                       f"last PIO writes={pio_writes[-12:]}, last PIO reads={pio_reads[-12:]}") from error
-                if result is None:
-                    status = -errno.EINTR
-                else:
-                    if result.reason == KVM_EXIT_IO:
-                        if firecracker:
-                            if result.is_write:
-                                pio_writes.append((result.address, result.width, result.data))
-                            else:
-                                pending_read = result
-                        elif result.is_write and result.address == IO_PORT and result.width == 1 and result.count == 1:
-                            io_events.append((cpu, result.data[0]))
-                        elif not pio:
-                            raise RuntimeError("unexpected port I/O exit")
-                        else:
-                            if io_events or len(pio_writes) + len(pio_reads) >= pio_exit_limit:
-                                raise RuntimeError("unexpected port I/O after the fixture prelude")
-                            # A REP instruction may complete through one or several exits.
-                            expected.insert(len(observed), RUN)
-                            if result.is_write:
-                                pio_writes.append((result.address, result.width, result.data))
-                            else:
-                                pending_read = result
-                                if complete_read and result.address == 0x3fd:
-                                    at = len(observed) + 1
-                                    expected[at:at] = (COMPLETE_READ, GET_REGS)
-                                    expected_counters.insert(len(counters), 0)
-                        if result.is_write:
-                            mapping[PIO_DATA_AT:PIO_DATA_AT + len(result.data)] = result.data
-                    elif result.is_write:
-                        mmio_events.append((result.address, result.data))
+                if opcode == RUN:
+                    completion = read_completion(mapping, pending_read, pio_reads, completed_reads)
+                    pending_read = None
+                    try:
+                        result = child.run(cpu, RunCancellation(cancellations, mapping, pending, deadline), completion)
+                    except TimeoutError as error:
+                        raise TimeoutError(f"KVM_RUN {pending} on vCPU {cpu} stopped responding; "
+                                           f"last PIO writes={pio_writes[-12:]}, last PIO reads={pio_reads[-12:]}") from error
+                    if result is None:
+                        status = -errno.EINTR
                     else:
-                        if not (firecracker or mmio_read):
-                            raise RuntimeError("unexpected MMIO read")
-                        pending_read = result
-                    mapping[EXIT_AT:EXIT_AT + EXIT_RECORD.size] = result.record()
+                        if result.reason == KVM_EXIT_IO:
+                            if firecracker:
+                                if result.is_write:
+                                    pio_writes.append((result.address, result.width, result.data))
+                                else:
+                                    pending_read = result
+                            elif result.is_write and result.address == IO_PORT and result.width == 1 and result.count == 1:
+                                io_events.append((cpu, result.data[0]))
+                            elif not pio:
+                                raise RuntimeError("unexpected port I/O exit")
+                            else:
+                                if io_events or len(pio_writes) + len(pio_reads) >= pio_exit_limit:
+                                    raise RuntimeError("unexpected port I/O after the fixture prelude")
+                                # A REP instruction may complete through one or several exits.
+                                expected.insert(len(observed), RUN)
+                                if result.is_write:
+                                    pio_writes.append((result.address, result.width, result.data))
+                                else:
+                                    pending_read = result
+                                    if complete_read and result.address == 0x3fd:
+                                        at = len(observed) + 1
+                                        expected[at:at] = (COMPLETE_READ, GET_REGS)
+                                        expected_counters.insert(len(counters), 0)
+                            if result.is_write:
+                                mapping[PIO_DATA_AT:PIO_DATA_AT + len(result.data)] = result.data
+                        elif result.is_write:
+                            mmio_events.append((result.address, result.data))
+                        else:
+                            if not (firecracker or mmio_read):
+                                raise RuntimeError("unexpected MMIO read")
+                            pending_read = result
+                        mapping[EXIT_AT:EXIT_AT + EXIT_RECORD.size] = result.record()
             elif length:
                 raise RuntimeError(f"unexpected memory argument for command {opcode}")
             elif opcode == GET_REGS:
@@ -1900,18 +2037,29 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
             os.eventfd_write(replies, 1)
         guest = (output / "outer.log").read_text(errors="replace")
         if firecracker:
+            if parallel and child is not None:
+                pio_writes = child.lanes.written_pio
+                mmio_events = child.lanes.written_mmio
+                completed_reads = child.lanes.read_mmio
+                if child.lanes.max_in_flight != cpu_count or child.lanes.live:
+                    raise RuntimeError("parallel vCPU lanes did not complete independently")
             if (outer.wait() != 0 or child is None or open_cpus or CLOSE_VM not in observed or
                     f"FLEXVM_SOFTWARE_INNER_CPUS {cpu_count}\n" not in guest or
                     child.process is not None or "FLEXVM_SOFTWARE_INNER_COMPLETE" not in guest or
                     "PASS parent KVM guest shutdown" not in guest):
                 raise RuntimeError(f"unchanged Firecracker did not complete; commands={observed[-32:]}, see outer.log")
+            guest_cpus = {int(id) for id in re.findall(r"^FLEXVM_SOFTWARE_INNER_CPU (\d+)$", guest, re.MULTILINE)}
+            if guest_cpus != set(range(cpu_count)):
+                raise RuntimeError(f"only these guest CPUs executed userspace: {sorted(guest_cpus)}")
             if "FLEXVM_SOFTWARE_INNER_NETWORK" not in guest or "PASS Firecracker network echo" not in guest:
                 raise RuntimeError("unchanged Firecracker did not exchange the network test datagram")
             return {
                 "firecracker": True, "nested_network": True, "guest_path": "/dev/kvm",
                 "guest_vmx": False, "guest_svm": False,
                 "parent_accelerator": parent_engine, "vcpu_count": cpu_count, "mapped_extents": extents,
-                "run_count": observed.count(RUN), "control_commands": [op for op in observed if op != RUN],
+                "run_count": child.lanes.run_count if parallel else observed.count(RUN),
+                "max_in_flight": child.lanes.max_in_flight if parallel else 1,
+                "control_commands": [op for op in observed if op != RUN],
                 "uart_writes": sum(address == 0x3f8 for address, _, _ in pio_writes),
                 "mmio_addresses": sorted({address for address, _ in mmio_events + completed_reads}),
                 "worker_stopped_before_close_reply": True,
@@ -2031,6 +2179,7 @@ def main():
     parser.add_argument("--kernel-build", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--firecracker", type=Path, help="boot the kernel through an unchanged Firecracker binary")
+    parser.add_argument("--firecracker-vcpus", type=int, choices=(1, 2), default=1)
     parser.add_argument("--native-oracle", action="store_true")
     parser.add_argument("--parent-engine", choices=("tcg", "kvm"), default="tcg")
     parser.add_argument("--ram-pages", type=int, default=2, help=f"number of pages from 1 to {MAX_SLOT_PAGES}")
@@ -2067,11 +2216,14 @@ def main():
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     firecracker = args.firecracker is not None
+    if args.firecracker_vcpus > 1 and (not firecracker or args.parent_engine != "kvm"):
+        parser.error("parallel Firecracker requires the native parent engine")
     if firecracker:
-        if args.native_oracle or args.reject_close or args.two_vcpus:
+        if args.native_oracle or args.reject_close or (args.two_vcpus and args.firecracker_vcpus == 1):
             parser.error("--firecracker needs a normal parent boot")
         args.pvh = True
         args.ram_pages = 32768
+        args.two_vcpus = args.firecracker_vcpus > 1
     if args.mmio_read or args.ioeventfd:
         args.mmio_write = True
     if args.pio_boundary:
@@ -2109,7 +2261,7 @@ def main():
     if args.irqchip and (not args.protected_entry or args.long_mode or args.cpuid or args.two_vcpus):
         parser.error("--irqchip requires a single vCPU in 32-bit protected mode")
     if args.zero_slot and (not args.protected_entry or args.ram_pages < 258 or args.split_slot or
-                           args.long_mode or args.irqchip or args.cpuid or args.two_vcpus):
+                           args.long_mode or args.irqchip or args.cpuid or (args.two_vcpus and not firecracker)):
         parser.error("--zero-slot requires one protected-mode vCPU and one slot of at least 258 pages")
     if args.pio and (not args.protected_entry or args.long_mode or args.cpuid or args.two_vcpus or args.zero_slot):
         parser.error("--pio requires a single protected-mode vCPU")
@@ -2305,7 +2457,7 @@ def main():
                     "initrd_path": "/firecracker-initrd",
                     "boot_args": "console=ttyS0 quiet panic=1 rdinit=/init reboot=k",
                 },
-                "machine-config": {"vcpu_count": 1, "mem_size_mib": args.ram_pages * PAGE_SIZE // MIB},
+                "machine-config": {"vcpu_count": args.firecracker_vcpus, "mem_size_mib": args.ram_pages * PAGE_SIZE // MIB},
                 "drives": [],
                 "network-interfaces": [
                     {"iface_id": "eth0", "host_dev_name": "flexvmtap", "guest_mac": "02:00:00:00:00:02"},
@@ -2343,7 +2495,7 @@ def main():
                             *(["--protected-entry"] if args.protected_entry else []),
                             *(["--split-slot"] if args.split_slot else []),
                             *(["--interrupt-run"] if args.interrupt_run else []),
-                            *(["--two-vcpus"] if args.two_vcpus else []),
+                            *(["--two-vcpus"] if args.two_vcpus and not firecracker else []),
                             *(["--long-mode"] if args.long_mode else []),
                             *(["--fpu"] if args.fpu else []),
                             *(["--msrs"] if args.msrs else []),
@@ -2370,7 +2522,8 @@ def main():
                             *(["--vcpu-events"] if args.vcpu_events else []),
                             *(["--clock"] if args.clock else []),
                             *(["--reject-close"] if args.reject_close else []),
-                            *(["--firecracker", args.firecracker] if firecracker else [])], 75, worker)
+                            *(["--firecracker", args.firecracker, "--firecracker-vcpus", str(args.firecracker_vcpus)]
+                              if firecracker else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}
         expected = {"/dev/kvm"} if args.parent_engine == "kvm" else set()

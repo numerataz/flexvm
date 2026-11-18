@@ -18,6 +18,7 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
+#include <linux/rwsem.h>
 #include <linux/poll.h>
 #include <linux/sched/mm.h>
 #include <linux/slab.h>
@@ -39,6 +40,7 @@
 struct pvkvm {
 	struct kref refs;
 	struct mutex lock;
+	struct rw_semaphore run_gate;
 	struct miscdevice misc;
 	void __iomem *mailbox;
 	void __iomem *doorbell;
@@ -49,6 +51,7 @@ struct pvkvm {
 	int irq;
 	bool dead;
 	bool vm_open;
+	bool parallel_run;
 };
 
 struct pvslot {
@@ -234,6 +237,12 @@ static void publish_slots(void __iomem *mailbox, const struct pvvm *vm)
 	writel(count, mailbox + PVKVM_SLOT_COUNT_AT);
 }
 
+static void mark_provider_dead(struct pvkvm *provider)
+{
+	WRITE_ONCE(provider->dead, true);
+	wake_up_all(&provider->replied);
+}
+
 /* The device lock serializes mailbox use, including close and PCI teardown. */
 static int request(struct pvkvm *provider, enum pvkvm_command command,
 		   const struct pvvm *memory,
@@ -245,11 +254,11 @@ static int request(struct pvkvm *provider, enum pvkvm_command command,
 	int status, interrupts;
 	unsigned int pages = memory ? memory->total_pages : 0;
 
-	if (provider->dead)
+	if (READ_ONCE(provider->dead))
 		return -ENODEV;
 	before = readl(m + PVKVM_REQUEST_AT);
 	if (readl(m + PVKVM_REPLY_AT) != before) {
-		provider->dead = true;
+		mark_provider_dead(provider);
 		return -EIO;
 	}
 	seq = before + 1;
@@ -293,13 +302,13 @@ static int request(struct pvkvm *provider, enum pvkvm_command command,
 		/* The parent can still finish the request. A fresh provider
 		 * must use a fresh mailbox.
 		 */
-		provider->dead = true;
+		mark_provider_dead(provider);
 		return waited ? -EINTR : -ETIMEDOUT;
 	}
 	rmb();
 	status = (s32)readl(m + PVKVM_STATUS_AT);
 	if (status > 0 || status < -MAX_ERRNO) {
-		provider->dead = true;
+		mark_provider_dead(provider);
 		return -EIO;
 	}
 	if (!status && exit)
@@ -311,7 +320,7 @@ static bool close_object(struct pvkvm *p, enum pvkvm_command command)
 {
 	if (!request(p, command, 0, NULL))
 		return true;
-	p->dead = true;
+	mark_provider_dead(p);
 	return false;
 }
 
@@ -320,7 +329,7 @@ static int request_for_cpu(struct pvcpu *cpu, enum pvkvm_command command,
 {
 	struct pvkvm *p = cpu->vm->provider;
 
-	if (p->dead)
+	if (READ_ONCE(p->dead))
 		return -ENODEV;
 	writel(cpu->id, p->mailbox + PVKVM_CPU_AT);
 	return request(p, command, memory, output);
@@ -453,7 +462,7 @@ static int cpu_release(struct inode *inode, struct file *file)
 	mutex_lock(&p->lock);
 	vm->open_cpus &= ~BIT(cpu->id);
 	if (request_for_cpu(cpu, PVKVM_CLOSE_VCPU, NULL, NULL))
-		p->dead = true;
+		mark_provider_dead(p);
 	else if (!vm->open_cpus)
 		vm->slots_exposed = false;
 	mutex_unlock(&p->lock);
@@ -535,15 +544,16 @@ static bool signal_ioeventfd(struct pvvm *vm, const struct pvkvm_run_exit *exit)
 
 enum { PVKVM_IOEVENT_HANDLED = 1 };
 
-static int complete_run(struct pvcpu *cpu, const struct pvkvm_run_exit *exit)
+static int complete_run(struct pvcpu *cpu, const struct pvkvm_run_exit *exit,
+			void __iomem *pio_data)
 {
-	struct pvkvm *p = cpu->vm->provider;
 	struct run_page *page = cpu->page;
 	unsigned int bytes;
 
 	if (exit->is_write > 1 || !exit->count)
 		return -EIO;
-	if (!exit->is_write && hweight_long(cpu->vm->open_cpus) > 1)
+	if (!exit->is_write && !cpu->vm->provider->parallel_run &&
+	    hweight_long(cpu->vm->open_cpus) > 1)
 		return -EOPNOTSUPP;
 	switch (exit->reason) {
 	case KVM_EXIT_IO:
@@ -554,7 +564,7 @@ static int complete_run(struct pvcpu *cpu, const struct pvkvm_run_exit *exit)
 			return PVKVM_IOEVENT_HANDLED;
 		bytes = exit->length * exit->count;
 		if (exit->is_write) {
-			memcpy_fromio(page->pio, p->mailbox + PVKVM_PIO_DATA_AT, bytes);
+			memcpy_fromio(page->pio, pio_data, bytes);
 		} else {
 			memset(page->pio, 0, bytes);
 			cpu->read_bytes = bytes;
@@ -589,30 +599,108 @@ static int complete_run(struct pvcpu *cpu, const struct pvkvm_run_exit *exit)
 	return 0;
 }
 
-static void publish_read_completion(struct pvcpu *cpu)
+static void publish_read_completion(struct pvcpu *cpu, void __iomem *record, void __iomem *pio_data)
 {
-	struct pvkvm *p = cpu->vm->provider;
 	struct pvkvm_read_completion completion = { .length = cpu->read_bytes };
 
 	if (completion.length && cpu->read_pio)
-		memcpy_toio(p->mailbox + PVKVM_PIO_DATA_AT, cpu->page->pio, completion.length);
+		memcpy_toio(pio_data, cpu->page->pio, completion.length);
 	else if (completion.length)
 		memcpy(completion.data, cpu->page->run.mmio.data, completion.length);
-	memcpy_toio(p->mailbox + PVKVM_COMPLETION_AT, &completion, sizeof(completion));
+	memcpy_toio(record, &completion, sizeof(completion));
 }
 
 static int finish_interrupted_read(struct pvcpu *cpu)
 {
+	struct pvkvm *p = cpu->vm->provider;
 	int result;
 
 	if (!cpu->read_bytes)
 		return -EINTR;
-	publish_read_completion(cpu);
+	publish_read_completion(cpu, p->mailbox + PVKVM_COMPLETION_AT,
+				p->mailbox + PVKVM_PIO_DATA_AT);
 	result = request_for_cpu(cpu, PVKVM_COMPLETE_READ, NULL, NULL);
 	if (result)
 		return result;
 	cpu->read_bytes = 0;
 	return -EINTR;
+}
+
+/* The caller holds the vCPU's execution mutex and a read lock on run_gate. */
+static int run_lane_request(struct pvcpu *cpu, void __iomem *lane,
+			    enum pvkvm_command command, struct pvkvm_run_exit *exit)
+{
+	struct pvkvm *p = cpu->vm->provider;
+	u32 prior = readl(lane + PVKVM_LANE_REQUEST);
+	u32 seq = prior + 1;
+	int interrupts = atomic_read(&p->interrupt_count);
+	long waited;
+	int status;
+
+	if (READ_ONCE(p->dead))
+		return -ENODEV;
+	if (!seq || seq > INT_MAX || readl(lane + PVKVM_LANE_REPLY) != prior)
+		return -EIO;
+	publish_read_completion(cpu, lane + PVKVM_LANE_COMPLETE, lane + PVKVM_LANE_PIO);
+	writel(command, lane + PVKVM_LANE_COMMAND);
+	wmb();
+	writel(seq, lane + PVKVM_LANE_REQUEST);
+	writel(PVKVM_HOST_VECTOR, p->doorbell + PVKVM_DOORBELL_AT);
+
+	if (command == PVKVM_RUN) {
+		waited = wait_event_interruptible(p->replied, READ_ONCE(p->dead) ||
+				(atomic_read(&p->interrupt_count) != interrupts &&
+				 readl(lane + PVKVM_LANE_REPLY) == seq));
+		if ((waited < 0 || READ_ONCE(p->dead)) &&
+		    readl(lane + PVKVM_LANE_REPLY) != seq) {
+			/* A broken peer retains the pins, but ask it to stop before
+			 * allowing PCI removal or completing the interrupted ioctl.
+			 */
+			writel(seq, lane + PVKVM_LANE_CANCEL);
+			wmb();
+			writel(PVKVM_CANCEL_VECTOR, p->doorbell + PVKVM_DOORBELL_AT);
+		}
+	}
+	waited = wait_event_timeout(p->replied,
+			atomic_read(&p->interrupt_count) != interrupts &&
+			readl(lane + PVKVM_LANE_REPLY) == seq, 5 * HZ);
+	if (!waited)
+		return -ETIMEDOUT;
+	if (READ_ONCE(p->dead))
+		return -ENODEV;
+	rmb();
+	status = (s32)readl(lane + PVKVM_LANE_STATUS);
+	if (status > 0 || status < -MAX_ERRNO)
+		return -EIO;
+	if (!status && exit)
+		memcpy_fromio(exit, lane + PVKVM_LANE_EXIT, sizeof(*exit));
+	return status;
+}
+
+static int run_parallel(struct pvcpu *cpu)
+{
+	struct pvkvm *p = cpu->vm->provider;
+	void __iomem *lane = p->mailbox + PVKVM_LANES_AT + cpu->id * PVKVM_LANE_STRIDE;
+	struct pvkvm_run_exit exit;
+	int result;
+
+	do {
+		if (READ_ONCE(cpu->page->run.immediate_exit) || signal_pending(current)) {
+			result = cpu->read_bytes ? run_lane_request(cpu, lane, PVKVM_COMPLETE_READ, NULL) : 0;
+			if (!result)
+				cpu->read_bytes = 0;
+			result = result ?: -EINTR;
+			break;
+		}
+		result = run_lane_request(cpu, lane, PVKVM_RUN, &exit);
+		if (!result || result == -EINTR || result == -EAGAIN)
+			cpu->read_bytes = 0;
+		if (!result)
+			result = complete_run(cpu, &exit, lane + PVKVM_LANE_PIO);
+	} while (result == PVKVM_IOEVENT_HANDLED);
+	if (result == -EIO || result == -ETIMEDOUT)
+		mark_provider_dead(p);
+	return result;
 }
 
 static int run_cpu(struct pvcpu *cpu)
@@ -626,11 +714,12 @@ static int run_cpu(struct pvcpu *cpu)
 	result = cpu->read_bytes ? mutex_lock_killable(&p->lock) : mutex_lock_interruptible(&p->lock);
 	if (result)
 		return -EINTR;
-	if (p->dead) {
+	if (READ_ONCE(p->dead)) {
 		result = -ENODEV;
 		goto unlock;
 	}
-	if (READ_ONCE(cpu->page->run.immediate_exit) || signal_pending(current)) {
+	if ((!p->parallel_run || !cpu->ran) &&
+	    (READ_ONCE(cpu->page->run.immediate_exit) || signal_pending(current))) {
 		result = finish_interrupted_read(cpu);
 		goto unlock;
 	}
@@ -671,8 +760,22 @@ static int run_cpu(struct pvcpu *cpu)
 				    offsetof(struct pvkvm_cpuid_table, entries) +
 				    cpu->cpuid->count * sizeof(cpu->cpuid->entries[0]));
 	}
+	if (p->parallel_run) {
+		if (!cpu->ran) {
+			result = request_for_cpu(cpu, PVKVM_PREPARE_RUN, memory, NULL);
+			if (result)
+				goto unlock;
+			cpu->ran = true;
+		}
+		down_read(&p->run_gate);
+		mutex_unlock(&p->lock);
+		result = run_parallel(cpu);
+		up_read(&p->run_gate);
+		return result;
+	}
 	do {
-		publish_read_completion(cpu);
+		publish_read_completion(cpu, p->mailbox + PVKVM_COMPLETION_AT,
+				p->mailbox + PVKVM_PIO_DATA_AT);
 		result = request_for_cpu(cpu, PVKVM_RUN, memory, &exit);
 		if (!result || result == -EINTR) {
 			cpu->ran = true;
@@ -680,9 +783,9 @@ static int run_cpu(struct pvcpu *cpu)
 		}
 		if (result)
 			break;
-		result = complete_run(cpu, &exit);
+		result = complete_run(cpu, &exit, p->mailbox + PVKVM_PIO_DATA_AT);
 		if (result < 0)
-			p->dead = true;
+			mark_provider_dead(p);
 		if (result == PVKVM_IOEVENT_HANDLED &&
 		    (READ_ONCE(cpu->page->run.immediate_exit) || signal_pending(current)))
 			result = -EINTR;
@@ -716,7 +819,7 @@ static int write_stopped_registers(struct pvcpu *cpu, enum pvkvm_command command
 
 	if (result)
 		return result;
-	if (p->dead) {
+	if (READ_ONCE(p->dead)) {
 		result = -ENODEV;
 	} else {
 		memcpy_toio(p->mailbox + offset, registers, size);
@@ -767,7 +870,7 @@ static long stopped_msr_batch(struct pvcpu *cpu, struct pvkvm_msr_batch *batch, 
 
 	if (result)
 		return result;
-	if (p->dead) {
+	if (READ_ONCE(p->dead)) {
 		result = -ENODEV;
 		goto unlock;
 	}
@@ -777,7 +880,7 @@ static long stopped_msr_batch(struct pvcpu *cpu, struct pvkvm_msr_batch *batch, 
 		goto unlock;
 	batch->count = readl(mailbox);
 	if (batch->count > offered) {
-		p->dead = true;
+		mark_provider_dead(p);
 		result = -EIO;
 	} else if (!write) {
 		memcpy_fromio(batch->entries, mailbox + offsetof(struct pvkvm_msr_batch, entries),
@@ -1392,7 +1495,7 @@ static int new_cpu(struct pvvm *vm, unsigned long id)
 		fd = anon_inode_getfd("flexvm-vcpu", &cpu_fops, cpu, O_RDWR | O_CLOEXEC);
 		if (fd < 0) {
 			if (request_for_cpu(cpu, PVKVM_CLOSE_VCPU, NULL, NULL))
-				p->dead = true;
+				mark_provider_dead(p);
 		} else {
 			vm->created_cpus |= BIT(id);
 			vm->open_cpus |= BIT(id);
@@ -1660,7 +1763,7 @@ static long access_irqchip(struct pvvm *vm, bool write, struct kvm_irqchip __use
 		goto free_chip;
 	if (!vm->irqchip_created) {
 		result = -ENXIO;
-	} else if (p->dead) {
+	} else if (READ_ONCE(p->dead)) {
 		result = -ENODEV;
 	} else {
 		memcpy_toio(p->mailbox + PVKVM_IRQCHIP_AT, chip, sizeof(*chip));
@@ -1691,7 +1794,7 @@ static long set_irq_line(struct pvvm *vm, struct kvm_irq_level __user *user)
 		return result;
 	if (!vm->irqchip_created) {
 		result = -ENXIO;
-	} else if (p->dead) {
+	} else if (READ_ONCE(p->dead)) {
 		result = -ENODEV;
 	} else {
 		memcpy_toio(p->mailbox + PVKVM_IRQ_AT, &irq, sizeof(irq));
@@ -1720,7 +1823,7 @@ static long create_pit(struct pvvm *vm, struct kvm_pit_config __user *user)
 		result = -ENXIO;
 	} else if (vm->topology_frozen) {
 		result = -EBUSY;
-	} else if (p->dead) {
+	} else if (READ_ONCE(p->dead)) {
 		result = -ENODEV;
 	} else {
 		writel(config.flags, p->mailbox + PVKVM_PIT_FLAGS_AT);
@@ -1758,7 +1861,7 @@ static long access_pit_state(struct pvvm *vm, bool write, struct kvm_pit_state2 
 		return result;
 	if (!vm->pit_created) {
 		result = -ENXIO;
-	} else if (p->dead) {
+	} else if (READ_ONCE(p->dead)) {
 		result = -ENODEV;
 	} else {
 		if (write)
@@ -1795,7 +1898,7 @@ static long set_tss_address(struct pvvm *vm, unsigned long gpa)
 	result = mutex_lock_interruptible(&p->lock);
 	if (result)
 		return result;
-	if (p->dead) {
+	if (READ_ONCE(p->dead)) {
 		result = -ENODEV;
 		goto out;
 	}
@@ -1837,7 +1940,7 @@ static long vm_clock(struct pvvm *vm, bool write, struct kvm_clock_data __user *
 	result = mutex_lock_interruptible(&p->lock);
 	if (result)
 		return result;
-	if (p->dead) {
+	if (READ_ONCE(p->dead)) {
 		result = -ENODEV;
 	} else {
 		if (write)
@@ -2002,7 +2105,7 @@ static long supported_cpuid(struct pvkvm *p, struct kvm_cpuid2 __user *user)
 	if (!result) {
 		memcpy_fromio(table, p->mailbox + PVKVM_CPUID_AT, sizeof(*table));
 		if (!table->count || table->count > PVKVM_CPUID_MAX || table->reserved || !valid_cpuid_table(table)) {
-			p->dead = true;
+			mark_provider_dead(p);
 			result = -EIO;
 		}
 	}
@@ -2095,6 +2198,11 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	BUILD_BUG_ON(sizeof(struct kvm_vcpu_events) != PVKVM_VCPU_EVENTS_BYTES);
 	BUILD_BUG_ON(PVKVM_VCPU_EVENTS_AT + PVKVM_VCPU_EVENTS_BYTES > PVKVM_CLOCK_AT);
 	BUILD_BUG_ON(sizeof(struct kvm_clock_data) != PVKVM_CLOCK_BYTES);
+	BUILD_BUG_ON(PVKVM_FEATURES_AT + sizeof(u32) > PVKVM_REGISTERS_AT);
+	BUILD_BUG_ON(PVKVM_CLOCK_AT + PVKVM_CLOCK_BYTES > PVKVM_LANES_AT);
+	BUILD_BUG_ON(PVKVM_LANE_EXIT + sizeof(struct pvkvm_run_exit) > PVKVM_LANE_COMPLETE);
+	BUILD_BUG_ON(PVKVM_LANE_COMPLETE + sizeof(struct pvkvm_read_completion) > PVKVM_LANE_PIO);
+	BUILD_BUG_ON(PVKVM_LANE_PIO + PVKVM_PIO_BYTES > PVKVM_LANE_STRIDE);
 	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
 	    pci_resource_len(dev, 2) < PVKVM_CLOCK_AT + PVKVM_CLOCK_BYTES)
 		return -ENODEV;
@@ -2110,6 +2218,7 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 		return -ENOMEM;
 	kref_init(&p->refs);
 	mutex_init(&p->lock);
+	init_rwsem(&p->run_gate);
 	init_waitqueue_head(&p->replied);
 	atomic_set(&p->interrupt_count, 0);
 	p->doorbell = pcim_iomap_table(dev)[0];
@@ -2120,6 +2229,12 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	    readl(p->mailbox + PVKVM_MAGIC_AT) != PVKVM_MAGIC ||
 	    readl(p->mailbox + PVKVM_VERSION_AT) != PVKVM_VERSION ||
 	    readl(p->mailbox + PVKVM_REQUEST_AT) || readl(p->mailbox + PVKVM_REPLY_AT)) {
+		result = -ENODEV;
+		goto free_provider;
+	}
+	p->parallel_run = readl(p->mailbox + PVKVM_FEATURES_AT) & PVKVM_FEATURE_PARALLEL_RUN;
+	if (p->parallel_run &&
+	    pci_resource_len(dev, 2) < PVKVM_LANES_AT + PVKVM_MAX_CPUS * PVKVM_LANE_STRIDE) {
 		result = -ENODEV;
 		goto free_provider;
 	}
@@ -2159,8 +2274,10 @@ static void pvkvm_remove(struct pci_dev *dev)
 	p->irqfd_doorbell_live = false;
 	spin_unlock_irqrestore(&p->irqfd_doorbell_lock, flags);
 	mutex_lock(&p->lock);
-	p->dead = true;
+	mark_provider_dead(p);
+	down_write(&p->run_gate);
 	p->mailbox = NULL;
+	up_write(&p->run_gate);
 	mutex_unlock(&p->lock);
 	free_irq(p->irq, p);
 	pci_free_irq_vectors(dev);

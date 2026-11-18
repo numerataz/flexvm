@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/kvm.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -17,18 +18,22 @@
 #include "mailbox.h"
 #include "slot-map.h"
 
-static struct kvm_run *run_page;
-static volatile sig_atomic_t active_run;
-static volatile sig_atomic_t cancelled_run;
+static _Thread_local struct kvm_run *run_page;
+static _Thread_local volatile sig_atomic_t active_run;
+static _Thread_local volatile sig_atomic_t cancelled_run;
+static _Thread_local volatile sig_atomic_t stop_requested;
 
 static void interrupt_run(int signal, siginfo_t *info, void *context)
 {
     (void)signal;
     (void)context;
-    if (info->si_code != SI_QUEUE || info->si_value.sival_int <= 0)
+    if (info->si_code != SI_QUEUE || info->si_value.sival_int < 0)
         return;
-    cancelled_run = info->si_value.sival_int;
-    if (cancelled_run == active_run)
+    if (info->si_value.sival_int == 0)
+        stop_requested = 1;
+    else
+        cancelled_run = info->si_value.sival_int;
+    if (active_run && (stop_requested || cancelled_run == active_run))
         __atomic_store_n(&run_page->immediate_exit, 1, __ATOMIC_RELAXED);
 }
 
@@ -193,6 +198,91 @@ static struct pending_read reply_run(int control, struct kvm_run *run, int mappi
     return is_write ? (struct pending_read){0} : (struct pending_read){data, length};
 }
 
+struct native_lane {
+    int control;
+    int cpu;
+    unsigned int id;
+    int mapping_bytes;
+    struct kvm_run *run;
+    struct pending_read input;
+};
+
+static void serve_cpu_request(struct native_lane *lane, int control,
+                              const unsigned char *request, ssize_t received)
+{
+    struct kvm_run *run = lane->run;
+    struct pending_read *pending = &lane->input;
+    uint32_t sequence;
+    const size_t header = 2 + sizeof(sequence);
+
+    if (request[0] == 'E') {
+        check(pending->length && received == (ssize_t)(2 + pending->length),
+              "invalid completion-only read");
+        memcpy(pending->data, request + 2, pending->length);
+        run->immediate_exit = 1;
+        check(ioctl(lane->cpu, KVM_RUN, 0) == -1 && errno == EINTR,
+              "complete host I/O and stop before entry");
+        run->immediate_exit = 0;
+        *pending = (struct pending_read){0};
+        check(write(control, "E", 1) == 1, "acknowledge completed host I/O");
+        return;
+    }
+
+    check(received == (ssize_t)(header + pending->length) && request[0] == 'R',
+          "invalid run request");
+    memcpy(&sequence, request + 2, sizeof(sequence));
+    check(sequence > 0 && sequence <= INT_MAX, "invalid run sequence");
+    if (pending->length) {
+        memcpy(pending->data, request + header, pending->length);
+        *pending = (struct pending_read){0};
+    }
+
+    run_page = run;
+    __atomic_store_n(&run->immediate_exit, 0, __ATOMIC_RELAXED);
+    /* A queued signal for this sequence can arrive before KVM_RUN begins. */
+    __atomic_signal_fence(__ATOMIC_SEQ_CST);
+    active_run = (sig_atomic_t)sequence;
+    if (stop_requested || cancelled_run == active_run)
+        __atomic_store_n(&run->immediate_exit, 1, __ATOMIC_RELAXED);
+    int result = ioctl(lane->cpu, KVM_RUN, 0);
+    active_run = 0;
+    if (stop_requested)
+        return;
+    if (result < 0 && errno == EINTR && cancelled_run == (sig_atomic_t)sequence) {
+        static const unsigned char interrupted[] = {'I', 0};
+        check(write(control, interrupted, sizeof(interrupted)) == sizeof(interrupted),
+              "acknowledge the stopped host vCPU");
+        return;
+    }
+    if (result < 0 && errno == EAGAIN && lane->control >= 0) {
+        static const unsigned char retry[] = {'A', 0};
+        check(write(control, retry, sizeof(retry)) == sizeof(retry), "report host vCPU retry");
+        return;
+    }
+
+    check(result == 0, "run host vCPU");
+    *pending = reply_run(control, run, lane->mapping_bytes);
+}
+
+static void *serve_cpu_lane(void *opaque)
+{
+    struct native_lane *lane = opaque;
+    unsigned char request[6 + PVKVM_PIO_BYTES];
+
+    check(write(lane->control, "R", 1) == 1, "announce native vCPU readiness");
+    while (!stop_requested) {
+        ssize_t received = recv(lane->control, request, sizeof(request), MSG_TRUNC);
+        if (!received)
+            return NULL;
+        if (received < 0 && errno == EINTR)
+            continue;
+        check(received >= 2 && received <= (ssize_t)sizeof(request) && request[1] == lane->id,
+              "invalid native vCPU lane request");
+        serve_cpu_request(lane, lane->control, request, received);
+    }
+    return NULL;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && !strcmp(argv[1], "--supported-cpuid")) {
@@ -252,9 +342,15 @@ int main(int argc, char **argv)
     unsigned int pit_request = number(argv[5], KVM_PIT_SPEAKER_DUMMY + 1);
     unsigned long tss = number(argv[6], UINT32_MAX);
     int first_slot = 7 + (irqchip ? PVKVM_GSI_COUNT : 0);
+    int first_lane = -1;
+    check(first_slot < argc && cpu_count > 0, "at least one native vCPU and RAM slot");
+    if (!strcmp(argv[first_slot], "--run-sockets")) {
+        first_lane = first_slot + 1;
+        first_slot = first_lane + cpu_count;
+    }
+    bool parallel = first_lane >= 0;
     check(argc >= first_slot + 3 && (argc - first_slot) % 3 == 0 &&
           (argc - first_slot) / 3 <= PVKVM_MAX_SLOTS, "invalid worker RAM slots or interrupt descriptors");
-    check(cpu_count > 0, "at least one native vCPU");
 
     int kvm = host_kvm();
     int bytes = ioctl(kvm, KVM_GET_VCPU_MMAP_SIZE, 0);
@@ -291,7 +387,8 @@ int main(int argc, char **argv)
     close(outer_ram);
     int cpus[PVKVM_MAX_CPUS];
     struct kvm_run *runs[PVKVM_MAX_CPUS];
-    struct pending_read pending_read[PVKVM_MAX_CPUS] = {0};
+    struct native_lane lanes[PVKVM_MAX_CPUS];
+    pthread_t threads[PVKVM_MAX_CPUS];
     struct kvm_sregs segments;
     for (unsigned int id = 0; id < cpu_count; id++) {
         cpus[id] = ioctl(vm, KVM_CREATE_VCPU, id);
@@ -302,10 +399,20 @@ int main(int argc, char **argv)
         segments.cs.base = 0;
         segments.cs.selector = 0;
         check(ioctl(cpus[id], KVM_SET_SREGS, &segments) == 0, "select real-mode code segment");
+        lanes[id] = (struct native_lane){
+            .control = parallel ? (int)number(argv[first_lane + id], INT_MAX) : -1,
+            .cpu = cpus[id], .id = id, .mapping_bytes = bytes, .run = runs[id],
+        };
     }
     struct sigaction action = {.sa_sigaction = interrupt_run, .sa_flags = SA_SIGINFO | SA_RESTART};
     check(sigemptyset(&action.sa_mask) == 0 && sigaction(SIGRTMIN, &action, NULL) == 0,
           "install the native run interrupt handler");
+    if (parallel) {
+        for (unsigned int id = 0; id < cpu_count; id++) {
+            errno = pthread_create(&threads[id], NULL, serve_cpu_lane, &lanes[id]);
+            check(!errno, "start the native vCPU thread");
+        }
+    }
     struct kvm_regs registers;
     struct kvm_fpu fpu;
     struct kvm_lapic_state lapic;
@@ -331,7 +438,6 @@ int main(int argc, char **argv)
         check(received >= 2 && request[1] < cpu_count, "invalid vCPU selector");
         unsigned int id = request[1];
         int cpu = cpus[id];
-        struct kvm_run *run = runs[id];
         if (received == 2 + sizeof(registers) && request[0] == 'S') {
             memcpy(&registers, request + 2, sizeof(registers));
             check(ioctl(cpu, KVM_SET_REGS, &registers) == 0, "write host registers");
@@ -570,45 +676,27 @@ int main(int argc, char **argv)
             check(write(control, "C", 1) == 1, "acknowledge host CPUID table");
             continue;
         }
-        if (request[0] == 'E') {
-            struct pending_read *pending = &pending_read[id];
-            check(pending->length && received == (ssize_t)(2 + pending->length), "invalid completion-only read");
-            memcpy(pending->data, request + 2, pending->length);
-            run->immediate_exit = 1;
-            check(ioctl(cpu, KVM_RUN, 0) == -1 && errno == EINTR, "complete host I/O and stop before entry");
-            run->immediate_exit = 0;
-            *pending = (struct pending_read){0};
-            check(write(control, "E", 1) == 1, "acknowledge completed host I/O");
-            continue;
+        if (parallel) {
+            uint32_t sequence;
+            check(received == 2 + sizeof(sequence) && request[0] == 'I', "invalid parallel run interrupt");
+            memcpy(&sequence, request + 2, sizeof(sequence));
+            check(sequence > 0 && sequence <= INT_MAX, "invalid parallel run sequence");
+            errno = pthread_sigqueue(threads[id], SIGRTMIN, (union sigval){.sival_int = sequence});
+            check(!errno, "interrupt the selected vCPU thread");
+        } else {
+            serve_cpu_request(&lanes[id], control, request, received);
         }
-        uint32_t sequence;
-        size_t run_header = 2 + sizeof(sequence);
-        check(received == (ssize_t)(run_header + pending_read[id].length) && request[0] == 'R', "invalid run request");
-        memcpy(&sequence, request + 2, sizeof(sequence));
-        check(sequence > 0 && sequence <= INT_MAX, "invalid run sequence");
-        if (pending_read[id].length) {
-            memcpy(pending_read[id].data, request + run_header, pending_read[id].length);
-            pending_read[id] = (struct pending_read){0};
+    }
+    if (parallel) {
+        for (unsigned int id = 0; id < cpu_count; id++) {
+            shutdown(lanes[id].control, SHUT_RD);
+            errno = pthread_sigqueue(threads[id], SIGRTMIN, (union sigval){.sival_int = 0});
+            check(!errno || errno == ESRCH, "stop the native vCPU thread");
         }
-        run_page = run;
-        __atomic_store_n(&run->immediate_exit, 0, __ATOMIC_RELAXED);
-        /* The signal handler may publish an interrupt as soon as this
-         * sequence becomes active. Finish clearing the old value first.
-         */
-        __atomic_signal_fence(__ATOMIC_SEQ_CST);
-        active_run = (sig_atomic_t)sequence;
-        if (cancelled_run == active_run)
-            __atomic_store_n(&run->immediate_exit, 1, __ATOMIC_RELAXED);
-        int result = ioctl(cpu, KVM_RUN, 0);
-        active_run = 0;
-        if (result < 0 && errno == EINTR && cancelled_run == (sig_atomic_t)sequence) {
-            static const unsigned char interrupted[] = {'I', 0};
-            check(write(control, interrupted, sizeof(interrupted)) == sizeof(interrupted),
-                  "acknowledge the stopped host vCPU");
-            continue;
+        for (unsigned int id = 0; id < cpu_count; id++) {
+            errno = pthread_join(threads[id], NULL);
+            check(!errno, "join the native vCPU thread");
         }
-        check(result == 0, "run host vCPU");
-        pending_read[id] = reply_run(control, run, bytes);
     }
     return 0;
 }

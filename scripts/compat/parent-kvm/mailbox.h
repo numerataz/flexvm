@@ -3,7 +3,7 @@
 #define FLEXVM_PVKVM_MAILBOX_H
 
 #define PVKVM_MAGIC        0x4d564b46
-#define PVKVM_VERSION      35
+#define PVKVM_VERSION      36
 #define PVKVM_MAGIC_AT     0
 #define PVKVM_VERSION_AT   4
 #define PVKVM_REQUEST_AT   8
@@ -17,6 +17,8 @@
 #define PVKVM_FPU_VALID_AT   48
 #define PVKVM_CPUID_VALID_AT 52
 #define PVKVM_LAPIC_VALID_AT 56
+#define PVKVM_FEATURES_AT    60
+#define PVKVM_FEATURE_PARALLEL_RUN 1
 #define PVKVM_SLOT_TABLE_AT  640
 #define PVKVM_SLOT_RECORD_SIZE 16
 #define PVKVM_FPU_AT         768
@@ -50,6 +52,16 @@
 #define PVKVM_VCPU_EVENTS_BYTES 64
 #define PVKVM_CLOCK_AT        0x89100
 #define PVKVM_CLOCK_BYTES     48
+#define PVKVM_LANES_AT        0x90000
+#define PVKVM_LANE_STRIDE     0x2000
+#define PVKVM_LANE_REQUEST    0
+#define PVKVM_LANE_REPLY      4
+#define PVKVM_LANE_COMMAND    8
+#define PVKVM_LANE_STATUS     12
+#define PVKVM_LANE_CANCEL     16
+#define PVKVM_LANE_EXIT       32
+#define PVKVM_LANE_COMPLETE   64
+#define PVKVM_LANE_PIO        0x1000
 #define PVKVM_IOAPIC_GPA     0xfec00000ULL
 #define PVKVM_GSI_COUNT      24
 #define PVKVM_REGISTERS_AT   64
@@ -133,6 +145,7 @@ enum pvkvm_command {
 	PVKVM_SET_VCPU_EVENTS,
 	PVKVM_GET_CLOCK,
 	PVKVM_SET_CLOCK,
+	PVKVM_PREPARE_RUN,
 };
 
 #endif
