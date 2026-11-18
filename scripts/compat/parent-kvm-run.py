@@ -552,6 +552,7 @@ class TcgChild:
         self.lanes = None
         self.debugger = None
         self.special_monitor = None
+        self.cpuid_profiles = {}
         self.irqchip = bool(irq_fds)
         self.directory = control / "c"
         self.directory.mkdir(mode=0o700)
@@ -620,10 +621,13 @@ class TcgChild:
                     raise RuntimeError("unexpected QEMU register layout")
                 if incoming is not None:
                     self.freeze_run_control(True)
+                    descriptor, cpuid_profiles = incoming
                     monitor = self.monitor(timeout=30)
-                    transfer_state(monitor, incoming, incoming=True)
+                    transfer_state(monitor, descriptor, incoming=True)
                     if monitor.ask("query-status")["status"] != "paused":
                         raise RuntimeError("restored x86 worker is not paused")
+                    for cpu, entries in cpuid_profiles:
+                        self.set_cpuid(cpu, entries)
                     return
                 self.clock()
                 for cpu in range(cpu_count):
@@ -679,6 +683,8 @@ class TcgChild:
 
     def capture(self, descriptor):
         transfer_state(self.monitor(timeout=30), descriptor)
+        # QEMU's migration stream omits the per-vCPU CPUID override table.
+        return sorted(self.cpuid_profiles.items())
 
     def special_registers(self, cpu):
         return pack_special_registers(self.special_command("x-flexvm-query-x86-sregs", {"cpu-index": cpu}))
@@ -718,7 +724,9 @@ class TcgChild:
         return [(entry["index"], entry["value"]) for entry in result["entries"]]
 
     def set_cpuid(self, cpu, entries):
-        self.special_command("x-flexvm-set-x86-cpuid", cpuid_arguments(cpu, entries))
+        registers = tuple(tuple(entry) for entry in entries)
+        self.special_command("x-flexvm-set-x86-cpuid", cpuid_arguments(cpu, registers))
+        self.cpuid_profiles[cpu] = registers
 
     def set_irq(self, gsi, level):
         self.special_command("x-flexvm-set-x86-gsi", {"gsi": gsi, "level": bool(level)})

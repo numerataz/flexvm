@@ -16,8 +16,11 @@ PAGE = PARENT["PAGE_SIZE"]
 BASE = 0x1000
 DATA = 0x200
 PORT = 0x500
-# Read the port, increment AL, store and report it twice, then halt.
-PROGRAM = bytes.fromhex("ba0005 ec fec0 a20012 ee fec0 a20112 ee f4")
+# Read the port, increment AL, then store and report it twice.
+# Finally report the guest's configured CPUID leaf and halt.
+PROGRAM = bytes.fromhex("ba0005 ec fec0 a20012 ee fec0 a20112 ee 66b800000040 0fa2 ba0005 66ef f4")
+CPUID_LEAF = 0x40000000
+CPUID_VALUE = 0x12345678
 SIZE_SEALS = fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL
 
 
@@ -48,10 +51,10 @@ def worker(qemu, state, ram, offset, incoming=None):
         event = os.eventfd(0, os.EFD_CLOEXEC | os.EFD_NONBLOCK)
         resources.callback(os.close, event)
 
-        def run():
+        def run(width=1):
             cancel = PARENT["RunCancellation"](event, None, 1, time.monotonic() + 5)
             result = child.run(0, cancel, b"")
-            if result.reason != PARENT["KVM_EXIT_IO"] or result.address != PORT or result.width != 1:
+            if result.reason != PARENT["KVM_EXIT_IO"] or result.address != PORT or result.width != width:
                 raise RuntimeError(f"wrong checkpoint I/O exit: {result}")
             return result
 
@@ -77,6 +80,7 @@ def exercise(qemu):
             registers = [0] * 18
             registers[16:18] = [BASE, 2]
             child.set_registers(0, PARENT["REGISTERS"].pack(*registers))
+            child.set_cpuid(0, [(CPUID_LEAF, 0, 0, CPUID_VALUE, 0, 0, 0)])
             if run().is_write:
                 raise RuntimeError("expected a live x86 port read")
             try:
@@ -92,19 +96,22 @@ def exercise(qemu):
                 raise RuntimeError("x86 worker did not finish its completed input")
             frozen_registers = child.registers(0)
             child.freeze_run_control(True)
-            child.capture(snapshot.fileno())
+            cpuid_profiles = child.capture(snapshot.fileno())
         snapshot.seek(0)
         if marker in snapshot.read():
             raise RuntimeError("x86 worker stream duplicated external RAM")
         snapshot.seek(0)
         os.pwrite(target, os.pread(source, PAGE, start), destination)
-        with worker(qemu, state, target, destination, incoming=snapshot.fileno()) as (child, run):
+        with worker(qemu, state, target, destination, incoming=(snapshot.fileno(), cpuid_profiles)) as (child, run):
             if child.registers(0) != frozen_registers:
                 raise RuntimeError("x86 worker did not restore its stopped registers")
             child.freeze_run_control(False)
             result = run()
             if not result.is_write or result.data != b"\x2b":
                 raise RuntimeError("restored x86 worker did not continue from the saved PC")
+            reported = run(4)
+            if not reported.is_write or reported.data != struct.pack("<I", CPUID_VALUE):
+                raise RuntimeError("restored x86 guest lost its custom CPUID profile")
         if os.pread(target, 2, destination + DATA) != b"\x2a\x2b" or os.pread(source, 2, start + DATA) != b"\x2a\x00":
             raise RuntimeError("restored x86 worker wrote to the wrong RAM backing")
 
