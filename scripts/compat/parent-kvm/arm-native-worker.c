@@ -4,6 +4,7 @@
 #include <limits.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -12,6 +13,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include "arm-native-wire.h"
+#include "arm-vgic.h"
 #include "slot-map.h"
 
 #if !defined(__aarch64__) || __BYTE_ORDER__ != __ORDER_LITTLE_ENDIAN__
@@ -35,6 +37,8 @@ struct arm_vm {
     int fd;
     size_t run_bytes;
     struct arm_cpu cpus[FLEXVM_ARM_MAX_CPUS];
+    int vgic[2];
+    bool wired_irqs[FLEXVM_ARM_GSI_COUNT];
     struct {
         uint64_t address;
         size_t bytes;
@@ -196,9 +200,74 @@ static int request_cpu(struct arm_cpu *cpu, const struct flexvm_arm_request *req
         struct kvm_one_reg reg = {.id = request->reg.id, .addr = (uintptr_t)reply->reg_data};
         return ioctl_result(ioctl(cpu->fd, set ? KVM_SET_ONE_REG : KVM_GET_ONE_REG, &reg));
     }
+    case FLEXVM_ARM_GET_MP_STATE:
+    case FLEXVM_ARM_SET_MP_STATE: {
+        struct kvm_mp_state state = {.mp_state = request->mp_state};
+        int set = request->command == FLEXVM_ARM_SET_MP_STATE;
+        int status = ioctl_result(ioctl(cpu->fd, set ? KVM_SET_MP_STATE : KVM_GET_MP_STATE, &state));
+        if (!status && !set)
+            reply->mp_state = state.mp_state;
+        return status;
+    }
     default:
         return -ENOTTY;
     }
+}
+
+static int device_ioctl(struct arm_vm *vm, const struct flexvm_arm_request *request, struct flexvm_arm_reply *reply)
+{
+    int id = arm_vgic_index(request->device.type);
+    if (id < 0 || request->device.reserved)
+        return -ENODEV;
+    if (request->command == FLEXVM_ARM_CREATE_DEVICE) {
+        struct kvm_create_device create = {.type = request->device.type, .flags = request->device.flags};
+        if (create.flags & ~KVM_CREATE_DEVICE_TEST)
+            return -EINVAL;
+        if (!create.flags && vm->vgic[id] >= 0)
+            return -EEXIST;
+        int status = ioctl_result(ioctl(vm->fd, KVM_CREATE_DEVICE, &create));
+        if (!status && !create.flags)
+            vm->vgic[id] = create.fd;
+        return status;
+    }
+    int fd = vm->vgic[id];
+    if (fd < 0)
+        return -EBADF;
+    if (request->command == FLEXVM_ARM_CLOSE_DEVICE) {
+        vm->vgic[id] = -1;
+        return ioctl_result(close(fd));
+    }
+    int bytes = arm_vgic_attribute_size(request->device.type, request->device.group, request->device.attribute);
+    if (bytes < 0 || request->device.flags)
+        return -ENXIO;
+    uint64_t value = request->device.value;
+    struct kvm_device_attr attribute = {
+        .group = request->device.group, .attr = request->device.attribute, .addr = bytes ? (uintptr_t)&value : 0,
+    };
+    if (request->command == FLEXVM_ARM_HAS_DEVICE_ATTR)
+        return ioctl_result(ioctl(fd, KVM_HAS_DEVICE_ATTR, &attribute));
+    if (request->command == FLEXVM_ARM_SET_DEVICE_ATTR)
+        return ioctl_result(ioctl(fd, KVM_SET_DEVICE_ATTR, &attribute));
+    if (!bytes)
+        return -ENXIO;
+    value = 0;
+    int status = ioctl_result(ioctl(fd, KVM_GET_DEVICE_ATTR, &attribute));
+    if (!status)
+        reply->device_value = value;
+    return status;
+}
+
+static int bind_irqfd(struct arm_vm *vm, uint32_t gsi, int fd)
+{
+    if (gsi >= FLEXVM_ARM_GSI_COUNT)
+        return -EINVAL;
+    if (vm->wired_irqs[gsi])
+        return 0;
+    struct kvm_irqfd irq = {.fd = fd, .gsi = gsi};
+    int status = ioctl_result(ioctl(vm->fd, KVM_IRQFD, &irq));
+    if (!status)
+        vm->wired_irqs[gsi] = true;
+    return status;
 }
 
 static int register_ram(struct arm_vm *vm, const struct flexvm_arm_request *request, int ram, int layout)
@@ -437,13 +506,17 @@ static void serve(struct arm_vm *vm, int control)
         unsigned int descriptors_needed = 0;
         if (request->command == FLEXVM_ARM_REGISTER_RAM)
             descriptors_needed = 2;
-        else if (request->command == FLEXVM_ARM_OPEN_LANE)
+        else if (request->command == FLEXVM_ARM_OPEN_LANE || request->command == FLEXVM_ARM_BIND_IRQFD)
             descriptors_needed = 1;
         if (!packet.well_formed || packet.count != descriptors_needed || request->reserved ||
             (request->sequence && request->command != FLEXVM_ARM_CANCEL_RUN)) {
             reply.status = -EPROTO;
         } else if (request->command == FLEXVM_ARM_REGISTER_RAM) {
             reply.status = vm->lanes_opened ? -EBUSY : register_ram(vm, request, packet.descriptors[0], packet.descriptors[1]);
+        } else if (request->command == FLEXVM_ARM_BIND_IRQFD) {
+            reply.status = bind_irqfd(vm, request->gsi, packet.descriptors[0]);
+        } else if (request->command >= FLEXVM_ARM_CREATE_DEVICE && request->command <= FLEXVM_ARM_HAS_DEVICE_ATTR) {
+            reply.status = device_ioctl(vm, request, &reply);
         } else if (request->command == FLEXVM_ARM_PREFERRED_TARGET) {
             reply.status = ioctl_result(ioctl(vm->fd, KVM_ARM_PREFERRED_TARGET, &reply.init));
         } else if (request->cpu >= FLEXVM_ARM_MAX_CPUS) {
@@ -514,7 +587,7 @@ int main(int argc, char **argv)
     check(ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_IMMEDIATE_EXIT) == 1, "enable ARM KVM run cancellation");
     int run_bytes = ioctl(kvm, KVM_GET_VCPU_MMAP_SIZE, 0);
     check(run_bytes >= (int)sizeof(struct kvm_run), "get the ARM KVM run mapping size");
-    struct arm_vm vm = {.fd = ioctl(kvm, KVM_CREATE_VM, type), .run_bytes = run_bytes};
+    struct arm_vm vm = {.fd = ioctl(kvm, KVM_CREATE_VM, type), .run_bytes = run_bytes, .vgic = {-1, -1}};
     struct flexvm_arm_reply startup = {.status = vm.fd < 0 ? -errno : 0};
     if (startup.status) {
         check(send(control, &startup, sizeof(startup), MSG_NOSIGNAL) == sizeof(startup), "send ARM VM creation error");

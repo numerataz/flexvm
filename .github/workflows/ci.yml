@@ -389,6 +389,21 @@ jobs:
               python3 scripts/compat/arm-parent-frontend.py --native \
               --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64" --kernel "$artifacts/vmlinux" \
               --bundle "$bundle" --output "$RUNNER_TEMP/arm-parent-frontend-native"
+            source scripts/versions.sh
+            stock="firecracker-$FC_VERSION-$ARCH"
+            url="https://github.com/firecracker-microvm/firecracker/releases/download/$FC_VERSION/$stock.tgz"
+            archive="$RUNNER_TEMP/$stock.tgz"
+            curl --fail --silent --show-error --location --retry 3 --output "$archive" "$url"
+            checksum=$(pinned "$url")
+            printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check --status
+            tar -xOzf "$archive" "release-$FC_VERSION-$ARCH/$stock" > "$RUNNER_TEMP/$stock"
+            for cpus in 1 2; do
+              sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% \
+                python3 scripts/compat/arm-parent-firecracker.py \
+                --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64" --kernel "$artifacts/vmlinux" \
+                --bundle "$bundle" --firecracker "$RUNNER_TEMP/$stock" --vcpus "$cpus" \
+                --output "$RUNNER_TEMP/arm-parent-firecracker-$cpus"
+            done
           fi
       - name: Parent TCG worker through the guest KVM API
         if: matrix.arch == 'x86_64'
@@ -637,6 +652,8 @@ jobs:
             ${{ runner.temp }}/arm-parent-frontend.strace
             ${{ runner.temp }}/arm-parent-frontend/*.log
             ${{ runner.temp }}/arm-parent-frontend-native/*.log
+            ${{ runner.temp }}/arm-parent-firecracker-*/*.log
+            ${{ runner.temp }}/arm-parent-firecracker-*/*.json
             ${{ runner.temp }}/parent-kvm-run/*.json
             ${{ runner.temp }}/parent-kvm-run/*.log
             ${{ runner.temp }}/parent-kvm-run/*.strace
