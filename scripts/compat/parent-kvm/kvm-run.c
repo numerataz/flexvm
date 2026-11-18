@@ -334,6 +334,8 @@ static void check_resumed_msrs(int cpu, const unsigned char *data)
 
 static void get_supported_cpuid(int kvm, struct pvkvm_cpuid_table *table)
 {
+    check(ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_EXT_CPUID) == 1,
+          "advertise the existing indexed CPUID interface");
     struct kvm_cpuid2 small = {0};
     check(ioctl(kvm, KVM_GET_SUPPORTED_CPUID, &small) == -1 && errno == E2BIG,
           "reject a short supported CPUID buffer");
