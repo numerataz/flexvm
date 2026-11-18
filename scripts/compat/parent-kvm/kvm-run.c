@@ -38,6 +38,7 @@
 #define PIC_IDT_OFFSET 0x400
 #define PIC_IDTR_OFFSET 0x540
 #define PIC_GSI 3
+#define FIRECRACKER_TSS_GPA 0xfffbd000UL
 #define PIC_VECTOR (32 + PIC_GSI)
 #define MMIO_BASE 0xd0000000ULL
 #define MMIO_FIRST_VALUE 0x5a443322U
@@ -721,6 +722,8 @@ int main(int argc, char **argv)
     bool pit = false;
     bool irqfd = false;
     bool zero_slot = false;
+    bool tss = false;
+    bool provider_tss = false;
     check(argc == 2 || protected_mode, "specify RAM pages and optional protected or split mode");
     for (int i = 3; i < argc; i++) {
         if (!interrupt_run && !strcmp(argv[i], "interrupt"))
@@ -749,7 +752,10 @@ int main(int argc, char **argv)
             irqfd = true;
         else if (!zero_slot && !strcmp(argv[i], "zero-slot"))
             zero_slot = true;
-        else
+        else if (!tss && (!strcmp(argv[i], "tss") || !strcmp(argv[i], "provider-tss"))) {
+            tss = true;
+            provider_tss = !strcmp(argv[i], "provider-tss");
+        } else
             check(false, "invalid execution option");
     }
     char *end;
@@ -771,6 +777,7 @@ int main(int argc, char **argv)
     check(!irqfd || (irqchip && !pit), "test IRQFD in a separate PIC vCPU run");
     check(!zero_slot || (count >= 258 && protected_mode && !split_slot && !long_mode &&
           !irqchip && !cpuid && !two_vcpus), "test one zero-based slot across the PC legacy region");
+    check(!tss || irqchip, "program the TSS before creating the x86 irqchip");
     size_t pages = count;
     size_t ram_bytes = pages * 4096;
     uint64_t gpa = PVKVM_GUEST_START;
@@ -802,6 +809,12 @@ int main(int argc, char **argv)
     check(vm >= 0 && (fcntl(vm, F_GETFD) & FD_CLOEXEC), "VM file descriptor");
     check(ioctl(vm, KVM_CHECK_EXTENSION, KVM_CAP_USER_MEMORY) == 1,
           "query the VM's memory capability");
+    if (tss) {
+        check(ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_SET_TSS_ADDR) == 1, "query TSS address support");
+        check(ioctl(vm, KVM_SET_TSS_ADDR, 0xffffe000UL) == -1 && errno == EINVAL,
+              "reject a TSS reservation that crosses 4 GiB");
+        check(ioctl(vm, KVM_SET_TSS_ADDR, FIRECRACKER_TSS_GPA) == 0, "reserve the Firecracker TSS address");
+    }
     unsigned char *ram = mmap(NULL, ram_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     check(ram != MAP_FAILED, "map client RAM");
     volatile unsigned char *scratch = NULL;
@@ -837,6 +850,12 @@ int main(int argc, char **argv)
         .guest_phys_addr = gpa, .memory_size = first_bytes, .userspace_addr = (unsigned long)ram,
     };
     check(ioctl(vm, KVM_SET_USER_MEMORY_REGION, &region) == 0, "register client RAM");
+    if (provider_tss) {
+        check(ioctl(vm, KVM_SET_TSS_ADDR, gpa) == -1 && errno == EEXIST,
+              "reject a new TSS reservation over a guest RAM slot");
+        check(ioctl(vm, KVM_SET_TSS_ADDR, 0xfee00000UL) == -1 && errno == EINVAL,
+              "reject a new TSS reservation over the APIC");
+    }
     if (scratch)
         check(munmap((void *)scratch, scratch_bytes) == 0, "release intervening pages");
     const unsigned char code[] = {
@@ -1209,6 +1228,8 @@ int main(int argc, char **argv)
             test_irqfd(vm, cpu, run, size, ram, data, gpa, data_address);
         close(vm);
     }
+    if (tss)
+        puts("PASS child ran with Firecracker's three-page TSS reservation");
     if (cpuid)
         puts("PASS child CPUID instructions used the installed vCPU profiles");
     if (mmio)

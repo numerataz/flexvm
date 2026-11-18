@@ -33,6 +33,8 @@
 			       X86_EFLAGS_AF | X86_EFLAGS_ZF | X86_EFLAGS_SF | \
 			       X86_EFLAGS_DF | X86_EFLAGS_OF)
 
+#define PVKVM_TSS_SIZE (3 * PAGE_SIZE)
+
 struct pvkvm {
 	struct kref refs;
 	struct mutex lock;
@@ -90,6 +92,8 @@ struct pvvm {
 	bool topology_frozen;
 	bool irqchip_created;
 	bool pit_created;
+	bool tss_set;
+	u32 tss_gpa;
 	unsigned long created_cpus;
 	unsigned long open_cpus;
 };
@@ -1020,6 +1024,7 @@ static long device_capability(unsigned long capability)
 	case KVM_CAP_PIT:
 	case KVM_CAP_PIT2:
 	case KVM_CAP_IRQFD:
+	case KVM_CAP_SET_TSS_ADDR:
 		return 1;
 	case KVM_CAP_NR_MEMSLOTS:
 		return PVKVM_MAX_SLOTS;
@@ -1031,10 +1036,15 @@ static long device_capability(unsigned long capability)
 	}
 }
 
+static bool overlaps(u64 base, u64 length, u64 other, u64 other_length)
+{
+	return base < other + other_length && other < base + length;
+}
+
 static int install_slot(struct pvvm *vm, unsigned int id, u64 gpa,
 			struct page **pages, unsigned int count)
 {
-	u64 end = gpa + count * PAGE_SIZE;
+	u64 bytes = count * PAGE_SIZE;
 	unsigned int other;
 
 	if (vm->provider->dead)
@@ -1045,11 +1055,12 @@ static int install_slot(struct pvvm *vm, unsigned int id, u64 gpa,
 		return -EEXIST;
 	if (count > PVKVM_MAX_PAGES - vm->total_pages)
 		return -ENOSPC;
+	if (vm->tss_set && overlaps(gpa, bytes, vm->tss_gpa, PVKVM_TSS_SIZE))
+		return -EEXIST;
 	for (other = 0; other < PVKVM_MAX_SLOTS; other++) {
 		const struct pvslot *existing = &vm->slots[other];
 
-		if (existing->count && gpa < existing->gpa + existing->count * PAGE_SIZE &&
-		    existing->gpa < end)
+		if (existing->count && overlaps(gpa, bytes, existing->gpa, existing->count * PAGE_SIZE))
 			return -EEXIST;
 	}
 	vm->slots[id] = (struct pvslot){ .pages = pages, .gpa = gpa, .count = count };
@@ -1275,6 +1286,55 @@ static long create_pit(struct pvvm *vm, struct kvm_pit_config __user *user)
 	return result;
 }
 
+static bool valid_tss_address(unsigned long gpa)
+{
+	if (!PAGE_ALIGNED(gpa) || gpa > (1ULL << 32) - PVKVM_TSS_SIZE)
+		return false;
+	/* Leave the legacy ROM, MMIO exit device, APICs, and reset ROM in place. */
+	return !overlaps(gpa, PVKVM_TSS_SIZE, 0xa0000, 0x60000) &&
+	       !overlaps(gpa, PVKVM_TSS_SIZE, 0xd0000000, PAGE_SIZE) &&
+	       !overlaps(gpa, PVKVM_TSS_SIZE, 0xfec00000, 0x400000) &&
+	       !overlaps(gpa, PVKVM_TSS_SIZE, 0xffff0000, 0x10000);
+}
+
+static long set_tss_address(struct pvvm *vm, unsigned long gpa)
+{
+	struct pvkvm *p = vm->provider;
+	unsigned int id;
+	int result;
+
+	if (!valid_tss_address(gpa))
+		return -EINVAL;
+	result = mutex_lock_interruptible(&p->lock);
+	if (result)
+		return result;
+	if (p->dead) {
+		result = -ENODEV;
+		goto out;
+	}
+	if (vm->topology_frozen) {
+		result = -EBUSY;
+		goto out;
+	}
+	for (id = 0; id < PVKVM_MAX_SLOTS; id++) {
+		const struct pvslot *slot = &vm->slots[id];
+
+		if (slot->count && overlaps(gpa, PVKVM_TSS_SIZE, slot->gpa, slot->count * PAGE_SIZE)) {
+			result = -EEXIST;
+			goto out;
+		}
+	}
+	writel(gpa, p->mailbox + PVKVM_TSS_AT);
+	result = request(p, PVKVM_SET_TSS_ADDR, NULL, NULL);
+	if (!result) {
+		vm->tss_gpa = gpa;
+		vm->tss_set = true;
+	}
+out:
+	mutex_unlock(&p->lock);
+	return result;
+}
+
 static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct pvvm *vm = file->private_data;
@@ -1303,6 +1363,8 @@ static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return create_pit(vm, NULL);
 	if (cmd == KVM_CREATE_PIT2)
 		return arg ? create_pit(vm, (void __user *)arg) : -EFAULT;
+	if (cmd == KVM_SET_TSS_ADDR)
+		return set_tss_address(vm, arg);
 	if (cmd != KVM_SET_USER_MEMORY_REGION)
 		return -ENOTTY;
 	if (copy_from_user(&memory, (void __user *)arg, sizeof(memory)))
@@ -1489,8 +1551,9 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	BUILD_BUG_ON(PVKVM_EXIT_AT + sizeof(struct pvkvm_run_exit) > PVKVM_COMPLETION_AT);
 	BUILD_BUG_ON(PVKVM_COMPLETION_AT + sizeof(struct pvkvm_mmio_completion) > PVKVM_IRQ_AT);
 	BUILD_BUG_ON(PVKVM_IRQ_AT + sizeof(struct kvm_irq_level) > PVKVM_PIT_FLAGS_AT);
+	BUILD_BUG_ON(PVKVM_PIT_FLAGS_AT + sizeof(u32) > PVKVM_TSS_AT);
 	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
-	    pci_resource_len(dev, 2) < PVKVM_PIT_FLAGS_AT + sizeof(u32))
+	    pci_resource_len(dev, 2) < PVKVM_TSS_AT + sizeof(u32))
 		return -ENODEV;
 	result = pcim_enable_device(dev);
 	if (result)

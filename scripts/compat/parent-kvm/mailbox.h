@@ -3,7 +3,7 @@
 #define FLEXVM_PVKVM_MAILBOX_H
 
 #define PVKVM_MAGIC        0x4d564b46
-#define PVKVM_VERSION      22
+#define PVKVM_VERSION      23
 #define PVKVM_MAGIC_AT     0
 #define PVKVM_VERSION_AT   4
 #define PVKVM_REQUEST_AT   8
@@ -29,6 +29,7 @@
 #define PVKVM_COMPLETION_AT  0x84100
 #define PVKVM_IRQ_AT         0x84200
 #define PVKVM_PIT_FLAGS_AT   0x84208
+#define PVKVM_TSS_AT         0x8420c
 #define PVKVM_GSI_COUNT      24
 #define PVKVM_REGISTERS_AT   64
 #define PVKVM_INITIAL_SREGISTERS_AT 256
@@ -91,6 +92,7 @@ enum pvkvm_command {
 	PVKVM_CREATE_IRQCHIP,
 	PVKVM_SET_IRQ_LINE,
 	PVKVM_CREATE_PIT,
+	PVKVM_SET_TSS_ADDR,
 };
 
 #endif

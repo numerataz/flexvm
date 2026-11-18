@@ -95,13 +95,14 @@ int main(int argc, char **argv)
         supported_cpuid();
         return 0;
     }
-    check(argc >= 9, "expected control, outer RAM, vCPU count, interrupt configuration, and slots");
+    check(argc >= 10, "expected control, outer RAM, vCPU count, device configuration, and slots");
     int control = (int)number(argv[1], INT_MAX);
     int outer_ram = (int)number(argv[2], INT_MAX);
     unsigned int cpu_count = number(argv[3], PVKVM_MAX_CPUS);
     bool irqchip = number(argv[4], 1);
     unsigned int pit_request = number(argv[5], KVM_PIT_SPEAKER_DUMMY + 1);
-    int first_slot = 6 + (irqchip ? PVKVM_GSI_COUNT : 0);
+    unsigned long tss = number(argv[6], UINT32_MAX);
+    int first_slot = 7 + (irqchip ? PVKVM_GSI_COUNT : 0);
     check(argc >= first_slot + 3 && (argc - first_slot) % 3 == 0 &&
           (argc - first_slot) / 3 <= PVKVM_MAX_SLOTS, "invalid worker RAM slots or interrupt descriptors");
     check(cpu_count > 0, "at least one native vCPU");
@@ -111,10 +112,12 @@ int main(int argc, char **argv)
     check(bytes >= (int)sizeof(struct kvm_run), "KVM run mapping size");
     int vm = ioctl(kvm, KVM_CREATE_VM, 0);
     check(vm >= 0, "create host VM");
+    if (tss != UINT32_MAX)
+        check(ioctl(vm, KVM_SET_TSS_ADDR, tss) == 0, "reserve the host VM TSS address");
     if (irqchip) {
         check(ioctl(vm, KVM_CREATE_IRQCHIP, 0) == 0, "create the host irqchip");
         for (unsigned int gsi = 0; gsi < PVKVM_GSI_COUNT; gsi++) {
-            struct kvm_irqfd irq = {.fd = number(argv[6 + gsi], INT_MAX), .gsi = gsi};
+            struct kvm_irqfd irq = {.fd = number(argv[7 + gsi], INT_MAX), .gsi = gsi};
             check(ioctl(vm, KVM_IRQFD, &irq) == 0, "connect a host irqfd doorbell");
         }
     }

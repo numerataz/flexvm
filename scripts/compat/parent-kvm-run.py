@@ -41,7 +41,8 @@ CR4_PAE = 1 << 5
 EFER_LONG_MODE_ACTIVE = 1 << 10
 EFER_LONG_MODE_ENABLE = 1 << 8
 (OPEN_VM, CLOSE_VM, OPEN_CPU, CLOSE_CPU, RUN, GET_REGS, SET_REGS, GET_SREGS,
- GET_FPU, SET_FPU, GET_MSRS, SET_MSRS, GET_SUPPORTED_CPUID, CREATE_IRQCHIP, SET_IRQ_LINE, CREATE_PIT) = range(1, 17)
+ GET_FPU, SET_FPU, GET_MSRS, SET_MSRS, GET_SUPPORTED_CPUID, CREATE_IRQCHIP, SET_IRQ_LINE,
+ CREATE_PIT, SET_TSS_ADDR) = range(1, 18)
 FPU_VALID_AT = 48
 FPU_AT = 768
 FPU_SIZE = 416
@@ -70,6 +71,8 @@ COMPLETION_RECORD = struct.Struct("<II8s")
 IRQ_AT = 0x84200
 IRQ_RECORD = struct.Struct("<II")
 PIT_FLAGS_AT = 0x84208
+TSS_AT = 0x8420c
+FIRECRACKER_TSS_GPA = 0xfffbd000
 KVM_PIT_SPEAKER_DUMMY = 1
 GSI_COUNT = 24
 IRQ_LEVELS = [(3, 0), (3, 1), (3, 0)]
@@ -484,7 +487,7 @@ class TcgChild:
 
 
 class KvmChild:
-    def __init__(self, output, outer_ram, layouts, slots, cpu_count, irqchip, pit_flags, irq_fds):
+    def __init__(self, output, outer_ram, layouts, slots, cpu_count, irqchip, pit_flags, irq_fds, tss_gpa):
         self.process = None
         self.channel = None
         self.sigqueue = ctypes.CDLL(None, use_errno=True).sigqueue
@@ -495,8 +498,9 @@ class KvmChild:
             with worker, (output / "child.log").open("wb") as log:
                 control = worker.fileno()
                 pit_request = 0 if pit_flags is None else pit_flags + 1
+                tss_request = 0xffffffff if tss_gpa is None else tss_gpa
                 command = [output / "native-worker", str(control), str(outer_ram), str(cpu_count),
-                           str(int(irqchip)), str(pit_request), *map(str, irq_fds)]
+                           str(int(irqchip)), str(pit_request), str(tss_request), *map(str, irq_fds)]
                 for slot, layout in zip(slots, layouts, strict=True):
                     command.extend(map(str, (layout, slot.gpa, slot.identifier)))
                 self.process = subprocess.Popen(command, pass_fds=(control, outer_ram, *irq_fds, *layouts),
@@ -701,9 +705,12 @@ def read_slot_table(mailbox, ram_pages, outer_bytes, protected_entry, split_slot
     return slots
 
 
-def start_child(engine, qemu, output, control, outer_ram, slots, cpu_count, mmio, irqchip, pit_flags, irq_fds):
+def start_child(engine, qemu, output, control, outer_ram, slots, cpu_count, mmio, irqchip, pit_flags, irq_fds, tss_gpa):
     if not irqchip:
         irq_fds = ()
+    if tss_gpa is not None and any(slot.gpa < tss_gpa + 3 * PAGE_SIZE and
+                                  tss_gpa < slot.gpa + len(slot.offsets) * PAGE_SIZE for slot in slots):
+        raise RuntimeError("TSS overlaps registered guest RAM")
     with ExitStack() as manifests:
         layouts = []
         for slot in slots:
@@ -716,7 +723,7 @@ def start_child(engine, qemu, output, control, outer_ram, slots, cpu_count, mmio
                         fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SEAL)
             layouts.append(manifest)
         if engine == "kvm":
-            return KvmChild(output, outer_ram, layouts, slots, cpu_count, irqchip, pit_flags, irq_fds)
+            return KvmChild(output, outer_ram, layouts, slots, cpu_count, irqchip, pit_flags, irq_fds, tss_gpa)
         return TcgChild(qemu, output, control / "child.sock", outer_ram, layouts, slots, cpu_count, mmio,
                         pit_flags, irq_fds)
 
@@ -749,12 +756,14 @@ def verify_slot_spans(pid, slots):
 
 def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry,
              split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs, cpuid, mmio, mmio_read,
-             ioeventfd, irqchip, pit, irqfd, zero_slot):
+             ioeventfd, irqchip, pit, irqfd, zero_slot, tss):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
     expected_interruptions = TEST_INTERRUPTS if interrupt_run else 0
     expected = [OPEN_VM]
+    if tss:
+        expected.append(SET_TSS_ADDR)
     if irqchip:
         expected.append(CREATE_IRQCHIP)
         if pit:
@@ -815,6 +824,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
     pending_read = None
     irqchip_created = False
     pit_flags = None
+    tss_gpa = None
     irq_levels = []
     staged_irq_levels = []
     open_cpus = set()
@@ -835,7 +845,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 22)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 23)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
         os.ftruncate(outer_ram, outer_ram_size)
@@ -902,6 +912,11 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 supported_cpuid = model_cpuid(parent_engine, qemu, output, control, cpu_count)
                 record = pack_cpuid(supported_cpuid)
                 mapping[CPUID_AT:CPUID_AT + len(record)] = record
+            elif opcode == SET_TSS_ADDR:
+                address, = struct.unpack_from("<I", mapping, TSS_AT)
+                if length or child is not None or address != FIRECRACKER_TSS_GPA:
+                    raise RuntimeError("invalid Firecracker TSS address")
+                tss_gpa = address
             elif opcode == CREATE_IRQCHIP:
                 if length or irqchip_created:
                     raise RuntimeError("invalid irqchip creation request")
@@ -930,7 +945,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                         raise RuntimeError("unexpected total size of registered RAM")
                     slots = read_slot_table(mapping, ram_pages, outer_ram_size, protected_entry, split_slot, zero_slot)
                     child = start_child(parent_engine, qemu, output, control, outer_ram, slots,
-                                        cpu_count, mmio, irqchip_created, pit_flags, irq_fds)
+                                        cpu_count, mmio, irqchip_created, pit_flags, irq_fds, tss_gpa)
                     cleanup.callback(child.close)
                     extents = verify_slot_spans(child.process.pid, slots)
                     for line, level in staged_irq_levels:
@@ -1044,6 +1059,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 or pit and "PASS PIT woke the halted vCPU" not in guest
                 or irqfd and "PASS KVM_IRQFD woke an active run and honored deassignment and pending signals" not in guest
                 or zero_slot and "PASS zero-based RAM shared every tested page across the legacy PC region" not in guest
+                or tss and "PASS child ran with Firecracker's three-page TSS reservation" not in guest
                 or "PASS /dev/kvm returned two port I/O exits" not in guest
                 or "PASS parent KVM guest shutdown" not in guest):
             raise RuntimeError(f"parent execution proof failed; commands={observed}, see outer.log")
@@ -1081,6 +1097,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         "irqfd": irqfd,
         "tcg_irqfd_pulses": pulses,
         "zero_based_ram": zero_slot,
+        "tss_gpa": tss_gpa,
         "register_counters": counters,
         "interrupted_runs": len(child.channel.interruptions),
         "interrupted_run_ms": child.channel.interruptions,
@@ -1124,12 +1141,13 @@ def main():
     parser.add_argument("--pit", action="store_true", help="program a PIT interrupt that wakes a halted worker")
     parser.add_argument("--irqfd", action="store_true", help="wake an active run through KVM_IRQFD")
     parser.add_argument("--zero-slot", action="store_true", help="share RAM at GPA zero across the PC legacy region")
+    parser.add_argument("--tss", action="store_true", help="reserve Firecracker's x86 TSS address")
     parser.add_argument("--reject-close", action="store_true", help="verify page retention when the parent refuses close")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.mmio_read or args.ioeventfd:
         args.mmio_write = True
-    if args.pit or args.irqfd:
+    if args.pit or args.irqfd or args.tss:
         args.irqchip = True
     if args.pit and args.irqfd:
         parser.error("--pit and --irqfd use separate fixtures")
@@ -1169,7 +1187,7 @@ def main():
                                   args.protected_entry, args.split_slot, args.interrupt_run,
                                   2 if args.two_vcpus else 1, args.long_mode, args.fpu, args.msrs, args.cpuid,
                                   args.mmio_write, args.mmio_read, args.ioeventfd, args.irqchip, args.pit,
-                                  args.irqfd, args.zero_slot)))
+                                  args.irqfd, args.zero_slot, args.tss)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -1223,6 +1241,8 @@ def main():
                 oracle.append("irqfd")
             if args.zero_slot:
                 oracle.append("zero-slot")
+            if args.tss:
+                oracle.append("tss")
             HELPERS["run"](oracle, 14 if args.interrupt_run else 8, output / "native-kvm.log")
             report["same_client_passed_native_kvm"] = True
             report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
@@ -1258,6 +1278,8 @@ def main():
             files["irqfd"] = b""
         if args.zero_slot:
             files["zero-slot"] = b""
+        if args.tss:
+            files["tss"] = b""
         image = HELPERS["initramfs"](init.read_bytes(), files=files)
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
@@ -1293,6 +1315,7 @@ def main():
                             *(["--pit"] if args.pit else []),
                             *(["--irqfd"] if args.irqfd else []),
                             *(["--zero-slot"] if args.zero_slot else []),
+                            *(["--tss"] if args.tss else []),
                             *(["--reject-close"] if args.reject_close else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}
