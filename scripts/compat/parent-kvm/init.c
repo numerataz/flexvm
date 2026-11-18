@@ -53,6 +53,12 @@ static void serve_guest_network(int fd)
 
 static void run_firecracker(void)
 {
+    bool block = access("/firecracker-block", F_OK) == 0;
+    if (block) {
+        int fd = open("/tmp/drive", O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        check(fd >= 0 && ftruncate(fd, 1 << 20) == 0 && pwrite(fd, "F", 1, 0) == 1 && close(fd) == 0,
+              "prepare the nested virtio block backing file");
+    }
     pid_t echo = 0;
     if (access("/firecracker-network", F_OK) == 0) {
         persist_tap(true);
@@ -81,6 +87,8 @@ static void run_firecracker(void)
         persist_tap(false);
         puts("PASS Firecracker network echo");
     }
+    if (block)
+        check(unlink("/tmp/drive") == 0, "remove the finished nested drive");
 }
 
 #ifndef FLEXVM_PARENT_KVM_APP

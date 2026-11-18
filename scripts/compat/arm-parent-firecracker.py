@@ -13,6 +13,7 @@ import time
 
 ROOT = Path(__file__).resolve().parent
 HELPERS = runpy.run_path(str(ROOT / "software-boot.py"))
+move_public = runpy.run_path(str(ROOT / "parent-kvm-move.py"))["move_public"]
 
 
 def main():
@@ -30,13 +31,14 @@ def main():
     checkpoint.add_argument("--rollback", action="store_true", help="resume the source after aborting a completed capture")
     checkpoint.add_argument("--suspend", action="store_true", help="stop and restore both VMs through the public command")
     checkpoint.add_argument("--idle-transfer", action="store_true", help="restore before creating a nested ARM worker")
+    checkpoint.add_argument("--move", action="store_true", help="transfer the running hierarchy to a separate software host identity")
     args = parser.parse_args()
     checkpoint_test = args.freeze or args.transfer or args.rollback
     if (checkpoint_test or args.idle_transfer) and (args.bin or args.engine != "tcg"):
         parser.error("checkpoint tests require the standalone ARM TCG broker")
-    public_checkpoint = args.pause or args.suspend
+    public_checkpoint = args.pause or args.suspend or args.move
     if public_checkpoint and (not args.bin or args.engine != "tcg"):
-        parser.error("--pause and --suspend need the public ARM TCG command")
+        parser.error("--pause, --suspend and --move need the public ARM TCG command")
     if args.engine == "auto" and not args.bin:
         parser.error("--engine auto requires --bin")
     output = args.output.resolve()
@@ -86,8 +88,8 @@ def main():
             if args.pause:
                 command.extend(["--name", "arm-kvm-pause", "--verbose"])
                 during = lambda proc, deadline: pause_public(proc, deadline, log, binary, state, output)
-            if args.suspend:
-                suspend_public(command, archive, binary, state, output, log)
+            if args.suspend or args.move:
+                suspend_public(command, archive, binary, state, output, log, trusted_qemu=args.qemu if args.move else None)
             else:
                 HELPERS["run"]([*command, archive], 180, log, during=during)
     else:
@@ -127,7 +129,7 @@ def main():
         if lines.count(marker) != 1:
             raise RuntimeError(f"missing or repeated {marker}; see {log}")
     report = {"status": "passed", "nested_vcpus": args.vcpus, "parent_engine": args.engine,
-              "checkpoint": next((mode for mode in ("transfer", "freeze", "rollback", "pause", "suspend", "idle_transfer") if getattr(args, mode)), None),
+              "checkpoint": next((mode for mode in ("transfer", "freeze", "rollback", "pause", "suspend", "idle_transfer", "move") if getattr(args, mode)), None),
               "virtio_block": "read-write-flush",
               "arm_timer": "passed", "firecracker_sha256": HELPERS["digest"](args.firecracker)}
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
@@ -186,7 +188,7 @@ def pause_public(proc, deadline, log, binary, state, output):
     HELPERS["run"]([binary, "unpause", "--state", state, "arm-kvm-pause"], 15, output / "unpause.log")
 
 
-def suspend_public(command, image, binary, state, output, log):
+def suspend_public(command, image, binary, state, output, log, *, trusted_qemu=None):
     name = "arm-kvm-checkpoint"
     source, target = output / "source.log", output / "target.log"
 
@@ -203,7 +205,10 @@ def suspend_public(command, image, binary, state, output, log):
         for member in ("frontend", "worker", "broker"):
             if (checkpoint / f"parent-{member}").stat().st_size != manifest["parent"][member]["bytes"]:
                 raise RuntimeError(f"missing ARM checkpoint {member} artifact")
-        HELPERS["run"]([binary, "start", "-a", "--state", state, name], 150, target)
+        if trusted_qemu is None:
+            HELPERS["run"]([binary, "start", "-a", "--state", state, name], 150, target)
+        else:
+            move_public(binary, state, name, trusted_qemu, output, target)
     finally:
         log.write_bytes(b"".join(part.read_bytes() for part in (source, target) if part.exists()))
 

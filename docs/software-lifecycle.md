@@ -9,11 +9,11 @@ copies, and a durable local ownership journal prevents implicit replay after a
 restore has been granted CPU authority. A failed restore after that grant remains
 quarantined; it is never silently restarted from the older state.
 
-This is a local lifecycle milestone, not completion of this contract. Software
-snapshots currently use private user networking: open host network connections
-are not preserved. Cross-host migration, persistent disk transfer, routed network
-continuity, elastic memory, hierarchy ownership and explicit quarantine recovery
-remain work to implement. Unknown or older guest agents cannot checkpoint; a
+Stopped software VMs can transfer across hosts with signed ownership handoffs.
+Software snapshots currently use private user networking, and open host network
+connections close on a move. Persistent disk transfer, routed network continuity,
+elastic memory, hierarchy ownership and explicit quarantine recovery remain work
+to implement. Unknown or older guest agents cannot checkpoint; a
 current serial agent must acknowledge its request and transport barriers.
 
 `scripts/compat/software-lifecycle.py` exercises two normal CLI stop/start cycles
@@ -179,14 +179,104 @@ unsigned or unknown-host receipts cannot authorize restore. Bind the VM, source
 and destination identities, transfer ID, retired generation and complete manifest
 digest, including every disk digest. The target checks all bindings against its
 prepared state and durable generation record; a receipt is not a reusable bearer
-permission for another target or snapshot. Cross-host migration stays unavailable
-until this trust and replay protection are implemented and verified.
-The destination requires that receipt and commits its journal before resuming.
+permission for another target or snapshot. The destination requires that receipt
+and commits its journal before resuming.
 Recovery never automatically resumes an ambiguously transferred source; it
 remains fenced until the journal protocol resolves ownership. Retry receipts
 idempotently, and retain the source tombstone across owner/host restarts. Test
 every crash window, including retirement recorded before the source exits, and
 destination commit before its acknowledgment reaches the source.
+
+The transfer journals use `flexvm software-transfer`. Run `id` on the
+destination to get its host ID, then `offer VM DESTINATION` on the source
+after the software VM has stopped. The offer identifies the exact unconsumed
+checkpoint and the next generation. On the destination, use
+`prepare OFFER --source-key KEY` with the source's trusted 32-byte Ed25519
+public key in standard padded base64.
+
+On the source, `retire VM OFFER --signing-key FILE --destination-key KEY`
+pins the destination's separately configured Ed25519 public key. It checks
+that the exact checkpoint is retired and that neither its owner nor engine is still alive.
+It writes a durable restart fence keyed by VM identity before returning the
+signed receipt. The private key must be a private, locally owned regular file
+containing Ed25519 PKCS#8 DER. Keep the source checkpoint for receipt retries
+and artifact transfer. Retirement blocks local starts, including grants that
+were prepared before the fence was written. If the destination aborts, run `acknowledge-abort OFFER --signing-key FILE`
+there. It durably rejects the offer before signing the acknowledgment with the
+destination key. Its message uses the same offer encoding with the separate
+domain `flexvm/software-abort/v1` followed by a NUL. Run
+`recover ABORT-RECEIPT` at the source. A valid acknowledgment for the exact
+fence permits restart above that transfer generation. A recovered source
+retains the generation floor, and a previous acknowledgment cannot release a
+newer fence. Use portable matching artifacts on both hosts.
+
+An offer is a JSON object with these fields in wire order:
+
+1. `vm_id`
+2. `source_host`
+3. `destination_host`
+4. `transfer_id`
+5. `manifest_sha256`
+6. `generation`
+
+The first four fields are 32 lowercase hexadecimal characters. The digest is
+64 lowercase hexadecimal characters and the generation is a positive integer.
+`commit RECEIPT` verifies a JSON object containing the original `offer` and a
+standard padded base64 `signature`. The Ed25519 message is the ASCII bytes
+`flexvm/software-retirement/v1`, one NUL, and the compact JSON offer serialized
+in the field order above. The destination pins the public key and offer at
+preparation. A commit retry verifies the same receipt. `abort OFFER` permanently
+rejects that offer, and a replacement needs a higher generation and a different
+transfer ID. These commands record ownership decisions for subsequent activation.
+
+For a prepared destination and a retired source, run
+`software-transfer send VM OFFER` on the source. Pipe its stdout into
+`software-transfer receive OFFER` on the destination, for example through SSH.
+Both sides use the same offer file. The receiver enforces a 16 GiB artifact
+limit by default, configurable with `--max-bundle-mib`, and reserves disk
+space before writing each member. It publishes the bundle under
+`STATE/software-incoming/VM-ID-TRANSFER-ID` after digest verification and
+a final check that the exact offer is still pending or committed. Retrying
+the same transfer rechecks the stored bytes.
+
+The stream starts with `flexvm-software-bundle-v1` and a newline, followed by
+the four-byte big-endian header length and a JSON object with `offer` and
+`manifest`. Raw members follow in the order engine, kernel, root filesystem,
+VM state, and firmware in manifest key order. The manifest supplies every
+length and digest. A truncated, extended or corrupted stream fails verification.
+The published bundle carries artifacts and the offer identity. After the
+destination commits the retirement receipt, run
+`software-transfer activate OFFER VM --qemu FILE` there. Choose a locally
+trusted QEMU binary with exactly the engine digest and size in the bundle.
+FlexVM launches from the local descriptor, loads the guest with its CPUs
+paused, and records its one-time execution grant in the host journal before
+resuming. A retry before the grant uses the same destination name and a newer
+generation. The grant survives removal of the VM or its imported artifacts.
+After activation, ordinary destination `stop` and `start` use local checkpoints.
+
+To return to the previous host, repeat the same commands with source and
+destination reversed. The returning offer must advance the generation and
+use the host identity and signing key pinned by the last outbound handoff.
+Activate under a free name if the previous local checkpoint still holds its
+old name. That checkpoint stays fenced after the return. Only a checkpoint
+captured by the new local owner can start or transfer again.
+
+To obtain a finalized handoff proof, run
+`software-transfer acknowledge-commit OFFER --signing-key FILE` with the
+destination signing key. Pass its signed output to
+`software-transfer finalize COMMIT-ACK --signing-key FILE` with the source
+signing key. The source verifies the commit against the pinned destination key
+and records the decision before issuing the proof. The same transfer cannot
+both finalize and recover from an abort. The proof binds the preceding
+inbound offer if the VM arrived through a transfer and activated here.
+
+For a return through intermediary hosts, pass
+`--handoff-chain FILE` to `prepare`. The file is a JSON array containing
+the finalized proofs in transfer order, beginning with the first move
+after the destination's last outbound fence. For A→B→C→A, supply the
+finalized B→C proof when preparing C→A on A. Each link must name the
+preceding offer and advance the VM's generation. The final link identifies
+the returning source and key supplied to `prepare`.
 
 After load, use the guest agent to step CLOCK_REALTIME from the current host time.
 Do not reset CLOCK_MONOTONIC through the agent. Preserve the engine virtual clock
