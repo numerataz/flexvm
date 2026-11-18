@@ -227,6 +227,10 @@ def exercise_vgic(qemu, program):
             else:
                 raise RuntimeError("QEMU accepted invalid ARM boot registers")
         qmp.ask("x-flexvm-set-arm-boot-registers", boot)
+        for powered in (False, True):
+            qmp.ask("x-flexvm-arm-mp-state", {"cpu-index": 0, "runnable": powered})
+            if qmp.ask("x-flexvm-arm-mp-state", {"cpu-index": 0}) != {"runnable": powered}:
+                raise RuntimeError("ARM TCG vCPU power state did not round-trip")
         connection.sendall(b"R")
         expect(stream, struct.pack("<cBQQ", b"M", 4, aperture + PAGE + 4, 0))
         if os.pread(ram, 8, 272) != struct.pack("<Q", boot["x0"]):

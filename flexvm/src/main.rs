@@ -85,7 +85,7 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      --kernel-modules FILE: custom runtime or SDK bundle
                                      experimental foreground QEMU TCG execution without host KVM;
                                      --qemu PATH, --vsock-backend PATH, --mem MIB, --vcpus N,
-                                     --parent-kvm-bundle DIR enables a parent-owned /dev/kvm (x86_64, aarch64 with KVM)
+                                     --parent-kvm-bundle DIR enables a parent-owned /dev/kvm (x86_64, aarch64)
                                      --parent-kvm-engine auto|tcg|kvm, --parent-kvm-mem MIB (max 256)
                                      --timeout SECS (boot only); image env/workdir/user options apply
   flexvm ps [-a] [-q] [--json] [-f, --filter KEY=VALUE]... [--format FORMAT]

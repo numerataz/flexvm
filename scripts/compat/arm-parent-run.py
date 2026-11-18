@@ -15,6 +15,7 @@ import select
 import shutil
 import socket
 import struct
+import subprocess
 import tempfile
 
 ROOT = Path(__file__).resolve().parent
@@ -112,6 +113,28 @@ class NativeArm:
             raise
         self.lanes[cpu] = Lane(lane)
 
+    def irq_descriptors(self):
+        return ()
+
+    def dispatch_irqs(self, ready):
+        pass
+
+    def run_request(self, cpu, operation, completion):
+        lane = self.lanes[cpu]
+        packet = REQUEST.pack(WORKER_RUN if operation == PARENT["RUN"] else COMPLETE_READ,
+                              cpu, lane.sequence, 0, completion)
+        if lane.socket.send(packet) != REQUEST.size:
+            raise RuntimeError("short native ARM vCPU request")
+
+    def run_reply(self, cpu, operation, cancelled):
+        status, reason, payload, extra = reply_from(self.lanes[cpu].socket)
+        if extra or (reason and (status or operation != PARENT["RUN"])):
+            raise RuntimeError("invalid native ARM vCPU reply")
+        return status, reason, payload
+
+    def cancel(self, cpu):
+        self.require(CANCEL_RUN, cpu=cpu, sequence=self.lanes[cpu].sequence)
+
     def close_cpu(self, cpu):
         try:
             self.require(CLOSE_CPU, cpu=cpu)
@@ -161,9 +184,7 @@ def service_lanes(worker, cpus, mailbox, replies, ready):
             if issued != seq or operation != op or cancelled > issued:
                 raise RuntimeError("ARM frontend changed a running request")
             if lane.socket in ready:
-                status, reason, payload, extra = reply_from(lane.socket)
-                if extra or (reason and (status or op != PARENT["RUN"])):
-                    raise RuntimeError("invalid ARM vCPU reply")
+                status, reason, payload = worker.run_reply(cpu, op, cancelled == issued)
                 if not status and op == PARENT["RUN"]:
                     if reason == PARENT["KVM_EXIT_MMIO"]:
                         address, length, writing, data = struct.unpack_from("<QII8s", payload)
@@ -181,7 +202,7 @@ def service_lanes(worker, cpus, mailbox, replies, ready):
                 lane.live = None
                 lane.cancelled = False
             elif op == PARENT["RUN"] and cancelled == issued and not lane.cancelled:
-                worker.require(CANCEL_RUN, cpu=cpu, sequence=lane.sequence)
+                worker.cancel(cpu)
                 lane.cancelled = True
             continue
         if seq == ack:
@@ -190,13 +211,10 @@ def service_lanes(worker, cpus, mailbox, replies, ready):
             raise RuntimeError("invalid ARM vCPU request")
         lane.sequence += 1
         completion = offset + PARENT["LANE_COMPLETION"] + 8
-        packet = REQUEST.pack(WORKER_RUN if operation == PARENT["RUN"] else COMPLETE_READ,
-                              cpu, lane.sequence, 0, mailbox[completion:completion + 8])
-        if lane.socket.send(packet) != REQUEST.size:
-            raise RuntimeError("short ARM vCPU request")
+        worker.run_request(cpu, operation, mailbox[completion:completion + 8])
         lane.live = (seq, operation)
         if operation == PARENT["RUN"] and cancelled == seq:
-            worker.require(CANCEL_RUN, cpu=cpu, sequence=lane.sequence)
+            worker.cancel(cpu)
             lane.cancelled = True
 
 
@@ -238,7 +256,7 @@ def arm_ioctl(worker, mailbox, command, cpu, irq_fds):
     return status
 
 
-def serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, binary, outer_ram, outer_bytes, max_pages):
+def serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, create_worker, outer_ram, outer_bytes, max_pages):
     worker = None
     vm_open = False
     cpus = set()
@@ -247,7 +265,8 @@ def serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, bi
     try:
         while True:
             lanes = [lane.socket for lane in worker.lanes.values() if lane.live] if worker else []
-            readable, _, _ = select.select([exited, requests, cancellations, *lanes], [], [])
+            interrupts = worker.irq_descriptors() if worker else ()
+            readable, _, _ = select.select([exited, requests, cancellations, *lanes, *interrupts], [], [])
             if exited in readable:
                 return outer.wait()
             for fd in (requests, cancellations):
@@ -255,6 +274,7 @@ def serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, bi
                     os.eventfd_read(fd)
             if worker:
                 service_lanes(worker, cpus, mailbox, replies, readable)
+                worker.dispatch_irqs(readable)
             seq, ack, command, _, length = struct.unpack_from("<IIIII", mailbox, 8)
             if seq == ack:
                 continue
@@ -265,7 +285,12 @@ def serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, bi
             try:
                 if command == PARENT["OPEN_VM"] and not vm_open:
                     vm_type, = struct.unpack_from("<Q", mailbox, ARM_VM_TYPE_AT)
-                    worker = NativeArm(binary, vm_type)
+                    for fd in irq_fds:
+                        try:
+                            os.eventfd_read(fd)
+                        except BlockingIOError:
+                            pass
+                    worker = create_worker(vm_type)
                     vm_open = True
                     registered = False
                 elif command == PARENT["CLOSE_VM"] and vm_open and not cpus:
@@ -309,11 +334,26 @@ def serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, bi
             os.close(exited)
 
 
-def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=None, frontend=None):
-    probe = PARENT["native_query"]([worker, "--ipa-bits"])
-    if probe.returncode:
-        raise RuntimeError(probe.stderr.decode(errors="replace"))
-    ipa_bits = int(probe.stdout)
+def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=None, frontend=None,
+               engine="kvm", tcg_qemu=None, emulator_fd=None):
+    ipa_bits = None
+    if engine != "tcg":
+        try:
+            probe = PARENT["native_query"]([worker, "--ipa-bits"])
+            if not probe.returncode:
+                ipa_bits = int(probe.stdout)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        if ipa_bits is None and engine == "kvm":
+            raise RuntimeError("native ARM parent execution requires an available KVM worker")
+    use_tcg = ipa_bits is None
+    if use_tcg:
+        if tcg_qemu is None:
+            raise RuntimeError("ARM TCG parent execution requires a software CPU engine")
+        devices = PARENT["native_query"]([tcg_qemu, "-device", "help"])
+        if any(device not in devices.stdout + devices.stderr for device in (b'"flexvm-mmio-run"', b'"flexvm-shared-ram"')):
+            raise RuntimeError("ARM parent TCG requires the patched QEMU engine from scripts/build-qemu.sh")
+        ipa_bits = 40
 
     with ExitStack() as resources:
         if control is None:
@@ -361,20 +401,36 @@ def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=
             command.extend(["-blockdev", block, "-device", "virtio-blk-pci,drive=parent-kvm-module,serial=flexvm-pvkvm"])
         outer = SPAWN(command, pass_fds=(memory, *inherited))
         for fd in inherited:
-            os.close(fd)
+            if use_tcg and fd == emulator_fd:
+                resources.callback(os.close, fd)
+            else:
+                os.close(fd)
         resources.callback(PARENT["stop_process"], outer)
         resources.enter_context(PARENT["doorbell_peer"](server, mailbox_fd, requests, cancellations, irq_fds, replies))
-        return serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, worker, memory, outer_bytes, max_pages)
+        if not use_tcg:
+            def create_worker(vm_type):
+                return NativeArm(worker, vm_type)
+        else:
+            setup = {"PARENT": PARENT, "Lane": Lane}
+            tcg_worker = runpy.run_path(str(ROOT / "arm-tcg-worker.py"), init_globals=setup)["TcgArm"]
+
+            def create_worker(vm_type):
+                return tcg_worker(tcg_qemu, runtime, vm_type)
+        return serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, create_worker,
+                              memory, outer_bytes, max_pages)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("qemu", "kernel", "initrd", "worker"):
+    for name in ("qemu", "kernel", "initrd"):
         parser.add_argument("--" + name, type=Path, required=True)
+    engine = parser.add_mutually_exclusive_group(required=True)
+    engine.add_argument("--worker", type=Path)
+    engine.add_argument("--tcg", action="store_true")
     parser.add_argument("--mem", type=int, default=256)
     parser.add_argument("--child-mem", type=int, default=128)
     args = parser.parse_args()
-    if platform.machine() != "aarch64":
+    if args.worker and platform.machine() != "aarch64":
         parser.error("the native ARM parent requires an aarch64 Linux host")
     if not 128 <= args.mem <= 3072 or not 1 <= args.child_mem <= min(args.mem, 256):
         parser.error("invalid outer or child RAM size")
@@ -386,7 +442,9 @@ def main():
         "-device", "virtconsole,chardev=console,bus=serial.0", "-kernel", args.kernel.resolve(strict=True),
         "-initrd", args.initrd.resolve(strict=True), "-append", "console=hvc0 quiet panic=1 rdinit=/init",
     ]
-    return launch_arm(command, args.worker.resolve(strict=True), args.mem, args.child_mem)
+    worker = args.worker.resolve(strict=True) if args.worker else None
+    return launch_arm(command, worker, args.mem, args.child_mem, engine="tcg" if args.tcg else "kvm",
+                      tcg_qemu=command[0])
 
 
 if __name__ == "__main__":

@@ -84,7 +84,10 @@ impl ParentKvm {
         fs::write(&broker, include_bytes!("../../scripts/compat/parent-kvm-run.py"))?;
         fs::write(directory.join("software-boot.py"), include_bytes!("../../scripts/compat/software-boot.py"))?;
         #[cfg(target_arch = "aarch64")]
-        fs::write(directory.join("arm-parent-run.py"), include_bytes!("../../scripts/compat/arm-parent-run.py"))?;
+        {
+            fs::write(directory.join("arm-parent-run.py"), include_bytes!("../../scripts/compat/arm-parent-run.py"))?;
+            fs::write(directory.join("arm-tcg-worker.py"), include_bytes!("../../scripts/compat/arm-tcg-worker.py"))?;
+        }
         let mut cmd = Command::new("python3");
         cmd.arg("-I").arg(broker).args(["--serve", "--bundle"]).arg(&self.bundle).arg("--output").arg(directory);
         cmd.arg("--control").arg(runtime.dir.join("k"));
@@ -326,16 +329,13 @@ impl Config {
             if !cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) {
                 bail!("the parent KVM provider requires x86_64 or aarch64");
             }
-            if cfg!(target_arch = "aarch64") && provider.engine == "tcg" {
-                bail!("the ARM parent currently requires a native KVM worker");
-            }
             if !(1..=self.mem_mib.min(256)).contains(&provider.child_mem_mib) {
                 bail!("--parent-kvm-mem must be 1..{} MiB", self.mem_mib.min(256));
             }
             if !matches!(provider.engine.as_str(), "auto" | "tcg" | "kvm") {
                 bail!("--parent-kvm-engine must be auto, tcg, or kvm");
             }
-            if cfg!(target_arch = "aarch64") && !provider.bundle.join("native-worker").is_file() {
+            if cfg!(target_arch = "aarch64") && provider.engine == "kvm" && !provider.bundle.join("native-worker").is_file() {
                 bail!("ARM parent KVM bundle has no native-worker: {}", provider.bundle.display());
             }
             if !provider.bundle.join("flexvm-pvkvm.img").is_file() {

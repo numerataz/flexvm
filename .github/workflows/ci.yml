@@ -392,20 +392,33 @@ jobs:
               python3 scripts/compat/arm-parent-frontend.py --native \
               --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64" --kernel "$artifacts/vmlinux" \
               --bundle "$bundle" --output "$RUNNER_TEMP/arm-parent-frontend-native"
-            source scripts/versions.sh
-            stock="firecracker-$FC_VERSION-$ARCH"
-            url="https://github.com/firecracker-microvm/firecracker/releases/download/$FC_VERSION/$stock.tgz"
-            archive="$RUNNER_TEMP/$stock.tgz"
-            curl --fail --silent --show-error --location --retry 3 --output "$archive" "$url"
-            checksum=$(pinned "$url")
-            printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check --status
-            tar -xOzf "$archive" "release-$FC_VERSION-$ARCH/$stock" > "$RUNNER_TEMP/$stock"
+          fi
+          source scripts/versions.sh
+          stock="firecracker-$FC_VERSION-$ARCH"
+          url="https://github.com/firecracker-microvm/firecracker/releases/download/$FC_VERSION/$stock.tgz"
+          archive="$RUNNER_TEMP/$stock.tgz"
+          curl --fail --silent --show-error --location --retry 3 --output "$archive" "$url"
+          checksum=$(pinned "$url")
+          printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check --status
+          tar -xOzf "$archive" "release-$FC_VERSION-$ARCH/$stock" > "$RUNNER_TEMP/$stock"
+          run_arm_parent() {
+            local engine=$1
+            local cpus=$2
+            local output="$RUNNER_TEMP/arm-parent-firecracker-$engine-$cpus"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% \
+              strace -f -e trace=file -o "$output.strace" python3 scripts/compat/arm-parent-firecracker.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64" --kernel "$artifacts/vmlinux" \
+              --bundle "$bundle" --firecracker "$RUNNER_TEMP/$stock" --engine "$engine" --vcpus "$cpus" \
+              --output "$output" || { cat "$output/guest.log" >&2 || true; return 1; }
+            if [ "$engine" = tcg ] && sudo grep -F '"/dev/kvm"' "$output.strace"; then return 1; fi
+            cat "$output/report.json"
+          }
+          for cpus in 1 2; do
+            run_arm_parent tcg "$cpus"
+          done
+          if sudo "$bundle/native-worker" --ipa-bits >/dev/null 2>&1; then
             for cpus in 1 2; do
-              sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% \
-                python3 scripts/compat/arm-parent-firecracker.py \
-                --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64" --kernel "$artifacts/vmlinux" \
-                --bundle "$bundle" --firecracker "$RUNNER_TEMP/$stock" --vcpus "$cpus" \
-                --output "$RUNNER_TEMP/arm-parent-firecracker-$cpus"
+              run_arm_parent kvm "$cpus"
             done
           fi
       - name: Parent TCG worker through the guest KVM API
@@ -638,19 +651,31 @@ jobs:
       - name: Launch unchanged ARM Firecracker through FlexVM software
         if: matrix.arch == 'aarch64'
         run: |
+          source scripts/versions.sh
           bundle="$RUNNER_TEMP/arm-parent-kvm-bundle"
-          if sudo "$bundle/native-worker" --ipa-bits >/dev/null 2>&1; then
-            source scripts/versions.sh
-            output="$RUNNER_TEMP/arm-parent-firecracker-public"
+          run_public_arm() {
+            local engine=$1
+            local selected_bundle=$2
+            local output="$RUNNER_TEMP/arm-parent-firecracker-public-$engine"
             sudo systemd-run --scope --collect -p MemoryMax=1400M -p MemorySwapMax=0 -p CPUQuota=200% \
-              python3 scripts/compat/arm-parent-firecracker.py --bin target/release/flexvm \
+              strace -f -e trace=file -o "$output.strace" python3 scripts/compat/arm-parent-firecracker.py \
+              --bin target/release/flexvm --engine "$engine" \
               --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" \
-              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64" --bundle "$bundle" \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64" --bundle "$selected_bundle" \
               --firecracker "$RUNNER_TEMP/firecracker-$FC_VERSION-$ARCH" --output "$output" || {
               cat "$output/guest.log" >&2 || true
-              exit 1
+              return 1
             }
+            if [ "$engine" != kvm ] && sudo grep -F '"/dev/kvm"' "$output.strace"; then return 1; fi
             cat "$output/report.json"
+          }
+          run_public_arm tcg "$bundle"
+          software_bundle="$RUNNER_TEMP/arm-parent-software-bundle"
+          mkdir "$software_bundle"
+          cp "$bundle/flexvm-pvkvm.img" "$software_bundle/"
+          run_public_arm auto "$software_bundle"
+          if sudo "$bundle/native-worker" --ipa-bits >/dev/null 2>&1; then
+            run_public_arm kvm "$bundle"
           fi
       - name: Guest compile, DKMS, ABI rejection and loaded module lifecycle
         run: |
