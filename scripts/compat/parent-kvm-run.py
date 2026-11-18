@@ -92,6 +92,7 @@ MP_STATE_AT = 0x87480
 MP_STATE = struct.Struct("<I")
 MP_STATE_REPLY = struct.Struct("<iI")
 MP_RUNNABLE = 0
+MP_UNINITIALIZED = 1
 MP_INIT_RECEIVED = 2
 MP_SIPI_RECEIVED = 4
 XCRS_AT = 0x87500
@@ -489,9 +490,10 @@ class RegisterChannel:
 
 class TcgChild:
     def __init__(self, qemu, output, socket_path, outer_ram, layouts, slots, cpu_count, mmio_base, pit_flags, irq_fds,
-                 fixture_checks):
+                 fixture_checks, parallel):
         self.process = None
         self.channel = None
+        self.lanes = None
         self.debugger = None
         self.special_monitor = None
         self.irqchip = bool(irq_fds)
@@ -500,7 +502,9 @@ class TcgChild:
         self.memory = outer_ram
         self.data_offset = slots[-1].offsets[-1] + 0x82 if fixture_checks else None
         try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener, (output / "child.log").open("wb") as log:
+            with ExitStack() as sockets:
+                listener = sockets.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
+                log = sockets.enter_context((output / "child.log").open("wb"))
                 listener.bind(str(socket_path))
                 listener.listen(1)
                 listener.settimeout(3)
@@ -514,6 +518,15 @@ class TcgChild:
                 if mmio_base is not None:
                     exit_device += f",mmio-base={mmio_base}"
                 pit = "off" if pit_flags is None else "on"
+                lane_args = []
+                if parallel:
+                    second_path = socket_path.with_name("child1.sock")
+                    second = sockets.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
+                    second.bind(str(second_path))
+                    second.listen(1)
+                    second.settimeout(3)
+                    lane_args = ["-chardev", f"socket,id=port1,path={second_path}"]
+                    exit_device += ",parallel-chardev=port1"
                 command = [
                     qemu, *QEMU_OPTIONS, "-machine", f"pc,accel=tcg,pit={pit}", "-m", "16",
                     "-smp", str(cpu_count), "-serial", "none",
@@ -522,7 +535,7 @@ class TcgChild:
                     "-chardev", f"socket,id=regs,path={debugger_path},server=on,wait=off",
                     "-gdb", "chardev:regs",
                     "-qmp", f"unix:{self.special_monitor_path},server=on,wait=off",
-                    "-device", exit_device,
+                    *lane_args, "-device", exit_device,
                 ]
                 for slot, layout in zip(slots, layouts, strict=True):
                     command.extend(["-device", f"flexvm-shared-ram,id=slot{slot.identifier},"
@@ -530,6 +543,9 @@ class TcgChild:
                 self.process = subprocess.Popen(command, pass_fds=(outer_ram, *layouts), stdout=log, stderr=log)
                 connection, _ = listener.accept()
                 self.channel = RunChannel(connection, irq_fds, self.pulse_irq)
+                if parallel:
+                    other_connection, _ = second.accept()
+                    self.lanes = RunLanes([self.channel, RunChannel(other_connection)])
                 self.debugger = RegisterChannel(debugger_path)
                 description = self.debugger.exchange("qXfer:features:read:target.xml:0,fff")
                 if b'<xi:include href="i386-64bit.xml"/>' not in description:
@@ -538,7 +554,10 @@ class TcgChild:
                 for cpu in range(cpu_count):
                     self.debugger.select_cpu(cpu)
                     self.debugger.write(18, 4, 0)  # Real-mode code segment with zero base.
-                    status, _ = self.mp_state(cpu, None if irq_fds else MP_RUNNABLE)
+                    state = MP_RUNNABLE if not irq_fds else None
+                    if irq_fds and parallel and cpu:
+                        state = MP_UNINITIALIZED
+                    status, _ = self.mp_state(cpu, state)
                     if status:
                         raise RuntimeError("TCG could not initialize the vCPU multiprocessing state")
         except BaseException:
@@ -690,17 +709,19 @@ class TcgChild:
                 self.debugger.close()
                 self.debugger = None
         finally:
-            if self.channel is not None:
+            if self.lanes is not None:
+                self.lanes.close()
+            elif self.channel is not None:
                 self.channel.close()
             if self.process is not None:
                 stop_process(self.process)
                 self.process = None
 
 
-class NativeRunLanes:
-    def __init__(self, control, sockets):
-        self.control = control
-        self.connections = [RunChannel(connection) for connection in sockets]
+class RunLanes:
+    def __init__(self, connections, native_control=None):
+        self.native_control = native_control
+        self.connections = connections
         self.live = {}
         self.cancelling = set()
         self.pending_inputs = {}
@@ -722,7 +743,8 @@ class NativeRunLanes:
                 if self.live[cpu] != (seq, command) or cancelled > seq:
                     raise RuntimeError("parallel vCPU changed an outstanding run")
                 if channel.connection in ready:
-                    self.complete(cpu, channel.read_exit(), cancelled, mailbox, offset, replies)
+                    packet = channel.connection.recv(2) if command == COMPLETE_READ else channel.read_exit()
+                    self.complete(cpu, packet, cancelled, mailbox, offset, replies)
                 elif command == RUN and seq == cancelled:
                     self.cancel(cpu, seq)
                 continue
@@ -736,10 +758,14 @@ class NativeRunLanes:
             if command == COMPLETE_READ:
                 if not completion:
                     raise RuntimeError("parallel completion needs outstanding I/O")
-                request = struct.pack("<cB", b"E", cpu) + completion
+                request = bytes((ord("E"), cpu)) if self.native_control else b"E"
             else:
                 self.run_count += 1
-                request = struct.pack("<cBI", b"R", cpu, seq) + completion
+                if self.native_control:
+                    request = struct.pack("<cBI", b"R", cpu, seq)
+                else:
+                    request = b"D" if completion else bytes((ord("R") + cpu,))
+            request += completion
             channel.connection.sendall(request)
             self.live[cpu] = (seq, command)
             self.max_in_flight = max(self.max_in_flight, len(self.live))
@@ -748,7 +774,10 @@ class NativeRunLanes:
 
     def cancel(self, cpu, seq):
         if cpu not in self.cancelling:
-            self.control.sendall(struct.pack("<cBI", b"I", cpu, seq))
+            if self.native_control:
+                self.native_control.sendall(struct.pack("<cBI", b"I", cpu, seq))
+            else:
+                self.connections[cpu].connection.sendall(b"I")
             self.cancelling.add(cpu)
 
     def complete(self, cpu, packet, cancelled, mailbox, offset, replies):
@@ -816,7 +845,7 @@ class KvmChild:
                                                 stdout=log, stderr=log)
             self.channel = RunChannel(connection)
             if sockets:
-                self.lanes = NativeRunLanes(connection, sockets)
+                self.lanes = RunLanes([RunChannel(parent) for parent in sockets], native_control=connection)
         except BaseException:
             connection.close()
             for parent in sockets:
@@ -1364,7 +1393,7 @@ def start_child(engine, qemu, output, control, outer_ram, slots, cpu_count, mmio
         if engine == "kvm":
             return KvmChild(output, outer_ram, layouts, slots, cpu_count, irqchip, pit_flags, irq_fds, tss_gpa, parallel)
         return TcgChild(qemu, output, control / "child.sock", outer_ram, layouts, slots, cpu_count, mmio_base,
-                        pit_flags, irq_fds, fixture_checks)
+                        pit_flags, irq_fds, fixture_checks, parallel)
 
 
 def verify_slot_spans(pid, slots):
@@ -1622,7 +1651,9 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 if cancellations in readable:
                     os.eventfd_read(cancellations)
                 if lanes:
-                    lanes.service(mapping, readable, open_cpus, started_cpus, replies)
+                    child.channel.dispatch_irqs(readable, running=bool(lanes.live))
+                    if parent_engine == "kvm" or len(started_cpus) == cpu_count:
+                        lanes.service(mapping, readable, open_cpus, started_cpus, replies)
                 request_seq, reply_seq = struct.unpack_from("<II", mapping, 8)
                 if requests not in readable or request_seq == reply_seq:
                     continue
@@ -2216,8 +2247,8 @@ def main():
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     firecracker = args.firecracker is not None
-    if args.firecracker_vcpus > 1 and (not firecracker or args.parent_engine != "kvm"):
-        parser.error("parallel Firecracker requires the native parent engine")
+    if args.firecracker_vcpus > 1 and not firecracker:
+        parser.error("--firecracker-vcpus requires --firecracker")
     if firecracker:
         if args.native_oracle or args.reject_close or (args.two_vcpus and args.firecracker_vcpus == 1):
             parser.error("--firecracker needs a normal parent boot")

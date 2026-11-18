@@ -480,6 +480,7 @@ jobs:
             cat "$output/report.json"
           }
           run_parent_firecracker tcg
+          run_parent_firecracker tcg 2
           if sudo python3 -c 'import fcntl, os; fd = os.open("/dev/kvm", os.O_RDWR); assert fcntl.ioctl(fd, 0xAE00) == 12; fcntl.ioctl(fd, 0xAE01, 0)' 2>/dev/null; then
             sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
               --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
