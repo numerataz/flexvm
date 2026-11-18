@@ -420,6 +420,7 @@ jobs:
             case "${3-}" in
               --freeze) output="$output-freeze" ;;
               --transfer) output="$output-transfer" ;;
+              --rollback) output="$output-rollback" ;;
             esac
             shift 2
             sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% \
@@ -435,6 +436,7 @@ jobs:
           done
           run_arm_parent tcg 2 --freeze
           run_arm_parent tcg 2 --transfer
+          run_arm_parent tcg 2 --rollback
           if sudo "$bundle/native-worker" --ipa-bits >/dev/null 2>&1; then
             for cpus in 1 2; do
               run_arm_parent kvm "$cpus"
