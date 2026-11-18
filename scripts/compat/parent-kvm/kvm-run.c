@@ -69,6 +69,12 @@
 #define XSAVE_XMM_OFFSET 160
 #define XSAVE_BITMAP_OFFSET 512
 #define XSAVE_YMM_HIGH_OFFSET 576
+#define EVENTS_ENTRY_OFFSET 0xe00
+#define EVENTS_GP_OFFSET 0xa00
+#define EVENTS_NMI_OFFSET 0xa20
+#define EVENTS_IRQ_OFFSET 0xa40
+#define EVENTS_IRQ_VECTOR 34
+#define EVENTS_ERROR_CODE 0x4320
 #define MMIO_BASE 0xd0000000ULL
 #define MMIO_FIRST_VALUE 0x5a443322U
 #define MMIO_SECOND_VALUE 0xaabbccddeeff0011ULL
@@ -689,6 +695,156 @@ static void set_mp_state(int cpu, unsigned int value)
     struct kvm_mp_state state = {.mp_state = value};
 
     check(ioctl(cpu, KVM_SET_MP_STATE, &state) == 0, "set vCPU multiprocessing state");
+}
+
+static struct kvm_vcpu_events read_vcpu_events(int cpu)
+{
+    struct kvm_vcpu_events events;
+
+    check(ioctl(cpu, KVM_GET_VCPU_EVENTS, &events) == 0, "read the live x86 vCPU events");
+    return events;
+}
+
+static void write_vcpu_events(int cpu, struct kvm_vcpu_events *events)
+{
+    check(ioctl(cpu, KVM_SET_VCPU_EVENTS, events) == 0, "restore the x86 vCPU events");
+}
+
+static void stage_vcpu_events(int kvm, int cpu)
+{
+    check(ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_VCPU_EVENTS) > 0, "check x86 vCPU event support");
+    struct kvm_vcpu_events events = read_vcpu_events(cpu);
+
+    check(!events.nmi.pending && !events.nmi.masked && !events.exception.injected, "read reset event state");
+    events.exception.injected = 1;
+    events.exception.nr = 2;
+    check(ioctl(cpu, KVM_SET_VCPU_EVENTS, &events) == -1 && errno == EINVAL,
+          "reject NMI through the exception field");
+    events.exception.injected = 0;
+    events.exception.nr = 0;
+    events.flags = KVM_VCPUEVENT_VALID_NMI_PENDING;
+    events.nmi.pending = 1;
+    events.nmi.masked = 1;
+    write_vcpu_events(cpu, &events);
+    events.flags = 0;
+    events.nmi.pending = 0;
+    write_vcpu_events(cpu, &events);
+    events = read_vcpu_events(cpu);
+    check(events.nmi.pending && events.nmi.masked, "preserve staged NMI pending when the flag is clear");
+}
+
+static void prepare_event_handlers(unsigned char *ram, uint32_t gpa)
+{
+    const unsigned char gp[] = {
+        0x58,                              /* pop the architectural error code */
+        0x89, 0x87, 0x10, 0x03, 0, 0, 0xcf,
+    };
+    const unsigned char nmi[] = {
+        0xfe, 0x87, 0x14, 0x03, 0, 0, 0xcf,
+    };
+    const unsigned char irq[] = {
+        0xfe, 0x87, 0x15, 0x03, 0, 0, 0xcf,
+    };
+    const struct {
+        unsigned int vector;
+        uint32_t offset;
+        const unsigned char *code;
+        size_t length;
+    } vectors[] = {
+        {13, EVENTS_GP_OFFSET, gp, sizeof(gp)},
+        {2, EVENTS_NMI_OFFSET, nmi, sizeof(nmi)},
+        {EVENTS_IRQ_VECTOR, EVENTS_IRQ_OFFSET, irq, sizeof(irq)},
+    };
+
+    for (size_t i = 0; i < sizeof(vectors) / sizeof(vectors[0]); i++) {
+        uint32_t handler = gpa + vectors[i].offset;
+        const uint32_t gate[] = {(handler & 0xffff) | (8 << 16), (handler & 0xffff0000) | 0x8e00};
+
+        memcpy(ram + PIC_IDT_OFFSET + vectors[i].vector * 8, gate, sizeof(gate));
+        memcpy(ram + vectors[i].offset, vectors[i].code, vectors[i].length);
+    }
+}
+
+static void run_event_checkpoint(int cpu, struct kvm_run *run, int size, uint64_t gpa)
+{
+    timed_run(cpu);
+    check_output(run, size, 0x8b);
+    check_registers(cpu, 0x8b, 0x7a41, gpa + EVENTS_ENTRY_OFFSET);
+}
+
+static void test_vcpu_events(int cpu, struct kvm_run *run, int size, unsigned char *ram, unsigned char *data,
+                             uint64_t gpa, uint64_t data_address)
+{
+    const unsigned char program[] = {
+        0xb0, 0x8b, 0xe6, 0x30,
+        0xb0, 0x8b, 0xe6, 0x30,
+        0xb0, 0x8b, 0xe6, 0x30, 0xf4,
+    };
+    const struct kvm_regs regs = {
+        .rcx = 0x7a41, .rsp = gpa + 0xf00, .rdi = data_address,
+        .rip = gpa + EVENTS_ENTRY_OFFSET, .rflags = 0x202,
+    };
+    uint32_t error_code;
+
+    memcpy(ram + EVENTS_ENTRY_OFFSET, program, sizeof(program));
+    check(ioctl(cpu, KVM_SET_REGS, &regs) == 0, "configure the VMM event test");
+    struct kvm_vcpu_events events = read_vcpu_events(cpu);
+
+    check(events.nmi.pending && events.nmi.masked && !data[0x314], "staged NMI remains masked during real execution");
+    events.flags = 0;
+    events.nmi.masked = 0;
+    write_vcpu_events(cpu, &events);
+    run_event_checkpoint(cpu, run, size, gpa);
+    events = read_vcpu_events(cpu);
+    check(data[0x314] == 1 && !events.nmi.pending, "unmasking delivered the saved NMI to the guest");
+
+    events.flags = KVM_VCPUEVENT_VALID_SHADOW;
+    events.interrupt.shadow = KVM_X86_SHADOW_INT_STI;
+    events.exception.injected = 1;
+    events.exception.nr = 13;
+    events.exception.has_error_code = 1;
+    events.exception.error_code = EVENTS_ERROR_CODE;
+    write_vcpu_events(cpu, &events);
+    events = read_vcpu_events(cpu);
+    check(events.exception.injected && events.exception.error_code == EVENTS_ERROR_CODE &&
+          (events.interrupt.shadow & KVM_X86_SHADOW_INT_STI), "read the restored exception and interrupt shadow");
+    run_event_checkpoint(cpu, run, size, gpa);
+    memcpy(&error_code, data + 0x310, sizeof(error_code));
+    events = read_vcpu_events(cpu);
+    check(error_code == EVENTS_ERROR_CODE && !events.exception.injected, "guest handled the restored exception");
+
+    events.flags = 0;
+    events.interrupt.injected = 1;
+    events.interrupt.nr = EVENTS_IRQ_VECTOR;
+    write_vcpu_events(cpu, &events);
+    run_event_checkpoint(cpu, run, size, gpa);
+    events = read_vcpu_events(cpu);
+    check(data[0x315] == 1 && !events.interrupt.injected, "guest handled the restored interrupt");
+}
+
+static void test_event_sipi_vector(int cpu)
+{
+    struct kvm_vcpu_events events = {
+        .flags = KVM_VCPUEVENT_VALID_SMM,
+        .nmi.masked = 1,
+        .smi = {.smm = 1, .pending = 1, .smm_inside_nmi = 1, .latched_init = 1},
+    };
+    struct kvm_sregs startup;
+
+    write_vcpu_events(cpu, &events);
+    events = read_vcpu_events(cpu);
+    check(events.smi.smm && events.smi.pending && events.smi.smm_inside_nmi &&
+          events.smi.latched_init, "read the restored SMM and latched INIT state");
+    events = (struct kvm_vcpu_events) {
+        .flags = KVM_VCPUEVENT_VALID_SMM | KVM_VCPUEVENT_VALID_SIPI_VECTOR,
+        .sipi_vector = 8,
+    };
+    write_vcpu_events(cpu, &events);
+    set_mp_state(cpu, KVM_MP_STATE_SIPI_RECEIVED);
+    check(read_mp_state(cpu) == KVM_MP_STATE_RUNNABLE && ioctl(cpu, KVM_GET_SREGS, &startup) == 0 &&
+          startup.cs.base == 0x8000 && startup.cs.selector == 0x800,
+          "restore a nonzero SIPI vector through the event and MP state ioctls");
+    puts("PASS real x86 exception, NMI, IRQ and nonzero startup vector");
 }
 
 static void stage_mp_state(int kvm, int cpu, uint64_t gpa)
@@ -1489,6 +1645,7 @@ int main(int argc, char **argv)
     bool mp_state = false;
     bool xcrs = false;
     bool xsave = false;
+    bool vcpu_events = false;
     bool irqfd = false;
     bool zero_slot = false;
     bool tss = false;
@@ -1533,6 +1690,8 @@ int main(int argc, char **argv)
             xcrs = true;
         else if (!xsave && !strcmp(argv[i], "xsave"))
             xsave = true;
+        else if (!vcpu_events && !strcmp(argv[i], "vcpu-events"))
+            vcpu_events = true;
         else if (!irqfd && !strcmp(argv[i], "irqfd"))
             irqfd = true;
         else if (!zero_slot && !strcmp(argv[i], "zero-slot"))
@@ -1578,6 +1737,8 @@ int main(int argc, char **argv)
           "use a single protected vCPU with CPUID and XSAVE support");
     check(!xsave || (cpuid && !xcrs && !two_vcpus && protected_mode && !irqchip && !long_mode && !mmio),
           "use a single protected vCPU with CPUID and AVX support");
+    check(!vcpu_events || (irqchip && !pit && !irqfd && !irqchip_state && !mp_state),
+          "use a separate PIC fixture for vCPU events");
     check(!debugregs || (protected_mode && !two_vcpus && !zero_slot && !long_mode &&
                          !mmio && !irqchip && !cpuid), "use the single-vCPU protected debug fixture");
     check(!irqfd || (irqchip && !pit), "test IRQFD in a separate PIC vCPU run");
@@ -1871,6 +2032,8 @@ int main(int argc, char **argv)
     }
     if (irqchip)
         prepare_pic(vm, ram, gpa, pit, lapic, irqchip_state, pit_state);
+    if (vcpu_events)
+        prepare_event_handlers(ram, gpa);
     if (zero_slot)
         prepare_zero_slot(ram, zero_slot_offsets, sizeof(zero_slot_offsets) / sizeof(zero_slot_offsets[0]));
     if (pvh) {
@@ -1936,6 +2099,8 @@ int main(int argc, char **argv)
         stage_xcrs(kvm, cpu);
     if (xsave)
         stage_xsave(kvm, cpu);
+    if (vcpu_events)
+        stage_vcpu_events(kvm, cpu);
     if (fpu)
         prepare_fpu(cpu);
     if (msrs)
@@ -2059,6 +2224,8 @@ int main(int argc, char **argv)
             reconfigure_lapic(cpu);
         if (irqchip_state)
             check_live_irqchip_state(vm);
+        if (vcpu_events)
+            test_vcpu_events(cpu, run, size, ram, data, gpa, data_address);
         check(!data[0xf8], "wait for a real IRQ before running the guest handler");
         set_irq_line(vm, PIC_GSI, 1);
     }
@@ -2106,6 +2273,8 @@ int main(int argc, char **argv)
             test_ioapic(vm, cpu, run, size, ram, data, gpa, data_address);
         if (mp_state)
             test_mp_state(vm, cpu, run, size, ram, data, gpa, data_address);
+        if (vcpu_events)
+            test_event_sipi_vector(cpu);
         close(vm);
     }
     if (tss)

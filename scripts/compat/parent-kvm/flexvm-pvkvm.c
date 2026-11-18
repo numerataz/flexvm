@@ -125,6 +125,7 @@ struct pvcpu {
 	unsigned int id;
 	unsigned int read_bytes;
 	u32 staged_mp_state;
+	u8 sipi_vector;
 	bool read_pio;
 	bool ran;
 	bool fpu_set;
@@ -991,13 +992,13 @@ static long cpu_mp_state(struct pvcpu *cpu, bool write, struct kvm_mp_state __us
 	result = read_stopped_registers(cpu, PVKVM_GET_MP_STATE, PVKVM_MP_STATE_AT,
 					&state, sizeof(state));
 	if (!result && !cpu->ran && cpu->staged_sipi_pending) {
-		/* A pre-run query can consume the SIPI with its reset vector. */
+		/* A pre-run query can consume the SIPI and install its vector. */
 		if (state.mp_state == KVM_MP_STATE_RUNNABLE &&
 		    (cpu->staged_mp_state == KVM_MP_STATE_INIT_RECEIVED ||
 		     cpu->staged_mp_state == KVM_MP_STATE_SIPI_RECEIVED)) {
 			cpu->regs.rip = 0;
-			cpu->sregs.cs.base = 0;
-			cpu->sregs.cs.selector = 0;
+			cpu->sregs.cs.base = (u32)cpu->sipi_vector << 12;
+			cpu->sregs.cs.selector = (u16)cpu->sipi_vector << 8;
 		}
 		cpu->staged_sipi_pending = false;
 	}
@@ -1161,6 +1162,39 @@ static long cpu_xsave(struct pvcpu *cpu, bool write, struct kvm_xsave __user *us
 	return result;
 }
 
+static long cpu_events(struct pvcpu *cpu, bool write, struct kvm_vcpu_events __user *user)
+{
+	const u32 valid_flags = KVM_VCPUEVENT_VALID_NMI_PENDING | KVM_VCPUEVENT_VALID_SIPI_VECTOR |
+				KVM_VCPUEVENT_VALID_SHADOW | KVM_VCPUEVENT_VALID_SMM;
+	struct kvm_vcpu_events events;
+	int result;
+
+	if (write) {
+		if (copy_from_user(&events, user, sizeof(events)))
+			return -EFAULT;
+		if ((events.flags & ~valid_flags) ||
+		    (events.exception.injected && (events.exception.nr > 31 || events.exception.nr == 2)))
+			return -EINVAL;
+		/* Payload and triple-fault reporting require capabilities this VM has not enabled. */
+		events.exception.pending = 0;
+		events.exception_has_payload = 0;
+		events.exception_payload = 0;
+		events.triple_fault.pending = 0;
+		memset(events.reserved, 0, sizeof(events.reserved));
+		result = write_stopped_registers(cpu, PVKVM_SET_VCPU_EVENTS, PVKVM_VCPU_EVENTS_AT,
+						 &events, sizeof(events));
+		if (!result && (events.flags & KVM_VCPUEVENT_VALID_SIPI_VECTOR) &&
+		    READ_ONCE(cpu->vm->irqchip_created))
+			cpu->sipi_vector = events.sipi_vector;
+		return result;
+	}
+	result = read_stopped_registers(cpu, PVKVM_GET_VCPU_EVENTS, PVKVM_VCPU_EVENTS_AT,
+					&events, sizeof(events));
+	if (!result && copy_to_user(user, &events, sizeof(events)))
+		return -EFAULT;
+	return result;
+}
+
 static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct pvcpu *cpu = file->private_data;
@@ -1298,6 +1332,10 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case KVM_SET_XSAVE:
 		result = cpu_xsave(cpu, cmd == KVM_SET_XSAVE, uarg);
 		break;
+	case KVM_GET_VCPU_EVENTS:
+	case KVM_SET_VCPU_EVENTS:
+		result = cpu_events(cpu, cmd == KVM_SET_VCPU_EVENTS, uarg);
+		break;
 	case KVM_RUN:
 		if (arg || cpu->sregs.cs.base || !registers_fit_mode(&cpu->regs, &cpu->sregs) ||
 		    (!(cpu->sregs.cr0 & X86_CR0_PE) && cpu->regs.rip > U16_MAX)) {
@@ -1388,6 +1426,7 @@ static long device_capability(unsigned long capability)
 	case KVM_CAP_MP_STATE:
 	case KVM_CAP_XCRS:
 	case KVM_CAP_XSAVE:
+	case KVM_CAP_VCPU_EVENTS:
 		return 1;
 	case KVM_CAP_NR_MEMSLOTS:
 		return PVKVM_MAX_SLOTS;
@@ -2017,8 +2056,10 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	BUILD_BUG_ON(sizeof(struct kvm_xcrs) != PVKVM_XCRS_BYTES);
 	BUILD_BUG_ON(PVKVM_XCRS_AT + PVKVM_XCRS_BYTES > PVKVM_XSAVE_AT);
 	BUILD_BUG_ON(sizeof(struct kvm_xsave) != PVKVM_XSAVE_BYTES);
+	BUILD_BUG_ON(PVKVM_XSAVE_AT + PVKVM_XSAVE_BYTES > PVKVM_VCPU_EVENTS_AT);
+	BUILD_BUG_ON(sizeof(struct kvm_vcpu_events) != PVKVM_VCPU_EVENTS_BYTES);
 	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
-	    pci_resource_len(dev, 2) < PVKVM_XSAVE_AT + PVKVM_XSAVE_BYTES)
+	    pci_resource_len(dev, 2) < PVKVM_VCPU_EVENTS_AT + PVKVM_VCPU_EVENTS_BYTES)
 		return -ENODEV;
 	result = pcim_enable_device(dev);
 	if (result)

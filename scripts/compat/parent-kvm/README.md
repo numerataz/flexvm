@@ -123,6 +123,9 @@ Add `--lapic` to read the reset xAPIC image, stage LINT0 and LINT1 before
 the first run, and update the stopped controller. The guest receives a PIC
 interrupt through the installed state, then changes LINT1 through MMIO.
 The test checks that restoring ICR contents does not send an interrupt.
+Use `--vcpu-events --protected-entry` to restore a masked pending NMI,
+deliver an exception with its error code and an interrupt, then restore
+SMM flags and a nonzero startup vector from the VMM.
 Use `--xsave --protected-entry` to verify the standard 4 KiB XSAVE image.
 The guest reads the staged and restored x87 control word, MXCSR, and both
 halves of YMM0. The VMM also observes guest changes and checks how the
