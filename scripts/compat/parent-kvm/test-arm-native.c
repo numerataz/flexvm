@@ -68,7 +68,7 @@ static int register_slot(int control, unsigned int slot, uint64_t address, int r
 static int open_lane(int control, unsigned int cpu)
 {
     int link[2];
-    ASSERT(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, link) == 0);
+    ASSERT(socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, link) == 0);
     struct flexvm_arm_request request = {.command = FLEXVM_ARM_OPEN_LANE, .cpu = cpu};
     ASSERT(pass_descriptors(control, request, &link[1], 1) == 0);
     ASSERT(close(link[1]) == 0);
@@ -115,6 +115,26 @@ static void set_core(int control, struct result *result, unsigned int cpu, size_
     write_and_read_register(control, result, cpu, core_id(offset), &value, sizeof(value));
 }
 
+static pid_t start_worker(const char *path, int ipa_bits, int link[2])
+{
+    ASSERT(socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, link) == 0);
+    pid_t worker = fork();
+    ASSERT(worker >= 0);
+    if (!worker) {
+        close(link[0]);
+        ASSERT(fcntl(link[1], F_SETFD, 0) == 0);
+        char peer_arg[24], ipa_arg[24];
+        snprintf(peer_arg, sizeof(peer_arg), "%d", link[1]);
+        snprintf(ipa_arg, sizeof(ipa_arg), "%d", ipa_bits > 48 ? 48 : ipa_bits);
+        execl(path, path, peer_arg, ipa_arg, NULL);
+        _exit(127);
+    }
+    close(link[1]);
+    ASSERT(!read_reply(link[0]).status);
+
+    return worker;
+}
+
 int main(int argc, char *argv[])
 {
     ASSERT(argc == 2);
@@ -152,19 +172,7 @@ int main(int argc, char *argv[])
     ASSERT(ipa_bits >= 32);
     ASSERT(close(kvm) == 0);
     int link[2];
-    ASSERT(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, link) == 0);
-    pid_t worker = fork();
-    ASSERT(worker >= 0);
-    if (!worker) {
-        close(link[0]);
-        char peer_arg[24], ipa_arg[24];
-        snprintf(peer_arg, sizeof(peer_arg), "%d", link[1]);
-        snprintf(ipa_arg, sizeof(ipa_arg), "%d", ipa_bits > 48 ? 48 : ipa_bits);
-        execl(argv[1], argv[1], peer_arg, ipa_arg, NULL);
-        _exit(127);
-    }
-    close(link[1]);
-    ASSERT(!read_reply(link[0]).status);
+    pid_t worker = start_worker(argv[1], ipa_bits, link);
 
     struct result result;
     ASSERT(send(link[0], "?", 1, MSG_NOSIGNAL) == 1);
@@ -227,6 +235,10 @@ int main(int argc, char *argv[])
     reply = read_reply(lane[0]);
     ASSERT(!reply.status && reply.exit_reason == KVM_EXIT_MMIO && reply.mmio.address == 0x10000000 &&
            reply.mmio.length == 4 && !reply.mmio.is_write);
+    int checkpoint = memfd_create("arm-native-core-checkpoint", MFD_ALLOW_SEALING | MFD_CLOEXEC);
+    ASSERT(checkpoint >= 0);
+    struct flexvm_arm_request save = {.command = FLEXVM_ARM_SAVE_CORE};
+    ASSERT(pass_descriptors(link[0], save, &checkpoint, 1) == -EBUSY);
     uint32_t flags[2];
     ASSERT(pread(ram, flags, sizeof(flags), offsets[1] + 8) == sizeof(flags) && flags[0] == 1 && flags[1] == 1);
     struct flexvm_arm_request future = {.command = FLEXVM_ARM_CANCEL_RUN, .cpu = 1, .sequence = 2};
@@ -261,6 +273,32 @@ int main(int argc, char *argv[])
     uint64_t x1;
     memcpy(&x1, reply.reg_data, sizeof(x1));
     ASSERT(!reply.status && x1 == pattern);
+
+    ASSERT(pass_descriptors(link[0], save, &checkpoint, 1) == 0);
+    ASSERT(fcntl(checkpoint, F_ADD_SEALS, seals | F_SEAL_WRITE) == 0);
+    int target[2];
+    pid_t replacement = start_worker(argv[1], ipa_bits, target);
+    ASSERT(!exchange(target[0], (struct flexvm_arm_request){.command = FLEXVM_ARM_CREATE_VCPU}, &result).status);
+    ASSERT(!exchange(target[0], (struct flexvm_arm_request){.command = FLEXVM_ARM_INIT_VCPU, .init = init}, &result).status);
+    struct flexvm_arm_request restore = {.command = FLEXVM_ARM_RESTORE_CORE};
+    int malformed = memfd_create("arm-native-malformed-core", MFD_CLOEXEC);
+    off_t size = lseek(checkpoint, 0, SEEK_END);
+    ASSERT(size > 0 && malformed >= 0 && ftruncate(malformed, size) == 0);
+    ASSERT(pass_descriptors(target[0], restore, &malformed, 1) == -EINVAL && close(malformed) == 0);
+    ASSERT(pass_descriptors(target[0], restore, &checkpoint, 1) == 0 && close(checkpoint) == 0);
+    reply = exchange(target[0], read_x1, &result);
+    memcpy(&x1, reply.reg_data, sizeof(x1));
+    ASSERT(!reply.status && x1 == pattern);
+    const struct flexvm_arm_request read_vector = {
+        .command = FLEXVM_ARM_GET_ONE_REG,
+        .reg = {.id = register_namespace | KVM_REG_SIZE_U128 | offsetof(struct kvm_regs, fp_regs.vregs[0]) / sizeof(uint32_t)},
+    };
+    reply = exchange(target[0], read_vector, &result);
+    ASSERT(!reply.status && !memcmp(reply.reg_data, vector, sizeof(vector)));
+    close(target[0]);
+    int replacement_status;
+    ASSERT(waitpid(replacement, &replacement_status, 0) == replacement && WIFEXITED(replacement_status) && !WEXITSTATUS(replacement_status));
+    puts("PASS native ARM checkpoint restored core and vector state in a fresh worker");
     run.sequence++;
     send_run(lane[0], run);
     reply = read_reply(lane[0]);
