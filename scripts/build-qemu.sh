@@ -43,8 +43,9 @@ patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-pio-exit.patch"
 patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-io-completion.patch"
 patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-pio-boundaries.patch"
 patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-pvh-sregs.patch"
+patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-irqchip-state.patch"
 cp "$scripts_dir/compat/parent-kvm/slot-map.h" include/hw/misc/flexvm-slot-map.h
-./configure --prefix="$prefix" --target-list=x86_64-softmmu --with-pkgversion=flexvm-tcg-nested-26 \
+./configure --prefix="$prefix" --target-list=x86_64-softmmu --with-pkgversion=flexvm-tcg-nested-27 \
   --disable-docs --disable-tools --disable-guest-agent --disable-werror \
   --disable-download --disable-gtk --disable-sdl --disable-vnc \
   --disable-opengl --disable-curses --enable-slirp --enable-seccomp

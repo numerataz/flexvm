@@ -410,6 +410,10 @@ jobs:
           cat "$RUNNER_TEMP/parent-kvm-irqchip/report.json"
           sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
             --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-irqchip-state" --ram-pages 64 --split-slot --protected-entry --irqchip-state --lapic
+          cat "$RUNNER_TEMP/parent-kvm-irqchip-state/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
             --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-irqfd" --ram-pages 64 --split-slot --protected-entry --irqfd
           cat "$RUNNER_TEMP/parent-kvm-irqfd/report.json"
           sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
@@ -457,6 +461,10 @@ jobs:
               --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
               --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-irqchip" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --protected-entry --pit --tss --lapic --pio-boundary --complete-read
             cat "$RUNNER_TEMP/parent-kvm-native-irqchip/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-irqchip-state" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --protected-entry --irqchip-state --lapic
+            cat "$RUNNER_TEMP/parent-kvm-native-irqchip-state/report.json"
             sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
               --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
               --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-irqfd" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --protected-entry --irqfd
@@ -524,9 +532,15 @@ jobs:
             ${{ runner.temp }}/parent-kvm-irqchip/*.json
             ${{ runner.temp }}/parent-kvm-irqchip/*.log
             ${{ runner.temp }}/parent-kvm-irqchip/*.strace
+            ${{ runner.temp }}/parent-kvm-irqchip-state/*.json
+            ${{ runner.temp }}/parent-kvm-irqchip-state/*.log
+            ${{ runner.temp }}/parent-kvm-irqchip-state/*.strace
             ${{ runner.temp }}/parent-kvm-native-irqchip/*.json
             ${{ runner.temp }}/parent-kvm-native-irqchip/*.log
             ${{ runner.temp }}/parent-kvm-native-irqchip/*.strace
+            ${{ runner.temp }}/parent-kvm-native-irqchip-state/*.json
+            ${{ runner.temp }}/parent-kvm-native-irqchip-state/*.log
+            ${{ runner.temp }}/parent-kvm-native-irqchip-state/*.strace
             ${{ runner.temp }}/parent-kvm-irqfd/*.json
             ${{ runner.temp }}/parent-kvm-irqfd/*.log
             ${{ runner.temp }}/parent-kvm-irqfd/*.strace

@@ -93,6 +93,20 @@ struct pending_read {
     size_t length;
 };
 
+static void reset_irqchips(void)
+{
+    int kvm = host_kvm();
+    int vm = ioctl(kvm, KVM_CREATE_VM, 0);
+    check(vm >= 0 && ioctl(vm, KVM_CREATE_IRQCHIP, 0) == 0, "create a host reset irqchip");
+    for (unsigned int id = 0; id < KVM_NR_IRQCHIPS; id++) {
+        struct kvm_irqchip chip = {.chip_id = id};
+        check(ioctl(vm, KVM_GET_IRQCHIP, &chip) == 0, "read the host reset irqchip");
+        check(write(STDOUT_FILENO, &chip, sizeof(chip)) == sizeof(chip), "write the reset irqchip image");
+    }
+    close(vm);
+    close(kvm);
+}
+
 static struct pending_read reply_run(int control, struct kvm_run *run, int mapping_bytes)
 {
     if (run->exit_reason == KVM_EXIT_MMIO) {
@@ -136,6 +150,10 @@ int main(int argc, char **argv)
     }
     if (argc == 4 && !strcmp(argv[1], "--reset-sregs")) {
         reset_state(number(argv[2], PVKVM_MAX_CPUS - 1), number(argv[3], 1), KVM_GET_SREGS);
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--reset-irqchips")) {
+        reset_irqchips();
         return 0;
     }
     check(argc >= 10, "expected control, outer RAM, vCPU count, device configuration, and slots");
@@ -267,6 +285,19 @@ int main(int argc, char **argv)
             check(irqchip && irq.irq < PVKVM_GSI_COUNT && irq.level <= 1 &&
                   ioctl(vm, KVM_IRQ_LINE, &irq) == 0, "set a host IRQ line");
             check(write(control, "L", 1) == 1, "acknowledge host IRQ line state");
+            continue;
+        }
+        if (received == 2 + sizeof(struct kvm_irqchip) && (request[0] == 'J' || request[0] == 'K')) {
+            struct kvm_irqchip chip;
+            bool write_state = request[0] == 'K';
+            memcpy(&chip, request + 2, sizeof(chip));
+            check(irqchip && chip.chip_id < KVM_NR_IRQCHIPS &&
+                  ioctl(vm, write_state ? KVM_SET_IRQCHIP : KVM_GET_IRQCHIP, &chip) == 0,
+                  "access the host irqchip state");
+            if (write_state)
+                check(write(control, "K", 1) == 1, "acknowledge host irqchip state");
+            else
+                check(write(control, &chip, sizeof(chip)) == sizeof(chip), "return host irqchip state");
             continue;
         }
         if (received == 2 && request[0] == 'F') {

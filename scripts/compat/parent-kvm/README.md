@@ -123,6 +123,10 @@ Add `--lapic` to read the reset xAPIC image, stage LINT0 and LINT1 before
 the first run, and update the stopped controller. The guest receives a PIC
 interrupt through the installed state, then changes LINT1 through MMIO.
 The test checks that restoring ICR contents does not send an interrupt.
+Add `--irqchip-state` to read and update the parent PIC and IOAPIC state.
+The VMM installs an IOAPIC route before the first run, reads the live PIC
+configuration, and verifies that the new IOAPIC route delivers a guest
+interrupt. Both parent engines operate on their live controllers.
 Add `--pio` to exercise VMM-owned x86 ports. The client gets the port,
 direction, width, count, and data in its mapped run area. It supplies bytes
 for scalar and repeated input before re-entering the vCPU. The test also
