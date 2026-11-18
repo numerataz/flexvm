@@ -14,12 +14,12 @@ import struct
 PARENT = runpy.run_path(str(Path(__file__).with_name("parent-kvm-run.py")))
 BASE = 0x1000
 PORT = 0x500
-LEAF = 0x40000000
+LEAF = 0x40000100
 VALUE = 0x12345678
 # Load AL, report it, and stay in a loop after the I/O exit is completed.
 PROGRAM = bytes.fromhex("ba0005 b021 ee ebfe")
 # Continue at the same guest RIP and report the retained AL and CPUID.
-CONTINUE = bytes.fromhex("fec0 ee 66b800000040 0fa2 ba0005 66ef f4")
+CONTINUE = bytes.fromhex("fec0 ee 66b800010040 0fa2 ba0005 66ef f4")
 
 
 def memfd(stack, name, size):
@@ -78,6 +78,11 @@ def main():
     args = parser.parse_args()
     args.output.mkdir()
     page = PARENT["PAGE_SIZE"]
+    staged_clock = 900_000_000_000
+    configured_msrs = [(0x176, 0x13571357), (0x4b564d00, BASE + 0x180), (0x4b564d01, (BASE + 0x200) | 1)]
+    signature = struct.unpack("<III", b"KVMKVMKVM\0\0\0")
+    cpuid = [(0x40000000, 0, 0, 0x40000001, *signature),
+             (0x40000001, 0, 0, 0x9, 0, 0, 0), (LEAF, 0, 0, VALUE, 0, 0, 0)]
     with ExitStack() as owned:
         state = memfd(owned, "x86-native-state", 0)
         source = memfd(owned, "x86-native-source", page)
@@ -89,7 +94,10 @@ def main():
             regs = [0] * 18
             regs[16:] = [BASE, 2]
             child.set_registers(0, PARENT["REGISTERS"].pack(*regs))
-            child.set_cpuid(0, [(LEAF, 0, 0, VALUE, 0, 0, 0)])
+            child.set_cpuid(0, cpuid)
+            status, _ = child.clock(PARENT["CLOCK_DATA"].pack(staged_clock, 0, 0, 0))
+            if status or child.access_msrs(0, configured_msrs, True) != configured_msrs:
+                raise RuntimeError("native source rejected the configured clock or MSR")
             begin(1)
             finish(1)
             if child.lanes.written_pio != [(PORT, 1, b"\x21")]:
@@ -123,6 +131,11 @@ def main():
             child.checkpoint_file(state, restore=True)
             if child.registers(0) != original:
                 raise RuntimeError("native target did not recover the exact source registers")
+            status, clock = child.clock()
+            if status or not staged_clock <= PARENT["CLOCK_DATA"].unpack(clock)[0] < staged_clock + 2_000_000_000:
+                raise RuntimeError("native target did not recover the source VM clock")
+            if child.access_msrs(0, [(index, 0) for index, _ in configured_msrs], False) != configured_msrs:
+                raise RuntimeError("native target did not recover the configured MSR")
             child.freeze_run_control(False)
             begin(1)
             finish(1)
@@ -130,7 +143,7 @@ def main():
             finish(2)
             if child.lanes.written_pio != [(PORT, 1, b"\x22"), (PORT, 4, struct.pack("<I", VALUE))]:
                 raise RuntimeError(f"native target lost CPU or CPUID state: {child.lanes.written_pio!r}")
-    print("PASS native x86 worker restored registers and CPUID on different parent RAM")
+    print("PASS native x86 worker restored registers, CPUID, clock and MSRs on different parent RAM")
 
 
 if __name__ == "__main__":
