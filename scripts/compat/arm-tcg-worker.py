@@ -2,6 +2,7 @@
 """ARM CPU execution for the parent-owned KVM device using QEMU TCG."""
 from contextlib import ExitStack
 import errno
+import fcntl
 import os
 from pathlib import Path
 import shutil
@@ -37,6 +38,7 @@ class TcgArm:
             raise OSError(errno.EINVAL, "unsupported ARM TCG VM type")
         self.qemu = qemu
         self.runtime = runtime
+        self.vm_type = vm_type
         self.checkpoint = checkpoint
         self.lanes = {}
         self.channels = {}
@@ -190,7 +192,7 @@ class TcgArm:
             raise OSError(errno.EEXIST, "ARM TCG lane already exists")
         self.lanes[cpu] = Lane(self.channels[cpu].connection)
 
-    def start(self):
+    def start(self, *, incoming=None):
         if set(self.cpus) not in ({0}, {0, 1}) or self.cpus.keys() != self.initialized or not self.slots:
             raise OSError(errno.EINVAL, "incomplete ARM TCG boot configuration")
         if not {(VGIC, 4, 0), (ITS, 4, 0)} <= self.device_config.keys():
@@ -210,6 +212,8 @@ class TcgArm:
             "-m", "16", "-smp", str(len(self.cpus)), "-nodefaults", "-display", "none", "-serial", "none",
             "-monitor", "none", "-nic", "none", "-no-reboot", "-S", "-qmp", f"unix:{tmp / 'qmp'},server=on,wait=off",
         ]
+        if incoming is not None:
+            command.extend(["-incoming", "defer"])
         descriptors = []
         for slot, address, ram, layout in self.slots:
             device = f"flexvm-shared-ram,id=slot{slot},ram-fd={ram},layout-fd={layout},addr={address}"
@@ -240,12 +244,85 @@ class TcgArm:
         self.qmp = PARENT["HELPERS"]["QMP"](tmp / "qmp", self.proc, time.monotonic() + 3)
         self.process_resources.callback(self.qmp.close)
         self.ask("x-flexvm-map-arm-gic", gic)
+        if incoming is not None:
+            self.freeze_run_control(True)
+            self.qmp.deadline = time.monotonic() + 30
+            transfer(self.qmp, incoming, incoming=True)
+            if self.ask("query-status", {})["status"] != "paused":
+                raise RuntimeError("restored ARM worker is not paused")
+            return
         for cpu, values in self.cpus.items():
             self.ask("x-flexvm-set-arm-boot-registers", {
                 "cpu-index": cpu, "pc": values[CORE_PC], "x0": values[CORE_X0], "pstate": values[CORE_PSTATE],
             })
             if self.powered[cpu] != (cpu == 0):
                 self.ask("x-flexvm-arm-mp-state", {"cpu-index": cpu, "runnable": self.powered[cpu]})
+
+    def capture(self, fd):
+        self.qmp.deadline = time.monotonic() + 30
+        transfer(self.qmp, fd)
+
+    def profile(self):
+        return {
+            "vm_type": self.vm_type,
+            "cpus": sorted(self.cpus),
+            "lanes": sorted(self.lanes),
+            "devices": sorted(self.devices),
+            "attributes": [[*key, value] for key, value in sorted(self.device_config.items())],
+            "irqs": sorted(set(self.irq_by_fd.values())),
+            "slots": [[slot, address, os.pread(layout, os.fstat(layout).st_size, 0).hex()]
+                      for slot, address, _, layout in self.slots],
+        }
+
+    def restore(self, profile, ram, irq_fds, incoming, max_pages, outer_bytes):
+        if profile["cpus"] not in ([0], [0, 1]) or not set(profile["lanes"]) <= set(profile["cpus"]):
+            raise RuntimeError("invalid ARM checkpoint CPU topology")
+        for cpu in profile["cpus"]:
+            self.require(CREATE_CPU, cpu=cpu)
+            self.require(INIT_CPU, cpu=cpu,
+                         data=struct.pack("<8I", CORTEX_A57, PSCI_0_2 | (POWER_OFF if cpu else 0), *(0,) * 6))
+        for kind in profile["devices"]:
+            self.require(CREATE_DEVICE, data=struct.pack("<IIIIQQ", kind, 0, 0, 0, 0, 0))
+        for kind, group, attr, value in profile["attributes"]:
+            self.require(SET_DEVICE_ATTR, data=struct.pack("<IIIIQQ", kind, 0, group, 0, attr, value))
+        if len(set(profile["irqs"])) != len(profile["irqs"]):
+            raise RuntimeError("duplicate ARM checkpoint IRQ route")
+        for gsi in profile["irqs"]:
+            if not 0 <= gsi < len(irq_fds):
+                raise RuntimeError("invalid ARM checkpoint IRQ route")
+            self.require(BIND_IRQFD, data=struct.pack("<I", gsi), fds=(irq_fds[gsi],))
+        seen_slots = set()
+        seen_offsets = set()
+        extents = []
+        page = PARENT["PAGE_SIZE"]
+        for slot, address, encoded in profile["slots"]:
+            if not 0 <= slot < 8 or slot in seen_slots or address < MMIO_LAST or address % page:
+                raise RuntimeError("invalid ARM checkpoint slot identity")
+            wire = bytes.fromhex(encoded)
+            if not wire or len(wire) % 8:
+                raise RuntimeError("invalid ARM checkpoint slot layout")
+            offsets = struct.unpack(f"<{len(wire) // 8}Q", wire)
+            if (len(set(offsets)) != len(offsets) or any(offset % page or offset + page > outer_bytes or
+                    offset in seen_offsets for offset in offsets) or len(seen_offsets) + len(offsets) > max_pages):
+                raise RuntimeError("invalid ARM checkpoint slot offsets")
+            end = address + len(offsets) * page
+            if end > 0xc0000000 or any(address < old_end and old_address < end for old_address, old_end in extents):
+                raise RuntimeError("overlapping ARM checkpoint slots")
+            seen_slots.add(slot)
+            seen_offsets.update(offsets)
+            extents.append((address, end))
+            fd = os.memfd_create("restored-arm-slot", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+            try:
+                if os.pwrite(fd, wire, 0) != len(wire):
+                    raise RuntimeError("short ARM checkpoint slot layout write")
+                fcntl.fcntl(fd, fcntl.F_ADD_SEALS, fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK |
+                            fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SEAL)
+                self.require(REGISTER_RAM, data=struct.pack("<QII", address, slot, 0), fds=(ram, fd))
+            finally:
+                os.close(fd)
+        self.start(incoming=incoming)
+        for cpu in profile["lanes"]:
+            self.add_lane(cpu)
 
     def freeze_run_control(self, frozen):
         if self.qmp and self.proc.poll() is None:

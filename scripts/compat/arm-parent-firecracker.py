@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Run released ARM Firecracker through FlexVM's owned KVM device."""
 import argparse
+from contextlib import ExitStack
 import json
+import re
 from pathlib import Path
 import runpy
 import socket
@@ -21,10 +23,12 @@ def main():
     parser.add_argument("--engine", choices=("auto", "tcg", "kvm"), default="kvm")
     parser.add_argument("--vcpus", type=int, choices=(1, 2), default=2)
     parser.add_argument("--cc", default="cc")
-    parser.add_argument("--freeze", action="store_true", help="freeze and thaw the direct ARM TCG run lanes")
+    checkpoint = parser.add_mutually_exclusive_group()
+    checkpoint.add_argument("--freeze", action="store_true", help="freeze and thaw the direct ARM TCG run lanes")
+    checkpoint.add_argument("--transfer", action="store_true", help="retire and restore the ARM parent and its nested worker")
     args = parser.parse_args()
-    if args.freeze and (args.bin or args.engine != "tcg"):
-        parser.error("--freeze requires the standalone ARM TCG broker")
+    if (args.freeze or args.transfer) and (args.bin or args.engine != "tcg"):
+        parser.error("checkpoint tests require the standalone ARM TCG broker")
     if args.engine == "auto" and not args.bin:
         parser.error("--engine auto requires --bin")
     output = args.output.resolve()
@@ -34,7 +38,7 @@ def main():
     mode = ["-DFLEXVM_ARM_FIRECRACKER_APP"] if args.bin else []
     HELPERS["run"]([*cc, *mode, ROOT / "parent-kvm/arm-firecracker-init.c", "-o", outer], 30, output / "outer-build.log")
     inner_flags = [f"-DFLEXVM_ARM_TEST_CPUS={args.vcpus}"]
-    if args.freeze:
+    if args.freeze or args.transfer:
         inner_flags.append("-DFLEXVM_ARM_TEST_CHECKPOINT")
     HELPERS["run"]([*cc, *inner_flags, ROOT / "parent-kvm/arm-block-init.c", "-o", inner],
                    30, output / "inner-build.log")
@@ -77,7 +81,9 @@ def main():
             sys.executable, ROOT / "arm-parent-run.py", "--qemu", args.qemu, "--kernel", kernel,
             "--initrd", cpio, "--mem", "384", *options,
         ]
-        if args.freeze:
+        if args.transfer:
+            transfer_checkpoint(command, output, log)
+        elif args.freeze:
             with tempfile.TemporaryDirectory(prefix="flexvm-arm-freeze-") as directory:
                 runtime = Path(directory) / "parent"
                 command.extend(["--checkpoint-control", runtime])
@@ -92,38 +98,100 @@ def main():
         "PASS ARM Firecracker architected timer",
         "PASS stock ARM Firecracker used the parent-owned KVM device",
     )
-    if args.freeze:
+    if args.freeze or args.transfer:
         markers += ("PASS ARM Firecracker resumed after checkpoint freeze",)
+        before = [line.rsplit(" ", 1)[-1] for line in lines if line.startswith("ARM Firecracker checkpoint canary ")]
+        after = [line.rsplit(" ", 1)[-1] for line in lines if line.startswith("ARM Firecracker restored canary ")]
+        if len(before) != 1 or before != after or not re.fullmatch("[0-9a-f]{16}", before[0]):
+            raise RuntimeError(f"ARM checkpoint lost the guest's memory canary; see {log}")
     for marker in markers:
         if lines.count(marker) != 1:
             raise RuntimeError(f"missing or repeated {marker}; see {log}")
     report = {"status": "passed", "nested_vcpus": args.vcpus, "parent_engine": args.engine,
+              "checkpoint": "transfer" if args.transfer else "freeze" if args.freeze else None,
               "virtio_block": "read-write-flush",
               "arm_timer": "passed", "firecracker_sha256": HELPERS["digest"](args.firecracker)}
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print("PASS stock ARM Firecracker executes through the parent KVM device")
 
 
-def freeze_and_thaw(proc, deadline, runtime, log):
+def wait_checkpoint_window(proc, deadline, log):
     while "ARM Firecracker checkpoint window" not in log.read_text(errors="replace"):
         if proc.poll() is not None or time.monotonic() >= deadline:
             raise RuntimeError("ARM nested guest did not enter the checkpoint window")
         time.sleep(.01)
+
+
+def connect_checkpoint(control, proc, deadline, runtime):
+    control.settimeout(min(15, deadline - time.monotonic()))
+    while True:
+        try:
+            control.connect(str(runtime / "checkpoint"))
+            return
+        except (FileNotFoundError, ConnectionRefusedError):
+            if proc.poll() is not None or time.monotonic() >= deadline:
+                raise RuntimeError("ARM checkpoint control did not become accessible")
+            time.sleep(.01)
+
+
+def checkpoint_request(control, request, fds=()):
+    if fds:
+        socket.send_fds(control, [request], fds)
+    else:
+        control.sendall(request)
+    reply = control.recv(64)
+    if reply != b"ok":
+        raise RuntimeError(f"ARM checkpoint control refused {request!r}: {reply!r}")
+
+
+def freeze_and_thaw(proc, deadline, runtime, log):
+    wait_checkpoint_window(proc, deadline, log)
     with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as control:
-        control.settimeout(min(8, deadline - time.monotonic()))
-        control.connect(str(runtime / "checkpoint"))
-
-        def ask(request):
-            control.sendall(request)
-            reply = control.recv(64)
-            if reply != b"ok":
-                raise RuntimeError(f"ARM checkpoint control refused {request!r}: {reply!r}")
-
-        ask(b"freeze")
+        connect_checkpoint(control, proc, deadline, runtime)
+        checkpoint_request(control, b"freeze")
         time.sleep(6)
         if proc.poll() is not None or "PASS ARM Firecracker resumed after checkpoint freeze" in log.read_text(errors="replace"):
             raise RuntimeError("the nested guest advanced while its vCPUs were fenced")
-        ask(b"thaw")
+        checkpoint_request(control, b"thaw")
+
+
+def transfer_checkpoint(command, output, log):
+    with ExitStack() as resources:
+        root = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix="flexvm-arm-transfer-")))
+        source, target = root / "source", root / "target"
+        source_log, target_log = output / "source.log", output / "target.log"
+        files = [resources.enter_context(tempfile.TemporaryFile()) for _ in range(3)]
+        fds = tuple(file.fileno() for file in files)
+
+        def capture(proc, deadline):
+            wait_checkpoint_window(proc, deadline, source_log)
+            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as control:
+                connect_checkpoint(control, proc, deadline, source)
+                checkpoint_request(control, b"freeze")
+                checkpoint_request(control, b"save", fds)
+                control.sendall(b"retire")
+                if control.recv(64):
+                    raise RuntimeError("source did not retire after capture")
+
+        HELPERS["run"]([*command, "--checkpoint-control", source], 90, source_log, during=capture)
+        for file in files:
+            file.seek(0)
+        if "PASS ARM Firecracker resumed" in source_log.read_text(errors="replace"):
+            raise RuntimeError("the source resumed after capture")
+
+        def resume(proc, deadline):
+            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as control:
+                connect_checkpoint(control, proc, deadline, target)
+                checkpoint_request(control, b"thaw")
+                monitor = HELPERS["QMP"](target / "outer-qmp", proc, deadline)
+                try:
+                    monitor.ask("cont")
+                finally:
+                    monitor.close()
+
+        HELPERS["run"]([*command, "--checkpoint-control", target, "--restore-fds", *map(str, fds)],
+                       90, target_log, during=resume, pass_fds=fds)
+        log.write_bytes(source_log.read_bytes() + target_log.read_bytes())
 
 
 if __name__ == "__main__":
