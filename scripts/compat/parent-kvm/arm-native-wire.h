@@ -14,10 +14,12 @@ enum flexvm_arm_command {
     FLEXVM_ARM_GET_ONE_REG,
     FLEXVM_ARM_SET_ONE_REG,
     FLEXVM_ARM_RUN,
+    FLEXVM_ARM_REGISTER_RAM,
 };
 
 #define FLEXVM_ARM_MAX_REGS 4096
 #define FLEXVM_ARM_MAX_CPUS 2
+#define FLEXVM_ARM_MAX_SLOTS 8
 #define FLEXVM_ARM_MAX_REG_BYTES 256
 #define FLEXVM_ARM_RAM_BASE UINT64_C(0x40000000)
 #define FLEXVM_ARM_RAM_LIMIT UINT64_C(0xc0000000)
@@ -31,6 +33,11 @@ struct flexvm_arm_request {
             uint64_t id;
             uint8_t data[FLEXVM_ARM_MAX_REG_BYTES];
         } reg;
+        struct {
+            uint64_t address;
+            uint32_t slot;
+            uint32_t reserved;
+        } ram;
         uint64_t count;
         uint8_t completion[8];
     };
