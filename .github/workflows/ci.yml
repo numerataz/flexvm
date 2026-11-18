@@ -399,6 +399,12 @@ jobs:
             --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64" --kernel "$artifacts/vmlinux" \
             --bundle "$bundle" --output "$RUNNER_TEMP/arm-parent-frontend-checkpoint"
           if grep -F '"/dev/kvm"' "$trace"; then exit 1; fi
+          trace="$RUNNER_TEMP/arm-parent-frontend-initial-state.strace"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% \
+            strace -f -e trace=file -o "$trace" python3 scripts/compat/arm-parent-frontend.py --initial-state \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64" --kernel "$artifacts/vmlinux" \
+            --bundle "$bundle" --output "$RUNNER_TEMP/arm-parent-frontend-initial-state"
+          if sudo grep -F '"/dev/kvm"' "$trace"; then exit 1; fi
           if sudo "$bundle/native-worker" --ipa-bits >/dev/null 2>&1; then
             sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% \
               python3 scripts/compat/arm-parent-frontend.py --native \
@@ -719,6 +725,7 @@ jobs:
             ${{ runner.temp }}/arm-parent-frontend.strace
             ${{ runner.temp }}/arm-parent-frontend/*.log
             ${{ runner.temp }}/arm-parent-frontend-native/*.log
+            ${{ runner.temp }}/arm-parent-frontend-initial-state/*.log
             ${{ runner.temp }}/arm-parent-firecracker-*/*.log
             ${{ runner.temp }}/arm-parent-firecracker-*/*.json
             ${{ runner.temp }}/parent-kvm-run/*.json

@@ -30,6 +30,7 @@ POWER_OFF = 1
 MMIO_FIRST = 0x40000000
 MMIO_LAST = 0x80000000
 SYSTEM_EVENT = 24
+STAGED_WORKER_STATE = b"FLEXVM ARM staged worker\n"
 
 
 class TcgArm:
@@ -259,11 +260,15 @@ class TcgArm:
                 self.ask("x-flexvm-arm-mp-state", {"cpu-index": cpu, "runnable": self.powered[cpu]})
 
     def capture(self, fd):
-        self.qmp.deadline = time.monotonic() + 30
-        transfer(self.qmp, fd)
+        if self.proc is None:
+            if os.write(fd, STAGED_WORKER_STATE) != len(STAGED_WORKER_STATE):
+                raise RuntimeError("short ARM staged worker state write")
+        else:
+            self.qmp.deadline = time.monotonic() + 30
+            transfer(self.qmp, fd)
 
     def profile(self):
-        return {
+        profile = {
             "vm_type": self.vm_type,
             "cpus": sorted(self.cpus),
             "lanes": sorted(self.lanes),
@@ -273,14 +278,48 @@ class TcgArm:
             "slots": [[slot, address, os.pread(layout, os.fstat(layout).st_size, 0).hex()]
                       for slot, address, _, layout in self.slots],
         }
+        if self.proc is None:
+            profile["boot"] = {
+                "registers": [[self.cpus[cpu][register] for register in CORE_REGISTERS] for cpu in profile["cpus"]],
+                "powered": [self.powered.get(cpu) for cpu in profile["cpus"]],
+            }
+        return profile
+
+    def restore_cpus(self, profile, incoming):
+        cpus, lanes = profile["cpus"], profile["lanes"]
+        if "boot" in profile:
+            size = len(STAGED_WORKER_STATE)
+            if os.fstat(incoming).st_size != size or os.pread(incoming, size, 0) != STAGED_WORKER_STATE:
+                raise RuntimeError("invalid ARM staged worker state")
+            boot = profile["boot"]
+            if lanes or cpus not in ([], [0], [1], [0, 1]) or len(boot["powered"]) != len(cpus) or len(boot["registers"]) != len(cpus):
+                raise RuntimeError("invalid ARM staged CPU topology")
+            powered, registers = boot["powered"], boot["registers"]
+        else:
+            if cpus not in ([0], [0, 1]) or len(set(lanes)) != len(lanes) or not set(lanes) <= set(cpus):
+                raise RuntimeError("invalid ARM checkpoint CPU topology")
+            powered, registers = [not cpu for cpu in cpus], [None] * len(cpus)
+        for cpu, runnable, values in zip(cpus, powered, registers, strict=True):
+            self.require(CREATE_CPU, cpu=cpu)
+            if runnable is not None:
+                if type(runnable) is not bool:
+                    raise RuntimeError("invalid ARM staged CPU power state")
+                self.require(INIT_CPU, cpu=cpu,
+                             data=struct.pack("<8I", CORTEX_A57, PSCI_0_2 | (POWER_OFF if cpu else 0), *(0,) * 6))
+                if self.powered[cpu] != runnable:
+                    mp_state = MP_RUNNABLE if runnable else MP_STOPPED
+                    self.require(SET_MP_STATE, cpu=cpu, data=struct.pack("<I", mp_state))
+            if values is not None:
+                if len(values) != len(CORE_REGISTERS) or any(type(value) is not int or not 0 <= value < 1 << 64 for value in values):
+                    raise RuntimeError("invalid ARM staged CPU registers")
+                for register, value in zip(CORE_REGISTERS, values, strict=True):
+                    if runnable is not None:
+                        self.require(SET_REG, cpu=cpu, data=struct.pack("<QQ", register, value))
+                    elif value != self.cpus[cpu][register]:
+                        raise RuntimeError("uninitialized ARM vCPU has staged registers")
 
     def restore(self, profile, ram, irq_fds, incoming, max_pages, outer_bytes):
-        if profile["cpus"] not in ([0], [0, 1]) or not set(profile["lanes"]) <= set(profile["cpus"]):
-            raise RuntimeError("invalid ARM checkpoint CPU topology")
-        for cpu in profile["cpus"]:
-            self.require(CREATE_CPU, cpu=cpu)
-            self.require(INIT_CPU, cpu=cpu,
-                         data=struct.pack("<8I", CORTEX_A57, PSCI_0_2 | (POWER_OFF if cpu else 0), *(0,) * 6))
+        self.restore_cpus(profile, incoming)
         for kind in profile["devices"]:
             self.require(CREATE_DEVICE, data=struct.pack("<IIIIQQ", kind, 0, 0, 0, 0, 0))
         for kind, group, attr, value in profile["attributes"]:
@@ -320,9 +359,10 @@ class TcgArm:
                 self.require(REGISTER_RAM, data=struct.pack("<QII", address, slot, 0), fds=(ram, fd))
             finally:
                 os.close(fd)
-        self.start(incoming=incoming)
-        for cpu in profile["lanes"]:
-            self.add_lane(cpu)
+        if "boot" not in profile:
+            self.start(incoming=incoming)
+            for cpu in profile["lanes"]:
+                self.add_lane(cpu)
 
     def freeze_run_control(self, frozen):
         if self.qmp and self.proc.poll() is None:
