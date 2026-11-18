@@ -19,6 +19,7 @@
 #define PVKVM_LAPIC_VALID_AT 56
 #define PVKVM_FEATURES_AT    60
 #define PVKVM_FEATURE_PARALLEL_RUN 1
+#define PVKVM_FEATURE_ARM 2
 #define PVKVM_SLOT_TABLE_AT  640
 #define PVKVM_SLOT_RECORD_SIZE 16
 #define PVKVM_FPU_AT         768
@@ -53,6 +54,16 @@
 #define PVKVM_CLOCK_AT        0x89100
 #define PVKVM_CLOCK_BYTES     48
 #define PVKVM_RAM_LIMIT_AT    0x89130
+#define PVKVM_ARM_IPA_BITS_AT 0x89138
+#define PVKVM_ARM_VM_TYPE_AT  0x89140
+#define PVKVM_ARM_INIT_AT     0x89300
+#define PVKVM_ARM_REG_AT      0x89400
+#define PVKVM_ARM_EVENT_AT    0x89520
+#define PVKVM_ARM_REGS_AT     0x96000
+#define PVKVM_ARM_REG_BYTES   256
+#define PVKVM_ARM_MAX_REGS    4096
+#define PVKVM_ARM_RAM_BASE    0x40000000ULL
+
 #define PVKVM_LANES_AT        0x90000
 #define PVKVM_LANE_STRIDE     0x2000
 #define PVKVM_LANE_REQUEST    0
@@ -62,6 +73,7 @@
 #define PVKVM_LANE_CANCEL     16
 #define PVKVM_LANE_EXIT       32
 #define PVKVM_LANE_COMPLETE   64
+#define PVKVM_LANE_ARM_EVENT  128
 #define PVKVM_LANE_PIO        0x1000
 #define PVKVM_IOAPIC_GPA     0xfec00000ULL
 #define PVKVM_GSI_COUNT      24
@@ -82,6 +94,7 @@
 #define PVKVM_CANCEL_VECTOR  1
 #define PVKVM_IRQFD_VECTOR   2
 
+#if defined(__x86_64__)
 struct pvkvm_msr_batch {
 	__u32 count;
 	__u32 reserved;
@@ -92,6 +105,19 @@ struct pvkvm_cpuid_table {
 	__u32 count;
 	__u32 reserved;
 	struct kvm_cpuid_entry2 entries[PVKVM_CPUID_MAX];
+};
+
+#endif
+
+struct pvkvm_arm_register {
+	__u64 id;
+	__u8 data[PVKVM_ARM_REG_BYTES];
+};
+
+struct pvkvm_arm_event {
+	__u32 type;
+	__u32 count;
+	__u64 data[16];
 };
 
 struct pvkvm_run_exit {
@@ -147,6 +173,11 @@ enum pvkvm_command {
 	PVKVM_GET_CLOCK,
 	PVKVM_SET_CLOCK,
 	PVKVM_PREPARE_RUN,
+	PVKVM_ARM_PREFERRED_TARGET,
+	PVKVM_ARM_INIT_VCPU,
+	PVKVM_ARM_GET_REG_LIST,
+	PVKVM_ARM_GET_ONE_REG,
+	PVKVM_ARM_SET_ONE_REG,
 };
 
 #endif

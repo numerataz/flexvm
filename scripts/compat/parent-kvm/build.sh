@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build the x86 guest frontend and optional native worker with a prepared guest kernel tree.
+# Build the guest frontend and optional native worker with a prepared guest kernel tree.
 set -euo pipefail
 umask 022
 
@@ -11,10 +11,25 @@ fi
 source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 kernel_build=$(realpath -e -- "$1")
 output=$(realpath -m -- "$2")
-if [[ $(uname -m) != x86_64 ]] ||
-   ! grep -Fxq 'CONFIG_X86_64=y' "$kernel_build/.config" ||
-   ! grep -Fxq 'CONFIG_MODULES=y' "$kernel_build/.config"; then
-  echo 'the parent KVM provider needs a prepared x86_64 guest kernel tree with modules enabled' >&2
+if ! grep -Fxq 'CONFIG_MODULES=y' "$kernel_build/.config"; then
+  echo 'the parent KVM provider needs a prepared guest kernel tree with modules enabled' >&2
+  exit 2
+fi
+if grep -Fxq 'CONFIG_X86_64=y' "$kernel_build/.config"; then
+  kernel_arch=x86
+  target=x86_64
+  worker=native-worker.c
+elif grep -Fxq 'CONFIG_ARM64=y' "$kernel_build/.config"; then
+  kernel_arch=arm64
+  target=aarch64
+  worker=arm-native-worker.c
+else
+  echo 'the parent KVM provider supports x86_64 and aarch64 kernel trees' >&2
+  exit 2
+fi
+cross=${CROSS_COMPILE:-}
+if [[ $(uname -m) != "$target" && -z $cross ]]; then
+  echo "set CROSS_COMPILE for the $target guest kernel" >&2
   exit 2
 fi
 
@@ -36,8 +51,8 @@ publish=
 trap 'rm -rf -- "$work" "${publish:-}"' EXIT
 publish=$(mktemp -d -- "$parent/.parent-kvm-build.XXXXXXXX")
 mkdir -- "$work/module" "$publish/bundle"
-cp -- "$source_dir"/{Makefile,mailbox.h,flexvm-pvkvm.c} "$work/module/"
-env -u KVM -u LOCALVERSION make -j2 -C "$kernel_build" "M=$work/module" modules
+cp -- "$source_dir"/{Makefile,mailbox.h,flexvm-pvkvm.c,arm-frontend.h} "$work/module/"
+env -u KVM -u LOCALVERSION make -j2 -C "$kernel_build" "ARCH=$kernel_arch" "CROSS_COMPILE=$cross" "M=$work/module" modules
 install -m 0644 -- "$work/module/flexvm-pvkvm.ko" "$publish/bundle/"
 printf '%s\n' "$release" > "$publish/bundle/kernel.release"
 python3 - "$publish/bundle" <<'PYMODULE'
@@ -53,7 +68,9 @@ image = struct.pack("<8sI", b"FLEXKVM1", len(module)) + module
 (bundle / "flexvm-pvkvm.img").write_bytes(image + bytes(-len(image) % 512))
 PYMODULE
 if [[ ${3:-} == --native ]]; then
-  cc -std=c11 -O2 -Wall -Wextra -Werror -static -pthread "$source_dir/native-worker.c" -o "$publish/bundle/native-worker"
+  compiler=cc
+  if [[ -n $cross ]]; then compiler=${cross}gcc; fi
+  "$compiler" -std=c11 -O2 -Wall -Wextra -Werror -static -pthread "$source_dir/$worker" -o "$publish/bundle/native-worker"
 fi
 
 mv -T --no-clobber -- "$publish/bundle" "$output"
