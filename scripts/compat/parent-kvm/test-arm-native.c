@@ -4,6 +4,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -274,6 +275,28 @@ int main(int argc, char *argv[])
     memcpy(&x1, reply.reg_data, sizeof(x1));
     ASSERT(!reply.status && x1 == pattern);
 
+    const uint64_t thread_id = UINT64_C(0x123456789abc);
+    const uint64_t deadline = UINT64_C(0x876543210);
+    const uint64_t counter = UINT64_C(0x123456789);
+    const uint64_t tpidr_el1 = ARM64_SYS_REG(3, 0, 13, 0, 4);
+    write_and_read_register(link[0], &result, 0, tpidr_el1, &thread_id, sizeof(thread_id));
+    write_and_read_register(link[0], &result, 0, KVM_REG_ARM_TIMER_CVAL, &deadline, sizeof(deadline));
+    struct flexvm_arm_request clock = {.command = FLEXVM_ARM_SET_ONE_REG, .reg = {.id = KVM_REG_ARM_TIMER_CNT}};
+    memcpy(clock.reg.data, &counter, sizeof(counter));
+    ASSERT(!exchange(link[0], clock, &result).status);
+    uint64_t frequency, physical;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(frequency));
+    const struct flexvm_arm_request physical_count = {.command = FLEXVM_ARM_GET_ONE_REG, .reg = {.id = KVM_REG_ARM_PTIMER_CNT}};
+    reply = exchange(link[0], physical_count, &result);
+    bool has_physical_counter = !reply.status;
+    if (has_physical_counter) {
+        memcpy(&physical, reply.reg_data, sizeof(physical));
+        physical += 30 * frequency;
+        write_and_read_register(link[0], &result, 0, KVM_REG_ARM_PTIMER_CVAL, &physical, sizeof(physical));
+    } else {
+        ASSERT(reply.status == -ENOENT || reply.status == -EINVAL);
+    }
+
     ASSERT(pass_descriptors(link[0], save, &checkpoint, 1) == 0);
     ASSERT(fcntl(checkpoint, F_ADD_SEALS, seals | F_SEAL_WRITE) == 0);
     int target[2];
@@ -295,10 +318,30 @@ int main(int argc, char *argv[])
     };
     reply = exchange(target[0], read_vector, &result);
     ASSERT(!reply.status && !memcmp(reply.reg_data, vector, sizeof(vector)));
+    const struct flexvm_arm_request read_thread = {.command = FLEXVM_ARM_GET_ONE_REG, .reg = {.id = tpidr_el1}};
+    reply = exchange(target[0], read_thread, &result);
+    ASSERT(!reply.status && !memcmp(reply.reg_data, &thread_id, sizeof(thread_id)));
+    const struct flexvm_arm_request read_deadline = {.command = FLEXVM_ARM_GET_ONE_REG, .reg = {.id = KVM_REG_ARM_TIMER_CVAL}};
+    reply = exchange(target[0], read_deadline, &result);
+    ASSERT(!reply.status && !memcmp(reply.reg_data, &deadline, sizeof(deadline)));
+    clock.command = FLEXVM_ARM_GET_ONE_REG;
+    reply = exchange(target[0], clock, &result);
+    uint64_t after;
+    memcpy(&after, reply.reg_data, sizeof(after));
+    ASSERT(!reply.status && after >= counter && after - counter < 3 * frequency);
+    if (has_physical_counter) {
+        reply = exchange(target[0], physical_count, &result);
+        memcpy(&after, reply.reg_data, sizeof(after));
+        ASSERT(!reply.status);
+        const struct flexvm_arm_request physical_compare = {.command = FLEXVM_ARM_GET_ONE_REG, .reg = {.id = KVM_REG_ARM_PTIMER_CVAL}};
+        reply = exchange(target[0], physical_compare, &result);
+        memcpy(&physical, reply.reg_data, sizeof(physical));
+        ASSERT(!reply.status && physical > after && physical - after >= 27 * frequency && physical - after <= 30 * frequency);
+    }
     close(target[0]);
     int replacement_status;
     ASSERT(waitpid(replacement, &replacement_status, 0) == replacement && WIFEXITED(replacement_status) && !WEXITSTATUS(replacement_status));
-    puts("PASS native ARM checkpoint restored core and vector state in a fresh worker");
+    puts("PASS native ARM checkpoint restored core, vector, system register and timer state in a fresh worker");
     run.sequence++;
     send_run(lane[0], run);
     reply = read_reply(lane[0]);

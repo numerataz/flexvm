@@ -473,19 +473,31 @@ static int control_cpu(struct arm_cpu *cpu, const struct flexvm_arm_request *req
     return result;
 }
 
-static int checkpoint_core(struct arm_cpu *cpu, const struct flexvm_arm_request *request, int fd, struct kvm_reg_list *list)
+static int checkpoint_core(struct arm_vm *vm, const struct flexvm_arm_request *request, int fd, struct kvm_reg_list *list)
 {
-    int lock = pthread_mutex_trylock(&cpu->execution);
-    if (lock)
-        return -lock;
-    int status;
-    if (!cpu->initialized)
-        status = -ENOEXEC;
-    else if (cpu->pending_read || atomic_load(&cpu->admitted) != atomic_load(&cpu->completed))
-        status = -EBUSY;
-    else
-        status = arm_core_state_file(cpu->fd, fd, list, request->command == FLEXVM_ARM_SAVE_CORE);
-    pthread_mutex_unlock(&cpu->execution);
+    unsigned int locked = 0;
+    int status = 0;
+    for (; locked < FLEXVM_ARM_MAX_CPUS; locked++) {
+        int lock = pthread_mutex_trylock(&vm->cpus[locked].execution);
+        if (lock) {
+            status = -lock;
+            break;
+        }
+    }
+    if (!status) {
+        struct arm_cpu *cpu = &vm->cpus[request->cpu];
+        if (!cpu->initialized)
+            status = -ENOEXEC;
+        for (unsigned int id = 0; !status && id < FLEXVM_ARM_MAX_CPUS; id++) {
+            const struct arm_cpu *peer = &vm->cpus[id];
+            if (peer->pending_read || atomic_load(&peer->admitted) != atomic_load(&peer->completed))
+                status = -EBUSY;
+        }
+        if (!status)
+            status = arm_core_state_file(cpu->fd, request->cpu, fd, list, request->command == FLEXVM_ARM_SAVE_CORE);
+    }
+    while (locked > 0)
+        pthread_mutex_unlock(&vm->cpus[--locked].execution);
     return status;
 }
 
@@ -542,7 +554,7 @@ static void serve(struct arm_vm *vm, int control)
         } else if (request->cpu >= FLEXVM_ARM_MAX_CPUS) {
             reply.status = -EINVAL;
         } else if (request->command == FLEXVM_ARM_SAVE_CORE || request->command == FLEXVM_ARM_RESTORE_CORE) {
-            reply.status = checkpoint_core(&vm->cpus[request->cpu], request, packet.descriptors[0], list);
+            reply.status = checkpoint_core(vm, request, packet.descriptors[0], list);
         } else if (request->command == FLEXVM_ARM_CREATE_VCPU) {
             reply.status = create_cpu(vm, request->cpu);
         } else if (request->command == FLEXVM_ARM_CLOSE_VCPU) {
