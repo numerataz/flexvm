@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 use crate::util::Result;
 use crate::{bail, util};
 
+pub(crate) mod transfer;
+
 const MAX_MANIFEST: u64 = 8 << 20;
 // Earlier writers did not take directory leases. Never sweep their names.
 const STAGING_PREFIX: &str = ".software-stage-v2-";
@@ -413,10 +415,13 @@ pub fn metadata(path: &Path) -> Result<Manifest> {
 }
 
 pub fn open(path: &Path, profiles: impl AsRef<[Profile]>) -> Result<Verified> {
-    let dir = private_directory(path)?;
+    open_pinned(private_directory(path)?, profiles.as_ref())
+}
+
+fn open_pinned(dir: File, profiles: &[Profile]) -> Result<Verified> {
     crate::host::flock(&dir, libc::LOCK_SH)?;
     let manifest = read_manifest(&dir)?;
-    if !profiles.as_ref().contains(&manifest.profile) {
+    if !profiles.contains(&manifest.profile) {
         bail!("software state execution profile does not match");
     }
     Ok(Verified {
@@ -508,15 +513,18 @@ fn write_record(dir: &File, name: &str, bytes: &[u8], replace: bool) -> Result<(
 }
 
 pub fn host_id(state: &Path) -> Result<String> {
-    let dir = parent_directory(state)?;
-    if !present(&dir, ".software-host-id")? {
+    host_id_in(&parent_directory(state)?)
+}
+
+fn host_id_in(dir: &File) -> Result<String> {
+    if !present(dir, ".software-host-id")? {
         let id = util::random_hex(16)?;
-        match write_record(&dir, ".software-host-id", &serde_json::to_vec(&id)?, false) {
+        match write_record(dir, ".software-host-id", &serde_json::to_vec(&id)?, false) {
             Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists) => {}
             result => result?,
         }
     }
-    let id: String = record(&dir, ".software-host-id")?;
+    let id: String = record(dir, ".software-host-id")?;
     if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!("invalid software host identity");
     }
@@ -582,7 +590,7 @@ pub struct Prepared<'a> {
     directory: File,
     manifest: Manifest,
     pub generation: u64,
-    _name: &'a crate::host::NameLock,
+    name: &'a crate::host::NameLock,
 }
 
 pub struct Consumed {
@@ -600,6 +608,9 @@ impl Verified {
         if self.manifest.host_id != local_host {
             bail!("software checkpoint belongs to another host; cross-host transfer is not enabled");
         }
+        let host = parent_directory(name.state_path())?;
+        let _transfer = parent_lock(&host, libc::LOCK_EX)?;
+        let floor = transfer::local_restart_floor(&host, &self.manifest)?;
         if present(dir, "DISCARDED")? {
             bail!("software checkpoint was discarded");
         }
@@ -625,15 +636,18 @@ impl Verified {
             bail!("retired software source engine is still alive");
         }
         let highest = if present(dir, "HIGHEST")? { record::<u64>(dir, "HIGHEST")? } else { self.manifest.owner_generation };
-        let generation = highest.max(self.manifest.owner_generation).checked_add(1).ok_or("software owner generation exhausted")?;
+        let generation = highest.max(self.manifest.owner_generation).max(floor).checked_add(1).ok_or("software owner generation exhausted")?;
         write_record(dir, "HIGHEST", &serde_json::to_vec(&generation)?, true)?;
-        Ok(Prepared { directory: dir.try_clone()?, manifest: self.manifest.clone(), generation, _name: name })
+        Ok(Prepared { directory: dir.try_clone()?, manifest: self.manifest.clone(), generation, name })
     }
 }
 
 impl Prepared<'_> {
     pub fn grant(self, engine: crate::host::Ident) -> Result<Consumed> {
-        if record::<u64>(&self.directory, "HIGHEST")? != self.generation {
+        let host = parent_directory(self.name.state_path())?;
+        let _transfer = parent_lock(&host, libc::LOCK_EX)?;
+        let floor = transfer::local_restart_floor(&host, &self.manifest)?;
+        if self.generation <= floor || record::<u64>(&self.directory, "HIGHEST")? != self.generation {
             bail!("software owner preparation was superseded");
         }
         if present(&self.directory, "DISCARDED")? {
@@ -977,6 +991,10 @@ pub fn sweep(state: &Path) -> Result<()> {
     if suspended.exists() {
         sweep_directory(&suspended, true)?;
     }
+    let incoming = state.join(transfer::bundle::INCOMING);
+    if incoming.exists() {
+        sweep_directory(&incoming, true)?;
+    }
     Ok(())
 }
 
@@ -1128,7 +1146,7 @@ mod tests {
         assert!(serde_json::from_value::<Main>(json!({"boot":"systemd", "id":"saved-main", "offset":19, "claim":2})).is_err());
     }
 
-    fn checkpoint(dir: &Path) -> (PathBuf, Profile) {
+    pub(super) fn checkpoint(dir: &Path) -> (PathBuf, Profile) {
         let inputs = Inputs {
             engine: source(dir, "source-engine", b"engine"),
             kernel: source(dir, "source-kernel", b"kernel"),
