@@ -33,6 +33,7 @@
 #define PIC_ENTRY_OFFSET 0xc00
 #define PIC_HANDLER_OFFSET 0xd00
 #define PIT_ENTRY_OFFSET 0xe00
+#define IRQFD_ENTRY_OFFSET 0xe00
 #define PIC_IDT_OFFSET 0x400
 #define PIC_IDTR_OFFSET 0x540
 #define PIC_GSI 3
@@ -552,6 +553,80 @@ static void test_pit(int cpu, struct kvm_run *run, int size, unsigned char *ram,
     printf("PASS PIT woke the halted vCPU after %llu ns\n", elapsed);
 }
 
+struct irqfd_test {
+    unsigned char *data;
+    int detached;
+    int active;
+};
+
+static void *signal_halted_vcpu(void *opaque)
+{
+    const struct irqfd_test *test = opaque;
+    const struct timespec retry = {.tv_nsec = 1000000};
+    const struct timespec quiet = {.tv_nsec = 20000000};
+
+    for (unsigned int i = 0; i < 2000 && !__atomic_load_n(test->data + 0xf9, __ATOMIC_RELAXED); i++)
+        nanosleep(&retry, NULL);
+    check(__atomic_load_n(test->data + 0xf9, __ATOMIC_RELAXED) == 1, "observe child entry to HLT");
+    check(eventfd_write(test->detached, 1) == 0, "signal the deassigned eventfd");
+    check(nanosleep(&quiet, NULL) == 0 && __atomic_load_n(test->data + 0xf8, __ATOMIC_RELAXED) == 1,
+          "deassigned eventfd did not wake the child");
+    check(eventfd_write(test->active, 1) == 0, "signal the registered IRQ eventfd during KVM_RUN");
+    return NULL;
+}
+
+static void test_irqfd(int vm, int cpu, struct kvm_run *run, int size, unsigned char *ram, unsigned char *data,
+                       uint64_t gpa, uint64_t data_address)
+{
+    struct irqfd_test test = {
+        .data = data, .detached = eventfd(0, EFD_CLOEXEC), .active = eventfd(0, EFD_CLOEXEC),
+    };
+    check(test.detached >= 0 && test.active >= 0, "create IRQ eventfds");
+    int alias = dup(test.detached);
+    check(alias >= 0, "duplicate the IRQ eventfd descriptor");
+    struct kvm_irqfd irq = {.fd = test.detached, .gsi = PIC_GSI};
+    check(ioctl(vm, KVM_CHECK_EXTENSION, KVM_CAP_IRQFD) > 0, "check IRQFD support");
+    check(ioctl(vm, KVM_IRQFD, &irq) == 0, "assign an IRQ eventfd");
+    irq.fd = alias;
+    check(ioctl(vm, KVM_IRQFD, &irq) == -1 && errno == EBUSY, "reject duplicate IRQ eventfd identity");
+    irq.flags = KVM_IRQFD_FLAG_DEASSIGN;
+    check(ioctl(vm, KVM_IRQFD, &irq) == 0, "deassign through the duplicate descriptor");
+    check(ioctl(vm, KVM_IRQFD, &irq) == 0 && close(alias) == 0, "repeat deassignment on the detached eventfd");
+    irq = (struct kvm_irqfd){.fd = test.active, .gsi = PIC_GSI};
+    check(ioctl(vm, KVM_IRQFD, &irq) == 0, "assign the active IRQ eventfd");
+
+    const unsigned char program[] = {
+        0xc6, 0x87, 0xf9, 0, 0, 0, 1,    /* mark entry into the halt sequence */
+        0xfb, 0xf4, 0xfa,                /* sti; hlt; cli */
+        0xb0, 0x6c, 0xe6, 0x30, 0xf4,    /* report wake to userspace */
+    };
+    memcpy(ram + IRQFD_ENTRY_OFFSET, program, sizeof(program));
+    const struct kvm_regs regs = {
+        .rcx = 0x5432, .rsp = gpa + 0xf00, .rdi = data_address,
+        .rip = gpa + IRQFD_ENTRY_OFFSET, .rflags = 2,
+    };
+    check(ioctl(cpu, KVM_SET_REGS, &regs) == 0, "start the IRQFD program");
+    pthread_t sender;
+    check(pthread_create(&sender, NULL, signal_halted_vcpu, &test) == 0, "start the IRQFD sender");
+    timed_run(cpu);
+    check(pthread_join(sender, NULL) == 0, "join the IRQFD sender");
+    check_output(run, size, 0x6c);
+    check_registers(cpu, 0x6c, 0x5432, gpa + IRQFD_ENTRY_OFFSET);
+    check(data[0xf8] == 2, "wake on exactly one eventfd interrupt during KVM_RUN");
+    check(close(test.detached) == 0 && close(test.active) == 0, "close the first IRQ eventfds");
+
+    int prefilled = eventfd(1, EFD_CLOEXEC);
+    check(prefilled >= 0, "create an already signaled IRQ eventfd");
+    irq.fd = prefilled;
+    check(ioctl(vm, KVM_IRQFD, &irq) == 0, "assign an IRQ eventfd with a pending signal");
+    check(ioctl(cpu, KVM_SET_REGS, &regs) == 0, "rerun the IRQFD program");
+    timed_run(cpu);
+    check_output(run, size, 0x6c);
+    check_registers(cpu, 0x6c, 0x5432, gpa + IRQFD_ENTRY_OFFSET);
+    check(data[0xf8] == 3 && close(prefilled) == 0, "deliver the IRQ that was pending at assignment");
+    puts("PASS KVM_IRQFD woke an active run and honored deassignment and pending signals");
+}
+
 struct interrupt_test {
     uint32_t *counter;
     uint32_t baseline;
@@ -627,6 +702,7 @@ int main(int argc, char **argv)
     bool ioeventfd = false;
     bool irqchip = false;
     bool pit = false;
+    bool irqfd = false;
     check(argc == 2 || protected_mode, "specify RAM pages and optional protected or split mode");
     for (int i = 3; i < argc; i++) {
         if (!interrupt_run && !strcmp(argv[i], "interrupt"))
@@ -651,6 +727,8 @@ int main(int argc, char **argv)
             irqchip = true;
         else if (!pit && !strcmp(argv[i], "pit"))
             pit = true;
+        else if (!irqfd && !strcmp(argv[i], "irqfd"))
+            irqfd = true;
         else
             check(false, "invalid execution option");
     }
@@ -670,6 +748,7 @@ int main(int argc, char **argv)
     check(!irqchip || (protected_mode && !long_mode && !cpuid && !two_vcpus),
           "test a single protected-mode PIC vCPU");
     check(!pit || irqchip, "test the PIT with a PIC vCPU");
+    check(!irqfd || (irqchip && !pit), "test IRQFD in a separate PIC vCPU run");
     size_t pages = count;
     size_t ram_bytes = pages * 4096;
     uint64_t gpa = protected_mode ? PROTECTED_SLOT_GPA : PVKVM_GUEST_START;
@@ -1091,6 +1170,8 @@ int main(int argc, char **argv)
         puts("PASS child PIC delivered and acknowledged the parent IRQ");
         if (pit)
             test_pit(cpu, run, size, ram, data, gpa, data_address);
+        if (irqfd)
+            test_irqfd(vm, cpu, run, size, ram, data, gpa, data_address);
         close(vm);
     }
     if (cpuid)
