@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise software suspend and fresh-owner restore with host virtualization devices masked."""
 import argparse
+import base64
 import fcntl
 import json
 import os
@@ -55,9 +56,9 @@ def exercise(args):
     def live():
         return next((e for e in json.loads(cli('ps', '--json')) if e['name'] == 'state-test'), None)
 
-    def launch(*words):
+    def launch(*words, workload_log="workload.log"):
         env = owner_environment()
-        with (args.output / 'workload.log').open('ab') as out, (args.output / f'owner-{len(owners)}.log').open('wb') as err:
+        with (args.output / workload_log).open('ab') as out, (args.output / f'owner-{len(owners)}.log').open('wb') as err:
             proc = subprocess.Popen([*base, *words], stdout=out, stderr=err, env=env)
         owners.append(proc)
         while time.monotonic() < deadline:
@@ -145,10 +146,258 @@ def exercise(args):
         finally:
             os.close(pidfd)
 
+    boot = ('software', '--name', 'state-test', '--control', 'serial', '--kernel', str(args.kernel),
+            '--mem', '512', '--vcpus', '2' if args.firecracker else '1', str(args.output / 'image.tar'))
+
+    def transfer_retirement():
+        destination_state = args.state / 'target'
+        destination_base = [str(args.bin), '--state', str(destination_state), '--run', str(args.state / 'target-run')]
+        target = [*destination_base, 'software-transfer']
+
+        def destination(*words):
+            return json.loads(subprocess.check_output([*target, *words], timeout=max(.1, deadline - time.monotonic())))
+
+        cli('rm', '-f', 'state-test', pending=True)
+        owner, entry = launch(*boot, workload_log='transfer-workload.log')
+        before = observation()
+        cli('stop', 'state-test')
+        if owner.wait(timeout=10) != 0:
+            raise RuntimeError('transfer source owner did not retire')
+        engine_gone(entry['backend']['process'])
+
+        def key_pair(secret):
+            subprocess.run(['openssl', 'genpkey', '-algorithm', 'Ed25519', '-outform', 'DER', '-out', secret], check=True, timeout=10)
+            secret.chmod(0o600)
+            public_der = subprocess.check_output(['openssl', 'pkey', '-inform', 'DER', '-in', secret, '-pubout', '-outform', 'DER'], timeout=10)
+            return base64.b64encode(public_der[-32:]).decode()
+
+        secret = args.state / 'signing-key.der'
+        public_key = key_pair(secret)
+        destination_secret = args.state / 'destination-key.der'
+        destination_key = key_pair(destination_secret)
+        offer = args.state / 'offer.json'
+        receipt = args.state / 'receipt.json'
+        target_id = destination('id')['host_id']
+
+        def prepare_and_retire():
+            proposal = cli('software-transfer', 'offer', 'state-test', target_id)
+            offer.write_text(proposal)
+            if destination('prepare', offer, '--source-key', public_key)['status'] != 'pending':
+                raise RuntimeError('transfer destination did not prepare')
+            retire = ('software-transfer', 'retire', 'state-test', offer, '--signing-key', secret, '--destination-key', destination_key)
+            receipt.write_text(cli(*retire))
+            if json.loads(cli(*retire)) != json.loads(receipt.read_text()):
+                raise RuntimeError('transfer receipt retry changed the signed offer')
+            return json.loads(proposal)['generation']
+
+        def require_refused(*words, error):
+            refused = subprocess.run([*base, *words], capture_output=True, text=True, timeout=30)
+            if refused.returncode == 0 or error not in refused.stderr:
+                raise RuntimeError(f'transfer operation was accepted or failed for another reason: {refused}')
+
+        aborted_generation = prepare_and_retire()
+        require_refused('start', 'state-test', error='source cannot restart')
+        ack = args.state / 'abort-receipt.json'
+        ack.write_text(json.dumps(destination('acknowledge-abort', offer, '--signing-key', destination_secret)))
+        if json.loads(cli('software-transfer', 'recover', ack))['status'] != 'recovered':
+            raise RuntimeError('the source rejected the signed abort')
+        cli('start', 'state-test', env=owner_environment())
+        after = advancing_observation()
+        if after[:3] != before[:3] or after[3] < before[3]:
+            raise RuntimeError('transfer recovery lost the source workload identity')
+        cli('stop', 'state-test')
+        checkpoint = args.state / 'state' / 'suspended' / 'state-test' / 'manifest.json'
+        if json.loads(checkpoint.read_text())['owner_generation'] <= aborted_generation:
+            raise RuntimeError('recovered owner did not advance the fenced generation')
+
+        prepare_and_retire()
+        require_refused('software-transfer', 'recover', ack, error='does not match a source fence')
+        with (args.output / 'transfer-send.log').open('wb') as errors:
+            source = subprocess.Popen([*base, 'software-transfer', 'send', 'state-test', offer], stdout=subprocess.PIPE, stderr=errors)
+            try:
+                received = json.loads(subprocess.check_output([*target, 'receive', offer], stdin=source.stdout,
+                                                             timeout=max(.1, deadline - time.monotonic())))
+                if source.wait(timeout=10) != 0 or received['status'] != 'received' or received['bytes'] <= 0:
+                    raise RuntimeError('software checkpoint bundle did not transfer; see transfer-send.log')
+            finally:
+                source.stdout.close()
+                if source.poll() is None:
+                    source.kill()
+                    source.wait(timeout=10)
+        engine = shutil.which('qemu-system-' + platform.machine())
+        if engine is None:
+            raise RuntimeError('trusted local QEMU was not found')
+        remote = 'received-test'
+        intermediary_base = [str(args.bin), '--state', str(args.state / 'intermediary'),
+                             '--run', str(args.state / 'intermediary-run')]
+
+        def target_cli(*words):
+            return subprocess.check_output([*destination_base, *words], text=True, timeout=max(.1, deadline - time.monotonic()))
+
+        def denied_activation(expected, vm=remote, qemu=engine):
+            result = subprocess.run([*target, 'activate', offer, vm, '--qemu', qemu], capture_output=True, text=True, timeout=30)
+            if result.returncode == 0 or expected not in result.stderr:
+                raise RuntimeError(f'destination activation accepted or failed for the wrong reason: {result}')
+
+        def destination_progress(previous, control=target_cli, vm=remote):
+            def guest_observation():
+                return [int(value) for value in control('exec', vm, '/state-probe', 'status').split()]
+
+            initial = guest_observation()
+            until = min(deadline, time.monotonic() + 15)
+            while time.monotonic() < until:
+                seen = guest_observation()
+                if initial[:3] != previous[:3] or seen[:3] != previous[:3] or seen[4] < previous[4]:
+                    raise RuntimeError('destination lost guest process, RAM or monotonic time')
+                if seen[3] > max(initial[3], previous[3]) and seen[4] > initial[4]:
+                    return seen
+                time.sleep(.15)
+            raise RuntimeError('destination guest did not make fresh progress')
+
+        def repeat_transfer(sender, receiver, old_name, new_name, sender_key, receiver_key,
+                            signer, previous, destination_host, *, abort_first=False, finalize_with=None, handoff_chain=None):
+            proposed = args.state / f'{new_name}-offer.json'
+            accepted = args.state / f'{new_name}-receipt.json'
+            previous_offer = None
+            for abort in ([True, False] if abort_first else [False]):
+                offer_text = subprocess.check_output([*sender, 'software-transfer', 'offer', old_name, destination_host],
+                                                     text=True, timeout=30)
+                proposed.write_text(offer_text)
+                current_offer = json.loads(offer_text)
+                if previous_offer and current_offer['generation'] <= previous_offer['generation']:
+                    raise RuntimeError('return offer did not advance the aborted generation')
+                prepare = [*receiver, 'software-transfer', 'prepare', proposed, '--source-key', sender_key]
+                if handoff_chain:
+                    denied = subprocess.run(prepare, capture_output=True, text=True, timeout=30)
+                    if denied.returncode == 0 or 'does not extend the pinned outgoing handoff' not in denied.stderr:
+                        raise RuntimeError(f'return from an unrecognized source unexpectedly prepared: {denied}')
+                    prepare += ['--handoff-chain', handoff_chain]
+                prepared = json.loads(subprocess.check_output(prepare, timeout=30))
+                if prepared['status'] != 'pending':
+                    raise RuntimeError('return transfer did not prepare')
+                accepted.write_bytes(subprocess.check_output([*sender, 'software-transfer', 'retire', old_name, proposed,
+                                                             '--signing-key', signer, '--destination-key', receiver_key], timeout=30))
+                if abort:
+                    abort_receipt = args.state / f'{new_name}-abort.json'
+                    abort_receipt.write_bytes(subprocess.check_output([*receiver, 'software-transfer', 'acknowledge-abort',
+                                                                      proposed, '--signing-key', secret], timeout=30))
+                    subprocess.check_call([*sender, 'software-transfer', 'recover', abort_receipt], timeout=30, stdout=subprocess.DEVNULL)
+                    previous_offer = current_offer
+
+            with (args.output / f'{new_name}-send.log').open('wb') as errors:
+                with subprocess.Popen([*sender, 'software-transfer', 'send', old_name, proposed],
+                                      stdout=subprocess.PIPE, stderr=errors) as source:
+                    try:
+                        subprocess.check_call([*receiver, 'software-transfer', 'receive', proposed], stdin=source.stdout,
+                                              stdout=subprocess.DEVNULL, timeout=max(.1, deadline - time.monotonic()))
+                        if source.wait(timeout=10) != 0:
+                            raise RuntimeError(f'return checkpoint failed to transfer to {new_name}')
+                    finally:
+                        if source.poll() is None:
+                            source.kill()
+            subprocess.check_call([*receiver, 'software-transfer', 'commit', accepted], timeout=30, stdout=subprocess.DEVNULL)
+            proof = None
+            if finalize_with:
+                acknowledgment = args.state / f'{new_name}-commit-ack.json'
+                acknowledgment.write_bytes(subprocess.check_output([*receiver, 'software-transfer', 'acknowledge-commit',
+                                                                   proposed, '--signing-key', finalize_with], timeout=30))
+                proof = json.loads(subprocess.check_output([*sender, 'software-transfer', 'finalize', acknowledgment,
+                                                          '--signing-key', signer], timeout=30))
+            with (args.output / f'{new_name}-owner.log').open('wb') as log:
+                activated = subprocess.Popen([*receiver, 'software-transfer', 'activate', proposed, new_name, '--qemu', engine],
+                                             stdout=log, stderr=log)
+            owners.append(activated)
+
+            def control(*words):
+                return subprocess.check_output([*receiver, *words], text=True, timeout=max(.1, deadline - time.monotonic()))
+
+            while time.monotonic() < deadline and activated.poll() is None:
+                if any(entry['name'] == new_name and entry['state'] == 'running' for entry in json.loads(control('ps', '--json'))):
+                    break
+                time.sleep(.1)
+            else:
+                raise RuntimeError(f'return owner failed to publish {new_name}')
+            seen = destination_progress(previous, control, new_name)
+            control('stop', new_name)
+            if activated.wait(timeout=15) != 0:
+                raise RuntimeError(f'return owner failed to stop {new_name}')
+            return (seen, proof)
+
+        denied_activation('requires a committed destination transfer')
+        if destination('commit', receipt)['status'] != 'committed':
+            raise RuntimeError('transfer destination did not commit')
+        commit_ack = args.state / 'commit-ack.json'
+        commit_ack.write_text(json.dumps(destination('acknowledge-commit', offer, '--signing-key', destination_secret)))
+        finalize = ('software-transfer', 'finalize', commit_ack, '--signing-key', secret)
+        proof = json.loads(cli(*finalize))
+        if proof['handoff']['offer'] != json.loads(offer.read_text()) or proof['handoff']['destination_key'] != destination_key:
+            raise RuntimeError('finalized proof did not bind the exact offer and destination key')
+        if proof != json.loads(cli(*finalize)):
+            raise RuntimeError('finalized proof changed after a retry')
+        evidence['finalized_transfer_proof'] = 'passed'
+        denied_activation('trusted local QEMU does not match', qemu='/bin/true')
+        try:
+            with (args.output / 'transfer-target.log').open('wb') as log:
+                activated = subprocess.Popen([*target, 'activate', offer, remote, '--qemu', engine], stdout=log, stderr=log)
+            owners.append(activated)
+            while time.monotonic() < deadline and activated.poll() is None:
+                if any(entry['name'] == remote and entry['state'] == 'running' for entry in json.loads(target_cli('ps', '--json'))):
+                    break
+                time.sleep(.1)
+            else:
+                raise RuntimeError('destination owner failed to publish; see transfer-target.log')
+            activated_state = destination_progress(after)
+            denied_activation('already granted execution', vm='duplicate')
+            require_refused('start', 'state-test', error='source cannot restart')
+            if live() is not None:
+                raise RuntimeError('the committed transfer source is running')
+            target_cli('pause', remote)
+            target_cli('unpause', remote)
+            target_cli('stop', remote)
+            if activated.wait(timeout=15) != 0:
+                raise RuntimeError('destination owner failed to stop after activation')
+            restored = json.loads((destination_state / 'suspended' / remote / 'manifest.json').read_text())
+            if restored['host_id'] != target_id or restored['owner_generation'] <= json.loads(offer.read_text())['generation']:
+                raise RuntimeError('destination checkpoint lacked its local host identity or newer generation')
+            target_cli('start', remote)
+            activated_state = destination_progress(activated_state)
+            target_cli('stop', remote)
+            # Retain each host's original checkpoint while the new owner returns
+            # under another name, then prove both old checkpoints remain fenced.
+            local_id = json.loads(cli('software-transfer', 'id'))['host_id']
+            returned, _ = repeat_transfer(destination_base, base, remote, 'returned-test', destination_key, public_key,
+                                          destination_secret, activated_state, local_id, abort_first=True)
+            require_refused('start', 'state-test', error='predates the return transfer grant')
+            back_on_peer, _ = repeat_transfer(base, destination_base, 'returned-test', 'received-again', public_key, destination_key,
+                                              secret, returned, target_id)
+            refused = subprocess.run([*destination_base, 'start', remote], capture_output=True, text=True, timeout=30)
+            if refused.returncode == 0 or 'predates the return transfer grant' not in refused.stderr:
+                raise RuntimeError(f'old destination checkpoint was not fenced: {refused}')
+            denied_activation('does not match a prepared destination', vm='duplicate')
+            evidence['repeated_transfer'] = 'passed'
+
+            intermediary_secret = args.state / 'intermediary-key.der'
+            intermediary_key = key_pair(intermediary_secret)
+            intermediary = json.loads(subprocess.check_output([*intermediary_base, 'software-transfer', 'id'], timeout=30))['host_id']
+            on_intermediary, proof = repeat_transfer(destination_base, intermediary_base, 'received-again', 'third-host',
+                                                       destination_key, intermediary_key, destination_secret, back_on_peer,
+                                                       intermediary, finalize_with=intermediary_secret)
+            chain = args.state / 'handoff-chain.json'
+            chain.write_text(json.dumps([proof]))
+            repeat_transfer(intermediary_base, base, 'third-host', 'returned-via-third', intermediary_key, public_key,
+                            intermediary_secret, on_intermediary, local_id, handoff_chain=chain)
+            require_refused('start', 'returned-test', error='predates the return transfer grant')
+            evidence['intermediary_transfer'] = 'passed'
+        finally:
+            for name in (remote, 'received-again'):
+                subprocess.run([*destination_base, 'rm', '-f', name], capture_output=True, timeout=20)
+            subprocess.run([*intermediary_base, 'rm', '-f', 'third-host'], capture_output=True, timeout=20)
+            cli('rm', '-f', 'returned-test', 'returned-via-third', pending=True)
+        cli('rm', '-f', 'state-test')
+
     evidence = {'cycles': []}
     try:
-        owner, entry = launch('software', '--name', 'state-test', '--control', 'serial', '--kernel', str(args.kernel),
-                              '--mem', '512', '--vcpus', '2' if args.firecracker else '1', str(args.output / 'image.tar'))
+        owner, entry = launch(*boot)
         first = observation()
         identity = entry['gen']
         nested_identity = nested_observation() if args.firecracker else None
@@ -298,6 +547,10 @@ def exercise(args):
             if lines.count('NESTED_INNER_BOOT') != 1 or lines.count('NESTED_INNER_READY') != 1:
                 raise RuntimeError('nested Firecracker guest booted repeatedly or never completed startup')
             evidence['nested_firecracker'] = {'boots': 1, 'identity': nested_identity[:8], 'cpu_and_timer_restore': 'passed'}
+        else:
+            transfer_retirement()
+            evidence['source_transfer_retirement'] = 'passed'
+            evidence['destination_transfer_activation'] = 'passed'
         evidence.update(status='passed', boots=1, delivered_ticks=len(ticks))
         (args.output / 'owner.json').write_text(json.dumps(evidence, indent=2) + '\n')
     except Exception:
