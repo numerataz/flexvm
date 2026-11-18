@@ -21,6 +21,14 @@
 #define SECOND_CPU_OFFSET 0x300
 #define FPU_ENTRY_OFFSET 0x400
 #define FPU_RESUME_OFFSET 0x480
+#define MSR_ENTRY_OFFSET 0x500
+#define MSR_RESUME_OFFSET 0x600
+#define TSC_START 0x1111222200000000ULL
+#define MSR_KERNEL_GS_BASE 0xc0000102U
+#define MSR_MTRR_DEFAULT 0x2ff
+#define GS_BASE_INITIAL 0x07654321U
+#define GS_BASE_FROM_GUEST 0x12345678U
+#define GS_BASE_FOR_RESUME 0x2468ace0U
 #define LONG_ALIAS 0x4001000000ULL
 #define HUGE_PAGE_SIZE 0x200000ULL
 #define LONG_REGISTER 0x8fedcba987654321ULL
@@ -167,6 +175,91 @@ static void install_jump(unsigned char *ram, int from, int to)
     memcpy(ram + from + 1, &target, sizeof(target));
 }
 
+static void prepare_msrs(int device, int cpu)
+{
+    const struct pvkvm_msr_batch initial = {
+        .count = 11,
+        .entries = {
+            {.index = 0x174}, {.index = 0x175}, {.index = 0x176},
+            {.index = 0xc0000081}, {.index = 0xc0000083},
+            {.index = MSR_KERNEL_GS_BASE, .data = GS_BASE_INITIAL},
+            {.index = 0xc0000084}, {.index = 0xc0000082},
+            {.index = 0x10, .data = TSC_START},
+            {.index = 0x1a0, .data = 1}, {.index = MSR_MTRR_DEFAULT, .data = 0x806},
+        },
+    };
+    struct kvm_msr_list size = {0};
+
+    check(ioctl(device, KVM_GET_MSR_INDEX_LIST, &size) == -1 && errno == E2BIG &&
+          size.nmsrs >= initial.count && size.nmsrs <= 4096, "query the MSR index list capacity");
+    struct kvm_msr_list *list = calloc(1, sizeof(*list) + size.nmsrs * sizeof(list->indices[0]));
+    check(list != NULL, "allocate the MSR index list");
+    list->nmsrs = size.nmsrs;
+    check(ioctl(device, KVM_GET_MSR_INDEX_LIST, list) == 0 && list->nmsrs <= size.nmsrs,
+          "query supported MSR indices");
+    for (unsigned int i = 0; i < initial.count; i++) {
+        /* KVM's save list need not include the separately writable MTRR default. */
+        if (initial.entries[i].index == MSR_MTRR_DEFAULT)
+            continue;
+        bool found = false;
+        for (unsigned int j = 0; j < list->nmsrs; j++) {
+            if (list->indices[j] == initial.entries[i].index) {
+                found = true;
+                break;
+            }
+        }
+        if (!found)
+            fprintf(stderr, "Linux boot MSR %#x is absent from the index list\n", initial.entries[i].index);
+        check(found, "find an MSR used to boot x86 Linux");
+    }
+    free(list);
+    check(ioctl(cpu, KVM_SET_MSRS, &initial) == (int)initial.count, "set the x86 Linux boot MSR batch");
+    struct pvkvm_msr_batch staged = {.count = 1, .entries = {{.index = MSR_KERNEL_GS_BASE}}};
+    check(ioctl(cpu, KVM_GET_MSRS, &staged) == 1 && staged.entries[0].data == GS_BASE_INITIAL,
+          "read the boot MSR before first entry");
+}
+
+static void update_msrs(int cpu, const unsigned char *ram)
+{
+    uint32_t gs_base;
+    uint64_t start, end;
+    struct pvkvm_msr_batch readback = {
+        .count = 4, .entries = {
+            {.index = MSR_KERNEL_GS_BASE}, {.index = 0x10}, {.index = UINT32_MAX},
+            {.index = MSR_KERNEL_GS_BASE, .data = 0x55},
+        },
+    };
+    const struct pvkvm_msr_batch update = {
+        .count = 3, .entries = {
+            {.index = MSR_KERNEL_GS_BASE, .data = GS_BASE_FOR_RESUME}, {.index = UINT32_MAX},
+            {.index = MSR_KERNEL_GS_BASE, .data = 0x55},
+        },
+    };
+
+    memcpy(&gs_base, ram + 0xc0, sizeof(gs_base));
+    memcpy(&start, ram + 0xc8, sizeof(start));
+    memcpy(&end, ram + 0xd0, sizeof(end));
+    check(gs_base == GS_BASE_INITIAL && start >= TSC_START && start - TSC_START < (1ULL << 34) && end > start,
+          "observe the configured GS base and a progressing TSC inside the child");
+    check(ioctl(cpu, KVM_GET_MSRS, &readback) == 2 &&
+          readback.entries[0].data == GS_BASE_FROM_GUEST && readback.entries[1].data >= end &&
+          readback.entries[3].data == 0x55,
+          "read live MSRs and stop at the first unsupported index");
+    check(ioctl(cpu, KVM_SET_MSRS, &update) == 1, "set the supported prefix of a mixed MSR batch");
+}
+
+static void check_resumed_msrs(int cpu, const unsigned char *data)
+{
+    uint32_t gs_base;
+    struct pvkvm_msr_batch readback = {.count = 1, .entries = {{.index = MSR_KERNEL_GS_BASE}}};
+
+    memcpy(&gs_base, data + 0xc0, sizeof(gs_base));
+    check(gs_base == GS_BASE_FOR_RESUME && ioctl(cpu, KVM_GET_MSRS, &readback) == 1 &&
+          readback.entries[0].data == GS_BASE_FOR_RESUME,
+          "the resumed child observed the updated MSR");
+    puts("PASS x86 boot MSRs reached the parent worker");
+}
+
 struct interrupt_test {
     uint32_t *counter;
     uint32_t baseline;
@@ -235,6 +328,7 @@ int main(int argc, char **argv)
     bool two_vcpus = false;
     bool long_mode = false;
     bool fpu = false;
+    bool msrs = false;
     check(argc == 2 || protected_mode, "specify RAM pages and optional protected or split mode");
     for (int i = 3; i < argc; i++) {
         if (!interrupt_run && !strcmp(argv[i], "interrupt"))
@@ -245,6 +339,8 @@ int main(int argc, char **argv)
             long_mode = true;
         else if (!fpu && !strcmp(argv[i], "fpu"))
             fpu = true;
+        else if (!msrs && !strcmp(argv[i], "msrs"))
+            msrs = true;
         else
             check(false, "invalid execution option");
     }
@@ -256,6 +352,7 @@ int main(int argc, char **argv)
     check(!split_slot || count >= 2, "split mode needs at least two RAM pages");
     check(!long_mode || (!two_vcpus && count >= (split_slot ? 8 : 4)), "reserve four low pages for long mode");
     check(!fpu || long_mode, "exercise floating-point state in long mode");
+    check(!msrs || (long_mode && !fpu), "exercise boot MSRs in a separate long-mode run");
     size_t pages = count;
     size_t ram_bytes = pages * 4096;
     uint64_t gpa = protected_mode ? PROTECTED_SLOT_GPA : PVKVM_GUEST_START;
@@ -391,6 +488,27 @@ int main(int argc, char **argv)
             0xdb, 0x9f, 0xb4, 0, 0, 0,          /* fistp dword [rdi+0xb4] */
             0x0f, 0xae, 0x9f, 0xbc, 0, 0, 0,   /* stmxcsr [rdi+0xbc] */
         };
+        const unsigned char msr_entry[] = {
+            0xb9, 0x02, 0x01, 0x00, 0xc0,        /* mov ecx, MSR_KERNEL_GS_BASE */
+            0x0f, 0x32,                         /* rdmsr */
+            0x89, 0x87, 0xc0, 0, 0, 0,          /* mov [rdi+0xc0], eax */
+            0xb8, 0x78, 0x56, 0x34, 0x12,        /* mov eax, 0x12345678 */
+            0x31, 0xd2, 0x0f, 0x30,             /* xor edx, edx; wrmsr */
+            0x0f, 0x31,                         /* rdtsc */
+            0x89, 0x87, 0xc8, 0, 0, 0,          /* mov [rdi+0xc8], eax */
+            0x89, 0x97, 0xcc, 0, 0, 0,          /* mov [rdi+0xcc], edx */
+            0x41, 0xb8, 0x00, 0x10, 0, 0,       /* mov r8d, 4096 */
+            0x41, 0xff, 0xc8, 0x75, 0xfb,        /* dec r8d; jnz to the decrement */
+            0x0f, 0x31,                         /* rdtsc */
+            0x89, 0x87, 0xd0, 0, 0, 0,          /* mov [rdi+0xd0], eax */
+            0x89, 0x97, 0xd4, 0, 0, 0,          /* mov [rdi+0xd4], edx */
+            0xb8, 0x41, 0, 0, 0, 0xf9,          /* mov eax, 0x41; stc */
+        };
+        const unsigned char msr_resume[] = {
+            0xb9, 0x02, 0x01, 0x00, 0xc0,        /* mov ecx, MSR_KERNEL_GS_BASE */
+            0x0f, 0x32,                         /* rdmsr */
+            0x89, 0x87, 0xc0, 0, 0, 0,          /* mov [rdi+0xc0], eax */
+        };
         size_t startup = 0x10;
         size_t resume = 0x40;
         if (fpu) {
@@ -404,6 +522,13 @@ int main(int argc, char **argv)
             resume += 5;
             memcpy(ram + FPU_RESUME_OFFSET, fpu_resume, sizeof(fpu_resume));
             install_jump(ram, FPU_RESUME_OFFSET + sizeof(fpu_resume), resume);
+        } else if (msrs) {
+            memcpy(ram + MSR_ENTRY_OFFSET, msr_entry, sizeof(msr_entry));
+            install_jump(ram, MSR_ENTRY_OFFSET + sizeof(msr_entry), startup);
+            install_jump(ram, resume, MSR_RESUME_OFFSET);
+            resume += 5;
+            memcpy(ram + MSR_RESUME_OFFSET, msr_resume, sizeof(msr_resume));
+            install_jump(ram, MSR_RESUME_OFFSET + sizeof(msr_resume), resume);
         }
         if (long_mode) {
             setup_page_tables(ram, gpa, middle_page, last_page);
@@ -428,6 +553,8 @@ int main(int argc, char **argv)
     struct kvm_regs regs = {.rax = 0x41, .rip = entry_base + 0x10, .rflags = 3};
     if (fpu)
         regs.rip = entry_base + FPU_ENTRY_OFFSET;
+    if (msrs)
+        regs.rip = entry_base + MSR_ENTRY_OFFSET;
     if (protected_mode) {
         regs.rbx = data_address;
         regs.rdi = entry_base;
@@ -442,6 +569,8 @@ int main(int argc, char **argv)
     select_segments(cpu, protected_mode, long_mode, gpa);
     if (fpu)
         prepare_fpu(cpu);
+    if (msrs)
+        prepare_msrs(kvm, cpu);
     int other_cpu = -1;
     struct kvm_run *other_run = NULL;
     if (two_vcpus) {
@@ -496,6 +625,8 @@ int main(int argc, char **argv)
     }
     if (fpu)
         update_fpu(cpu, ram);
+    if (msrs)
+        update_msrs(cpu, ram);
     data[0x81] = 0x52;
     const struct kvm_regs update = {
         .rbx = 0xf5, .rcx = 0x3579, .rsp = 0x1f00, .rbp = 0x12345678,
@@ -520,6 +651,8 @@ int main(int argc, char **argv)
         puts("PASS x86-64 child used guest page tables and a virtual RAM alias");
     if (fpu)
         check_resumed_fpu(cpu, data);
+    if (msrs)
+        check_resumed_msrs(cpu, data);
     munmap(run, size);
     close(cpu);
     munmap(ram, ram_bytes);

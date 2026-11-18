@@ -5,6 +5,7 @@
 #include <linux/kvm.h>
 #include <signal.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -97,11 +98,12 @@ int main(int argc, char **argv)
           "install the native run interrupt handler");
     struct kvm_regs registers;
     struct kvm_fpu fpu;
-    _Static_assert(sizeof(fpu) == PVKVM_FPU_BYTES && sizeof(fpu) >= sizeof(segments),
-                   "native worker control record size");
+    struct pvkvm_msr_batch msrs;
+    _Static_assert(sizeof(fpu) == PVKVM_FPU_BYTES && sizeof(msrs) >= sizeof(fpu) &&
+                   sizeof(msrs) >= sizeof(segments), "native worker control record size");
 
     check(write(control, "R", 1) == 1, "announce worker readiness");
-    unsigned char request[2 + sizeof(fpu)];
+    unsigned char request[2 + sizeof(msrs)];
     ssize_t received;
     while ((received = recv(control, request, sizeof(request), MSG_TRUNC)) != 0) {
         if (received < 0 && errno == EINTR) continue;
@@ -154,6 +156,22 @@ int main(int argc, char **argv)
             memcpy(&fpu, request + 2, sizeof(fpu));
             check(ioctl(cpu, KVM_SET_FPU, &fpu) == 0, "write host floating-point registers");
             check(write(control, "W", 1) == 1, "acknowledge host floating-point write");
+            continue;
+        }
+        if (request[0] == 'M' || request[0] == 'N') {
+            const size_t header = offsetof(struct pvkvm_msr_batch, entries);
+            bool set = request[0] == 'N';
+            check(received >= 2 + (ssize_t)header && received <= (ssize_t)sizeof(request),
+                  "invalid host MSR request size");
+            size_t payload = received - 2;
+            memcpy(&msrs, request + 2, payload);
+            check(msrs.count <= PVKVM_MSR_BATCH_MAX &&
+                  payload == header + msrs.count * sizeof(msrs.entries[0]), "invalid host MSR batch");
+            int processed = ioctl(cpu, set ? KVM_SET_MSRS : KVM_GET_MSRS, &msrs);
+            check(processed >= 0 && (uint32_t)processed <= msrs.count, "access host MSR registers");
+            msrs.count = processed;
+            size_t response = header + (set ? 0 : msrs.count * sizeof(msrs.entries[0]));
+            check(write(control, &msrs, response) == (ssize_t)response, "return host MSR batch result");
             continue;
         }
         uint32_t sequence;

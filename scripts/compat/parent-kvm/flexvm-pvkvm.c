@@ -64,6 +64,12 @@ struct run_page {
 	u8 data;
 };
 
+static const u32 boot_msr_indices[] = {
+	MSR_IA32_SYSENTER_CS, MSR_IA32_SYSENTER_ESP, MSR_IA32_SYSENTER_EIP,
+	MSR_STAR, MSR_CSTAR, MSR_KERNEL_GS_BASE, MSR_SYSCALL_MASK, MSR_LSTAR,
+	MSR_IA32_TSC, MSR_IA32_MISC_ENABLE, MSR_MTRRdefType,
+};
+
 struct pvcpu {
 	struct pvvm *vm;
 	struct mutex execution;
@@ -71,6 +77,8 @@ struct pvcpu {
 	struct kvm_regs regs;
 	struct kvm_sregs sregs;
 	struct kvm_fpu fpu;
+	u64 msrs[ARRAY_SIZE(boot_msr_indices)];
+	unsigned long msrs_set;
 	unsigned int id;
 	bool ran;
 	bool fpu_set;
@@ -331,6 +339,24 @@ static bool slot_contains(const struct pvvm *vm, u64 gpa, unsigned int size)
 	return false;
 }
 
+static void publish_initial_msrs(struct pvcpu *cpu)
+{
+	void __iomem *mailbox = cpu->vm->provider->mailbox + PVKVM_MSR_AT;
+	unsigned int id, count = 0;
+
+	for_each_set_bit(id, &cpu->msrs_set, ARRAY_SIZE(boot_msr_indices)) {
+		const struct kvm_msr_entry entry = {
+			.index = boot_msr_indices[id], .data = cpu->msrs[id],
+		};
+
+		memcpy_toio(mailbox + offsetof(struct pvkvm_msr_batch, entries) + count * sizeof(entry),
+			    &entry, sizeof(entry));
+		count++;
+	}
+	writel(count, mailbox);
+	writel(0, mailbox + sizeof(u32));
+}
+
 static int run_cpu(struct pvcpu *cpu)
 {
 	struct pvvm *vm = cpu->vm;
@@ -371,6 +397,7 @@ static int run_cpu(struct pvcpu *cpu)
 		writel(cpu->fpu_set, p->mailbox + PVKVM_FPU_VALID_AT);
 		if (cpu->fpu_set)
 			memcpy_toio(p->mailbox + PVKVM_FPU_AT, &cpu->fpu, sizeof(cpu->fpu));
+		publish_initial_msrs(cpu);
 	}
 	result = request_for_cpu(cpu, PVKVM_RUN, memory, &cpu->page->data);
 	if (!result || result == -EINTR)
@@ -410,6 +437,119 @@ static int write_stopped_registers(struct pvcpu *cpu, enum pvkvm_command command
 		result = request_for_cpu(cpu, command, NULL, NULL);
 	}
 	mutex_unlock(&p->lock);
+	return result;
+}
+
+static int boot_msr_index(u32 msr)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(boot_msr_indices); i++)
+		if (boot_msr_indices[i] == msr)
+			return i;
+	return -1;
+}
+
+static bool valid_msr_value(u32 msr, u64 value)
+{
+	switch (msr) {
+	case MSR_IA32_SYSENTER_CS:
+		return value <= U16_MAX;
+	case MSR_IA32_MISC_ENABLE:
+		return value <= 1;
+	case MSR_SYSCALL_MASK:
+		return value <= U32_MAX;
+	case MSR_MTRRdefType:
+		return value == 0 || value == 0x806;
+	case MSR_IA32_SYSENTER_ESP:
+	case MSR_IA32_SYSENTER_EIP:
+	case MSR_CSTAR:
+	case MSR_LSTAR:
+	case MSR_KERNEL_GS_BASE:
+		return (s64)(value << 16) >> 16 == (s64)value;
+	default:
+		return true;
+	}
+}
+
+static long stopped_msr_batch(struct pvcpu *cpu, struct pvkvm_msr_batch *batch, bool write)
+{
+	struct pvkvm *p = cpu->vm->provider;
+	void __iomem *mailbox = p->mailbox + PVKVM_MSR_AT;
+	unsigned int offered = batch->count;
+	int result = mutex_lock_interruptible(&p->lock);
+
+	if (result)
+		return result;
+	if (p->dead) {
+		result = -ENODEV;
+		goto unlock;
+	}
+	memcpy_toio(mailbox, batch, offsetof(struct pvkvm_msr_batch, entries) + offered * sizeof(batch->entries[0]));
+	result = request_for_cpu(cpu, write ? PVKVM_SET_MSRS : PVKVM_GET_MSRS, NULL, NULL);
+	if (result)
+		goto unlock;
+	batch->count = readl(mailbox);
+	if (batch->count > offered) {
+		p->dead = true;
+		result = -EIO;
+	} else if (!write) {
+		memcpy_fromio(batch->entries, mailbox + offsetof(struct pvkvm_msr_batch, entries),
+			      batch->count * sizeof(batch->entries[0]));
+	}
+unlock:
+	mutex_unlock(&p->lock);
+	return result;
+}
+
+static long cpu_msrs(struct pvcpu *cpu, bool write, struct kvm_msrs __user *user)
+{
+	struct pvkvm_msr_batch *batch;
+	unsigned int count, i;
+	long result;
+
+	if (get_user(count, &user->nmsrs))
+		return -EFAULT;
+	if (count > PVKVM_MSR_BATCH_MAX)
+		return -E2BIG;
+	if (!count)
+		return 0;
+	batch = kzalloc(sizeof(*batch), GFP_KERNEL);
+	if (!batch)
+		return -ENOMEM;
+	if (copy_from_user(batch->entries, user->entries, count * sizeof(batch->entries[0]))) {
+		result = -EFAULT;
+		goto out;
+	}
+	for (i = 0; i < count; i++) {
+		struct kvm_msr_entry *entry = &batch->entries[i];
+		int id = boot_msr_index(entry->index);
+
+		if (id < 0 || (write && !valid_msr_value(entry->index, entry->data)))
+			break;
+		entry->reserved = 0;
+		if (cpu->ran)
+			continue;
+		if (write) {
+			cpu->msrs[id] = entry->data;
+			set_bit(id, &cpu->msrs_set);
+		} else if (test_bit(id, &cpu->msrs_set)) {
+			entry->data = cpu->msrs[id];
+		} else {
+			break;
+		}
+	}
+	batch->count = i;
+	if (cpu->ran && batch->count) {
+		result = stopped_msr_batch(cpu, batch, write);
+		if (result)
+			goto out;
+	}
+	result = batch->count;
+	if (!write && copy_to_user(user->entries, batch->entries, batch->count * sizeof(batch->entries[0])))
+		result = -EFAULT;
+out:
+	kfree(batch);
 	return result;
 }
 
@@ -511,6 +651,10 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		cpu->fpu = fpu;
 		cpu->fpu_set = true;
 		result = 0;
+		break;
+	case KVM_GET_MSRS:
+	case KVM_SET_MSRS:
+		result = cpu_msrs(cpu, cmd == KVM_SET_MSRS, uarg);
 		break;
 	case KVM_RUN:
 		if (arg || cpu->sregs.cs.base || !registers_fit_mode(&cpu->regs, &cpu->sregs) ||
@@ -754,6 +898,16 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return PAGE_SIZE;
 	case KVM_CHECK_EXTENSION:
 		return device_capability(arg);
+	case KVM_GET_MSR_INDEX_LIST: {
+		struct kvm_msr_list __user *list = (void __user *)arg;
+		u32 capacity;
+
+		if (get_user(capacity, &list->nmsrs) || put_user(ARRAY_SIZE(boot_msr_indices), &list->nmsrs))
+			return -EFAULT;
+		if (capacity < ARRAY_SIZE(boot_msr_indices))
+			return -E2BIG;
+		return copy_to_user(list->indices, boot_msr_indices, sizeof(boot_msr_indices)) ? -EFAULT : 0;
+	}
 	case KVM_CREATE_VM:
 		return new_vm(file->private_data, arg);
 	default:
@@ -787,8 +941,9 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	BUILD_BUG_ON(PVKVM_SLOT_TABLE_AT + PVKVM_MAX_SLOTS * PVKVM_SLOT_RECORD_SIZE > PVKVM_FPU_AT);
 	BUILD_BUG_ON(sizeof(struct kvm_fpu) != PVKVM_FPU_BYTES);
 	BUILD_BUG_ON(PVKVM_FPU_AT + PVKVM_FPU_BYTES > PVKVM_RAM_ADDRESS_AT);
+	BUILD_BUG_ON(PVKVM_RAM_ADDRESS_AT + PVKVM_MAX_PAGES * sizeof(u64) > PVKVM_MSR_AT);
 	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
-	    pci_resource_len(dev, 2) < PVKVM_RAM_ADDRESS_AT + PVKVM_MAX_PAGES * sizeof(u64))
+	    pci_resource_len(dev, 2) < PVKVM_MSR_AT + sizeof(struct pvkvm_msr_batch))
 		return -ENODEV;
 	result = pcim_enable_device(dev);
 	if (result)

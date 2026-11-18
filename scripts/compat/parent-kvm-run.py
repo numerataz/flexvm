@@ -40,11 +40,16 @@ CR0_PAGING = 1 << 31
 CR4_PAE = 1 << 5
 EFER_LONG_MODE_ACTIVE = 1 << 10
 EFER_LONG_MODE_ENABLE = 1 << 8
-OPEN_VM, CLOSE_VM, OPEN_CPU, CLOSE_CPU, RUN, GET_REGS, SET_REGS, GET_SREGS, GET_FPU, SET_FPU = range(1, 11)
+(OPEN_VM, CLOSE_VM, OPEN_CPU, CLOSE_CPU, RUN, GET_REGS, SET_REGS, GET_SREGS,
+ GET_FPU, SET_FPU, GET_MSRS, SET_MSRS) = range(1, 13)
 FPU_VALID_AT = 48
 FPU_AT = 768
 FPU_SIZE = 416
 RAM_ADDRESS_AT = 1280
+MSR_AT = 0x81000
+MSR_BATCH_MAX = 64
+MSR_HEADER = struct.Struct("<II")
+MSR_ENTRY = struct.Struct("<IIQ")
 # Linux's x86 struct kvm_regs.
 REGISTERS = struct.Struct("<18Q")
 SEGMENT = struct.Struct("<QIH9Bx")
@@ -130,6 +135,24 @@ def read_protected_entry(mailbox, slots, long_mode):
 
 def slot_contains(slots, address, size):
     return any(slot.gpa <= address and address + size <= slot.gpa + len(slot.offsets) * PAGE_SIZE for slot in slots)
+
+
+def pack_msr_batch(entries):
+    return MSR_HEADER.pack(len(entries), 0) + b"".join(
+        MSR_ENTRY.pack(index, 0, value) for index, value in entries)
+
+
+def unpack_msr_batch(record):
+    count, reserved = MSR_HEADER.unpack_from(record)
+    if reserved or count > MSR_BATCH_MAX or len(record) < MSR_HEADER.size + count * MSR_ENTRY.size:
+        raise RuntimeError("invalid MSR batch")
+    entries = []
+    for offset in range(MSR_HEADER.size, MSR_HEADER.size + count * MSR_ENTRY.size, MSR_ENTRY.size):
+        index, reserved, value = MSR_ENTRY.unpack_from(record, offset)
+        if reserved:
+            raise RuntimeError("reserved MSR entry field is nonzero")
+        entries.append((index, value))
+    return entries
 
 
 def stop_process(process):
@@ -328,6 +351,13 @@ class TcgChild:
     def set_floating_point(self, cpu, record):
         self.special_command("x-flexvm-set-x86-fpu", {"cpu-index": cpu, "record": record.hex()})
 
+    def access_msrs(self, cpu, entries, write):
+        result = self.special_command("x-flexvm-access-x86-msrs", {
+            "cpu-index": cpu, "write": write,
+            "entries": [{"index": index, "value": value} for index, value in entries],
+        })
+        return [(entry["index"], entry["value"]) for entry in result["entries"]]
+
     def close(self):
         try:
             if self.special_monitor is not None:
@@ -412,6 +442,18 @@ class KvmChild:
         self.channel.connection.sendall(bytes((ord("W"), cpu)) + record)
         if self.channel.connection.recv(2) != b"W":
             raise RuntimeError("native parent worker did not acknowledge the floating-point write")
+
+    def access_msrs(self, cpu, entries, write):
+        payload = pack_msr_batch(entries)
+        self.channel.connection.sendall(bytes((ord("N" if write else "M"), cpu)) + payload)
+        maximum = MSR_HEADER.size if write else len(payload)
+        result = self.channel.connection.recv(maximum + 1)
+        if len(result) < MSR_HEADER.size or len(result) > maximum:
+            raise RuntimeError("native parent worker returned an invalid MSR result size")
+        count, reserved = MSR_HEADER.unpack_from(result)
+        if reserved or count > len(entries) or len(result) != MSR_HEADER.size + (0 if write else count * MSR_ENTRY.size):
+            raise RuntimeError("native parent worker returned an invalid MSR result")
+        return entries[:count] if write else unpack_msr_batch(result)
 
     def close(self):
         if self.channel is not None:
@@ -514,7 +556,7 @@ def verify_slot_spans(pid, slots):
 
 
 def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry,
-             split_slot, interrupt_run, cpu_count, long_mode, fpu):
+             split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
@@ -528,9 +570,13 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         expected_io.append((1, 0x56))
     if fpu:
         expected.extend((GET_FPU, SET_FPU))
+    if msrs:
+        expected.extend((GET_MSRS, SET_MSRS))
     expected.extend((SET_REGS, GET_REGS, *((RUN, GET_REGS) * expected_interruptions), RUN, GET_REGS))
     if fpu:
         expected.append(GET_FPU)
+    if msrs:
+        expected.append(GET_MSRS)
     expected.extend((CLOSE_CPU, CLOSE_VM))
     expected_counters.extend((*([0x3579] * (1 + expected_interruptions)), 0x2468))
     expected_io.append((0, 0xa7))
@@ -556,7 +602,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 15)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 16)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
         os.ftruncate(outer_ram, outer_ram_size)
@@ -605,7 +651,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
             if pending != complete + 1 or len(observed) >= len(expected) or opcode != expected[len(observed)]:
                 raise RuntimeError(f"unexpected doorbell request {pending}, command {opcode}")
             cpu, = struct.unpack_from("<I", mapping, 44)
-            if opcode in (CLOSE_CPU, RUN, GET_REGS, GET_SREGS, SET_REGS, GET_FPU, SET_FPU) and cpu not in open_cpus:
+            cpu_commands = (CLOSE_CPU, RUN, GET_REGS, GET_SREGS, SET_REGS, GET_FPU, SET_FPU, GET_MSRS, SET_MSRS)
+            if opcode in cpu_commands and cpu not in open_cpus:
                 raise RuntimeError(f"command {opcode} requested unopened vCPU {cpu}")
             status = 0
             if opcode == OPEN_CPU:
@@ -632,6 +679,11 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                         raise RuntimeError("unexpected staged floating-point state")
                     if fpu_valid:
                         child.set_floating_point(cpu, mapping[FPU_AT:FPU_AT + FPU_SIZE])
+                    initial_msrs = unpack_msr_batch(mapping[MSR_AT:MSR_AT + MSR_HEADER.size + MSR_ENTRY.size * MSR_BATCH_MAX])
+                    if bool(initial_msrs) != msrs:
+                        raise RuntimeError("unexpected staged boot MSR state")
+                    if initial_msrs and child.access_msrs(cpu, initial_msrs, True) != initial_msrs:
+                        raise RuntimeError("worker rejected staged boot MSR state")
                     started_cpus.add(cpu)
                 value = child.run(cpu, RunCancellation(cancellations, mapping, pending, deadline))
                 if value is None:
@@ -663,6 +715,13 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 mapping[FPU_AT:FPU_AT + FPU_SIZE] = child.floating_point(cpu)
             elif opcode == SET_FPU:
                 child.set_floating_point(cpu, mapping[FPU_AT:FPU_AT + FPU_SIZE])
+            elif opcode in (GET_MSRS, SET_MSRS):
+                entries = unpack_msr_batch(mapping[MSR_AT:MSR_AT + MSR_HEADER.size + MSR_ENTRY.size * MSR_BATCH_MAX])
+                completed = child.access_msrs(cpu, entries, opcode == SET_MSRS)
+                if [index for index, _ in completed] != [index for index, _ in entries[:len(completed)]]:
+                    raise RuntimeError("worker returned a different MSR prefix")
+                record = pack_msr_batch(completed)
+                mapping[MSR_AT:MSR_AT + len(record)] = record
             elif opcode == CLOSE_CPU:
                 open_cpus.remove(cpu)
                 if not open_cpus:
@@ -684,6 +743,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 or cpu_count == 2 and "PASS two vCPUs kept independent state in one child" not in guest
                 or long_mode and "PASS x86-64 child used guest page tables and a virtual RAM alias" not in guest
                 or fpu and "PASS x87 and XMM state reached the parent worker" not in guest
+                or msrs and "PASS x86 boot MSRs reached the parent worker" not in guest
                 or "PASS /dev/kvm returned two port I/O exits" not in guest
                 or "PASS parent KVM guest shutdown" not in guest):
             raise RuntimeError(f"parent execution proof failed; commands={observed}, see outer.log")
@@ -704,6 +764,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         "io_values": child.channel.exits, "child_memory_write_visible": True, "same_child_worker": True,
         "vcpu_io_events": io_events, "vcpu_count": cpu_count,
         "floating_point": fpu,
+        "boot_msrs": msrs,
         "register_counters": counters,
         "interrupted_runs": len(child.channel.interruptions),
         "interrupted_run_ms": child.channel.interruptions,
@@ -738,11 +799,14 @@ def main():
     parser.add_argument("--two-vcpus", action="store_true", help="run two vCPUs serially with shared child RAM")
     parser.add_argument("--long-mode", action="store_true", help="enter x86-64 mode with client-supplied page tables")
     parser.add_argument("--fpu", action="store_true", help="exercise x87 and XMM state in long mode")
+    parser.add_argument("--msrs", action="store_true", help="exercise x86 Linux boot MSRs in long mode")
     parser.add_argument("--reject-close", action="store_true", help="verify page retention when the parent refuses close")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.fpu and not args.long_mode:
         parser.error("--fpu requires long mode")
+    if args.msrs and (not args.long_mode or args.fpu):
+        parser.error("--msrs requires long mode and a separate run from --fpu")
     if args.long_mode:
         if args.two_vcpus or args.ram_pages < (8 if args.split_slot else 4):
             parser.error("--long-mode requires one vCPU and four pages in the low slot")
@@ -764,7 +828,7 @@ def main():
     if args.worker:
         print(json.dumps(exercise(qemu, kernel, output, args.reject_close, args.parent_engine, args.ram_pages,
                                   args.protected_entry, args.split_slot, args.interrupt_run,
-                                  2 if args.two_vcpus else 1, args.long_mode, args.fpu)))
+                                  2 if args.two_vcpus else 1, args.long_mode, args.fpu, args.msrs)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -800,6 +864,8 @@ def main():
                 oracle.append("long")
             if args.fpu:
                 oracle.append("fpu")
+            if args.msrs:
+                oracle.append("msrs")
             HELPERS["run"](oracle, 14 if args.interrupt_run else 8, output / "native-kvm.log")
             report["same_client_passed_native_kvm"] = True
             report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
@@ -817,6 +883,8 @@ def main():
             files["long-mode"] = b""
         if args.fpu:
             files["floating-point"] = b""
+        if args.msrs:
+            files["boot-msrs"] = b""
         image = HELPERS["initramfs"](init.read_bytes(), files=files)
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
@@ -843,6 +911,7 @@ def main():
                             *(["--two-vcpus"] if args.two_vcpus else []),
                             *(["--long-mode"] if args.long_mode else []),
                             *(["--fpu"] if args.fpu else []),
+                            *(["--msrs"] if args.msrs else []),
                             *(["--reject-close"] if args.reject_close else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}
