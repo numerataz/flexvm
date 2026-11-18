@@ -499,7 +499,7 @@ static int checkpoint_core(struct arm_vm *vm, const struct flexvm_arm_request *r
             int cpus[FLEXVM_ARM_MAX_CPUS];
             for (unsigned int id = 0; id < FLEXVM_ARM_MAX_CPUS; id++)
                 cpus[id] = vm->cpus[id].fd;
-            status = arm_gic_state_file(vm->vgic[0], cpus, fd, request->command == FLEXVM_ARM_SAVE_GIC);
+            status = arm_gic_state_file(vm->vgic, cpus, fd, request->command == FLEXVM_ARM_SAVE_GIC);
         } else if (!status) {
             status = arm_core_state_file(cpu->fd, request->cpu, fd, list, request->command == FLEXVM_ARM_SAVE_CORE);
         }
