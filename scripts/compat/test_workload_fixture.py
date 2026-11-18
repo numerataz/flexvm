@@ -137,6 +137,16 @@ class Fixture(unittest.TestCase):
         with self.assertRaises(ValueError):
             verify(fifo, {})
 
+    def test_daemon_export_without_an_image_manifest_is_rejected(self):
+        verify = runpy.run_path(str(HELPER.with_name('verify-fixture-import.py')))['verify']
+        path = self.root / 'incomplete.tar'
+        with tarfile.open(path, 'w') as archive:
+            entry = tarfile.TarInfo('blobs/sha256/' + self.config_descriptor['digest'][7:])
+            entry.size = len(self.config)
+            archive.addfile(entry, io.BytesIO(self.config))
+        with self.assertRaisesRegex(ValueError, 'missing regular member .*index.json'):
+            verify(path, self.api['validate_cache'](self.cache, 'amd64'))
+
 
 if __name__ == '__main__':
     unittest.main()
