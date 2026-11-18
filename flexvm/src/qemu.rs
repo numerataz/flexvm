@@ -85,12 +85,22 @@ impl ParentKvm {
         runtime: &SocketRoot,
         memory: u32,
         qmp: &Path,
-    ) -> Result<(Command, software_state::Input)> {
+    ) -> Result<(Command, software_state::Input, Option<software_state::Input>)> {
         let directory = runtime.dir.join("logs/parent-kvm");
         fs::create_dir(&directory)?;
         let saved = incoming.and_then(|state| state.parent);
         let bundle = directory.join("bundle");
         let frontend = self.stage_frontend(&bundle, saved)?;
+        let native_worker = if saved.is_some() && self.engine == "kvm" {
+            let worker = software_state::Input::open(&self.bundle.join("native-worker").canonicalize()?)?;
+            // The runtime directory can be mounted noexec. Keep a descriptor
+            // for the locally trusted executable throughout the owner lifetime.
+            let pinned = format!("/proc/{}/fd/{}", std::process::id(), worker.file.as_raw_fd());
+            std::os::unix::fs::symlink(pinned, bundle.join("native-worker"))?;
+            Some(worker)
+        } else {
+            None
+        };
         let broker = directory.join("parent-kvm-run.py");
         fs::write(&broker, include_bytes!("../../scripts/compat/parent-kvm-run.py"))?;
         fs::write(directory.join("software-boot.py"), include_bytes!("../../scripts/compat/software-boot.py"))?;
@@ -112,7 +122,7 @@ impl ParentKvm {
             cmd.arg("--inherit").arg(fd.to_string());
         }
         cmd.arg("--").arg(qemu.get_program()).args(qemu.get_args());
-        Ok((cmd, frontend))
+        Ok((cmd, frontend, native_worker))
     }
 
     fn stage_frontend(&self, bundle: &Path, saved: Option<&software_state::ParentInputs>) -> Result<software_state::Input> {
@@ -330,6 +340,7 @@ pub struct Machine {
     parent_provider: bool,
     parent_fence: Option<ParentFence>,
     parent_frontend: Option<software_state::Input>,
+    _native_worker: Option<software_state::Input>,
     parent_memory_mib: u32,
 }
 
@@ -351,15 +362,16 @@ struct ParentFence {
 }
 
 impl ParentFence {
-    fn request(socket: &UnixStream, command: &[u8], fds: &[RawFd], deadline: Instant) -> Result<()> {
+    fn request(socket: &UnixStream, command: &[u8], fds: &[RawFd], deadline: Instant) -> Result<bool> {
         util::send_with_fds(socket, command, fds, deadline)?;
         socket.set_read_timeout(Some(remaining(deadline)?))?;
         let mut reply = [0; 64];
         let (received, fds) = util::recvmsg_fds(socket.as_raw_fd(), &mut reply)?;
-        if !fds.is_empty() || &reply[..received] != b"ok" {
+        let native = command == b"check-save" && &reply[..received] == b"ok:kvm";
+        if !fds.is_empty() || (&reply[..received] != b"ok" && !native) {
             bail!("parent KVM broker rejected {}: {}", String::from_utf8_lossy(command), String::from_utf8_lossy(&reply[..received]));
         }
-        Ok(())
+        Ok(native)
     }
 
     fn acquire(&self, command: &[u8], deadline: Instant) -> Result<()> {
@@ -373,7 +385,7 @@ impl ParentFence {
         Ok(())
     }
 
-    fn check_save(&self, deadline: Instant) -> Result<()> {
+    fn check_save(&self, deadline: Instant) -> Result<bool> {
         let lease = self.lease.lock().unwrap();
         let socket = lease.as_ref().ok_or("parent KVM checkpoint has no owner lease")?;
         Self::request(socket, b"check-save", &[], deadline)
@@ -382,13 +394,13 @@ impl ParentFence {
     fn save(&self, fds: &[RawFd; 3], deadline: Instant) -> Result<()> {
         let lease = self.lease.lock().unwrap();
         let socket = lease.as_ref().ok_or("parent KVM checkpoint has no owner lease")?;
-        Self::request(socket, b"save", fds, deadline)
+        Self::request(socket, b"save", fds, deadline).map(|_| ())
     }
 
     fn rollback(&self, deadline: Instant) -> Result<()> {
         let lease = self.lease.lock().unwrap();
         let socket = lease.as_ref().ok_or("parent KVM rollback has no owner lease")?;
-        Self::request(socket, b"rollback", &[], deadline)
+        Self::request(socket, b"rollback", &[], deadline).map(|_| ())
     }
 
     fn thaw(&self, deadline: Instant) -> Result<()> {
@@ -561,8 +573,8 @@ impl Config {
     pub fn restore(&self, verified: software_state::Verified, processes: Arc<Processes>) -> Result<Machine> {
         match (&self.parent_kvm, &verified.manifest.parent) {
             (None, None) => {}
-            (Some(config), Some(parent))
-                if cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) && config.engine == "tcg" && config.child_mem_mib == parent.child_memory_mib => {}
+            (Some(config), Some(parent)) if config.engine == (if parent.native { "kvm" } else { "tcg" }) && config.child_mem_mib == parent.child_memory_mib => {
+            }
             _ => bail!("software restore requires the captured parent KVM configuration"),
         }
         if self.control != Control::Serial {
@@ -622,6 +634,7 @@ impl Config {
             parent_provider: self.parent_kvm.is_some(),
             parent_fence: None,
             parent_frontend: None,
+            _native_worker: None,
             parent_memory_mib: self.parent_kvm.as_ref().map_or(0, |parent| parent.child_mem_mib),
         };
         let firmware = machine.logs.join("firmware");
@@ -657,9 +670,10 @@ impl Config {
                 if let Some(fds) = incoming.as_ref().and_then(Incoming::parent_fds) {
                     inherited.extend(fds);
                 }
-                let (parent_command, frontend) = provider.command(cmd, &inherited, incoming.as_ref(), &root, self.mem_mib, endpoints.api)?;
+                let (parent_command, frontend, native_worker) = provider.command(cmd, &inherited, incoming.as_ref(), &root, self.mem_mib, endpoints.api)?;
                 cmd = parent_command;
                 machine.parent_frontend = Some(frontend);
+                machine._native_worker = native_worker;
             }
             machine.processes.spawn_with_fds(&mut cmd, &machine.logs.join("qemu.log"), &inherited)?;
             while !machine.sockets.api.exists() {
@@ -980,9 +994,9 @@ impl Machine {
         if let (Some(fence), Some(frontend)) = (&self.parent_fence, &self.parent_frontend) {
             // Refusal here leaves the existing pause lease intact. Once save
             // is sent, only explicit rollback can authorize source execution.
-            fence.check_save(deadline)?;
+            let native = fence.check_save(deadline)?;
             let outer = staging.state.as_raw_fd();
-            let parent = staging.prepare_parent(frontend, self.parent_memory_mib)?;
+            let parent = staging.prepare_parent(frontend, self.parent_memory_mib, native)?;
             let fds = [outer, parent.worker.as_raw_fd(), parent.broker.as_raw_fd()];
             let mut capture = self.capture.lock().unwrap();
             if *capture != Capture::None {
@@ -1567,6 +1581,7 @@ mod tests {
             parent_provider: false,
             parent_fence: None,
             parent_frontend: None,
+            _native_worker: None,
             parent_memory_mib: 0,
         }
     }

@@ -683,6 +683,7 @@ jobs:
           if [ -x "$RUNNER_TEMP/parent-kvm-firecracker-kvm-2/provider/native-worker" ]; then
             run_public_parent kvm
             run_public_parent kvm kvm --pause
+            run_public_parent kvm kvm --suspend
             run_public_parent auto kvm
           fi
       - name: Launch unchanged ARM Firecracker through FlexVM software

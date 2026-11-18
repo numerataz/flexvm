@@ -342,6 +342,7 @@ class OuterLaunch:
     control: Path | None
     checkpoint_qmp: Path | None = None
     restore_fds: tuple[int, ...] = ()
+    native_checkpoint: bool = False
 
 
 def spawn_owned(command, **kwargs):
@@ -2210,7 +2211,8 @@ def exercise(
                 if gate:
                     active_ready = lanes and started_cpus == open_cpus == set(range(len(lanes.connections)))
                     unstarted = child is None and len(staged_irq_levels) <= X86_STAGED_IRQ_LIMIT
-                    capturable = not active_vm or unstarted or active_ready
+                    capturable = ((parent_engine != "kvm" or launch.native_checkpoint) and
+                                  (not active_vm or unstarted or active_ready))
                     if gate.service(readable, child, capture if capturable else None, rollback):
                         return 0
                 held = gate is not None and gate.phase != "running"
@@ -2840,9 +2842,9 @@ def serve_outer(argv):
         parser.error("only unique non-standard inherited descriptors are supported")
     for descriptor in args.inherit:
         os.fstat(descriptor)
-    if args.restore_fds and (args.engine != "tcg" or len(set(args.restore_fds)) != 3 or
+    if args.restore_fds and (args.engine == "auto" or len(set(args.restore_fds)) != 3 or
                             not set(args.restore_fds) <= set(args.inherit)):
-        parser.error("restoring parent state requires three inherited descriptors and a TCG worker")
+        parser.error("parent restore requires three inherited descriptors and an explicit worker")
     qemu = command[0]
     if qemu.startswith("/proc/self/fd/") or args.emulator_fd is not None:
         if args.emulator_fd not in args.inherit or qemu != f"/proc/self/fd/{args.emulator_fd}":
@@ -2879,16 +2881,21 @@ def serve_outer(argv):
         if not available and engine == "kvm":
             parser.error("native parent execution requires an available KVM worker")
         engine = "kvm" if available else "tcg"
-    if checkpoint and engine == "tcg":
-        options = native_query([qemu, "-device", "isa-debugcon,help"])
-        checkpoint = b"checkpoint-control" in options.stdout + options.stderr
-    if args.restore_fds and not checkpoint:
+    native_checkpoint = False
+    if checkpoint:
+        if engine == "tcg":
+            options = native_query([qemu, "-device", "isa-debugcon,help"])
+            checkpoint = b"checkpoint-control" in options.stdout + options.stderr
+        else:
+            options = native_query([bundle / "native-worker", "--checkpoint-state"])
+            native_checkpoint = not options.returncode and options.stdout == b"flexvm-native-x86-checkpoint-1\n"
+    if args.restore_fds and (not checkpoint or (engine == "kvm" and not native_checkpoint)):
         parser.error("restoring x86 parent state requires a checkpoint-capable engine and frontend")
     result = exercise(
         qemu, None, output, parent_engine=engine, ram_pages=args.child_memory * MIB // PAGE_SIZE,
         protected_entry=True, pvh=True, cpu_count=2,
         launch=OuterLaunch(tuple(command), tuple(args.inherit), args.outer_memory, args.emulator_fd, args.control,
-                           args.outer_qmp if checkpoint else None, tuple(args.restore_fds or ())),
+                           args.outer_qmp if checkpoint else None, tuple(args.restore_fds or ()), native_checkpoint),
     )
     return 128 - result if result < 0 else result
 
