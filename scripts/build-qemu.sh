@@ -7,7 +7,7 @@ prefix=${1:?usage: build-qemu.sh INSTALL_PREFIX [x86_64|aarch64]}
 arch=${2:-x86_64}
 case "$arch" in
   x86_64) pkgversion=flexvm-tcg-nested-36 ;;
-  aarch64) pkgversion=flexvm-tcg-arm-2 ;;
+  aarch64) pkgversion=flexvm-tcg-arm-3 ;;
   *) echo "unsupported QEMU target: $arch" >&2; exit 2 ;;
 esac
 scripts_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
