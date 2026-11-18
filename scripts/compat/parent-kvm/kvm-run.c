@@ -19,6 +19,12 @@
 #define SPLIT_SLOT_GPA 0x20000000
 #define GDT_OFFSET 0x200
 #define SECOND_CPU_OFFSET 0x300
+#define LONG_ALIAS 0x4001000000ULL
+#define HUGE_PAGE_SIZE 0x200000ULL
+#define LONG_REGISTER 0x8fedcba987654321ULL
+#define LONG_CR0 0x80000001ULL
+#define LONG_CR4 0x20ULL
+#define LONG_EFER 0x500ULL
 #define TEST_INTERRUPTS 3
 
 static void check(bool valid, const char *why)
@@ -45,23 +51,24 @@ static void check_output(struct kvm_run *run, int bytes, unsigned char value)
           ((unsigned char *)run)[run->io.data_offset] == value, "KVM I/O exit");
 }
 
-static void check_registers(int cpu, unsigned char accumulator, unsigned int counter, uint64_t gpa)
+static struct kvm_regs check_registers(int cpu, unsigned char accumulator, unsigned int counter, uint64_t start)
 {
     struct kvm_regs regs;
 
     check(ioctl(cpu, KVM_GET_REGS, &regs) == 0, "read actual registers after exit");
     check((regs.rax & 0xff) == accumulator && regs.rcx == counter &&
-          regs.rip >= gpa && (regs.rflags & 2), "check actual registers after exit");
+          regs.rip >= start && (regs.rflags & 2), "check actual registers after exit");
+    return regs;
 }
 
-static void select_segments(int cpu, bool protected_mode, uint64_t gpa)
+static void select_segments(int cpu, bool protected_mode, bool long_mode, uint64_t gpa)
 {
     struct kvm_sregs sregs;
     check(ioctl(cpu, KVM_GET_SREGS, &sregs) == 0, "read reset segments");
     if (protected_mode) {
         const struct kvm_segment code = {
             .limit = UINT32_MAX, .selector = 8, .type = 11, .present = 1,
-            .db = 1, .s = 1, .g = 1,
+            .db = !long_mode, .s = 1, .l = long_mode, .g = 1,
         };
         const struct kvm_segment data = {
             .limit = UINT32_MAX, .selector = 16, .type = 3, .present = 1,
@@ -71,11 +78,32 @@ static void select_segments(int cpu, bool protected_mode, uint64_t gpa)
         sregs.ds = sregs.es = sregs.fs = sregs.gs = sregs.ss = data;
         sregs.gdt = (struct kvm_dtable){.base = gpa + GDT_OFFSET, .limit = 23};
         sregs.cr0 |= 1;
+        if (long_mode) {
+            sregs.cr0 |= LONG_CR0;
+            sregs.cr3 = gpa + 4096;
+            sregs.cr4 |= LONG_CR4;
+            sregs.efer |= LONG_EFER;
+        }
     } else {
         sregs.cs.base = 0;
         sregs.cs.selector = 0;
     }
     check(ioctl(cpu, KVM_SET_SREGS, &sregs) == 0, "select the child execution mode");
+}
+
+static void setup_page_tables(unsigned char *ram, uint64_t gpa, uint64_t middle, uint64_t last)
+{
+    uint64_t *level4 = (uint64_t *)(ram + 4096);
+    uint64_t *level3 = (uint64_t *)(ram + 8192);
+    uint64_t *level2 = (uint64_t *)(ram + 12288);
+    const size_t entry = (LONG_ALIAS >> 21) & 511;
+
+    level4[(LONG_ALIAS >> 39) & 511] = (gpa + 8192) | 3;
+    level3[0] = (gpa + 12288) | 3; /* Keep the GDT identity mapped. */
+    level3[(LONG_ALIAS >> 30) & 511] = (gpa + 12288) | 3;
+    level2[entry] = gpa | 0x83;
+    level2[entry + 1] = (middle & ~(HUGE_PAGE_SIZE - 1)) | 0x83;
+    level2[entry + 2] = (last & ~(HUGE_PAGE_SIZE - 1)) | 0x83;
 }
 
 struct interrupt_test {
@@ -144,12 +172,15 @@ int main(int argc, char **argv)
     bool protected_mode = split_slot || (argc >= 3 && !strcmp(argv[2], "protected"));
     bool interrupt_run = false;
     bool two_vcpus = false;
+    bool long_mode = false;
     check(argc == 2 || protected_mode, "specify RAM pages and optional protected or split mode");
     for (int i = 3; i < argc; i++) {
         if (!interrupt_run && !strcmp(argv[i], "interrupt"))
             interrupt_run = true;
         else if (!two_vcpus && !strcmp(argv[i], "smp"))
             two_vcpus = true;
+        else if (!long_mode && !strcmp(argv[i], "long"))
+            long_mode = true;
         else
             check(false, "invalid execution option");
     }
@@ -159,6 +190,7 @@ int main(int argc, char **argv)
     check(!errno && !*end && count > 0 && count <= PVKVM_MAX_PAGES, "select the RAM page count");
     check(protected_mode || count <= PVKVM_REAL_MODE_MAX_PAGES, "select protected mode for a large slot");
     check(!split_slot || count >= 2, "split mode needs at least two RAM pages");
+    check(!long_mode || (!two_vcpus && count >= (split_slot ? 8 : 4)), "reserve four low pages for long mode");
     size_t pages = count;
     size_t ram_bytes = pages * 4096;
     uint64_t gpa = protected_mode ? PROTECTED_SLOT_GPA : PVKVM_GUEST_START;
@@ -168,6 +200,9 @@ int main(int argc, char **argv)
         middle_page = SPLIT_SLOT_GPA;
         last_page = SPLIT_SLOT_GPA + (pages - pages / 2 - 1) * 4096;
     }
+    uint64_t entry_base = long_mode ? LONG_ALIAS : gpa;
+    uint64_t middle_address = long_mode ? LONG_ALIAS + HUGE_PAGE_SIZE + (middle_page % HUGE_PAGE_SIZE) : middle_page;
+    uint64_t data_address = long_mode ? LONG_ALIAS + 2 * HUGE_PAGE_SIZE + (last_page % HUGE_PAGE_SIZE) : last_page;
     int kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     check(kvm >= 0, "open /dev/kvm");
     check(ioctl(kvm, KVM_GET_API_VERSION, 0) == KVM_API_VERSION, "API version");
@@ -268,9 +303,16 @@ int main(int argc, char **argv)
     unsigned char *data = ram + ram_bytes - 4096;
     unsigned char *middle = ram + (pages / 2) * 4096;
     const unsigned char gdtr[] = {0x2f, 0x00, 0x80, 0x34, 0x12, 0x00};
-    const uint64_t gdt[] = { 0, 0x00cf9b000000ffff, 0x00cf93000000ffff };
+    const uint64_t gdt[] = { 0, long_mode ? 0x00af9b000000ffff : 0x00cf9b000000ffff, 0x00cf93000000ffff };
     if (protected_mode) {
-        memcpy(ram + 0x10, flat_code, sizeof(flat_code));
+        const unsigned char long_prelude[] = {0x4d, 0x89, 0xf8}; /* mov r8, r15 */
+        size_t startup = 0x10;
+        if (long_mode) {
+            setup_page_tables(ram, gpa, middle_page, last_page);
+            memcpy(ram + startup, long_prelude, sizeof(long_prelude));
+            startup += sizeof(long_prelude);
+        }
+        memcpy(ram + startup, flat_code, sizeof(flat_code));
         memcpy(ram + 0x40, flat_resumed, sizeof(flat_resumed));
         if (interrupt_run)
             memcpy(ram + 0x60, flat_interruptible, sizeof(flat_interruptible));
@@ -285,17 +327,19 @@ int main(int argc, char **argv)
     check(ioctl(vm, KVM_CREATE_VCPU, 0) == -1 && errno == EEXIST, "reject duplicate vCPU");
     struct kvm_run *run = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, cpu, 0);
     check(run != MAP_FAILED, "map kvm_run");
-    struct kvm_regs regs = {.rax = 0x41, .rip = gpa + 0x10, .rflags = 3};
+    struct kvm_regs regs = {.rax = 0x41, .rip = entry_base + 0x10, .rflags = 3};
     if (protected_mode) {
-        regs.rbx = last_page;
-        regs.rdi = gpa;
-        regs.rsi = middle_page;
+        regs.rbx = data_address;
+        regs.rdi = entry_base;
+        regs.rsi = middle_address;
     }
+    if (long_mode)
+        regs.r15 = LONG_REGISTER;
     check(ioctl(cpu, KVM_SET_REGS, &regs) == 0, "set initial registers");
     struct kvm_regs readback;
     check(ioctl(cpu, KVM_GET_REGS, &readback) == 0 && !memcmp(&readback, &regs, sizeof(regs)),
           "read back initial registers");
-    select_segments(cpu, protected_mode, gpa);
+    select_segments(cpu, protected_mode, long_mode, gpa);
     int other_cpu = -1;
     struct kvm_run *other_run = NULL;
     if (two_vcpus) {
@@ -307,7 +351,7 @@ int main(int argc, char **argv)
         check(other_run != MAP_FAILED, "map second kvm_run");
         const struct kvm_regs other_regs = {.rdi = last_page, .rip = gpa + SECOND_CPU_OFFSET, .rflags = 2};
         check(ioctl(other_cpu, KVM_SET_REGS, &other_regs) == 0, "set second vCPU registers");
-        select_segments(other_cpu, true, gpa);
+        select_segments(other_cpu, true, false, gpa);
     }
     close(vm);
     run->immediate_exit = 1;
@@ -315,16 +359,22 @@ int main(int argc, char **argv)
     run->immediate_exit = 0;
     unsigned long long first = timed_run(cpu);
     check_output(run, size, 0x42);
-    check_registers(cpu, 0x42, 0x1357, gpa);
+    struct kvm_regs observed = check_registers(cpu, 0x42, 0x1357, entry_base);
+    if (long_mode)
+        check(observed.r8 == LONG_REGISTER && observed.r15 == LONG_REGISTER, "execute a 64-bit register transfer");
     struct kvm_sregs sregs;
     check(ioctl(cpu, KVM_GET_SREGS, &sregs) == 0, "read actual special registers after exit");
     check(sregs.cr2 == 0x89abcdef && sregs.ds.present && !sregs.ds.unusable,
           "read the child's control register and active data segment");
     if (protected_mode) {
-        check((sregs.cr0 & 1) && sregs.cs.selector == 8 && sregs.cs.db &&
+        check((sregs.cr0 & 1) && sregs.cs.selector == 8 && sregs.cs.db == !long_mode &&
               sregs.ds.selector == 16 && sregs.ds.base == 0 && sregs.ds.limit == UINT32_MAX &&
               sregs.gdt.base == gpa + GDT_OFFSET && sregs.gdt.limit == 23,
               "observe the client's flat protected-mode state");
+        if (long_mode)
+            check(sregs.cs.l && (sregs.cr0 & LONG_CR0) == LONG_CR0 && sregs.cr3 == gpa + 4096 &&
+                  (sregs.cr4 & LONG_CR4) && (sregs.efer & LONG_EFER) == LONG_EFER,
+                  "observe active long-mode paging");
     } else {
         check(sregs.ds.selector == pages * 0x100 && sregs.ds.base == pages * 4096 &&
               sregs.ds.limit == 0xffff && sregs.gdt.base == 0x123480 && sregs.gdt.limit == 0x2f,
@@ -345,16 +395,16 @@ int main(int argc, char **argv)
     data[0x81] = 0x52;
     const struct kvm_regs update = {
         .rbx = 0xf5, .rcx = 0x3579, .rsp = 0x1f00, .rbp = 0x12345678,
-        .rdi = protected_mode ? last_page : 0, .rip = gpa + (interrupt_run ? 0x60 : 0x40), .rflags = 2,
+        .rdi = protected_mode ? data_address : 0, .rip = entry_base + (interrupt_run ? 0x60 : 0x40), .rflags = 2,
     };
     check(ioctl(cpu, KVM_SET_REGS, &update) == 0, "set stopped registers before re-entry");
     check(ioctl(cpu, KVM_GET_REGS, &readback) == 0 && !memcmp(&readback, &update, sizeof(readback)),
           "read back updated registers");
     if (interrupt_run)
-        interrupt_and_resume(cpu, data, gpa);
+        interrupt_and_resume(cpu, data, entry_base);
     unsigned long long second = timed_run(cpu);
     check_output(run, size, 0xa7);
-    check_registers(cpu, 0xa7, 0x2468, gpa);
+    check_registers(cpu, 0xa7, 0x2468, entry_base);
     check(data[0x82] == 0x52, "child saw the client's write during re-entry");
     if (two_vcpus) {
         check(data[0xa1] == 0, "closing a vCPU leaves it stopped during another vCPU's run");
@@ -362,6 +412,8 @@ int main(int argc, char **argv)
     }
     if (interrupt_run)
         puts("PASS stopped and resumed the same running child");
+    if (long_mode)
+        puts("PASS x86-64 child used guest page tables and a virtual RAM alias");
     munmap(run, size);
     close(cpu);
     munmap(ram, ram_bytes);

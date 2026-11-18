@@ -36,8 +36,12 @@ PROTECTED_GPA = 16 * MIB
 SPLIT_GPA = 512 * MIB
 MAX_SLOTS = 8
 TEST_INTERRUPTS = 3
+CR0_PAGING = 1 << 31
+CR4_PAE = 1 << 5
+EFER_LONG_MODE_ACTIVE = 1 << 10
+EFER_LONG_MODE_ENABLE = 1 << 8
 OPEN_VM, CLOSE_VM, OPEN_CPU, CLOSE_CPU, RUN, GET_REGS, SET_REGS, GET_SREGS = range(1, 9)
-# Linux's x86 struct kvm_regs. The fixture runs in real mode.
+# Linux's x86 struct kvm_regs.
 REGISTERS = struct.Struct("<18Q")
 SEGMENT = struct.Struct("<QIH9Bx")
 DESCRIPTOR_TABLE = struct.Struct("<QH6x")
@@ -46,7 +50,7 @@ SPECIAL_REGISTERS_SIZE = 8 * SEGMENT.size + 2 * DESCRIPTOR_TABLE.size + CONTROL_
 # (GDB index, KVM index, bytes) from QEMU's i386-64bit.xml.
 GDB_REGISTERS = (
     (0, 0, 8), (1, 1, 8), (2, 2, 8), (3, 3, 8), (4, 4, 8), (5, 5, 8),
-    (6, 7, 8), (7, 6, 8), (16, 16, 8), (17, 17, 4),
+    (6, 7, 8), (7, 6, 8), *((index, index, 8) for index in range(8, 17)), (17, 17, 4),
 )
 QEMU_OPTIONS = [
     "-nodefaults", "-display", "none", "-monitor", "none", "-nic", "none",
@@ -99,18 +103,29 @@ def pack_special_registers(snapshot):
     return b"".join((*segments, gdt, idt, controls))
 
 
-def read_protected_entry(mailbox, gpa, size):
+def read_protected_entry(mailbox, slots, long_mode):
     record = mailbox[256:256 + SPECIAL_REGISTERS_SIZE]
     base, limit = DESCRIPTOR_TABLE.unpack_from(record, 8 * SEGMENT.size)
-    if limit != 23 or base < gpa or base + limit >= gpa + size:
-        raise RuntimeError("protected entry GDT lies outside the registered slot")
-    code = SEGMENT.pack(0, 0xffffffff, 8, 11, 1, 0, 1, 1, 0, 1, 0, 0)
+    control_at = 8 * SEGMENT.size + 2 * DESCRIPTOR_TABLE.size
+    root = CONTROL_REGISTERS.unpack_from(record, control_at)[2]
+    if limit != 23 or not slot_contains(slots, base, limit + 1):
+        raise RuntimeError("protected entry GDT lies outside registered RAM")
+    if long_mode and (root % PAGE_SIZE or not slot_contains(slots, root, PAGE_SIZE)):
+        raise RuntimeError("long-mode page table root lies outside registered RAM")
+    code = SEGMENT.pack(0, 0xffffffff, 8, 11, 1, 0, not long_mode, 1, long_mode, 1, 0, 0)
     data = SEGMENT.pack(0, 0xffffffff, 16, 3, 1, 0, 1, 1, 0, 1, 0, 0)
+    controls = (CONTROL_REGISTERS.pack(1 | CR0_PAGING, 0, root, CR4_PAE, 0,
+                                      EFER_LONG_MODE_ENABLE | EFER_LONG_MODE_ACTIVE, 0)
+                if long_mode else CONTROL_REGISTERS.pack(1, 0, 0, 0, 0, 0, 0))
     expected = (code + data * 5 + bytes(2 * SEGMENT.size) + DESCRIPTOR_TABLE.pack(base, limit) +
-                bytes(DESCRIPTOR_TABLE.size) + CONTROL_REGISTERS.pack(1, 0, 0, 0, 0, 0, 0))
+                bytes(DESCRIPTOR_TABLE.size) + controls)
     if record != expected:
         raise RuntimeError("unsupported protected entry state")
     return record
+
+
+def slot_contains(slots, address, size):
+    return any(slot.gpa <= address and address + size <= slot.gpa + len(slot.offsets) * PAGE_SIZE for slot in slots)
 
 
 def stop_process(process):
@@ -291,8 +306,13 @@ class TcgChild:
         return pack_special_registers(self.special_command("x-flexvm-query-x86-sregs", {"cpu-index": cpu}))
 
     def set_protected_entry(self, cpu, record):
-        base, limit = DESCRIPTOR_TABLE.unpack_from(record, 8 * SEGMENT.size)
-        self.special_command("x-flexvm-set-x86-protected-entry", {"cpu-index": cpu, "gdt-base": base, "gdt-limit": limit})
+        table_at = 8 * SEGMENT.size
+        base, limit = DESCRIPTOR_TABLE.unpack_from(record, table_at)
+        controls = CONTROL_REGISTERS.unpack_from(record, table_at + 2 * DESCRIPTOR_TABLE.size)
+        arguments = {"cpu-index": cpu, "gdt-base": base, "gdt-limit": limit}
+        if controls[5] & EFER_LONG_MODE_ACTIVE:
+            arguments["page-table-root"] = controls[2]
+        self.special_command("x-flexvm-set-x86-protected-entry", arguments)
 
     def close(self):
         try:
@@ -467,7 +487,8 @@ def verify_slot_spans(pid, slots):
     return extents
 
 
-def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry, split_slot, interrupt_run, cpu_count):
+def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry,
+             split_slot, interrupt_run, cpu_count, long_mode):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
@@ -504,7 +525,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 13)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 14)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
         os.ftruncate(outer_ram, outer_ram_size)
@@ -572,7 +593,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                     raise RuntimeError("unexpected slot registration after the first run")
                 if cpu not in started_cpus:
                     if protected_entry:
-                        state = read_protected_entry(mapping, slots[0].gpa, len(slots[0].offsets) * PAGE_SIZE)
+                        state = read_protected_entry(mapping, slots, long_mode)
                         child.set_protected_entry(cpu, state)
                     child.set_registers(cpu, mapping[64:64 + REGISTERS.size])
                     started_cpus.add(cpu)
@@ -595,11 +616,13 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 mapping[64:64 + SPECIAL_REGISTERS_SIZE] = registers
                 special = {
                     "cs_selector": SEGMENT.unpack_from(registers)[2],
+                    "cs_long": bool(SEGMENT.unpack_from(registers)[8]),
                     "ds_base": SEGMENT.unpack_from(registers, SEGMENT.size)[0],
                     "gdt_base": DESCRIPTOR_TABLE.unpack_from(registers, 8 * SEGMENT.size)[0],
                 }
                 control_state = CONTROL_REGISTERS.unpack_from(registers, 8 * SEGMENT.size + 2 * DESCRIPTOR_TABLE.size)
-                special.update(cr0=control_state[0], cr2=control_state[1])
+                special.update(cr0=control_state[0], cr2=control_state[1], cr3=control_state[2],
+                               cr4=control_state[3], efer=control_state[5])
             elif opcode == CLOSE_CPU:
                 open_cpus.remove(cpu)
                 if not open_cpus:
@@ -619,6 +642,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 or len(child.channel.interruptions) != expected_interruptions or counters != expected_counters
                 or interrupt_run and "PASS stopped and resumed the same running child" not in guest
                 or cpu_count == 2 and "PASS two vCPUs kept independent state in one child" not in guest
+                or long_mode and "PASS x86-64 child used guest page tables and a virtual RAM alias" not in guest
                 or "PASS /dev/kvm returned two port I/O exits" not in guest
                 or "PASS parent KVM guest shutdown" not in guest):
             raise RuntimeError(f"parent execution proof failed; commands={observed}, see outer.log")
@@ -633,7 +657,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         layout_summary = {"sample_outer_page_offsets": [(slot.offsets[0], slot.offsets[-1]) for slot in slots]}
     return {
         "guest_path": "/dev/kvm", "guest_vmx": False, "guest_svm": False,
-        "boot_mode": "protected" if protected_entry else "real", "slot_gpa": slots[0].gpa,
+        "boot_mode": "long" if long_mode else "protected" if protected_entry else "real", "slot_gpa": slots[0].gpa,
         "guest_slots": [{"id": slot.identifier, "gpa": slot.gpa, "pages": len(slot.offsets)} for slot in slots],
         "parent_accelerator": parent_engine, "parent_commands": observed, "transport": "eventfd and MSI-X",
         "io_values": child.channel.exits, "child_memory_write_visible": True, "same_child_worker": True,
@@ -670,9 +694,14 @@ def main():
     parser.add_argument("--split-slot", action="store_true", help="divide memory between two discontiguous GPAs")
     parser.add_argument("--interrupt-run", action="store_true", help="interrupt live child execution before resuming")
     parser.add_argument("--two-vcpus", action="store_true", help="run two vCPUs serially with shared child RAM")
+    parser.add_argument("--long-mode", action="store_true", help="enter x86-64 mode with client-supplied page tables")
     parser.add_argument("--reject-close", action="store_true", help="verify page retention when the parent refuses close")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.long_mode:
+        if args.two_vcpus or args.ram_pages < (8 if args.split_slot else 4):
+            parser.error("--long-mode requires one vCPU and four pages in the low slot")
+        args.protected_entry = True
     if not 1 <= args.ram_pages <= MAX_SLOT_PAGES:
         parser.error(f"--ram-pages must be between 1 and {MAX_SLOT_PAGES}")
     if args.ram_pages > MAX_REAL_MODE_PAGES and not args.protected_entry:
@@ -689,7 +718,8 @@ def main():
         parser.error("run as root on x86_64")
     if args.worker:
         print(json.dumps(exercise(qemu, kernel, output, args.reject_close, args.parent_engine, args.ram_pages,
-                                  args.protected_entry, args.split_slot, args.interrupt_run, 2 if args.two_vcpus else 1)))
+                                  args.protected_entry, args.split_slot, args.interrupt_run,
+                                  2 if args.two_vcpus else 1, args.long_mode)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -721,6 +751,8 @@ def main():
                 oracle.append("interrupt")
             if args.two_vcpus:
                 oracle.append("smp")
+            if args.long_mode:
+                oracle.append("long")
             HELPERS["run"](oracle, 14 if args.interrupt_run else 8, output / "native-kvm.log")
             report["same_client_passed_native_kvm"] = True
             report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
@@ -734,6 +766,8 @@ def main():
             files["interrupt-run"] = b""
         if args.two_vcpus:
             files["two-vcpus"] = b""
+        if args.long_mode:
+            files["long-mode"] = b""
         image = HELPERS["initramfs"](init.read_bytes(), files=files)
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
@@ -758,6 +792,7 @@ def main():
                             *(["--split-slot"] if args.split_slot else []),
                             *(["--interrupt-run"] if args.interrupt_run else []),
                             *(["--two-vcpus"] if args.two_vcpus else []),
+                            *(["--long-mode"] if args.long_mode else []),
                             *(["--reject-close"] if args.reject_close else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}

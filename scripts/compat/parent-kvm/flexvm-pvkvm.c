@@ -20,6 +20,7 @@
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 #include <linux/wait.h>
+#include <asm/msr-index.h>
 #include <asm/processor-flags.h>
 #include "mailbox.h"
 
@@ -77,6 +78,11 @@ static const struct kvm_sregs reset_sregs = {
 	.cs = { .base = 0xffff0000, .limit = 0xffff, .selector = 0xf000, .present = 1 },
 };
 
+static bool long_mode(const struct kvm_sregs *sregs)
+{
+	return sregs->efer & EFER_LMA;
+}
+
 static bool valid_protected_entry(const struct kvm_sregs *sregs)
 {
 	static const struct kvm_segment code = {
@@ -94,7 +100,27 @@ static bool valid_protected_entry(const struct kvm_sregs *sregs)
 	wanted.cr0 = X86_CR0_PE;
 	wanted.gdt.limit = 23;
 	wanted.gdt.base = sregs->gdt.base;
+	if (long_mode(sregs)) {
+		wanted.cs.db = 0;
+		wanted.cs.l = 1;
+		wanted.cr0 |= X86_CR0_PG;
+		wanted.cr3 = sregs->cr3;
+		wanted.cr4 = X86_CR4_PAE;
+		wanted.efer = EFER_LME | EFER_LMA;
+		if (!IS_ALIGNED(sregs->cr3, PAGE_SIZE))
+			return false;
+	}
 	return !memcmp(sregs, &wanted, sizeof(wanted)) && sregs->gdt.base <= U32_MAX;
+}
+
+static bool registers_fit_mode(const struct kvm_regs *regs, const struct kvm_sregs *sregs)
+{
+	if (long_mode(sregs))
+		return true;
+	return (regs->rax | regs->rbx | regs->rcx | regs->rdx | regs->rsi | regs->rdi |
+		regs->rsp | regs->rbp | regs->rip) <= U32_MAX &&
+	       !(regs->r8 | regs->r9 | regs->r10 | regs->r11 | regs->r12 | regs->r13 |
+		 regs->r14 | regs->r15);
 }
 
 static void publish_slots(void __iomem *mailbox, const struct pvvm *vm)
@@ -321,12 +347,16 @@ static int run_cpu(struct pvcpu *cpu)
 		result = -ENODEV;
 		goto unlock;
 	}
-	if (!cpu->ran && !slot_contains(vm, cpu->regs.rip, 1)) {
+	if (!cpu->ran && !long_mode(&cpu->sregs) && !slot_contains(vm, cpu->regs.rip, 1)) {
 		result = -EINVAL;
 		goto unlock;
 	}
 	if (!cpu->ran && (cpu->sregs.cr0 & X86_CR0_PE) &&
 	    !slot_contains(vm, cpu->sregs.gdt.base, cpu->sregs.gdt.limit + 1)) {
+		result = -EINVAL;
+		goto unlock;
+	}
+	if (!cpu->ran && long_mode(&cpu->sregs) && !slot_contains(vm, cpu->sregs.cr3, PAGE_SIZE)) {
 		result = -EINVAL;
 		goto unlock;
 	}
@@ -394,13 +424,9 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			result = -EFAULT;
 			break;
 		}
-		/* Classic real-mode register subset, with arithmetic flags and DF. */
-		if ((regs.rax | regs.rbx | regs.rcx | regs.rdx | regs.rsi | regs.rdi |
-		     regs.rsp | regs.rbp) > U32_MAX ||
-		    regs.r8 || regs.r9 || regs.r10 || regs.r11 || regs.r12 || regs.r13 ||
-		    regs.r14 || regs.r15 || regs.rip > U32_MAX ||
-		    (cpu->ran && !(cpu->sregs.cr0 & X86_CR0_PE) && regs.rip > U16_MAX) ||
-		    !(regs.rflags & X86_EFLAGS_FIXED) || (regs.rflags & ~PVKVM_REAL_MODE_FLAGS)) {
+		if ((cpu->ran && !registers_fit_mode(&regs, &cpu->sregs)) ||
+		    (regs.rflags & ~PVKVM_REAL_MODE_FLAGS) || !(regs.rflags & X86_EFLAGS_FIXED) ||
+		    (cpu->ran && !(cpu->sregs.cr0 & X86_CR0_PE) && regs.rip > U16_MAX)) {
 			result = -EINVAL;
 			break;
 		}
@@ -447,7 +473,8 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		result = 0;
 		break;
 	case KVM_RUN:
-		if (arg || cpu->sregs.cs.base || (!(cpu->sregs.cr0 & X86_CR0_PE) && cpu->regs.rip > U16_MAX)) {
+		if (arg || cpu->sregs.cs.base || !registers_fit_mode(&cpu->regs, &cpu->sregs) ||
+		    (!(cpu->sregs.cr0 & X86_CR0_PE) && cpu->regs.rip > U16_MAX)) {
 			result = -EINVAL;
 			break;
 		}

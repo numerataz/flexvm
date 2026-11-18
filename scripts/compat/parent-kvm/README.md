@@ -18,13 +18,14 @@ shared mappings of the outer VM RAM and combine consecutive offsets into
 one mapping. The parent stops the child before acknowledging
 release of the slot. If it cannot confirm release, the pages stay pinned
 until the outer VM exits.
-The worker supports byte output to one port in x86 real mode and flat
-32-bit protected mode. The client writes general registers through `KVM_SET_REGS` before
+The worker supports byte output to one port in x86 real mode, flat
+32-bit protected mode, and 64-bit mode with four-level paging.
+The client writes general registers through `KVM_SET_REGS` before
 and between runs and reads actual worker state through `KVM_GET_REGS`.
 After an exit, `KVM_GET_SREGS` also returns live segment caches, descriptor
 tables, and control registers. The TCG worker uses private Unix sockets for
-debugger and QMP register requests. Memory invalidation, paging and long
-mode state, concurrent vCPU runs, interrupt delivery, and checkpointing remain part of
+debugger and QMP register requests. Memory invalidation, additional x86
+CPU state, concurrent vCPU runs, interrupt delivery, and checkpointing remain part of
 [issue #1501](https://github.com/numerataz/flexvm/issues/1501).
 
 Run the fixture on x86 with the QEMU build from `scripts/build-qemu.sh` and
@@ -61,6 +62,9 @@ on subsequent runs, then releases the loop and receives an I/O exit.
 Add `--two-vcpus` in protected mode to alternate between two vCPUs in one
 worker. The client checks shared RAM, independent register state, and continued
 execution of the first vCPU after closing the second vCPU's descriptor.
+Add `--long-mode` with at least four pages in the first slot. The client supplies
+page tables, enters at a virtual address above 4 GiB, checks the live control
+registers and executes a 64-bit transfer between extended registers.
 The worker uses one host mapping per consecutive extent. Highly fragmented
 slots can reach the host's mapping limit. A failed mapping releases the
 partially mapped worker span.

@@ -123,6 +123,9 @@ int main(int argc, char **argv)
             segments.ss = setup.ss;
             segments.gdt = setup.gdt;
             segments.cr0 |= setup.cr0;
+            segments.cr3 = setup.cr3;
+            segments.cr4 |= setup.cr4;
+            segments.efer |= setup.efer;
             check(ioctl(cpu, KVM_SET_SREGS, &segments) == 0, "configure host protected mode");
             check(write(control, "P", 1) == 1, "acknowledge host protected mode");
             continue;
