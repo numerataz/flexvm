@@ -3,7 +3,7 @@
 #define FLEXVM_PVKVM_MAILBOX_H
 
 #define PVKVM_MAGIC        0x4d564b46
-#define PVKVM_VERSION      23
+#define PVKVM_VERSION      24
 #define PVKVM_MAGIC_AT     0
 #define PVKVM_VERSION_AT   4
 #define PVKVM_REQUEST_AT   8
@@ -16,6 +16,7 @@
 #define PVKVM_CPU_AT         44
 #define PVKVM_FPU_VALID_AT   48
 #define PVKVM_CPUID_VALID_AT 52
+#define PVKVM_LAPIC_VALID_AT 56
 #define PVKVM_SLOT_TABLE_AT  640
 #define PVKVM_SLOT_RECORD_SIZE 16
 #define PVKVM_FPU_AT         768
@@ -30,6 +31,8 @@
 #define PVKVM_IRQ_AT         0x84200
 #define PVKVM_PIT_FLAGS_AT   0x84208
 #define PVKVM_TSS_AT         0x8420c
+#define PVKVM_LAPIC_AT       0x85000
+#define PVKVM_LAPIC_BYTES    1024
 #define PVKVM_GSI_COUNT      24
 #define PVKVM_REGISTERS_AT   64
 #define PVKVM_INITIAL_SREGISTERS_AT 256
@@ -93,6 +96,8 @@ enum pvkvm_command {
 	PVKVM_SET_IRQ_LINE,
 	PVKVM_CREATE_PIT,
 	PVKVM_SET_TSS_ADDR,
+	PVKVM_GET_LAPIC,
+	PVKVM_SET_LAPIC,
 };
 
 #endif

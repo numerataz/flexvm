@@ -1,0 +1,229 @@
+--- a/qapi/misc-i386.json
++++ b/qapi/misc-i386.json
+@@ -728,2 +728,43 @@
+   'data': { 'gsi': 'uint32' },
+   'features': [ 'unstable' ] }
++
++##
++# @FlexvmX86LapicRecord:
++#
++# @record: Hex-encoded 1024-byte xAPIC register image.
++##
++{ 'struct': 'FlexvmX86LapicRecord',
++  'data': { 'record': 'str' } }
++
++##
++# @x-flexvm-query-x86-lapic:
++#
++# Read the stopped x86 vCPU's local APIC register image.
++#
++# @cpu-index: The worker's vCPU index.
++#
++# Features:
++#
++# @unstable: Experimental FlexVM worker protocol.
++##
++{ 'command': 'x-flexvm-query-x86-lapic',
++  'data': { 'cpu-index': 'uint16' },
++  'returns': 'FlexvmX86LapicRecord',
++  'features': [ 'unstable' ] }
++
++##
++# @x-flexvm-set-x86-lapic:
++#
++# Install a local APIC register image on a stopped x86 vCPU.
++#
++# @cpu-index: The worker's vCPU index.
++#
++# @record: Hex-encoded 1024-byte xAPIC register image.
++#
++# Features:
++#
++# @unstable: Experimental FlexVM worker protocol.
++##
++{ 'command': 'x-flexvm-set-x86-lapic',
++  'data': { 'cpu-index': 'uint16', 'record': 'str' },
++  'features': [ 'unstable' ] }
+--- a/target/i386/monitor.c
++++ b/target/i386/monitor.c
+@@ -1025,2 +1025,78 @@
+     }
+ }
++
++static CPUState *flexvm_stopped_xapic(uint16_t index, Error **errp)
++{
++    CPUX86State *env = flexvm_stopped_cpu(index, errp);
++    X86CPU *cpu;
++    APICCommonState *apic;
++
++    if (!env) {
++        return NULL;
++    }
++    cpu = env_archcpu(env);
++    apic = cpu->apic_state;
++    if (!apic || is_x2apic_mode(apic)) {
++        error_setg(errp, "FlexVM requires an xAPIC controller");
++        return NULL;
++    }
++    return CPU(cpu);
++}
++
++static void flexvm_read_xapic(CPUState *cpu, run_on_cpu_data data)
++{
++    apic_flexvm_read_xapic(X86_CPU(cpu)->apic_state, data.host_ptr);
++}
++
++static void flexvm_write_xapic(CPUState *cpu, run_on_cpu_data data)
++{
++    apic_flexvm_write_xapic(X86_CPU(cpu)->apic_state, data.host_ptr);
++}
++
++FlexvmX86LapicRecord *qmp_x_flexvm_query_x86_lapic(uint16_t cpu_index,
++                                                Error **errp)
++{
++    static const char hex[] = "0123456789abcdef";
++    CPUState *cpu = flexvm_stopped_xapic(cpu_index, errp);
++    uint8_t bytes[FLEXVM_XAPIC_IMAGE_SIZE];
++    FlexvmX86LapicRecord *result;
++
++    if (!cpu) {
++        return NULL;
++    }
++    run_on_cpu(cpu, flexvm_read_xapic, RUN_ON_CPU_HOST_PTR(bytes));
++    result = g_new0(FlexvmX86LapicRecord, 1);
++    result->record = g_malloc(2 * sizeof(bytes) + 1);
++    for (size_t i = 0; i < sizeof(bytes); i++) {
++        result->record[2 * i] = hex[bytes[i] >> 4];
++        result->record[2 * i + 1] = hex[bytes[i] & 15];
++    }
++    result->record[2 * sizeof(bytes)] = '\0';
++    return result;
++}
++
++void qmp_x_flexvm_set_x86_lapic(uint16_t cpu_index, const char *record,
++                               Error **errp)
++{
++    CPUState *cpu = flexvm_stopped_xapic(cpu_index, errp);
++    uint8_t bytes[FLEXVM_XAPIC_IMAGE_SIZE];
++
++    if (!cpu) {
++        return;
++    }
++    if (strlen(record) != 2 * sizeof(bytes)) {
++        error_setg(errp, "Invalid FlexVM LAPIC image size");
++        return;
++    }
++    for (size_t i = 0; i < sizeof(bytes); i++) {
++        int hi = g_ascii_xdigit_value(record[2 * i]);
++        int lo = g_ascii_xdigit_value(record[2 * i + 1]);
++
++        if (hi < 0 || lo < 0) {
++            error_setg(errp, "Invalid hex in FlexVM LAPIC image");
++            return;
++        }
++        bytes[i] = (hi << 4) | lo;
++    }
++    run_on_cpu(cpu, flexvm_write_xapic, RUN_ON_CPU_HOST_PTR(bytes));
++}
+--- a/stubs/monitor-i386-flexvm.c
++++ b/stubs/monitor-i386-flexvm.c
+@@ -64,2 +64,15 @@
+     error_setg(errp, "FlexVM interrupts require an x86 PC worker");
+ }
++
++FlexvmX86LapicRecord *qmp_x_flexvm_query_x86_lapic(uint16_t cpu_index,
++                                                Error **errp)
++{
++    error_setg(errp, "FlexVM LAPIC state requires an x86 worker");
++    return NULL;
++}
++
++void qmp_x_flexvm_set_x86_lapic(uint16_t cpu_index, const char *record,
++                               Error **errp)
++{
++    error_setg(errp, "FlexVM LAPIC state requires an x86 worker");
++}
+--- a/hw/intc/apic.c
++++ b/hw/intc/apic.c
+@@ -18,4 +18,5 @@
+  */
+ #include "qemu/osdep.h"
++#include "qemu/bswap.h"
+ #include "qemu/thread.h"
+ #include "qemu/error-report.h"
+@@ -861,4 +862,62 @@
+ }
+
++static bool flexvm_xapic_readable(unsigned index)
++{
++    return index == 0x2 || index == 0x3 || (index >= 8 && index <= 0xb) ||
++           (index >= 0xd && index <= 0x28) ||
++           (index >= 0x30 && index <= 0x39) || index == 0x3e;
++}
++
++void apic_flexvm_read_xapic(APICCommonState *s,
++                           uint8_t record[FLEXVM_XAPIC_IMAGE_SIZE])
++{
++    memset(record, 0, FLEXVM_XAPIC_IMAGE_SIZE);
++    for (unsigned int i = 0; i < FLEXVM_XAPIC_IMAGE_SIZE / 16; i++) {
++        if (flexvm_xapic_readable(i)) {
++            uint64_t value;
++
++            apic_register_read(s, i, &value);
++            stl_le_p(record + i * 16, value);
++        }
++    }
++}
++
++void apic_flexvm_write_xapic(APICCommonState *s,
++                            const uint8_t record[FLEXVM_XAPIC_IMAGE_SIZE])
++{
++    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    uint32_t current;
++    unsigned int divide;
++
++    s->id = ldl_le_p(record + 0x020) >> 24;
++    s->tpr = ldl_le_p(record + 0x080) & 0xff;
++    s->log_dest = ldl_le_p(record + 0x0d0) >> 24;
++    s->dest_mode = ldl_le_p(record + 0x0e0) >> 28;
++    s->spurious_vec = ldl_le_p(record + 0x0f0) & 0x1ff;
++    for (unsigned int i = 0; i < 8; i++) {
++        s->isr[i] = ldl_le_p(record + 0x100 + i * 16);
++        s->tmr[i] = ldl_le_p(record + 0x180 + i * 16);
++        s->irr[i] = ldl_le_p(record + 0x200 + i * 16);
++    }
++    s->esr = ldl_le_p(record + 0x280);
++    /* Restoring ICR contents must not send an interrupt. */
++    s->icr[0] = ldl_le_p(record + 0x300);
++    s->icr[1] = ldl_le_p(record + 0x310);
++    for (unsigned int i = 0; i < APIC_LVT_NB; i++) {
++        s->lvt[i] = ldl_le_p(record + 0x320 + i * 16);
++    }
++    s->initial_count = ldl_le_p(record + 0x380);
++    current = MIN(s->initial_count, ldl_le_p(record + 0x390));
++    s->divide_conf = ldl_le_p(record + 0x3e0) & 0xb;
++    divide = (s->divide_conf & 3) | ((s->divide_conf >> 1) & 4);
++    s->count_shift = (divide + 1) & 7;
++    s->initial_count_load_time = now -
++        ((int64_t)(s->initial_count - current) << s->count_shift);
++    apic_timer_update(s, now);
++    apic_sync_vapic(s, SYNC_TO_VAPIC);
++    apic_check_pic(s);
++    apic_update_irq(s);
++}
++
+ static uint64_t apic_mem_read(void *opaque, hwaddr addr, unsigned size)
+ {
+--- a/include/hw/i386/apic.h
++++ b/include/hw/i386/apic.h
+@@ -24,4 +24,10 @@
+ bool is_x2apic_mode(APICCommonState *s);
+
++#define FLEXVM_XAPIC_IMAGE_SIZE 1024
++void apic_flexvm_read_xapic(APICCommonState *s,
++                           uint8_t record[FLEXVM_XAPIC_IMAGE_SIZE]);
++void apic_flexvm_write_xapic(APICCommonState *s,
++                            const uint8_t record[FLEXVM_XAPIC_IMAGE_SIZE]);
++
+ /* pc.c */
+ APICCommonState *cpu_get_current_apic(void);

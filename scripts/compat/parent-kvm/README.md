@@ -115,6 +115,10 @@ Add `--tss` to reserve the same three-page guest physical range that
 Firecracker configures before creating the x86 interrupt controller. Native
 KVM receives the exact address. The TCG worker uses the reservation when
 validating its RAM slots.
+Add `--lapic` to read the reset xAPIC image, stage LINT0 and LINT1 before
+the first run, and update the stopped controller. The guest receives a PIC
+interrupt through the installed state, then changes LINT1 through MMIO.
+The test checks that restoring ICR contents does not send an interrupt.
 The worker uses one host mapping per consecutive extent. Highly fragmented
 slots can reach the host's mapping limit. A failed mapping releases the
 partially mapped worker span.

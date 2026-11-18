@@ -116,6 +116,7 @@ struct pvcpu {
 	struct kvm_regs regs;
 	struct kvm_sregs sregs;
 	struct kvm_fpu fpu;
+	struct kvm_lapic_state lapic;
 	struct pvkvm_cpuid_table *cpuid;
 	u64 msrs[ARRAY_SIZE(boot_msr_indices)];
 	unsigned long msrs_set;
@@ -123,6 +124,7 @@ struct pvcpu {
 	unsigned int mmio_read_width;
 	bool ran;
 	bool fpu_set;
+	bool lapic_set;
 };
 
 static const struct kvm_sregs reset_sregs = {
@@ -586,6 +588,9 @@ static int run_cpu(struct pvcpu *cpu)
 		writel(cpu->fpu_set, p->mailbox + PVKVM_FPU_VALID_AT);
 		if (cpu->fpu_set)
 			memcpy_toio(p->mailbox + PVKVM_FPU_AT, &cpu->fpu, sizeof(cpu->fpu));
+		writel(cpu->lapic_set, p->mailbox + PVKVM_LAPIC_VALID_AT);
+		if (cpu->lapic_set)
+			memcpy_toio(p->mailbox + PVKVM_LAPIC_AT, &cpu->lapic, sizeof(cpu->lapic));
 		publish_initial_msrs(cpu);
 		writel(!!cpu->cpuid, p->mailbox + PVKVM_CPUID_VALID_AT);
 		if (cpu->cpuid)
@@ -830,6 +835,35 @@ static long cpu_cpuid(struct pvcpu *cpu, bool write, struct kvm_cpuid2 __user *u
 	return result;
 }
 
+static long cpu_lapic(struct pvcpu *cpu, bool write, void __user *user)
+{
+	struct kvm_lapic_state *record;
+	int result = 0;
+
+	if (!READ_ONCE(cpu->vm->irqchip_created))
+		return -EINVAL;
+	if (!write) {
+		if (cpu->ran || !cpu->lapic_set)
+			result = read_stopped_registers(cpu, PVKVM_GET_LAPIC, PVKVM_LAPIC_AT,
+							&cpu->lapic, sizeof(cpu->lapic));
+		if (result)
+			return result;
+		return copy_to_user(user, &cpu->lapic, sizeof(cpu->lapic)) ? -EFAULT : 0;
+	}
+	record = memdup_user(user, sizeof(*record));
+	if (IS_ERR(record))
+		return PTR_ERR(record);
+	if (cpu->ran) {
+		result = write_stopped_registers(cpu, PVKVM_SET_LAPIC, PVKVM_LAPIC_AT,
+						 record, sizeof(*record));
+	} else {
+		cpu->lapic = *record;
+		cpu->lapic_set = true;
+	}
+	kfree(record);
+	return result;
+}
+
 static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct pvcpu *cpu = file->private_data;
@@ -936,6 +970,10 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case KVM_GET_CPUID2:
 	case KVM_SET_CPUID2:
 		result = cpu_cpuid(cpu, cmd == KVM_SET_CPUID2, uarg);
+		break;
+	case KVM_GET_LAPIC:
+	case KVM_SET_LAPIC:
+		result = cpu_lapic(cpu, cmd == KVM_SET_LAPIC, uarg);
 		break;
 	case KVM_RUN:
 		if (arg || cpu->sregs.cs.base || !registers_fit_mode(&cpu->regs, &cpu->sregs) ||
@@ -1552,8 +1590,11 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	BUILD_BUG_ON(PVKVM_COMPLETION_AT + sizeof(struct pvkvm_mmio_completion) > PVKVM_IRQ_AT);
 	BUILD_BUG_ON(PVKVM_IRQ_AT + sizeof(struct kvm_irq_level) > PVKVM_PIT_FLAGS_AT);
 	BUILD_BUG_ON(PVKVM_PIT_FLAGS_AT + sizeof(u32) > PVKVM_TSS_AT);
+	BUILD_BUG_ON(PVKVM_TSS_AT + sizeof(u32) > PVKVM_LAPIC_AT);
+	BUILD_BUG_ON(sizeof(struct kvm_lapic_state) != PVKVM_LAPIC_BYTES);
+	BUILD_BUG_ON(PVKVM_LAPIC_VALID_AT + sizeof(u32) > PVKVM_REGISTERS_AT);
 	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
-	    pci_resource_len(dev, 2) < PVKVM_TSS_AT + sizeof(u32))
+	    pci_resource_len(dev, 2) < PVKVM_LAPIC_AT + PVKVM_LAPIC_BYTES)
 		return -ENODEV;
 	result = pcim_enable_device(dev);
 	if (result)

@@ -68,6 +68,20 @@ static void supported_cpuid(void)
     close(kvm);
 }
 
+static void reset_lapic(unsigned int id)
+{
+    struct kvm_lapic_state lapic;
+    int kvm = host_kvm();
+    int vm = ioctl(kvm, KVM_CREATE_VM, 0);
+    check(vm >= 0 && ioctl(vm, KVM_CREATE_IRQCHIP, 0) == 0, "create a host IRQ controller");
+    int cpu = ioctl(vm, KVM_CREATE_VCPU, id);
+    check(cpu >= 0 && ioctl(cpu, KVM_GET_LAPIC, &lapic) == 0, "read the host reset LAPIC");
+    check(write(STDOUT_FILENO, &lapic, sizeof(lapic)) == sizeof(lapic), "write the reset LAPIC image");
+    close(cpu);
+    close(vm);
+    close(kvm);
+}
+
 static unsigned int reply_run(int control, const struct kvm_run *run, int mapping_bytes)
 {
     if (run->exit_reason == KVM_EXIT_MMIO) {
@@ -93,6 +107,10 @@ int main(int argc, char **argv)
 {
     if (argc == 2 && !strcmp(argv[1], "--supported-cpuid")) {
         supported_cpuid();
+        return 0;
+    }
+    if (argc == 3 && !strcmp(argv[1], "--reset-lapic")) {
+        reset_lapic(number(argv[2], PVKVM_MAX_CPUS - 1));
         return 0;
     }
     check(argc >= 10, "expected control, outer RAM, vCPU count, device configuration, and slots");
@@ -159,9 +177,11 @@ int main(int argc, char **argv)
           "install the native run interrupt handler");
     struct kvm_regs registers;
     struct kvm_fpu fpu;
+    struct kvm_lapic_state lapic;
     struct pvkvm_msr_batch msrs;
     struct pvkvm_cpuid_table cpuid;
     _Static_assert(sizeof(fpu) == PVKVM_FPU_BYTES && sizeof(cpuid) >= sizeof(fpu) &&
+                   sizeof(lapic) == PVKVM_LAPIC_BYTES && sizeof(cpuid) >= sizeof(lapic) &&
                    sizeof(cpuid) >= sizeof(segments) && sizeof(cpuid) >= sizeof(msrs),
                    "native worker control record size");
 
@@ -228,6 +248,17 @@ int main(int argc, char **argv)
             memcpy(&fpu, request + 2, sizeof(fpu));
             check(ioctl(cpu, KVM_SET_FPU, &fpu) == 0, "write host floating-point registers");
             check(write(control, "W", 1) == 1, "acknowledge host floating-point write");
+            continue;
+        }
+        if (received == 2 && request[0] == 'A') {
+            check(ioctl(cpu, KVM_GET_LAPIC, &lapic) == 0, "read host LAPIC");
+            check(write(control, &lapic, sizeof(lapic)) == sizeof(lapic), "return host LAPIC state");
+            continue;
+        }
+        if (received == 2 + sizeof(lapic) && request[0] == 'B') {
+            memcpy(&lapic, request + 2, sizeof(lapic));
+            check(ioctl(cpu, KVM_SET_LAPIC, &lapic) == 0, "write host LAPIC");
+            check(write(control, "B", 1) == 1, "acknowledge host LAPIC state");
             continue;
         }
         if (request[0] == 'M' || request[0] == 'N') {
