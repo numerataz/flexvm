@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """Run released ARM Firecracker through FlexVM's owned KVM device."""
 import argparse
-import base64
 from contextlib import ExitStack
 import json
 import re
 from pathlib import Path
 import runpy
 import socket
-import subprocess
 import sys
 import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parent
 HELPERS = runpy.run_path(str(ROOT / "software-boot.py"))
+move_public = runpy.run_path(str(ROOT / "parent-kvm-move.py"))["move_public"]
 
 
 def main():
@@ -212,51 +211,6 @@ def suspend_public(command, image, binary, state, output, log, *, trusted_qemu=N
             move_public(binary, state, name, trusted_qemu, output, target)
     finally:
         log.write_bytes(b"".join(part.read_bytes() for part in (source, target) if part.exists()))
-
-
-def move_public(binary, state, name, qemu, output, target_log):
-    def key_pair(secret):
-        subprocess.run(["openssl", "genpkey", "-algorithm", "Ed25519", "-outform", "DER", "-out", secret], check=True, timeout=10)
-        secret.chmod(0o600)
-        public = subprocess.check_output(["openssl", "pkey", "-inform", "DER", "-in", secret, "-pubout", "-outform", "DER"], timeout=10)
-        return base64.b64encode(public[-32:]).decode()
-
-    def transfer(command, *args, stdin=None):
-        return subprocess.check_output([*command, *args], stdin=stdin, timeout=90)
-
-    with tempfile.TemporaryDirectory(prefix="flexvm-arm-move-", dir="/var/lib") as directory:
-        work = Path(directory)
-        source = [binary, "--state", state, "software-transfer"]
-        destination = [binary, "--state", work / "destination", "--run", work / "run", "software-transfer"]
-        source_secret, target_secret = work / "source.der", work / "target.der"
-        source_key, target_key = key_pair(source_secret), key_pair(target_secret)
-        destination_id = json.loads(transfer(destination, "id"))["host_id"]
-        offer = work / "offer.json"
-        offer.write_bytes(transfer(source, "offer", name, destination_id))
-        transfer(destination, "prepare", offer, "--source-key", source_key)
-        receipt = work / "receipt.json"
-        receipt.write_bytes(transfer(source, "retire", name, offer, "--signing-key", source_secret, "--destination-key", target_key))
-
-        blocked = subprocess.run([binary, "--state", state, "start", "-a", name], capture_output=True, timeout=15)
-        if blocked.returncode == 0 or b"source cannot restart" not in blocked.stderr:
-            raise RuntimeError("ARM transfer did not fence source restart")
-        with (output / "transfer-send.log").open("wb") as errors:
-            sender = subprocess.Popen([*source, "send", name, offer], stdout=subprocess.PIPE, stderr=errors)
-            try:
-                received = json.loads(transfer(destination, "receive", offer, stdin=sender.stdout))
-                if sender.wait(timeout=15) or received["status"] != "received":
-                    raise RuntimeError("ARM checkpoint transfer failed")
-            finally:
-                sender.stdout.close()
-                if sender.poll() is None:
-                    sender.kill()
-                    sender.wait(timeout=10)
-
-        transfer(destination, "commit", receipt)
-        ack = work / "commit-ack.json"
-        ack.write_bytes(transfer(destination, "acknowledge-commit", offer, "--signing-key", target_secret))
-        transfer(source, "finalize", ack, "--signing-key", source_secret)
-        HELPERS["run"]([*destination, "activate", offer, "moved-arm-kvm", "--qemu", qemu], 150, target_log)
 
 
 def resume_outer(proc, deadline, runtime):
