@@ -12,6 +12,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "firecracker-net.h"
+#include <linux/if_tun.h>
+
 static void check(bool valid, const char *why)
 {
     if (valid) return;
@@ -19,6 +22,27 @@ static void check(bool valid, const char *why)
     fflush(NULL);
     reboot(RB_POWER_OFF);
     _exit(1);
+}
+
+static void serve_guest_network(void)
+{
+    int fd = test_datagram_socket(20);
+    struct sockaddr_in local = test_network_peer();
+    struct sockaddr_in guest;
+    socklen_t guest_size = sizeof(guest);
+    char data[sizeof(FLEXVM_TEST_PACKET)];
+
+    if (fd < 0 || configure_test_link(fd, FLEXVM_TEST_TAP, FLEXVM_TEST_HOST) < 0 ||
+        bind(fd, (struct sockaddr *)&local, sizeof(local)) < 0 ||
+        recvfrom(fd, data, sizeof(data), 0, (struct sockaddr *)&guest, &guest_size) != sizeof(data) ||
+        memcmp(data, FLEXVM_TEST_PACKET, sizeof(data)) ||
+        sendto(fd, data, sizeof(data), 0, (struct sockaddr *)&guest, guest_size) != sizeof(data)) {
+        perror("Firecracker network echo");
+        _exit(1);
+    }
+    puts("PASS Firecracker network echo");
+    fflush(NULL);
+    _exit(0);
 }
 
 int main(void)
@@ -29,7 +53,13 @@ int main(void)
     check(module >= 0, "open module");
     check(syscall(SYS_finit_module, module, "", 0) == 0, "load provider");
     close(module);
-    check(chmod("/kvm-run", 0700) == 0, "make the client executable");
+    bool firecracker = access("/firecracker", X_OK) == 0;
+    if (firecracker) {
+        check(mount("proc", "/proc", "proc", 0, NULL) == 0, "mount proc for Firecracker");
+        check(mount("sysfs", "/sys", "sysfs", 0, NULL) == 0, "mount sysfs for Firecracker");
+    } else {
+        check(chmod("/kvm-run", 0700) == 0, "make the client executable");
+    }
     int fixture = open("/ram-pages", O_RDONLY | O_CLOEXEC);
     check(fixture >= 0, "open fixture configuration");
     char pages[8];
@@ -37,9 +67,26 @@ int main(void)
     check(page_bytes > 0 && page_bytes < (ssize_t)sizeof(pages), "read fixture page count");
     pages[page_bytes] = '\0';
     close(fixture);
+    pid_t echo = 0;
+    if (firecracker && access("/firecracker-network", F_OK) == 0) {
+        int tap = open("/dev/net/tun", O_RDWR | O_CLOEXEC);
+        struct ifreq request = {.ifr_flags = IFF_TAP | IFF_NO_PI | IFF_VNET_HDR};
+        snprintf(request.ifr_name, sizeof(request.ifr_name), "%s", FLEXVM_TEST_TAP);
+        check(tap >= 0 && ioctl(tap, TUNSETIFF, &request) == 0, "create Firecracker TAP");
+        check(ioctl(tap, TUNSETPERSIST, 1) == 0, "keep Firecracker TAP available");
+        close(tap);
+        echo = fork();
+        check(echo >= 0, "fork Firecracker network echo");
+        if (echo == 0)
+            serve_guest_network();
+    }
     pid_t child = fork();
     check(child >= 0, "fork the KVM client");
     if (child == 0) {
+        if (firecracker) {
+            execl("/firecracker", "firecracker", "--no-api", "--config-file", "/firecracker.json", NULL);
+            _exit(127);
+        }
         char *arguments[31] = {"kvm-run", pages};
         unsigned int next = 2;
         if (access("/split-slot", F_OK) == 0)
@@ -106,6 +153,9 @@ int main(void)
     int status;
     check(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status),
           "KVM client exit");
+    if (echo > 0)
+        check(waitpid(echo, &status, 0) == echo && WIFEXITED(status) && !WEXITSTATUS(status),
+              "Firecracker network echo exit");
     puts("PASS parent KVM guest shutdown");
     fflush(NULL);
     reboot(RB_POWER_OFF);

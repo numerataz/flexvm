@@ -100,7 +100,7 @@ class QMP:
                     if proc.poll() is not None:
                         raise RuntimeError("emulator exited before QMP connected")
                     time.sleep(.02)
-            self.stream = self.socket.makefile("rb", buffering=0)
+            self.stream = self.socket.makefile("rb")
             if "QMP" not in self.reply():
                 raise RuntimeError("missing QMP greeting")
             self.ask("qmp_capabilities")
