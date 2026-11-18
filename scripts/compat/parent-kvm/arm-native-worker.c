@@ -2,6 +2,9 @@
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
+#include <signal.h>
+#include <stdatomic.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +23,12 @@ struct arm_cpu {
     struct kvm_run *run;
     uint32_t pending_read;
     int initialized;
+    uint32_t id;
+    int lane;
+    pthread_t thread;
+    pthread_mutex_t execution;
+    atomic_uint admitted;
+    atomic_uint completed;
 };
 
 struct arm_vm {
@@ -31,7 +40,34 @@ struct arm_vm {
         size_t bytes;
     } slots[FLEXVM_ARM_MAX_SLOTS];
     size_t ram_bytes;
+    int lanes_opened;
 };
+
+static _Thread_local struct kvm_run *active_run_page;
+static _Thread_local volatile sig_atomic_t active_sequence;
+static _Thread_local volatile sig_atomic_t cancelled_sequence;
+static _Thread_local volatile sig_atomic_t stop_requested;
+
+static void interrupt_run(int number, siginfo_t *info, void *context)
+{
+    (void)number;
+    (void)context;
+    if (info->si_code != SI_QUEUE || info->si_value.sival_int <= 0)
+        return;
+    sig_atomic_t sequence = info->si_value.sival_int;
+    if (sequence > cancelled_sequence)
+        cancelled_sequence = sequence;
+    if (active_sequence == sequence)
+        __atomic_store_n(&active_run_page->immediate_exit, 1, __ATOMIC_RELAXED);
+}
+
+static void terminate_lane(int signal)
+{
+    (void)signal;
+    stop_requested = 1;
+    if (active_sequence)
+        __atomic_store_n(&active_run_page->immediate_exit, 1, __ATOMIC_RELAXED);
+}
 
 static void check(int condition, const char *message)
 {
@@ -78,8 +114,15 @@ static int run_cpu(struct arm_cpu *cpu, const struct flexvm_arm_request *request
     struct kvm_run *run = cpu->run;
     if (cpu->pending_read)
         memcpy(run->mmio.data, request->completion, cpu->pending_read);
-    if (ioctl(cpu->fd, KVM_RUN, 0) < 0)
-        return -errno;
+    __atomic_store_n(&run->immediate_exit, 0, __ATOMIC_RELAXED);
+    atomic_signal_fence(memory_order_seq_cst);
+    active_sequence = request->sequence;
+    if (active_sequence && (stop_requested || active_sequence == cancelled_sequence))
+        __atomic_store_n(&run->immediate_exit, 1, __ATOMIC_RELAXED);
+    int status = ioctl_result(ioctl(cpu->fd, KVM_RUN, 0));
+    active_sequence = 0;
+    if (status)
+        return status;
     cpu->pending_read = 0;
     if (run->exit_reason == KVM_EXIT_MMIO) {
         if (!run->mmio.len || run->mmio.len > sizeof(run->mmio.data))
@@ -102,6 +145,21 @@ static int run_cpu(struct arm_cpu *cpu, const struct flexvm_arm_request *request
         return -EOPNOTSUPP;
     }
     reply->exit_reason = run->exit_reason;
+    return 0;
+}
+
+static int complete_read(struct arm_cpu *cpu, const struct flexvm_arm_request *request)
+{
+    if (!cpu->pending_read)
+        return -EINVAL;
+    struct kvm_run *run = cpu->run;
+    memcpy(run->mmio.data, request->completion, cpu->pending_read);
+    __atomic_store_n(&run->immediate_exit, 1, __ATOMIC_RELAXED);
+    int status = ioctl_result(ioctl(cpu->fd, KVM_RUN, 0));
+    __atomic_store_n(&run->immediate_exit, 0, __ATOMIC_RELAXED);
+    if (status != -EINTR)
+        return status ? status : -EIO;
+    cpu->pending_read = 0;
     return 0;
 }
 
@@ -138,8 +196,6 @@ static int request_cpu(struct arm_cpu *cpu, const struct flexvm_arm_request *req
         struct kvm_one_reg reg = {.id = request->reg.id, .addr = (uintptr_t)reply->reg_data};
         return ioctl_result(ioctl(cpu->fd, set ? KVM_SET_ONE_REG : KVM_GET_ONE_REG, &reg));
     }
-    case FLEXVM_ARM_RUN:
-        return run_cpu(cpu, request, reply);
     default:
         return -ENOTTY;
     }
@@ -228,6 +284,117 @@ static ssize_t receive_packet(int control, struct worker_packet *packet)
     return received;
 }
 
+static void discard_descriptors(struct worker_packet *packet)
+{
+    for (unsigned int index = 0; index < packet->count; index++)
+        if (packet->descriptors[index] >= 0)
+            close(packet->descriptors[index]);
+}
+
+static void *serve_lane(void *opaque)
+{
+    struct arm_cpu *cpu = opaque;
+    uint32_t previous = 0;
+    active_run_page = cpu->run;
+    while (!stop_requested) {
+        struct worker_packet packet = {0};
+        ssize_t received = receive_packet(cpu->lane, &packet);
+        if (received < 0 && errno == EINTR)
+            continue;
+        if (received <= 0)
+            break;
+        const struct flexvm_arm_request *request = &packet.request;
+        struct flexvm_arm_reply reply = {0};
+        if (!packet.well_formed || packet.count || request->reserved ||
+            (request->command != FLEXVM_ARM_RUN && request->command != FLEXVM_ARM_COMPLETE_READ) ||
+            request->cpu != cpu->id ||
+            request->sequence != previous + 1 || request->sequence > INT_MAX) {
+            reply.status = -EPROTO;
+        } else {
+            previous = request->sequence;
+            atomic_store(&cpu->admitted, previous);
+            int lock = pthread_mutex_lock(&cpu->execution);
+            if (lock) {
+                reply.status = -lock;
+            } else {
+                reply.status = request->command == FLEXVM_ARM_RUN ?
+                               run_cpu(cpu, request, &reply) : complete_read(cpu, request);
+                pthread_mutex_unlock(&cpu->execution);
+            }
+            atomic_store(&cpu->completed, previous);
+        }
+        discard_descriptors(&packet);
+        if (send(cpu->lane, &reply, sizeof(reply), MSG_NOSIGNAL) != sizeof(reply))
+            break;
+    }
+    return NULL;
+}
+
+static int open_lane(struct arm_vm *vm, struct arm_cpu *cpu, struct worker_packet *packet)
+{
+    if (!cpu->initialized || !vm->ram_bytes)
+        return -ENOEXEC;
+    if (cpu->lane >= 0)
+        return -EEXIST;
+    int descriptor = packet->descriptors[0];
+    int type;
+    socklen_t size = sizeof(type);
+    if (getsockopt(descriptor, SOL_SOCKET, SO_TYPE, &type, &size) < 0 || type != SOCK_SEQPACKET)
+        return -EINVAL;
+    cpu->lane = descriptor;
+    int result = pthread_create(&cpu->thread, NULL, serve_lane, cpu);
+    if (result) {
+        cpu->lane = -1;
+        return -result;
+    }
+    packet->descriptors[0] = -1;
+    vm->lanes_opened = 1;
+    return 0;
+}
+
+static int control_cpu(struct arm_cpu *cpu, const struct flexvm_arm_request *request,
+                       struct flexvm_arm_reply *reply, struct kvm_reg_list *list)
+{
+    if (request->command == FLEXVM_ARM_CANCEL_RUN) {
+        if (cpu->lane < 0 || !request->sequence || request->sequence > INT_MAX)
+            return -EINVAL;
+        unsigned int admitted = atomic_load(&cpu->admitted);
+        unsigned int completed = atomic_load(&cpu->completed);
+        if (request->sequence <= completed)
+            return 0;
+        // The next run can be cancelled before its packet arrives on the lane.
+        // An unfinished current run owns the only pending cancellation.
+        if (request->sequence != admitted &&
+            (request->sequence != admitted + 1 || completed < admitted))
+            return -EINVAL;
+        return -pthread_sigqueue(cpu->thread, SIGRTMIN, (union sigval){.sival_int = request->sequence});
+    }
+    int lock = pthread_mutex_trylock(&cpu->execution);
+    if (lock)
+        return -lock;
+    int result = request_cpu(cpu, request, reply, list);
+    pthread_mutex_unlock(&cpu->execution);
+    return result;
+}
+
+static void stop_lanes(struct arm_vm *vm)
+{
+    for (uint32_t id = 0; id < FLEXVM_ARM_MAX_CPUS; id++) {
+        struct arm_cpu *cpu = &vm->cpus[id];
+        if (cpu->lane < 0)
+            continue;
+        pthread_kill(cpu->thread, SIGUSR1);
+        shutdown(cpu->lane, SHUT_RDWR);
+    }
+    for (uint32_t id = 0; id < FLEXVM_ARM_MAX_CPUS; id++) {
+        struct arm_cpu *cpu = &vm->cpus[id];
+        if (cpu->lane >= 0) {
+            pthread_join(cpu->thread, NULL);
+            close(cpu->lane);
+        }
+    }
+}
+
 static void serve(struct arm_vm *vm, int control)
 {
     struct kvm_reg_list *list = calloc(1, sizeof(*list) + FLEXVM_ARM_MAX_REGS * sizeof(list->reg[0]));
@@ -243,24 +410,30 @@ static void serve(struct arm_vm *vm, int control)
 
         const struct flexvm_arm_request *request = &packet.request;
         struct flexvm_arm_reply reply = {0};
-        unsigned int descriptors_needed = request->command == FLEXVM_ARM_REGISTER_RAM ? 2 : 0;
-        if (!packet.well_formed || packet.count != descriptors_needed) {
+        unsigned int descriptors_needed = 0;
+        if (request->command == FLEXVM_ARM_REGISTER_RAM)
+            descriptors_needed = 2;
+        else if (request->command == FLEXVM_ARM_OPEN_LANE)
+            descriptors_needed = 1;
+        if (!packet.well_formed || packet.count != descriptors_needed || request->reserved ||
+            (request->sequence && request->command != FLEXVM_ARM_CANCEL_RUN)) {
             reply.status = -EPROTO;
         } else if (request->command == FLEXVM_ARM_REGISTER_RAM) {
-            reply.status = register_ram(vm, request, packet.descriptors[0], packet.descriptors[1]);
+            reply.status = vm->lanes_opened ? -EBUSY : register_ram(vm, request, packet.descriptors[0], packet.descriptors[1]);
         } else if (request->command == FLEXVM_ARM_PREFERRED_TARGET) {
             reply.status = ioctl_result(ioctl(vm->fd, KVM_ARM_PREFERRED_TARGET, &reply.init));
         } else if (request->cpu >= FLEXVM_ARM_MAX_CPUS) {
             reply.status = -EINVAL;
         } else if (request->command == FLEXVM_ARM_CREATE_VCPU) {
             reply.status = create_cpu(vm, request->cpu);
-        } else if (request->command == FLEXVM_ARM_RUN && !vm->ram_bytes) {
-            reply.status = -ENOEXEC;
+        } else if (request->command == FLEXVM_ARM_OPEN_LANE) {
+            reply.status = open_lane(vm, &vm->cpus[request->cpu], &packet);
+        } else if (request->command == FLEXVM_ARM_RUN || request->command == FLEXVM_ARM_COMPLETE_READ) {
+            reply.status = -EOPNOTSUPP;
         } else {
-            reply.status = request_cpu(&vm->cpus[request->cpu], request, &reply, list);
+            reply.status = control_cpu(&vm->cpus[request->cpu], request, &reply, list);
         }
-        for (unsigned int index = 0; index < packet.count; index++)
-            close(packet.descriptors[index]);
+        discard_descriptors(&packet);
 
         size_t registers = 0;
         if (!reply.status && request->command == FLEXVM_ARM_GET_REG_LIST) {
@@ -272,6 +445,7 @@ static void serve(struct arm_vm *vm, int control)
         check(sendmsg(control, &message, MSG_NOSIGNAL) == (ssize_t)(sizeof(reply) + registers), "send ARM KVM reply");
     }
     free(list);
+    stop_lanes(vm);
 }
 
 int main(int argc, char **argv)
@@ -283,13 +457,32 @@ int main(int argc, char **argv)
     check(getsockopt(control, SOL_SOCKET, SO_TYPE, &socket_type, &socket_type_size) == 0 &&
           socket_type == SOCK_SEQPACKET, "expected ARM worker packet socket");
     unsigned long type = number(argv[2], KVM_VM_TYPE_ARM_IPA_SIZE_MASK);
+    struct sigaction action = {.sa_sigaction = interrupt_run, .sa_flags = SA_SIGINFO};
+    sigemptyset(&action.sa_mask);
+    check(sigaction(SIGRTMIN, &action, NULL) == 0, "install ARM run cancellation signal");
+    struct sigaction stop = {.sa_handler = terminate_lane};
+    sigemptyset(&stop.sa_mask);
+    check(sigaction(SIGUSR1, &stop, NULL) == 0, "install ARM lane termination signal");
+    sigset_t signals;
+    sigemptyset(&signals);
+    sigaddset(&signals, SIGRTMIN);
+    sigaddset(&signals, SIGUSR1);
+    check(pthread_sigmask(SIG_UNBLOCK, &signals, NULL) == 0, "enable ARM worker signals");
     int kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     check(kvm >= 0 && ioctl(kvm, KVM_GET_API_VERSION, 0) == KVM_API_VERSION, "open ARM KVM");
+    check(ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_IMMEDIATE_EXIT) == 1, "enable ARM KVM run cancellation");
     int run_bytes = ioctl(kvm, KVM_GET_VCPU_MMAP_SIZE, 0);
     check(run_bytes >= (int)sizeof(struct kvm_run), "get the ARM KVM run mapping size");
-    struct arm_vm vm = {.fd = ioctl(kvm, KVM_CREATE_VM, type), .run_bytes = run_bytes,
-                        .cpus = {{.fd = -1}, {.fd = -1}}};
+    struct arm_vm vm = {.fd = ioctl(kvm, KVM_CREATE_VM, type), .run_bytes = run_bytes};
     check(vm.fd >= 0, "create the ARM KVM VM");
+    for (uint32_t id = 0; id < FLEXVM_ARM_MAX_CPUS; id++) {
+        struct arm_cpu *cpu = &vm.cpus[id];
+        cpu->id = id;
+        cpu->fd = cpu->lane = -1;
+        atomic_init(&cpu->admitted, 0);
+        atomic_init(&cpu->completed, 0);
+        check(pthread_mutex_init(&cpu->execution, NULL) == 0, "initialize ARM vCPU lock");
+    }
     serve(&vm, control);
     return 0;
 }
