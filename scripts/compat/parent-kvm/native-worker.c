@@ -73,8 +73,13 @@ static void reset_state(unsigned int id, bool irqchip, unsigned long operation)
     union {
         struct kvm_lapic_state lapic;
         struct kvm_sregs sregs;
+        struct kvm_debugregs debugregs;
     } state;
-    size_t length = operation == KVM_GET_LAPIC ? sizeof(state.lapic) : sizeof(state.sregs);
+    size_t length = sizeof(state.sregs);
+    if (operation == KVM_GET_LAPIC)
+        length = sizeof(state.lapic);
+    if (operation == KVM_GET_DEBUGREGS)
+        length = sizeof(state.debugregs);
     int kvm = host_kvm();
     int vm = ioctl(kvm, KVM_CREATE_VM, 0);
     check(vm >= 0, "create a host reset-state VM");
@@ -171,6 +176,10 @@ int main(int argc, char **argv)
         reset_state(number(argv[2], PVKVM_MAX_CPUS - 1), number(argv[3], 1), KVM_GET_SREGS);
         return 0;
     }
+    if (argc == 3 && !strcmp(argv[1], "--reset-debugregs")) {
+        reset_state(number(argv[2], PVKVM_MAX_CPUS - 1), false, KVM_GET_DEBUGREGS);
+        return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "--reset-irqchips")) {
         reset_irqchips();
         return 0;
@@ -248,6 +257,7 @@ int main(int argc, char **argv)
     struct pvkvm_cpuid_table cpuid;
     _Static_assert(sizeof(fpu) == PVKVM_FPU_BYTES && sizeof(cpuid) >= sizeof(fpu) &&
                    sizeof(struct kvm_pit_state2) == PVKVM_PIT_STATE_BYTES &&
+                   sizeof(struct kvm_debugregs) == PVKVM_DEBUGREGS_BYTES &&
                    sizeof(lapic) == PVKVM_LAPIC_BYTES && sizeof(cpuid) >= sizeof(lapic) &&
                    sizeof(cpuid) >= PVKVM_PIO_BYTES + sizeof(uint32_t) &&
                    sizeof(cpuid) >= sizeof(segments) && sizeof(cpuid) >= sizeof(msrs),
@@ -301,6 +311,21 @@ int main(int argc, char **argv)
             check(ioctl(cpu, KVM_GET_SREGS, &segments) == 0, "read host special registers after exit");
             check(write(control, &segments, sizeof(segments)) == (ssize_t)sizeof(segments),
                   "return host special registers to the parent");
+            continue;
+        }
+        if (received == 2 && request[0] == 'H') {
+            struct kvm_debugregs debug;
+
+            check(ioctl(cpu, KVM_GET_DEBUGREGS, &debug) == 0, "read live host debug registers");
+            check(write(control, &debug, sizeof(debug)) == sizeof(debug), "return the host debug registers");
+            continue;
+        }
+        if (received == 2 + sizeof(struct kvm_debugregs) && request[0] == 'I') {
+            struct kvm_debugregs debug;
+
+            memcpy(&debug, request + 2, sizeof(debug));
+            check(ioctl(cpu, KVM_SET_DEBUGREGS, &debug) == 0, "restore live host debug registers");
+            check(write(control, "I", 1) == 1, "acknowledge the host debug registers");
             continue;
         }
         if (received == 2 + sizeof(struct kvm_irq_level) && request[0] == 'L') {

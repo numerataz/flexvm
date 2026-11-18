@@ -123,6 +123,9 @@ Add `--lapic` to read the reset xAPIC image, stage LINT0 and LINT1 before
 the first run, and update the stopped controller. The guest receives a PIC
 interrupt through the installed state, then changes LINT1 through MMIO.
 The test checks that restoring ICR contents does not send an interrupt.
+Use `--debugregs --protected-entry` to stage a hardware breakpoint,
+handle the ensuing debug exception inside the child, and verify the guest's
+debug register writes from the stopped VMM.
 Add `--pit-state` to stage a timer latch and the speaker state before
 execution. The guest consumes the latch and updates the speaker port. The
 VMM then restores a live one-shot timer and the interrupt wakes the guest.
