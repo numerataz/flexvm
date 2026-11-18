@@ -37,6 +37,7 @@
 #define IRQFD_ENTRY_OFFSET 0xe00
 #define ZERO_SLOT_ENTRY_OFFSET 0xe00
 #define PORT_IO_ENTRY_OFFSET 0xe80
+#define PORT_BOUNDARY_ENTRY_OFFSET 0xb00
 #define PIC_IDT_OFFSET 0x400
 #define PIC_IDTR_OFFSET 0x540
 #define PIC_GSI 3
@@ -579,6 +580,33 @@ static void test_port_io(int cpu, struct kvm_run *run, size_t bytes, const unsig
     test_port_access(cpu, run, bytes, 0x2f8, 1, false, "data", 4);
 }
 
+static void prepare_port_boundary(unsigned char *ram, unsigned char *data, int next)
+{
+    const unsigned char program[] = {
+        0x66, 0xba, 0x1e, 0, 0xb8, 0xe8, 0x39, 0x63, 0x1a, 0xef, /* outl starts before PIC */
+        0x66, 0xba, 0x21, 0, 0x66, 0xed,             /* inw crosses the end of the PIC range */
+        0x66, 0x89, 0x83, 0xa0, 0x01, 0, 0,         /* mov [ebx+0x1a0], ax */
+        0x66, 0xba, 0xfe, 0xff, 0xb8, 1, 2, 3, 4, 0xef, /* outl starts near the end of the port space */
+        0x66, 0xba, 0xff, 0xff, 0xed,                /* inl starts at port 65535 */
+        0x89, 0x83, 0xa4, 0x01, 0, 0,               /* mov [ebx+0x1a4], eax */
+        0x66, 0xba, 0x20, 0, 0x66, 0xed,            /* inw stays inside the master PIC range */
+        0x66, 0x89, 0x83, 0xa2, 0x01, 0, 0,         /* mov [ebx+0x1a2], ax */
+        0xb8, 0x41, 0, 0, 0, 0xf9,                  /* mov eax, 0x41; stc */
+    };
+
+    memset(data + 0x1a0, 0xff, 8);
+    memcpy(ram + PORT_BOUNDARY_ENTRY_OFFSET, program, sizeof(program));
+    install_jump(ram, PORT_BOUNDARY_ENTRY_OFFSET + sizeof(program), next);
+}
+
+static void test_port_boundary(int cpu, struct kvm_run *run, size_t bytes)
+{
+    test_port_access(cpu, run, bytes, 0x1e, 4, true, "\xe8\x39\x63\x1a", 4);
+    test_port_access(cpu, run, bytes, 0x21, 2, false, "\x55\x33", 2);
+    test_port_access(cpu, run, bytes, 0xfffe, 4, true, "\x01\x02\x03\x04", 4);
+    test_port_access(cpu, run, bytes, 0xffff, 4, false, "\xde\xc0\xef\xbe", 4);
+}
+
 static void set_pic_line(int vm, unsigned int level)
 {
     const struct kvm_irq_level irq = {.irq = PIC_GSI, .level = level};
@@ -867,6 +895,7 @@ int main(int argc, char **argv)
     bool lapic = false;
     bool pio = false;
     bool complete_read = false;
+    bool pio_boundary = false;
     check(argc == 2 || protected_mode, "specify RAM pages and optional protected or split mode");
     for (int i = 3; i < argc; i++) {
         if (!interrupt_run && !strcmp(argv[i], "interrupt"))
@@ -904,6 +933,8 @@ int main(int argc, char **argv)
             pio = true;
         else if (!complete_read && !strcmp(argv[i], "complete-read"))
             complete_read = true;
+        else if (!pio_boundary && !strcmp(argv[i], "pio-boundary"))
+            pio_boundary = true;
         else
             check(false, "invalid execution option");
     }
@@ -931,6 +962,7 @@ int main(int argc, char **argv)
     check(!pio || (protected_mode && !long_mode && !cpuid && !two_vcpus && !zero_slot),
           "test port I/O with a single protected-mode vCPU");
     check(!complete_read || pio || mmio_read, "exercise completion-only entry with a pending read");
+    check(!pio_boundary || (pio && irqchip), "test port boundary behavior with the PIC enabled");
     size_t pages = count;
     size_t ram_bytes = pages * 4096;
     uint64_t gpa = PVKVM_GUEST_START;
@@ -1237,7 +1269,12 @@ int main(int argc, char **argv)
         regs.rsp = gpa + 0xf00;
     }
     if (pio) {
-        prepare_port_io(ram, data, regs.rip - entry_base);
+        int next = regs.rip - entry_base;
+        if (pio_boundary) {
+            prepare_port_boundary(ram, data, next);
+            next = PORT_BOUNDARY_ENTRY_OFFSET;
+        }
+        prepare_port_io(ram, data, next);
         regs.rip = entry_base + PORT_IO_ENTRY_OFFSET;
         regs.rsp = gpa + 0xf00;
     }
@@ -1301,12 +1338,19 @@ int main(int argc, char **argv)
         complete_mmio_reads(cpu, run, ram, entry_base, complete_read);
     if (pio)
         test_port_io(cpu, run, size, data, complete_read);
+    if (pio_boundary)
+        test_port_boundary(cpu, run, size);
     unsigned long long first = timed_run(cpu);
     check_output(run, size, 0x42);
     if (pio) {
         check(data[0x140] == 0x60 && !memcmp(data + 0x142, "\x67\x45\xef\xbe\x34\x12", 6) &&
               !memcmp(data + 0x188, "data", 4), "observe all supplied port input bytes in guest RAM");
         puts("PASS x86 port I/O preserved widths, counts, and VMM read data");
+    }
+    if (pio_boundary) {
+        check(!memcmp(data + 0x1a0, "\x55\x33\0\0\xde\xc0\xef\xbe", 8),
+              "commit the returned values and keep the intact PIC input in the worker");
+        puts("PASS x86 port I/O kept the original width across device boundaries");
     }
     if (zero_slot) {
         for (size_t i = 0; i < sizeof(zero_slot_offsets) / sizeof(zero_slot_offsets[0]); i++)

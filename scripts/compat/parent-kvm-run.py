@@ -71,6 +71,8 @@ PIO_WRITES = ((0x3f8, 1, b"L"), (0x2f8, 2, b"\xcd\xab"),
               (0xcf8, 4, b"\x00\x00\x00\x80"), (0x3f8, 1, b"vmio"))
 PIO_READS = ((0x3fd, 1, b"\x60"), (0x2f8, 2, b"\x67\x45"),
              (0xcfc, 4, b"\xef\xbe\x34\x12"), (0x2f8, 1, b"data"))
+PIO_BOUNDARY_WRITES = ((0x1e, 4, b"\xe8\x39\x63\x1a"), (0xfffe, 4, b"\x01\x02\x03\x04"))
+PIO_BOUNDARY_READS = ((0x21, 2, b"\x55\x33"), (0xffff, 4, b"\xde\xc0\xef\xbe"))
 EXIT_AT = 0x84000
 EXIT_RECORD = struct.Struct("<IIQ8sII")
 COMPLETION_AT = 0x84100
@@ -442,6 +444,8 @@ class TcgChild:
                     exit_device += ",keep-pic-ports=on"
                 if pit_flags is not None:
                     exit_device += ",keep-pit-ports=on"
+                    if pit_flags & KVM_PIT_SPEAKER_DUMMY:
+                        exit_device += ",keep-speaker-port=on"
                 if mmio:
                     exit_device += f",mmio-base={MMIO_BASE}"
                 pit = "off" if pit_flags is None else "on"
@@ -874,7 +878,7 @@ def verify_slot_spans(pid, slots):
 
 def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry,
              split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs, cpuid, mmio, mmio_read,
-             ioeventfd, irqchip, pit, irqfd, zero_slot, tss, lapic, pio, complete_read):
+             ioeventfd, irqchip, pit, irqfd, zero_slot, tss, lapic, pio, complete_read, pio_boundary):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
@@ -951,7 +955,9 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
     completed_reads = []
     pio_writes = []
     pio_reads = []
-    pio_exit_limit = sum(len(data) // width for _, width, data in (*PIO_WRITES, *PIO_READS))
+    expected_pio_writes = (PIO_WRITES if pio else ()) + (PIO_BOUNDARY_WRITES if pio_boundary else ())
+    expected_pio_reads = (PIO_READS if pio else ()) + (PIO_BOUNDARY_READS if pio_boundary else ())
+    pio_exit_limit = sum(len(data) // width for _, width, data in (*expected_pio_writes, *expected_pio_reads))
     pending_read = None
     irqchip_created = False
     pit_flags = None
@@ -1210,8 +1216,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         guest = (output / "outer.log").read_text(errors="replace")
         if (outer.wait() != 0 or observed != expected or child is None or io_events != expected_io
                 or tuple(mmio_events) != expected_mmio
-                or coalesce_pio(pio_writes) != (PIO_WRITES if pio else ())
-                or coalesce_pio(pio_reads) != (PIO_READS if pio else ())
+                or coalesce_pio(pio_writes) != expected_pio_writes or coalesce_pio(pio_reads) != expected_pio_reads
                 or pending_read is not None or tuple(completed_reads) != (MMIO_READS if mmio_read else ())
                 or irq_levels != (IRQ_LEVELS if irqchip else [])
                 or pit_flags != (KVM_PIT_SPEAKER_DUMMY if pit else None)
@@ -1233,6 +1238,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 or lapic and "PASS VMM and guest updated the parent LAPIC" not in guest
                 or pio and "PASS x86 port I/O preserved widths, counts, and VMM read data" not in guest
                 or complete_read and "PASS interrupted KVM_RUN completed one input without executing the following instruction" not in guest
+                or pio_boundary and "PASS x86 port I/O kept the original width across device boundaries" not in guest
                 or "PASS /dev/kvm returned two port I/O exits" not in guest
                 or "PASS parent KVM guest shutdown" not in guest):
             raise RuntimeError(f"parent execution proof failed; commands={observed}, see outer.log")
@@ -1273,6 +1279,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         "tss_gpa": tss_gpa,
         "lapic": lapic,
         "completed_read_without_entry": complete_read,
+        "pio_boundary": pio_boundary,
         "pio_writes": [{"port": port, "width": width, "data": data.hex()} for port, width, data in pio_writes],
         "pio_reads": [{"port": port, "width": width, "data": data.hex()} for port, width, data in pio_reads],
         "register_counters": counters,
@@ -1322,11 +1329,14 @@ def main():
     parser.add_argument("--lapic", action="store_true", help="get and set parent-owned xAPIC state")
     parser.add_argument("--pio", action="store_true", help="exercise arbitrary x86 port reads and writes")
     parser.add_argument("--complete-read", action="store_true", help="complete a read before an immediate exit")
+    parser.add_argument("--pio-boundary", action="store_true", help="preserve the port and width across device boundaries")
     parser.add_argument("--reject-close", action="store_true", help="verify page retention when the parent refuses close")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.mmio_read or args.ioeventfd:
         args.mmio_write = True
+    if args.pio_boundary:
+        args.pio = args.irqchip = True
     if args.pit or args.irqfd or args.tss or args.lapic:
         args.irqchip = True
     if args.pit and args.irqfd:
@@ -1371,7 +1381,8 @@ def main():
                                   args.protected_entry, args.split_slot, args.interrupt_run,
                                   2 if args.two_vcpus else 1, args.long_mode, args.fpu, args.msrs, args.cpuid,
                                   args.mmio_write, args.mmio_read, args.ioeventfd, args.irqchip, args.pit,
-                                  args.irqfd, args.zero_slot, args.tss, args.lapic, args.pio, args.complete_read)))
+                                  args.irqfd, args.zero_slot, args.tss, args.lapic, args.pio, args.complete_read,
+                                  args.pio_boundary)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -1433,6 +1444,8 @@ def main():
                 oracle.append("pio")
             if args.complete_read:
                 oracle.append("complete-read")
+            if args.pio_boundary:
+                oracle.append("pio-boundary")
             HELPERS["run"](oracle, 14 if args.interrupt_run else 8, output / "native-kvm.log")
             report["same_client_passed_native_kvm"] = True
             report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
@@ -1476,6 +1489,8 @@ def main():
             files["pio"] = b""
         if args.complete_read:
             files["complete-read"] = b""
+        if args.pio_boundary:
+            files["pio-boundary"] = b""
         image = HELPERS["initramfs"](init.read_bytes(), files=files)
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
@@ -1515,6 +1530,7 @@ def main():
                             *(["--lapic"] if args.lapic else []),
                             *(["--pio"] if args.pio else []),
                             *(["--complete-read"] if args.complete_read else []),
+                            *(["--pio-boundary"] if args.pio_boundary else []),
                             *(["--reject-close"] if args.reject_close else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}

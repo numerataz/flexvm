@@ -123,6 +123,9 @@ Add `--pio` to exercise VMM-owned x86 ports. The client gets the port,
 direction, width, count, and data in its mapped run area. It supplies bytes
 for scalar and repeated input before re-entering the vCPU. The test also
 checks that the configured PIC and PIT still handle their own ports.
+Add `--pio-boundary` to exercise both sides of a PIC port range and the
+top of the x86 port space. The TCG worker classifies the complete CPU
+transaction before handing it to a device or to the VMM.
 Add `--complete-read` to the MMIO or port fixture to complete an input with
 `immediate_exit` set. The client observes the updated result register and
 verifies that the next guest instruction waits for ordinary re-entry.
