@@ -40,7 +40,7 @@ int main(void)
     pid_t child = fork();
     check(child >= 0, "fork the KVM client");
     if (child == 0) {
-        char *arguments[28] = {"kvm-run", pages};
+        char *arguments[29] = {"kvm-run", pages};
         unsigned int next = 2;
         if (access("/split-slot", F_OK) == 0)
             arguments[next++] = "split";
@@ -94,6 +94,8 @@ int main(void)
             arguments[next++] = "mp-state";
         if (access("/xcrs", F_OK) == 0)
             arguments[next++] = "xcrs";
+        if (access("/xsave", F_OK) == 0)
+            arguments[next++] = "xsave";
         execv("/kvm-run", arguments);
         _exit(127);
     }

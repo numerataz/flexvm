@@ -64,6 +64,11 @@
 #define DEBUG_TARGET_OFFSET (DEBUG_ENTRY_OFFSET + 7)
 #define DEBUG_DR1_GUEST_VALUE 0x3399
 #define XCRS_ENTRY_OFFSET 0xe00
+#define XSAVE_ENTRY_OFFSET 0xe00
+#define XSAVE_MXCSR_OFFSET 24
+#define XSAVE_XMM_OFFSET 160
+#define XSAVE_BITMAP_OFFSET 512
+#define XSAVE_YMM_HIGH_OFFSET 576
 #define MMIO_BASE 0xd0000000ULL
 #define MMIO_FIRST_VALUE 0x5a443322U
 #define MMIO_SECOND_VALUE 0xaabbccddeeff0011ULL
@@ -713,6 +718,145 @@ static struct kvm_xcrs read_xcrs(int cpu)
     return state;
 }
 
+static struct kvm_xsave read_xsave(int cpu)
+{
+    struct kvm_xsave state;
+
+    check(ioctl(cpu, KVM_GET_XSAVE, &state) == 0, "read the actual XSAVE image");
+    return state;
+}
+
+static void write_xsave_pattern(int cpu, uint16_t control, uint32_t mxcsr,
+                               unsigned char xmm_low, unsigned char ymm_high)
+{
+    struct kvm_xsave state = {0};
+    unsigned char *record = (void *)state.region;
+    const uint64_t components = 7; /* x87, SSE, and AVX. */
+
+    memcpy(record, &control, sizeof(control));
+    memcpy(record + XSAVE_MXCSR_OFFSET, &mxcsr, sizeof(mxcsr));
+    memcpy(record + XSAVE_BITMAP_OFFSET, &components, sizeof(components));
+    memset(record + XSAVE_XMM_OFFSET, xmm_low, 16);
+    memset(record + XSAVE_YMM_HIGH_OFFSET, ymm_high, 16);
+    check(ioctl(cpu, KVM_SET_XSAVE, &state) == 0, "install x87, SSE and AVX state");
+}
+
+static void stage_xsave(int kvm, int cpu)
+{
+    check(ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_XSAVE) > 0, "check XSAVE support");
+    struct kvm_xsave reset = read_xsave(cpu);
+    uint16_t control;
+
+    memcpy(&control, reset.region, sizeof(control));
+    check(control == 0x37f, "read the reset x87 control word in XSAVE");
+    reset.region[130] = 1; /* Reserved low bit of XCOMP_BV. */
+    check(ioctl(cpu, KVM_SET_XSAVE, &reset) == -1 && errno == EINVAL,
+          "reject a malformed standard-format header");
+    write_xsave_pattern(cpu, 0x77f, 0x3f80, 0x5a, 0xa6);
+    struct kvm_fpu legacy = {.fcw = 0xb7f};
+
+    legacy.xmm[0][0] = 0x19;
+    check(ioctl(cpu, KVM_SET_FPU, &legacy) == 0, "stage the legacy registers before XSAVE");
+    struct kvm_xsave after_fpu = read_xsave(cpu);
+    const unsigned char *record = (const void *)after_fpu.region;
+
+    memcpy(&control, record, sizeof(control));
+    check(control == 0xb7f && record[XSAVE_XMM_OFFSET] == 0x19, "XSAVE reflects staged legacy registers");
+    write_xsave_pattern(cpu, 0x77f, 0x3f80, 0x5a, 0xa6);
+    check(ioctl(cpu, KVM_GET_FPU, &legacy) == 0 && legacy.fcw == 0x77f && legacy.xmm[0][0] == 0x5a,
+          "a later XSAVE updates staged legacy registers");
+}
+
+static void check_xsave_guest(unsigned char *observed, uint16_t control, uint32_t mxcsr,
+                              unsigned char xmm_low, unsigned char ymm_high)
+{
+    uint16_t guest_control;
+    uint32_t guest_mxcsr;
+    unsigned char expected[32];
+
+    memcpy(&guest_control, observed, sizeof(guest_control));
+    memcpy(&guest_mxcsr, observed + 4, sizeof(guest_mxcsr));
+    memset(expected, xmm_low, 16);
+    memset(expected + 16, ymm_high, 16);
+    check(guest_control == control && guest_mxcsr == mxcsr &&
+          !memcmp(observed + 16, expected, sizeof(expected)), "guest observed the restored x87, MXCSR and YMM0");
+}
+
+static void test_xsave(int cpu, struct kvm_run *run, int size, unsigned char *ram, unsigned char *data,
+                       uint64_t gpa, uint64_t data_address)
+{
+    const unsigned char setup[] = {
+        0x0f, 0x20, 0xe0,                     /* mov eax, cr4 */
+        0x0d, 0, 0x02, 0x04, 0,               /* enable OSFXSR and OSXSAVE */
+        0x0f, 0x22, 0xe0,
+        0x31, 0xc9, 0x31, 0xd2,                /* clear ecx and edx */
+        0xb8, 7, 0, 0, 0, 0x0f, 0x01, 0xd1,   /* set XCR0 to x87, SSE and AVX */
+        0x8d, 0xb7, 0xc0, 1, 0, 0,             /* lea esi, [edi+0x1c0] */
+    };
+    const unsigned char record_state[] = {
+        0xd9, 0x3e,                            /* fnstcw [esi] */
+        0x0f, 0xae, 0x5e, 4,                   /* stmxcsr [esi+4] */
+        0xc5, 0xfe, 0x7f, 0x46, 16,             /* vmovdqu [esi+16], ymm0 */
+    };
+    const unsigned char guest_update[] = {
+        0xdb, 0xe3,                            /* fninit */
+        0x0f, 0xae, 0x97, 0x80, 0x02, 0, 0,    /* ldmxcsr [edi+0x280] */
+        0xc5, 0xfc, 0x57, 0xc0,                /* vxorps ymm0, ymm0, ymm0 */
+    };
+    const unsigned char checkpoint[] = {
+        0xb9, 0x31, 0x7a, 0, 0,                /* mov ecx, 0x7a31 */
+        0xb0, 0x8a, 0xe6, 0x30,
+    };
+    const unsigned char next_result[] = {
+        0x81, 0xc6, 0x80, 0, 0, 0,             /* add esi, 0x80 */
+    };
+    const uint32_t updated_mxcsr = 0x5f80;
+    const struct kvm_regs regs = {
+        .rsp = gpa + 0xf00, .rdi = data_address,
+        .rip = gpa + XSAVE_ENTRY_OFFSET, .rflags = 2,
+    };
+    unsigned char *entry = ram + XSAVE_ENTRY_OFFSET;
+    size_t pos = 0;
+    const struct {
+        const unsigned char *code;
+        size_t bytes;
+    } blocks[] = {
+        {setup, sizeof(setup)}, {record_state, sizeof(record_state)},
+        {guest_update, sizeof(guest_update)}, {checkpoint, sizeof(checkpoint)},
+        {next_result, sizeof(next_result)}, {record_state, sizeof(record_state)},
+        {checkpoint, sizeof(checkpoint)},
+    };
+
+    for (size_t i = 0; i < sizeof(blocks) / sizeof(blocks[0]); i++) {
+        memcpy(entry + pos, blocks[i].code, blocks[i].bytes);
+        pos += blocks[i].bytes;
+    }
+    entry[pos] = 0xf4;
+    memcpy(data + 0x280, &updated_mxcsr, sizeof(updated_mxcsr));
+    check(ioctl(cpu, KVM_SET_REGS, &regs) == 0, "enter the guest XSAVE test");
+    timed_run(cpu);
+    check_output(run, size, 0x8a);
+    check_registers(cpu, 0x8a, 0x7a31, gpa + XSAVE_ENTRY_OFFSET);
+    check_xsave_guest(data + 0x1c0, 0x77f, 0x3f80, 0x5a, 0xa6);
+    struct kvm_xsave live = read_xsave(cpu);
+    unsigned char *record = (void *)live.region;
+    uint16_t control;
+    uint32_t mxcsr;
+    const unsigned char cleared[16] = {0};
+
+    memcpy(&control, record, sizeof(control));
+    memcpy(&mxcsr, record + XSAVE_MXCSR_OFFSET, sizeof(mxcsr));
+    check(control == 0x37f && mxcsr == updated_mxcsr &&
+          !memcmp(record + XSAVE_XMM_OFFSET, cleared, sizeof(cleared)) &&
+          !memcmp(record + XSAVE_YMM_HIGH_OFFSET, cleared, sizeof(cleared)), "read live guest changes in the XSAVE image");
+    write_xsave_pattern(cpu, 0xb7f, 0x1f80, 0x6b, 0xd2);
+    timed_run(cpu);
+    check_output(run, size, 0x8a);
+    check_registers(cpu, 0x8a, 0x7a31, gpa + XSAVE_ENTRY_OFFSET);
+    check_xsave_guest(data + 0x240, 0xb7f, 0x1f80, 0x6b, 0xd2);
+    puts("PASS XSAVE installed and read actual x87, MXCSR and AVX state");
+}
+
 static void stage_xcrs(int kvm, int cpu)
 {
     check(ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_XCRS) > 0, "check XCR support");
@@ -1344,6 +1488,7 @@ int main(int argc, char **argv)
     bool debugregs = false;
     bool mp_state = false;
     bool xcrs = false;
+    bool xsave = false;
     bool irqfd = false;
     bool zero_slot = false;
     bool tss = false;
@@ -1386,6 +1531,8 @@ int main(int argc, char **argv)
             mp_state = true;
         else if (!xcrs && !strcmp(argv[i], "xcrs"))
             xcrs = true;
+        else if (!xsave && !strcmp(argv[i], "xsave"))
+            xsave = true;
         else if (!irqfd && !strcmp(argv[i], "irqfd"))
             irqfd = true;
         else if (!zero_slot && !strcmp(argv[i], "zero-slot"))
@@ -1429,6 +1576,8 @@ int main(int argc, char **argv)
           "use a separate PIC fixture for MP state");
     check(!xcrs || (cpuid && !two_vcpus && protected_mode && !irqchip && !long_mode && !mmio),
           "use a single protected vCPU with CPUID and XSAVE support");
+    check(!xsave || (cpuid && !xcrs && !two_vcpus && protected_mode && !irqchip && !long_mode && !mmio),
+          "use a single protected vCPU with CPUID and AVX support");
     check(!debugregs || (protected_mode && !two_vcpus && !zero_slot && !long_mode &&
                          !mmio && !irqchip && !cpuid), "use the single-vCPU protected debug fixture");
     check(!irqfd || (irqchip && !pit), "test IRQFD in a separate PIC vCPU run");
@@ -1785,6 +1934,8 @@ int main(int argc, char **argv)
         stage_mp_state(kvm, cpu, gpa);
     if (xcrs)
         stage_xcrs(kvm, cpu);
+    if (xsave)
+        stage_xsave(kvm, cpu);
     if (fpu)
         prepare_fpu(cpu);
     if (msrs)
@@ -1967,6 +2118,8 @@ int main(int argc, char **argv)
         test_debugregs(cpu, run, size, ram, data, gpa, data_address);
     if (xcrs)
         test_xcrs(cpu, run, size, ram, data, gpa, data_address);
+    if (xsave)
+        test_xsave(cpu, run, size, ram, data, gpa, data_address);
     munmap(run, size);
     close(cpu);
     munmap(ram, ram_bytes);

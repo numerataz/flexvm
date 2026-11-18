@@ -44,7 +44,7 @@ EFER_LONG_MODE_ENABLE = 1 << 8
  GET_FPU, SET_FPU, GET_MSRS, SET_MSRS, GET_SUPPORTED_CPUID, CREATE_IRQCHIP, SET_IRQ_LINE,
  CREATE_PIT, SET_TSS_ADDR, GET_LAPIC, SET_LAPIC, COMPLETE_READ, GET_IRQCHIP, SET_IRQCHIP,
  GET_PIT, SET_PIT, GET_DEBUGREGS, SET_DEBUGREGS, GET_MP_STATE, SET_MP_STATE,
- GET_XCRS, SET_XCRS) = range(1, 31)
+ GET_XCRS, SET_XCRS, GET_XSAVE, SET_XSAVE) = range(1, 33)
 FPU_VALID_AT = 48
 FPU_AT = 768
 FPU_SIZE = 416
@@ -60,7 +60,7 @@ CPUID_HEADER = struct.Struct("<II")
 CPUID_ENTRY = struct.Struct("<7I12x")
 CPUID_BYTES = CPUID_HEADER.size + CPUID_ENTRY.size * CPUID_MAX
 CPUID_FIELDS = ("function", "index", "indexed", "eax", "ebx", "ecx", "edx")
-TCG_CHILD_CPU = "qemu64,+xsave"
+TCG_CHILD_CPU = "qemu64,+xsave,+avx"
 KVM_EXIT_IO = 2
 KVM_EXIT_MMIO = 6
 IO_PORT = 0x30
@@ -86,6 +86,8 @@ MP_SIPI_RECEIVED = 4
 XCRS_AT = 0x87500
 XCRS = struct.Struct("<4IQ368x")
 IOCTL_RESULT = struct.Struct("<i")
+XSAVE_AT = 0x88000
+XSAVE_SIZE = 4096
 PIO_WRITES = ((0x3f8, 1, b"L"), (0x2f8, 2, b"\xcd\xab"),
               (0xcf8, 4, b"\x00\x00\x00\x80"), (0x3f8, 1, b"vmio"))
 PIO_READS = ((0x3fd, 1, b"\x60"), (0x2f8, 2, b"\x67\x45"),
@@ -628,6 +630,14 @@ class TcgChild:
         state = self.special_command("x-flexvm-access-x86-xcr0", {"cpu-index": cpu, "value": value})
         return state["status"]
 
+    def xsave(self, cpu):
+        state = self.special_command("x-flexvm-access-x86-xsave", {"cpu-index": cpu})
+        return 0, parse_xsave(state)
+
+    def set_xsave(self, cpu, record):
+        state = self.special_command("x-flexvm-access-x86-xsave", {"cpu-index": cpu, "record": record.hex()})
+        return state["status"]
+
     def pulse_irq(self, gsi):
         self.special_command("x-flexvm-pulse-x86-gsi", {"gsi": gsi})
 
@@ -819,6 +829,20 @@ class KvmChild:
         result = self.channel.connection.recv(IOCTL_RESULT.size + 1)
         if len(result) != IOCTL_RESULT.size:
             raise RuntimeError("native parent worker returned an invalid XCR write result")
+        return IOCTL_RESULT.unpack(result)[0]
+
+    def xsave(self, cpu):
+        self.channel.connection.sendall(bytes((ord("u"), cpu)))
+        result = self.channel.connection.recv(IOCTL_RESULT.size + XSAVE_SIZE + 1)
+        if len(result) != IOCTL_RESULT.size + XSAVE_SIZE:
+            raise RuntimeError("native parent worker returned an invalid XSAVE image")
+        return IOCTL_RESULT.unpack_from(result)[0], result[IOCTL_RESULT.size:]
+
+    def set_xsave(self, cpu, record):
+        self.channel.connection.sendall(bytes((ord("v"), cpu)) + record)
+        result = self.channel.connection.recv(IOCTL_RESULT.size + 1)
+        if len(result) != IOCTL_RESULT.size:
+            raise RuntimeError("native parent worker returned an invalid XSAVE write result")
         return IOCTL_RESULT.unpack(result)[0]
 
     def close(self):
@@ -1036,6 +1060,24 @@ def reset_xcrs(engine, qemu, output, control, cpu_count, cpu):
         return pack_xcrs(monitor.ask("x-flexvm-access-x86-xcr0", {"cpu-index": cpu})["value"])
 
 
+def parse_xsave(state):
+    record = bytes.fromhex(state["record"])
+    if state["status"] or len(record) != XSAVE_SIZE:
+        raise RuntimeError("TCG parent worker returned an invalid XSAVE image")
+    return record
+
+
+def reset_xsave(engine, qemu, output, control, cpu_count, cpu):
+    if engine == "kvm":
+        native = subprocess.run([output / "native-worker", "--reset-xsave", str(cpu)],
+                                capture_output=True, timeout=3)
+        if native.returncode or len(native.stdout) != XSAVE_SIZE:
+            raise RuntimeError(f"native XSAVE query failed: {native.stderr.decode(errors='replace')}")
+        return native.stdout
+    with model_monitor(qemu, output, control, cpu_count, "xsave") as monitor:
+        return parse_xsave(monitor.ask("x-flexvm-access-x86-xsave", {"cpu-index": cpu}))
+
+
 def read_slot_table(mailbox, ram_pages, outer_bytes, protected_entry, split_slot, zero_slot):
     first_gpa = PROTECTED_GPA if protected_entry else PAGE_SIZE
     if zero_slot:
@@ -1117,7 +1159,7 @@ def verify_slot_spans(pid, slots):
 def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry,
              split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs, cpuid, mmio, mmio_read,
              ioeventfd, irqchip, pit, irqfd, zero_slot, tss, lapic, pio, complete_read, pio_boundary, pvh,
-             irqchip_state, pit_state, debugregs, mp_state, xcrs):
+             irqchip_state, pit_state, debugregs, mp_state, xcrs, xsave):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
@@ -1143,6 +1185,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         expected.extend((GET_MP_STATE, SET_MP_STATE, GET_MP_STATE, SET_MP_STATE, GET_MP_STATE))
     if xcrs:
         expected.extend((GET_XCRS, SET_XCRS, GET_XCRS))
+    if xsave:
+        expected.extend((GET_XSAVE, SET_XSAVE, GET_XSAVE, SET_XSAVE))
     if lapic:
         expected.append(GET_LAPIC)
     expected_counters = []
@@ -1219,6 +1263,10 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         expected.extend((SET_REGS, RUN, GET_REGS, GET_XCRS, SET_XCRS, GET_XCRS, RUN, GET_REGS))
         expected_counters.extend((0x7a11, 0x7a11))
         expected_io.extend(((0, 0x7f), (0, 0x7f)))
+    if xsave:
+        expected.extend((SET_REGS, RUN, GET_REGS, GET_XSAVE, SET_XSAVE, RUN, GET_REGS))
+        expected_counters.extend((0x7a31, 0x7a31))
+        expected_io.extend(((0, 0x8a), (0, 0x8a)))
     expected.extend((CLOSE_CPU, CLOSE_VM))
     if reject_close:
         expected = expected[:-1]
@@ -1239,6 +1287,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
     staged_debugregs = {}
     staged_mp_states = {}
     staged_xcrs = {}
+    staged_xsave = {}
     tss_gpa = None
     irq_levels = []
     expected_irq_levels = IRQ_LEVELS + ([(6, 1), (6, 0)] if irqchip_state else []) if irqchip else []
@@ -1264,7 +1313,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 32)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 33)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
         os.ftruncate(outer_ram, outer_ram_size)
@@ -1323,7 +1372,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
             cpu, = struct.unpack_from("<I", mapping, 44)
             cpu_commands = (CLOSE_CPU, RUN, GET_REGS, GET_SREGS, SET_REGS, GET_FPU, SET_FPU, GET_MSRS, SET_MSRS,
                             GET_LAPIC, SET_LAPIC, COMPLETE_READ, GET_DEBUGREGS, SET_DEBUGREGS,
-                            GET_MP_STATE, SET_MP_STATE, GET_XCRS, SET_XCRS)
+                            GET_MP_STATE, SET_MP_STATE, GET_XCRS, SET_XCRS, GET_XSAVE, SET_XSAVE)
             if opcode in cpu_commands and cpu not in open_cpus:
                 raise RuntimeError(f"command {opcode} requested unopened vCPU {cpu}")
             status = 0
@@ -1472,6 +1521,25 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                     else:
                         record = reset_xcrs(parent_engine, qemu, output, control, cpu_count, cpu)
                     mapping[XCRS_AT:end] = record
+            elif opcode in (GET_XSAVE, SET_XSAVE):
+                if length:
+                    raise RuntimeError("unexpected memory argument for XSAVE")
+                end = XSAVE_AT + XSAVE_SIZE
+                if opcode == SET_XSAVE:
+                    record = mapping[XSAVE_AT:end]
+                    if cpu in started_cpus:
+                        status = child.set_xsave(cpu, record)
+                    else:
+                        staged_xsave[cpu] = record
+                else:
+                    if cpu in started_cpus:
+                        status, record = child.xsave(cpu)
+                    elif cpu in staged_xsave:
+                        record = staged_xsave[cpu]
+                    else:
+                        record = reset_xsave(parent_engine, qemu, output, control, cpu_count, cpu)
+                    if not status:
+                        mapping[XSAVE_AT:end] = record
             elif opcode == RUN:
                 if child is None:
                     if length != slot_size or len(open_cpus) != cpu_count:
@@ -1506,6 +1574,10 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                         xcr_status = child.set_xcrs(cpu, staged_xcrs.pop(cpu))
                         if xcr_status:
                             raise RuntimeError(f"parent worker rejected staged XCRs with error {xcr_status}")
+                    if cpu in staged_xsave:
+                        xsave_status = child.set_xsave(cpu, staged_xsave.pop(cpu))
+                        if xsave_status:
+                            raise RuntimeError(f"parent worker rejected staged XSAVE with error {xsave_status}")
                     if protected_entry:
                         state = read_protected_entry(mapping, slots, long_mode, pvh, reset_registers[cpu])
                         child.set_protected_entry(cpu, state)
@@ -1600,6 +1672,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 open_cpus.remove(cpu)
                 staged_mp_states.pop(cpu, None)
                 staged_xcrs.pop(cpu, None)
+                staged_xsave.pop(cpu, None)
                 if not open_cpus:
                     # The guest can unpin its pages after the last CPU closes.
                     if reject_close:
@@ -1635,6 +1708,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 or debugregs and "PASS staged hardware breakpoint and live debug registers" not in guest
                 or mp_state and "PASS real IRQ woke a vCPU restored to KVM_MP_STATE_HALTED" not in guest
                 or xcrs and "PASS guest XGETBV and XSETBV used the actual parent XCR0" not in guest
+                or xsave and "PASS XSAVE installed and read actual x87, MXCSR and AVX state" not in guest
                 or irqfd and "PASS KVM_IRQFD woke an active run and honored deassignment and pending signals" not in guest
                 or zero_slot and "PASS zero-based RAM shared every tested page across the legacy PC region" not in guest
                 or tss and "PASS child ran with Firecracker's three-page TSS reservation" not in guest
@@ -1686,6 +1760,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         "debugregs": debugregs,
         "mp_state": mp_state,
         "xcrs": xcrs,
+        "xsave": xsave,
         "irqfd": irqfd,
         "tcg_irqfd_pulses": pulses,
         "zero_based_ram": zero_slot,
@@ -1741,6 +1816,7 @@ def main():
     parser.add_argument("--debugregs", action="store_true", help="verify staged debug registers and a hardware breakpoint")
     parser.add_argument("--mp-state", action="store_true", help="restore a halted vCPU and wake it through an IRQ")
     parser.add_argument("--xcrs", action="store_true", help="verify real XGETBV and XSETBV with VMM-restored XCR0")
+    parser.add_argument("--xsave", action="store_true", help="verify real x87, MXCSR and AVX state restore")
     parser.add_argument("--irqfd", action="store_true", help="wake an active run through KVM_IRQFD")
     parser.add_argument("--zero-slot", action="store_true", help="share RAM at GPA zero across the PC legacy region")
     parser.add_argument("--tss", action="store_true", help="reserve Firecracker's x86 TSS address")
@@ -1763,7 +1839,7 @@ def main():
             parser.error("--pvh needs at least 8192 pages for the kernel entry point")
     if args.pit_state:
         args.pit = True
-    if args.xcrs:
+    if args.xcrs or args.xsave:
         args.cpuid = True
     if args.pit or args.irqfd or args.tss or args.lapic or args.irqchip_state or args.mp_state:
         args.irqchip = True
@@ -1810,6 +1886,9 @@ def main():
     if args.xcrs and (not args.protected_entry or args.two_vcpus or args.zero_slot or args.long_mode or
                        args.mmio_write or args.irqchip):
         parser.error("--xcrs requires the single-vCPU protected-mode fixture")
+    if args.xsave and (not args.protected_entry or args.two_vcpus or args.zero_slot or args.long_mode or
+                       args.mmio_write or args.irqchip or args.xcrs):
+        parser.error("--xsave requires a separate single-vCPU protected-mode fixture")
     qemu, kernel = (path.resolve(strict=True) for path in (args.qemu, args.kernel))
     output = args.output.resolve()
     if os.geteuid() != 0 or platform.machine() != "x86_64":
@@ -1821,7 +1900,7 @@ def main():
                                   args.mmio_write, args.mmio_read, args.ioeventfd, args.irqchip, args.pit,
                                   args.irqfd, args.zero_slot, args.tss, args.lapic, args.pio, args.complete_read,
                                   args.pio_boundary, args.pvh, args.irqchip_state, args.pit_state, args.debugregs,
-                                  args.mp_state, args.xcrs)))
+                                  args.mp_state, args.xcrs, args.xsave)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -1897,6 +1976,8 @@ def main():
                 oracle.append("mp-state")
             if args.xcrs:
                 oracle.append("xcrs")
+            if args.xsave:
+                oracle.append("xsave")
             HELPERS["run"](oracle, 14 if args.interrupt_run else 8, output / "native-kvm.log")
             report["same_client_passed_native_kvm"] = True
             report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
@@ -1954,6 +2035,8 @@ def main():
             files["mp-state"] = b""
         if args.xcrs:
             files["xcrs"] = b""
+        if args.xsave:
+            files["xsave"] = b""
         image = HELPERS["initramfs"](init.read_bytes(), files=files)
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
@@ -2000,6 +2083,7 @@ def main():
                             *(["--debugregs"] if args.debugregs else []),
                             *(["--mp-state"] if args.mp_state else []),
                             *(["--xcrs"] if args.xcrs else []),
+                            *(["--xsave"] if args.xsave else []),
                             *(["--reject-close"] if args.reject_close else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}
@@ -2011,7 +2095,7 @@ def main():
             workers = {line.split()[0] for line in lines if worker_path in line and line.endswith(" = 0")}
             kvm_users = {line.split()[0] for line in lines if '"/dev/kvm"' in line}
             reset_queries = 2 if args.two_vcpus else 1
-            model_queries = sum((args.cpuid, args.lapic, args.irqchip_state, args.debugregs, args.xcrs))
+            model_queries = sum((args.cpuid, args.lapic, args.irqchip_state, args.debugregs, args.xcrs, args.xsave))
             model_queries += 2 * int(args.pit_state) + 3 * int(args.mp_state)
             if len(workers) != 1 + model_queries + reset_queries or kvm_users != workers:
                 raise RuntimeError("only the native parent worker may use host KVM")

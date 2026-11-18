@@ -1007,7 +1007,7 @@ static long cpu_mp_state(struct pvcpu *cpu, bool write, struct kvm_mp_state __us
 }
 
 /* Serialized with KVM_SET_CPUID2 by cpu_ioctl's execution mutex. */
-static bool valid_xcr0(const struct pvcpu *cpu, u64 value)
+static u64 guest_xcr0_mask(const struct pvcpu *cpu)
 {
 	u64 allowed = XFEATURE_MASK_FP;
 	unsigned int i;
@@ -1022,7 +1022,12 @@ static bool valid_xcr0(const struct pvcpu *cpu, u64 value)
 			}
 		}
 	}
-	return (value & XFEATURE_MASK_FP) && !(value & ~allowed) &&
+	return allowed;
+}
+
+static bool valid_xcr0(const struct pvcpu *cpu, u64 value)
+{
+	return (value & XFEATURE_MASK_FP) && !(value & ~guest_xcr0_mask(cpu)) &&
 	       (!(value & XFEATURE_MASK_YMM) || (value & XFEATURE_MASK_SSE)) &&
 	       (!!(value & XFEATURE_MASK_BNDREGS) == !!(value & XFEATURE_MASK_BNDCSR)) &&
 	       (!(value & XFEATURE_MASK_AVX512) ||
@@ -1062,6 +1067,97 @@ static long cpu_xcrs(struct pvcpu *cpu, bool write, struct kvm_xcrs __user *user
 					&state, sizeof(state));
 	if (!result && copy_to_user(user, &state, sizeof(state)))
 		return -EFAULT;
+	return result;
+}
+
+static u64 guest_xsave_mask(const struct pvcpu *cpu)
+{
+	u64 fits = XFEATURE_MASK_FP | XFEATURE_MASK_SSE;
+	unsigned int i;
+
+	if (cpu->cpuid) {
+		for (i = 0; i < cpu->cpuid->count; i++) {
+			const struct kvm_cpuid_entry2 *entry = &cpu->cpuid->entries[i];
+
+			if (entry->function == 0xd && entry->index >= 2 && entry->index < 64 &&
+			    entry->ebx >= sizeof(struct xregs_state) && entry->ebx < PVKVM_XSAVE_BYTES &&
+			    entry->eax && entry->eax <= PVKVM_XSAVE_BYTES - entry->ebx)
+				fits |= BIT_ULL(entry->index);
+		}
+	}
+	return fits & (guest_xcr0_mask(cpu) | XFEATURE_MASK_SSE);
+}
+
+static void apply_fpu_to_xsave(struct xregs_state *record, const struct kvm_fpu *fpu)
+{
+	/* KVM_SET_FPU updates the legacy registers without changing XSTATE_BV. */
+	if (record->header.xfeatures & XFEATURE_MASK_FP) {
+		record->i387.cwd = fpu->fcw;
+		record->i387.swd = fpu->fsw;
+		record->i387.twd = fpu->ftwx;
+		record->i387.fop = fpu->last_opcode;
+		record->i387.rip = fpu->last_ip;
+		record->i387.rdp = fpu->last_dp;
+		memcpy(record->i387.st_space, fpu->fpr, sizeof(fpu->fpr));
+	}
+	if (record->header.xfeatures & XFEATURE_MASK_SSE)
+		memcpy(record->i387.xmm_space, fpu->xmm, sizeof(fpu->xmm));
+}
+
+static void read_fpu_from_xsave(struct kvm_fpu *fpu, const struct xregs_state *record)
+{
+	memset(fpu, 0, sizeof(*fpu));
+	fpu->fcw = 0x37f;
+	if (record->header.xfeatures & XFEATURE_MASK_FP) {
+		fpu->fcw = record->i387.cwd;
+		fpu->fsw = record->i387.swd;
+		fpu->ftwx = record->i387.twd;
+		fpu->last_opcode = record->i387.fop;
+		fpu->last_ip = record->i387.rip;
+		fpu->last_dp = record->i387.rdp;
+		memcpy(fpu->fpr, record->i387.st_space, sizeof(fpu->fpr));
+	}
+	if (record->header.xfeatures & XFEATURE_MASK_SSE)
+		memcpy(fpu->xmm, record->i387.xmm_space, sizeof(fpu->xmm));
+}
+
+static long cpu_xsave(struct pvcpu *cpu, bool write, struct kvm_xsave __user *user)
+{
+	struct kvm_xsave *state;
+	int result;
+
+	if (write) {
+		const struct xregs_state *record;
+		u64 supported = guest_xsave_mask(cpu);
+
+		state = memdup_user(user, sizeof(*state));
+		if (IS_ERR(state))
+			return PTR_ERR(state);
+		record = (const void *)state;
+		if ((record->header.xfeatures & ~supported) || record->header.xcomp_bv ||
+		    memchr_inv(record->header.reserved, 0, sizeof(record->header.reserved)) ||
+		    (record->i387.mxcsr & 0xffff0000U)) {
+			result = -EINVAL;
+		} else {
+			result = write_stopped_registers(cpu, PVKVM_SET_XSAVE, PVKVM_XSAVE_AT,
+							 state, sizeof(*state));
+			if (!result && !cpu->ran) {
+				read_fpu_from_xsave(&cpu->fpu, record);
+				cpu->fpu_set = false;
+			}
+		}
+	} else {
+		state = kmalloc(sizeof(*state), GFP_KERNEL);
+		if (!state)
+			return -ENOMEM;
+		result = read_stopped_registers(cpu, PVKVM_GET_XSAVE, PVKVM_XSAVE_AT,
+						state, sizeof(*state));
+		if (!result && !cpu->ran && cpu->fpu_set)
+			apply_fpu_to_xsave((void *)state, &cpu->fpu);
+		if (!result && copy_to_user(user, state, sizeof(*state)))
+			result = -EFAULT;
+	}
+	kfree(state);
 	return result;
 }
 
@@ -1198,6 +1294,10 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case KVM_SET_XCRS:
 		result = cpu_xcrs(cpu, cmd == KVM_SET_XCRS, uarg);
 		break;
+	case KVM_GET_XSAVE:
+	case KVM_SET_XSAVE:
+		result = cpu_xsave(cpu, cmd == KVM_SET_XSAVE, uarg);
+		break;
 	case KVM_RUN:
 		if (arg || cpu->sregs.cs.base || !registers_fit_mode(&cpu->regs, &cpu->sregs) ||
 		    (!(cpu->sregs.cr0 & X86_CR0_PE) && cpu->regs.rip > U16_MAX)) {
@@ -1287,6 +1387,7 @@ static long device_capability(unsigned long capability)
 	case KVM_CAP_DEBUGREGS:
 	case KVM_CAP_MP_STATE:
 	case KVM_CAP_XCRS:
+	case KVM_CAP_XSAVE:
 		return 1;
 	case KVM_CAP_NR_MEMSLOTS:
 		return PVKVM_MAX_SLOTS;
@@ -1914,8 +2015,10 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	BUILD_BUG_ON(sizeof(struct kvm_mp_state) != sizeof(u32));
 	BUILD_BUG_ON(PVKVM_MP_STATE_AT + sizeof(struct kvm_mp_state) > PVKVM_XCRS_AT);
 	BUILD_BUG_ON(sizeof(struct kvm_xcrs) != PVKVM_XCRS_BYTES);
+	BUILD_BUG_ON(PVKVM_XCRS_AT + PVKVM_XCRS_BYTES > PVKVM_XSAVE_AT);
+	BUILD_BUG_ON(sizeof(struct kvm_xsave) != PVKVM_XSAVE_BYTES);
 	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
-	    pci_resource_len(dev, 2) < PVKVM_XCRS_AT + PVKVM_XCRS_BYTES)
+	    pci_resource_len(dev, 2) < PVKVM_XSAVE_AT + PVKVM_XSAVE_BYTES)
 		return -ENODEV;
 	result = pcim_enable_device(dev);
 	if (result)
