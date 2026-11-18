@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <sched.h>
 #include <string.h>
+#include <sys/mount.h>
 #include <sys/random.h>
 #include <sys/reboot.h>
 #include <unistd.h>
@@ -40,7 +41,9 @@ int main(void) {
     if (console > 2) close(console);
     setvbuf(stdout, NULL, _IONBF, 0);
     puts("FLEXVM_SOFTWARE_INNER_BOOTED");
-    if (access("/firecracker-network", F_OK) == 0) {
+    int network = access("/firecracker-network", F_OK) == 0;
+    int persistent_block = access("/firecracker-block", F_OK) == 0;
+    if (network || persistent_block) {
         cpu_set_t online;
         if (sched_getaffinity(0, sizeof(online), &online) < 0)
             return 1;
@@ -57,6 +60,8 @@ int main(void) {
         if (sched_setaffinity(0, sizeof(online), &online) < 0)
             return 1;
         printf("FLEXVM_SOFTWARE_INNER_CPUS %d\n", CPU_COUNT(&online));
+    }
+    if (network) {
         if (check_network() < 0) {
             perror("inner Firecracker network");
             return 1;
@@ -68,13 +73,46 @@ int main(void) {
     if (checkpoint && getrandom(&nonce, sizeof(nonce), 0) != sizeof(nonce))
         return 1;
     volatile uint64_t canary = nonce;
+    int block = -1;
+    _Alignas(4096) unsigned char sector[4096] = {0};
+    if (persistent_block) {
+        if (mount("devtmpfs", "/dev", "devtmpfs", 0, NULL) < 0)
+            return 1;
+        block = open("/dev/vda", O_RDWR | O_DIRECT | O_CLOEXEC);
+        if (block < 0 || pread(block, sector, sizeof(sector), 0) != sizeof(sector) || sector[0] != 'F') {
+            perror("read nested virtio block marker");
+            return 1;
+        }
+        memset(sector, 0, sizeof(sector));
+        memcpy(sector, &nonce, sizeof(nonce));
+        if (pwrite(block, sector, sizeof(sector), sizeof(sector)) != sizeof(sector) || fsync(block) < 0) {
+            perror("write and flush nested virtio block canary");
+            return 1;
+        }
+        printf("FLEXVM_X86_BLOCK_FLUSHED %016" PRIx64 "\n", canary);
+    }
     for (unsigned i = 0; i < 3; i++) {
         if (checkpoint && i == 0) {
             printf("FLEXVM_SOFTWARE_INNER_CANARY %016" PRIx64 "\n", canary);
             sleep(5);
         }
-        if (checkpoint && i == 1)
+        if (checkpoint && i == 1) {
+            if (block >= 0) {
+                uint64_t actual;
+                if (pread(block, sector, sizeof(sector), sizeof(sector)) != sizeof(sector)) {
+                    perror("read nested virtio block after restore");
+                    return 1;
+                }
+                memcpy(&actual, sector, sizeof(actual));
+                if (actual != canary) {
+                    fprintf(stderr, "nested virtio block canary changed\n");
+                    return 1;
+                }
+                close(block);
+                printf("FLEXVM_X86_BLOCK_READ %016" PRIx64 "\n", actual);
+            }
             printf("FLEXVM_SOFTWARE_INNER_RESTORED %016" PRIx64 "\n", canary);
+        }
         printf("FLEXVM_SOFTWARE_INNER_TICK %u\n", i);
         if (i == 0 && access("/checkpoint-gate", F_OK) == 0) {
             puts("FLEXVM_SOFTWARE_INNER_WAITING");
