@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Run released ARM Firecracker through FlexVM's owned KVM device."""
 import argparse
+import base64
 from contextlib import ExitStack
 import json
 import re
 from pathlib import Path
 import runpy
 import socket
+import subprocess
 import sys
 import tempfile
 import time
@@ -30,13 +32,14 @@ def main():
     checkpoint.add_argument("--rollback", action="store_true", help="resume the source after aborting a completed capture")
     checkpoint.add_argument("--suspend", action="store_true", help="stop and restore both VMs through the public command")
     checkpoint.add_argument("--idle-transfer", action="store_true", help="restore before creating a nested ARM worker")
+    checkpoint.add_argument("--move", action="store_true", help="transfer the running hierarchy to a separate software host identity")
     args = parser.parse_args()
     checkpoint_test = args.freeze or args.transfer or args.rollback
     if (checkpoint_test or args.idle_transfer) and (args.bin or args.engine != "tcg"):
         parser.error("checkpoint tests require the standalone ARM TCG broker")
-    public_checkpoint = args.pause or args.suspend
+    public_checkpoint = args.pause or args.suspend or args.move
     if public_checkpoint and (not args.bin or args.engine != "tcg"):
-        parser.error("--pause and --suspend need the public ARM TCG command")
+        parser.error("--pause, --suspend and --move need the public ARM TCG command")
     if args.engine == "auto" and not args.bin:
         parser.error("--engine auto requires --bin")
     output = args.output.resolve()
@@ -86,8 +89,8 @@ def main():
             if args.pause:
                 command.extend(["--name", "arm-kvm-pause", "--verbose"])
                 during = lambda proc, deadline: pause_public(proc, deadline, log, binary, state, output)
-            if args.suspend:
-                suspend_public(command, archive, binary, state, output, log)
+            if args.suspend or args.move:
+                suspend_public(command, archive, binary, state, output, log, trusted_qemu=args.qemu if args.move else None)
             else:
                 HELPERS["run"]([*command, archive], 180, log, during=during)
     else:
@@ -127,7 +130,7 @@ def main():
         if lines.count(marker) != 1:
             raise RuntimeError(f"missing or repeated {marker}; see {log}")
     report = {"status": "passed", "nested_vcpus": args.vcpus, "parent_engine": args.engine,
-              "checkpoint": next((mode for mode in ("transfer", "freeze", "rollback", "pause", "suspend", "idle_transfer") if getattr(args, mode)), None),
+              "checkpoint": next((mode for mode in ("transfer", "freeze", "rollback", "pause", "suspend", "idle_transfer", "move") if getattr(args, mode)), None),
               "virtio_block": "read-write-flush",
               "arm_timer": "passed", "firecracker_sha256": HELPERS["digest"](args.firecracker)}
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
@@ -186,7 +189,7 @@ def pause_public(proc, deadline, log, binary, state, output):
     HELPERS["run"]([binary, "unpause", "--state", state, "arm-kvm-pause"], 15, output / "unpause.log")
 
 
-def suspend_public(command, image, binary, state, output, log):
+def suspend_public(command, image, binary, state, output, log, *, trusted_qemu=None):
     name = "arm-kvm-checkpoint"
     source, target = output / "source.log", output / "target.log"
 
@@ -203,9 +206,57 @@ def suspend_public(command, image, binary, state, output, log):
         for member in ("frontend", "worker", "broker"):
             if (checkpoint / f"parent-{member}").stat().st_size != manifest["parent"][member]["bytes"]:
                 raise RuntimeError(f"missing ARM checkpoint {member} artifact")
-        HELPERS["run"]([binary, "start", "-a", "--state", state, name], 150, target)
+        if trusted_qemu is None:
+            HELPERS["run"]([binary, "start", "-a", "--state", state, name], 150, target)
+        else:
+            move_public(binary, state, name, trusted_qemu, output, target)
     finally:
         log.write_bytes(b"".join(part.read_bytes() for part in (source, target) if part.exists()))
+
+
+def move_public(binary, state, name, qemu, output, target_log):
+    def key_pair(secret):
+        subprocess.run(["openssl", "genpkey", "-algorithm", "Ed25519", "-outform", "DER", "-out", secret], check=True, timeout=10)
+        secret.chmod(0o600)
+        public = subprocess.check_output(["openssl", "pkey", "-inform", "DER", "-in", secret, "-pubout", "-outform", "DER"], timeout=10)
+        return base64.b64encode(public[-32:]).decode()
+
+    def transfer(command, *args, stdin=None):
+        return subprocess.check_output([*command, *args], stdin=stdin, timeout=90)
+
+    with tempfile.TemporaryDirectory(prefix="flexvm-arm-move-", dir="/var/lib") as directory:
+        work = Path(directory)
+        source = [binary, "--state", state, "software-transfer"]
+        destination = [binary, "--state", work / "destination", "--run", work / "run", "software-transfer"]
+        source_secret, target_secret = work / "source.der", work / "target.der"
+        source_key, target_key = key_pair(source_secret), key_pair(target_secret)
+        destination_id = json.loads(transfer(destination, "id"))["host_id"]
+        offer = work / "offer.json"
+        offer.write_bytes(transfer(source, "offer", name, destination_id))
+        transfer(destination, "prepare", offer, "--source-key", source_key)
+        receipt = work / "receipt.json"
+        receipt.write_bytes(transfer(source, "retire", name, offer, "--signing-key", source_secret, "--destination-key", target_key))
+
+        blocked = subprocess.run([binary, "--state", state, "start", "-a", name], capture_output=True, timeout=15)
+        if blocked.returncode == 0 or b"source cannot restart" not in blocked.stderr:
+            raise RuntimeError("ARM transfer did not fence source restart")
+        with (output / "transfer-send.log").open("wb") as errors:
+            sender = subprocess.Popen([*source, "send", name, offer], stdout=subprocess.PIPE, stderr=errors)
+            try:
+                received = json.loads(transfer(destination, "receive", offer, stdin=sender.stdout))
+                if sender.wait(timeout=15) or received["status"] != "received":
+                    raise RuntimeError("ARM checkpoint transfer failed")
+            finally:
+                sender.stdout.close()
+                if sender.poll() is None:
+                    sender.kill()
+                    sender.wait(timeout=10)
+
+        transfer(destination, "commit", receipt)
+        ack = work / "commit-ack.json"
+        ack.write_bytes(transfer(destination, "acknowledge-commit", offer, "--signing-key", target_secret))
+        transfer(source, "finalize", ack, "--signing-key", source_secret)
+        HELPERS["run"]([*destination, "activate", offer, "moved-arm-kvm", "--qemu", qemu], 150, target_log)
 
 
 def resume_outer(proc, deadline, runtime):
