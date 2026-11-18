@@ -48,6 +48,7 @@ struct pvkvm {
 	struct miscdevice misc;
 	void __iomem *mailbox;
 	void __iomem *doorbell;
+	u32 parent_doorbell;
 	spinlock_t irqfd_doorbell_lock;
 	bool irqfd_doorbell_live;
 	wait_queue_head_t replied;
@@ -61,6 +62,11 @@ struct pvkvm {
 	bool vm_open;
 	bool parallel_run;
 };
+
+static void kick_parent(struct pvkvm *provider, u32 vector)
+{
+	writel(provider->parent_doorbell | vector, provider->doorbell + PVKVM_DOORBELL_AT);
+}
 
 struct pvslot {
 	struct page **pages;
@@ -286,7 +292,7 @@ static int request(struct pvkvm *provider, enum pvkvm_command command,
 	writel(command, m + PVKVM_COMMAND_AT);
 	wmb();
 	writel(seq, m + PVKVM_REQUEST_AT);
-	writel(PVKVM_HOST_VECTOR, provider->doorbell + PVKVM_DOORBELL_AT);
+	kick_parent(provider, PVKVM_HOST_VECTOR);
 	if (command == PVKVM_RUN) {
 		waited = wait_event_interruptible(provider->replied,
 				atomic_read(&provider->interrupt_count) != interrupts &&
@@ -309,7 +315,7 @@ static int request(struct pvkvm *provider, enum pvkvm_command command,
 		if (readl(m + PVKVM_REPLY_AT) != seq) {
 			writel(seq, m + PVKVM_CANCEL_AT);
 			wmb();
-			writel(PVKVM_CANCEL_VECTOR, provider->doorbell + PVKVM_DOORBELL_AT);
+			kick_parent(provider, PVKVM_CANCEL_VECTOR);
 		}
 		waited = wait_event_timeout(provider->replied,
 				atomic_read(&provider->interrupt_count) != interrupts &&
@@ -375,7 +381,7 @@ static void signal_irqfd(struct pv_irqfd *entry)
 		return;
 	spin_lock_irqsave(&p->irqfd_doorbell_lock, flags);
 	if (p->irqfd_doorbell_live)
-		writel(PVKVM_IRQFD_VECTOR + entry->gsi, p->doorbell + PVKVM_DOORBELL_AT);
+		kick_parent(p, PVKVM_IRQFD_VECTOR + entry->gsi);
 	spin_unlock_irqrestore(&p->irqfd_doorbell_lock, flags);
 }
 
@@ -685,7 +691,7 @@ static int run_lane_request(struct pvcpu *cpu, void __iomem *lane,
 	writel(command, lane + PVKVM_LANE_COMMAND);
 	wmb();
 	writel(seq, lane + PVKVM_LANE_REQUEST);
-	writel(PVKVM_HOST_VECTOR, p->doorbell + PVKVM_DOORBELL_AT);
+	kick_parent(p, PVKVM_HOST_VECTOR);
 
 	if (command == PVKVM_RUN) {
 		waited = wait_event_interruptible(p->replied, READ_ONCE(p->dead) ||
@@ -698,7 +704,7 @@ static int run_lane_request(struct pvcpu *cpu, void __iomem *lane,
 			 */
 			writel(seq, lane + PVKVM_LANE_CANCEL);
 			wmb();
-			writel(PVKVM_CANCEL_VECTOR, p->doorbell + PVKVM_DOORBELL_AT);
+			kick_parent(p, PVKVM_CANCEL_VECTOR);
 		}
 	}
 	waited = wait_event_timeout(p->replied,
@@ -2297,6 +2303,7 @@ static irqreturn_t reply_ready(int irq, void *data)
 static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
 	struct pvkvm *p;
+	u32 guest_position;
 	int result;
 
 	BUILD_BUG_ON(sizeof(struct run_page) != 2 * PAGE_SIZE);
@@ -2369,13 +2376,16 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	p->mailbox = pcim_iomap_table(dev)[2];
 	spin_lock_init(&p->irqfd_doorbell_lock);
 	p->irqfd_doorbell_live = true;
-	if (readl(p->doorbell + PVKVM_IVPOSITION_AT) != PVKVM_GUEST_POSITION ||
+	guest_position = readl(p->doorbell + PVKVM_IVPOSITION_AT);
+	if (guest_position > 1 ||
 	    readl(p->mailbox + PVKVM_MAGIC_AT) != PVKVM_MAGIC ||
 	    readl(p->mailbox + PVKVM_VERSION_AT) != PVKVM_VERSION ||
 	    readl(p->mailbox + PVKVM_REQUEST_AT) || readl(p->mailbox + PVKVM_REPLY_AT)) {
 		result = -ENODEV;
 		goto free_provider;
 	}
+	/* The other of the two peer IDs belongs to the parent broker. */
+	p->parent_doorbell = (guest_position ^ 1U) << 16;
 	p->page_limit = readl(p->mailbox + PVKVM_RAM_LIMIT_AT) ?: PVKVM_MAX_PAGES;
 	if (p->page_limit > PVKVM_MAX_PAGES) {
 		result = -EINVAL;

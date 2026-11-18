@@ -394,6 +394,11 @@ jobs:
             --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64" --kernel "$artifacts/vmlinux" \
             --bundle "$bundle" --output "$RUNNER_TEMP/arm-parent-frontend"
           if grep -F '"/dev/kvm"' "$trace"; then exit 1; fi
+          trace="$RUNNER_TEMP/arm-parent-frontend-checkpoint.strace"
+          strace -f -e trace=file -o "$trace" python3 scripts/compat/arm-parent-frontend.py --checkpoint \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64" --kernel "$artifacts/vmlinux" \
+            --bundle "$bundle" --output "$RUNNER_TEMP/arm-parent-frontend-checkpoint"
+          if grep -F '"/dev/kvm"' "$trace"; then exit 1; fi
           if sudo "$bundle/native-worker" --ipa-bits >/dev/null 2>&1; then
             sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% \
               python3 scripts/compat/arm-parent-frontend.py --native \
