@@ -92,6 +92,10 @@ Add `--ioeventfd` to exercise real eventfd notifications on matching MMIO and
 port writes. The VM's registry supports address, access width, data matches
 and any-length writes. Matching writes signal the eventfd and continue the
 same vCPU. The fixture checks that a deassigned write returns to userspace.
+Add `--irqchip` to a single-vCPU protected-mode run to exercise
+`KVM_CREATE_IRQCHIP` and `KVM_IRQ_LINE`. The guest configures the PIC and
+interrupt descriptor table and acknowledges the interrupt in its own handler.
+This test sets line state between runs.
 The worker uses one host mapping per consecutive extent. Highly fragmented
 slots can reach the host's mapping limit. A failed mapping releases the
 partially mapped worker span.
