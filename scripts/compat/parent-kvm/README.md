@@ -86,8 +86,8 @@ physical address, width and byte sequence. A shared-memory marker shows that
 the worker stopped at each exit and continued from the same instruction stream.
 Use `--mmio-read` to exercise both writes and reads. The single vCPU stops
 at each read. On the next ordinary `KVM_RUN`, it completes the access with
-the bytes written by the client into the mapped `kvm_run` page. Completion
-with a pending signal and parallel vCPU entry remain part of #1501.
+the bytes written by the client into the mapped `kvm_run` page. Parallel vCPU
+entry remains part of #1501.
 Add `--ioeventfd` to exercise real eventfd notifications on matching MMIO and
 port writes. The VM's registry supports address, access width, data matches
 and any-length writes. Matching writes signal the eventfd and continue the
@@ -123,6 +123,9 @@ Add `--pio` to exercise VMM-owned x86 ports. The client gets the port,
 direction, width, count, and data in its mapped run area. It supplies bytes
 for scalar and repeated input before re-entering the vCPU. The test also
 checks that the configured PIC and PIT still handle their own ports.
+Add `--complete-read` to the MMIO or port fixture to complete an input with
+`immediate_exit` set. The client observes the updated result register and
+verifies that the next guest instruction waits for ordinary re-entry.
 The worker uses one host mapping per consecutive extent. Highly fragmented
 slots can reach the host's mapping limit. A failed mapping releases the
 partially mapped worker span.

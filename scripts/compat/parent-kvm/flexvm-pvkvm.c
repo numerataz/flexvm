@@ -560,6 +560,32 @@ static int complete_run(struct pvcpu *cpu, const struct pvkvm_run_exit *exit)
 	return 0;
 }
 
+static void publish_read_completion(struct pvcpu *cpu)
+{
+	struct pvkvm *p = cpu->vm->provider;
+	struct pvkvm_read_completion completion = { .length = cpu->read_bytes };
+
+	if (completion.length && cpu->read_pio)
+		memcpy_toio(p->mailbox + PVKVM_PIO_DATA_AT, cpu->page->pio, completion.length);
+	else if (completion.length)
+		memcpy(completion.data, cpu->page->run.mmio.data, completion.length);
+	memcpy_toio(p->mailbox + PVKVM_COMPLETION_AT, &completion, sizeof(completion));
+}
+
+static int finish_interrupted_read(struct pvcpu *cpu)
+{
+	int result;
+
+	if (!cpu->read_bytes)
+		return -EINTR;
+	publish_read_completion(cpu);
+	result = request_for_cpu(cpu, PVKVM_COMPLETE_READ, NULL, NULL);
+	if (result)
+		return result;
+	cpu->read_bytes = 0;
+	return -EINTR;
+}
+
 static int run_cpu(struct pvcpu *cpu)
 {
 	struct pvvm *vm = cpu->vm;
@@ -568,15 +594,15 @@ static int run_cpu(struct pvcpu *cpu)
 	struct pvkvm_run_exit exit;
 	int result;
 
-	result = mutex_lock_interruptible(&p->lock);
+	result = cpu->read_bytes ? mutex_lock_killable(&p->lock) : mutex_lock_interruptible(&p->lock);
 	if (result)
 		return -EINTR;
-	if (signal_pending(current)) {
-		result = -EINTR;
-		goto unlock;
-	}
 	if (p->dead) {
 		result = -ENODEV;
+		goto unlock;
+	}
+	if (READ_ONCE(cpu->page->run.immediate_exit) || signal_pending(current)) {
+		result = finish_interrupted_read(cpu);
 		goto unlock;
 	}
 	if (!cpu->ran && !long_mode(&cpu->sregs) && !slot_contains(vm, cpu->regs.rip, 1)) {
@@ -612,13 +638,7 @@ static int run_cpu(struct pvcpu *cpu)
 				    cpu->cpuid->count * sizeof(cpu->cpuid->entries[0]));
 	}
 	do {
-		struct pvkvm_read_completion completion = { .length = cpu->read_bytes };
-
-		if (completion.length && cpu->read_pio)
-			memcpy_toio(p->mailbox + PVKVM_PIO_DATA_AT, cpu->page->pio, completion.length);
-		else if (completion.length)
-			memcpy(completion.data, cpu->page->run.mmio.data, completion.length);
-		memcpy_toio(p->mailbox + PVKVM_COMPLETION_AT, &completion, sizeof(completion));
+		publish_read_completion(cpu);
 		result = request_for_cpu(cpu, PVKVM_RUN, memory, &exit);
 		if (!result || result == -EINTR) {
 			cpu->ran = true;
@@ -882,7 +902,6 @@ static long cpu_lapic(struct pvcpu *cpu, bool write, void __user *user)
 static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct pvcpu *cpu = file->private_data;
-	struct run_page *page = cpu->page;
 	struct kvm_fpu fpu;
 	struct kvm_sregs sregs, wanted;
 	struct kvm_regs regs;
@@ -891,7 +910,9 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 	if (cpu->vm->owner != current->mm)
 		return -EIO;
-	result = mutex_lock_interruptible(&cpu->execution);
+	/* As in Linux KVM, an ordinary signal does not abandon a run in the lock queue. */
+	result = cmd == KVM_RUN ? mutex_lock_killable(&cpu->execution) :
+				 mutex_lock_interruptible(&cpu->execution);
 	if (result)
 		return -EINTR;
 	if (cpu->ran && cmd == KVM_SET_SREGS) {
@@ -994,10 +1015,6 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if (arg || cpu->sregs.cs.base || !registers_fit_mode(&cpu->regs, &cpu->sregs) ||
 		    (!(cpu->sregs.cr0 & X86_CR0_PE) && cpu->regs.rip > U16_MAX)) {
 			result = -EINVAL;
-			break;
-		}
-		if (READ_ONCE(page->run.immediate_exit) || signal_pending(current)) {
-			result = -EINTR;
 			break;
 		}
 		result = run_cpu(cpu);

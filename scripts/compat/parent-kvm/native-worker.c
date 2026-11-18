@@ -305,6 +305,17 @@ int main(int argc, char **argv)
             check(write(control, "C", 1) == 1, "acknowledge host CPUID table");
             continue;
         }
+        if (request[0] == 'E') {
+            struct pending_read *pending = &pending_read[id];
+            check(pending->length && received == (ssize_t)(2 + pending->length), "invalid completion-only read");
+            memcpy(pending->data, request + 2, pending->length);
+            run->immediate_exit = 1;
+            check(ioctl(cpu, KVM_RUN, 0) == -1 && errno == EINTR, "complete host I/O and stop before entry");
+            run->immediate_exit = 0;
+            *pending = (struct pending_read){0};
+            check(write(control, "E", 1) == 1, "acknowledge completed host I/O");
+            continue;
+        }
         uint32_t sequence;
         size_t run_header = 2 + sizeof(sequence);
         check(received == (ssize_t)(run_header + pending_read[id].length) && request[0] == 'R', "invalid run request");

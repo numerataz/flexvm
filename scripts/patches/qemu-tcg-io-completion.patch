@@ -1,0 +1,56 @@
+--- a/hw/char/debugcon.c
++++ b/hw/char/debugcon.c
+@@ -80,2 +80,4 @@
+     bool receiving_read;
++    bool completion_only;
++    bool completion_ack_pending;
+     bool read_ready;
+@@ -110,2 +112,14 @@
+
++static void debugcon_ack_read(CPUState *cpu, run_on_cpu_data data)
++{
++    DebugconState *s = data.host_ptr;
++
++    assert(bql_locked());
++    if (!s->run_failed && qemu_chr_fe_write(&s->chr, (const uint8_t *)"E", 1) != 1) {
++        debugcon_run_failed(s);
++    }
++    s->completion_ack_pending = false;
++    qemu_cond_broadcast(&s->read_completed);
++}
++
+ static void debugcon_run(void *opaque, const uint8_t *buf, int len)
+@@ -114,3 +128,3 @@
+
+-    if (len != 1) {
++    if (len != 1 || s->completion_ack_pending) {
+         debugcon_run_failed(s);
+@@ -122,2 +136,14 @@
+             s->receiving_read = false;
++            if (s->completion_only) {
++                /*
++                 * Let the paused CPU finish the device callback. Report the
++                 * completion when its CPU thread reaches the queued work.
++                 */
++                s->completion_ack_pending = true;
++                async_run_on_cpu(s->run_cpu, debugcon_ack_read,
++                                 RUN_ON_CPU_HOST_PTR(s));
++                s->read_ready = true;
++                qemu_cond_broadcast(&s->read_completed);
++                return;
++            }
+             s->run_active = true;
+@@ -132,3 +158,3 @@
+     }
+-    if (buf[0] == 'D') {
++    if (buf[0] == 'D' || buf[0] == 'E') {
+         if (!s->read_width || s->run_failed || s->run_active ||
+@@ -138,2 +164,3 @@
+         }
++        s->completion_only = buf[0] == 'E';
+         s->receiving_read = true;
+@@ -506,3 +533,3 @@
+             debugcon_run_failed(s);
+-            while (s->read_width || s->pio_waiters) {
++            while (s->read_width || s->pio_waiters || s->completion_ack_pending) {
+                 qemu_cond_wait_bql(&s->read_completed);

@@ -450,7 +450,19 @@ static void check_ioeventfds(int vm, int cpu, const struct kvm_run *run,
     puts("PASS KVM_IOEVENTFD signaled matched MMIO and PIO writes");
 }
 
-static void complete_mmio_reads(int cpu, struct kvm_run *run, const unsigned char *ram, uint64_t entry_base)
+static void check_completion_only(int cpu, struct kvm_run *run, uint64_t value, uint64_t mask)
+{
+    struct kvm_regs registers;
+
+    run->immediate_exit = 1;
+    check(ioctl(cpu, KVM_RUN, 0) == -1 && errno == EINTR, "finish input before returning EINTR");
+    run->immediate_exit = 0;
+    check(ioctl(cpu, KVM_GET_REGS, &registers) == 0 && (registers.rax & mask) == value,
+          "read the committed input register before resuming");
+}
+
+static void complete_mmio_reads(int cpu, struct kvm_run *run, const unsigned char *ram, uint64_t entry_base,
+                                bool complete_read)
 {
     const uint32_t first_value = MMIO_FIRST_VALUE;
     const uint64_t second_value = MMIO_SECOND_VALUE;
@@ -468,6 +480,12 @@ static void complete_mmio_reads(int cpu, struct kvm_run *run, const unsigned cha
     memcpy(&second, ram + 0x108, sizeof(second));
     check(!first && !second, "stop at the first read before consuming any data");
     memcpy(run->mmio.data, &first_value, sizeof(first_value));
+    if (complete_read) {
+        check_completion_only(cpu, run, first_value, UINT64_MAX);
+        memcpy(&first, ram + 0x100, sizeof(first));
+        check(!first, "stop before the instruction following MMIO input");
+        puts("PASS interrupted KVM_RUN completed one input without executing the following instruction");
+    }
 
     timed_run(cpu);
     check(run->exit_reason == KVM_EXIT_MMIO && !run->mmio.is_write &&
@@ -544,10 +562,15 @@ static void test_port_access(int cpu, struct kvm_run *run, size_t mapping_bytes,
     }
 }
 
-static void test_port_io(int cpu, struct kvm_run *run, size_t bytes)
+static void test_port_io(int cpu, struct kvm_run *run, size_t bytes, const unsigned char *data, bool complete_read)
 {
     test_port_access(cpu, run, bytes, 0x3f8, 1, true, "L", 1);
     test_port_access(cpu, run, bytes, 0x3fd, 1, false, "\x60", 1);
+    if (complete_read) {
+        check_completion_only(cpu, run, 0x60, 0xff);
+        check(!data[0x140], "stop before the instruction following port input");
+        puts("PASS interrupted KVM_RUN completed one input without executing the following instruction");
+    }
     test_port_access(cpu, run, bytes, 0x2f8, 2, true, "\xcd\xab", 2);
     test_port_access(cpu, run, bytes, 0x2f8, 2, false, "\x67\x45", 2);
     test_port_access(cpu, run, bytes, 0xcf8, 4, true, "\x00\x00\x00\x80", 4);
@@ -843,6 +866,7 @@ int main(int argc, char **argv)
     bool provider_tss = false;
     bool lapic = false;
     bool pio = false;
+    bool complete_read = false;
     check(argc == 2 || protected_mode, "specify RAM pages and optional protected or split mode");
     for (int i = 3; i < argc; i++) {
         if (!interrupt_run && !strcmp(argv[i], "interrupt"))
@@ -878,6 +902,8 @@ int main(int argc, char **argv)
             lapic = true;
         else if (!pio && !strcmp(argv[i], "pio"))
             pio = true;
+        else if (!complete_read && !strcmp(argv[i], "complete-read"))
+            complete_read = true;
         else
             check(false, "invalid execution option");
     }
@@ -904,6 +930,7 @@ int main(int argc, char **argv)
     check(!lapic || irqchip, "get and set the local APIC with an irqchip");
     check(!pio || (protected_mode && !long_mode && !cpuid && !two_vcpus && !zero_slot),
           "test port I/O with a single protected-mode vCPU");
+    check(!complete_read || pio || mmio_read, "exercise completion-only entry with a pending read");
     size_t pages = count;
     size_t ram_bytes = pages * 4096;
     uint64_t gpa = PVKVM_GUEST_START;
@@ -1271,9 +1298,9 @@ int main(int argc, char **argv)
         check_mmio_writes(cpu, run, ram);
     }
     if (mmio_read)
-        complete_mmio_reads(cpu, run, ram, entry_base);
+        complete_mmio_reads(cpu, run, ram, entry_base, complete_read);
     if (pio)
-        test_port_io(cpu, run, size);
+        test_port_io(cpu, run, size, data, complete_read);
     unsigned long long first = timed_run(cpu);
     check_output(run, size, 0x42);
     if (pio) {

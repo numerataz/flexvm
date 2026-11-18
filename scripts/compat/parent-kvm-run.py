@@ -42,7 +42,7 @@ EFER_LONG_MODE_ACTIVE = 1 << 10
 EFER_LONG_MODE_ENABLE = 1 << 8
 (OPEN_VM, CLOSE_VM, OPEN_CPU, CLOSE_CPU, RUN, GET_REGS, SET_REGS, GET_SREGS,
  GET_FPU, SET_FPU, GET_MSRS, SET_MSRS, GET_SUPPORTED_CPUID, CREATE_IRQCHIP, SET_IRQ_LINE,
- CREATE_PIT, SET_TSS_ADDR, GET_LAPIC, SET_LAPIC) = range(1, 20)
+ CREATE_PIT, SET_TSS_ADDR, GET_LAPIC, SET_LAPIC, COMPLETE_READ) = range(1, 21)
 FPU_VALID_AT = 48
 FPU_AT = 768
 FPU_SIZE = 416
@@ -164,6 +164,21 @@ def coalesce_pio(records):
         else:
             groups.append((port, width, data))
     return tuple(groups)
+
+
+def read_completion(mailbox, pending, pio_reads, mmio_reads):
+    size, reserved, value = COMPLETION_RECORD.unpack_from(mailbox, COMPLETION_AT)
+    if reserved or size != (len(pending.data) if pending else 0):
+        raise RuntimeError("guest changed the outstanding I/O read size")
+    if pending is None:
+        return b""
+    if pending.reason == KVM_EXIT_IO:
+        completion = mailbox[PIO_DATA_AT:PIO_DATA_AT + size]
+        pio_reads.append((pending.address, pending.width, completion))
+    else:
+        completion = value[:size]
+        mmio_reads.append((pending.address, completion))
+    return completion
 
 
 class SignalValue(ctypes.Union):
@@ -463,6 +478,11 @@ class TcgChild:
         request = b"D" + completion if completion else bytes((ord("R") + cpu,))
         return self.channel.run(request, cancellation, lambda: self.channel.connection.sendall(b"I"))
 
+    def complete_read(self, cpu, completion):
+        self.channel.connection.sendall(b"E" + completion)
+        if self.channel.connection.recv(1) != b"E":
+            raise RuntimeError("TCG worker did not acknowledge the completed read")
+
     def registers(self, cpu):
         self.debugger.select_cpu(cpu)
         registers = [0] * 18
@@ -574,6 +594,11 @@ class KvmChild:
             raise RuntimeError("invalid native cancellation sequence")
         return self.channel.run(struct.pack("<cBI", b"R", cpu, sequence) + completion, cancellation,
                                 lambda: self.interrupt(sequence))
+
+    def complete_read(self, cpu, completion):
+        self.channel.connection.sendall(bytes((ord("E"), cpu)) + completion)
+        if self.channel.connection.recv(2) != b"E":
+            raise RuntimeError("native worker did not acknowledge the completed read")
 
     def interrupt(self, sequence):
         if self.sigqueue(self.process.pid, signal.SIGRTMIN, SignalValue(integer=sequence)):
@@ -849,7 +874,7 @@ def verify_slot_spans(pid, slots):
 
 def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry,
              split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs, cpuid, mmio, mmio_read,
-             ioeventfd, irqchip, pit, irqfd, zero_slot, tss, lapic, pio):
+             ioeventfd, irqchip, pit, irqfd, zero_slot, tss, lapic, pio, complete_read):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
@@ -873,8 +898,12 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
     if mmio:
         expected.extend([RUN] * len(expected_mmio))
     if mmio_read:
-        expected.extend((RUN, GET_REGS) * len(MMIO_READS))
-        expected_counters.extend([0] * len(MMIO_READS))
+        for i in range(len(MMIO_READS)):
+            expected.extend((RUN, GET_REGS))
+            expected_counters.append(0)
+            if i == 0 and complete_read:
+                expected.extend((COMPLETE_READ, GET_REGS))
+                expected_counters.append(0)
     expected.extend((RUN, GET_REGS, GET_SREGS))
     if cpuid:
         expected.insert(0, GET_SUPPORTED_CPUID)
@@ -947,7 +976,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 25)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 26)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
         os.ftruncate(outer_ram, outer_ram_size)
@@ -1005,7 +1034,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 raise RuntimeError(f"unexpected doorbell request {pending}, command {opcode}")
             cpu, = struct.unpack_from("<I", mapping, 44)
             cpu_commands = (CLOSE_CPU, RUN, GET_REGS, GET_SREGS, SET_REGS, GET_FPU, SET_FPU, GET_MSRS, SET_MSRS,
-                            GET_LAPIC, SET_LAPIC)
+                            GET_LAPIC, SET_LAPIC, COMPLETE_READ)
             if opcode in cpu_commands and cpu not in open_cpus:
                 raise RuntimeError(f"command {opcode} requested unopened vCPU {cpu}")
             status = 0
@@ -1052,6 +1081,11 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 if length or not irqchip_created or cpu not in started_cpus:
                     raise RuntimeError("LAPIC write requires a stopped, initialized vCPU")
                 child.set_lapic(cpu, mapping[LAPIC_AT:LAPIC_AT + LAPIC_SIZE])
+            elif opcode == COMPLETE_READ:
+                if length or pending_read is None:
+                    raise RuntimeError("completion-only entry requires an outstanding read")
+                child.complete_read(cpu, read_completion(mapping, pending_read, pio_reads, completed_reads))
+                pending_read = None
             elif opcode == RUN:
                 if child is None:
                     if length != slot_size or len(open_cpus) != cpu_count:
@@ -1091,18 +1125,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                     if lapic_valid:
                         child.set_lapic(cpu, mapping[LAPIC_AT:LAPIC_AT + LAPIC_SIZE])
                     started_cpus.add(cpu)
-                size, reserved, value = COMPLETION_RECORD.unpack_from(mapping, COMPLETION_AT)
-                completion = b""
-                if reserved or size != (len(pending_read.data) if pending_read else 0):
-                    raise RuntimeError("guest changed the outstanding I/O read size")
-                if pending_read:
-                    if pending_read.reason == KVM_EXIT_IO:
-                        completion = mapping[PIO_DATA_AT:PIO_DATA_AT + size]
-                        pio_reads.append((pending_read.address, pending_read.width, completion))
-                    else:
-                        completion = value[:size]
-                        completed_reads.append((pending_read.address, completion))
-                    pending_read = None
+                completion = read_completion(mapping, pending_read, pio_reads, completed_reads)
+                pending_read = None
                 try:
                     result = child.run(cpu, RunCancellation(cancellations, mapping, pending, deadline), completion)
                 except TimeoutError as error:
@@ -1125,6 +1149,10 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                                 pio_writes.append((result.address, result.width, result.data))
                             else:
                                 pending_read = result
+                                if complete_read and result.address == 0x3fd:
+                                    at = len(observed) + 1
+                                    expected[at:at] = (COMPLETE_READ, GET_REGS)
+                                    expected_counters.insert(len(counters), 0)
                         if result.is_write:
                             mapping[PIO_DATA_AT:PIO_DATA_AT + len(result.data)] = result.data
                     elif result.is_write:
@@ -1204,6 +1232,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 or tss and "PASS child ran with Firecracker's three-page TSS reservation" not in guest
                 or lapic and "PASS VMM and guest updated the parent LAPIC" not in guest
                 or pio and "PASS x86 port I/O preserved widths, counts, and VMM read data" not in guest
+                or complete_read and "PASS interrupted KVM_RUN completed one input without executing the following instruction" not in guest
                 or "PASS /dev/kvm returned two port I/O exits" not in guest
                 or "PASS parent KVM guest shutdown" not in guest):
             raise RuntimeError(f"parent execution proof failed; commands={observed}, see outer.log")
@@ -1243,6 +1272,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         "zero_based_ram": zero_slot,
         "tss_gpa": tss_gpa,
         "lapic": lapic,
+        "completed_read_without_entry": complete_read,
         "pio_writes": [{"port": port, "width": width, "data": data.hex()} for port, width, data in pio_writes],
         "pio_reads": [{"port": port, "width": width, "data": data.hex()} for port, width, data in pio_reads],
         "register_counters": counters,
@@ -1291,6 +1321,7 @@ def main():
     parser.add_argument("--tss", action="store_true", help="reserve Firecracker's x86 TSS address")
     parser.add_argument("--lapic", action="store_true", help="get and set parent-owned xAPIC state")
     parser.add_argument("--pio", action="store_true", help="exercise arbitrary x86 port reads and writes")
+    parser.add_argument("--complete-read", action="store_true", help="complete a read before an immediate exit")
     parser.add_argument("--reject-close", action="store_true", help="verify page retention when the parent refuses close")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -1319,6 +1350,8 @@ def main():
         parser.error("--zero-slot requires one protected-mode vCPU and one slot of at least 258 pages")
     if args.pio and (not args.protected_entry or args.long_mode or args.cpuid or args.two_vcpus or args.zero_slot):
         parser.error("--pio requires a single protected-mode vCPU")
+    if args.complete_read and not (args.pio or args.mmio_read):
+        parser.error("--complete-read requires --pio or --mmio-read")
     if not 1 <= args.ram_pages <= MAX_SLOT_PAGES:
         parser.error(f"--ram-pages must be between 1 and {MAX_SLOT_PAGES}")
     if args.ram_pages > MAX_REAL_MODE_PAGES and not args.protected_entry:
@@ -1338,7 +1371,7 @@ def main():
                                   args.protected_entry, args.split_slot, args.interrupt_run,
                                   2 if args.two_vcpus else 1, args.long_mode, args.fpu, args.msrs, args.cpuid,
                                   args.mmio_write, args.mmio_read, args.ioeventfd, args.irqchip, args.pit,
-                                  args.irqfd, args.zero_slot, args.tss, args.lapic, args.pio)))
+                                  args.irqfd, args.zero_slot, args.tss, args.lapic, args.pio, args.complete_read)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -1398,6 +1431,8 @@ def main():
                 oracle.append("lapic")
             if args.pio:
                 oracle.append("pio")
+            if args.complete_read:
+                oracle.append("complete-read")
             HELPERS["run"](oracle, 14 if args.interrupt_run else 8, output / "native-kvm.log")
             report["same_client_passed_native_kvm"] = True
             report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
@@ -1439,6 +1474,8 @@ def main():
             files["lapic"] = b""
         if args.pio:
             files["pio"] = b""
+        if args.complete_read:
+            files["complete-read"] = b""
         image = HELPERS["initramfs"](init.read_bytes(), files=files)
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
@@ -1477,6 +1514,7 @@ def main():
                             *(["--tss"] if args.tss else []),
                             *(["--lapic"] if args.lapic else []),
                             *(["--pio"] if args.pio else []),
+                            *(["--complete-read"] if args.complete_read else []),
                             *(["--reject-close"] if args.reject_close else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}
