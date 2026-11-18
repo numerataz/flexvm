@@ -95,12 +95,13 @@ int main(int argc, char **argv)
         supported_cpuid();
         return 0;
     }
-    check(argc >= 8 && (argc - 5) % 3 == 0 &&
-          (argc - 5) / 3 <= PVKVM_MAX_SLOTS, "expected control, outer RAM, vCPU count, irqchip, and slots");
+    check(argc >= 9 && (argc - 6) % 3 == 0 &&
+          (argc - 6) / 3 <= PVKVM_MAX_SLOTS, "expected control, outer RAM, vCPU count, irqchip, PIT, and slots");
     int control = (int)number(argv[1], INT_MAX);
     int outer_ram = (int)number(argv[2], INT_MAX);
     unsigned int cpu_count = number(argv[3], PVKVM_MAX_CPUS);
     bool irqchip = number(argv[4], 1);
+    unsigned int pit_request = number(argv[5], KVM_PIT_SPEAKER_DUMMY + 1);
     check(cpu_count > 0, "at least one native vCPU");
 
     int kvm = host_kvm();
@@ -110,7 +111,11 @@ int main(int argc, char **argv)
     check(vm >= 0, "create host VM");
     if (irqchip)
         check(ioctl(vm, KVM_CREATE_IRQCHIP, 0) == 0, "create the host irqchip");
-    for (int arg = 5; arg < argc; arg += 3) {
+    if (pit_request) {
+        struct kvm_pit_config pit = {.flags = pit_request - 1};
+        check(ioctl(vm, KVM_CREATE_PIT2, &pit) == 0, "create the host PIT");
+    }
+    for (int arg = 6; arg < argc; arg += 3) {
         int layout = (int)number(argv[arg], INT_MAX);
         uint64_t gpa = number(argv[arg + 1], UINT32_MAX);
         uint32_t id = number(argv[arg + 2], PVKVM_MAX_SLOTS - 1);

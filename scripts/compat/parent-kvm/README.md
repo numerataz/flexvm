@@ -96,6 +96,10 @@ Add `--irqchip` to a single-vCPU protected-mode run to exercise
 `KVM_CREATE_IRQCHIP` and `KVM_IRQ_LINE`. The guest configures the PIC and
 interrupt descriptor table and acknowledges the interrupt in its own handler.
 This test sets line state between runs.
+Add `--pit` to that run to create an i8254 timer with `KVM_CREATE_PIT2`.
+The child programs a one-shot tick over port I/O and halts. The timer
+interrupt wakes the same vCPU, and the guest acknowledges it before returning
+to the VMM. PIT state transfer is tracked in #1501.
 The worker uses one host mapping per consecutive extent. Highly fragmented
 slots can reach the host's mapping limit. A failed mapping releases the
 partially mapped worker span.
