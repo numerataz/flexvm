@@ -2,7 +2,8 @@
 // Configure GICv3 at the nested VMM’s addresses and report SPI 3 from EL1.
 .text
     adr x4, .
-    movz x5, #0xb00, lsl #16
+    str x0, [x4, #272]
+    movz x5, #0x4000, lsl #16
     movz x6, #0x3fff, lsl #16
     movz x7, #0x3ffd, lsl #16
     movz x8, #0x3ffb, lsl #16
@@ -28,7 +29,7 @@
     msr vbar_el1, x4
     msr spsel, #1
     isb
-    str wzr, [x5, #4]
+    str wzr, [x5, #4100]
     msr daifclr, #2
 1:  wfi
     b 1b
@@ -36,7 +37,7 @@
 irq:
     mrs x0, icc_iar1_el1
     msr icc_eoir1_el1, x0
-    str w0, [x5, #8]
+    str w0, [x5, #4104]
     eret
 
 .org 0x100
