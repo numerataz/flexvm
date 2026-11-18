@@ -41,7 +41,7 @@ CR4_PAE = 1 << 5
 EFER_LONG_MODE_ACTIVE = 1 << 10
 EFER_LONG_MODE_ENABLE = 1 << 8
 (OPEN_VM, CLOSE_VM, OPEN_CPU, CLOSE_CPU, RUN, GET_REGS, SET_REGS, GET_SREGS,
- GET_FPU, SET_FPU, GET_MSRS, SET_MSRS) = range(1, 13)
+ GET_FPU, SET_FPU, GET_MSRS, SET_MSRS, GET_SUPPORTED_CPUID) = range(1, 14)
 FPU_VALID_AT = 48
 FPU_AT = 768
 FPU_SIZE = 416
@@ -50,6 +50,14 @@ MSR_AT = 0x81000
 MSR_BATCH_MAX = 64
 MSR_HEADER = struct.Struct("<II")
 MSR_ENTRY = struct.Struct("<IIQ")
+CPUID_VALID_AT = 52
+CPUID_AT = 0x82000
+CPUID_MAX = 128
+CPUID_HEADER = struct.Struct("<II")
+CPUID_ENTRY = struct.Struct("<7I12x")
+CPUID_BYTES = CPUID_HEADER.size + CPUID_ENTRY.size * CPUID_MAX
+CPUID_FIELDS = ("function", "index", "indexed", "eax", "ebx", "ecx", "edx")
+TCG_CHILD_CPU = "qemu64"
 # Linux's x86 struct kvm_regs.
 REGISTERS = struct.Struct("<18Q")
 SEGMENT = struct.Struct("<QIH9Bx")
@@ -153,6 +161,23 @@ def unpack_msr_batch(record):
             raise RuntimeError("reserved MSR entry field is nonzero")
         entries.append((index, value))
     return entries
+
+
+def pack_cpuid(entries):
+    return CPUID_HEADER.pack(len(entries), 0) + b"".join(CPUID_ENTRY.pack(*entry) for entry in entries)
+
+
+def unpack_cpuid(record):
+    count, reserved = CPUID_HEADER.unpack_from(record)
+    if reserved or count > CPUID_MAX or len(record) < CPUID_HEADER.size + count * CPUID_ENTRY.size:
+        raise RuntimeError("invalid CPUID table")
+    return [CPUID_ENTRY.unpack_from(record, CPUID_HEADER.size + i * CPUID_ENTRY.size) for i in range(count)]
+
+
+def cpuid_arguments(cpu, entries):
+    return {"cpu-index": cpu, "entries": [
+        dict(zip(CPUID_FIELDS, (*entry[:2], bool(entry[2]), *entry[3:]), strict=True)) for entry in entries
+    ]}
 
 
 def stop_process(process):
@@ -280,6 +305,7 @@ class TcgChild:
                 listener.settimeout(3)
                 command = [
                     qemu, *QEMU_OPTIONS, "-machine", "pc,accel=tcg", "-m", "16", "-smp", str(cpu_count), "-serial", "none",
+                    "-cpu", TCG_CHILD_CPU,
                     "-bios", output / "reset.rom", "-S", "-chardev", f"socket,id=port,path={socket_path}",
                     "-chardev", f"socket,id=regs,path={debugger_path},server=on,wait=off",
                     "-gdb", "chardev:regs",
@@ -357,6 +383,9 @@ class TcgChild:
             "entries": [{"index": index, "value": value} for index, value in entries],
         })
         return [(entry["index"], entry["value"]) for entry in result["entries"]]
+
+    def set_cpuid(self, cpu, entries):
+        self.special_command("x-flexvm-set-x86-cpuid", cpuid_arguments(cpu, entries))
 
     def close(self):
         try:
@@ -455,6 +484,11 @@ class KvmChild:
             raise RuntimeError("native parent worker returned an invalid MSR result")
         return entries[:count] if write else unpack_msr_batch(result)
 
+    def set_cpuid(self, cpu, entries):
+        self.channel.connection.sendall(bytes((ord("C"), cpu)) + pack_cpuid(entries))
+        if self.channel.connection.recv(2) != b"C":
+            raise RuntimeError("native parent worker did not acknowledge the CPUID table")
+
     def close(self):
         if self.channel is not None:
             self.channel.close()
@@ -483,6 +517,71 @@ def doorbell_peer(server, memory, requests, cancellations, replies, unused_vecto
     except BaseException:
         peer.close()
         raise
+
+
+def read_tcg_cpuid(monitor):
+    def query(requests):
+        rows = [(function, index, flag, 0, 0, 0, 0) for function, index, flag in requests]
+        result = monitor.ask("x-flexvm-query-x86-cpuid", cpuid_arguments(0, rows))
+        found = [tuple(entry[field] for field in CPUID_FIELDS) for entry in result["entries"]]
+        if [entry[:3] for entry in found] != requests:
+            raise RuntimeError("TCG CPUID query returned a different function or subleaf")
+        return found
+
+    roots = [0, 0x40000000, 0x80000000]
+    maxima = query([(function, 0, 0) for function in roots])
+    indexed = (4, 7, 0xb, 0xd, 0x1f, 0x8000001d)
+    basic = []
+    for first, result in zip(roots, maxima, strict=True):
+        maximum = result[3]
+        if first <= maximum <= first + 0x3f:
+            basic.extend((function, 0, int(function in indexed)) for function in range(first, maximum + 1))
+    entries = query(basic)
+    for function, _, significant, eax, _, _, edx in tuple(entries):
+        if not significant:
+            continue
+        if function == 7:
+            if eax >= 32:
+                raise RuntimeError("TCG structured feature list exceeds the fixture budget")
+            entries.extend(query([(function, index, 1) for index in range(1, eax + 1)]))
+        elif function == 0xd and (eax or edx):
+            xsave = (edx << 32) | eax
+            entries.extend(query([(function, index, 1) for index in range(1, 64) if index == 1 or xsave & (1 << index)]))
+        elif function in (4, 0xb, 0x1f, 0x8000001d):
+            for index in range(1, 16):
+                entry, = query([(function, index, 1)])
+                entries.append(entry)
+                if (function in (4, 0x8000001d) and not entry[3] & 0x1f or
+                        function in (0xb, 0x1f) and not entry[4] & 0xffff):
+                    break
+    return sorted(entries)
+
+
+def model_cpuid(engine, qemu, output, control, cpu_count):
+    if engine == "kvm":
+        native = subprocess.run([output / "native-worker", "--supported-cpuid"], capture_output=True, timeout=3)
+        if native.returncode:
+            raise RuntimeError(f"native CPUID query failed: {native.stderr.decode(errors='replace')}")
+        entries = [entry for entry in unpack_cpuid(native.stdout) if not entry[2] & ~1]
+    else:
+        path = control / "cpuid.sock"
+        with (output / "cpuid-model.log").open("wb") as log:
+            process = subprocess.Popen([
+                qemu, *QEMU_OPTIONS, "-machine", "pc,accel=tcg", "-cpu", TCG_CHILD_CPU,
+                "-m", "16", "-smp", str(cpu_count), "-serial", "none", "-S",
+                "-qmp", f"unix:{path},server=on,wait=off",
+            ], stdout=log, stderr=log)
+        try:
+            monitor = HELPERS["QMP"](path, process, time.monotonic() + 3)
+            try:
+                entries = read_tcg_cpuid(monitor)
+            finally:
+                monitor.close()
+        finally:
+            stop_process(process)
+    if not 0 < len(entries) <= CPUID_MAX:
+        raise RuntimeError("CPUID model returned an empty or oversized profile")
+    return entries
 
 
 def read_slot_table(mailbox, ram_pages, outer_bytes, protected_entry, split_slot):
@@ -556,12 +655,14 @@ def verify_slot_spans(pid, slots):
 
 
 def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry,
-             split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs):
+             split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs, cpuid):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
     expected_interruptions = TEST_INTERRUPTS if interrupt_run else 0
     expected = [OPEN_VM, *([OPEN_CPU] * cpu_count), RUN, GET_REGS, GET_SREGS]
+    if cpuid:
+        expected.insert(0, GET_SUPPORTED_CPUID)
     expected_counters = [0x1357]
     expected_io = [(0, 0x42)]
     if cpu_count == 2:
@@ -588,6 +689,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
     open_cpus = set()
     started_cpus = set()
     special = None
+    supported_cpuid = []
     child = None
     slot_size = ram_pages * PAGE_SIZE
     outer_mib = max(192, (slot_size + MIB - 1) // MIB + 128)
@@ -602,7 +704,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 16)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 17)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
         os.ftruncate(outer_ram, outer_ram_size)
@@ -655,7 +757,13 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
             if opcode in cpu_commands and cpu not in open_cpus:
                 raise RuntimeError(f"command {opcode} requested unopened vCPU {cpu}")
             status = 0
-            if opcode == OPEN_CPU:
+            if opcode == GET_SUPPORTED_CPUID:
+                if length:
+                    raise RuntimeError("unexpected memory argument for CPUID query")
+                supported_cpuid = model_cpuid(parent_engine, qemu, output, control, cpu_count)
+                record = pack_cpuid(supported_cpuid)
+                mapping[CPUID_AT:CPUID_AT + len(record)] = record
+            elif opcode == OPEN_CPU:
                 if length or cpu >= cpu_count or cpu in open_cpus:
                     raise RuntimeError(f"invalid request to create vCPU {cpu}")
                 open_cpus.add(cpu)
@@ -670,6 +778,11 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 elif length:
                     raise RuntimeError("unexpected slot registration after the first run")
                 if cpu not in started_cpus:
+                    cpuid_valid, = struct.unpack_from("<I", mapping, CPUID_VALID_AT)
+                    if cpuid_valid != int(cpuid):
+                        raise RuntimeError("unexpected staged CPUID table")
+                    if cpuid_valid:
+                        child.set_cpuid(cpu, unpack_cpuid(mapping[CPUID_AT:CPUID_AT + CPUID_BYTES]))
                     if protected_entry:
                         state = read_protected_entry(mapping, slots, long_mode)
                         child.set_protected_entry(cpu, state)
@@ -744,6 +857,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 or long_mode and "PASS x86-64 child used guest page tables and a virtual RAM alias" not in guest
                 or fpu and "PASS x87 and XMM state reached the parent worker" not in guest
                 or msrs and "PASS x86 boot MSRs reached the parent worker" not in guest
+                or cpuid and "PASS child CPUID instructions used the installed vCPU profiles" not in guest
                 or "PASS /dev/kvm returned two port I/O exits" not in guest
                 or "PASS parent KVM guest shutdown" not in guest):
             raise RuntimeError(f"parent execution proof failed; commands={observed}, see outer.log")
@@ -765,6 +879,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         "vcpu_io_events": io_events, "vcpu_count": cpu_count,
         "floating_point": fpu,
         "boot_msrs": msrs,
+        "configured_cpuid": cpuid,
+        "supported_cpuid_entries": len(supported_cpuid),
         "register_counters": counters,
         "interrupted_runs": len(child.channel.interruptions),
         "interrupted_run_ms": child.channel.interruptions,
@@ -800,6 +916,7 @@ def main():
     parser.add_argument("--long-mode", action="store_true", help="enter x86-64 mode with client-supplied page tables")
     parser.add_argument("--fpu", action="store_true", help="exercise x87 and XMM state in long mode")
     parser.add_argument("--msrs", action="store_true", help="exercise x86 Linux boot MSRs in long mode")
+    parser.add_argument("--cpuid", action="store_true", help="query and install x86 CPUID profiles")
     parser.add_argument("--reject-close", action="store_true", help="verify page retention when the parent refuses close")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -811,6 +928,8 @@ def main():
         if args.two_vcpus or args.ram_pages < (8 if args.split_slot else 4):
             parser.error("--long-mode requires one vCPU and four pages in the low slot")
         args.protected_entry = True
+    if args.cpuid and (not args.protected_entry or args.fpu or args.msrs):
+        parser.error("--cpuid requires protected mode and a separate run from --fpu or --msrs")
     if not 1 <= args.ram_pages <= MAX_SLOT_PAGES:
         parser.error(f"--ram-pages must be between 1 and {MAX_SLOT_PAGES}")
     if args.ram_pages > MAX_REAL_MODE_PAGES and not args.protected_entry:
@@ -828,7 +947,7 @@ def main():
     if args.worker:
         print(json.dumps(exercise(qemu, kernel, output, args.reject_close, args.parent_engine, args.ram_pages,
                                   args.protected_entry, args.split_slot, args.interrupt_run,
-                                  2 if args.two_vcpus else 1, args.long_mode, args.fpu, args.msrs)))
+                                  2 if args.two_vcpus else 1, args.long_mode, args.fpu, args.msrs, args.cpuid)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -866,6 +985,8 @@ def main():
                 oracle.append("fpu")
             if args.msrs:
                 oracle.append("msrs")
+            if args.cpuid:
+                oracle.append("cpuid")
             HELPERS["run"](oracle, 14 if args.interrupt_run else 8, output / "native-kvm.log")
             report["same_client_passed_native_kvm"] = True
             report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
@@ -885,6 +1006,8 @@ def main():
             files["floating-point"] = b""
         if args.msrs:
             files["boot-msrs"] = b""
+        if args.cpuid:
+            files["cpuid-profile"] = b""
         image = HELPERS["initramfs"](init.read_bytes(), files=files)
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
@@ -912,6 +1035,7 @@ def main():
                             *(["--long-mode"] if args.long_mode else []),
                             *(["--fpu"] if args.fpu else []),
                             *(["--msrs"] if args.msrs else []),
+                            *(["--cpuid"] if args.cpuid else []),
                             *(["--reject-close"] if args.reject_close else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}
@@ -922,7 +1046,7 @@ def main():
             worker_path = f'execve("{output / "native-worker"}",'
             workers = {line.split()[0] for line in lines if worker_path in line and line.endswith(" = 0")}
             kvm_users = {line.split()[0] for line in lines if '"/dev/kvm"' in line}
-            if len(workers) != 1 or kvm_users != workers:
+            if len(workers) != 1 + int(args.cpuid) or kvm_users != workers:
                 raise RuntimeError("only the native parent worker may use host KVM")
         report.update(json.loads(worker.read_text()), status="passed", host_device_access=bool(devices),
                       host_devices=sorted(devices))

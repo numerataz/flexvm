@@ -49,8 +49,31 @@ static unsigned long number(const char *text, unsigned long maximum)
     return value;
 }
 
+static int host_kvm(void)
+{
+    int kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
+    check(kvm >= 0 && ioctl(kvm, KVM_GET_API_VERSION, 0) == KVM_API_VERSION,
+          "open a compatible host KVM device");
+    return kvm;
+}
+
+static void supported_cpuid(void)
+{
+    struct pvkvm_cpuid_table table = {.count = PVKVM_CPUID_MAX};
+    int kvm = host_kvm();
+    check(ioctl(kvm, KVM_GET_SUPPORTED_CPUID, &table) == 0 && table.count <= PVKVM_CPUID_MAX,
+          "read the host supported CPUID table");
+    size_t bytes = offsetof(struct pvkvm_cpuid_table, entries) + table.count * sizeof(table.entries[0]);
+    check(write(STDOUT_FILENO, &table, bytes) == (ssize_t)bytes, "write the supported CPUID table");
+    close(kvm);
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "--supported-cpuid")) {
+        supported_cpuid();
+        return 0;
+    }
     check(argc >= 7 && (argc - 4) % 3 == 0 &&
           (argc - 4) / 3 <= PVKVM_MAX_SLOTS, "expected control, outer RAM, vCPU count, and slot triples");
     int control = (int)number(argv[1], INT_MAX);
@@ -58,9 +81,7 @@ int main(int argc, char **argv)
     unsigned int cpu_count = number(argv[3], PVKVM_MAX_CPUS);
     check(cpu_count > 0, "at least one native vCPU");
 
-    int kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
-    check(kvm >= 0 && ioctl(kvm, KVM_GET_API_VERSION, 0) == KVM_API_VERSION,
-          "open a compatible host KVM device");
+    int kvm = host_kvm();
     int bytes = ioctl(kvm, KVM_GET_VCPU_MMAP_SIZE, 0);
     check(bytes >= (int)sizeof(struct kvm_run), "KVM run mapping size");
     int vm = ioctl(kvm, KVM_CREATE_VM, 0);
@@ -99,11 +120,13 @@ int main(int argc, char **argv)
     struct kvm_regs registers;
     struct kvm_fpu fpu;
     struct pvkvm_msr_batch msrs;
-    _Static_assert(sizeof(fpu) == PVKVM_FPU_BYTES && sizeof(msrs) >= sizeof(fpu) &&
-                   sizeof(msrs) >= sizeof(segments), "native worker control record size");
+    struct pvkvm_cpuid_table cpuid;
+    _Static_assert(sizeof(fpu) == PVKVM_FPU_BYTES && sizeof(cpuid) >= sizeof(fpu) &&
+                   sizeof(cpuid) >= sizeof(segments) && sizeof(cpuid) >= sizeof(msrs),
+                   "native worker control record size");
 
     check(write(control, "R", 1) == 1, "announce worker readiness");
-    unsigned char request[2 + sizeof(msrs)];
+    unsigned char request[2 + sizeof(cpuid)];
     ssize_t received;
     while ((received = recv(control, request, sizeof(request), MSG_TRUNC)) != 0) {
         if (received < 0 && errno == EINTR) continue;
@@ -161,7 +184,7 @@ int main(int argc, char **argv)
         if (request[0] == 'M' || request[0] == 'N') {
             const size_t header = offsetof(struct pvkvm_msr_batch, entries);
             bool set = request[0] == 'N';
-            check(received >= 2 + (ssize_t)header && received <= (ssize_t)sizeof(request),
+            check(received >= 2 + (ssize_t)header && received <= 2 + (ssize_t)sizeof(msrs),
                   "invalid host MSR request size");
             size_t payload = received - 2;
             memcpy(&msrs, request + 2, payload);
@@ -172,6 +195,18 @@ int main(int argc, char **argv)
             msrs.count = processed;
             size_t response = header + (set ? 0 : msrs.count * sizeof(msrs.entries[0]));
             check(write(control, &msrs, response) == (ssize_t)response, "return host MSR batch result");
+            continue;
+        }
+        if (request[0] == 'C') {
+            const size_t header = offsetof(struct pvkvm_cpuid_table, entries);
+            check(received >= 2 + (ssize_t)header && received <= (ssize_t)sizeof(request),
+                  "invalid host CPUID request size");
+            size_t payload = received - 2;
+            memcpy(&cpuid, request + 2, payload);
+            check(cpuid.count <= PVKVM_CPUID_MAX &&
+                  payload == header + cpuid.count * sizeof(cpuid.entries[0]), "invalid host CPUID table");
+            check(ioctl(cpu, KVM_SET_CPUID2, &cpuid) == 0, "configure host CPUID table");
+            check(write(control, "C", 1) == 1, "acknowledge host CPUID table");
             continue;
         }
         uint32_t sequence;

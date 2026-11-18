@@ -3,7 +3,7 @@
 #define FLEXVM_PVKVM_MAILBOX_H
 
 #define PVKVM_MAGIC        0x4d564b46
-#define PVKVM_VERSION      16
+#define PVKVM_VERSION      17
 #define PVKVM_MAGIC_AT     0
 #define PVKVM_VERSION_AT   4
 #define PVKVM_REQUEST_AT   8
@@ -16,6 +16,7 @@
 #define PVKVM_CANCEL_AT      40
 #define PVKVM_CPU_AT         44
 #define PVKVM_FPU_VALID_AT   48
+#define PVKVM_CPUID_VALID_AT 52
 #define PVKVM_SLOT_TABLE_AT  640
 #define PVKVM_SLOT_RECORD_SIZE 16
 #define PVKVM_FPU_AT         768
@@ -23,6 +24,8 @@
 #define PVKVM_RAM_ADDRESS_AT 1280
 #define PVKVM_MSR_AT         0x81000
 #define PVKVM_MSR_BATCH_MAX  64
+#define PVKVM_CPUID_AT       0x82000
+#define PVKVM_CPUID_MAX      128
 #define PVKVM_REGISTERS_AT   64
 #define PVKVM_INITIAL_SREGISTERS_AT 256
 #define PVKVM_GUEST_PAGE_SIZE 4096
@@ -47,6 +50,12 @@ struct pvkvm_msr_batch {
 	struct kvm_msr_entry entries[PVKVM_MSR_BATCH_MAX];
 };
 
+struct pvkvm_cpuid_table {
+	__u32 count;
+	__u32 reserved;
+	struct kvm_cpuid_entry2 entries[PVKVM_CPUID_MAX];
+};
+
 enum pvkvm_command {
 	PVKVM_CREATE_VM = 1,
 	PVKVM_CLOSE_VM,
@@ -60,6 +69,7 @@ enum pvkvm_command {
 	PVKVM_SET_FPU,
 	PVKVM_GET_MSRS,
 	PVKVM_SET_MSRS,
+	PVKVM_GET_SUPPORTED_CPUID,
 };
 
 #endif

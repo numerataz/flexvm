@@ -74,6 +74,12 @@ The client reads and writes MSRs from the guest, measures TSC progress, and
 checks the completed prefix of batches with an unsupported index. This
 fixture supports up to 64 entries per request and returns staged values before
 the first run. The worker provides live values after it starts.
+Add `--cpuid` in a separate protected-mode run. The client queries the parent
+CPU model and configures each vCPU before its first run. With `--two-vcpus`,
+the child checks that each CPU sees different results for the same indexed
+CPUID function. The TCG worker uses the installed table for its responses
+and applies vendor-specific out-of-range behavior. It computes OSXSAVE,
+OSPKE, and the active XSAVE area size from the running CPU's state.
 The worker uses one host mapping per consecutive extent. Highly fragmented
 slots can reach the host's mapping limit. A failed mapping releases the
 partially mapped worker span.

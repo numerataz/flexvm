@@ -40,7 +40,7 @@ int main(void)
     pid_t child = fork();
     check(child >= 0, "fork the KVM client");
     if (child == 0) {
-        char *arguments[9] = {"kvm-run", pages};
+        char *arguments[10] = {"kvm-run", pages};
         unsigned int next = 2;
         if (access("/split-slot", F_OK) == 0)
             arguments[next++] = "split";
@@ -56,6 +56,8 @@ int main(void)
             arguments[next++] = "fpu";
         if (access("/boot-msrs", F_OK) == 0)
             arguments[next++] = "msrs";
+        if (access("/cpuid-profile", F_OK) == 0)
+            arguments[next++] = "cpuid";
         execv("/kvm-run", arguments);
         _exit(127);
     }
