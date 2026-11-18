@@ -14,7 +14,7 @@ pub fn load_if_requested(cmdline: &str) -> io::Result<()> {
     let mut mode = cmdline.split_whitespace().filter_map(|arg| arg.strip_prefix("flexvm.kvm="));
     match (mode.next(), mode.next()) {
         (None, None) => return Ok(()),
-        (Some("parent"), None) if cfg!(target_arch = "x86_64") => {}
+        (Some("parent"), None) if cfg!(any(target_arch = "x86_64", target_arch = "aarch64")) => {}
         _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid guest KVM provider boot argument")),
     }
     load()
