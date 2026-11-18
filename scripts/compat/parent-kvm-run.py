@@ -667,6 +667,8 @@ def capture_hierarchy(outer, qmp, irq_fds, descriptors, capture_worker):
     return pending
 
 
+X86_IDLE_WORKER_STATE = b"FLEXVM x86 no nested worker\n"
+
 class TcgChild:
     def __init__(self, qemu, output, control, outer_ram, layouts, slots, cpu_count, mmio_base, pit_flags, irq_fds,
                  fixture_checks, parallel, *, checkpoint=False, incoming=None):
@@ -1967,6 +1969,10 @@ def exercise(
 
         def capture(worker, descriptors):
             def capture_worker(descriptor):
+                if worker is None:
+                    if os.write(descriptor, X86_IDLE_WORKER_STATE) != len(X86_IDLE_WORKER_STATE):
+                        raise RuntimeError("short x86 idle worker state write")
+                    return None
                 slot_bytes = sum(len(slot.offsets) * PAGE_SIZE for slot in slots)
                 if read_registered_slots(mapping, slot_bytes, ram_pages, outer_ram_size) != slots:
                     raise RuntimeError("x86 checkpoint RAM slots changed during execution")
@@ -1975,7 +1981,8 @@ def exercise(
             return capture_hierarchy(outer, launch.checkpoint_qmp, irq_fds, descriptors, capture_worker)
 
         def rollback(worker, pending):
-            worker.freeze_run_control(False)
+            if worker is not None:
+                worker.freeze_run_control(False)
             restore_interrupts(irq_fds, pending)
 
         request_wakeup = False
@@ -1988,12 +1995,6 @@ def exercise(
             if record["version"] != 1:
                 raise RuntimeError("unsupported x86 checkpoint metadata")
             profile = record["worker"]
-            worker_cpus = profile["cpus"]
-            irqchip_created, pit_flags, tss_gpa = profile["irqchip"], profile["pit"], profile["tss"]
-            if (worker_cpus not in (1, 2) or type(irqchip_created) is not bool or
-                    pit_flags not in (None, 0, KVM_PIT_SPEAKER_DUMMY) or
-                    (tss_gpa is not None and (not 0 <= tss_gpa <= 0xffffd000 or tss_gpa % PAGE_SIZE))):
-                raise RuntimeError("invalid x86 checkpoint worker topology")
             monitor = HELPERS["QMP"](launch.checkpoint_qmp, outer, time.monotonic() + 30)
             try:
                 transfer_state(monitor, outer_fd, incoming=True)
@@ -2001,13 +2002,24 @@ def exercise(
                     raise RuntimeError("restored x86 outer VM is not paused")
             finally:
                 monitor.close()
-            slots = read_registered_slots(mapping, profile["slot_bytes"], ram_pages, outer_ram_size)
-            child = start_child(parent_engine, qemu, output, control, outer_ram, slots,
-                                worker_cpus, FIRECRACKER_NET_MMIO_BASE, irqchip_created, pit_flags, irq_fds, tss_gpa,
-                                fixture_checks, parallel, checkpoint=True, incoming=(worker_fd, profile["engine"]))
-            active_vm = True
-            open_cpus.update(range(worker_cpus))
-            started_cpus.update(open_cpus)
+            if profile is None:
+                if (os.fstat(worker_fd).st_size != len(X86_IDLE_WORKER_STATE) or
+                        os.pread(worker_fd, len(X86_IDLE_WORKER_STATE), 0) != X86_IDLE_WORKER_STATE):
+                    raise RuntimeError("invalid x86 idle worker state")
+            else:
+                worker_cpus = profile["cpus"]
+                irqchip_created, pit_flags, tss_gpa = profile["irqchip"], profile["pit"], profile["tss"]
+                if (worker_cpus not in (1, 2) or type(irqchip_created) is not bool or
+                        pit_flags not in (None, 0, KVM_PIT_SPEAKER_DUMMY) or
+                        (tss_gpa is not None and (not 0 <= tss_gpa <= 0xffffd000 or tss_gpa % PAGE_SIZE))):
+                    raise RuntimeError("invalid x86 checkpoint worker topology")
+                slots = read_registered_slots(mapping, profile["slot_bytes"], ram_pages, outer_ram_size)
+                child = start_child(parent_engine, qemu, output, control, outer_ram, slots,
+                                    worker_cpus, FIRECRACKER_NET_MMIO_BASE, irqchip_created, pit_flags, irq_fds, tss_gpa,
+                                    fixture_checks, parallel, checkpoint=True, incoming=(worker_fd, profile["engine"]))
+                active_vm = True
+                open_cpus.update(range(worker_cpus))
+                started_cpus.update(open_cpus)
             restore_interrupts(irq_fds, record["pending"])
             restore_inputs.close()
             gate.phase = "frozen"
@@ -2044,7 +2056,8 @@ def exercise(
                 if cancellations in readable:
                     os.eventfd_read(cancellations)
                 if gate:
-                    capturable = parent_engine == "tcg" and lanes and started_cpus == open_cpus == set(range(len(lanes.connections)))
+                    active_ready = lanes and started_cpus == open_cpus == set(range(len(lanes.connections)))
+                    capturable = parent_engine == "tcg" and (not active_vm or active_ready)
                     if gate.service(readable, child, capture if capturable else None, rollback):
                         return 0
                 held = gate is not None and gate.phase != "running"

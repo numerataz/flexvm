@@ -172,6 +172,11 @@ int main(void)
 {
 #ifdef FLEXVM_PARENT_KVM_APP
     check(access("/sys/module/flexvm_pvkvm", F_OK) == 0, "parent KVM module was loaded by the guest init");
+    if (access("/firecracker-idle-checkpoint", F_OK) == 0) {
+        puts("FLEXVM_X86_PARENT_IDLE");
+        fflush(stdout);
+        sleep(6);
+    }
     run_firecracker();
     run_firecracker();
     puts("PASS parent KVM device reuse");
