@@ -28,7 +28,7 @@ patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-scattered-slot.patch"
 patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-special-registers.patch"
 patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-protected-entry.patch"
 cp "$scripts_dir/compat/parent-kvm/slot-map.h" include/hw/misc/flexvm-slot-map.h
-./configure --prefix="$prefix" --target-list=x86_64-softmmu --with-pkgversion=flexvm-tcg-nested-9 \
+./configure --prefix="$prefix" --target-list=x86_64-softmmu --with-pkgversion=flexvm-tcg-nested-10 \
   --disable-docs --disable-tools --disable-guest-agent --disable-werror \
   --disable-download --disable-gtk --disable-sdl --disable-vnc \
   --disable-opengl --disable-curses --enable-slirp --enable-seccomp

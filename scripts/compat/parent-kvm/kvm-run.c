@@ -81,10 +81,12 @@ int main(int argc, char **argv)
     errno = 0;
     long count = strtol(argv[1], &end, 10);
     check(!errno && !*end && count > 0 && count <= PVKVM_MAX_PAGES, "select the RAM page count");
+    check(protected_mode || count <= PVKVM_REAL_MODE_MAX_PAGES, "select protected mode for a large slot");
     size_t pages = count;
     size_t ram_bytes = pages * 4096;
     uint64_t gpa = protected_mode ? PROTECTED_SLOT_GPA : PVKVM_GUEST_START;
     uint64_t last_page = gpa + ram_bytes - 4096;
+    uint64_t middle_page = gpa + (pages / 2) * 4096;
     int kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     check(kvm >= 0, "open /dev/kvm");
     check(ioctl(kvm, KVM_GET_API_VERSION, 0) == KVM_API_VERSION, "API version");
@@ -96,17 +98,19 @@ int main(int argc, char **argv)
     check(ram != MAP_FAILED, "map client RAM");
     volatile unsigned char *scratch = NULL;
     size_t gap = 32 * 4096;
-    size_t scratch_bytes = (pages - 1) * gap;
+    size_t separated_pages = pages > 129 ? 128 : pages - 1;
+    size_t scratch_bytes = separated_pages * gap;
     if (scratch_bytes) {
         volatile unsigned char *touch = ram;
         scratch = mmap(NULL, scratch_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         check(scratch != MAP_FAILED, "allocate intervening pages");
-        for (size_t page = pages - 1; page; page--) {
-            touch[page * 4096] = 0;
-            for (size_t byte = (page - 1) * gap; byte < page * gap; byte += 4096)
+        for (size_t i = 0; i < separated_pages; i++) {
+            touch[(pages - 1 - i) * 4096] = 0;
+            for (size_t byte = i * gap; byte < (i + 1) * gap; byte += 4096)
                 scratch[byte] = 1;
         }
-        touch[0] = 0;
+        for (size_t i = 0; i < pages - separated_pages; i++)
+            touch[i * 4096] = 0;
     }
     struct kvm_userspace_memory_region region = {
         .guest_phys_addr = gpa, .memory_size = ram_bytes, .userspace_addr = (unsigned long)ram,
@@ -134,6 +138,7 @@ int main(int argc, char **argv)
     };
     const unsigned char flat_code[] = {
         0xc6, 0x87, 0x90, 0, 0, 0, 0x57, /* mov byte [edi+0x90], 0x57 */
+        0xc6, 0x46, 0x78, 0xb3,          /* mov byte [esi+0x78], 0xb3 */
         0xc6, 0x83, 0x80, 0, 0, 0, 0x56, /* mov byte [ebx+0x80], 0x56 */
         0xb9, 0x57, 0x13, 0, 0,          /* mov ecx, 0x1357 */
         0xbe, 0xef, 0xcd, 0xab, 0x89,    /* mov esi, 0x89abcdef */
@@ -148,6 +153,7 @@ int main(int argc, char **argv)
         0xe6, 0x30, 0xf4,                /* out 0x30, al; hlt */
     };
     unsigned char *data = ram + ram_bytes - 4096;
+    unsigned char *middle = ram + (pages / 2) * 4096;
     const unsigned char gdtr[] = {0x2f, 0x00, 0x80, 0x34, 0x12, 0x00};
     const uint64_t gdt[] = { 0, 0x00cf9b000000ffff, 0x00cf93000000ffff };
     if (protected_mode) {
@@ -168,6 +174,7 @@ int main(int argc, char **argv)
     if (protected_mode) {
         regs.rbx = last_page;
         regs.rdi = gpa;
+        regs.rsi = middle_page;
     }
     check(ioctl(cpu, KVM_SET_REGS, &regs) == 0, "set initial registers");
     struct kvm_regs readback;
@@ -197,6 +204,7 @@ int main(int argc, char **argv)
     }
     check(ram[0x90] == 0x57 && data[0x80] == 0x56 && data[0x82] == 0,
           "child wrote the first and last pages and stopped after its first output");
+    check(!protected_mode || middle[0x78] == 0xb3, "protected child wrote the middle page");
     data[0x81] = 0x52;
     const struct kvm_regs update = {
         .rbx = 0xf5, .rcx = 0x3579, .rsp = 0x1f00, .rbp = 0x12345678,
