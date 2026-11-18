@@ -35,8 +35,10 @@ def main():
     if (checkpoint_test or args.idle_transfer) and (args.bin or args.engine != "tcg"):
         parser.error("checkpoint tests require the standalone ARM TCG broker")
     public_checkpoint = args.pause or args.suspend
-    if public_checkpoint and (not args.bin or args.engine != "tcg"):
-        parser.error("--pause and --suspend need the public ARM TCG command")
+    if public_checkpoint and not args.bin:
+        parser.error("--pause and --suspend need the public ARM command")
+    if args.suspend and args.engine != "tcg":
+        parser.error("--suspend needs the ARM TCG provider")
     if args.engine == "auto" and not args.bin:
         parser.error("--engine auto requires --bin")
     output = args.output.resolve()

@@ -710,6 +710,7 @@ jobs:
           run_public_arm auto "$software_bundle"
           if sudo "$bundle/native-worker" --ipa-bits >/dev/null 2>&1; then
             run_public_arm kvm "$bundle"
+            run_public_arm kvm "$bundle" --pause
           fi
       - name: Guest compile, DKMS, ABI rejection and loaded module lifecycle
         run: |
