@@ -643,6 +643,10 @@ jobs:
             cat "$RUNNER_TEMP/parent-kvm-native-zero-slot/report.json"
             run_parent_firecracker kvm 1 96
             run_parent_firecracker kvm 2
+            sudo systemd-run --scope --collect -p MemoryMax=256M -p MemorySwapMax=0 -p CPUQuota=150% \
+              python3 scripts/compat/x86-native-worker-checkpoint.py \
+              --worker "$RUNNER_TEMP/parent-kvm-firecracker-kvm-2/provider/native-worker" \
+              --output "$RUNNER_TEMP/x86-native-worker-checkpoint"
           fi
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
         with:

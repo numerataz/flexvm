@@ -1012,6 +1012,7 @@ class KvmChild:
         self.process = None
         self.channel = None
         self.lanes = None
+        self.frozen = False
         self.sigqueue = ctypes.CDLL(None, use_errno=True).sigqueue
         self.sigqueue.argtypes = (ctypes.c_int, ctypes.c_int, SignalValue)
         self.sigqueue.restype = ctypes.c_int
@@ -1056,6 +1057,21 @@ class KvmChild:
         # No worker command can start a vCPU until the owner releases the hold.
         if frozen and not self.checkpoint_ready():
             raise RuntimeError("native x86 worker still has pending execution")
+        self.frozen = frozen
+
+    def checkpoint_file(self, fd, *, restore=False):
+        if not self.frozen or not self.checkpoint_ready():
+            raise RuntimeError("native x86 checkpoint requires fenced vCPU lanes")
+        connection = self.channel.connection
+        packet = b"b\0" if restore else b"a\0"
+        if socket.send_fds(connection, [packet], [fd]) != len(packet):
+            raise RuntimeError("short native x86 checkpoint request")
+        response = connection.recv(5)
+        if len(response) != 4:
+            raise RuntimeError("invalid native x86 checkpoint response")
+        status, = struct.unpack("<i", response)
+        if status:
+            raise OSError(-status, os.strerror(-status))
 
     def run(self, cpu, cancellation, completion):
         sequence = cancellation.sequence
