@@ -2339,6 +2339,7 @@ def serve_outer(argv):
     parser.add_argument("--inherit", type=int, action="append", default=[])
     parser.add_argument("--emulator-fd", type=int)
     parser.add_argument("--control", type=Path)
+    parser.add_argument("--outer-qmp", type=Path)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     arch = platform.machine()
@@ -2372,9 +2373,12 @@ def serve_outer(argv):
     engine = args.engine
     if arch == "aarch64":
         launch_arm = runpy.run_path(str(ROOT / "arm-parent-run.py"))["launch_arm"]
+        checkpoint_bundle = destination / "checkpoint.version"
+        checkpoint = args.outer_qmp is not None and checkpoint_bundle.is_file() and checkpoint_bundle.read_bytes() == b"1\n"
         result = launch_arm(command, destination / "native-worker", args.outer_memory, args.child_memory,
                             inherited=args.inherit, control=args.control, frontend=destination / "flexvm-pvkvm.img",
-                            engine=engine, tcg_qemu=qemu, emulator_fd=args.emulator_fd)
+                            engine=engine, tcg_qemu=qemu, emulator_fd=args.emulator_fd,
+                            checkpoint=checkpoint, qmp_path=args.outer_qmp)
         return 128 - result if result < 0 else result
     if engine != "tcg":
         worker = bundle / "native-worker"
