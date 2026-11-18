@@ -34,6 +34,7 @@
 #define PIC_HANDLER_OFFSET 0xd00
 #define PIT_ENTRY_OFFSET 0xe00
 #define IRQFD_ENTRY_OFFSET 0xe00
+#define ZERO_SLOT_ENTRY_OFFSET 0xe00
 #define PIC_IDT_OFFSET 0x400
 #define PIC_IDTR_OFFSET 0x540
 #define PIC_GSI 3
@@ -470,6 +471,22 @@ static void complete_mmio_reads(int cpu, struct kvm_run *run, const unsigned cha
     memcpy(run->mmio.data, &second_value, sizeof(second_value));
 }
 
+static void prepare_zero_slot(unsigned char *ram, const uint32_t *offsets, size_t count)
+{
+    int pc = ZERO_SLOT_ENTRY_OFFSET;
+
+    for (size_t i = 0; i < count; i++) {
+        unsigned char instruction[] = {0x80, 0x35, 0, 0, 0, 0, 0x5a}; /* xor byte [abs32], 0x5a */
+
+        ram[offsets[i]] = 0x13 + i;
+        memcpy(instruction + 2, &offsets[i], sizeof(offsets[i]));
+        memcpy(ram + pc, instruction, sizeof(instruction));
+        pc += sizeof(instruction);
+    }
+    ram[pc++] = 0xf9; /* stc for the standard startup sequence */
+    install_jump(ram, pc, 0x10);
+}
+
 static void set_pic_line(int vm, unsigned int level)
 {
     const struct kvm_irq_level irq = {.irq = PIC_GSI, .level = level};
@@ -703,6 +720,7 @@ int main(int argc, char **argv)
     bool irqchip = false;
     bool pit = false;
     bool irqfd = false;
+    bool zero_slot = false;
     check(argc == 2 || protected_mode, "specify RAM pages and optional protected or split mode");
     for (int i = 3; i < argc; i++) {
         if (!interrupt_run && !strcmp(argv[i], "interrupt"))
@@ -729,6 +747,8 @@ int main(int argc, char **argv)
             pit = true;
         else if (!irqfd && !strcmp(argv[i], "irqfd"))
             irqfd = true;
+        else if (!zero_slot && !strcmp(argv[i], "zero-slot"))
+            zero_slot = true;
         else
             check(false, "invalid execution option");
     }
@@ -749,11 +769,17 @@ int main(int argc, char **argv)
           "test a single protected-mode PIC vCPU");
     check(!pit || irqchip, "test the PIT with a PIC vCPU");
     check(!irqfd || (irqchip && !pit), "test IRQFD in a separate PIC vCPU run");
+    check(!zero_slot || (count >= 258 && protected_mode && !split_slot && !long_mode &&
+          !irqchip && !cpuid && !two_vcpus), "test one zero-based slot across the PC legacy region");
     size_t pages = count;
     size_t ram_bytes = pages * 4096;
-    uint64_t gpa = protected_mode ? PROTECTED_SLOT_GPA : PVKVM_GUEST_START;
+    uint64_t gpa = PVKVM_GUEST_START;
+    if (protected_mode)
+        gpa = zero_slot ? 0 : PROTECTED_SLOT_GPA;
     uint64_t middle_page = gpa + (pages / 2) * 4096;
     uint64_t last_page = gpa + ram_bytes - 4096;
+    const uint32_t zero_slot_offsets[] = {0x1f0, 0x9f120, 0xa0120, 0xc8120, 0xf0120, 0x100120,
+                                          last_page + 0x120};
     if (split_slot) {
         middle_page = SPLIT_SLOT_GPA;
         last_page = SPLIT_SLOT_GPA + (pages - pages / 2 - 1) * 4096;
@@ -1004,6 +1030,8 @@ int main(int argc, char **argv)
     }
     if (irqchip)
         prepare_pic(vm, ram, gpa, pit);
+    if (zero_slot)
+        prepare_zero_slot(ram, zero_slot_offsets, sizeof(zero_slot_offsets) / sizeof(zero_slot_offsets[0]));
     int cpu = ioctl(vm, KVM_CREATE_VCPU, 0);
     check(cpu >= 0 && (fcntl(cpu, F_GETFD) & FD_CLOEXEC), "vCPU file descriptor");
     check(ioctl(vm, KVM_CREATE_VCPU, 0) == -1 && errno == EEXIST, "reject duplicate vCPU");
@@ -1015,6 +1043,8 @@ int main(int argc, char **argv)
     struct kvm_run *run = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, cpu, 0);
     check(run != MAP_FAILED, "map kvm_run");
     struct kvm_regs regs = {.rax = 0x41, .rip = entry_base + 0x10, .rflags = 3};
+    if (zero_slot)
+        regs.rip = ZERO_SLOT_ENTRY_OFFSET;
     if (fpu)
         regs.rip = entry_base + FPU_ENTRY_OFFSET;
     if (msrs)
@@ -1083,6 +1113,11 @@ int main(int argc, char **argv)
         complete_mmio_reads(cpu, run, ram, entry_base);
     unsigned long long first = timed_run(cpu);
     check_output(run, size, 0x42);
+    if (zero_slot) {
+        for (size_t i = 0; i < sizeof(zero_slot_offsets) / sizeof(zero_slot_offsets[0]); i++)
+            check(ram[zero_slot_offsets[i]] == ((0x13 + i) ^ 0x5a), "alias a marker across the legacy RAM range");
+        puts("PASS zero-based RAM shared every tested page across the legacy PC region");
+    }
     struct kvm_regs observed = check_registers(cpu, 0x42, 0x1357, entry_base);
     if (long_mode)
         check(observed.r8 == LONG_REGISTER && observed.r15 == LONG_REGISTER, "execute a 64-bit register transfer");

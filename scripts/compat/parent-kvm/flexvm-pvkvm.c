@@ -1307,12 +1307,10 @@ static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return -ENOTTY;
 	if (copy_from_user(&memory, (void __user *)arg, sizeof(memory)))
 		return -EFAULT;
-	if (memory.slot >= PVKVM_MAX_SLOTS || memory.flags || memory.guest_phys_addr < PVKVM_GUEST_START ||
+	if (memory.slot >= PVKVM_MAX_SLOTS || memory.flags ||
 	    memory.guest_phys_addr >= PVKVM_PC_HIGH_RAM_LIMIT || !PAGE_ALIGNED(memory.guest_phys_addr) ||
 	    !memory.memory_size || memory.memory_size > PVKVM_MAX_PAGES * PAGE_SIZE ||
 	    memory.guest_phys_addr + memory.memory_size > PVKVM_PC_HIGH_RAM_LIMIT ||
-	    (memory.guest_phys_addr < PVKVM_PC_HIGH_RAM_START &&
-	     memory.guest_phys_addr + memory.memory_size > PVKVM_PC_LOW_RAM_LIMIT) ||
 	    !PAGE_ALIGNED(memory.memory_size) || !memory.userspace_addr ||
 	    !PAGE_ALIGNED(memory.userspace_addr))
 		return -EINVAL;

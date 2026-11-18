@@ -106,6 +106,11 @@ directly and lets the TCG worker pulse its controller during an active run.
 The client wakes a halted vCPU, exercises deassignment through a duplicated
 descriptor, and registers an eventfd with a signal already pending. Resampling,
 custom routes, and snapshot state are tracked in #1501.
+Use `--zero-slot --protected-entry --ram-pages 32768` to exercise the 128 MiB
+slot used by Firecracker. The guest reads and updates markers at the beginning
+and end of the slot, including within the legacy VGA and ROM windows. The
+worker maps the registered bytes there and limits VM RAM to addresses below
+the reserved 3 GiB device boundary.
 The worker uses one host mapping per consecutive extent. Highly fragmented
 slots can reach the host's mapping limit. A failed mapping releases the
 partially mapped worker span.

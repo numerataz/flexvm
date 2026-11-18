@@ -672,8 +672,10 @@ def model_cpuid(engine, qemu, output, control, cpu_count):
     return entries
 
 
-def read_slot_table(mailbox, ram_pages, outer_bytes, protected_entry, split_slot):
+def read_slot_table(mailbox, ram_pages, outer_bytes, protected_entry, split_slot, zero_slot):
     first_gpa = PROTECTED_GPA if protected_entry else PAGE_SIZE
+    if zero_slot:
+        first_gpa = 0
     expected = [(0, ram_pages, first_gpa)]
     if split_slot:
         first_pages = ram_pages // 2
@@ -747,7 +749,7 @@ def verify_slot_spans(pid, slots):
 
 def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry,
              split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs, cpuid, mmio, mmio_read,
-             ioeventfd, irqchip, pit, irqfd):
+             ioeventfd, irqchip, pit, irqfd, zero_slot):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
@@ -926,7 +928,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 if child is None:
                     if length != slot_size or len(open_cpus) != cpu_count:
                         raise RuntimeError("unexpected total size of registered RAM")
-                    slots = read_slot_table(mapping, ram_pages, outer_ram_size, protected_entry, split_slot)
+                    slots = read_slot_table(mapping, ram_pages, outer_ram_size, protected_entry, split_slot, zero_slot)
                     child = start_child(parent_engine, qemu, output, control, outer_ram, slots,
                                         cpu_count, mmio, irqchip_created, pit_flags, irq_fds)
                     cleanup.callback(child.close)
@@ -1041,6 +1043,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 or irqchip and "PASS child PIC delivered and acknowledged the parent IRQ" not in guest
                 or pit and "PASS PIT woke the halted vCPU" not in guest
                 or irqfd and "PASS KVM_IRQFD woke an active run and honored deassignment and pending signals" not in guest
+                or zero_slot and "PASS zero-based RAM shared every tested page across the legacy PC region" not in guest
                 or "PASS /dev/kvm returned two port I/O exits" not in guest
                 or "PASS parent KVM guest shutdown" not in guest):
             raise RuntimeError(f"parent execution proof failed; commands={observed}, see outer.log")
@@ -1077,6 +1080,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         "pit_flags": pit_flags,
         "irqfd": irqfd,
         "tcg_irqfd_pulses": pulses,
+        "zero_based_ram": zero_slot,
         "register_counters": counters,
         "interrupted_runs": len(child.channel.interruptions),
         "interrupted_run_ms": child.channel.interruptions,
@@ -1119,6 +1123,7 @@ def main():
     parser.add_argument("--irqchip", action="store_true", help="deliver a real PIC interrupt on a stopped worker")
     parser.add_argument("--pit", action="store_true", help="program a PIT interrupt that wakes a halted worker")
     parser.add_argument("--irqfd", action="store_true", help="wake an active run through KVM_IRQFD")
+    parser.add_argument("--zero-slot", action="store_true", help="share RAM at GPA zero across the PC legacy region")
     parser.add_argument("--reject-close", action="store_true", help="verify page retention when the parent refuses close")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -1142,6 +1147,9 @@ def main():
         parser.error("--mmio-write requires a separate long-mode run")
     if args.irqchip and (not args.protected_entry or args.long_mode or args.cpuid or args.two_vcpus):
         parser.error("--irqchip requires a single vCPU in 32-bit protected mode")
+    if args.zero_slot and (not args.protected_entry or args.ram_pages < 258 or args.split_slot or
+                           args.long_mode or args.irqchip or args.cpuid or args.two_vcpus):
+        parser.error("--zero-slot requires one protected-mode vCPU and one slot of at least 258 pages")
     if not 1 <= args.ram_pages <= MAX_SLOT_PAGES:
         parser.error(f"--ram-pages must be between 1 and {MAX_SLOT_PAGES}")
     if args.ram_pages > MAX_REAL_MODE_PAGES and not args.protected_entry:
@@ -1160,7 +1168,8 @@ def main():
         print(json.dumps(exercise(qemu, kernel, output, args.reject_close, args.parent_engine, args.ram_pages,
                                   args.protected_entry, args.split_slot, args.interrupt_run,
                                   2 if args.two_vcpus else 1, args.long_mode, args.fpu, args.msrs, args.cpuid,
-                                  args.mmio_write, args.mmio_read, args.ioeventfd, args.irqchip, args.pit, args.irqfd)))
+                                  args.mmio_write, args.mmio_read, args.ioeventfd, args.irqchip, args.pit,
+                                  args.irqfd, args.zero_slot)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -1212,6 +1221,8 @@ def main():
                 oracle.append("pit")
             if args.irqfd:
                 oracle.append("irqfd")
+            if args.zero_slot:
+                oracle.append("zero-slot")
             HELPERS["run"](oracle, 14 if args.interrupt_run else 8, output / "native-kvm.log")
             report["same_client_passed_native_kvm"] = True
             report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
@@ -1245,6 +1256,8 @@ def main():
             files["pit"] = b""
         if args.irqfd:
             files["irqfd"] = b""
+        if args.zero_slot:
+            files["zero-slot"] = b""
         image = HELPERS["initramfs"](init.read_bytes(), files=files)
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
@@ -1279,6 +1292,7 @@ def main():
                             *(["--irqchip"] if args.irqchip else []),
                             *(["--pit"] if args.pit else []),
                             *(["--irqfd"] if args.irqfd else []),
+                            *(["--zero-slot"] if args.zero_slot else []),
                             *(["--reject-close"] if args.reject_close else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}
