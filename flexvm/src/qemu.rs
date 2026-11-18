@@ -70,6 +70,32 @@ impl Network {
     }
 }
 
+pub struct ParentKvm {
+    pub bundle: PathBuf,
+    pub engine: String,
+    pub child_mem_mib: u32,
+}
+
+impl ParentKvm {
+    fn command(&self, qemu: Command, pinned_engine: RawFd, inherited: &[RawFd], runtime: &SocketRoot, memory: u32) -> Result<Command> {
+        let directory = runtime.dir.join("logs/parent-kvm");
+        fs::create_dir(&directory)?;
+        let broker = directory.join("parent-kvm-run.py");
+        fs::write(&broker, include_bytes!("../../scripts/compat/parent-kvm-run.py"))?;
+        fs::write(directory.join("software-boot.py"), include_bytes!("../../scripts/compat/software-boot.py"))?;
+        let mut cmd = Command::new("python3");
+        cmd.arg("-I").arg(broker).args(["--serve", "--bundle"]).arg(&self.bundle).arg("--output").arg(directory);
+        cmd.arg("--control").arg(runtime.dir.join("k"));
+        cmd.args(["--outer-memory", &memory.to_string(), "--child-memory", &self.child_mem_mib.to_string(), "--engine", &self.engine]);
+        cmd.args(["--emulator-fd", &pinned_engine.to_string()]);
+        for fd in inherited {
+            cmd.arg("--inherit").arg(fd.to_string());
+        }
+        cmd.arg("--").arg(qemu.get_program()).args(qemu.get_args());
+        Ok(cmd)
+    }
+}
+
 pub struct Config {
     pub control: Control,
     pub kernel: PathBuf,
@@ -78,6 +104,7 @@ pub struct Config {
     pub mem_mib: u32,
     pub vcpus: u32,
     pub boot_timeout: Duration,
+    pub parent_kvm: Option<ParentKvm>,
 }
 
 /// Children remain unreaped until their owner observes exit, so their pids cannot
@@ -293,6 +320,20 @@ impl Drop for Machine {
 impl Config {
     pub fn validate(&self) -> Result<()> {
         self.validate_limits()?;
+        if let Some(provider) = &self.parent_kvm {
+            if !cfg!(target_arch = "x86_64") {
+                bail!("the parent KVM provider currently requires x86_64");
+            }
+            if !(1..=self.mem_mib.min(256)).contains(&provider.child_mem_mib) {
+                bail!("--parent-kvm-mem must be 1..{} MiB", self.mem_mib.min(256));
+            }
+            if !matches!(provider.engine.as_str(), "auto" | "tcg" | "kvm") {
+                bail!("--parent-kvm-engine must be auto, tcg, or kvm");
+            }
+            if !provider.bundle.join("flexvm-pvkvm.img").is_file() {
+                bail!("parent KVM bundle has no flexvm-pvkvm.img: {}", provider.bundle.display());
+            }
+        }
         if !self.kernel.is_file() {
             bail!("software kernel is not a file: {}", self.kernel.display());
         }
@@ -322,21 +363,26 @@ impl Config {
             "aarch64" => ("virt,virtualization=on,gic-version=3", "cortex-a72", "ttyAMA0", "virtio-blk-device", "vhost-user-vsock-device", "virtio-net-device"),
             _ => bail!("software execution is not implemented for {arch}"),
         };
+        let (ram, cpu) = if self.parent_kvm.is_some() { ("outer-ram", "max,vmx=off,svm=off") } else { ("ram", cpu) };
         let mut cmd = Command::new(engine);
         cmd.arg("-L").arg(endpoints.firmware);
-        cmd.args(["-machine", &format!("{board},memory-backend=ram"), "-accel", "tcg,thread=multi", "-cpu", cpu]);
+        cmd.args(["-machine", &format!("{board},memory-backend={ram}"), "-accel", "tcg,thread=multi", "-cpu", cpu]);
         cmd.args(["-m", &self.mem_mib.to_string(), "-smp", &self.vcpus.to_string()]);
-        cmd.args(["-object", &json!({"qom-type":"memory-backend-memfd", "id":"ram", "size":u64::from(self.mem_mib)<<20, "share":true}).to_string()]);
+        if self.parent_kvm.is_none() {
+            cmd.args(["-object", &json!({"qom-type":"memory-backend-memfd", "id":"ram", "size":u64::from(self.mem_mib)<<20, "share":true}).to_string()]);
+        }
         cmd.args(["-display", "none", "-monitor", "none", "-serial", "stdio", "-no-reboot"]);
         cmd.args(["-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"]);
         let control_arg = if self.control == Control::Serial { " flexvm.control=serial" } else { "" };
+        let kvm_arg = if self.parent_kvm.is_some() { " flexvm.kvm=parent" } else { "" };
         cmd.arg("-kernel").arg(kernel).args([
             "-append",
             &format!(
-                "console={console} quiet panic=1 root=/dev/vda ro init=/sbin/flexvm-init flexvm.tmpfs_mib={}{}{}",
+                "console={console} quiet panic=1 root=/dev/vda ro init=/sbin/flexvm-init flexvm.tmpfs_mib={}{}{}{}",
                 self.mem_mib,
                 control_arg,
-                network.kernel_arg()
+                network.kernel_arg(),
+                kvm_arg,
             ),
         ]);
         cmd.args([
@@ -392,6 +438,9 @@ impl Config {
 
     /// Load state into a fresh engine, with CPUs paused and public admission closed.
     pub fn restore(&self, verified: software_state::Verified, processes: Arc<Processes>) -> Result<Machine> {
+        if self.parent_kvm.is_some() {
+            bail!("software restore is unavailable with the parent KVM provider");
+        }
         if self.control != Control::Serial {
             bail!("software restore requires serial control");
         }
@@ -424,8 +473,9 @@ impl Config {
         fs::create_dir(&logs)?;
         let kernel = PathBuf::from(format!("/proc/self/fd/{}", inputs.kernel.file.as_raw_fd()));
         let rootfs = PathBuf::from(format!("/proc/self/fd/{}", inputs.rootfs.file.as_raw_fd()));
-        let engine = PathBuf::from(format!("/proc/self/fd/{}", inputs.engine.file.as_raw_fd()));
-        let mut inherited = vec![inputs.engine.file.as_raw_fd(), inputs.kernel.file.as_raw_fd(), inputs.rootfs.file.as_raw_fd()];
+        let engine_fd = inputs.engine.file.as_raw_fd();
+        let engine = PathBuf::from(format!("/proc/self/fd/{engine_fd}"));
+        let mut inherited = vec![engine_fd, inputs.kernel.file.as_raw_fd(), inputs.rootfs.file.as_raw_fd()];
         let mut machine = Machine {
             inputs: Some(inputs),
             profile,
@@ -465,6 +515,9 @@ impl Config {
             let mut cmd = self.command(&engine, &kernel, &rootfs, &endpoints, network)?;
             if incoming.is_some() {
                 cmd.args(["-incoming", "defer", "-S"]);
+            }
+            if let Some(provider) = &self.parent_kvm {
+                cmd = provider.command(cmd, engine_fd, &inherited, &root, self.mem_mib)?;
             }
             machine.processes.spawn_with_fds(&mut cmd, &machine.logs.join("qemu.log"), &inherited)?;
             while !machine.sockets.api.exists() {
@@ -978,7 +1031,7 @@ impl Machine {
         self.finish_exec(&mut reader, &id, out)
     }
 
-    fn diagnostics(&self) -> String {
+    pub(crate) fn diagnostics(&self) -> String {
         ["qemu.log", "vsock.log"]
             .iter()
             .map(|name| {
@@ -1006,6 +1059,7 @@ mod tests {
             mem_mib: 512,
             vcpus: 1,
             boot_timeout: Duration::from_secs(120),
+            parent_kvm: None,
         };
         let [private, legacy] = config.profiles().unwrap();
         assert_eq!(private, config.profile().unwrap());
@@ -1090,6 +1144,7 @@ mod tests {
             mem_mib: 512,
             vcpus: 1,
             boot_timeout: Duration::from_secs(60),
+            parent_kvm: None,
         };
         let source = Arc::new(Processes::default());
         let machine = config.boot(&rootfs, source.clone()).unwrap();

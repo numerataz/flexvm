@@ -28,6 +28,29 @@ debugger and QMP register requests. Memory invalidation, additional x86
 CPU state, concurrent vCPU runs, interrupt delivery, and checkpointing remain part of
 [issue #1501](https://github.com/numerataz/flexvm/issues/1501).
 
+## Launch from FlexVM
+
+On x86_64, build the provider against the SDK for the kernel you will boot.
+Use the QEMU build from `scripts/build-qemu.sh` and a host with Python 3.10 or
+later.
+
+```sh
+scripts/compat/parent-kvm/build.sh /path/to/kernel/build /path/to/provider --native
+sudo flexvm software --kernel /path/to/vmlinux --qemu /path/to/qemu-system-x86_64 \
+  --parent-kvm-bundle /path/to/provider --parent-kvm-mem 128 IMAGE
+```
+
+The application can open `/dev/kvm` normally. The parent runs one child at a
+time, with up to two vCPUs and eight pinned RAM slots. The child memory quota
+defaults to the lesser of 256 MiB and the outer VM memory. In `auto` mode,
+FlexVM selects a usable native worker when the bundle contains one and
+otherwise uses TCG. Use `--parent-kvm-engine tcg` to avoid any host KVM access,
+or `--parent-kvm-engine kvm` to require it. The current launch is foreground
+and unnamed. Checkpoint and migration are tracked in
+[issue #1603](https://github.com/numerataz/flexvm/issues/1603).
+
+## Compatibility fixture
+
 Run the fixture on x86 with the QEMU build from `scripts/build-qemu.sh` and
 the prepared kernel build tree for the selected FlexVM kernel.
 

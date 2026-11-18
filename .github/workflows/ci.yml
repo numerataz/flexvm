@@ -564,6 +564,29 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Build FlexVM
         run: cargo build --release -p flexvm
+      - name: Launch unchanged Firecracker through the public parent KVM command
+        if: matrix.arch == 'x86_64'
+        run: |
+          source scripts/versions.sh
+          run_public_parent() {
+            local engine=$1
+            local bundle=${2:-$engine}
+            local output="$RUNNER_TEMP/software-parent-kvm-$engine"
+            sudo systemd-run --scope --collect -p MemoryMax=1400M -p MemorySwapMax=0 -p CPUQuota=200% \
+              python3 scripts/compat/software-parent-kvm.py --bin target/release/flexvm \
+              --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" \
+              --firecracker "$RUNNER_TEMP/firecracker-$FC_VERSION-$ARCH" --engine "$engine" \
+              --bundle "$RUNNER_TEMP/parent-kvm-firecracker-$bundle-2/provider" --output "$output" || {
+              cat "$output/guest.log" >&2 || true
+              return 1
+            }
+            cat "$output/report.json"
+          }
+          run_public_parent tcg
+          if [ -x "$RUNNER_TEMP/parent-kvm-firecracker-kvm-2/provider/native-worker" ]; then
+            run_public_parent kvm
+            run_public_parent auto kvm
+          fi
       - name: Guest compile, DKMS, ABI rejection and loaded module lifecycle
         run: |
           sudo systemd-run --scope --collect -p MemoryMax=4G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-modules.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-modules" --timeout 1800
@@ -577,6 +600,9 @@ jobs:
             ${{ runner.temp }}/software-modules/*.json
             ${{ runner.temp }}/software-modules/*.log
             ${{ runner.temp }}/software-modules/*.strace
+            ${{ runner.temp }}/software-parent-kvm-*/*.json
+            ${{ runner.temp }}/software-parent-kvm-*/*.log
+            ${{ runner.temp }}/software-parent-kvm-*/*.strace
             ${{ runner.temp }}/parent-kvm-run/*.json
             ${{ runner.temp }}/parent-kvm-run/*.log
             ${{ runner.temp }}/parent-kvm-run/*.strace

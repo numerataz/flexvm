@@ -815,6 +815,7 @@ pub fn restore(host: Host, vm_name: &str, notify: Option<std::fs::File>) -> Resu
             mem_mib: metadata.memory_mib,
             vcpus: metadata.vcpus,
             boot_timeout: Duration::from_secs(120),
+            parent_kvm: None,
         };
         let _reservation = Reservation::new(&host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)?;
         let verified = software_state::open(&path, config.profiles()?)?;
