@@ -81,6 +81,7 @@ struct pvcpu {
 	u64 msrs[ARRAY_SIZE(boot_msr_indices)];
 	unsigned long msrs_set;
 	unsigned int id;
+	unsigned int mmio_read_width;
 	bool ran;
 	bool fpu_set;
 };
@@ -359,11 +360,15 @@ static void publish_initial_msrs(struct pvcpu *cpu)
 	writel(0, mailbox + sizeof(u32));
 }
 
-static int complete_run(struct run_page *page, const struct pvkvm_run_exit *exit)
+static int complete_run(struct pvcpu *cpu, const struct pvkvm_run_exit *exit)
 {
+	struct run_page *page = cpu->page;
+
+	if (exit->is_write > 1 || exit->reserved)
+		return -EIO;
 	switch (exit->reason) {
 	case KVM_EXIT_IO:
-		if (exit->length != 1 || exit->address != PVKVM_IO_PORT)
+		if (exit->length != 1 || exit->address != PVKVM_IO_PORT || !exit->is_write)
 			return -EIO;
 		page->data = exit->data[0];
 		page->run.io.direction = KVM_EXIT_IO_OUT;
@@ -375,11 +380,16 @@ static int complete_run(struct run_page *page, const struct pvkvm_run_exit *exit
 	case KVM_EXIT_MMIO:
 		if (!is_power_of_2(exit->length) || exit->length > sizeof(exit->data))
 			return -EIO;
+		if (!exit->is_write && hweight_long(cpu->vm->open_cpus) > 1)
+			return -EOPNOTSUPP;
 		page->run.mmio.phys_addr = exit->address;
 		memset(page->run.mmio.data, 0, sizeof(page->run.mmio.data));
-		memcpy(page->run.mmio.data, exit->data, exit->length);
+		if (exit->is_write)
+			memcpy(page->run.mmio.data, exit->data, exit->length);
+		else
+			cpu->mmio_read_width = exit->length;
 		page->run.mmio.len = exit->length;
-		page->run.mmio.is_write = 1;
+		page->run.mmio.is_write = exit->is_write;
 		break;
 	default:
 		return -EIO;
@@ -394,6 +404,7 @@ static int run_cpu(struct pvcpu *cpu)
 	struct pvkvm *p = vm->provider;
 	const struct pvvm *memory;
 	struct pvkvm_run_exit exit;
+	struct pvkvm_mmio_completion completion = {};
 	int result;
 
 	result = mutex_lock_interruptible(&p->lock);
@@ -436,11 +447,17 @@ static int run_cpu(struct pvcpu *cpu)
 				    offsetof(struct pvkvm_cpuid_table, entries) +
 				    cpu->cpuid->count * sizeof(cpu->cpuid->entries[0]));
 	}
+	completion.length = cpu->mmio_read_width;
+	if (completion.length)
+		memcpy(completion.data, cpu->page->run.mmio.data, completion.length);
+	memcpy_toio(p->mailbox + PVKVM_COMPLETION_AT, &completion, sizeof(completion));
 	result = request_for_cpu(cpu, PVKVM_RUN, memory, &exit);
-	if (!result || result == -EINTR)
+	if (!result || result == -EINTR) {
 		cpu->ran = true;
+		cpu->mmio_read_width = 0;
+	}
 	if (!result) {
-		result = complete_run(cpu->page, &exit);
+		result = complete_run(cpu, &exit);
 		if (result)
 			p->dead = true;
 	}
@@ -1081,8 +1098,9 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	BUILD_BUG_ON(PVKVM_RAM_ADDRESS_AT + PVKVM_MAX_PAGES * sizeof(u64) > PVKVM_MSR_AT);
 	BUILD_BUG_ON(PVKVM_MSR_AT + sizeof(struct pvkvm_msr_batch) > PVKVM_CPUID_AT);
 	BUILD_BUG_ON(PVKVM_CPUID_AT + sizeof(struct pvkvm_cpuid_table) > PVKVM_EXIT_AT);
+	BUILD_BUG_ON(PVKVM_EXIT_AT + sizeof(struct pvkvm_run_exit) > PVKVM_COMPLETION_AT);
 	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
-	    pci_resource_len(dev, 2) < PVKVM_EXIT_AT + sizeof(struct pvkvm_run_exit))
+	    pci_resource_len(dev, 2) < PVKVM_COMPLETION_AT + sizeof(struct pvkvm_mmio_completion))
 		return -ENODEV;
 	result = pcim_enable_device(dev);
 	if (result)

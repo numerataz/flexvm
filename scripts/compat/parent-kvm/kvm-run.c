@@ -26,7 +26,10 @@
 #define CPUID_ENTRY_OFFSET 0x700
 #define CPUID_SECOND_OFFSET 0x800
 #define MMIO_ENTRY_OFFSET 0x900
+#define MMIO_READ_OFFSET 0xa00
 #define MMIO_BASE 0xd0000000ULL
+#define MMIO_FIRST_VALUE 0x5a443322U
+#define MMIO_SECOND_VALUE 0xaabbccddeeff0011ULL
 #define CPUID_TEST_FUNCTION 0x4000007e
 #define CPUID_TEST_RESULT 0x31234500
 #define TSC_START 0x1111222200000000ULL
@@ -358,6 +361,37 @@ static void check_mmio_writes(int cpu, const struct kvm_run *run, const unsigned
     }
 }
 
+static void complete_mmio_reads(int cpu, struct kvm_run *run, const unsigned char *ram, uint64_t entry_base)
+{
+    const uint32_t first_value = MMIO_FIRST_VALUE;
+    const uint64_t second_value = MMIO_SECOND_VALUE;
+    uint32_t first;
+    uint64_t second;
+    struct kvm_regs stopped;
+
+    timed_run(cpu);
+    check(run->exit_reason == KVM_EXIT_MMIO && !run->mmio.is_write &&
+          run->mmio.phys_addr == MMIO_BASE + 0x24 && run->mmio.len == sizeof(first_value),
+          "exit for a four-byte MMIO read");
+    check(ioctl(cpu, KVM_GET_REGS, &stopped) == 0 && stopped.rip >= entry_base + MMIO_READ_OFFSET,
+          "read the vCPU register state during MMIO completion");
+    memcpy(&first, ram + 0x100, sizeof(first));
+    memcpy(&second, ram + 0x108, sizeof(second));
+    check(!first && !second, "stop at the first read before consuming any data");
+    memcpy(run->mmio.data, &first_value, sizeof(first_value));
+
+    timed_run(cpu);
+    check(run->exit_reason == KVM_EXIT_MMIO && !run->mmio.is_write &&
+          run->mmio.phys_addr == MMIO_BASE + 0x28 && run->mmio.len == sizeof(second_value),
+          "exit for an eight-byte MMIO read");
+    check(ioctl(cpu, KVM_GET_REGS, &stopped) == 0 && stopped.rip >= entry_base + MMIO_READ_OFFSET,
+          "read the vCPU register state during the second MMIO read");
+    memcpy(&first, ram + 0x100, sizeof(first));
+    memcpy(&second, ram + 0x108, sizeof(second));
+    check(first == first_value && !second, "continue from the first read and stop at the second");
+    memcpy(run->mmio.data, &second_value, sizeof(second_value));
+}
+
 struct interrupt_test {
     uint32_t *counter;
     uint32_t baseline;
@@ -429,6 +463,7 @@ int main(int argc, char **argv)
     bool msrs = false;
     bool cpuid = false;
     bool mmio = false;
+    bool mmio_read = false;
     check(argc == 2 || protected_mode, "specify RAM pages and optional protected or split mode");
     for (int i = 3; i < argc; i++) {
         if (!interrupt_run && !strcmp(argv[i], "interrupt"))
@@ -445,6 +480,8 @@ int main(int argc, char **argv)
             cpuid = true;
         else if (!mmio && !strcmp(argv[i], "mmio"))
             mmio = true;
+        else if (!mmio_read && !strcmp(argv[i], "mmio-read"))
+            mmio_read = true;
         else
             check(false, "invalid execution option");
     }
@@ -459,6 +496,7 @@ int main(int argc, char **argv)
     check(!msrs || (long_mode && !fpu), "exercise boot MSRs in a separate long-mode run");
     check(!cpuid || (protected_mode && !fpu && !msrs), "exercise CPUID in a separate protected-mode run");
     check(!mmio || (long_mode && !cpuid && !fpu && !msrs), "exercise MMIO in a separate long-mode run");
+    check(!mmio_read || mmio, "test MMIO reads after the write exits");
     size_t pages = count;
     size_t ram_bytes = pages * 4096;
     uint64_t gpa = protected_mode ? PROTECTED_SLOT_GPA : PVKVM_GUEST_START;
@@ -646,6 +684,13 @@ int main(int argc, char **argv)
             0xc6, 0x87, 0xf0, 0, 0, 0, 3,          /* mov byte [rdi+0xf0], 3 */
             0xb8, 0x41, 0, 0, 0, 0xf9,              /* mov eax, 0x41; stc */
         };
+        const unsigned char mmio_read_code[] = {
+            0x41, 0x8b, 0x41, 0x24,              /* mov eax, [r9+0x24] */
+            0x89, 0x87, 0x00, 0x01, 0, 0,       /* mov [rdi+0x100], eax */
+            0x49, 0x8b, 0x41, 0x28,              /* mov rax, [r9+0x28] */
+            0x48, 0x89, 0x87, 0x08, 0x01, 0, 0, /* mov [rdi+0x108], rax */
+            0xb8, 0x41, 0, 0, 0, 0xf9,           /* mov eax, 0x41; stc */
+        };
         size_t startup = 0x10;
         size_t resume = 0x40;
         if (fpu) {
@@ -670,7 +715,11 @@ int main(int argc, char **argv)
             const uint64_t address = LONG_ALIAS + 3 * HUGE_PAGE_SIZE;
             memcpy(ram + MMIO_ENTRY_OFFSET, mmio_entry, sizeof(mmio_entry));
             memcpy(ram + MMIO_ENTRY_OFFSET + 2, &address, sizeof(address));
-            install_jump(ram, MMIO_ENTRY_OFFSET + sizeof(mmio_entry), startup);
+            install_jump(ram, MMIO_ENTRY_OFFSET + sizeof(mmio_entry), mmio_read ? MMIO_READ_OFFSET : startup);
+            if (mmio_read) {
+                memcpy(ram + MMIO_READ_OFFSET, mmio_read_code, sizeof(mmio_read_code));
+                install_jump(ram, MMIO_READ_OFFSET + sizeof(mmio_read_code), startup);
+            }
         }
         if (long_mode) {
             setup_page_tables(ram, gpa, middle_page, last_page, mmio);
@@ -750,6 +799,8 @@ int main(int argc, char **argv)
     run->immediate_exit = 0;
     if (mmio)
         check_mmio_writes(cpu, run, ram);
+    if (mmio_read)
+        complete_mmio_reads(cpu, run, ram, entry_base);
     unsigned long long first = timed_run(cpu);
     check_output(run, size, 0x42);
     struct kvm_regs observed = check_registers(cpu, 0x42, 0x1357, entry_base);
@@ -780,6 +831,12 @@ int main(int argc, char **argv)
         check_cpuid_result(ram, 0, &supported);
     if (mmio)
         check(ram[0xf0] == 3, "resume after the final MMIO write");
+    if (mmio_read) {
+        uint64_t observed_value;
+        memcpy(&observed_value, ram + 0x108, sizeof(observed_value));
+        check(observed_value == MMIO_SECOND_VALUE, "continue from the second read with userspace data");
+        puts("PASS MMIO reads continued with VMM-supplied bytes");
+    }
     if (two_vcpus) {
         check(data[0xa0] == 0 && data[0xa1] == 0, "second vCPU waited for KVM_RUN");
         timed_run(other_cpu);

@@ -68,23 +68,25 @@ static void supported_cpuid(void)
     close(kvm);
 }
 
-static void reply_run(int control, const struct kvm_run *run, int mapping_bytes)
+static unsigned int reply_run(int control, const struct kvm_run *run, int mapping_bytes)
 {
     if (run->exit_reason == KVM_EXIT_MMIO) {
         unsigned int width = run->mmio.len;
-        check(run->mmio.is_write && (width == 1 || width == 2 || width == 4 || width == 8),
+        check(width == 1 || width == 2 || width == 4 || width == 8,
               "unexpected host MMIO access");
-        unsigned char output[18] = {'M', width};
+        unsigned char output[18] = {run->mmio.is_write ? 'M' : 'Q', width};
         memcpy(output + 2, &run->mmio.phys_addr, sizeof(run->mmio.phys_addr));
-        memcpy(output + 10, run->mmio.data, width);
-        check(write(control, output, sizeof(output)) == sizeof(output), "return a host MMIO write");
-        return;
+        if (run->mmio.is_write)
+            memcpy(output + 10, run->mmio.data, width);
+        check(write(control, output, sizeof(output)) == sizeof(output), "return a host MMIO exit");
+        return run->mmio.is_write ? 0 : width;
     }
     check(run->exit_reason == KVM_EXIT_IO && run->io.direction == KVM_EXIT_IO_OUT &&
           run->io.port == PVKVM_IO_PORT && run->io.count == 1 && run->io.size == 1 &&
           run->io.data_offset < (unsigned long)mapping_bytes, "unexpected host vCPU exit");
     unsigned char output[] = {'O', ((const unsigned char *)run)[run->io.data_offset]};
     check(write(control, output, sizeof(output)) == sizeof(output), "return a host port write");
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -122,6 +124,7 @@ int main(int argc, char **argv)
     close(outer_ram);
     int cpus[PVKVM_MAX_CPUS];
     struct kvm_run *runs[PVKVM_MAX_CPUS];
+    unsigned int pending_read[PVKVM_MAX_CPUS] = {0};
     struct kvm_sregs segments;
     for (unsigned int id = 0; id < cpu_count; id++) {
         cpus[id] = ioctl(vm, KVM_CREATE_VCPU, id);
@@ -150,8 +153,9 @@ int main(int argc, char **argv)
     while ((received = recv(control, request, sizeof(request), MSG_TRUNC)) != 0) {
         if (received < 0 && errno == EINTR) continue;
         check(received >= 2 && request[1] < cpu_count, "invalid vCPU selector");
-        int cpu = cpus[request[1]];
-        struct kvm_run *run = runs[request[1]];
+        unsigned int id = request[1];
+        int cpu = cpus[id];
+        struct kvm_run *run = runs[id];
         if (received == 2 + sizeof(registers) && request[0] == 'S') {
             memcpy(&registers, request + 2, sizeof(registers));
             check(ioctl(cpu, KVM_SET_REGS, &registers) == 0, "write host registers");
@@ -229,9 +233,14 @@ int main(int argc, char **argv)
             continue;
         }
         uint32_t sequence;
-        check(received == 2 + sizeof(sequence) && request[0] == 'R', "invalid run request");
+        size_t run_header = 2 + sizeof(sequence);
+        check(received == (ssize_t)(run_header + pending_read[id]) && request[0] == 'R', "invalid run request");
         memcpy(&sequence, request + 2, sizeof(sequence));
         check(sequence > 0 && sequence <= INT_MAX, "invalid run sequence");
+        if (pending_read[id]) {
+            memcpy(run->mmio.data, request + run_header, pending_read[id]);
+            pending_read[id] = 0;
+        }
         run_page = run;
         __atomic_store_n(&run->immediate_exit, 0, __ATOMIC_RELAXED);
         /* The signal handler may publish an interrupt as soon as this
@@ -250,7 +259,7 @@ int main(int argc, char **argv)
             continue;
         }
         check(result == 0, "run host vCPU");
-        reply_run(control, run, bytes);
+        pending_read[id] = reply_run(control, run, bytes);
     }
     return 0;
 }

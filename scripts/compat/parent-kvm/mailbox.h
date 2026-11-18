@@ -3,7 +3,7 @@
 #define FLEXVM_PVKVM_MAILBOX_H
 
 #define PVKVM_MAGIC        0x4d564b46
-#define PVKVM_VERSION      18
+#define PVKVM_VERSION      19
 #define PVKVM_MAGIC_AT     0
 #define PVKVM_VERSION_AT   4
 #define PVKVM_REQUEST_AT   8
@@ -26,6 +26,7 @@
 #define PVKVM_CPUID_AT       0x82000
 #define PVKVM_CPUID_MAX      128
 #define PVKVM_EXIT_AT        0x84000
+#define PVKVM_COMPLETION_AT  0x84100
 #define PVKVM_REGISTERS_AT   64
 #define PVKVM_INITIAL_SREGISTERS_AT 256
 #define PVKVM_GUEST_PAGE_SIZE 4096
@@ -60,6 +61,14 @@ struct pvkvm_run_exit {
 	__u32 reason;
 	__u32 length;
 	__u64 address;
+	__u8 data[8];
+	__u32 is_write;
+	__u32 reserved;
+};
+
+struct pvkvm_mmio_completion {
+	__u32 length;
+	__u32 reserved;
 	__u8 data[8];
 };
 
