@@ -335,22 +335,31 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends ${{ matrix.qemu }} strace build-essential flex bison bc libelf-dev libssl-dev dwarves xz-utils kmod pkg-config zlib1g-dev libzstd-dev
-      - name: Cache fixed x86 software CPU engine
-        if: matrix.arch == 'x86_64'
+      - name: Cache fixed software CPU engine
         id: software-qemu
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/software-qemu
-          key: software-qemu-x86_64-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch', 'scripts/compat/parent-kvm/slot-map.h') }}
-      - name: Install fixed x86 software CPU engine
-        if: matrix.arch == 'x86_64'
+          key: software-qemu-${{ matrix.arch }}-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch', 'scripts/compat/parent-kvm/slot-map.h') }}
+      - name: Install fixed software CPU engine
         run: |
-          if [ ! -x "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" ]; then
+          arch=${{ matrix.arch }}
+          engine="$RUNNER_TEMP/software-qemu/bin/qemu-system-$arch"
+          if [ ! -x "$engine" ]; then
             sudo apt-get install -y -q --no-install-recommends ninja-build python3-venv libglib2.0-dev libpixman-1-dev libslirp-dev libseccomp-dev libfdt-dev
-            scripts/build-qemu.sh "$RUNNER_TEMP/software-qemu"
+            scripts/build-qemu.sh "$RUNNER_TEMP/software-qemu" "$arch"
           fi
-          sudo ln -sf "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" /usr/local/bin/qemu-system-x86_64
-          sudo qemu-system-x86_64 --version
+          if [ "$arch" = x86_64 ]; then
+            sudo ln -sf "$engine" /usr/local/bin/qemu-system-x86_64
+          fi
+          "$engine" --version
+      - name: ARM worker reads and writes shared guest RAM without KVM
+        if: matrix.arch == 'aarch64'
+        run: |
+          trace="$RUNNER_TEMP/arm-parent-shared-ram.strace"
+          strace -f -e trace=file -o "$trace" python3 scripts/compat/arm-shared-ram.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64"
+          if grep -F '"/dev/kvm"' "$trace"; then exit 1; fi
       - name: Kernel artifact directory
         run: sudo install -d -o "$(id -u)" -g "$(id -g)" "$RUNNER_TEMP/software-state/artifacts"
       - name: Matching kernel and development bundles
@@ -603,6 +612,7 @@ jobs:
             ${{ runner.temp }}/software-parent-kvm-*/*.json
             ${{ runner.temp }}/software-parent-kvm-*/*.log
             ${{ runner.temp }}/software-parent-kvm-*/*.strace
+            ${{ runner.temp }}/arm-parent-shared-ram.strace
             ${{ runner.temp }}/parent-kvm-run/*.json
             ${{ runner.temp }}/parent-kvm-run/*.log
             ${{ runner.temp }}/parent-kvm-run/*.strace
