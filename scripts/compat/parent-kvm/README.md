@@ -111,6 +111,10 @@ slot used by Firecracker. The guest reads and updates markers at the beginning
 and end of the slot, including within the legacy VGA and ROM windows. The
 worker maps the registered bytes there and limits VM RAM to addresses below
 the reserved 3 GiB device boundary.
+Use `--pvh --ram-pages 32768` to exercise that slot with the x86 PVH entry
+state from Firecracker. The VMM reads the actual worker reset registers and
+sets the GDT, IDT, task selector, and CR0 before entry at GPA `0x1000540`.
+The guest records the descriptor and control registers using x86 instructions.
 Add `--tss` to reserve the same three-page guest physical range that
 Firecracker configures before creating the x86 interrupt controller. Native
 KVM receives the exact address. The TCG worker uses the reservation when

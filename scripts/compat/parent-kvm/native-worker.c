@@ -68,15 +68,21 @@ static void supported_cpuid(void)
     close(kvm);
 }
 
-static void reset_lapic(unsigned int id)
+static void reset_state(unsigned int id, bool irqchip, unsigned long operation)
 {
-    struct kvm_lapic_state lapic;
+    union {
+        struct kvm_lapic_state lapic;
+        struct kvm_sregs sregs;
+    } state;
+    size_t length = operation == KVM_GET_LAPIC ? sizeof(state.lapic) : sizeof(state.sregs);
     int kvm = host_kvm();
     int vm = ioctl(kvm, KVM_CREATE_VM, 0);
-    check(vm >= 0 && ioctl(vm, KVM_CREATE_IRQCHIP, 0) == 0, "create a host IRQ controller");
+    check(vm >= 0, "create a host reset-state VM");
+    if (irqchip)
+        check(ioctl(vm, KVM_CREATE_IRQCHIP, 0) == 0, "create a host IRQ controller");
     int cpu = ioctl(vm, KVM_CREATE_VCPU, id);
-    check(cpu >= 0 && ioctl(cpu, KVM_GET_LAPIC, &lapic) == 0, "read the host reset LAPIC");
-    check(write(STDOUT_FILENO, &lapic, sizeof(lapic)) == sizeof(lapic), "write the reset LAPIC image");
+    check(cpu >= 0 && ioctl(cpu, operation, &state) == 0, "read the host reset state");
+    check(write(STDOUT_FILENO, &state, length) == (ssize_t)length, "write the host reset record");
     close(cpu);
     close(vm);
     close(kvm);
@@ -125,7 +131,11 @@ int main(int argc, char **argv)
         return 0;
     }
     if (argc == 3 && !strcmp(argv[1], "--reset-lapic")) {
-        reset_lapic(number(argv[2], PVKVM_MAX_CPUS - 1));
+        reset_state(number(argv[2], PVKVM_MAX_CPUS - 1), true, KVM_GET_LAPIC);
+        return 0;
+    }
+    if (argc == 4 && !strcmp(argv[1], "--reset-sregs")) {
+        reset_state(number(argv[2], PVKVM_MAX_CPUS - 1), number(argv[3], 1), KVM_GET_SREGS);
         return 0;
     }
     check(argc >= 10, "expected control, outer RAM, vCPU count, device configuration, and slots");
@@ -219,18 +229,22 @@ int main(int argc, char **argv)
         if (received == 2 + sizeof(segments) && request[0] == 'P') {
             struct kvm_sregs setup;
             memcpy(&setup, request + 2, sizeof(setup));
-            check(ioctl(cpu, KVM_GET_SREGS, &segments) == 0, "read host protected-entry baseline");
-            segments.cs = setup.cs;
-            segments.ds = setup.ds;
-            segments.es = setup.es;
-            segments.fs = setup.fs;
-            segments.gs = setup.gs;
-            segments.ss = setup.ss;
-            segments.gdt = setup.gdt;
-            segments.cr0 |= setup.cr0;
-            segments.cr3 = setup.cr3;
-            segments.cr4 |= setup.cr4;
-            segments.efer |= setup.efer;
+            if (setup.gdt.limit == 31) {
+                segments = setup;
+            } else {
+                check(ioctl(cpu, KVM_GET_SREGS, &segments) == 0, "read host protected-entry baseline");
+                segments.cs = setup.cs;
+                segments.ds = setup.ds;
+                segments.es = setup.es;
+                segments.fs = setup.fs;
+                segments.gs = setup.gs;
+                segments.ss = setup.ss;
+                segments.gdt = setup.gdt;
+                segments.cr0 |= setup.cr0;
+                segments.cr3 = setup.cr3;
+                segments.cr4 |= setup.cr4;
+                segments.efer |= setup.efer;
+            }
             check(ioctl(cpu, KVM_SET_SREGS, &segments) == 0, "configure host protected mode");
             check(write(control, "P", 1) == 1, "acknowledge host protected mode");
             continue;
