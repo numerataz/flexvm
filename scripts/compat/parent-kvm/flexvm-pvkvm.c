@@ -44,6 +44,7 @@ struct pvvm {
 	struct pvkvm *provider;
 	struct mm_struct *owner;
 	struct page *slot[PVKVM_MAX_PAGES];
+	u64 gpa;
 	unsigned int pages;
 	bool slot_exposed;
 	bool cpu_open;
@@ -66,6 +67,26 @@ struct pvcpu {
 static const struct kvm_sregs reset_sregs = {
 	.cs = { .base = 0xffff0000, .limit = 0xffff, .selector = 0xf000, .present = 1 },
 };
+
+static bool valid_protected_entry(const struct kvm_sregs *sregs)
+{
+	static const struct kvm_segment code = {
+		.limit = U32_MAX, .selector = 8, .type = 11, .present = 1,
+		.db = 1, .s = 1, .g = 1,
+	};
+	static const struct kvm_segment data = {
+		.limit = U32_MAX, .selector = 16, .type = 3, .present = 1,
+		.db = 1, .s = 1, .g = 1,
+	};
+	struct kvm_sregs wanted = reset_sregs;
+
+	wanted.cs = code;
+	wanted.ds = wanted.es = wanted.fs = wanted.gs = wanted.ss = data;
+	wanted.cr0 = X86_CR0_PE;
+	wanted.gdt.limit = 23;
+	wanted.gdt.base = sregs->gdt.base;
+	return !memcmp(sregs, &wanted, sizeof(wanted)) && sregs->gdt.base <= U32_MAX;
+}
 
 /* The device lock serializes mailbox use, including close and PCI teardown. */
 static int request(struct pvkvm *provider, enum pvkvm_command command,
@@ -93,6 +114,10 @@ static int request(struct pvkvm *provider, enum pvkvm_command command,
 
 		writel(lower_32_bits(address), entry);
 		writel(upper_32_bits(address), entry + sizeof(u32));
+	}
+	if (memory) {
+		writel(lower_32_bits(memory->gpa), m + PVKVM_SLOT_GPA_AT);
+		writel(upper_32_bits(memory->gpa), m + PVKVM_SLOT_GPA_AT + sizeof(u32));
 	}
 	writel(pages * PAGE_SIZE, m + PVKVM_DATA_SIZE_AT);
 	writel(command, m + PVKVM_COMMAND_AT);
@@ -201,6 +226,7 @@ static int run_cpu(struct pvcpu *cpu)
 {
 	struct pvvm *vm = cpu->vm;
 	struct pvkvm *p = vm->provider;
+	u64 slot_end;
 	int result;
 
 	result = mutex_lock_interruptible(&p->lock);
@@ -214,14 +240,21 @@ static int run_cpu(struct pvcpu *cpu)
 		result = -ENODEV;
 		goto unlock;
 	}
-	if (!vm->pages || (!cpu->ran && (cpu->regs.rip < PVKVM_GUEST_START ||
-					 cpu->regs.rip >= PVKVM_GUEST_START + vm->pages * PAGE_SIZE))) {
+	slot_end = vm->gpa + vm->pages * PAGE_SIZE;
+	if (!vm->pages || (!cpu->ran && (cpu->regs.rip < vm->gpa || cpu->regs.rip >= slot_end))) {
+		result = -EINVAL;
+		goto unlock;
+	}
+	if (!cpu->ran && (cpu->sregs.cr0 & X86_CR0_PE) &&
+	    (cpu->sregs.gdt.base < vm->gpa || cpu->sregs.gdt.base + cpu->sregs.gdt.limit >= slot_end)) {
 		result = -EINVAL;
 		goto unlock;
 	}
 	vm->slot_exposed = true;
-	if (!cpu->ran)
+	if (!cpu->ran) {
 		memcpy_toio(p->mailbox + PVKVM_REGISTERS_AT, &cpu->regs, sizeof(cpu->regs));
+		memcpy_toio(p->mailbox + PVKVM_INITIAL_SREGISTERS_AT, &cpu->sregs, sizeof(cpu->sregs));
+	}
 	result = request(p, PVKVM_RUN, cpu->ran ? NULL : vm, &cpu->page->data);
 	if (!result)
 		cpu->ran = true;
@@ -282,7 +315,8 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		if ((regs.rax | regs.rbx | regs.rcx | regs.rdx | regs.rsi | regs.rdi |
 		     regs.rsp | regs.rbp) > U32_MAX ||
 		    regs.r8 || regs.r9 || regs.r10 || regs.r11 || regs.r12 || regs.r13 ||
-		    regs.r14 || regs.r15 || regs.rip > U16_MAX ||
+		    regs.r14 || regs.r15 || regs.rip > U32_MAX ||
+		    (cpu->ran && !(cpu->sregs.cr0 & X86_CR0_PE) && regs.rip > U16_MAX) ||
 		    !(regs.rflags & X86_EFLAGS_FIXED) || (regs.rflags & ~PVKVM_REAL_MODE_FLAGS)) {
 			result = -EINVAL;
 			break;
@@ -322,7 +356,7 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		wanted = reset_sregs;
 		wanted.cs.base = 0;
 		wanted.cs.selector = 0;
-		if (memcmp(&sregs, &wanted, sizeof(sregs))) {
+		if (memcmp(&sregs, &wanted, sizeof(sregs)) && !valid_protected_entry(&sregs)) {
 			result = -EINVAL;
 			break;
 		}
@@ -330,7 +364,7 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		result = 0;
 		break;
 	case KVM_RUN:
-		if (arg || cpu->sregs.cs.base) {
+		if (arg || cpu->sregs.cs.base || (!(cpu->sregs.cr0 & X86_CR0_PE) && cpu->regs.rip > U16_MAX)) {
 			result = -EINVAL;
 			break;
 		}
@@ -420,8 +454,12 @@ static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return -ENOTTY;
 	if (copy_from_user(&memory, (void __user *)arg, sizeof(memory)))
 		return -EFAULT;
-	if (memory.slot || memory.flags || memory.guest_phys_addr != PVKVM_GUEST_START ||
+	if (memory.slot || memory.flags || memory.guest_phys_addr < PVKVM_GUEST_START ||
+	    memory.guest_phys_addr >= PVKVM_PC_HIGH_RAM_LIMIT || !PAGE_ALIGNED(memory.guest_phys_addr) ||
 	    !memory.memory_size || memory.memory_size > PVKVM_MAX_PAGES * PAGE_SIZE ||
+	    memory.guest_phys_addr + memory.memory_size > PVKVM_PC_HIGH_RAM_LIMIT ||
+	    (memory.guest_phys_addr < PVKVM_PC_HIGH_RAM_START &&
+	     memory.guest_phys_addr + memory.memory_size > PVKVM_PC_LOW_RAM_LIMIT) ||
 	    !PAGE_ALIGNED(memory.memory_size) || !memory.userspace_addr ||
 	    !PAGE_ALIGNED(memory.userspace_addr))
 		return -EINVAL;
@@ -436,6 +474,7 @@ static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	result = p->dead ? -ENODEV : vm->pages ? -EEXIST : 0;
 	if (!result) {
 		memcpy(vm->slot, slot, pages * sizeof(slot[0]));
+		vm->gpa = memory.guest_phys_addr;
 		vm->pages = pages;
 	}
 	mutex_unlock(&p->lock);

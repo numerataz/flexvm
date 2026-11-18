@@ -33,10 +33,11 @@ static unsigned long number(const char *text, unsigned long maximum)
 
 int main(int argc, char **argv)
 {
-    check(argc == 4, "expected control, outer RAM, and slot layout file descriptors");
+    check(argc == 5, "expected control, outer RAM, slot layout, and guest slot address");
     int control = (int)number(argv[1], INT_MAX);
     int outer_ram = (int)number(argv[2], INT_MAX);
     int layout = (int)number(argv[3], INT_MAX);
+    uint64_t guest_phys_addr = number(argv[4], UINT32_MAX);
     size_t slot_bytes;
     void *slot = flexvm_map_slot(outer_ram, layout, &slot_bytes);
     check(slot != MAP_FAILED, "map the parent RAM slot");
@@ -51,7 +52,7 @@ int main(int argc, char **argv)
     int vm = ioctl(kvm, KVM_CREATE_VM, 0);
     check(vm >= 0, "create host VM");
     struct kvm_userspace_memory_region memory = {
-        .guest_phys_addr = 4096, .memory_size = slot_bytes, .userspace_addr = (uintptr_t)slot,
+        .guest_phys_addr = guest_phys_addr, .memory_size = slot_bytes, .userspace_addr = (uintptr_t)slot,
     };
     check(ioctl(vm, KVM_SET_USER_MEMORY_REGION, &memory) == 0, "register shared page");
     int cpu = ioctl(vm, KVM_CREATE_VCPU, 0);
@@ -66,14 +67,29 @@ int main(int argc, char **argv)
     struct kvm_regs registers;
 
     check(write(control, "R", 1) == 1, "announce worker readiness");
-    unsigned char request[1 + sizeof(registers)];
+    unsigned char request[1 + sizeof(segments)];
     ssize_t received;
     while ((received = recv(control, request, sizeof(request), MSG_TRUNC)) != 0) {
         if (received < 0 && errno == EINTR) continue;
-        if (received == sizeof(request) && request[0] == 'S') {
+        if (received == 1 + sizeof(registers) && request[0] == 'S') {
             memcpy(&registers, request + 1, sizeof(registers));
             check(ioctl(cpu, KVM_SET_REGS, &registers) == 0, "write host registers");
             check(write(control, "S", 1) == 1, "acknowledge host register write");
+            continue;
+        }
+        if (received == sizeof(request) && request[0] == 'P') {
+            struct kvm_sregs setup;
+            memcpy(&setup, request + 1, sizeof(setup));
+            segments.cs = setup.cs;
+            segments.ds = setup.ds;
+            segments.es = setup.es;
+            segments.fs = setup.fs;
+            segments.gs = setup.gs;
+            segments.ss = setup.ss;
+            segments.gdt = setup.gdt;
+            segments.cr0 |= setup.cr0;
+            check(ioctl(cpu, KVM_SET_SREGS, &segments) == 0, "configure host protected mode");
+            check(write(control, "P", 1) == 1, "acknowledge host protected mode");
             continue;
         }
         if (received == 1 && request[0] == 'G') {

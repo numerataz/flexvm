@@ -40,7 +40,8 @@ int main(void)
     pid_t child = fork();
     check(child >= 0, "fork the KVM client");
     if (child == 0) {
-        execl("/kvm-run", "kvm-run", pages, NULL);
+        const char *mode = access("/protected-entry", F_OK) == 0 ? "protected" : NULL;
+        execl("/kvm-run", "kvm-run", pages, mode, NULL);
         _exit(127);
     }
     int status;
