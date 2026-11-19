@@ -1564,7 +1564,7 @@ def guest_poweroff():
             except Exception as cleanup_error:
                 if original_error is None:
                     raise
-                original_error.add_note(f"{phase}: cleanup failed: {cleanup_error}")
+                print(f"{phase}: cleanup failed: {cleanup_error}", file=sys.stderr, flush=True)
         check(f"{phase}: no VM records left", not any(records.values()), records)
 
 
