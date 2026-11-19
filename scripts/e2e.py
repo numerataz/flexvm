@@ -1545,19 +1545,26 @@ def guest_poweroff():
             finally:
                 os.close(fd)
         finally:
-            if release_blocked:
-                cleared = B.cli("debug", "fault", "status", "0", check=False)
-                if cleared.returncode:
-                    print(f"{phase}: could not restore migration status replies: {cleared.stderr.strip()}", flush=True)
-                elif not wait_for(lambda: A.ps().get(vm, {}).get("state") != "source", 10):
-                    print(f"{phase}: source still retained during cleanup: {A.ps().get(vm)}", flush=True)
-            for label, peer in (("A", A), ("B", B)):
-                removed = peer.rm(vm, force=True, check=False)
-                print(f"{phase}: cleanup {label}: exit={removed.returncode} stdout={removed.stdout!r} stderr={removed.stderr!r}", flush=True)
-            clear_checkpoints(A, B)
-            records = {label: peer.ps().get(vm) for label, peer in (("A", A), ("B", B))}
-            if any(records.values()):
-                print(f"{phase}: remaining VM records: {records}", flush=True)
+            original_error = sys.exc_info()[1]
+            try:
+                if release_blocked:
+                    cleared = B.cli("debug", "fault", "status", "0", check=False)
+                    if cleared.returncode:
+                        print(f"{phase}: could not restore migration status replies: {cleared.stderr.strip()}", flush=True)
+                for label, peer in (("B", B), ("A", A)):
+                    if phase == "migration" and label == "A":
+                        if not wait_for(lambda: A.ps().get(vm, {}).get("state") != "source", 10):
+                            print(f"{phase}: source still retained during cleanup: {A.ps().get(vm)}", flush=True)
+                    removed = peer.rm(vm, force=True, check=False)
+                    print(f"{phase}: cleanup {label}: exit={removed.returncode} stdout={removed.stdout!r} stderr={removed.stderr!r}", flush=True)
+                clear_checkpoints(A, B)
+                records = {label: peer.ps().get(vm) for label, peer in (("A", A), ("B", B))}
+                if any(records.values()):
+                    print(f"{phase}: remaining VM records: {records}", flush=True)
+            except Exception as cleanup_error:
+                if original_error is None:
+                    raise
+                original_error.add_note(f"{phase}: cleanup failed: {cleanup_error}")
         check(f"{phase}: no VM records left", not any(records.values()), records)
 
 
