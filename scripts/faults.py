@@ -30,7 +30,7 @@ unusable (--no-kvm).
 """
 from contextlib import ExitStack, contextmanager, suppress
 
-import argparse, base64, fcntl, glob, ipaddress, json, multiprocessing, shlex, shutil, struct, os, re, signal, socket, subprocess, sys, tempfile, termios, threading, time, traceback, types
+import argparse, base64, fcntl, glob, ipaddress, json, multiprocessing, shlex, shutil, stat, struct, os, re, signal, socket, subprocess, sys, tempfile, termios, threading, time, traceback, types
 
 p = argparse.ArgumentParser(usage=__doc__)
 p.add_argument("--a", help="host A's listener (default: a free loopback port)")
@@ -49,6 +49,7 @@ p.add_argument("--state", default=os.environ.get("FLEXVM_STATE_DIR") or "/var/li
 p.add_argument("--ckpt-dir", help="where checkpoint scenarios write checkpoints (removed afterwards; default: this run's own, "
                "under /var/tmp)")
 p.add_argument("--no-skips", action="store_true", help="a skipped scenario counts as a failure")
+p.add_argument("--failure-dir", help="retain bounded console and process evidence before failed-scenario cleanup")
 p.add_argument("--template", default="small")
 p.add_argument("--image", default="public.ecr.aws/docker/library/busybox:1.36",
                help="container image of the app_log and bad_app_log scenarios' template (APP_TEMPLATE names a built one instead)")
@@ -584,6 +585,12 @@ def needs_kvm(scenario):
     return scenario
 
 
+def host_exclusive(scenario):
+    """Needs contiguous host memory; e2e runs it before ordinary parallel workers."""
+    scenario.host_exclusive = True
+    return scenario
+
+
 def log(host, name):
     """What VM processes named `name` on `host` wrote (incoming ones included), removed ones too."""
     try:
@@ -619,6 +626,70 @@ def dump_logs(names, tail=6000):
             except Exception as e:
                 with suppress(Exception):
                     print(f"--- {n} on {h}: its logs could not be printed: {type(e).__name__}: {e}", flush=True)
+
+
+
+def save_failure_evidence(scenario, names):
+    """Best-effort capture while the owned VM work directories and processes exist."""
+    if not args.failure_dir:
+        return
+    try:
+        os.makedirs(args.failure_dir, exist_ok=True)
+        destination = tempfile.mkdtemp(prefix=scenario + "-", dir=args.failure_dir)
+        report = {"scenario": scenario, "hosts": {}, "logs": [], "errors": []}
+        limit = 64 << 20
+        remaining = 256 << 20
+        for label, host in (("a", A), ("b", B)):
+            try:
+                code, out, err = cli(host, "ps", "-a", "--json", timeout=5)
+                if code:
+                    raise RuntimeError(err or out)
+                entries = [entry for entry in json.loads(out) if entry["name"] in names]
+                details = report["hosts"][label] = {"entries": entries, "threads": {}}
+                for entry in entries:
+                    pid = entry.get("pid")
+                    if not pid or starttime_of(pid) != entry.get("start"):
+                        continue
+                    details["threads"][str(pid)] = threads_of(pid)
+                    fc = entry.get("firecracker")
+                    if fc:
+                        # A stale registry PID must not label an unrelated process as this VMM.
+                        with open(f"/proc/{fc}/stat") as f:
+                            fields = f.read().rsplit(")", 1)[1].split()
+                        if int(fields[1]) == pid:
+                            details["threads"][str(fc)] = threads_of(fc)
+            except Exception as error:
+                report["errors"].append(f"host {label} process capture: {type(error).__name__}: {error}")
+            # These directories belong to this isolated test host. Copy before kill
+            # removes its VMM consoles; existing HeldLogs retains VM log tails too.
+            for path in sorted(glob.glob(os.path.join(host.run, "**", "*.log"), recursive=True)):
+                try:
+                    if not remaining:
+                        report["errors"].append("log capture reached its 256 MiB budget")
+                        break
+                    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK), "rb") as source:
+                        metadata = os.fstat(source.fileno())
+                        if not stat.S_ISREG(metadata.st_mode):
+                            raise ValueError("log is not a regular file")
+                        size = metadata.st_size
+                        offset = max(0, size - min(limit, remaining))
+                        source.seek(offset)
+                        data = source.read(min(limit, remaining))
+                    remaining -= len(data)
+                    relative = os.path.relpath(path, host.run)
+                    target = os.path.join(destination, label, relative)
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with open(target, "xb") as output:
+                        output.write(data)
+                    report["logs"].append({"host": label, "path": relative, "bytes": len(data),
+                                           "observed_bytes": size, "offset": offset, "truncated": size > len(data)})
+                except Exception as error:
+                    report["errors"].append(f"host {label} log {path}: {type(error).__name__}: {error}")
+        with open(os.path.join(destination, "report.json"), "x") as output:
+            json.dump(report, output, indent=2)
+        print(f"failure evidence before cleanup: {destination}", flush=True)
+    except Exception as error:
+        print(f"failure evidence capture: {type(error).__name__}: {error}", flush=True)
 
 
 def whole_log(host, name):
@@ -6248,6 +6319,7 @@ def require_huge_pages(blocks):
 
 
 @needs_kvm
+@host_exclusive
 def cow_collapsed():
     """Memory a migration paged in is collapsed into huge pages once the pull is done (#141), and keeps what 4 KiB
     pages guarantee: with the guest rewriting it, a keep-running checkpoint and a delta each hold exactly the memory at
@@ -6301,6 +6373,7 @@ def cow_collapsed():
 
 
 @needs_kvm
+@host_exclusive
 def collapse_abort():
     """A migration that aborts after its source paused, its collapse pass mid-way (#191): the source runs its copy
     again, and the pass goes on to the end instead of leaving the VM on 4 KiB pages for good."""
@@ -6336,6 +6409,7 @@ def collapse_abort():
 
 
 @needs_kvm
+@host_exclusive
 def collapse_ckpt_fail():
     """A `checkpoint --stop` that fails while writing, its quiesce having ended the collapse pass mid-way (#207): the VM
     runs on and the pass starts again and goes on to the end, as after an aborted migration."""
@@ -6429,6 +6503,7 @@ def guest_blocks(host, name):
 
 
 @needs_kvm
+@host_exclusive
 def unplug_collapsed():
     """virtio-mem unplug of memory collapsed into huge pages after a migration (#141): the guest moves the data out of
     the blocks it gives back, Firecracker discards them (2 MiB blocks, whole huge pages), every huge page in them is
@@ -13297,6 +13372,8 @@ try:
             traceback.print_exc()
             check(f"{s}: raised {type(e).__name__}", False, e)
         finally:
+            if failures != before:
+                save_failure_evidence(s, scenario_vms)
             disarm()
             for n in scenario_vms:
                 for h in (A, B):
