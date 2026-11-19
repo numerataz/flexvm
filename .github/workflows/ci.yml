@@ -217,9 +217,28 @@ jobs:
         run: |
           sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --image "$RUNNER_TEMP/software-systemd-image" --workload scripts/compat/workloads/user-sessions.sh --boot systemd --mem 2048 --timeout 900 --require storage.fuse --output "$RUNNER_TEMP/software-user-sessions"
           cat "$RUNNER_TEMP/software-user-sessions/report.json"
+      - name: Restore pinned Alpine base for OpenRC
+        id: openrc-alpine-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/openrc-alpine-oci
+          key: openrc-alpine-v1-${{ runner.arch }}-${{ hashFiles('scripts/compat/workload-fixture.py') }}
+      - name: Verify pinned Alpine base for OpenRC
+        run: |
+          if [[ ! -d "$RUNNER_TEMP/openrc-alpine-oci" ]] && ! command -v skopeo >/dev/null; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q --no-install-recommends skopeo
+          fi
+          python3 scripts/compat/workload-fixture.py --alpine --cache "$RUNNER_TEMP/openrc-alpine-oci"
+      - name: Save verified Alpine base for OpenRC
+        if: steps.openrc-alpine-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/openrc-alpine-oci
+          key: ${{ steps.openrc-alpine-cache.outputs.cache-primary-key }}
       - name: OpenRC PID 1 and fresh-owner restore without virtualization devices
         run: |
-          sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/openrc-image.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-openrc-image"
+          sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/openrc-image.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --alpine-layout "$RUNNER_TEMP/openrc-alpine-oci" --output "$RUNNER_TEMP/software-openrc-image"
           sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --image "$RUNNER_TEMP/software-openrc-image" --workload scripts/compat/workloads/distro-openrc.sh --boot openrc --mem 1536 --timeout 900 --require storage.fuse --output "$RUNNER_TEMP/software-openrc"
           cat "$RUNNER_TEMP/software-openrc/report.json"
       - name: Unchanged KVM clients inside software FlexVM
@@ -807,6 +826,22 @@ jobs:
         with:
           path: ${{ runner.temp }}/ubuntu-workload-oci
           key: ${{ steps.ubuntu-workload-cache.outputs.cache-primary-key }}
+      - name: Restore pinned Alpine base for OpenRC
+        if: env.KVM == 'true'
+        id: openrc-alpine-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/openrc-alpine-oci
+          key: openrc-alpine-v1-${{ runner.arch }}-${{ hashFiles('scripts/compat/workload-fixture.py') }}
+      - name: Verify pinned Alpine base for OpenRC
+        if: env.KVM == 'true'
+        run: python3 scripts/compat/workload-fixture.py --alpine --cache "$RUNNER_TEMP/openrc-alpine-oci"
+      - name: Save verified Alpine base for OpenRC
+        if: env.KVM == 'true' && steps.openrc-alpine-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/openrc-alpine-oci
+          key: ${{ steps.openrc-alpine-cache.outputs.cache-primary-key }}
       - name: End-to-end tests
         env:
           SHARD: ${{ matrix.shard }}
@@ -815,7 +850,7 @@ jobs:
           set -- $SHARD
           jobs=4; if [ "$1" = heavy ]; then jobs=1; fi
           kvm=--require-kvm; if [ "$KVM" != true ]; then kvm=--no-kvm; fi
-          sudo env FLEXVM_WORKLOAD_FIXTURE="$RUNNER_TEMP/workload-fixture" FLEXVM_COMPAT_APP_IMAGE="$RUNNER_TEMP/ubuntu-workload-oci" python3 -u scripts/e2e.py --shard "$1" ${2:+--split "$2"} --jobs "$jobs" --no-skips "$kvm" --image "$E2E_IMAGE" --image-cache "$RUNNER_TEMP/image-cache" --test-image "/var/lib/flexvm-test-image" --log-dir "$RUNNER_TEMP/e2e-logs"
+          sudo env FLEXVM_WORKLOAD_FIXTURE="$RUNNER_TEMP/workload-fixture" FLEXVM_COMPAT_APP_IMAGE="$RUNNER_TEMP/ubuntu-workload-oci" FLEXVM_OPENRC_ALPINE_LAYOUT="$RUNNER_TEMP/openrc-alpine-oci" python3 -u scripts/e2e.py --shard "$1" ${2:+--split "$2"} --jobs "$jobs" --no-skips "$kvm" --image "$E2E_IMAGE" --image-cache "$RUNNER_TEMP/image-cache" --test-image "/var/lib/flexvm-test-image" --log-dir "$RUNNER_TEMP/e2e-logs"
       - name: Test image made
         id: test-image-made
         if: always() && steps.test-image-cache.outputs.cache-hit != 'true'

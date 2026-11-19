@@ -2616,8 +2616,9 @@ def openrc_test_image():
     if (output / "index.json").exists():
         return str(output)
     builder = "e2e-openrc-builder"
+    image = fixture["base_image"](ENV.get("FLEXVM_OPENRC_ALPINE_LAYOUT"))
     A.cli("pull", "--tag", "ci-openrc-builder", "--max", "1024", "--vcpus", "2",
-          "--cmd", '["/bin/sleep","1800"]', fixture["IMAGE"], timeout=300)
+          "--cmd", '["/bin/sleep","1800"]', image, timeout=300)
     dns = json.load(open(os.path.join(A.state_dir, "host.json"))).get("dns")
     try:
         A.configure(dns=ENV["FLEXVM_TEST_DNS"].split())

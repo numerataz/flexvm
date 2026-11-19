@@ -17,6 +17,7 @@ import tempfile
 SOURCE = 'public.ecr.aws/docker/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662'
 PIN = SOURCE.split('@')[1]
 UBUNTU = 'docker.io/library/ubuntu@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8'
+ALPINE = 'docker.io/library/alpine@sha256:469c9ea410b9215eaee7976ba6c0639039b444be8e5d638f7abbada189971eb2'
 TAG = 'docker.io/flexvm/busybox:compat'
 LIMIT = 64 << 20
 
@@ -193,18 +194,17 @@ def prepare(cache, output, arch, source=SOURCE):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--cache', type=Path, required=True)
-    parser.add_argument('--output', type=Path, help='directory for the BusyBox Docker archive and metadata')
-    parser.add_argument('--ubuntu', action='store_true', help='prepare a verified Ubuntu OCI layout in the cache')
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--output', type=Path, help='directory for the BusyBox Docker archive and metadata')
+    mode.add_argument('--ubuntu', action='store_const', const=UBUNTU, dest='source', help='prepare a verified Ubuntu OCI layout')
+    mode.add_argument('--alpine', action='store_const', const=ALPINE, dest='source', help='prepare a verified Alpine OCI layout')
     parser.add_argument('--arch', choices=('amd64', 'arm64'),
                         default={'x86_64': 'amd64', 'aarch64': 'arm64'}.get(platform.machine()))
     args = parser.parse_args()
     if args.arch is None:
         parser.error('native x86_64 or aarch64 is required')
-    if args.ubuntu == (args.output is not None):
-        parser.error("choose --ubuntu for OCI or --output for the BusyBox archive")
     try:
-        source = UBUNTU if args.ubuntu else SOURCE
-        print(json.dumps(prepare(args.cache.absolute(), args.output, args.arch, source), indent=2))
+        print(json.dumps(prepare(args.cache.absolute(), args.output, args.arch, args.source or SOURCE), indent=2))
     except (OSError, ValueError, KeyError, TypeError, tarfile.TarError, subprocess.SubprocessError) as error:
         parser.exit(1, f'fixture preparation failed: {error}\n')
 
