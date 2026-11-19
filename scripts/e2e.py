@@ -1438,6 +1438,7 @@ def guest_poweroff():
     """Unchanged Linux reboot(RB_POWER_OFF) terminates the VMM after each restore path."""
     for phase in ("run", "suspend", "checkpoint", "migration"):
         vm, host = f"e2e-poweroff-{phase}", A
+        release_blocked = False
         A.run(vm)
         try:
             if phase == "suspend":
@@ -1447,6 +1448,10 @@ def guest_poweroff():
                 saved = A.checkpoint(vm, stop=True)
                 A.restore(saved["id"])
             elif phase == "migration":
+                # Let the guest migrate and shut down while the old owner
+                # cannot yet learn that the destination released its memory.
+                release_blocked = True
+                B.cli("debug", "fault", "status", "120000")
                 A.migrate(vm, B)
                 host = B
             entry = host.ps()[vm]
@@ -1464,8 +1469,14 @@ def guest_poweroff():
                 check(f"{phase}: actual VMM exits on guest poweroff", bool(poll.poll(10000)), result)
                 check(f"{phase}: owner retires after VMM exits", wait_for(lambda: not alive(entry["pid"]), 10), host.ps().get(vm))
                 if phase == "migration":
-                    # The target exits before the source necessarily observes
-                    # the release and retires its paused owner.
+                    source = A.ps().get(vm)
+                    check("migration: source is retained after target poweroff", source and source["state"] == "source", source)
+                    refused = A.rm(vm, force=True, check=False)
+                    check("migration: force-remove refuses a retained source",
+                          refused.returncode != 0 and "source of a migration in progress" in refused.stderr, refused)
+                    B.cli("debug", "fault", "status", "0")
+                    release_blocked = False
+
                     def source_retired():
                         source = A.ps().get(vm)
                         if source and source.get("state") != "source":
@@ -1477,12 +1488,20 @@ def guest_poweroff():
             finally:
                 os.close(fd)
         finally:
+            if release_blocked:
+                cleared = B.cli("debug", "fault", "status", "0", check=False)
+                if cleared.returncode:
+                    print(f"{phase}: could not restore migration status replies: {cleared.stderr.strip()}", flush=True)
+                elif not wait_for(lambda: A.ps().get(vm, {}).get("state") != "source", 10):
+                    print(f"{phase}: source still retained during cleanup: {A.ps().get(vm)}", flush=True)
             for label, peer in (("A", A), ("B", B)):
                 removed = peer.rm(vm, force=True, check=False)
                 print(f"{phase}: cleanup {label}: exit={removed.returncode} stdout={removed.stdout!r} stderr={removed.stderr!r}", flush=True)
             clear_checkpoints(A, B)
             records = {label: peer.ps().get(vm) for label, peer in (("A", A), ("B", B))}
-            check(f"{phase}: no VM records left", not any(records.values()), records)
+            if any(records.values()):
+                print(f"{phase}: remaining VM records: {records}", flush=True)
+        check(f"{phase}: no VM records left", not any(records.values()), records)
 
 
 @case
