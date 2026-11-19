@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""One x86 KVM I/O exit via a parent TCG worker and a guest PCI mailbox."""
+"""Two x86 KVM I/O exits from the same TCG worker via a guest PCI mailbox."""
 import argparse
 import errno
 import json
@@ -7,6 +7,7 @@ import mmap
 import os
 from pathlib import Path
 import platform
+import re
 import runpy
 import shutil
 import struct
@@ -22,7 +23,7 @@ DEVICES = ("/dev/kvm", "/dev/vhost-vsock", "/dev/vhost-net")
 MIB = 1 << 20
 MAILBOX_SIZE = 64 << 10
 RAM_AT = 4096
-IO_VALUE = 0x42
+IO_VALUES = (0x42, 0xa7)
 OPEN_VM, CLOSE_VM, OPEN_CPU, CLOSE_CPU, RUN = range(1, 6)
 QEMU_OPTIONS = [
     "-nodefaults", "-display", "none", "-monitor", "none", "-nic", "none",
@@ -30,24 +31,62 @@ QEMU_OPTIONS = [
 ]
 
 
-def execute_child(qemu, output, code):
-    ram = os.memfd_create("flexvm-parent-kvm-run", os.MFD_CLOEXEC)
-    try:
-        os.ftruncate(ram, 16 * MIB)
-        os.pwrite(ram, code, RAM_AT)
-        memory = f"memory-backend-file,id=ram,mem-path=/proc/self/fd/{ram},share=on,size=16M"
-        command = [
-            qemu, *QEMU_OPTIONS, "-machine", "pc,accel=tcg,memory-backend=ram", "-m", "16", "-serial", "none",
-            "-object", memory, "-device", "isa-debug-exit,iobase=0x30,iosize=1", "-bios", output / "reset.rom",
-        ]
-        with (output / "child.log").open("wb") as log:
-            child = subprocess.run(command, pass_fds=(ram,), stdout=log, stderr=log, timeout=3)
-        # The debug-exit device encodes the port write in the host process status.
-        if child.returncode != (IO_VALUE << 1) | 1:
-            raise RuntimeError(f"unexpected child exit status {child.returncode}")
-        return child.returncode >> 1, os.pread(ram, len(code), RAM_AT)
-    finally:
-        os.close(ram)
+class Child:
+    def __init__(self, qemu, output, socket_path):
+        self.process = None
+        self.monitor = None
+        self.port = output / "port-io.bin"
+        self.memory = os.memfd_create("flexvm-parent-kvm-run", os.MFD_CLOEXEC)
+        self.exits = []
+        self.timings = []
+        try:
+            os.ftruncate(self.memory, 16 * MIB)
+            memory = f"memory-backend-file,id=ram,mem-path=/proc/self/fd/{self.memory},share=on,size=16M"
+            command = [
+                qemu, *QEMU_OPTIONS, "-machine", "pc,accel=tcg,memory-backend=ram", "-m", "16", "-serial", "none",
+                "-object", memory, "-bios", output / "reset.rom", "-S", "-qmp", f"unix:{socket_path},server=on,wait=off",
+                "-chardev", f"file,id=port,path={self.port}",
+                "-device", "isa-debugcon,iobase=0x30,chardev=port,stop-on-write=on",
+            ]
+            with (output / "child.log").open("wb") as log:
+                self.process = subprocess.Popen(command, pass_fds=(self.memory,), stdout=log, stderr=log)
+            self.monitor = HELPERS["QMP"](socket_path, self.process, time.monotonic() + 3)
+        except BaseException:
+            self.close()
+            raise
+
+    def run(self, code):
+        started = time.monotonic()
+        self.monitor.deadline = started + 3
+        if self.exits:
+            if self.monitor.ask("query-status")["running"] or self.port.read_bytes() != bytes(self.exits):
+                raise RuntimeError("child progressed while the KVM client was stopped")
+            saved = os.pread(self.memory, len(code), RAM_AT)
+            if saved[0x22] or saved[:0x20] != code[:0x20]:
+                raise RuntimeError("child passed the exit or client changed instructions between runs")
+        os.pwrite(self.memory, code, RAM_AT)
+        self.monitor.ask("cont")
+        while True:
+            state = self.monitor.ask("query-status")
+            exits = self.port.read_bytes()
+            if len(exits) > len(self.exits) + 1:
+                raise RuntimeError("child executed beyond the requested I/O exit")
+            if state["status"] == "paused" and len(exits) == len(self.exits) + 1:
+                self.exits.append(exits[-1])
+                self.timings.append(round((time.monotonic() - started) * 1000, 3))
+                return exits[-1], os.pread(self.memory, len(code), RAM_AT)
+            time.sleep(.001)
+
+    def close(self):
+        try:
+            if self.monitor is not None:
+                self.monitor.close()
+        finally:
+            if self.process is not None:
+                if self.process.poll() is None:
+                    self.process.kill()
+                self.process.wait()
+            os.close(self.memory)
 
 
 def exercise(qemu, kernel, output):
@@ -63,10 +102,10 @@ def exercise(qemu, kernel, output):
         "-object", f"memory-backend-file,id=mailbox,mem-path={mailbox},share=on,size=64K",
         "-device", "ivshmem-plain,memdev=mailbox",
     ]
-    expected = (OPEN_VM, OPEN_CPU, RUN, CLOSE_CPU, CLOSE_VM)
+    expected = (OPEN_VM, OPEN_CPU, RUN, RUN, CLOSE_CPU, CLOSE_VM)
     observed = []
-    io_value = None
-    with mailbox.open("w+b") as backing:
+    child = None
+    with tempfile.TemporaryDirectory(prefix="flexvm-kvm-qmp-") as control, mailbox.open("w+b") as backing:
         backing.truncate(MAILBOX_SIZE)
         with mmap.mmap(backing.fileno(), MAILBOX_SIZE) as mapping, (output / "outer.log").open("wb") as log:
             struct.pack_into("<II", mapping, 0, 0x4d564b46, 1)
@@ -82,7 +121,9 @@ def exercise(qemu, kernel, output):
                     if (pending == complete + 1 and len(observed) < len(expected)
                             and opcode == expected[len(observed)] and length == (4096 if opcode == RUN else 0)):
                         if opcode == RUN:
-                            io_value, data = execute_child(qemu, output, mapping[RAM_AT:RAM_AT + length])
+                            if child is None:
+                                child = Child(qemu, output, Path(control) / "child.sock")
+                            io_value, data = child.run(mapping[RAM_AT:RAM_AT + length])
                             mapping[RAM_AT:RAM_AT + length] = data
                             struct.pack_into("<I", mapping, 28, io_value)
                         observed.append(opcode)
@@ -92,19 +133,31 @@ def exercise(qemu, kernel, output):
                 if outer.poll() is None:
                     raise TimeoutError("outer guest did not shut down")
                 guest = (output / "outer.log").read_text(errors="replace")
-                if (outer.returncode != 0 or tuple(observed) != expected or io_value != IO_VALUE
-                        or "PASS /dev/kvm returned the expected port I/O exit" not in guest
+                if (outer.returncode != 0 or tuple(observed) != expected or child is None or tuple(child.exits) != IO_VALUES
+                        or "PASS /dev/kvm returned two port I/O exits" not in guest
                         or "PASS parent KVM guest shutdown" not in guest):
                     raise RuntimeError(f"parent execution proof failed; commands={observed}, see outer.log")
             finally:
-                if outer.poll() is None:
-                    outer.kill()
-                outer.wait()
+                try:
+                    if child is not None:
+                        child.close()
+                finally:
+                    if outer.poll() is None:
+                        outer.kill()
+                    outer.wait()
     return {
         "guest_path": "/dev/kvm", "guest_vmx": False, "guest_svm": False,
         "parent_accelerator": "tcg", "parent_commands": observed,
-        "io_value": io_value, "child_memory_write_visible": True,
+        "io_values": child.exits, "child_memory_write_visible": True, "same_child_worker": True,
+        "client_run_ns": client_timings(guest), "worker_run_ms": child.timings,
     }
+
+
+def client_timings(log):
+    match = re.search(r"KVM_RUN_NS first=(\d+) warm=(\d+)", log)
+    if match is None:
+        raise RuntimeError("missing client run timing")
+    return {"first": int(match[1]), "warm": int(match[2])}
 
 
 def main():
@@ -145,6 +198,7 @@ def main():
         if args.native_oracle:
             HELPERS["run"]([client], 8, output / "native-kvm.log")
             report["same_client_passed_native_kvm"] = True
+            report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
         image = HELPERS["initramfs"](init.read_bytes(), files={
             "kvm-run": client.read_bytes(), "flexvm-pvkvm.ko": (module / "flexvm-pvkvm.ko").read_bytes(),
         })

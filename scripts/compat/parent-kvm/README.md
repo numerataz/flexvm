@@ -4,15 +4,16 @@ The x86 compatibility fixture loads this module into a disposable software VM
 with guest SVM and VMX disabled. A PCI shared-memory mailbox connects it to a
 parent process that starts a separate QEMU TCG worker. A standalone Linux KVM
 client opens `/dev/kvm`, creates a VM and vCPU, maps `kvm_run`, and gets a port
-I/O exit. The child writes a byte back to the client's registered RAM.
+I/O exit. A second `KVM_RUN` resumes the same child. The child reads a byte
+the client changed while it was paused and reports it on the next I/O exit.
 
 The module supports one VM, one vCPU and one copied 4 KiB RAM region. The
-worker executes a single I/O-exit test with a fixed entry point. Full register
-state, repeated execution, live memory mappings, interrupts, and checkpointing
+worker supports byte output to one port with a fixed entry point. Full register
+state, live memory mappings, interrupts, and checkpointing
 remain part of [issue #1501](https://github.com/numerataz/flexvm/issues/1501).
 
-Run the fixture on x86 with a QEMU build that supports sandboxing and the
-prepared kernel build tree for the selected FlexVM kernel.
+Run the fixture on x86 with the QEMU build from `scripts/build-qemu.sh` and
+the prepared kernel build tree for the selected FlexVM kernel.
 
 ```sh
 sudo python3 scripts/compat/parent-kvm-run.py \
@@ -21,4 +22,6 @@ sudo python3 scripts/compat/parent-kvm-run.py \
 ```
 
 On a host with working KVM, add `--native-oracle` to run the same client binary
-against the host kernel before starting the software-only proof.
+against the host kernel before starting the software-only proof. The report
+records first-run and warm re-entry durations, including the mailbox and
+monitor waits on the software path.

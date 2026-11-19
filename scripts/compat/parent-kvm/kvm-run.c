@@ -8,6 +8,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 static void check(bool valid, const char *why)
@@ -15,6 +16,23 @@ static void check(bool valid, const char *why)
     if (valid) return;
     fprintf(stderr, "FAIL parent KVM: %s: %s\n", why, strerror(errno));
     exit(1);
+}
+
+static unsigned long long timed_run(int cpu)
+{
+    struct timespec start, end;
+    check(clock_gettime(CLOCK_MONOTONIC_RAW, &start) == 0, "read start time");
+    check(ioctl(cpu, KVM_RUN, 0) == 0, "execute vCPU");
+    check(clock_gettime(CLOCK_MONOTONIC_RAW, &end) == 0, "read exit time");
+    return (end.tv_sec - start.tv_sec) * 1000000000LL + end.tv_nsec - start.tv_nsec;
+}
+
+static void check_output(struct kvm_run *run, int bytes, unsigned char value)
+{
+    check(run->exit_reason == KVM_EXIT_IO && run->io.direction == KVM_EXIT_IO_OUT &&
+          run->io.size == 1 && run->io.count == 1 && run->io.port == 0x30 &&
+          run->io.data_offset < (unsigned)bytes &&
+          ((unsigned char *)run)[run->io.data_offset] == value, "KVM I/O exit");
 }
 
 int main(void)
@@ -32,8 +50,13 @@ int main(void)
         .guest_phys_addr = 4096, .memory_size = 4096, .userspace_addr = (unsigned long)ram,
     };
     check(ioctl(vm, KVM_SET_USER_MEMORY_REGION, &region) == 0, "register client RAM");
-    /* mov byte [0x1010], 0x56; mov al, 0x42; out 0x30, al */
-    static const unsigned char code[] = {0xc6, 0x06, 0x10, 0x10, 0x56, 0xb0, 0x42, 0xe6, 0x30};
+    static const unsigned char code[] = {
+        0xc6, 0x06, 0x20, 0x10, 0x56, /* mov byte [0x1020], 0x56 */
+        0xb0, 0x42, 0xe6, 0x30,       /* mov al, 0x42; out 0x30, al */
+        0xa0, 0x21, 0x10,             /* mov al, [0x1021] */
+        0xa2, 0x22, 0x10,             /* mov [0x1022], al */
+        0xe6, 0x30, 0xf4,             /* out 0x30, al; hlt */
+    };
     memcpy(ram, code, sizeof(code));
     int cpu = ioctl(vm, KVM_CREATE_VCPU, 0);
     check(cpu >= 0 && (fcntl(cpu, F_GETFD) & FD_CLOEXEC), "vCPU file descriptor");
@@ -51,16 +74,18 @@ int main(void)
     run->immediate_exit = 1;
     check(ioctl(cpu, KVM_RUN, 0) == -1 && errno == EINTR, "immediate exit");
     run->immediate_exit = 0;
-    check(ioctl(cpu, KVM_RUN, 0) == 0, "parent executes L2");
-    check(run->exit_reason == KVM_EXIT_IO && run->io.direction == KVM_EXIT_IO_OUT &&
-          run->io.size == 1 && run->io.count == 1 && run->io.port == 0x30 &&
-          run->io.data_offset < (unsigned)size &&
-          ((unsigned char *)run)[run->io.data_offset] == 0x42, "real KVM I/O exit");
-    check(ram[0x10] == 0x56, "child write visible in the original mapping");
+    unsigned long long first = timed_run(cpu);
+    check_output(run, size, 0x42);
+    check(ram[0x20] == 0x56 && ram[0x22] == 0, "child stopped after its first output");
+    ram[0x21] = 0xa7;
+    unsigned long long second = timed_run(cpu);
+    check_output(run, size, 0xa7);
+    check(ram[0x22] == 0xa7, "child saw the client's write during re-entry");
     munmap(run, size);
     close(cpu);
     munmap(ram, 4096);
     close(kvm);
-    puts("PASS /dev/kvm returned the expected port I/O exit");
+    printf("KVM_RUN_NS first=%llu warm=%llu\n", first, second);
+    puts("PASS /dev/kvm returned two port I/O exits");
     return 0;
 }
