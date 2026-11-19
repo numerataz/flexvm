@@ -4,8 +4,9 @@
  * One VM, one vCPU, one copied real-mode 4 KiB slot, and port-output exits.
  */
 #include <linux/anon_inodes.h>
-#include <linux/delay.h>
+#include <linux/atomic.h>
 #include <linux/fs.h>
+#include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/kref.h>
 #include <linux/kvm.h>
@@ -17,6 +18,7 @@
 #include <linux/sched/mm.h>
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
+#include <linux/wait.h>
 #include "mailbox.h"
 
 struct pvkvm {
@@ -24,6 +26,10 @@ struct pvkvm {
 	struct mutex lock;
 	struct miscdevice misc;
 	void __iomem *mailbox;
+	void __iomem *doorbell;
+	wait_queue_head_t replied;
+	atomic_t interrupt_count;
+	int irq;
 	bool dead;
 	bool vm_open;
 };
@@ -64,9 +70,9 @@ static int request(struct pvkvm *provider, enum pvkvm_command command, void *pag
 		   u8 *io_value)
 {
 	void __iomem *m = provider->mailbox;
-	unsigned long deadline = jiffies + 5 * HZ;
 	u32 before, seq;
-	int status;
+	long waited;
+	int status, interrupts;
 
 	if (provider->dead)
 		return -ENODEV;
@@ -76,29 +82,28 @@ static int request(struct pvkvm *provider, enum pvkvm_command command, void *pag
 		return -EIO;
 	}
 	seq = before + 1;
+	interrupts = atomic_read(&provider->interrupt_count);
 	if (page)
 		memcpy_toio(m + PVKVM_MEMORY_AT, page, PVKVM_MEMORY_LEN);
 	writel(page ? PVKVM_MEMORY_LEN : 0, m + PVKVM_DATA_SIZE_AT);
 	writel(command, m + PVKVM_COMMAND_AT);
 	wmb();
 	writel(seq, m + PVKVM_REQUEST_AT);
-	while (readl(m + PVKVM_REPLY_AT) != seq) {
-		if (time_after_eq(jiffies, deadline)) {
-			provider->dead = true;
-			return -ETIMEDOUT;
-		}
-		if (command == PVKVM_RUN) {
-			msleep_interruptible(1);
-			if (signal_pending(current)) {
-				/* The parent can still finish this run. A fresh
-				 * provider must use a fresh mailbox.
-				 */
-				provider->dead = true;
-				return -EINTR;
-			}
-		} else {
-			msleep(1);
-		}
+	writel(PVKVM_HOST_VECTOR, provider->doorbell + PVKVM_DOORBELL_AT);
+	if (command == PVKVM_RUN)
+		waited = wait_event_interruptible_timeout(provider->replied,
+				atomic_read(&provider->interrupt_count) != interrupts &&
+				readl(m + PVKVM_REPLY_AT) == seq, 5 * HZ);
+	else
+		waited = wait_event_timeout(provider->replied,
+				atomic_read(&provider->interrupt_count) != interrupts &&
+				readl(m + PVKVM_REPLY_AT) == seq, 5 * HZ);
+	if (waited <= 0) {
+		/* The parent can still finish the request. A fresh provider
+		 * must use a fresh mailbox.
+		 */
+		provider->dead = true;
+		return waited ? -EINTR : -ETIMEDOUT;
 	}
 	rmb();
 	status = (s32)readl(m + PVKVM_STATUS_AT);
@@ -444,18 +449,29 @@ static const struct file_operations device_fops = {
 	.unlocked_ioctl = device_ioctl,
 };
 
+static irqreturn_t reply_ready(int irq, void *data)
+{
+	struct pvkvm *p = data;
+
+	atomic_inc(&p->interrupt_count);
+	wake_up(&p->replied);
+	return IRQ_HANDLED;
+}
+
 static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
 	struct pvkvm *p;
 	int result;
 
 	BUILD_BUG_ON(sizeof(struct run_page) > PAGE_SIZE);
-	if (pci_resource_len(dev, 2) < PVKVM_MEMORY_AT + PVKVM_MEMORY_LEN)
+	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
+	    pci_resource_len(dev, 2) < PVKVM_MEMORY_AT + PVKVM_MEMORY_LEN)
 		return -ENODEV;
 	result = pcim_enable_device(dev);
 	if (result)
 		return result;
-	result = pcim_iomap_regions(dev, BIT(2), KBUILD_MODNAME);
+	pci_set_master(dev);
+	result = pcim_iomap_regions(dev, BIT(0) | BIT(2), KBUILD_MODNAME);
 	if (result)
 		return result;
 	p = kzalloc(sizeof(*p), GFP_KERNEL);
@@ -463,24 +479,41 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 		return -ENOMEM;
 	kref_init(&p->refs);
 	mutex_init(&p->lock);
+	init_waitqueue_head(&p->replied);
+	atomic_set(&p->interrupt_count, 0);
+	p->doorbell = pcim_iomap_table(dev)[0];
 	p->mailbox = pcim_iomap_table(dev)[2];
-	if (readl(p->mailbox + PVKVM_MAGIC_AT) != PVKVM_MAGIC ||
+	if (readl(p->doorbell + PVKVM_IVPOSITION_AT) != PVKVM_GUEST_POSITION ||
+	    readl(p->mailbox + PVKVM_MAGIC_AT) != PVKVM_MAGIC ||
 	    readl(p->mailbox + PVKVM_VERSION_AT) != PVKVM_VERSION ||
 	    readl(p->mailbox + PVKVM_REQUEST_AT) || readl(p->mailbox + PVKVM_REPLY_AT)) {
-		kfree(p);
-		return -ENODEV;
+		result = -ENODEV;
+		goto free_provider;
 	}
+	result = pci_alloc_irq_vectors(dev, 1, 1, PCI_IRQ_MSIX);
+	if (result < 0)
+		goto free_provider;
+	p->irq = pci_irq_vector(dev, 0);
+	result = request_irq(p->irq, reply_ready, 0, KBUILD_MODNAME, p);
+	if (result)
+		goto free_vectors;
 	p->misc.minor = 232;
 	p->misc.name = "kvm";
 	p->misc.fops = &device_fops;
 	p->misc.mode = 0600;
 	result = misc_register(&p->misc);
-	if (result) {
-		kfree(p);
-		return result;
-	}
+	if (result)
+		goto release_irq;
 	pci_set_drvdata(dev, p);
 	return 0;
+
+release_irq:
+	free_irq(p->irq, p);
+free_vectors:
+	pci_free_irq_vectors(dev);
+free_provider:
+	kfree(p);
+	return result;
 }
 
 static void pvkvm_remove(struct pci_dev *dev)
@@ -492,6 +525,8 @@ static void pvkvm_remove(struct pci_dev *dev)
 	p->dead = true;
 	p->mailbox = NULL;
 	mutex_unlock(&p->lock);
+	free_irq(p->irq, p);
+	pci_free_irq_vectors(dev);
 	kref_put(&p->refs, provider_free);
 }
 
