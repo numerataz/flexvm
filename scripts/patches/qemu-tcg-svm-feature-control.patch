@@ -1,0 +1,30 @@
+--- a/target/i386/tcg/system/misc_helper.c
++++ b/target/i386/tcg/system/misc_helper.c
+@@ -140,6 +140,14 @@
+         ((uint64_t)((uint32_t)env->regs[R_EDX]) << 32);
+ 
+     switch ((uint32_t)env->regs[R_ECX]) {
++    case MSR_IA32_FEATURE_CONTROL:
++        /* SVM CPUs have no Intel feature-control MSR. Do not silently accept
++         * it as an unknown MSR and expose false host capabilities to KVM.
++         */
++        if (env->features[FEAT_8000_0001_ECX] & CPUID_EXT3_SVM) {
++            goto error;
++        }
++        break;
+     case MSR_IA32_SYSENTER_CS:
+         env->sysenter_cs = val & 0xffff;
+         break;
+@@ -334,6 +342,12 @@
+     cpu_svm_check_intercept_param(env, SVM_EXIT_MSR, 0, GETPC());
+ 
+     switch ((uint32_t)env->regs[R_ECX]) {
++    case MSR_IA32_FEATURE_CONTROL:
++        if (env->features[FEAT_8000_0001_ECX] & CPUID_EXT3_SVM) {
++            raise_exception_err_ra(env, EXCP0D_GPF, 0, GETPC());
++        }
++        val = 0;
++        break;
+     case MSR_IA32_SYSENTER_CS:
+         val = env->sysenter_cs;
+         break;
