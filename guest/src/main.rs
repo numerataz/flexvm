@@ -595,7 +595,7 @@ fn serve_serial(statuses: Statuses, sessions: session::Sessions) -> io::Result<(
     // One dispatcher preserves quick-request ordering, just like the vsock
     // accept loop. Session bodies/attachments still run concurrently.
     thread::Builder::new().name("serial-requests".into()).spawn(move || {
-        for stream in requests {
+        for stream in requests.into_iter().filter_map(control::IncomingRequest::wait_for_payload) {
             accept_request(File::from(OwnedFd::from(stream)), &statuses, &sessions, Some(&admission));
         }
     })?;
