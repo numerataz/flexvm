@@ -11,11 +11,13 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 
 SOURCE = 'public.ecr.aws/docker/library/busybox@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662'
 PIN = SOURCE.split('@')[1]
+BUSYBOX_DOCKER_HUB = 'docker.io/library/busybox'
 UBUNTU = 'docker.io/library/ubuntu@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8'
 ALPINE = 'docker.io/library/alpine@sha256:469c9ea410b9215eaee7976ba6c0639039b444be8e5d638f7abbada189971eb2'
 TAG = 'docker.io/flexvm/busybox:compat'
@@ -151,23 +153,34 @@ def canonical_archive(source, target):
                 output.addfile(canonical, archive.extractfile(entry))
 
 
-def prepare(cache, output, arch, source=SOURCE):
+def download(cache, arch, source, remote):
     pin = PIN if source == SOURCE else source.split('@')[1]
+    with tempfile.TemporaryDirectory(prefix='.' + cache.name + '-', dir=cache.parent) as temporary:
+        stage = Path(temporary) / 'oci'
+        upstream = subprocess.check_output(['skopeo', 'inspect', '--raw', 'docker://' + remote], timeout=120)
+        if digest(upstream) != pin:
+            raise ValueError('downloaded fixture index differs from the pin')
+        subprocess.run(['skopeo', 'copy', '--preserve-digests', '--override-os', 'linux', '--override-arch', arch,
+                        'docker://' + remote, f'oci:{stage}:fixture'], check=True, timeout=180)
+        (stage / 'upstream-index.json').write_bytes(upstream)
+        validate_cache(stage, arch, source)
+        stage.rename(cache)
+
+
+def prepare(cache, output, arch, source=SOURCE):
     cache.parent.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(cache.parent / (cache.name + '.lock'), os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, 'a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if not cache.exists():
-            with tempfile.TemporaryDirectory(prefix='.' + cache.name + '-', dir=cache.parent) as temporary:
-                stage = Path(temporary) / 'oci'
-                upstream = subprocess.check_output(['skopeo', 'inspect', '--raw', 'docker://' + source], timeout=120)
-                if digest(upstream) != pin:
-                    raise ValueError('downloaded fixture index differs from the pin')
-                subprocess.run(['skopeo', 'copy', '--preserve-digests', '--override-os', 'linux', '--override-arch', arch,
-                                'docker://' + source, f'oci:{stage}:fixture'], check=True, timeout=180)
-                (stage / 'upstream-index.json').write_bytes(upstream)
-                validate_cache(stage, arch, source)
-                stage.rename(cache)
+            if source == SOURCE:
+                try:
+                    download(cache, arch, source, f'{BUSYBOX_DOCKER_HUB}@{PIN}')
+                except subprocess.SubprocessError:
+                    print('BusyBox download from Docker Hub failed; trying ECR Public', file=sys.stderr)
+                    download(cache, arch, source, source)
+            else:
+                download(cache, arch, source, source)
         identity = validate_cache(cache, arch, source)
         if output is None:
             return identity
