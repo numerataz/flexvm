@@ -270,6 +270,17 @@ class Host:
     def wait_state(self, vm, state, timeout=60):
         assert wait_for(lambda: self.ps().get(vm, {}).get("state") == state, timeout), (vm, self.ps().get(vm))
 
+    def wait_local_memory(self, vm):
+        status = {}
+
+        def pulled():
+            nonlocal status
+            status = json.loads(self.cli("debug", vm, "status", timeout=5).stdout)
+            return status["failed"] is not None or status["remote_left"] == 0
+
+        ready = wait_for(pulled, 60)
+        check("all restored pages are local", ready and status["failed"] is None, status)
+
     # VM commands
     def run_json(self, vm=None, template=None, ip=None, extra=()):
         """Starts a VM (in the background; without a name flexvm makes one up); returns its JSON."""
@@ -2711,6 +2722,7 @@ def distro_openrc():
         saved = A.checkpoint(vm, stop=True)
         A.restore(saved["id"])
         observe("checkpoint")
+        A.wait_local_memory(vm)
         A.migrate(vm, B)
         host = B
         observe("migration")
@@ -2868,6 +2880,7 @@ def distro_systemd():
         saved = A.checkpoint(vm, stop=True)
         A.restore(saved["id"])
         observe("checkpoint")
+        A.wait_local_memory(vm)
         A.migrate(vm, B)
         host = B
         observe("migration")
@@ -2898,6 +2911,7 @@ def distro_systemd():
         dns = json.load(open(os.path.join(host.state_dir, "host.json"))).get("dns")
         try:
             host.configure(dns=["203.0.113.53"])
+            host.wait_local_memory(vm)
             saved = host.checkpoint(vm, stop=True)
             host.restore(saved["id"], ip="auto")
             execute("cat /etc/resolv.conf; grep -Fx 'nameserver 203.0.113.53' /etc/resolv.conf")
