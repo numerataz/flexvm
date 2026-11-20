@@ -1011,7 +1011,7 @@ impl Pager {
 
     /// A uffd ioctl, `arg` being its struct (all 64-bit words).
     fn ioctl(&self, req: libc::c_ulong, arg: &mut [u64]) -> io::Result<()> {
-        match unsafe { libc::ioctl(self.uffd.get().unwrap().as_raw_fd(), req, arg.as_mut_ptr()) } {
+        match unsafe { libc::ioctl(self.uffd.get().unwrap().as_raw_fd(), req as _, arg.as_mut_ptr()) } {
             0.. => Ok(()),
             _ => Err(io::Error::last_os_error()),
         }

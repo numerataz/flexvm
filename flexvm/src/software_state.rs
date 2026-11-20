@@ -110,6 +110,10 @@ impl Disk {
     }
 }
 
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -119,6 +123,10 @@ pub struct Manifest {
     pub snapshot_id: String,
     pub identity_generation: u64,
     pub memory_mib: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_memory_mib: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub plugged_mib: u64,
     pub vcpus: u32,
     pub paused: bool,
     pub terminal: bool,
@@ -172,6 +180,15 @@ impl Manifest {
             || self.barrier_sequence == 0
         {
             bail!("software state has invalid ownership, session or barrier identity");
+        }
+        let max_mib = self.max_memory_mib.unwrap_or(self.memory_mib);
+        if max_mib < self.memory_mib
+            || max_mib > 1_048_576
+            || (max_mib > self.memory_mib && !(max_mib - self.memory_mib).is_multiple_of(2))
+            || self.plugged_mib > u64::from(max_mib - self.memory_mib)
+            || (self.plugged_mib > 0 && !self.plugged_mib.is_multiple_of(2))
+        {
+            bail!("software state has invalid elastic memory bounds");
         }
         if let Some(parent) = &self.parent {
             if !matches!(self.profile.architecture.as_str(), "aarch64" | "x86_64")
@@ -874,13 +891,13 @@ pub fn describe(path: &Path, name: &str) -> Result<serde_json::Value> {
             image: manifest.image.source,
             digest: manifest.image.digest,
             argv: manifest.image.argv,
-            ram_mib: manifest.memory_mib,
+            ram_mib: manifest.memory_mib.saturating_add(u32::try_from(manifest.plugged_mib).unwrap_or(u32::MAX)),
         },
         ip: crate::qemu::Network::from_profile(&manifest.profile).map(crate::qemu::Network::ip),
         gen: manifest.identity_generation,
         vcpus: manifest.vcpus,
-        max_mib: u64::from(manifest.memory_mib),
-        cmd: true,
+        max_mib: u64::from(manifest.max_memory_mib.unwrap_or(manifest.memory_mib)),
+        cmd: manifest.image.boot.is_app(),
         state: if grant.is_some() { "quarantined" } else { "suspended" }.into(),
         ..Default::default()
     };
@@ -1032,7 +1049,7 @@ impl Staging {
         }
         if previous.is_some() {
             let (from, to) = (util::cpath(&self.path)?, util::cpath(&target)?);
-            if unsafe { libc::renameat2(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), libc::RENAME_EXCHANGE) } < 0 {
+            if util::rename_at(libc::AT_FDCWD, &from, libc::AT_FDCWD, &to, libc::RENAME_EXCHANGE) < 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
         } else if !util::rename_noreplace(&self.path, &target)? {
@@ -1176,6 +1193,8 @@ mod tests {
             snapshot_id: "abcdef0123456789abcdef0123456789".into(),
             identity_generation: 1,
             memory_mib: 512,
+            max_memory_mib: None,
+            plugged_mib: 0,
             vcpus: 1,
             paused: false,
             terminal: true,
@@ -1476,7 +1495,7 @@ mod tests {
         fs::write(canonical.join("live-input"), b"must remain linked").unwrap();
         let stale = private_directory(&stage).unwrap();
         let (from, to) = (util::cpath(&stage).unwrap(), util::cpath(&canonical).unwrap());
-        assert_eq!(unsafe { libc::renameat2(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), libc::RENAME_EXCHANGE) }, 0);
+        assert_eq!(util::rename_at(libc::AT_FDCWD, &from, libc::AT_FDCWD, &to, libc::RENAME_EXCHANGE), 0);
         // The sweeper's fd pins the newly published bundle, but its old path
         // names the consumed inputs. Locking that fd cannot authorize deletion.
         sweep_entry(&stale, &stage, true).unwrap();
@@ -1673,5 +1692,96 @@ mod tests {
         assert_eq!(fs::read(path.join("manifest.json")).unwrap(), before);
         assert!(open(&path, &profile).is_ok());
         assert!(fs::read_dir(&*root).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with(".software-stage-")));
+    }
+
+    #[test]
+    fn manifest_validate_checks_elastic_memory_bounds() {
+        let valid_artifact = Artifact { bytes: 64, sha256: "a".repeat(64) };
+        let base = || {
+            let mut m = manifest(Profile { architecture: std::env::consts::ARCH.into(), arguments: Vec::new() });
+            m.engine = valid_artifact.clone();
+            m.kernel = valid_artifact.clone();
+            m.rootfs = valid_artifact.clone();
+            m.state = valid_artifact.clone();
+            m
+        };
+
+        for (max_memory_mib, plugged_mib) in
+            [(None, 0), (Some(512), 0), (Some(1024), 0), (Some(1024), 256), (Some(1024), 512), (Some(1_048_576), 1_048_576 - 512)]
+        {
+            let mut m = base();
+            m.max_memory_mib = max_memory_mib;
+            m.plugged_mib = plugged_mib;
+            m.validate().unwrap_or_else(|e| panic!("expected valid ({max_memory_mib:?}, {plugged_mib}): {e}"));
+        }
+
+        for (label, max_memory_mib, plugged_mib) in [
+            ("max < memory", Some(256), 0),
+            ("max > 1_048_576", Some(1_048_578), 0),
+            ("odd hotplug size", Some(515), 0),
+            ("plugged without max", None, 2),
+            ("plugged > max - mem", Some(1024), 514),
+            ("odd plugged_mib", Some(1024), 3),
+            ("plugged_mib >= 2^32", Some(1024), 1u64 << 32),
+        ] {
+            let mut m = base();
+            m.max_memory_mib = max_memory_mib;
+            m.plugged_mib = plugged_mib;
+            assert!(m.validate().is_err(), "expected rejection for {label}");
+        }
+    }
+
+    #[test]
+    fn describe_reports_elastic_plugged_and_max_memory() {
+        let root = TempDir::new("software-describe-elastic");
+        let (plain_path, _profile) = checkpoint(&root);
+        let plain = describe(&plain_path, "plain-vm").unwrap();
+        assert_eq!(plain["backend"]["ram_mib"], json!(512));
+        assert_eq!(plain["max_mib"], json!(512));
+
+        let inputs = Inputs {
+            engine: source(&root, "elastic-engine", b"engine"),
+            kernel: source(&root, "elastic-kernel", b"kernel"),
+            rootfs: source(&root, "elastic-rootfs", b"rootfs"),
+            firmware: firmware_names().iter().map(|name| (name.to_string(), source(&root, &format!("elastic-{name}"), name.as_bytes()))).collect(),
+        };
+        let profile = Profile { architecture: std::env::consts::ARCH.into(), arguments: vec!["native-profile".into()] };
+        let mut m = manifest(profile);
+        m.max_memory_mib = Some(2048);
+        m.plugged_mib = 256;
+        let mut staging = Staging::new(&root).unwrap();
+        staging.state.write_all(b"saved-state").unwrap();
+        let elastic_path = root.join("elastic-checkpoint");
+        staging.commit(&elastic_path, &inputs, m).unwrap().retire().unwrap();
+
+        let elastic = describe(&elastic_path, "elastic-vm").unwrap();
+        assert_eq!(elastic["backend"]["ram_mib"], json!(768));
+        assert_eq!(elastic["max_mib"], json!(2048));
+    }
+
+    #[test]
+    fn describe_sets_cmd_from_image_boot_profile() {
+        let root = TempDir::new("software-describe-cmd");
+        let (app_path, _profile) = checkpoint(&root);
+        let app = describe(&app_path, "app-vm").unwrap();
+        assert_eq!(app["cmd"], json!(true));
+
+        let inputs = Inputs {
+            engine: source(&root, "distro-engine", b"engine"),
+            kernel: source(&root, "distro-kernel", b"kernel"),
+            rootfs: source(&root, "distro-rootfs", b"rootfs"),
+            firmware: firmware_names().iter().map(|name| (name.to_string(), source(&root, &format!("distro-{name}"), name.as_bytes()))).collect(),
+        };
+        let profile = Profile { architecture: std::env::consts::ARCH.into(), arguments: vec!["native-profile".into()] };
+        let mut m = manifest(profile);
+        m.image.boot = crate::image::BootProfile::Systemd;
+        m.main = Main::Distro(Distro { boot: crate::image::BootProfile::Systemd });
+        let mut staging = Staging::new(&root).unwrap();
+        staging.state.write_all(b"saved-state").unwrap();
+        let distro_path = root.join("distro-checkpoint");
+        staging.commit(&distro_path, &inputs, m).unwrap().retire().unwrap();
+
+        let distro = describe(&distro_path, "distro-vm").unwrap();
+        assert_eq!(distro["cmd"], json!(false));
     }
 }

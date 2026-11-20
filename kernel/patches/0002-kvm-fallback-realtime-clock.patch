@@ -1,0 +1,36 @@
+From: FlexVM maintainers
+Subject: [PATCH] KVM: x86: correlate fallback kvmclock and realtime snapshots
+
+Use one timekeeping snapshot for both raw and realtime timestamps when the
+VM cannot use a master TSC clock. Retain the established boot and VM offsets,
+and do not advertise a stable TSC or a correlated host TSC on this path.
+The 32-bit fallback and existing master-clock path are unchanged.
+
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -3034,7 +3034,25 @@
+ 				   &hv_clock.tsc_to_system_mul);
+ 		data->clock = __pvclock_read_cycles(&hv_clock, data->host_tsc);
+ 	} else {
++#ifdef CONFIG_X86_64
++		struct system_time_snapshot snapshot;
++		ktime_t offs_boot;
++		unsigned int seq;
++
++		/* Correlate both clocks without asserting a stable host TSC. */
++		do {
++			seq = read_seqcount_begin(&pvclock_gtod_data.seq);
++			offs_boot = pvclock_gtod_data.offs_boot;
++			ktime_get_snapshot(&snapshot);
++		} while (read_seqcount_retry(&pvclock_gtod_data.seq, seq));
++
++		data->clock = ktime_to_ns(ktime_add(snapshot.raw, offs_boot)) +
++			      ka->kvmclock_offset;
++		data->realtime = ktime_to_ns(snapshot.real);
++		data->flags |= KVM_CLOCK_REALTIME;
++#else
+ 		data->clock = get_kvmclock_base_ns() + ka->kvmclock_offset;
++#endif
+ 	}
+ 
+ 	put_cpu();

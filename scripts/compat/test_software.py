@@ -255,7 +255,7 @@ class SoftwareCheck(unittest.TestCase):
     def test_c_checks_compile_with_strict_warnings(self):
         sources = ['software-init.c', 'nested-init.c']
         if platform.machine() == 'x86_64':
-            sources.extend(('kvm-abi.c', 'kvm-tsc.c'))
+            sources.extend(('kvm-abi.c', 'kvm-tsc.c', 'kvm-clock.c'))
         elif platform.machine() == 'aarch64':
             sources.append('kvm-arm.c')
         for source in sources:
@@ -340,6 +340,32 @@ class WorkloadSeeds(unittest.TestCase):
                 stream.truncate(256 * 1024 * 1024 + 1)
             with self.assertRaises(ValueError):
                 seed([(str(file), '/nested-input/large')])
+
+    def test_mem_validation_allows_default_zero_and_rejects_out_of_range(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake_bin = root / 'flexvm'
+            fake_kernel = root / 'kernel'
+            fake_workload = root / 'workload.sh'
+            for path in (fake_bin, fake_kernel, fake_workload):
+                path.write_bytes(b'fixture')
+            output = root / 'output'
+            output.mkdir()
+            (output / 'report.json').write_text('{}')
+            env = dict(os.environ, TEST_ARCH=platform.machine())
+            base = [sys.executable, '-c', HELPER, str(ROOT / 'software-workload.py'),
+                    '--bin', str(fake_bin), '--kernel', str(fake_kernel),
+                    '--workload', str(fake_workload), '--output', str(output)]
+            for extra in ([], ['--mem', '0'], ['--mem', '512']):
+                with self.subTest(valid=extra):
+                    result = subprocess.run(base + extra, env=env, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn('output already contains a report', result.stderr)
+            for extra in (['--mem', '-1'], ['--mem', '256'], ['--mem', '16384']):
+                with self.subTest(invalid=extra):
+                    result = subprocess.run(base + extra, env=env, capture_output=True, text=True, timeout=10)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn('--mem 0 or 512..8192', result.stderr)
 
 
 if __name__ == '__main__':

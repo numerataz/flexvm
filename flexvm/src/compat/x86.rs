@@ -141,7 +141,7 @@ fn supported_cpuid(kvm: &std::fs::File) -> Result<Vec<[u32; 6]>> {
     // each entry { function, index, flags, eax, ebx, ecx, edx, padding[3] }.
     let mut buf = vec![0u32; 2 + MAX * 10];
     buf[0] = MAX as u32;
-    crate::syscall_check!(unsafe { libc::ioctl(kvm.as_raw_fd(), 0xc008_ae05, buf.as_mut_ptr()) } < 0, "KVM_GET_SUPPORTED_CPUID");
+    crate::syscall_check!(unsafe { libc::ioctl(kvm.as_raw_fd(), 0xc008_ae05u32 as _, buf.as_mut_ptr()) } < 0, "KVM_GET_SUPPORTED_CPUID");
     let n = (buf[0] as usize).min(MAX);
     Ok(buf[2..2 + n * 10].chunks(10).map(|e| [e[0], e[1], e[3], e[4], e[5], e[6]]).collect())
 }
@@ -168,10 +168,10 @@ fn saved_msrs(kvm: &std::fs::File) -> Result<BTreeSet<u32>> {
     use std::os::fd::AsRawFd;
     // KVM reports the required size with E2BIG. Do not silently truncate a future kernel's list.
     let mut buf = vec![0u32; 1];
-    let result = unsafe { libc::ioctl(kvm.as_raw_fd(), 0xc004_ae02, buf.as_mut_ptr()) };
+    let result = unsafe { libc::ioctl(kvm.as_raw_fd(), 0xc004_ae02u32 as _, buf.as_mut_ptr()) };
     crate::syscall_check!(result < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::E2BIG), "KVM_GET_MSR_INDEX_LIST");
     buf.resize(1 + buf[0] as usize, 0);
-    crate::syscall_check!(unsafe { libc::ioctl(kvm.as_raw_fd(), 0xc004_ae02, buf.as_mut_ptr()) } < 0, "KVM_GET_MSR_INDEX_LIST");
+    crate::syscall_check!(unsafe { libc::ioctl(kvm.as_raw_fd(), 0xc004_ae02u32 as _, buf.as_mut_ptr()) } < 0, "KVM_GET_MSR_INDEX_LIST");
     Ok(buf[1..].iter().copied().filter(|&index| msr_should_serialize(index)).collect())
 }
 
