@@ -14,14 +14,13 @@
 
 #include "firecracker-net.h"
 #include <linux/if_tun.h>
-#ifdef FLEXVM_PARENT_KVM_APP
+#if defined(FLEXVM_PARENT_KVM_APP) && defined(__x86_64__)
 #include <linux/kvm.h>
 #endif
 
-static void check(bool valid, const char *why)
+static void fail_message(const char *why, const char *detail)
 {
-    if (valid) return;
-    fprintf(stderr, "FAIL parent KVM setup: %s: %s\n", why, strerror(errno));
+    fprintf(stderr, "FAIL parent KVM setup: %s: %s\n", why, detail);
     fflush(NULL);
 #ifndef FLEXVM_PARENT_KVM_APP
     reboot(RB_POWER_OFF);
@@ -29,23 +28,35 @@ static void check(bool valid, const char *why)
     _exit(1);
 }
 
-static void check_child(pid_t child, const char *why)
+static void check(bool valid, const char *why)
+{
+    if (valid) return;
+    fail_message(why, strerror(errno));
+}
+
+static void wait_child(pid_t child, const char *why)
 {
     int status;
-    check(waitpid(child, &status, 0) == child, why);
-    if (WIFEXITED(status) && !WEXITSTATUS(status))
-        return;
-    if (WIFEXITED(status))
-        fprintf(stderr, "FAIL parent KVM setup: %s: exit status %d\n", why, WEXITSTATUS(status));
-    else if (WIFSIGNALED(status))
-        fprintf(stderr, "FAIL parent KVM setup: %s: signal %d\n", why, WTERMSIG(status));
-    else
-        fprintf(stderr, "FAIL parent KVM setup: %s: wait status 0x%x\n", why, status);
-    fflush(NULL);
-#ifndef FLEXVM_PARENT_KVM_APP
-    reboot(RB_POWER_OFF);
-#endif
-    _exit(1);
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    check(waited == child, why);
+    if (WIFEXITED(status)) {
+        if (WEXITSTATUS(status) == 0)
+            return;
+        char detail[64];
+        snprintf(detail, sizeof(detail), "exited with status %d", WEXITSTATUS(status));
+        fail_message(why, detail);
+    }
+    if (WIFSIGNALED(status)) {
+        char detail[64];
+        snprintf(detail, sizeof(detail), "terminated by signal %d", WTERMSIG(status));
+        fail_message(why, detail);
+    }
+    char detail[64];
+    snprintf(detail, sizeof(detail), "unexpected wait status %#x", (unsigned int)status);
+    fail_message(why, detail);
 }
 
 static void persist_tap(bool enabled)
@@ -94,15 +105,16 @@ static void run_firecracker(void)
         execl("/firecracker", "firecracker", "--no-api", "--config-file", "/firecracker.json", NULL);
         _exit(127);
     }
-    check_child(child, "Firecracker exit");
+    wait_child(child, "Firecracker exit");
     if (echo > 0) {
-        check_child(echo, "Firecracker network echo exit");
+        wait_child(echo, "Firecracker network echo exit");
         persist_tap(false);
         puts("PASS Firecracker network echo");
     }
 }
 
 #ifdef FLEXVM_PARENT_KVM_APP
+#ifdef __x86_64__
 static void checkpoint_initial_worker(void)
 {
     int kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
@@ -140,6 +152,7 @@ static void checkpoint_initial_worker(void)
     close(kvm);
     puts("PASS x86 parent KVM staged worker state");
 }
+#endif
 #else
 static void run_kvm_client(void)
 {
@@ -219,7 +232,7 @@ static void run_kvm_client(void)
         execv("/kvm-run", arguments);
         _exit(127);
     }
-    check_child(child, "KVM client exit");
+    wait_child(child, "KVM client exit");
 }
 #endif
 
@@ -232,8 +245,10 @@ int main(void)
         fflush(stdout);
         sleep(6);
     }
+#ifdef __x86_64__
     if (access("/firecracker-initial-checkpoint", F_OK) == 0)
         checkpoint_initial_worker();
+#endif
     run_firecracker();
     run_firecracker();
     puts("PASS parent KVM device reuse");
