@@ -1,24 +1,120 @@
 # flexvm
 
-Elastic Firecracker microVMs. By default, a VM sees the host's CPUs, capped at
-32 and rounded down to even (1 on a single-CPU host), and a memory ceiling of
-host RAM (at most about 528 GiB, what Firecracker's hotplug window holds), but
-only uses what it touches. It starts in about 5 ms, pauses,
-checkpoints and suspends to disk, and live-migrates to another host
-(post-copy) in tens of milliseconds, keeping its address and TCP connections.
+Elastic Firecracker microVMs. By default, a VM sees the host's CPUs (capped at
+32, rounded down to even; 1 on a single-CPU host) and a memory ceiling of host
+RAM (up to ~528 GiB, Firecracker's hotplug window), while only consuming host
+RAM it actually touches. VMs start in ~5 ms from standby, pause, checkpoint and
+suspend to disk, and live-migrate across hosts (post-copy) in tens of
+milliseconds while keeping their IP addresses and open TCP connections.
 
-There is no daemon. `flexvm run` starts a process that *is* the VM: kill the
-process and the VM is gone, send it a signal and the VM pauses or suspends.
+There is no central daemon. `flexvm run` starts a process that *is* the VM:
+kill the process and the VM is gone; send it a signal and the VM pauses or
+suspends. Host-wide coordination lives in small `flock`-guarded files under
+`/var/lib/flexvm` (`STATE`) and `/run/flexvm` (`RUN`).
+
+```sh
+cargo build --release && sudo install target/release/flexvm /usr/local/bin/
+sudo flexvm pull ubuntu:24.04              # build a snapshot template from an OCI image (needs e2fsprogs)
+sudo flexvm run ubuntu:24.04 uname -a      # foreground VM: runs the command and exits with its status
+sudo flexvm run -d --name web nginx:1.27   # background VM: prints {"name", "ip", "pid", ...}
+```
+
+## Contents
+
+- [Architecture](#architecture)
+- [Setup](#setup)
+- [Run a VM](#run-a-vm)
+- [Forward host ports](#forward-host-ports)
+- [Stop, start, pause, kill, rm](#stop-start-pause-kill-rm)
+- [Checkpoint and restore](#checkpoint-and-restore)
+- [Configuration](#configuration)
+- [Migrate](#migrate)
+- [Fast starts](#fast-starts)
+- [Images](#images)
+- [Docker inside a VM](#docker-inside-a-vm)
+- [Docker API](#docker-api)
+- [Paths and knobs](#paths-and-knobs)
+- [Benchmarks](#benchmarks)
+- [Tests](#tests)
+- [How it works](#how-it-works)
+- [Limits](#limits)
+
+## Architecture
+
+Each running VM is an independent `flexvm` OS process (`vmproc`) that owns its
+Firecracker child, userfaultfd pager, network tap and `/32` (and optional
+`/128`) route, host port forwarders, and control socket.
+
+```mermaid
+flowchart TB
+    CLI["flexvm CLI / Docker API (flexvm api)"]
+    LOCK["STATE (/var/lib/flexvm) & RUN (/run/flexvm)\nflock-guarded addrs, locks, templates, checkpoints"]
+    TPL["Shared Template\nsparse mem + read-only rootfs.ext4 (DAX)"]
+
+    subgraph VMPROC["VM Process (one OS process per VM)"]
+        CTRL["Control Socket\nRUN/vms/NAME.sock"]
+        PAGER["UFFD Pager\nlazy fault, prefetch, WP COW, page server"]
+        NET["TAP + /32 (/128) Route\nclsact anti-spoof BPF, port forwarder"]
+        HOLD["Packet Holder\n(pause / migration downtime)"]
+        FC["Firecracker VMM\n(per-VM cgroup2 cpu + memory.high)"]
+        subgraph GUEST["Linux Guest"]
+            INIT["flexvm-init (PID 1)\nvsock agent, mem cgroup /vm, app supervisor"]
+            APP["Container App / Exec Sessions\n(tmpfs overlay over virtio-pmem rootfs)"]
+        end
+    end
+
+    PEER["Peer Host (flexvm listen :7070)\npost-copy arrival, route announce, page pull"]
+
+    CLI -->|"exec / pause / stop / migrate"| CTRL
+    CLI -.->|"flock / read"| LOCK
+    VMPROC <-->|"claim IP, grants, records"| LOCK
+    TPL -->|"UFFDIO_COPY on fault"| PAGER
+    TPL -->|"virtio-pmem DAX (shared page cache)"| FC
+    PAGER <-->|"userfaultfd"| FC
+    FC <-->|"virtio-net"| NET
+    NET -.->|"buffer during pause"| HOLD
+    CTRL <-->|"vsock (exec, stdin, mem grow)"| INIT
+    INIT --> APP
+    PAGER <-->|"TCP page pull (process_vm_readv)"| PEER
+    CTRL <-->|"prepare / vmstate / commit"| PEER
+```
+
+### Post-copy live migration
+
+```mermaid
+sequenceDiagram
+    participant Src as Source VM Process (Host A)
+    participant Peer as Listener / Arrival (Host B)
+    Src->>Peer: 1. Prepare (template ID, CPU/KVM compat, IP claim, pre-spawn Firecracker)
+    Peer-->>Src: Ready
+    Note over Src: 2. Pause vCPUs & hold incoming packets
+    Src->>Peer: 3. Send vCPU/device vmstate (~20–200 KiB) + page-state runs + preload
+    Note over Peer: 4. Load vmstate, announce route/ARP, resume vCPUs
+    Peer-->>Src: Resumed (target owns VM)
+    loop On fault & background pull
+        Peer->>Src: Request missing guest pages
+        Src-->>Peer: Read directly from paused Firecracker via process_vm_readv
+    end
+    Peer->>Src: All pages pulled (release)
+    Note over Src: 5. Destroy paused source & exit
+```
+
+Deep dives: [docs/process-per-vm.md](docs/process-per-vm.md) (process model,
+on-disk state, locking, migration fencing) and
+[docs/internals.md](docs/internals.md) (memory elasticity, UFFD pager,
+copy-on-write checkpoints, packet holds, Firecracker patches).
 
 ## Setup
 
+### State and run directories
+
 Everything flexvm keeps lives in its state directory, `/var/lib/flexvm`: the
 artifacts (`artifacts/`), templates (`templates/`), pulled images
-(`images/`), VMs and the host's configuration (`host.json`). To build a
-binary with another default, set `FLEXVM_STATE_DIR` to an absolute path when
-building (`FLEXVM_STATE_DIR=/srv/flexvm cargo build --release`); `--state`
-still overrides it at run time. This README writes `/var/lib/flexvm` for
-whichever default the binary was built with, except in the run-path rules
+(`images/`), checkpoints (`checkpoints/`), and host configuration (`host.json`).
+To build a binary with another default, set `FLEXVM_STATE_DIR` to an absolute
+path when building (`FLEXVM_STATE_DIR=/srv/flexvm cargo build --release`);
+`--state` still overrides it at run time. This README writes `/var/lib/flexvm`
+for whichever default the binary was built with, except in the run-path rules
 below. The test and lab scripts
 (`e2e.py`, `faults.py`, `test-image.py`, `netlab.sh`, `nettest.sh`, `fetch.sh`,
 `build-firecracker.sh`) take `FLEXVM_STATE_DIR` from the environment too;
@@ -36,12 +132,7 @@ even with `--run`. A binary built with another default therefore uses
 `/run/flexvm-PREFIX`, while an existing `/var/lib/flexvm` keeps working with
 `--state /var/lib/flexvm`, so both can be used side by side.
 
-```sh
-cargo build --release && sudo install target/release/flexvm /usr/local/bin/
-sudo flexvm pull ubuntu:24.04    # pull an image; its template is a cold boot of it, snapshotted (needs e2fsprogs)
-sudo flexvm run ubuntu:24.04 uname -a   # a VM of it (pulled first if missing), in the foreground: runs
-                                       # the command and exits with it
-```
+### Artifacts and requirements
 
 flexvm-init (the guest's PID 1 and agent) is built by the same `cargo build`
 and embedded in the binary. The patched Firecracker and the guest kernel are
@@ -1585,7 +1676,7 @@ copy-on-write, packet holds, clocks, Firecracker patches, measurements).
 
 - Until a migrated VM has pulled all its memory (~1 s per GB) it depends on
   both hosts.
-- IPv4 only; peers form a full mesh; address ranges are per host and set by hand.
+- Peers form a full mesh; address ranges (`vm_ips`, optional `vm_ipv6_prefix`) are configured per host by hand.
 - The peer protocol is plain TCP, served to the peers' addresses only, without
   authentication: trusted networks only. A listed peer can claim any VM
   address for itself (as a newer revision or generation; see Migrate) and
