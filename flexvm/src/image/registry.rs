@@ -182,7 +182,7 @@ impl Connector<()> for PeerConnector {
                     stream.set_nodelay(details.config.no_delay())?;
                     *self.0.lock().unwrap() = Some(stream.peer_addr()?);
                     let buffers = LazyBuffers::new(details.config.input_buffer_size(), details.config.output_buffer_size());
-                    return Ok(Some(PeerTcp { stream, buffers }));
+                    return Ok(Some(PeerTcp { stream, buffers, read_timeout: None, write_timeout: None }));
                 }
                 Err(e) if matches!(e.kind(), ConnectionRefused | HostUnreachable | NetworkUnreachable | AddrNotAvailable | TimedOut | WouldBlock) => {
                     last = Some(e)
@@ -283,6 +283,8 @@ fn connect_cancellable(addr: &std::net::SocketAddr, timeout: Option<Duration>) -
 struct PeerTcp {
     stream: TcpStream,
     buffers: LazyBuffers,
+    read_timeout: Option<Duration>,
+    write_timeout: Option<Duration>,
 }
 
 fn io_error(e: std::io::Error, timeout: NextTimeout) -> ureq::Error {
@@ -324,7 +326,10 @@ impl Transport for PeerTcp {
                 return Err(ureq::Error::Timeout(timeout.reason));
             }
             let n = network_wait(NextTimeout { after: left.into(), reason: timeout.reason }, |wait| {
-                self.stream.set_write_timeout(Some(wait))?;
+                if self.write_timeout != Some(wait) {
+                    self.stream.set_write_timeout(Some(wait))?;
+                    self.write_timeout = Some(wait);
+                }
                 self.stream.write(output)
             })?;
             if n == 0 {
@@ -337,7 +342,10 @@ impl Transport for PeerTcp {
 
     fn await_input(&mut self, timeout: NextTimeout) -> std::result::Result<bool, ureq::Error> {
         let n = network_wait(timeout, |wait| {
-            self.stream.set_read_timeout(Some(wait))?;
+            if self.read_timeout != Some(wait) {
+                self.stream.set_read_timeout(Some(wait))?;
+                self.read_timeout = Some(wait);
+            }
             self.stream.read(self.buffers.input_append_buf())
         })?;
         self.buffers.input_appended(n);

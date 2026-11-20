@@ -256,6 +256,7 @@ impl TarIn<'_> {
 /// read and checked as they are written, one checkpoint's at a time, so a chain's metadata is never
 /// all in memory at once.
 struct Saved {
+    dir: PathBuf,
     id: String,
     manifest: Manifest,
     text: Vec<u8>,
@@ -286,12 +287,19 @@ fn check_spec(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn read_member(dir: &Path, id: &str) -> Result<Saved> {
+fn read_member(dir: &Path, expected_id: Option<&str>) -> Result<Saved> {
+    let dir = dir.canonicalize().map_err(|e| format!("checkpoint {}: {e}", dir.display()))?;
     let bad = |why: String| format!("checkpoint {}: {why}", dir.display());
     let dfd = open_dir_at(libc::AT_FDCWD, &CString::new(dir.as_os_str().as_bytes())?).map_err(|e| bad(e.to_string()))?;
     let (_, text) = read_at(dfd.as_raw_fd(), "manifest.json", MAX_MANIFEST).map_err(|e| bad(format!("manifest.json: {e}")))?;
     let (found, manifest) = parse_manifest(&text).map_err(|e| bad(e.to_string()))?;
-    ensure!(found == id, "{}", bad("it changed as it was saved".into()));
+    match (manifest.format, &manifest.parent) {
+        (FORMAT, None) | (FORMAT_INCREMENTAL, Some(_)) => {}
+        (f, _) => bail!("{}", bad(format!("format {f}; this flexvm reads formats {FORMAT} and {FORMAT_INCREMENTAL}"))),
+    }
+    if let Some(id) = expected_id {
+        ensure!(found == id, "{}", bad(format!("id {found} is not {id}")));
+    }
     let open = |name: &str| -> Result<File> {
         let want = manifest.files.get(name).ok_or_else(|| bad(format!("manifest lists no {name}")))?;
         let (f, _) = read_at(dfd.as_raw_fd(), name, 0).map_err(|e| bad(format!("{name}: {e}")))?;
@@ -310,7 +318,24 @@ fn read_member(dir: &Path, id: &str) -> Result<Saved> {
     let (pages, _) = read_at(dfd.as_raw_fd(), "pages", 0).map_err(|e| bad(format!("pages: {e}")))?;
     let pages_len = pages.metadata()?.len();
     ensure!(Some(pages_len) == manifest.files.get("pages").map(|f| f.len), "{}", bad("pages has the wrong length".into()));
-    Ok(Saved { id: id.into(), manifest, text, spec, vmstate, pagemap, pages, pages_len })
+    Ok(Saved { dir, id: found, manifest, text, spec, vmstate, pagemap, pages, pages_len })
+}
+
+fn read_chain(dir: &Path) -> Result<Vec<Saved>> {
+    let mut members = vec![read_member(dir, None)?];
+    while let Some(parent) = members.last().unwrap().manifest.parent.clone() {
+        let child = members.last().unwrap();
+        ensure!(members.len() < MAX_CHAIN, "checkpoint {} is more than {MAX_CHAIN} deltas deep", dir.display());
+        let link = read_member(&child.dir.join(&parent.path), Some(&parent.id)).map_err(|e| format!("parent of {}: {e}", child.dir.display()))?;
+        ensure!(
+            child.manifest.template_id == link.manifest.template_id && child.manifest.guest_pages == link.manifest.guest_pages,
+            "checkpoint {}: its parent {} is of another template or size",
+            child.dir.display(),
+            link.dir.display()
+        );
+        members.push(link);
+    }
+    Ok(members)
 }
 
 /// `checkpoint save`: stored checkpoint `what`, its chain and its template generation, as one tar
@@ -321,10 +346,8 @@ pub fn save(state: &Path, paths: &Paths, what: &str, w: &mut dyn Write) -> Resul
     let lock = store::lock(state, libc::LOCK_SH)?;
     let all = store::list(state);
     let entry = store::find(&all, what)?;
-    // The chain by its manifests; `read_member` verifies each against its id. In the store, each is named by its id.
-    let chain = chain_ids(&entry.dir)?;
-    let store_dir = store::dir(state);
-    let mut members = chain.iter().map(|id| read_member(&store_dir.join(id), id)).collect::<Result<Vec<_>>>()?;
+    let mut members = read_chain(&entry.dir)?;
+    let chain: Vec<String> = members.iter().map(|m| m.id.clone()).collect();
     members.reverse();
     let head = &members.last().unwrap().manifest;
     let (tid, digests) = (head.template_id.clone(), head.template_digests.clone());
@@ -646,7 +669,8 @@ fn receive(
     let len = src.member(&checkpoint_member(id, "manifest.json"))?;
     take(len, MAX_MANIFEST, "manifest")?;
     let mut text = read_all(src, len)?;
-    digest.file("manifest.json", len, &Sha256::digest(&text));
+    let mut manifest_sha = Sha256::digest(&text);
+    digest.file("manifest.json", len, &manifest_sha);
     let (found, mut manifest) = parse_manifest(&text).map_err(|e| bad(&e.to_string()))?;
     ensure!(found == id, "{}", bad("its manifest does not match its id"));
     match (manifest.format, &manifest.parent, parent) {
@@ -662,6 +686,7 @@ fn receive(
         if manifest.parent.as_ref().is_some_and(|p| p.path != path) || was != now {
             manifest.parent = Some(Parent { path, id: now.into() });
             (here, text) = manifest_text(&manifest)?;
+            manifest_sha = Sha256::digest(&text);
         }
     }
     // This host may have one by its id, which is no cryptographic check: what was sent is verified all
@@ -674,39 +699,37 @@ fn receive(
         }
         None => Sink::Stage(Staging::import(store_dir)?),
     };
-    let spec = match spec {
+    let (spec, spec_sha) = match spec {
         true => {
             let len = src.member(&checkpoint_member(id, SPEC))?;
             take(len, MAX_SPEC, "run settings")?;
             let bytes = read_all(src, len)?;
             check_spec(&bytes).map_err(|e| bad(&e.to_string()))?;
-            digest.file(SPEC, len, &Sha256::digest(&bytes));
-            Some(bytes)
+            let sha = Sha256::digest(&bytes);
+            digest.file(SPEC, len, &sha);
+            (Some(bytes), Some(sha.to_vec()))
         }
-        false => None,
+        false => (None, None),
     };
     sink.small(SPEC, spec.as_deref())?;
     let want = |name: &str| manifest.files.get(name).cloned().ok_or_else(|| bad(&format!("its manifest lists no {name}")));
-    let mut checked = |name: &'static str, max: u64, sink: &mut Sink| -> Result<Vec<u8>> {
+    let mut checked = |name: &'static str, max: u64, sink: &mut Sink| -> Result<(Vec<u8>, Vec<u8>)> {
         let want = want(name)?;
         let len = src.member(&checkpoint_member(id, name))?;
         ensure!(len == want.len, "{}", bad(&format!("its {name} is not as long as its manifest says")));
         take(len, max, name)?;
         let bytes = read_all(src, len)?;
         ensure!(sum(&bytes) == want.hash, "{}", bad(&format!("its {name} does not match its checksum")));
-        digest.file(name, len, &Sha256::digest(&bytes));
+        let sha = Sha256::digest(&bytes);
+        digest.file(name, len, &sha);
         sink.small(name, Some(&bytes))?;
-        Ok(bytes)
+        Ok((bytes, sha.to_vec()))
     };
-    let vmstate = checked("vmstate", MAX_VMSTATE, &mut sink)?;
+    let (vmstate, vmstate_sha) = checked("vmstate", MAX_VMSTATE, &mut sink)?;
     let map_max = manifest.guest_pages * 36 + 24;
-    let map = checked("pagemap", map_max, &mut sink)?;
+    let (map, map_sha) = checked("pagemap", map_max, &mut sink)?;
     let meta = (text.len() + vmstate.len() + map.len()) as u64;
-    let mut files = vec![
-        (SPEC, spec.as_ref().map(|b| Sha256::digest(b).to_vec())),
-        ("vmstate", Some(Sha256::digest(&vmstate).to_vec())),
-        ("pagemap", Some(Sha256::digest(&map).to_vec())),
-    ];
+    let mut files = vec![(SPEC, spec_sha), ("vmstate", Some(vmstate_sha)), ("pagemap", Some(map_sha))];
     drop(vmstate);
     let (runs, sums) = parse_pagemap(&map, manifest.guest_pages, manifest.parent.is_some(), 0).map_err(|e| bad(&e.to_string()))?;
     drop(map);
@@ -731,7 +754,7 @@ fn receive(
     let equal = out.finish()?;
     let sha = sha.finalize();
     digest.file("pages", len, &sha);
-    files.extend([("pages", Some(sha.to_vec())), ("manifest.json", Some(Sha256::digest(&text).to_vec()))]);
+    files.extend([("pages", Some(sha.to_vec())), ("manifest.json", Some(manifest_sha.to_vec()))]);
     let (staging, pinned) = match sink {
         Sink::Stage(staging) => {
             staging.add_file("manifest.json", &text)?;
