@@ -108,7 +108,7 @@ def exercise(args):
         gate = 'while [ ! -x /state-probe ]; do sleep .05; done; exec /state-probe'
         with (args.output / 'guest.log').open('w') as out, (args.output / 'owner.log').open('w') as err:
             owner = subprocess.Popen([*base, 'software', '--name', NAME, '--control', 'serial', '--kernel', str(args.kernel),
-                                      '--mem', str(args.mem), '--vcpus', str(args.vcpus), '--timeout', '120', '--boot', args.boot,
+                                      *(['--mem', str(args.mem)] if args.mem else []), '--vcpus', str(args.vcpus), '--timeout', '120', '--boot', args.boot,
                                       *(['--entrypoint', '[]', args.image, '/bin/sh', '-ec', gate] if args.boot == 'app' else [args.image])], stdout=out, stderr=err, env=environment)
         ready()
         # Software management supports streaming exec. Transfer opaque guest
@@ -254,7 +254,7 @@ def main():
         parser.add_argument('--' + name, type=Path, required=True)
     parser.add_argument('--image', default=IMAGE)
     parser.add_argument('--boot', choices=('app', 'systemd', 'openrc'), default='app')
-    parser.add_argument('--mem', type=int, default=2048)
+    parser.add_argument('--mem', type=int, default=0, help='optional maximum memory cap MiB (default: host RAM)')
     parser.add_argument('--vcpus', type=int, default=2)
     parser.add_argument('--timeout', type=int, default=1800)
     parser.add_argument('--poweroff-timeout', type=int, default=30, help='bounded OS shutdown wait, within the overall test deadline')
@@ -275,8 +275,8 @@ def main():
         return 0
     if os.geteuid() != 0:
         parser.error('run as root for private device masking and image preparation')
-    if not 1 <= args.timeout <= 3600 or not 512 <= args.mem <= 8192 or not 1 <= args.poweroff_timeout <= 300 or not 1 <= args.vcpus <= 8:
-        parser.error('--timeout must be 1..3600, --mem 512..8192 and --poweroff-timeout 1..300 and --vcpus 1..8')
+    if not 1 <= args.timeout <= 3600 or (args.mem != 0 and not 512 <= args.mem <= 8192) or not 1 <= args.poweroff_timeout <= 300 or not 1 <= args.vcpus <= 8:
+        parser.error('--timeout must be 1..3600, --mem 0 or 512..8192 and --poweroff-timeout 1..300 and --vcpus 1..8')
     args.output.mkdir(parents=True, exist_ok=True)
     report_path = args.output / 'report.json'
     if report_path.exists():

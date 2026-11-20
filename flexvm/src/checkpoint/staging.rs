@@ -301,7 +301,7 @@ impl Staging {
     /// accepts an existing content-addressed entry (`Ok(false)`); a checkpoint must be new.
     fn publish(&mut self, import: bool) -> std::result::Result<bool, CommitError> {
         let (outer, parent) = (self.outer.as_raw_fd(), self.parent.as_raw_fd());
-        match check(unsafe { libc::renameat2(outer, c"ck".as_ptr(), parent, self.base.as_ptr(), libc::RENAME_NOREPLACE) }) {
+        match check(crate::util::rename_at(outer, c"ck", parent, &self.base, libc::RENAME_NOREPLACE)) {
             Err(e) if import && matches!(e.raw_os_error(), Some(libc::EEXIST | libc::ENOTEMPTY)) => return Ok(false),
             r => r.map_err(|e| format!("publish checkpoint at {}: {e}", self.dest.display()))?,
         }

@@ -1242,8 +1242,7 @@ and `--memory` cap a VM below them):
 | option | default | what |
 |---|---|---|
 | `--vcpus N` | host CPUs, at most 32, rounded down to even | vCPUs (Firecracker cannot add vCPUs to a running VM) |
-| `--max MIB` | host RAM, at most what fits the window | memory ceiling: boot memory plus the hot-plug region, in whole 1 GiB slots; the region and the root filesystem share Firecracker's 512 GiB window, so a larger `--max` is refused |
-| `--mem MIB` | 256 + max/32, rounded up to 128 | boot memory, which holds kernel memory for the whole ceiling; at most 255 GiB on x86_64 and 254 GiB on aarch64, what fits below Firecracker's 64-bit MMIO gap |
+| `--mem MIB` | host RAM, at most what fits the window | optional memory ceiling: guests start at a small derived base (`256 + mem/32`, rounded up to 128 MiB) and grow elastically up to `--mem` (or host RAM) in whole 1 GiB hot-plug slots; the region and root filesystem share Firecracker's 512 GiB window, so a larger `--mem` is refused |
 | `--plug MIB` | 4096 | plugged in the snapshot (free until touched); a VM never shrinks below it |
 
 Overrides follow `docker run`: `--entrypoint`, `--cmd`, `--env K[=V]`
@@ -1535,7 +1534,7 @@ iproute2 the guests run) as an OCI layout with no command. `scripts/faults.py`,
 
 ```sh
 sudo scripts/test-image.py /var/lib/flexvm-test-image
-sudo flexvm pull /var/lib/flexvm-test-image --tag small --vcpus 2 --max 2048
+sudo flexvm pull /var/lib/flexvm-test-image --tag small --vcpus 2 --mem 2048
 ```
 This root-owned location is also `e2e.py`'s default. Keep custom test image
 paths under a root-owned directory so another user cannot supply the image.

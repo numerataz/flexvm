@@ -16,8 +16,8 @@ directories of this run's own.
 --template names a template of the test image, whose guests have what the
 scenarios run (python3, socat, iproute2):
     sudo scripts/test-image.py /var/lib/flexvm-test-image
-    sudo flexvm pull /var/lib/flexvm-test-image --tag small --vcpus 2 --max 2048
-(scripts/e2e.py's heavy shard builds it with --max 10240: scenarios that set
+    sudo flexvm pull /var/lib/flexvm-test-image --tag small --vcpus 2 --mem 2048
+(scripts/e2e.py's heavy shard builds it with --mem 10240: scenarios that set
 up 1500 MiB or more, such as pages_dead, need that.)
 
 Each scenario ends `ok`, `FAILED` or `SKIPPED` (this host lacks what it tests,
@@ -11790,7 +11790,7 @@ def warm_ready():
         with open(os.path.join(image, "oci-layout"), "w") as f:
             json.dump({"imageLayoutVersion": "1.0.0"}, f)
         ready = identity + " && test -f /tmp/app-ready"
-        code, out, err = cli(A, "pull", image, "--tag", tpl, "--vcpus", "2", "--max", "2048",
+        code, out, err = cli(A, "pull", image, "--tag", tpl, "--vcpus", "2", "--mem", "2048",
                              "--warm", "--ready-cmd", ready, "--ready-timeout", "10", timeout=600)
         check("warm ready: template passes the credential check", code == 0, err or out)
     ok(run(A, n, template=tpl))
@@ -11807,7 +11807,7 @@ def app_template():
     name = args.template + "-applog"
     if not os.path.isdir(os.path.join(A.state, "templates", name)):
         cmd = ["sh", "-c", "head -c 8000000 /dev/zero | tr '\\0' x; echo; i=0; while :; do echo applog-$i; i=$((i+1)); sleep 0.05; done"]
-        code, out, err = cli(A, "pull", args.image, "--tag", name, "--vcpus", "2", "--max", "2048", "--cmd", json.dumps(cmd), timeout=600)
+        code, out, err = cli(A, "pull", args.image, "--tag", name, "--vcpus", "2", "--mem", "2048", "--cmd", json.dumps(cmd), timeout=600)
         assert code == 0, err or out
     return name
 
@@ -12218,7 +12218,7 @@ def template_tap():
     tdir = os.path.join(A.state, "templates")
     prefix = ok(cli_json(A, "info"))["derived"]["prefix"]
     # Its tap is made before the image is read.
-    p = spawn_cli(A, "pull", args.image, "--tag", name, "--vcpus", "1", "--max", "512")
+    p = spawn_cli(A, "pull", args.image, "--tag", name, "--vcpus", "1", "--mem", "512")
     tap = f"{prefix}x{p.pid:x}"
     def ifalias(dev):
         try:
@@ -12547,7 +12547,7 @@ def rmi_suspend():
     n, tpl = "ft-rmi-suspend", f"ft-rmi-{os.getpid()}"
     tdir = os.path.join(A.state, "templates")
     # An app that runs on (the image's own, a shell with no input, exits at once, and its VM with it).
-    code, out, err = cli(A, "pull", args.image, "--tag", tpl, "--vcpus", "1", "--max", "512", "--cmd", json.dumps(["sleep", "1000000"]), timeout=600)
+    code, out, err = cli(A, "pull", args.image, "--tag", tpl, "--vcpus", "1", "--mem", "512", "--cmd", json.dumps(["sleep", "1000000"]), timeout=600)
     assert code == 0, err or out
     gid = os.path.basename(os.readlink(os.path.join(tdir, tpl)))
     gen = os.path.join(tdir, ".gen", gid)

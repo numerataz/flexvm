@@ -364,7 +364,7 @@ fn firecracker_id(path: &Path, run: Option<&Path>) -> Result<(Stamp, String)> {
 
 #[cfg_attr(not(any(target_arch = "x86_64", target_arch = "aarch64")), allow(dead_code))]
 fn ioctl(fd: &impl AsRawFd, request: libc::c_ulong, arg: libc::c_ulong, name: &str) -> Result<i32> {
-    let value = unsafe { libc::ioctl(fd.as_raw_fd(), request, arg) };
+    let value = unsafe { libc::ioctl(fd.as_raw_fd(), request as _, arg) };
     crate::syscall_check!(value < 0, "{name}");
     Ok(value)
 }

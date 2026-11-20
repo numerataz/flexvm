@@ -27,7 +27,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-"${fv[@]}" pull docker:27-dind --tag "$image" --vcpus 2 --max 4096
+"${fv[@]}" pull docker:27-dind --tag "$image" --vcpus 2 --mem 4096
 pulled=true
 "${fv[@]}" run -d --name "$vm" "$image"
 started=true

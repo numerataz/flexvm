@@ -104,8 +104,8 @@ def exercise(args):
         evidence['inherited_leases'] = inherited_leases(entry)
         if entry['backend']['kind'] != 'qemu-tcg' or entry.get('firecracker') is not None:
             raise RuntimeError('owner did not publish an honest software backend identity')
-        if entry['max_mib'] != 512 or entry['backend']['ram_mib'] != 512 or entry.get('template_id'):
-            raise RuntimeError('wrong RAM reservation or fake template identity')
+        if entry['max_mib'] != 512 or not (384 <= entry['backend']['ram_mib'] <= 512) or entry.get('template_id'):
+            raise RuntimeError(f'wrong RAM reservation or fake template identity: {entry}')
         inspect = json.loads(cli('inspect', 'owner-test').stdout)
         if isinstance(inspect, list):
             inspect = inspect[0]

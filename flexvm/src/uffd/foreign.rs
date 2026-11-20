@@ -85,7 +85,7 @@ fn scan_runs(pagemap: &std::fs::File, start: u64, len: u64) -> io::Result<Vec<(u
             ..PmScanArg::default()
         };
         // The struct and the regions array outlive the call; the kernel writes only `walk_end` and the regions.
-        let n = unsafe { libc::ioctl(pagemap.as_raw_fd(), PAGEMAP_SCAN, &mut arg as *mut PmScanArg) };
+        let n = unsafe { libc::ioctl(pagemap.as_raw_fd(), PAGEMAP_SCAN as _, &mut arg as *mut PmScanArg) };
         if n < 0 {
             return Err(io::Error::last_os_error());
         }

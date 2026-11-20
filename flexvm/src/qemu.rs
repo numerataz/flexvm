@@ -152,6 +152,7 @@ pub struct Config {
     pub qemu: String,
     pub vsock_backend: String,
     pub mem_mib: u32,
+    pub max_mib: u32,
     pub vcpus: u32,
     pub boot_timeout: Duration,
     pub parent_kvm: Option<ParentKvm>,
@@ -442,7 +443,37 @@ impl Drop for Machine {
     }
 }
 
+/// Default initial boot RAM for elastic software VMs before virtio-mem growth.
+pub const ELASTIC_BASE_MIB: u32 = 384;
+
 impl Config {
+    /// Compute `(base_mib, max_mib)` from an optional `--mem` cap and host total RAM.
+    /// With no `--mem`, the VM can grow dynamically up to all host RAM; with `--mem N`,
+    /// `N` is the hard ceiling while boot RAM stays small (`<= ELASTIC_BASE_MIB`).
+    pub fn elastic_limits(cap_mib: Option<u32>, host_ram_mib: u64) -> Result<(u32, u32)> {
+        let cap = match cap_mib {
+            Some(n) => n,
+            None => {
+                if host_ram_mib == 0 {
+                    bail!("cannot determine host memory for software VM; pass --mem");
+                }
+                (host_ram_mib & !1).clamp(128, 1_048_576) as u32
+            }
+        };
+        if !(128..=1_048_576).contains(&cap) {
+            bail!("software --mem must be 128..1048576 MiB");
+        }
+        if cap <= ELASTIC_BASE_MIB {
+            return Ok((cap, cap));
+        }
+        let base = ELASTIC_BASE_MIB - ((cap - ELASTIC_BASE_MIB) % 2);
+        Ok((base, cap))
+    }
+
+    pub fn effective_max_mib(&self) -> u32 {
+        self.max_mib.max(self.mem_mib)
+    }
+
     pub fn validate(&self) -> Result<()> {
         self.validate_limits()?;
         if let Some(provider) = &self.parent_kvm {
@@ -472,6 +503,16 @@ impl Config {
         if !(128..=1_048_576).contains(&self.mem_mib) {
             bail!("software --mem must be 128..1048576 MiB");
         }
+        if self.max_mib != 0 && self.max_mib < self.mem_mib {
+            bail!("software max memory ({}) must be at least --mem ({})", self.max_mib, self.mem_mib);
+        }
+        let max_mib = self.effective_max_mib();
+        if max_mib > 1_048_576 {
+            bail!("software max memory must be at most 1048576 MiB");
+        }
+        if max_mib > self.mem_mib && !(max_mib - self.mem_mib).is_multiple_of(2) {
+            bail!("software elastic hotplug size (max memory - --mem) must be a multiple of 2 MiB");
+        }
         if !(1..=256).contains(&self.vcpus) {
             bail!("software --vcpus must be 1..256");
         }
@@ -483,38 +524,66 @@ impl Config {
 
     fn command(&self, engine: &Path, kernel: &Path, rootfs: &Path, endpoints: &Endpoints<'_>, network: Network, disks: &[(&str, PathBuf)]) -> Result<Command> {
         let arch = std::env::consts::ARCH;
-        let (board, cpu, console, block, vsock, nic) = match arch {
+        let (board, cpu, console, block, vsock, nic, balloon) = match arch {
             // TCG implements AMD SVM: the ordinary guest Linux KVM driver
             // supplies the ABI without a host KVM device. Enforce support
             // instead of silently losing guest virtualization capabilities.
             "x86_64" => {
                 let cpu = if self.parent_kvm.is_some() { "max,vmx=off,svm=off" } else { "max,svm=on,npt=on,enforce=on" };
-                ("q35", cpu, "ttyS0", "virtio-blk-pci", "vhost-user-vsock-pci", "virtio-net-pci")
+                ("q35", cpu, "ttyS0", "virtio-blk-pci", "vhost-user-vsock-pci", "virtio-net-pci", "virtio-balloon-pci")
             }
             "aarch64" => {
                 let board = if self.parent_kvm.is_some() { "virt,gic-version=3" } else { "virt,virtualization=on,gic-version=3" };
-                (board, "cortex-a72", "ttyAMA0", "virtio-blk-device", "vhost-user-vsock-device", "virtio-net-device")
+                (board, "cortex-a72", "ttyAMA0", "virtio-blk-device", "vhost-user-vsock-device", "virtio-net-device", "virtio-balloon-device")
             }
             _ => bail!("software execution is not implemented for {arch}"),
         };
         let ram = if self.parent_kvm.is_some() { "outer-ram" } else { "ram" };
+        let max_mib = self.effective_max_mib();
+        let hotplug_mib = if self.parent_kvm.is_some() { 0 } else { max_mib - self.mem_mib };
+        // QEMU x86_64 TCG defaults to 40-bit physical addresses (1 TiB), which
+        // is too small once the 32-bit PCI hole and hotplug device-memory
+        // alignment push guest RAM above 1 TiB. Request 42-bit physical
+        // addresses (4 TiB) for elastic or >512 GiB x86_64 VMs while keeping
+        // the legacy CPU profile unchanged for smaller fixed-memory checkpoints.
+        let cpu = if arch == "x86_64" && self.parent_kvm.is_none() && (hotplug_mib > 0 || max_mib > 524_288) {
+            "max,svm=on,npt=on,enforce=on,phys-bits=42"
+        } else {
+            cpu
+        };
         let mut cmd = Command::new(engine);
         cmd.arg("-L").arg(endpoints.firmware);
         cmd.args(["-machine", &format!("{board},memory-backend={ram}"), "-accel", "tcg,thread=multi", "-cpu", cpu]);
-        cmd.args(["-m", &self.mem_mib.to_string(), "-smp", &self.vcpus.to_string()]);
+        if hotplug_mib > 0 {
+            cmd.args(["-m", &format!("size={}M,slots=1,maxmem={}M", self.mem_mib, max_mib), "-smp", &self.vcpus.to_string()]);
+        } else {
+            cmd.args(["-m", &self.mem_mib.to_string(), "-smp", &self.vcpus.to_string()]);
+        }
         if self.parent_kvm.is_none() {
             cmd.args(["-object", &json!({"qom-type":"memory-backend-memfd", "id":"ram", "size":u64::from(self.mem_mib)<<20, "share":true}).to_string()]);
+        }
+        if hotplug_mib > 0 {
+            cmd.args([
+                "-object",
+                &json!({"qom-type":"memory-backend-memfd", "id":"hotplug", "size":u64::from(hotplug_mib)<<20, "share":true, "reserve":false}).to_string(),
+            ]);
+            cmd.args(["-device", "virtio-mem-pci,id=vmem0,memdev=hotplug,requested-size=0,block-size=2M"]);
+            cmd.args(["-device", &format!("{balloon},free-page-reporting=on")]);
         }
         cmd.args(["-display", "none", "-monitor", "none", "-serial", "stdio", "-no-reboot"]);
         cmd.args(["-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny"]);
         let control_arg = if self.control == Control::Serial { " flexvm.control=serial" } else { "" };
+        let hotplug_arg =
+            if hotplug_mib > 0 { " memhp_default_state=online memory_hotplug.online_policy=auto-movable memory_hotplug.auto_movable_ratio=2000" } else { "" };
         let kvm_arg = if self.parent_kvm.is_some() { " flexvm.kvm=parent" } else { "" };
+        let tmpfs_mib = if hotplug_mib > 0 { max_mib } else { self.mem_mib };
         cmd.arg("-kernel").arg(kernel).args([
             "-append",
             &format!(
-                "console={console} quiet panic=1 root=/dev/vda ro init=/sbin/flexvm-init flexvm.tmpfs_mib={}{}{}{}",
-                self.mem_mib,
+                "console={console} quiet panic=1 root=/dev/vda ro init=/sbin/flexvm-init flexvm.tmpfs_mib={}{}{}{}{}",
+                tmpfs_mib,
                 control_arg,
+                hotplug_arg,
                 network.kernel_arg(),
                 kvm_arg,
             ),
@@ -1187,6 +1256,23 @@ impl Machine {
         }
     }
 
+    pub fn meminfo(&self, deadline: Instant) -> Result<(u64, u64)> {
+        let reply = self.message("MEMINFO", deadline)?;
+        parse_meminfo(&String::from_utf8_lossy(&reply))
+    }
+
+    pub fn set_virtio_mem(&self, bytes: u64, deadline: Instant) -> Result<()> {
+        let mut qmp = Qmp::connect(&self.sockets.api, deadline)?;
+        qmp.command("qom-set", json!({"path": "vmem0", "property": "requested-size", "value": bytes}), &[])?;
+        Ok(())
+    }
+
+    pub fn virtio_mem_size(&self, deadline: Instant) -> Result<u64> {
+        let mut qmp = Qmp::connect(&self.sockets.api, deadline)?;
+        let reply = qmp.command("qom-get", json!({"path": "vmem0", "property": "size"}), &[])?;
+        reply.as_u64().ok_or_else(|| format!("unexpected qom-get virtio-mem size: {reply}").into())
+    }
+
     pub fn switch(&self, command: &str, deadline: Instant) -> Result<()> {
         let capture = self.capture.lock().unwrap();
         if *capture != Capture::None {
@@ -1300,6 +1386,19 @@ impl Machine {
     }
 }
 
+fn parse_meminfo(reply: &str) -> Result<(u64, u64)> {
+    let mut parts = reply.split_whitespace();
+    if parts.next() != Some("ok") {
+        bail!("guest MEMINFO failed: {reply}");
+    }
+    let avail = parts.next().and_then(|s| s.parse::<u64>().ok()).ok_or_else(|| format!("bad MEMINFO available: {reply}"))?;
+    let total = parts.next().and_then(|s| s.parse::<u64>().ok()).ok_or_else(|| format!("bad MEMINFO total: {reply}"))?;
+    if parts.next().is_some() {
+        bail!("unexpected trailing MEMINFO fields: {reply}");
+    }
+    Ok((avail, total))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1313,6 +1412,7 @@ mod tests {
             qemu: String::new(),
             vsock_backend: String::new(),
             mem_mib: 512,
+            max_mib: 512,
             vcpus: 1,
             boot_timeout: Duration::from_secs(120),
             parent_kvm: None,
@@ -1398,6 +1498,7 @@ mod tests {
             qemu: std::env::var("FLEXVM_SOFTWARE_TEST_QEMU").unwrap_or_else(|_| format!("qemu-system-{}", std::env::consts::ARCH)),
             vsock_backend: String::new(),
             mem_mib: 512,
+            max_mib: 512,
             vcpus: 1,
             boot_timeout: Duration::from_secs(60),
             parent_kvm: None,
@@ -1440,6 +1541,8 @@ mod tests {
             snapshot_id: util::random_hex(16).unwrap(),
             identity_generation: 1,
             memory_mib: 512,
+            max_memory_mib: None,
+            plugged_mib: 0,
             vcpus: 1,
             paused: false,
             terminal: true,
@@ -1768,5 +1871,117 @@ mod tests {
         let error = watched.read(&mut [0]).unwrap_err();
         assert!(error.to_string().contains("exited"), "{error:?}");
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn elastic_memory_config_adds_virtio_mem_balloon_and_hotplug_args() {
+        let mut config = Config {
+            control: Control::Serial,
+            kernel: PathBuf::new(),
+            qemu: String::new(),
+            vsock_backend: String::new(),
+            mem_mib: 512,
+            max_mib: 2048,
+            vcpus: 1,
+            boot_timeout: Duration::from_secs(120),
+            parent_kvm: None,
+        };
+        config.validate_limits().unwrap();
+        let profile = config.profile().unwrap();
+        let m_arg = profile.arguments.windows(2).find(|args| args[0] == "-m").unwrap()[1].as_str();
+        assert_eq!(m_arg, "size=512M,slots=1,maxmem=2048M");
+        let hotplug_obj: Value = profile
+            .arguments
+            .windows(2)
+            .filter(|args| args[0] == "-object")
+            .filter_map(|args| serde_json::from_str::<Value>(&args[1]).ok())
+            .find(|obj| obj["id"] == "hotplug")
+            .unwrap();
+        assert_eq!(hotplug_obj["qom-type"], "memory-backend-memfd");
+        assert_eq!(hotplug_obj["size"], json!(1536u64 << 20));
+        assert_eq!(hotplug_obj["share"], json!(true));
+        assert_eq!(hotplug_obj["reserve"], json!(false));
+        assert!(profile.arguments.iter().any(|a| a.contains("virtio-mem-pci,id=vmem0,memdev=hotplug,requested-size=0,block-size=2M")));
+        assert!(profile.arguments.iter().any(|a| a.contains("free-page-reporting=on")));
+        let append = profile.arguments.windows(2).find(|args| args[0] == "-append").unwrap()[1].as_str();
+        assert!(append.contains("flexvm.tmpfs_mib=2048"), "{append}");
+        assert!(append.contains("memhp_default_state=online"), "{append}");
+
+        if cfg!(target_arch = "x86_64") {
+            let make_config = |mem_mib, max_mib| Config {
+                control: Control::Serial,
+                kernel: PathBuf::new(),
+                qemu: String::new(),
+                vsock_backend: String::new(),
+                mem_mib,
+                max_mib,
+                vcpus: 1,
+                boot_timeout: Duration::from_secs(120),
+                parent_kvm: None,
+            };
+            let cpu_arg = |cfg: &Config| cfg.profile().unwrap().arguments.windows(2).find(|args| args[0] == "-cpu").unwrap()[1].clone();
+            assert_eq!(cpu_arg(&config), "max,svm=on,npt=on,enforce=on,phys-bits=42");
+
+            let one_tib_elastic = make_config(ELASTIC_BASE_MIB, 1_048_576);
+            one_tib_elastic.validate_limits().unwrap();
+            assert_eq!(cpu_arg(&one_tib_elastic), "max,svm=on,npt=on,enforce=on,phys-bits=42");
+
+            let one_tib_fixed = make_config(1_048_576, 1_048_576);
+            one_tib_fixed.validate_limits().unwrap();
+            assert_eq!(cpu_arg(&one_tib_fixed), "max,svm=on,npt=on,enforce=on,phys-bits=42");
+
+            let small_fixed = make_config(512, 512);
+            assert_eq!(cpu_arg(&small_fixed), "max,svm=on,npt=on,enforce=on");
+        }
+
+        config.max_mib = 256;
+        let err = config.validate_limits().unwrap_err().to_string();
+        assert!(err.contains("software max memory"), "{err}");
+        config.max_mib = 513;
+        let err = config.validate_limits().unwrap_err().to_string();
+        assert!(err.contains("max memory"), "{err}");
+    }
+
+    #[test]
+    fn qmp_virtio_mem_resize_and_size_query_round_trip() {
+        let machine = machine();
+        let listener = UnixListener::bind(&machine.sockets.api).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut reader = BufReader::new(qmp_peer(listener.try_clone().unwrap()));
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let req: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(req["execute"], "qom-set");
+            assert_eq!(req["arguments"], json!({"path":"vmem0","property":"requested-size","value":256u64 << 20}));
+            writeln!(reader.get_mut(), "{}", json!({"return":{},"id":req["id"]})).unwrap();
+
+            let mut reader = BufReader::new(qmp_peer(listener));
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let req: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(req["execute"], "qom-get");
+            assert_eq!(req["arguments"], json!({"path":"vmem0","property":"size"}));
+            writeln!(reader.get_mut(), "{}", json!({"return":256u64 << 20,"id":req["id"]})).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        machine.set_virtio_mem(256 << 20, deadline).unwrap();
+        assert_eq!(machine.virtio_mem_size(deadline).unwrap(), 256 << 20);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn parse_meminfo_accepts_valid_and_rejects_malformed() {
+        assert_eq!(parse_meminfo("ok 123456 524288").unwrap(), (123456, 524288));
+        for bad in ["error: boom", "ok 123", "ok x 524288", "ok 1 2 3"] {
+            assert!(parse_meminfo(bad).is_err(), "{bad}");
+        }
+        assert_eq!(Config::elastic_limits(None, 49152).unwrap(), (ELASTIC_BASE_MIB, 49152));
+        assert_eq!(Config::elastic_limits(Some(2048), 49152).unwrap(), (ELASTIC_BASE_MIB, 2048));
+        assert_eq!(Config::elastic_limits(Some(256), 49152).unwrap(), (256, 256));
+        assert_eq!(Config::elastic_limits(Some(513), 49152).unwrap(), (383, 513));
+        assert!(Config::elastic_limits(Some(64), 49152).is_err());
+        let err = Config::elastic_limits(None, 0).unwrap_err().to_string();
+        assert!(err.contains("cannot determine host memory"), "{err}");
+        assert_eq!(Config::elastic_limits(Some(512), 0).unwrap(), (ELASTIC_BASE_MIB, 512));
     }
 }

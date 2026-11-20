@@ -1,1 +1,2 @@
 0001-kvm-initialize-tsc-multiplier.patch
+0002-kvm-fallback-realtime-clock.patch
