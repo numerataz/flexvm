@@ -40,7 +40,7 @@ int main(void)
     pid_t child = fork();
     check(child >= 0, "fork the KVM client");
     if (child == 0) {
-        char *arguments[18] = {"kvm-run", pages};
+        char *arguments[28] = {"kvm-run", pages};
         unsigned int next = 2;
         if (access("/split-slot", F_OK) == 0)
             arguments[next++] = "split";
@@ -74,6 +74,26 @@ int main(void)
             arguments[next++] = "zero-slot";
         if (access("/tss", F_OK) == 0)
             arguments[next++] = "provider-tss";
+        if (access("/lapic", F_OK) == 0)
+            arguments[next++] = "lapic";
+        if (access("/pio", F_OK) == 0)
+            arguments[next++] = "pio";
+        if (access("/complete-read", F_OK) == 0)
+            arguments[next++] = "complete-read";
+        if (access("/pio-boundary", F_OK) == 0)
+            arguments[next++] = "pio-boundary";
+        if (access("/pvh", F_OK) == 0)
+            arguments[next++] = "pvh";
+        if (access("/irqchip-state", F_OK) == 0)
+            arguments[next++] = "irqchip-state";
+        if (access("/pit-state", F_OK) == 0)
+            arguments[next++] = "pit-state";
+        if (access("/debugregs", F_OK) == 0)
+            arguments[next++] = "debugregs";
+        if (access("/mp-state", F_OK) == 0)
+            arguments[next++] = "mp-state";
+        if (access("/xcrs", F_OK) == 0)
+            arguments[next++] = "xcrs";
         execv("/kvm-run", arguments);
         _exit(127);
     }

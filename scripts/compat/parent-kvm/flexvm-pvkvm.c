@@ -27,11 +27,12 @@
 #include <linux/workqueue.h>
 #include <asm/msr-index.h>
 #include <asm/processor-flags.h>
+#include <asm/fpu/types.h>
 #include "mailbox.h"
 
 #define PVKVM_REAL_MODE_FLAGS (X86_EFLAGS_FIXED | X86_EFLAGS_CF | X86_EFLAGS_PF | \
 			       X86_EFLAGS_AF | X86_EFLAGS_ZF | X86_EFLAGS_SF | \
-			       X86_EFLAGS_DF | X86_EFLAGS_OF)
+			       X86_EFLAGS_IF | X86_EFLAGS_DF | X86_EFLAGS_OF)
 
 #define PVKVM_TSS_SIZE (3 * PAGE_SIZE)
 
@@ -100,7 +101,7 @@ struct pvvm {
 
 struct run_page {
 	struct kvm_run run;
-	u8 data;
+	u8 pio[PVKVM_PIO_BYTES] __aligned(PAGE_SIZE);
 };
 
 static const u32 boot_msr_indices[] = {
@@ -115,14 +116,22 @@ struct pvcpu {
 	struct run_page *page;
 	struct kvm_regs regs;
 	struct kvm_sregs sregs;
+	struct kvm_sregs sregs_reset;
 	struct kvm_fpu fpu;
+	struct kvm_lapic_state lapic;
 	struct pvkvm_cpuid_table *cpuid;
 	u64 msrs[ARRAY_SIZE(boot_msr_indices)];
 	unsigned long msrs_set;
 	unsigned int id;
-	unsigned int mmio_read_width;
+	unsigned int read_bytes;
+	u32 staged_mp_state;
+	bool read_pio;
 	bool ran;
 	bool fpu_set;
+	bool lapic_set;
+	bool sregs_reset_known;
+	bool sregs_set;
+	bool staged_sipi_pending;
 };
 
 static const struct kvm_sregs reset_sregs = {
@@ -134,7 +143,7 @@ static bool long_mode(const struct kvm_sregs *sregs)
 	return sregs->efer & EFER_LMA;
 }
 
-static bool valid_protected_entry(const struct kvm_sregs *sregs)
+static bool valid_protected_entry(const struct kvm_sregs *sregs, const struct kvm_sregs *baseline)
 {
 	static const struct kvm_segment code = {
 		.limit = U32_MAX, .selector = 8, .type = 11, .present = 1,
@@ -144,13 +153,26 @@ static bool valid_protected_entry(const struct kvm_sregs *sregs)
 		.limit = U32_MAX, .selector = 16, .type = 3, .present = 1,
 		.db = 1, .s = 1, .g = 1,
 	};
-	struct kvm_sregs wanted = reset_sregs;
+	static const struct kvm_segment pvh_tr = {
+		.limit = 103, .selector = 24, .type = 11, .present = 1,
+	};
+	struct kvm_sregs wanted = *baseline;
+	bool pvh = !long_mode(sregs) && sregs->gdt.limit == 31;
 
 	wanted.cs = code;
 	wanted.ds = wanted.es = wanted.fs = wanted.gs = wanted.ss = data;
-	wanted.cr0 = X86_CR0_PE;
+	wanted.cr0 |= X86_CR0_PE;
 	wanted.gdt.limit = 23;
 	wanted.gdt.base = sregs->gdt.base;
+	if (pvh) {
+		wanted.tr = pvh_tr;
+		wanted.gdt.limit = 31;
+		wanted.idt.base = sregs->idt.base;
+		wanted.idt.limit = 7;
+		wanted.cr0 = X86_CR0_PE | X86_CR0_ET;
+		if (sregs->idt.base > U32_MAX)
+			return false;
+	}
 	if (long_mode(sregs)) {
 		wanted.cs.db = 0;
 		wanted.cs.l = 1;
@@ -162,6 +184,15 @@ static bool valid_protected_entry(const struct kvm_sregs *sregs)
 			return false;
 	}
 	return !memcmp(sregs, &wanted, sizeof(wanted)) && sregs->gdt.base <= U32_MAX;
+}
+
+static bool valid_real_entry(const struct kvm_sregs *sregs, const struct kvm_sregs *baseline)
+{
+	struct kvm_sregs wanted = *baseline;
+
+	wanted.cs.base = 0;
+	wanted.cs.selector = 0;
+	return !memcmp(sregs, &wanted, sizeof(wanted));
 }
 
 static bool registers_fit_mode(const struct kvm_regs *regs, const struct kvm_sregs *sregs)
@@ -438,7 +469,7 @@ static int cpu_mmap(struct file *file, struct vm_area_struct *vma)
 
 	if (cpu->vm->owner != current->mm)
 		return -EIO;
-	if (vma->vm_pgoff || vma->vm_end - vma->vm_start != PAGE_SIZE ||
+	if (vma->vm_pgoff || vma->vm_end - vma->vm_start != sizeof(*cpu->page) ||
 	    !(vma->vm_flags & VM_SHARED) || (vma->vm_flags & VM_EXEC))
 		return -EINVAL;
 	vma->vm_flags &= ~VM_MAYEXEC;
@@ -505,36 +536,48 @@ enum { PVKVM_IOEVENT_HANDLED = 1 };
 
 static int complete_run(struct pvcpu *cpu, const struct pvkvm_run_exit *exit)
 {
+	struct pvkvm *p = cpu->vm->provider;
 	struct run_page *page = cpu->page;
+	unsigned int bytes;
 
-	if (exit->is_write > 1 || exit->reserved)
+	if (exit->is_write > 1 || !exit->count)
 		return -EIO;
+	if (!exit->is_write && hweight_long(cpu->vm->open_cpus) > 1)
+		return -EOPNOTSUPP;
 	switch (exit->reason) {
 	case KVM_EXIT_IO:
-		if (exit->length != 1 || exit->address != PVKVM_IO_PORT || !exit->is_write)
+		if (!is_power_of_2(exit->length) || exit->length > 4 ||
+		    exit->address > U16_MAX || exit->count > sizeof(page->pio) / exit->length)
 			return -EIO;
-		if (signal_ioeventfd(cpu->vm, exit))
+		if (exit->count == 1 && signal_ioeventfd(cpu->vm, exit))
 			return PVKVM_IOEVENT_HANDLED;
-		page->data = exit->data[0];
-		page->run.io.direction = KVM_EXIT_IO_OUT;
-		page->run.io.size = 1;
-		page->run.io.port = PVKVM_IO_PORT;
-		page->run.io.count = 1;
-		page->run.io.data_offset = offsetof(struct run_page, data);
+		bytes = exit->length * exit->count;
+		if (exit->is_write) {
+			memcpy_fromio(page->pio, p->mailbox + PVKVM_PIO_DATA_AT, bytes);
+		} else {
+			memset(page->pio, 0, bytes);
+			cpu->read_bytes = bytes;
+			cpu->read_pio = true;
+		}
+		page->run.io.direction = exit->is_write ? KVM_EXIT_IO_OUT : KVM_EXIT_IO_IN;
+		page->run.io.size = exit->length;
+		page->run.io.port = exit->address;
+		page->run.io.count = exit->count;
+		page->run.io.data_offset = offsetof(struct run_page, pio);
 		break;
 	case KVM_EXIT_MMIO:
-		if (!is_power_of_2(exit->length) || exit->length > sizeof(exit->data))
+		if (!is_power_of_2(exit->length) || exit->length > sizeof(exit->data) || exit->count != 1)
 			return -EIO;
 		if (signal_ioeventfd(cpu->vm, exit))
 			return PVKVM_IOEVENT_HANDLED;
-		if (!exit->is_write && hweight_long(cpu->vm->open_cpus) > 1)
-			return -EOPNOTSUPP;
 		page->run.mmio.phys_addr = exit->address;
 		memset(page->run.mmio.data, 0, sizeof(page->run.mmio.data));
 		if (exit->is_write)
 			memcpy(page->run.mmio.data, exit->data, exit->length);
-		else
-			cpu->mmio_read_width = exit->length;
+		else {
+			cpu->read_bytes = exit->length;
+			cpu->read_pio = false;
+		}
 		page->run.mmio.len = exit->length;
 		page->run.mmio.is_write = exit->is_write;
 		break;
@@ -545,6 +588,32 @@ static int complete_run(struct pvcpu *cpu, const struct pvkvm_run_exit *exit)
 	return 0;
 }
 
+static void publish_read_completion(struct pvcpu *cpu)
+{
+	struct pvkvm *p = cpu->vm->provider;
+	struct pvkvm_read_completion completion = { .length = cpu->read_bytes };
+
+	if (completion.length && cpu->read_pio)
+		memcpy_toio(p->mailbox + PVKVM_PIO_DATA_AT, cpu->page->pio, completion.length);
+	else if (completion.length)
+		memcpy(completion.data, cpu->page->run.mmio.data, completion.length);
+	memcpy_toio(p->mailbox + PVKVM_COMPLETION_AT, &completion, sizeof(completion));
+}
+
+static int finish_interrupted_read(struct pvcpu *cpu)
+{
+	int result;
+
+	if (!cpu->read_bytes)
+		return -EINTR;
+	publish_read_completion(cpu);
+	result = request_for_cpu(cpu, PVKVM_COMPLETE_READ, NULL, NULL);
+	if (result)
+		return result;
+	cpu->read_bytes = 0;
+	return -EINTR;
+}
+
 static int run_cpu(struct pvcpu *cpu)
 {
 	struct pvvm *vm = cpu->vm;
@@ -553,15 +622,15 @@ static int run_cpu(struct pvcpu *cpu)
 	struct pvkvm_run_exit exit;
 	int result;
 
-	result = mutex_lock_interruptible(&p->lock);
+	result = cpu->read_bytes ? mutex_lock_killable(&p->lock) : mutex_lock_interruptible(&p->lock);
 	if (result)
 		return -EINTR;
-	if (signal_pending(current)) {
-		result = -EINTR;
-		goto unlock;
-	}
 	if (p->dead) {
 		result = -ENODEV;
+		goto unlock;
+	}
+	if (READ_ONCE(cpu->page->run.immediate_exit) || signal_pending(current)) {
+		result = finish_interrupted_read(cpu);
 		goto unlock;
 	}
 	if (!cpu->ran && !long_mode(&cpu->sregs) && !slot_contains(vm, cpu->regs.rip, 1)) {
@@ -570,6 +639,11 @@ static int run_cpu(struct pvcpu *cpu)
 	}
 	if (!cpu->ran && (cpu->sregs.cr0 & X86_CR0_PE) &&
 	    !slot_contains(vm, cpu->sregs.gdt.base, cpu->sregs.gdt.limit + 1)) {
+		result = -EINVAL;
+		goto unlock;
+	}
+	if (!cpu->ran && cpu->sregs.gdt.limit == 31 &&
+	    !slot_contains(vm, cpu->sregs.idt.base, cpu->sregs.idt.limit + 1)) {
 		result = -EINVAL;
 		goto unlock;
 	}
@@ -586,6 +660,9 @@ static int run_cpu(struct pvcpu *cpu)
 		writel(cpu->fpu_set, p->mailbox + PVKVM_FPU_VALID_AT);
 		if (cpu->fpu_set)
 			memcpy_toio(p->mailbox + PVKVM_FPU_AT, &cpu->fpu, sizeof(cpu->fpu));
+		writel(cpu->lapic_set, p->mailbox + PVKVM_LAPIC_VALID_AT);
+		if (cpu->lapic_set)
+			memcpy_toio(p->mailbox + PVKVM_LAPIC_AT, &cpu->lapic, sizeof(cpu->lapic));
 		publish_initial_msrs(cpu);
 		writel(!!cpu->cpuid, p->mailbox + PVKVM_CPUID_VALID_AT);
 		if (cpu->cpuid)
@@ -594,15 +671,11 @@ static int run_cpu(struct pvcpu *cpu)
 				    cpu->cpuid->count * sizeof(cpu->cpuid->entries[0]));
 	}
 	do {
-		struct pvkvm_mmio_completion completion = { .length = cpu->mmio_read_width };
-
-		if (completion.length)
-			memcpy(completion.data, cpu->page->run.mmio.data, completion.length);
-		memcpy_toio(p->mailbox + PVKVM_COMPLETION_AT, &completion, sizeof(completion));
+		publish_read_completion(cpu);
 		result = request_for_cpu(cpu, PVKVM_RUN, memory, &exit);
 		if (!result || result == -EINTR) {
 			cpu->ran = true;
-			cpu->mmio_read_width = 0;
+			cpu->read_bytes = 0;
 		}
 		if (result)
 			break;
@@ -830,19 +903,182 @@ static long cpu_cpuid(struct pvcpu *cpu, bool write, struct kvm_cpuid2 __user *u
 	return result;
 }
 
+static int read_reset_sregs(struct pvcpu *cpu)
+{
+	int result;
+
+	if (cpu->sregs_reset_known)
+		return 0;
+	result = read_stopped_registers(cpu, PVKVM_GET_SREGS, PVKVM_REGISTERS_AT,
+					&cpu->sregs_reset, sizeof(cpu->sregs_reset));
+	if (!result)
+		cpu->sregs_reset_known = true;
+	return result;
+}
+
+static long cpu_lapic(struct pvcpu *cpu, bool write, void __user *user)
+{
+	struct kvm_lapic_state *record;
+	int result = 0;
+
+	if (!READ_ONCE(cpu->vm->irqchip_created))
+		return -EINVAL;
+	if (!write) {
+		if (cpu->ran || !cpu->lapic_set)
+			result = read_stopped_registers(cpu, PVKVM_GET_LAPIC, PVKVM_LAPIC_AT,
+							&cpu->lapic, sizeof(cpu->lapic));
+		if (result)
+			return result;
+		return copy_to_user(user, &cpu->lapic, sizeof(cpu->lapic)) ? -EFAULT : 0;
+	}
+	record = memdup_user(user, sizeof(*record));
+	if (IS_ERR(record))
+		return PTR_ERR(record);
+	if (cpu->ran) {
+		result = write_stopped_registers(cpu, PVKVM_SET_LAPIC, PVKVM_LAPIC_AT,
+						 record, sizeof(*record));
+	} else {
+		cpu->lapic = *record;
+		cpu->lapic_set = true;
+	}
+	kfree(record);
+	return result;
+}
+
+static long cpu_debugregs(struct pvcpu *cpu, bool write, struct kvm_debugregs __user *user)
+{
+	struct kvm_debugregs state;
+	int result;
+
+	if (write) {
+		if (copy_from_user(&state, user, sizeof(state)))
+			return -EFAULT;
+		if (state.flags || state.dr6 > U32_MAX || state.dr7 > U32_MAX)
+			return -EINVAL;
+		memset(state.reserved, 0, sizeof(state.reserved));
+		return write_stopped_registers(cpu, PVKVM_SET_DEBUGREGS, PVKVM_DEBUGREGS_AT,
+					       &state, sizeof(state));
+	}
+	result = read_stopped_registers(cpu, PVKVM_GET_DEBUGREGS, PVKVM_DEBUGREGS_AT,
+					&state, sizeof(state));
+	if (!result && copy_to_user(user, &state, sizeof(state)))
+		return -EFAULT;
+	return result;
+}
+
+static long cpu_mp_state(struct pvcpu *cpu, bool write, struct kvm_mp_state __user *user)
+{
+	struct kvm_mp_state state;
+	int result;
+
+	if (write) {
+		if (copy_from_user(&state, user, sizeof(state)))
+			return -EFAULT;
+		if (state.mp_state != KVM_MP_STATE_RUNNABLE &&
+		    (!READ_ONCE(cpu->vm->irqchip_created) ||
+		     (state.mp_state > KVM_MP_STATE_SIPI_RECEIVED &&
+		      state.mp_state != KVM_MP_STATE_AP_RESET_HOLD)))
+			return -EINVAL;
+		result = write_stopped_registers(cpu, PVKVM_SET_MP_STATE, PVKVM_MP_STATE_AT,
+						 &state, sizeof(state));
+		if (!result && !cpu->ran) {
+			cpu->staged_mp_state = state.mp_state;
+			if (state.mp_state == KVM_MP_STATE_SIPI_RECEIVED)
+				cpu->staged_sipi_pending = true;
+		}
+		return result;
+	}
+	result = read_stopped_registers(cpu, PVKVM_GET_MP_STATE, PVKVM_MP_STATE_AT,
+					&state, sizeof(state));
+	if (!result && !cpu->ran && cpu->staged_sipi_pending) {
+		/* A pre-run query can consume the SIPI with its reset vector. */
+		if (state.mp_state == KVM_MP_STATE_RUNNABLE &&
+		    (cpu->staged_mp_state == KVM_MP_STATE_INIT_RECEIVED ||
+		     cpu->staged_mp_state == KVM_MP_STATE_SIPI_RECEIVED)) {
+			cpu->regs.rip = 0;
+			cpu->sregs.cs.base = 0;
+			cpu->sregs.cs.selector = 0;
+		}
+		cpu->staged_sipi_pending = false;
+	}
+	if (!result && copy_to_user(user, &state, sizeof(state)))
+		return -EFAULT;
+	return result;
+}
+
+/* Serialized with KVM_SET_CPUID2 by cpu_ioctl's execution mutex. */
+static bool valid_xcr0(const struct pvcpu *cpu, u64 value)
+{
+	u64 allowed = XFEATURE_MASK_FP;
+	unsigned int i;
+
+	if (cpu->cpuid) {
+		for (i = 0; i < cpu->cpuid->count; i++) {
+			const struct kvm_cpuid_entry2 *entry = &cpu->cpuid->entries[i];
+
+			if (entry->function == 0xd && entry->index == 0) {
+				allowed |= entry->eax | ((u64)entry->edx << 32);
+				break;
+			}
+		}
+	}
+	return (value & XFEATURE_MASK_FP) && !(value & ~allowed) &&
+	       (!(value & XFEATURE_MASK_YMM) || (value & XFEATURE_MASK_SSE)) &&
+	       (!!(value & XFEATURE_MASK_BNDREGS) == !!(value & XFEATURE_MASK_BNDCSR)) &&
+	       (!(value & XFEATURE_MASK_AVX512) ||
+		((value & XFEATURE_MASK_AVX512) == XFEATURE_MASK_AVX512 && (value & XFEATURE_MASK_YMM))) &&
+	       (!(value & XFEATURE_MASK_XTILE) || (value & XFEATURE_MASK_XTILE) == XFEATURE_MASK_XTILE);
+}
+
+static long cpu_xcrs(struct pvcpu *cpu, bool write, struct kvm_xcrs __user *user)
+{
+	struct kvm_xcrs state;
+	unsigned int i;
+	int result;
+
+	if (write) {
+		if (copy_from_user(&state, user, sizeof(state)))
+			return -EFAULT;
+		if (state.flags || state.nr_xcrs > ARRAY_SIZE(state.xcrs))
+			return -EINVAL;
+		for (i = 0; i < state.nr_xcrs; i++) {
+			struct kvm_xcr xcr = state.xcrs[i];
+
+			if (xcr.xcr)
+				continue;
+			if (!valid_xcr0(cpu, xcr.value))
+				return -EINVAL;
+			/* Linux uses the first XCR0 entry, including when a later one repeats it. */
+			memset(&state, 0, sizeof(state));
+			state.nr_xcrs = 1;
+			state.xcrs[0].value = xcr.value;
+			return write_stopped_registers(cpu, PVKVM_SET_XCRS, PVKVM_XCRS_AT,
+						       &state, sizeof(state));
+		}
+		/* The x86 KVM ioctl ignores unsupported XCR indices. */
+		return 0;
+	}
+	result = read_stopped_registers(cpu, PVKVM_GET_XCRS, PVKVM_XCRS_AT,
+					&state, sizeof(state));
+	if (!result && copy_to_user(user, &state, sizeof(state)))
+		return -EFAULT;
+	return result;
+}
+
 static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct pvcpu *cpu = file->private_data;
-	struct run_page *page = cpu->page;
 	struct kvm_fpu fpu;
-	struct kvm_sregs sregs, wanted;
+	struct kvm_sregs sregs;
 	struct kvm_regs regs;
 	void __user *uarg = (void __user *)arg;
 	long result;
 
 	if (cpu->vm->owner != current->mm)
 		return -EIO;
-	result = mutex_lock_interruptible(&cpu->execution);
+	/* As in Linux KVM, an ordinary signal does not abandon a run in the lock queue. */
+	result = cmd == KVM_RUN ? mutex_lock_killable(&cpu->execution) :
+				 mutex_lock_interruptible(&cpu->execution);
 	if (result)
 		return -EINTR;
 	if (cpu->ran && cmd == KVM_SET_SREGS) {
@@ -884,6 +1120,11 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			result = read_stopped_registers(cpu, PVKVM_GET_SREGS, PVKVM_REGISTERS_AT, &sregs, sizeof(sregs));
 			if (result)
 				break;
+		} else if (!cpu->sregs_set) {
+			result = read_reset_sregs(cpu);
+			if (result)
+				break;
+			sregs = cpu->sregs_reset;
 		}
 		result = copy_to_user(uarg, &sregs, sizeof(sregs)) ? -EFAULT : 0;
 		break;
@@ -892,14 +1133,18 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			result = -EFAULT;
 			break;
 		}
-		wanted = reset_sregs;
-		wanted.cs.base = 0;
-		wanted.cs.selector = 0;
-		if (memcmp(&sregs, &wanted, sizeof(sregs)) && !valid_protected_entry(&sregs)) {
+		result = read_reset_sregs(cpu);
+		if (result)
+			break;
+		if (!valid_real_entry(&sregs, &cpu->sregs_reset) &&
+		    !valid_protected_entry(&sregs, &cpu->sregs_reset) &&
+		    !valid_real_entry(&sregs, &reset_sregs) &&
+		    !valid_protected_entry(&sregs, &reset_sregs)) {
 			result = -EINVAL;
 			break;
 		}
 		cpu->sregs = sregs;
+		cpu->sregs_set = true;
 		result = 0;
 		break;
 	case KVM_GET_FPU:
@@ -937,14 +1182,26 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case KVM_SET_CPUID2:
 		result = cpu_cpuid(cpu, cmd == KVM_SET_CPUID2, uarg);
 		break;
+	case KVM_GET_LAPIC:
+	case KVM_SET_LAPIC:
+		result = cpu_lapic(cpu, cmd == KVM_SET_LAPIC, uarg);
+		break;
+	case KVM_GET_DEBUGREGS:
+	case KVM_SET_DEBUGREGS:
+		result = cpu_debugregs(cpu, cmd == KVM_SET_DEBUGREGS, uarg);
+		break;
+	case KVM_GET_MP_STATE:
+	case KVM_SET_MP_STATE:
+		result = cpu_mp_state(cpu, cmd == KVM_SET_MP_STATE, uarg);
+		break;
+	case KVM_GET_XCRS:
+	case KVM_SET_XCRS:
+		result = cpu_xcrs(cpu, cmd == KVM_SET_XCRS, uarg);
+		break;
 	case KVM_RUN:
 		if (arg || cpu->sregs.cs.base || !registers_fit_mode(&cpu->regs, &cpu->sregs) ||
 		    (!(cpu->sregs.cr0 & X86_CR0_PE) && cpu->regs.rip > U16_MAX)) {
 			result = -EINVAL;
-			break;
-		}
-		if (READ_ONCE(page->run.immediate_exit) || signal_pending(current)) {
-			result = -EINTR;
 			break;
 		}
 		result = run_cpu(cpu);
@@ -974,7 +1231,7 @@ static int new_cpu(struct pvvm *vm, unsigned long id)
 	cpu = kzalloc(sizeof(*cpu), GFP_KERNEL);
 	if (!cpu)
 		return -ENOMEM;
-	cpu->page = vmalloc_user(PAGE_SIZE);
+	cpu->page = vmalloc_user(sizeof(*cpu->page));
 	if (!cpu->page) {
 		kfree(cpu);
 		return -ENOMEM;
@@ -1023,8 +1280,13 @@ static long device_capability(unsigned long capability)
 	case KVM_CAP_IOEVENTFD_ANY_LENGTH:
 	case KVM_CAP_PIT:
 	case KVM_CAP_PIT2:
+	case KVM_CAP_PIT_STATE2:
 	case KVM_CAP_IRQFD:
 	case KVM_CAP_SET_TSS_ADDR:
+	case KVM_CAP_IRQCHIP:
+	case KVM_CAP_DEBUGREGS:
+	case KVM_CAP_MP_STATE:
+	case KVM_CAP_XCRS:
 	case KVM_CAP_EXT_CPUID:
 		return 1;
 	case KVM_CAP_NR_MEMSLOTS:
@@ -1231,6 +1493,47 @@ static long create_irqchip(struct pvvm *vm, unsigned long arg)
 	return result;
 }
 
+static long access_irqchip(struct pvvm *vm, bool write, struct kvm_irqchip __user *user)
+{
+	struct pvkvm *p = vm->provider;
+	struct kvm_irqchip *chip;
+	int result;
+
+	chip = memdup_user(user, sizeof(*chip));
+	if (IS_ERR(chip))
+		return PTR_ERR(chip);
+	if (chip->chip_id >= KVM_NR_IRQCHIPS) {
+		result = -EINVAL;
+		goto free_chip;
+	}
+	if (write && chip->chip_id == KVM_IRQCHIP_IOAPIC &&
+	    (chip->chip.ioapic.base_address != PVKVM_IOAPIC_GPA ||
+	     chip->chip.ioapic.ioregsel > U8_MAX || chip->chip.ioapic.id > U8_MAX ||
+	     chip->chip.ioapic.irr >= BIT(PVKVM_GSI_COUNT) || chip->chip.ioapic.pad)) {
+		result = -EINVAL;
+		goto free_chip;
+	}
+	result = mutex_lock_interruptible(&p->lock);
+	if (result)
+		goto free_chip;
+	if (!vm->irqchip_created) {
+		result = -ENXIO;
+	} else if (p->dead) {
+		result = -ENODEV;
+	} else {
+		memcpy_toio(p->mailbox + PVKVM_IRQCHIP_AT, chip, sizeof(*chip));
+		result = request(p, write ? PVKVM_SET_IRQCHIP : PVKVM_GET_IRQCHIP, NULL, NULL);
+		if (!result && !write)
+			memcpy_fromio(chip, p->mailbox + PVKVM_IRQCHIP_AT, sizeof(*chip));
+	}
+	mutex_unlock(&p->lock);
+	if (!result && !write && copy_to_user(user, chip, sizeof(*chip)))
+		result = -EFAULT;
+free_chip:
+	kfree(chip);
+	return result;
+}
+
 static long set_irq_line(struct pvvm *vm, struct kvm_irq_level __user *user)
 {
 	struct pvkvm *p = vm->provider;
@@ -1284,6 +1587,47 @@ static long create_pit(struct pvvm *vm, struct kvm_pit_config __user *user)
 			vm->pit_created = true;
 	}
 	mutex_unlock(&p->lock);
+	return result;
+}
+
+static long access_pit_state(struct pvvm *vm, bool write, struct kvm_pit_state2 __user *user)
+{
+	struct pvkvm *p = vm->provider;
+	struct kvm_pit_state2 state;
+	unsigned int i;
+	int result;
+
+	if (write && copy_from_user(&state, user, sizeof(state)))
+		return -EFAULT;
+	if (write) {
+		if (state.flags & ~(KVM_PIT_FLAGS_HPET_LEGACY | KVM_PIT_FLAGS_SPEAKER_DATA_ON))
+			return -EINVAL;
+		for (i = 0; i < ARRAY_SIZE(state.channels); i++) {
+			const struct kvm_pit_channel_state *ch = &state.channels[i];
+
+			if (ch->count > 65536 || ch->count_latched > 3 || ch->status_latched > 1 ||
+			    ch->read_state > 4 || ch->write_state > 4 || ch->rw_mode > 3 ||
+			    (ch->mode > 7 && ch->mode != 0xff) || ch->bcd > 1 || ch->gate > 1)
+				return -EINVAL;
+		}
+	}
+	result = mutex_lock_interruptible(&p->lock);
+	if (result)
+		return result;
+	if (!vm->pit_created) {
+		result = -ENXIO;
+	} else if (p->dead) {
+		result = -ENODEV;
+	} else {
+		if (write)
+			memcpy_toio(p->mailbox + PVKVM_PIT_STATE_AT, &state, sizeof(state));
+		result = request(p, write ? PVKVM_SET_PIT : PVKVM_GET_PIT, NULL, NULL);
+		if (!result && !write)
+			memcpy_fromio(&state, p->mailbox + PVKVM_PIT_STATE_AT, sizeof(state));
+	}
+	mutex_unlock(&p->lock);
+	if (!result && !write && copy_to_user(user, &state, sizeof(state)))
+		return -EFAULT;
 	return result;
 }
 
@@ -1356,6 +1700,8 @@ static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return vm_ioeventfd(vm, (void __user *)arg);
 	if (cmd == KVM_CREATE_IRQCHIP)
 		return create_irqchip(vm, arg);
+	if (cmd == KVM_GET_IRQCHIP || cmd == KVM_SET_IRQCHIP)
+		return access_irqchip(vm, cmd == KVM_SET_IRQCHIP, (void __user *)arg);
 	if (cmd == KVM_IRQ_LINE)
 		return set_irq_line(vm, (void __user *)arg);
 	if (cmd == KVM_IRQFD)
@@ -1364,6 +1710,8 @@ static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return create_pit(vm, NULL);
 	if (cmd == KVM_CREATE_PIT2)
 		return arg ? create_pit(vm, (void __user *)arg) : -EFAULT;
+	if (cmd == KVM_GET_PIT2 || cmd == KVM_SET_PIT2)
+		return access_pit_state(vm, cmd == KVM_SET_PIT2, (void __user *)arg);
 	if (cmd == KVM_SET_TSS_ADDR)
 		return set_tss_address(vm, arg);
 	if (cmd != KVM_SET_USER_MEMORY_REGION)
@@ -1498,7 +1846,7 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case KVM_GET_API_VERSION:
 		return KVM_API_VERSION;
 	case KVM_GET_VCPU_MMAP_SIZE:
-		return PAGE_SIZE;
+		return sizeof(struct run_page);
 	case KVM_CHECK_EXTENSION:
 		return device_capability(arg);
 	case KVM_GET_MSR_INDEX_LIST: {
@@ -1541,7 +1889,7 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	struct pvkvm *p;
 	int result;
 
-	BUILD_BUG_ON(sizeof(struct run_page) > PAGE_SIZE);
+	BUILD_BUG_ON(sizeof(struct run_page) != 2 * PAGE_SIZE);
 	BUILD_BUG_ON(PAGE_SIZE != PVKVM_GUEST_PAGE_SIZE);
 	BUILD_BUG_ON(PVKVM_SLOT_TABLE_AT + PVKVM_MAX_SLOTS * PVKVM_SLOT_RECORD_SIZE > PVKVM_FPU_AT);
 	BUILD_BUG_ON(sizeof(struct kvm_fpu) != PVKVM_FPU_BYTES);
@@ -1550,11 +1898,25 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	BUILD_BUG_ON(PVKVM_MSR_AT + sizeof(struct pvkvm_msr_batch) > PVKVM_CPUID_AT);
 	BUILD_BUG_ON(PVKVM_CPUID_AT + sizeof(struct pvkvm_cpuid_table) > PVKVM_EXIT_AT);
 	BUILD_BUG_ON(PVKVM_EXIT_AT + sizeof(struct pvkvm_run_exit) > PVKVM_COMPLETION_AT);
-	BUILD_BUG_ON(PVKVM_COMPLETION_AT + sizeof(struct pvkvm_mmio_completion) > PVKVM_IRQ_AT);
+	BUILD_BUG_ON(PVKVM_COMPLETION_AT + sizeof(struct pvkvm_read_completion) > PVKVM_IRQ_AT);
 	BUILD_BUG_ON(PVKVM_IRQ_AT + sizeof(struct kvm_irq_level) > PVKVM_PIT_FLAGS_AT);
 	BUILD_BUG_ON(PVKVM_PIT_FLAGS_AT + sizeof(u32) > PVKVM_TSS_AT);
+	BUILD_BUG_ON(PVKVM_TSS_AT + sizeof(u32) > PVKVM_LAPIC_AT);
+	BUILD_BUG_ON(sizeof(struct kvm_lapic_state) != PVKVM_LAPIC_BYTES);
+	BUILD_BUG_ON(PVKVM_LAPIC_VALID_AT + sizeof(u32) > PVKVM_REGISTERS_AT);
+	BUILD_BUG_ON(PVKVM_LAPIC_AT + PVKVM_LAPIC_BYTES > PVKVM_PIO_DATA_AT);
+	BUILD_BUG_ON(PVKVM_PIO_DATA_AT + PVKVM_PIO_BYTES > PVKVM_IRQCHIP_AT);
+	BUILD_BUG_ON(sizeof(struct kvm_irqchip) != PVKVM_IRQCHIP_BYTES);
+	BUILD_BUG_ON(PVKVM_IRQCHIP_AT + PVKVM_IRQCHIP_BYTES > PVKVM_PIT_STATE_AT);
+	BUILD_BUG_ON(sizeof(struct kvm_pit_state2) != PVKVM_PIT_STATE_BYTES);
+	BUILD_BUG_ON(PVKVM_PIT_STATE_AT + PVKVM_PIT_STATE_BYTES > PVKVM_DEBUGREGS_AT);
+	BUILD_BUG_ON(sizeof(struct kvm_debugregs) != PVKVM_DEBUGREGS_BYTES);
+	BUILD_BUG_ON(PVKVM_DEBUGREGS_AT + PVKVM_DEBUGREGS_BYTES > PVKVM_MP_STATE_AT);
+	BUILD_BUG_ON(sizeof(struct kvm_mp_state) != sizeof(u32));
+	BUILD_BUG_ON(PVKVM_MP_STATE_AT + sizeof(struct kvm_mp_state) > PVKVM_XCRS_AT);
+	BUILD_BUG_ON(sizeof(struct kvm_xcrs) != PVKVM_XCRS_BYTES);
 	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
-	    pci_resource_len(dev, 2) < PVKVM_TSS_AT + sizeof(u32))
+	    pci_resource_len(dev, 2) < PVKVM_XCRS_AT + PVKVM_XCRS_BYTES)
 		return -ENODEV;
 	result = pcim_enable_device(dev);
 	if (result)

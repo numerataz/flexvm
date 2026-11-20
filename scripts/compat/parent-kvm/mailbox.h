@@ -3,7 +3,7 @@
 #define FLEXVM_PVKVM_MAILBOX_H
 
 #define PVKVM_MAGIC        0x4d564b46
-#define PVKVM_VERSION      23
+#define PVKVM_VERSION      32
 #define PVKVM_MAGIC_AT     0
 #define PVKVM_VERSION_AT   4
 #define PVKVM_REQUEST_AT   8
@@ -16,6 +16,7 @@
 #define PVKVM_CPU_AT         44
 #define PVKVM_FPU_VALID_AT   48
 #define PVKVM_CPUID_VALID_AT 52
+#define PVKVM_LAPIC_VALID_AT 56
 #define PVKVM_SLOT_TABLE_AT  640
 #define PVKVM_SLOT_RECORD_SIZE 16
 #define PVKVM_FPU_AT         768
@@ -30,6 +31,20 @@
 #define PVKVM_IRQ_AT         0x84200
 #define PVKVM_PIT_FLAGS_AT   0x84208
 #define PVKVM_TSS_AT         0x8420c
+#define PVKVM_LAPIC_AT       0x85000
+#define PVKVM_LAPIC_BYTES    1024
+#define PVKVM_PIO_DATA_AT    0x86000
+#define PVKVM_PIO_BYTES      4096
+#define PVKVM_IRQCHIP_AT     0x87000
+#define PVKVM_IRQCHIP_BYTES  520
+#define PVKVM_PIT_STATE_AT   0x87300
+#define PVKVM_PIT_STATE_BYTES 112
+#define PVKVM_DEBUGREGS_AT   0x87400
+#define PVKVM_DEBUGREGS_BYTES 128
+#define PVKVM_MP_STATE_AT     0x87480
+#define PVKVM_XCRS_AT         0x87500
+#define PVKVM_XCRS_BYTES      392
+#define PVKVM_IOAPIC_GPA     0xfec00000ULL
 #define PVKVM_GSI_COUNT      24
 #define PVKVM_REGISTERS_AT   64
 #define PVKVM_INITIAL_SREGISTERS_AT 256
@@ -66,10 +81,10 @@ struct pvkvm_run_exit {
 	__u64 address;
 	__u8 data[8];
 	__u32 is_write;
-	__u32 reserved;
+	__u32 count;
 };
 
-struct pvkvm_mmio_completion {
+struct pvkvm_read_completion {
 	__u32 length;
 	__u32 reserved;
 	__u8 data[8];
@@ -93,6 +108,19 @@ enum pvkvm_command {
 	PVKVM_SET_IRQ_LINE,
 	PVKVM_CREATE_PIT,
 	PVKVM_SET_TSS_ADDR,
+	PVKVM_GET_LAPIC,
+	PVKVM_SET_LAPIC,
+	PVKVM_COMPLETE_READ,
+	PVKVM_GET_IRQCHIP,
+	PVKVM_SET_IRQCHIP,
+	PVKVM_GET_PIT,
+	PVKVM_SET_PIT,
+	PVKVM_GET_DEBUGREGS,
+	PVKVM_SET_DEBUGREGS,
+	PVKVM_GET_MP_STATE,
+	PVKVM_SET_MP_STATE,
+	PVKVM_GET_XCRS,
+	PVKVM_SET_XCRS,
 };
 
 #endif

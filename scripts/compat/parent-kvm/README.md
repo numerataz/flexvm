@@ -86,8 +86,8 @@ physical address, width and byte sequence. A shared-memory marker shows that
 the worker stopped at each exit and continued from the same instruction stream.
 Use `--mmio-read` to exercise both writes and reads. The single vCPU stops
 at each read. On the next ordinary `KVM_RUN`, it completes the access with
-the bytes written by the client into the mapped `kvm_run` page. Completion
-with a pending signal and parallel vCPU entry remain part of #1501.
+the bytes written by the client into the mapped `kvm_run` page. Parallel vCPU
+entry remains part of #1501.
 Add `--ioeventfd` to exercise real eventfd notifications on matching MMIO and
 port writes. The VM's registry supports address, access width, data matches
 and any-length writes. Matching writes signal the eventfd and continue the
@@ -111,10 +111,43 @@ slot used by Firecracker. The guest reads and updates markers at the beginning
 and end of the slot, including within the legacy VGA and ROM windows. The
 worker maps the registered bytes there and limits VM RAM to addresses below
 the reserved 3 GiB device boundary.
+Use `--pvh --ram-pages 32768` to exercise that slot with the x86 PVH entry
+state from Firecracker. The VMM reads the actual worker reset registers and
+sets the GDT, IDT, task selector, and CR0 before entry at GPA `0x1000540`.
+The guest records the descriptor and control registers using x86 instructions.
 Add `--tss` to reserve the same three-page guest physical range that
 Firecracker configures before creating the x86 interrupt controller. Native
 KVM receives the exact address. The TCG worker uses the reservation when
 validating its RAM slots.
+Add `--lapic` to read the reset xAPIC image, stage LINT0 and LINT1 before
+the first run, and update the stopped controller. The guest receives a PIC
+interrupt through the installed state, then changes LINT1 through MMIO.
+The test checks that restoring ICR contents does not send an interrupt.
+Use `--xcrs --protected-entry` to stage XCR0, change it in the guest with
+XSETBV, and read back a live restore with XGETBV.
+Use `--mp-state --protected-entry` to read the startup state, restore the
+vCPU to HALTED and keep it stopped until a real IRQ arrives. The fixture
+also checks the entry offset after restoring a startup IPI.
+Use `--debugregs --protected-entry` to stage a hardware breakpoint,
+handle the ensuing debug exception inside the child, and verify the guest's
+debug register writes from the stopped VMM.
+Add `--pit-state` to stage a timer latch and the speaker state before
+execution. The guest consumes the latch and updates the speaker port. The
+VMM then restores a live one-shot timer and the interrupt wakes the guest.
+Add `--irqchip-state` to read and update the parent PIC and IOAPIC state.
+The VMM installs an IOAPIC route before the first run, reads the live PIC
+configuration, and verifies that the new IOAPIC route delivers a guest
+interrupt. Both parent engines operate on their live controllers.
+Add `--pio` to exercise VMM-owned x86 ports. The client gets the port,
+direction, width, count, and data in its mapped run area. It supplies bytes
+for scalar and repeated input before re-entering the vCPU. The test also
+checks that the configured PIC and PIT still handle their own ports.
+Add `--pio-boundary` to exercise both sides of a PIC port range and the
+top of the x86 port space. The TCG worker classifies the complete CPU
+transaction before handing it to a device or to the VMM.
+Add `--complete-read` to the MMIO or port fixture to complete an input with
+`immediate_exit` set. The client observes the updated result register and
+verifies that the next guest instruction waits for ordinary re-entry.
 The worker uses one host mapping per consecutive extent. Highly fragmented
 slots can reach the host's mapping limit. A failed mapping releases the
 partially mapped worker span.

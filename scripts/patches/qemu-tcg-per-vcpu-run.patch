@@ -30,7 +30,7 @@
 +    }
 +
 +    qemu_clock_enable(QEMU_CLOCK_VIRTUAL, true);
-+    cpu->halted = false;
++    /* Preserve the vCPU halt state across userspace exits. */
 +    cpu_resume(cpu);
 +    return true;
 +}
