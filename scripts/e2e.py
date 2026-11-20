@@ -212,7 +212,7 @@ class Host:
         while not owns_socket(self.proc.pid, listener_inode(self.port)):
             if self.proc.poll() is not None or time.time() > deadline:
                 raise AssertionError(f"host {self.label} did not come up; see {self.log}")
-            time.sleep(0.2)
+            time.sleep(0.02)
 
     def stop(self, timeout=60):
         """Destroys what VMs are left and stops the listener; raises if it died early."""
@@ -3901,7 +3901,7 @@ COST = {"incus": 180, "kind": 180, "k3s": 180, "lxc": 180, "nspawn": 180, "rootl
         "faults/shrink_stall": 45, "faults/pages_dead": 40, "faults/source_killed_basic": 35, "faults/kill_refused_checkpoint": 35,
         "faults/quiet_source": 32, "faults/kill_source": 32, "faults/checkpoint_crash": 30, "faults/suspend_disk_freed": 23,
         "faults/collapse_ckpt_fail": 12, "faults/evacuate": 25}
-BATCH_S = 20
+BATCH_S = 60
 SELFTEST_SKIP_NAME = "wildcard_listen"
 
 
@@ -3986,9 +3986,14 @@ def selected_work(selected, scenarios, kvm, split=None):
         i, n = map(int, split.split("/"))
         assert 1 <= i <= n, f"--split {split}: want I/N with 1 <= I <= N"
         parts = [[] for _ in range(n)]
-        for item in work:
+        # Keep GROW-template scenarios in one split so only one runner builds the GROW template.
+        grow = [item for item in work if GROW in item[1]]
+        rest = [item for item in work if GROW not in item[1]]
+        parts[0].extend(grow)
+        for item in rest:
             min(parts, key=lambda part: sum(value[2] for value in part)).append(item)
         work = parts[i - 1]
+        work.sort(key=lambda w: (-w[2], w[0]))
     return work
 
 
@@ -4064,11 +4069,13 @@ def main():
             if not ready:
                 return None
             # A batch's worker starts its hosts' listeners, or leaves them to faults.py: never both.
+            # Heavy scenarios each run in their own worker so each gets its own faults.py timeout.
             batch = [ready[0]]
-            for w in reversed([w for w in ready[1:] if own(w[0]) == own(ready[0][0])]):
-                if sum(b[2] for b in batch) + w[2] > BATCH_S:
-                    break
-                batch.append(w)
+            if args.shard != "heavy":
+                for w in reversed([w for w in ready[1:] if own(w[0]) == own(ready[0][0])]):
+                    if sum(b[2] for b in batch) + w[2] > BATCH_S:
+                        break
+                    batch.append(w)
             for w in batch:
                 work.remove(w)
             return [w[0] for w in batch]
@@ -4242,6 +4249,8 @@ def main():
         for egress_case in ("podman", "namespace_sandboxes", "containerd"):
             assigned = [any(item[0] == egress_case for item in selected_work(list(CASES), scenarios, kvm, f"{i}/4")) for i in range(1, 5)]
             assert sum(assigned) == 1, f"{egress_case} egress must belong to exactly one split: {assigned}"
+        grow_splits = [any(GROW in item[1] for item in selected_work(list(CASES), scenarios, kvm, f"{i}/4")) for i in range(1, 5)]
+        assert sum(grow_splits) == 1, f"GROW scenarios must belong to exactly one split: {grow_splits}"
         # The second batch could not be spawned: exactly its cases and scenarios fail, the rest pass.
         bad = sorted(r[0] for r in failed)
         want = sorted(spawned[1][0] + [f"faults/{x}" for x in spawned[1][1]]) if len(spawned) > 1 else ["(no second batch)"]
