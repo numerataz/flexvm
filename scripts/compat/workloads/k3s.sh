@@ -81,7 +81,8 @@ PYFIXTURE
         image=docker.io/flexvm/busybox:compat
         policy=Never
         k3s crictl inspecti "$image" > "$base/fixture-image.json"
-        k3s ctr --namespace k8s.io images export "$base/imported-image.tar" "$image"
+        # The direct exporter writes the complete archive before ctr returns.
+        k3s ctr --namespace k8s.io images export --local --skip-manifest-json "$base/imported-image.tar" "$image"
         python3 /nested-input/verify-fixture-import.py --archive "$base/imported-image.tar" --metadata /nested-input/busybox.json
         rm "$base/imported-image.tar"
     fi
@@ -182,7 +183,7 @@ PY
     test "$(k exec "$first" -- wget -qO- http://web.flexvm-compat.svc.cluster.local:8080)" = "$nonce"
     peer=$(k get pod "$second" -o jsonpath='{.status.podIP}')
     test "$(k exec "$first" -- wget -qO- "http://$peer:8080")" = "$nonce"
-    k exec "$first" -- wget -qO /dev/null http://example.com
+    k exec "$first" -- wget -qO /dev/null https://github.com/robots.txt
     node_port=$(cat "$base/node-port")
     case $node_port in ''|*[!0-9]*) exit 1 ;; esac
     test "$node_port" -ge 30000 && test "$node_port" -le 32767

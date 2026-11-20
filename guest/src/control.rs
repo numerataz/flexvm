@@ -47,6 +47,19 @@ pub struct Client {
     thread: Option<JoinHandle<()>>,
 }
 
+pub struct IncomingRequest {
+    peer: UnixStream,
+    payload: mpsc::Receiver<()>,
+}
+
+impl IncomingRequest {
+    /// Keep dispatch order while the bridge negotiates the stream. The guest's
+    /// request-line timeout starts only after a request byte reaches the socket.
+    pub fn wait_for_payload(self) -> Option<UnixStream> {
+        self.payload.recv().ok().map(|()| self.peer)
+    }
+}
+
 impl Client {
     pub fn connect(io: UnixStream) -> io::Result<Self> {
         let runtime = runtime()?;
@@ -187,7 +200,7 @@ impl AsyncWrite for Serial {
     }
 }
 
-pub fn serve(port: File, incoming: SyncSender<UnixStream>) -> io::Result<()> {
+pub fn serve(port: File, incoming: SyncSender<IncomingRequest>) -> io::Result<()> {
     let flags = unsafe { libc::fcntl(port.as_raw_fd(), libc::F_GETFL) };
     if flags < 0 || unsafe { libc::fcntl(port.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         return Err(io::Error::last_os_error());
@@ -211,7 +224,7 @@ enum Event {
 async fn drive<T>(
     io: T,
     mut requests: Option<channel::Receiver<Open>>,
-    incoming: Option<SyncSender<UnixStream>>,
+    incoming: Option<SyncSender<IncomingRequest>>,
     mut stop: watch::Receiver<bool>,
 ) -> io::Result<()>
 where
@@ -311,7 +324,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for Shared<T> {
 
 enum Endpoint {
     Outgoing(Open),
-    Incoming(SyncSender<UnixStream>),
+    Incoming(SyncSender<IncomingRequest>),
 }
 
 /// Record framing preserves Unix write-half closure without sending Yamux FIN.
@@ -519,7 +532,8 @@ fn bridge(stream: yamux::Stream, endpoint: Endpoint) {
             });
         }
         Endpoint::Incoming(incoming) => {
-            if incoming.try_send(peer).is_err() {
+            let (ready, payload) = mpsc::channel();
+            if incoming.try_send(IncomingRequest { peer, payload }).is_err() {
                 return;
             }
             tokio::spawn(async move {
@@ -531,10 +545,13 @@ fn bridge(stream: yamux::Stream, endpoint: Endpoint) {
                         return Err(io::ErrorKind::InvalidData.into());
                     }
                     stream.write_all(HELLO).await?;
-                    stream.flush().await
+                    stream.flush().await?;
+                    let mut first = [0];
+                    stream.read_exact(&mut first).await?;
+                    io.write_all(&first).await
                 })
                 .await;
-                if !matches!(handshake, Ok(Ok(()))) {
+                if !matches!(handshake, Ok(Ok(()))) || ready.send(()).is_err() {
                     return;
                 }
                 let _ = forward(&mut io, &mut stream, Side::Agent).await;
@@ -552,7 +569,7 @@ mod tests {
     use std::os::unix::fs::OpenOptionsExt;
     use std::time::Duration;
 
-    fn pair() -> (Client, mpsc::Receiver<UnixStream>, mpsc::Receiver<io::Result<()>>) {
+    fn pair() -> (Client, mpsc::Receiver<IncomingRequest>, mpsc::Receiver<io::Result<()>>) {
         let (host, guest) = UnixStream::pair().unwrap();
         guest.set_nonblocking(true).unwrap();
         let (incoming, requests) = mpsc::sync_channel(STREAMS);
@@ -563,13 +580,13 @@ mod tests {
         (Client::connect(host).unwrap(), requests, done)
     }
 
-    fn open(client: &Client, requests: &mpsc::Receiver<UnixStream>) -> (UnixStream, UnixStream) {
+    fn open(client: &Client, requests: &mpsc::Receiver<IncomingRequest>) -> (UnixStream, UnixStream) {
         let mut host = client.open(Instant::now() + Duration::from_secs(3)).unwrap();
         host.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
         host.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
         // Yamux sends the stream's SYN with its first data/window frame.
         host.write_all(b"x").unwrap();
-        let mut guest = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+        let mut guest = requests.recv_timeout(Duration::from_secs(3)).unwrap().wait_for_payload().unwrap();
         guest.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
         guest.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
         let mut first = [0];
@@ -725,8 +742,8 @@ mod tests {
         let mut second = client.open(Instant::now() + Duration::from_secs(3)).unwrap();
         second.write_all(b"second").unwrap();
         first.write_all(b"first").unwrap();
-        let mut a = requests.recv_timeout(Duration::from_secs(3)).unwrap();
-        let mut b = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+        let mut a = requests.recv_timeout(Duration::from_secs(3)).unwrap().wait_for_payload().unwrap();
+        let mut b = requests.recv_timeout(Duration::from_secs(3)).unwrap().wait_for_payload().unwrap();
         a.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
         b.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
         let mut bytes = [0; 5];
@@ -735,6 +752,27 @@ mod tests {
         let mut bytes = [0; 6];
         b.read_exact(&mut bytes).unwrap();
         assert_eq!(&bytes, b"second");
+        drop(client);
+        done.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+    }
+
+    #[test]
+    fn an_acknowledged_stream_waits_for_request_bytes_before_dispatch() {
+        let (client, requests, done) = pair();
+        let mut host = client.open(Instant::now() + Duration::from_secs(3)).unwrap();
+        let pending = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(pending.payload.try_recv(), Err(mpsc::TryRecvError::Empty));
+        host.write_all(b"PING\n").unwrap();
+        let mut guest = pending.wait_for_payload().unwrap();
+        guest.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut request = [0; 5];
+        guest.read_exact(&mut request).unwrap();
+        assert_eq!(&request, b"PING\n");
+
+        let silent = client.open(Instant::now() + Duration::from_secs(3)).unwrap();
+        let pending = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+        drop(silent);
+        assert!(pending.wait_for_payload().is_none());
         drop(client);
         done.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
     }
@@ -798,14 +836,15 @@ mod tests {
     fn a_full_dispatch_queue_resets_new_opens_and_recovers_after_draining() {
         let (host, guest) = UnixStream::pair().unwrap();
         let client = Client::connect(host).unwrap();
-        let (incoming, requests) = mpsc::sync_channel::<UnixStream>(1);
+        let (incoming, requests) = mpsc::sync_channel::<IncomingRequest>(1);
         let server = std::thread::spawn(move || serve(File::from(OwnedFd::from(guest)), incoming));
         let first = client.open(Instant::now() + Duration::from_secs(3)).unwrap();
         let error = client.open(Instant::now() + Duration::from_secs(3)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
         let first_peer = requests.recv_timeout(Duration::from_secs(3)).unwrap();
         let mut next = client.open(Instant::now() + Duration::from_secs(3)).unwrap();
-        let mut peer = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+        next.write_all(b"x").unwrap();
+        let mut peer = requests.recv_timeout(Duration::from_secs(3)).unwrap().wait_for_payload().unwrap();
         next.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
         peer.write_all(b"ok").unwrap();
         let mut reply = [0; 2];
@@ -826,10 +865,10 @@ mod tests {
             let error = client.open(Instant::now() + Duration::from_millis(10)).unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
         }
-        let (incoming, requests) = mpsc::sync_channel::<UnixStream>(STREAMS);
+        let (incoming, requests) = mpsc::sync_channel::<IncomingRequest>(STREAMS);
         let server = std::thread::spawn(move || serve(File::from(OwnedFd::from(guest)), incoming));
         let handler = std::thread::spawn(move || {
-            for mut request in requests {
+            for mut request in requests.into_iter().filter_map(IncomingRequest::wait_for_payload) {
                 request.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
                 if request.read_exact(&mut [0]).is_ok() {
                     let _ = request.write_all(b"ok");

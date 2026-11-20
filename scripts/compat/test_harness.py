@@ -134,6 +134,23 @@ class Harness(unittest.TestCase):
         self.assertEqual(self.report()['phases'][0]['status'], 'failed')
         self.assertFalse(json.loads((self.root / 'state').read_text())['active'])
 
+    def test_workload_diagnostics_run_before_cleanup_and_keep_original_failure(self):
+        workload = self.root / 'workload.sh'
+        workload.write_text('exit 1\n')
+        result = self.run_suite('--workload', str(workload), '--workload-diagnostics',
+                                FAIL_WORKLOAD='verify')
+        self.assertEqual(result.returncode, 1)
+        report = self.report()
+        self.assertIn("verify", report["error"])
+        self.assertEqual(report["phases"][0]["status"], "failed")
+        self.assertEqual((self.output / "diagnose-run.stdout.log").read_text(), "workload-diagnose\n")
+        self.assertIn("Workload diagnostics for run:\nworkload-diagnose", result.stderr)
+        calls = self.calls()
+        diagnoses = [i for i, call in enumerate(calls) if call[0] == "exec" and "diagnose" in call]
+        removes = [i for i, call in enumerate(calls) if call[0] == "rm"]
+        self.assertEqual(len(diagnoses), 1)
+        self.assertLess(diagnoses[0], removes[0])
+
     def test_inode_failure_cleans_owned_vm_before_workload_setup(self):
         workload = self.root / 'workload.sh'
         workload.write_text('exit 0\n')

@@ -86,7 +86,7 @@ EOF
             test "$(cat /sys/fs/cgroup/memory.max)" = 67108864
             test "$(cat /sys/fs/cgroup/cpu.max)" = "50000 100000"
             test "$(cat /sys/fs/cgroup/pids.max)" = 64
-            wget -qO /dev/null http://example.com
+            wget -qO /dev/null https://github.com/robots.txt
         '
         context=$base/build-$mode
         mkdir "$context"

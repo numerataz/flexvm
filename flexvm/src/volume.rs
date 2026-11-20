@@ -33,7 +33,13 @@ pub struct Catalog {
     directory: File,
 }
 
-fn valid_id(id: &str) -> bool {
+pub(crate) struct Writer {
+    pub id: String,
+    pub size: u64,
+    pub file: File,
+}
+
+pub(crate) fn valid_id(id: &str) -> bool {
     id.len() == 32 && id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
@@ -102,7 +108,7 @@ fn copy_sparse(source: &File, target: &File, size: u64) -> Result<()> {
     Ok(())
 }
 
-fn copy_raw(source: &File, target: &File, size: u64) -> Result<()> {
+pub(crate) fn copy_raw(source: &File, target: &File, size: u64) -> Result<()> {
     loop {
         if unsafe { libc::ioctl(target.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) } == 0 {
             return Ok(());
@@ -280,11 +286,24 @@ impl Catalog {
         self.create_locked(name, size, |_| Ok(()))
     }
 
-    pub fn clone_volume(&self, source: &str, name: &str) -> Result<Info> {
-        let _catalog = self.lock(libc::LOCK_EX)?;
+    fn locked_writer(&self, source: &str) -> Result<(Info, File)> {
         let info = self.find(source)?;
         let (_, _, disk) = self.read(&info.metadata.id)?;
-        crate::host::flock(&disk, libc::LOCK_EX | libc::LOCK_NB).map_err(|error| format!("source volume is still in use: {error}"))?;
+        crate::host::flock(&disk, libc::LOCK_EX | libc::LOCK_NB).map_err(|error| format!("volume {source:?} is still in use: {error}"))?;
+        Ok((info, disk))
+    }
+
+    /// Opening and taking the per-volume lease must precede releasing the
+    /// catalog lock. Removal and cloning take the same backing-file lease.
+    pub(crate) fn writer(&self, volume: &str) -> Result<Writer> {
+        let _catalog = self.lock(libc::LOCK_SH)?;
+        let (info, file) = self.locked_writer(volume)?;
+        Ok(Writer { id: info.metadata.id, size: info.metadata.capacity_bytes, file })
+    }
+
+    pub fn clone_volume(&self, source: &str, name: &str) -> Result<Info> {
+        let _catalog = self.lock(libc::LOCK_EX)?;
+        let (info, disk) = self.locked_writer(source)?;
         self.create_locked(name, info.metadata.capacity_bytes, |target| {
             copy_raw(&disk, target, info.metadata.capacity_bytes)?;
             if disk.metadata()?.len() != info.metadata.capacity_bytes {
@@ -432,6 +451,20 @@ mod tests {
 
     #[test]
     fn inherited_disk_lock_survives_owner_descriptor_close() {
+        const CHILD: &str = "FLEXVM_TEST_VOLUME_WRITER_LEASE";
+        if std::env::var_os(CHILD).is_none() {
+            // Other tests can fork while the lease is open. Run the lease
+            // owner alone so only its designated child can inherit the fd.
+            let status = crate::test_util::status(
+                Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "volume::tests::inherited_disk_lock_survives_owner_descriptor_close"])
+                    .env(CHILD, "1"),
+            )
+            .unwrap();
+            assert!(status.success(), "volume writer lease helper: {status}");
+            return;
+        }
+
         let state = crate::test_util::TempDir::new("volume-lease");
         let catalog = Catalog::open(&state).unwrap();
         let id = catalog.create("busy", 512).unwrap().metadata.id;
