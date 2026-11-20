@@ -20,11 +20,49 @@ diagnostics() {
     exit "$status"
 }
 trap diagnostics EXIT
+load_base() {
+    if [ -e /nested-input/busybox.tar ] || [ -e /nested-input/busybox.json ] || [ -e /nested-input/busybox-oci ]; then
+        python3 - "$source_image" > "$base/base-manifest" <<'PYFIXTURE'
+from pathlib import Path
+import json, platform, runpy, sys
+
+root = Path('/nested-input')
+fixture = runpy.run_path(str(root / 'workload-fixture.py'))
+arch = {'x86_64': 'amd64', 'aarch64': 'arm64'}[platform.machine()]
+identity = fixture['validate_cache'](root / 'busybox-oci', arch)
+if identity['source'] != sys.argv[1]:
+    raise ValueError('fixture source differs from the pinned BusyBox reference')
+metadata = json.loads((root / 'busybox.json').read_text())
+if any(metadata[key] != expected for key, expected in identity.items()):
+    raise ValueError('seeded BusyBox metadata differs from the pinned OCI layout')
+archive = fixture['validate_archive'](root / 'busybox.tar', identity)
+if archive != 'sha256:' + metadata['archive_sha256']:
+    raise ValueError('seeded BusyBox archive differs from the verified export')
+print(identity['manifest_digest'])
+PYFIXTURE
+        seed_tag=docker.io/flexvm/busybox:compat
+        nerd load -i /nested-input/busybox.tar
+        nerd save "$seed_tag" > "$base/imported-image.tar"
+        python3 /nested-input/verify-fixture-import.py --archive "$base/imported-image.tar" --metadata /nested-input/busybox.json
+        rm "$base/imported-image.tar"
+        nerd tag "$seed_tag" "$image"
+        build_source=fixture-base
+    else
+        nerd pull "$source_image"
+        nerd tag "$source_image" "$image"
+        build_source=$source_image
+    fi
+}
 build() {
     free -m
     epoch=1
     if [ -f "$base/build-counter" ]; then epoch=$(($(cat "$base/build-counter")+1)); fi
-    buildctl_user build --frontend dockerfile.v0 --local "context=$base/context" --local "dockerfile=$base/context" \
+    set --
+    if [ -f "$base/base-manifest" ]; then
+        manifest=$(cat "$base/base-manifest")
+        set -- --oci-layout fixture=/nested-input/busybox-oci --opt "context:fixture-base=oci-layout://fixture@$manifest"
+    fi
+    buildctl_user build "$@" --frontend dockerfile.v0 --local "context=$base/context" --local "dockerfile=$base/context" \
         --secret "id=token,src=$base/secret" --opt "build-arg:RUN_EPOCH=$epoch" \
         --output "type=oci,dest=$base/build/built.tar"
     nerd load -i "$base/build/built.tar"
@@ -83,8 +121,7 @@ CONFIG
     cat "$base/workers"
     grep 'org.mobyproject.buildkit.worker.snapshotter:.*fuse-overlayfs' "$base/workers"
     nerd info
-    nerd pull "$source_image"
-    nerd tag "$source_image" "$image"
+    load_base
     nerd image inspect "$image"
     nerd network create compat-net
     nerd volume create compat-data
@@ -93,13 +130,13 @@ CONFIG
         test "$(cat /sys/fs/cgroup/memory.max)" = 134217728
         test "$(cat /sys/fs/cgroup/cpu.max)" = "50000 100000"
         test "$(cat /sys/fs/cgroup/pids.max)" = 64
-        wget -qO /dev/null http://example.com'
+        wget -qO /dev/null https://github.com/robots.txt'
     nerd run -d --name compat-server --network compat-net --memory=128m --cpus=.5 --pids-limit=64 -p 18086:8080 -v compat-data:/data -v "$base/bind:/bind:ro" "$image" sh -ec '
         mkdir /www; cp /data/marker /www/index.html; exec httpd -f -p 8080 -h /www'
     nerd exec compat-server cat /proc/1/stat > "$base/process"
     printf '%s\n' "$nonce" > "$base/secret"
     cat > "$base/context/Dockerfile" <<EOF
-FROM $source_image
+FROM $build_source
 ARG RUN_EPOCH
 RUN --mount=type=cache,target=/cache --mount=type=secret,id=token \\
     set -eu; test -s /run/secrets/token; echo ok >/secret-check; \\

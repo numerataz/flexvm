@@ -70,6 +70,11 @@ impl Asset {
         }
         Ok(())
     }
+
+    /// Verify the content read from the actual descriptor used by the VM.
+    pub fn check_opened(&self, path: &Path, sha256: &str) -> Result<()> {
+        check_content(path, self, if cfg!(test) { None } else { self.sha256 }, sha256)
+    }
 }
 
 /// The release the assets come from; `FLEXVM_ARTIFACTS_URL` names a mirror holding the same files (they are checked
@@ -180,6 +185,10 @@ fn cached_sha256(path: &Path, asset: &Asset, run: Option<&Path>) -> Result<Strin
 /// The file already at `path` must match the pin; only without a pin does `record_path` count.
 fn check_existing(path: &Path, asset: &Asset, sha256: Option<&str>) -> Result<()> {
     let got = cached_sha256(path, asset, crate::host::run_dir()).map_err(|e| format!("{}: cannot check its sha256: {e}", path.display()))?;
+    check_content(path, asset, sha256, &got)
+}
+
+fn check_content(path: &Path, asset: &Asset, sha256: Option<&str>, got: &str) -> Result<()> {
     if let Some(pin) = sha256 {
         if got == pin {
             return Ok(());
@@ -193,7 +202,7 @@ fn check_existing(path: &Path, asset: &Asset, sha256: Option<&str>) -> Result<()
     }
     let record = record_path(path);
     let recorded = std::fs::read_to_string(&record).unwrap_or_default();
-    if recorded.lines().any(|l| l.split_whitespace().next() == Some(got.as_str())) {
+    if recorded.lines().any(|l| l.split_whitespace().next() == Some(got)) {
         return Ok(());
     }
     bail!(
