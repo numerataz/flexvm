@@ -80,14 +80,41 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
       --checkpoint NAME|ID           start it from a stored checkpoint instead of IMAGE (its name and
                                      address unless --name and --ip IP|auto), or from a checkpoint
                                      directory (a path, with a '/'); --paused holds it until unpause
-  flexvm software --kernel FILE [OPTIONS] IMAGE [CMD...]
+  flexvm software-transfer id        show the local software host identity
+  flexvm software-transfer offer VM DESTINATION
+                                     identify a stopped VM and its intended destination
+  flexvm software-transfer retire VM OFFER --signing-key FILE --destination-key KEY
+                                     fence local restart and sign a retirement receipt
+  flexvm software-transfer prepare OFFER --source-key KEY [--handoff-chain FILE]
+                                     record an incoming transfer and its base64 Ed25519 public key
+  flexvm software-transfer commit RECEIPT
+                                     verify source retirement and commit the destination journal
+  flexvm software-transfer acknowledge-commit OFFER --signing-key FILE
+                                     sign the destination's committed decision
+  flexvm software-transfer finalize COMMIT-ACK --signing-key FILE
+                                     record the completed outgoing handoff and sign its proof
+  flexvm software-transfer abort OFFER
+                                     durably reject the prepared transfer
+  flexvm software-transfer acknowledge-abort OFFER --signing-key FILE
+                                     write the abort and sign its acknowledgment
+  flexvm software-transfer recover ABORT-RECEIPT
+                                     authorize the source at a higher generation
+  flexvm software-transfer send VM OFFER
+                                     stream the exact retired software checkpoint to stdout
+  flexvm software-transfer receive OFFER [--max-bundle-mib MIB]
+                                     verify a prepared checkpoint bundle from stdin
+  flexvm software-transfer activate OFFER VM --qemu FILE
+                                     run one committed checkpoint with a matching local emulator
+  flexvm software [--kernel FILE] [OPTIONS] IMAGE [CMD...]
                                      --kernel-sdk: matching native module build inputs;
                                      --kernel-modules FILE: custom runtime or SDK bundle
                                      experimental foreground QEMU TCG execution without host KVM;
+                                     defaults to the installed, verified kernel and runtime modules;
                                      --qemu PATH, --vsock-backend PATH, --mem MIB, --vcpus N,
                                      --parent-kvm-bundle DIR enables a parent-owned /dev/kvm (x86_64, aarch64)
                                      --parent-kvm-engine auto|tcg|kvm, --parent-kvm-mem MIB (max 256)
                                      --timeout SECS (boot only); image env/workdir/user options apply
+                                     --disk VOLUME attaches a managed data disk (repeatable, requires --name)
   flexvm ps [-a] [-q] [--json] [-f, --filter KEY=VALUE]... [--format FORMAT]
                                      list running VMs (-a: stopped ones too; -q: names only);
                                      --filter name=PART|status=STATE|image=IMAGE|ip=IP (a key again:
@@ -453,7 +480,8 @@ fn main() {
         _ => false,
     };
     util::set_verbose(args.has("verbose") || logged);
-    let vm = matches!(args.positional.first().map(String::as_str), Some("run" | "start" | "exec" | "software"));
+    let vm = matches!(args.positional.first().map(String::as_str), Some("run" | "start" | "exec" | "software"))
+        || args.positional.first().is_some_and(|s| s == "software-transfer") && args.positional.get(1).is_some_and(|s| s == "activate");
     // Here, not in `real_main`, which unit tests run on any host; after the arguments, whose errors come first.
     let host_fits = || if reads_only(&args) { Ok(()) } else { check_applies(&args).and_then(|()| util::check_page_size()) };
     let result = error.map_or_else(|| host_fits().and_then(|()| real_main(&args)), Err);
@@ -503,7 +531,7 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     (
         "software",
         2,
-        &["name", "kernel", "qemu", "control", "vsock-backend", "mem", "vcpus", "timeout", "parent-kvm-bundle", "parent-kvm-engine", "parent-kvm-mem"],
+        &["name", "kernel", "qemu", "control", "vsock-backend", "mem", "vcpus", "timeout", "disk", "parent-kvm-bundle", "parent-kvm-engine", "parent-kvm-mem"],
     ),
     (
         "run",
@@ -548,6 +576,7 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("rm", NAMES, &["force"]),
     ("volume", NAMES, &["size"]),
     ("checkpoint", NAMES, &["stop", "incremental", "quiet", "format", "filter", "force", "older-than", "output", "input", "name", "sha256"]),
+    ("software-transfer", 4, &["source-key", "signing-key", "destination-key", "handoff-chain", "max-bundle-mib", "qemu"]),
     ("migrate", 3, &[]),
     ("reclaim", 2, &["force"]),
     ("listen", 2, &[]),
@@ -632,6 +661,31 @@ fn check_applies(args: &Args) -> Result<()> {
             };
             if !valid {
                 bail!("volume needs create NAME --size BYTES, clone SOURCE NAME, inspect NAME|ID, ls, or rm NAME|ID");
+            }
+        }
+        "software-transfer" => {
+            let words = args.positional.len();
+            let keys = (args.has("source-key"), args.has("signing-key"), args.has("destination-key"));
+            if args.has("handoff-chain") && first.map(String::as_str) != Some("prepare") {
+                bail!("--handoff-chain applies only to software-transfer prepare");
+            }
+            if args.has("max-bundle-mib") && first.map(String::as_str) != Some("receive") {
+                bail!("--max-bundle-mib applies only to software-transfer receive");
+            }
+            let activating = first.map(String::as_str) == Some("activate");
+            if args.has("qemu") != activating {
+                bail!("software-transfer activate requires --qemu FILE; other transfer commands do not take it");
+            }
+            if !matches!(
+                (first.map(String::as_str), words, keys),
+                (Some("id"), 2, (false, false, false))
+                    | (Some("prepare"), 3, (true, false, false))
+                    | (Some("commit" | "abort" | "recover" | "receive"), 3, (false, false, false))
+                    | (Some("acknowledge-abort" | "acknowledge-commit" | "finalize"), 3, (false, true, false))
+                    | (Some("offer" | "send" | "activate"), 4, (false, false, false))
+                    | (Some("retire"), 4, (false, true, true))
+            ) {
+                bail!("invalid software-transfer arguments (see flexvm --help)");
             }
         }
         "checkpoint" => {
@@ -786,6 +840,47 @@ fn real_main(args: &Args) -> Result<()> {
             }
         }
         Some("pull") => pull(args, name),
+        Some("software-transfer") if name == "activate" => {
+            util::block_signals(&[libc::SIGTSTP, libc::SIGCONT, libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGHUP]);
+            util::exit(software::activate(open_host(args)?, pos[3], Path::new(pos[2]), Path::new(args.get("qemu").unwrap()))?)
+        }
+        Some("software-transfer") if name == "send" => {
+            software_state::transfer::bundle::send(&open_host(args)?, pos[2], Path::new(pos[3]), &mut std::io::stdout().lock())
+        }
+        Some("software-transfer") if name == "offer" => print(software_state::transfer::offer(&open_host(args)?, pos[2], pos[3])?),
+        Some("software-transfer") if name == "retire" => print(software_state::transfer::retire(
+            &open_host(args)?,
+            pos[2],
+            Path::new(pos[3]),
+            Path::new(args.get("signing-key").unwrap()),
+            args.get("destination-key").unwrap(),
+        )?),
+        Some("software-transfer") => {
+            let path = state(args)?;
+            host::host_dir(&path, 0o755)?;
+            if name == "receive" {
+                return print(software_state::transfer::bundle::import(&path, Path::new(pos[2]), &mut std::io::stdin().lock(), args.get("max-bundle-mib"))?);
+            }
+            if name == "acknowledge-abort" {
+                return print(software_state::transfer::acknowledge_abort(&path, Path::new(pos[2]), Path::new(args.get("signing-key").unwrap()))?);
+            }
+            if name == "acknowledge-commit" {
+                return print(software_state::transfer::finalize::acknowledge(&path, Path::new(pos[2]), Path::new(args.get("signing-key").unwrap()))?);
+            }
+            if name == "finalize" {
+                return print(software_state::transfer::finalize::outgoing(&path, Path::new(pos[2]), Path::new(args.get("signing-key").unwrap()))?);
+            }
+            if name == "recover" {
+                return print(software_state::transfer::recover(&path, Path::new(pos[2]))?);
+            }
+            print(software_state::transfer::command(
+                &path,
+                name,
+                Path::new(arg2.unwrap_or("")),
+                args.get("source-key"),
+                args.get("handoff-chain").map(Path::new),
+            )?)
+        }
         Some("software") => util::exit(software(args, name)?),
         Some("images") => images(&open_host(args)?, &paths(args)?, args),
         Some("tag") => print(template::tag(&paths(args)?, name, arg2.ok_or("tag needs SRC DST")?)?),
@@ -2319,14 +2414,14 @@ fn kernel_bundle(args: &Args, kernel: &Path, reviewed: bool) -> Result<Option<im
     if let Some(custom) = args.get("kernel-modules") {
         let bundle = image::KernelBundle::open(kernel, Path::new(custom), None)?;
         if reviewed {
-            artifacts::KERNEL.check_digest(&bundle.kernel.artifact.sha256)?;
+            artifacts::KERNEL.check_opened(kernel, &bundle.kernel.artifact.sha256)?;
         }
         return Ok(Some(bundle));
     }
     let development = args.has("kernel-sdk");
     let asset = if development { &artifacts::KERNEL_SDK } else { &artifacts::MODULES };
-    let kernel = kernel.canonicalize()?;
-    let adjacent = kernel.with_file_name(asset.name);
+    let canonical_kernel = kernel.canonicalize()?;
+    let adjacent = canonical_kernel.with_file_name(asset.name);
     let state_kernel = paths(args)?.kernel;
     let state_artifacts = state_kernel.parent().ok_or("kernel has no artifact directory")?;
     let authenticated = reviewed || !adjacent.exists() || state_artifacts.canonicalize().is_ok_and(|directory| adjacent.parent() == Some(directory.as_path()));
@@ -2340,12 +2435,12 @@ fn kernel_bundle(args: &Args, kernel: &Path, reviewed: bool) -> Result<Option<im
     if authenticated {
         artifacts::ensure(&[(&selected, asset)])?;
     }
-    let bundle = image::KernelBundle::open(&kernel, &selected, Some(development))?;
+    let bundle = image::KernelBundle::open(&canonical_kernel, &selected, Some(development))?;
     if authenticated {
-        asset.check_digest(&bundle.identity().bundle_sha256)?;
+        asset.check_opened(&selected, &bundle.identity().bundle_sha256)?;
     }
     if reviewed {
-        artifacts::KERNEL.check_digest(&bundle.kernel.artifact.sha256)?;
+        artifacts::KERNEL.check_opened(kernel, &bundle.kernel.artifact.sha256)?;
     }
     Ok(Some(bundle))
 }
@@ -2354,6 +2449,9 @@ fn kernel_bundle(args: &Args, kernel: &Path, reviewed: bool) -> Result<Option<im
 /// with engine processes owned by this foreground command. Named VMs also expose
 /// live management and local suspend/restore; migration remains separate work.
 fn software(args: &Args, src: &str) -> Result<i32> {
+    if args.has("disk") && !args.has("name") {
+        bail!("--disk requires a named software VM");
+    }
     let mem_mib = args.parse_or("mem", 512)?;
     let parent_kvm = if let Some(bundle) = args.get("parent-kvm-bundle") {
         if args.get("name").is_some() {
@@ -2393,9 +2491,17 @@ fn software(args: &Args, src: &str) -> Result<i32> {
     if args.get("name").is_some() && control != qemu::Control::Serial {
         bail!("named software VMs require --control serial");
     }
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("software image preparation currently requires root");
+    }
+    let kernel = args.get("kernel").map_or_else(|| paths(args).map(|paths| paths.kernel), |kernel| Ok(PathBuf::from(kernel)))?;
+    let installed = !args.has("kernel");
+    if installed {
+        artifacts::ensure(&[(&kernel, &artifacts::KERNEL)])?;
+    }
     let config = qemu::Config {
         control,
-        kernel: PathBuf::from(args.get("kernel").ok_or("software needs --kernel FILE (with virtio PCI on x86_64)")?),
+        kernel,
         qemu: args.get("qemu").map(String::from).unwrap_or_else(|| format!("qemu-system-{}", std::env::consts::ARCH)),
         vsock_backend: args.get("vsock-backend").unwrap_or("vhost-device-vsock").into(),
         mem_mib,
@@ -2404,9 +2510,6 @@ fn software(args: &Args, src: &str) -> Result<i32> {
         parent_kvm,
     };
     config.validate()?;
-    if unsafe { libc::geteuid() } != 0 {
-        bail!("software image preparation currently requires root");
-    }
     let processes = std::sync::Arc::new(qemu::Processes::default());
     let stopping = processes.clone();
     let signals: &[i32] = if args.get("name").is_some() { &[libc::SIGINT, libc::SIGQUIT, libc::SIGHUP] } else { &[libc::SIGINT, libc::SIGTERM, libc::SIGHUP] };
@@ -2422,7 +2525,7 @@ fn software(args: &Args, src: &str) -> Result<i32> {
         opts.cmd = Some(args.rest.clone());
     }
     let init = args.get("init").map(PathBuf::from);
-    let modules = kernel_bundle(args, &config.kernel, false)?;
+    let modules = kernel_bundle(args, &config.kernel, installed)?;
     let (rootfs, meta, _reserved, _cache_lock) = image::prepare(&state(args)?.join("images"), init.as_deref(), &opts, modules.as_ref())?;
     if meta.argv.is_empty() {
         bail!("software execution needs an image command or CMD");
@@ -2437,9 +2540,16 @@ fn software(args: &Args, src: &str) -> Result<i32> {
         .transpose()?;
     let _reservation =
         named.as_ref().map(|(host, _)| software::Reservation::new(host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)).transpose()?;
+    let disks = if args.has("disk") {
+        let (host, _) = named.as_ref().ok_or("--disk requires a named software VM")?;
+        let catalog = volume::Catalog::open(&host.state)?;
+        args.all("disk").iter().map(|name| catalog.writer(name)).collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
     let machine = match modules {
-        Some(bundle) => config.boot_with_kernel(&rootfs, processes.clone(), bundle.kernel)?,
-        None => config.boot(&rootfs, processes.clone())?,
+        Some(bundle) => config.boot_with_kernel(&rootfs, processes.clone(), bundle.kernel, disks)?,
+        None => config.boot(&rootfs, processes.clone(), disks)?,
     };
     drop(_cache_lock);
     if let Some((host, lock)) = named {

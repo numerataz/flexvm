@@ -48,7 +48,7 @@ EOF
     pod pull "$image"
     pod image inspect "$image"
     pod network create compat-net
-    pod run --rm --network compat-net "$image" wget -qO /dev/null http://example.com
+    pod run --rm --network compat-net "$image" wget -qO /dev/null https://github.com/robots.txt
     pod volume create compat-data
     pod run --rm -v compat-data:/data -v "$base/bind:/bind" "$image" sh -ec 'echo "$1" >/data/marker; echo "$1" >/bind/marker' sh "$nonce"
     pod run -d --name compat-server --network compat-net --memory=64m --cpus=.5 --pids-limit=64 -p 18087:8080 \
