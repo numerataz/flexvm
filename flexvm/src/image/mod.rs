@@ -1196,7 +1196,7 @@ fn inject_systemd(root: &mut Root) -> Result<()> {
         br#"[Unit]
 Description=FlexVM workload delegation
 DefaultDependencies=no
-After=local-fs.target
+After=local-fs.target sysinit.target basic.target
 Before=shutdown.target
 Conflicts=shutdown.target
 IgnoreOnIsolate=yes
@@ -2876,6 +2876,7 @@ mod tests {
         inject_systemd(&mut root).unwrap();
         let unit = read(sd.join("etc/systemd/system/flexvm-runtime.service"));
         assert!(unit.contains("DefaultDependencies=no"), "{unit}");
+        assert!(unit.contains("After=local-fs.target sysinit.target basic.target"), "{unit}");
         assert!(unit.contains("IgnoreOnIsolate=yes"), "{unit}");
         assert!(unit.contains("Before=shutdown.target"), "{unit}");
         assert!(unit.contains("Conflicts=shutdown.target"), "{unit}");
