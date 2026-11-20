@@ -356,13 +356,13 @@ pub fn translate(api: &Api, name: &str, body: &Value) -> Result<Record, Error> {
     refuse_unsupported(&config, &host_config, name)?;
     let meta = tpl.image.as_ref();
     let image_config = images::config(api, &tpl);
-    let argv: Vec<String> = meta.map(|i| i.argv.clone()).unwrap_or_default();
-    let (image_entrypoint, image_cmd, matched) = images::app(&argv, image_config.as_ref());
+    let argv = meta.map_or(&[][..], |i| i.argv.as_slice());
+    let (image_entrypoint, image_cmd, matched) = images::app(argv, image_config.as_deref());
     if config["Entrypoint"].as_array().is_some_and(|e| e.is_empty()) && config["Cmd"].as_array().is_none_or(|c| c.is_empty()) && !argv.is_empty() && !matched {
         return Err(Error::unsupported("clearing the entrypoint without a command: the image's Entrypoint and Cmd are unavailable"));
     }
     for (key, flag) in [("WorkingDir", "a working directory"), ("User", "a user")] {
-        let image = image_config.as_ref().and_then(|c| c[key].as_str()).unwrap_or("");
+        let image = image_config.as_deref().and_then(|c| c[key].as_str()).unwrap_or("");
         if let Some(v) = config[key].as_str().filter(|v| !v.is_empty() && *v != image) {
             return Err(Error::unsupported(format!("{flag} for the app ({key} {v:?}): give it to flexvm pull")));
         }
@@ -374,7 +374,7 @@ pub fn translate(api: &Api, name: &str, body: &Value) -> Result<Record, Error> {
     if config["Entrypoint"].is_array() || config["Cmd"].is_array() {
         let (e, c) = app(&config, image_entrypoint, image_cmd);
         let app: Vec<String> = e.into_iter().chain(c).collect();
-        match (app == argv, app.is_empty(), meta.is_some()) {
+        match (app.as_slice() == argv, app.is_empty(), meta.is_some()) {
             (true, _, _) => {}
             (false, true, _) => return Err(Error::unsupported("an empty command over an image's app: a VM's app is its image's or a command")),
             (false, false, true) => run.extend(["--entrypoint".to_string(), serde_json::to_string(&app).unwrap_or_default()]),
@@ -412,7 +412,7 @@ pub fn translate(api: &Api, name: &str, body: &Value) -> Result<Record, Error> {
         run.extend(["--cpus".to_string(), c.to_string()]);
     }
     let mut exposed: Vec<String> = config["ExposedPorts"].as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
-    exposed.extend(image_config.as_ref().and_then(|c| c["ExposedPorts"].as_object()).map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default());
+    exposed.extend(image_config.as_deref().and_then(|c| c["ExposedPorts"].as_object()).map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default());
     exposed.sort();
     exposed.dedup();
     for p in ports(&host_config, &exposed)? {
@@ -449,7 +449,7 @@ pub(super) mod tests {
     pub fn fixture() -> (crate::test_util::TempDir, std::sync::Arc<Api>) {
         let d = crate::test_util::TempDir::new("api-create");
         let host = crate::host::Host::open(&d.join("state"), &d.join("run")).unwrap();
-        let api = std::sync::Arc::new(Api { host, paths: crate::template::Paths::new(&d.join("state")), globals: vec![], renames: Default::default() });
+        let api = std::sync::Arc::new(Api::new(host, crate::template::Paths::new(&d.join("state")), vec![]));
         image(&api, "aaaa1111", json!({"Entrypoint": ["/bin/sh", "-c", ""], "Cmd": ["default"], "Labels": {"keep": "image"}, "Env": ["A=image", "B=image"]}));
         std::os::unix::fs::symlink(".gen/aaaa1111", api.paths.templates.join("image")).unwrap();
         (d, api)
