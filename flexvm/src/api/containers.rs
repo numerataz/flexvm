@@ -474,8 +474,8 @@ fn matches(d: &Detail, key: &str, value: &str) -> Result<bool, Error> {
         "ancestor" => {
             let image = crate::template::name_of(value).ok();
             let mine = crate::template::name_of(&d.image).ok();
-            (image.is_some() && image == mine)
-                || (!value.is_empty() && d.image_id.trim_start_matches("sha256:").starts_with(value.trim_start_matches("sha256:")))
+            let prefix = value.trim_start_matches("sha256:");
+            (image.is_some() && image == mine) || (!prefix.is_empty() && d.image_id.trim_start_matches("sha256:").starts_with(prefix))
         }
         "network" => matches!(value, "bridge" | "flexvm"),
         _ => return Err(Error::bad(format!("invalid filter '{key}': flexvm takes id, name, status, exited, label, ancestor and network"))),
@@ -500,7 +500,7 @@ pub async fn list(api: &Arc<Api>, q: Query) -> Reply {
     keys.dedup();
     let mut out = Vec::new();
     for d in &details {
-        let mut keep = all || d.state.running || status_filtered;
+        let mut keep = true;
         for &key in &keys {
             let mut any = false;
             for (_, v) in filters.iter().filter(|(k, _)| k == key) {
@@ -1008,6 +1008,9 @@ mod tests {
         assert!(matches(&d, "name", "^/web$").unwrap());
         assert!(!matches(&d, "name", "^db$").unwrap());
         assert!(matches(&d, "ancestor", "abcd").unwrap());
+        assert!(matches(&d, "ancestor", "sha256:abcd").unwrap());
+        assert!(!matches(&d, "ancestor", "sha256:").unwrap());
+        assert!(!matches(&d, "ancestor", "").unwrap());
         assert_eq!(stream_type(d.config["run"]["tty"] == true), stream_type(true));
         let inspect = d.inspect();
         assert_eq!(inspect["Config"]["Tty"], true);

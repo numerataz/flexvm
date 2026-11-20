@@ -9,6 +9,7 @@
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -338,7 +339,7 @@ impl Drop for Writer {
 static WINCH: AtomicI32 = AtomicI32::new(-1);
 
 extern "C" fn on_winch(_: libc::c_int) {
-    let fd = WINCH.load(Ordering::Relaxed);
+    let fd = WINCH.load(Ordering::Acquire);
     if fd >= 0 {
         unsafe { libc::write(fd, [0u8].as_ptr().cast(), 1) };
     }
@@ -350,21 +351,21 @@ fn watch_resizes(feed: Arc<Feed>) -> Result<()> {
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    WINCH.store(fds[1], Ordering::Relaxed);
+    let (woken, notify) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    std::thread::Builder::new().spawn(move || {
+        let mut buf = [0u8; 64];
+        loop {
+            let mut p = libc::pollfd { fd: woken.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            unsafe { libc::poll(&mut p, 1, -1) };
+            while unsafe { libc::read(woken.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+            feed.resized();
+        }
+    })?;
+    WINCH.store(notify.into_raw_fd(), Ordering::Release);
     let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
     act.sa_sigaction = on_winch as usize;
     act.sa_flags = libc::SA_RESTART;
     unsafe { libc::sigaction(libc::SIGWINCH, &act, std::ptr::null_mut()) };
-    let woken = fds[0];
-    std::thread::Builder::new().spawn(move || {
-        let mut buf = [0u8; 64];
-        loop {
-            let mut p = libc::pollfd { fd: woken, events: libc::POLLIN, revents: 0 };
-            unsafe { libc::poll(&mut p, 1, -1) };
-            while unsafe { libc::read(woken, buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
-            feed.resized();
-        }
-    })?;
     Ok(())
 }
 

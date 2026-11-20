@@ -195,8 +195,14 @@ impl Drop for Forwarder {
 fn wait(fds: &mut Vec<libc::pollfd>, stop: BorrowedFd, until: Option<Instant>) -> bool {
     fds.push(libc::pollfd { fd: stop.as_raw_fd(), events: libc::POLLIN, revents: 0 });
     let ms = until.map_or(TICK, |u| (u.saturating_duration_since(Instant::now()).as_millis() as libc::c_int + 1).min(TICK));
-    unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, ms) };
-    fds.pop().is_some_and(|s| s.revents == 0)
+    let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, ms) };
+    let stopped = fds.pop().is_none_or(|s| rc > 0 && s.revents != 0);
+    if rc <= 0 {
+        for fd in fds.iter_mut() {
+            fd.revents = 0;
+        }
+    }
+    !stopped
 }
 
 fn poll(fd: &impl AsRawFd, events: i16) -> libc::pollfd {

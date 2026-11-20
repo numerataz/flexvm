@@ -29,6 +29,25 @@ static void check(bool valid, const char *why)
     _exit(1);
 }
 
+static void check_child(pid_t child, const char *why)
+{
+    int status;
+    check(waitpid(child, &status, 0) == child, why);
+    if (WIFEXITED(status) && !WEXITSTATUS(status))
+        return;
+    if (WIFEXITED(status))
+        fprintf(stderr, "FAIL parent KVM setup: %s: exit status %d\n", why, WEXITSTATUS(status));
+    else if (WIFSIGNALED(status))
+        fprintf(stderr, "FAIL parent KVM setup: %s: signal %d\n", why, WTERMSIG(status));
+    else
+        fprintf(stderr, "FAIL parent KVM setup: %s: wait status 0x%x\n", why, status);
+    fflush(NULL);
+#ifndef FLEXVM_PARENT_KVM_APP
+    reboot(RB_POWER_OFF);
+#endif
+    _exit(1);
+}
+
 static void persist_tap(bool enabled)
 {
     int tap = open("/dev/net/tun", O_RDWR | O_CLOEXEC);
@@ -59,7 +78,7 @@ static void run_firecracker(void)
     pid_t echo = 0;
     if (access("/firecracker-network", F_OK) == 0) {
         persist_tap(true);
-        int fd = test_datagram_socket(20);
+        int fd = test_datagram_socket(60);
         struct sockaddr_in local = test_network_peer();
         check(fd >= 0 && configure_test_link(fd, FLEXVM_TEST_TAP, FLEXVM_TEST_HOST) == 0 &&
               bind(fd, (struct sockaddr *)&local, sizeof(local)) == 0, "configure Firecracker UDP peer");
@@ -75,12 +94,9 @@ static void run_firecracker(void)
         execl("/firecracker", "firecracker", "--no-api", "--config-file", "/firecracker.json", NULL);
         _exit(127);
     }
-    int status;
-    check(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status),
-          "Firecracker exit");
+    check_child(child, "Firecracker exit");
     if (echo > 0) {
-        check(waitpid(echo, &status, 0) == echo && WIFEXITED(status) && !WEXITSTATUS(status),
-              "Firecracker network echo exit");
+        check_child(echo, "Firecracker network echo exit");
         persist_tap(false);
         puts("PASS Firecracker network echo");
     }
@@ -203,9 +219,7 @@ static void run_kvm_client(void)
         execv("/kvm-run", arguments);
         _exit(127);
     }
-    int status;
-    check(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status),
-          "KVM client exit");
+    check_child(child, "KVM client exit");
 }
 #endif
 
