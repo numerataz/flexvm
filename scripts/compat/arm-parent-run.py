@@ -282,7 +282,7 @@ def serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, cr
                    gate=None, capture=None, rollback=None, worker=None):
     vm_open = worker is not None
     cpus = set(worker.cpus) if worker else set()
-    registered = worker is not None
+    registered = worker is not None and bool(worker.slots)
     exited = os.pidfd_open(outer.pid)
     try:
         while True:

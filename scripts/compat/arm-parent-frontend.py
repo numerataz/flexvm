@@ -26,12 +26,15 @@ def main():
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--native", action="store_true", help="run the KVM ABI client through a native ARM child")
     mode.add_argument("--checkpoint", action="store_true", help="restore an in-flight request against a fresh mailbox")
+    mode.add_argument("--initial-state", action="store_true", help="checkpoint open ARM KVM descriptors before first KVM_RUN")
     args = parser.parse_args()
     output = args.output.resolve()
     output.mkdir()
     init = output / "init"
     cc = [args.cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static"]
     flags = ["-DFLEXVM_ARM_NATIVE_TEST"] if args.native else []
+    if args.initial_state:
+        flags.append("-DFLEXVM_ARM_INITIAL_STATE_TEST")
     HELPERS["run"]([*cc, *flags, ROOT / "parent-kvm/arm-frontend-probe.c", "-o", init], 30, output / "build.log")
     module = (args.bundle / "flexvm-pvkvm.ko").read_bytes()
     abi = None
@@ -52,7 +55,15 @@ def main():
         print("PASS ARM parent-owned KVM ABI execution")
         return
 
-    if args.checkpoint:
+    if args.initial_state:
+        capture = runpy.run_path(str(ROOT / "arm-parent-firecracker.py"))["transfer_checkpoint"]
+        log = output / "guest.log"
+        capture([sys.executable, ROOT / "arm-parent-run.py", "--qemu", args.qemu, "--kernel", args.kernel,
+                 "--initrd", cpio, "--tcg"], output, log, window="ARM checkpoint window before first KVM_RUN")
+        if (output / "target.log").read_text(errors="replace").splitlines().count("PASS ARM pending vCPU configuration survived checkpoint") != 1:
+            raise RuntimeError(f"ARM pre-run checkpoint failed; see {log}")
+        print("PASS ARM pre-run checkpoint restored staged registers and vCPU power state")
+    elif args.checkpoint:
         with tempfile.TemporaryFile() as snapshot:
             exercise(args, cpio, output, snapshot=snapshot)
             snapshot.seek(0)

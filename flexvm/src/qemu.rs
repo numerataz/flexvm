@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 
 use crate::socket::{SocketRoot, Sockets};
 use crate::util::{By, Result};
-use crate::{bail, guest, software_state, template, util};
+use crate::{bail, guest, software_state, template, util, volume};
 
 #[path = "../../guest/src/control.rs"]
 #[allow(dead_code)]
@@ -318,6 +318,7 @@ struct Endpoints<'a> {
 
 pub struct Machine {
     inputs: Option<software_state::Inputs>,
+    disks: Vec<volume::Writer>,
     profile: software_state::Profile,
     network: Network,
     engine_version: Value,
@@ -468,7 +469,7 @@ impl Config {
         Ok(())
     }
 
-    fn command(&self, engine: &Path, kernel: &Path, rootfs: &Path, endpoints: &Endpoints<'_>, network: Network) -> Result<Command> {
+    fn command(&self, engine: &Path, kernel: &Path, rootfs: &Path, endpoints: &Endpoints<'_>, network: Network, disks: &[(&str, PathBuf)]) -> Result<Command> {
         let arch = std::env::consts::ARCH;
         let (board, cpu, console, block, vsock, nic) = match arch {
             // TCG implements AMD SVM: the ordinary guest Linux KVM driver
@@ -506,12 +507,23 @@ impl Config {
                 kvm_arg,
             ),
         ]);
+        // ARM virt auto-assigns MMIO buses in reverse enumeration order. With managed
+        // disks, bind the root and each disk to the buses Linux enumerates first.
+        let root_bus = if arch == "aarch64" && !disks.is_empty() { ",bus=virtio-mmio-bus.0" } else { "" };
         cmd.args([
             "-blockdev",
             &json!({"driver":"raw", "node-name":"root", "read-only":true, "file":{"driver":"file", "filename":rootfs}}).to_string(),
             "-device",
-            &format!("{block},drive=root"),
+            &format!("{block},drive=root{root_bus}"),
         ]);
+        for (index, (id, path)) in disks.iter().enumerate() {
+            let node = format!("managed-{index}");
+            let mut device = format!("{block},drive={node},serial={}", &id[..20]);
+            if arch == "aarch64" {
+                device.push_str(&format!(",bus=virtio-mmio-bus.{}", index + 1));
+            }
+            cmd.args(["-blockdev", &json!({"driver":"raw", "node-name":node, "file":{"driver":"file", "filename":path}}).to_string(), "-device", &device]);
+        }
         // Private short socket paths contain no keyval separators.
         if self.control == Control::Vsock {
             cmd.args(["-chardev", &format!("socket,id=vsock,path={}", endpoints.backend.display()), "-device", &format!("{vsock},chardev=vsock")]);
@@ -527,17 +539,26 @@ impl Config {
     }
 
     pub fn profile(&self) -> Result<software_state::Profile> {
-        self.profile_for(Network::Private)
+        self.profile_for(Network::Private, &[])
     }
 
     pub fn profiles(&self) -> Result<[software_state::Profile; 2]> {
-        Ok([self.profile()?, self.profile_for(Network::Legacy)?])
+        Ok([self.profile()?, self.profile_for(Network::Legacy, &[])?])
     }
 
-    fn profile_for(&self, network: Network) -> Result<software_state::Profile> {
+    fn disk_profile<'a>(ids: impl Iterator<Item = &'a str>) -> Vec<(&'a str, PathBuf)> {
+        ids.map(|id| (id, PathBuf::from(format!("@disk:{id}")))).collect()
+    }
+
+    pub fn profiles_for_disk_ids<'a>(&self, ids: impl Iterator<Item = &'a str>) -> Result<[software_state::Profile; 2]> {
+        let disks = Self::disk_profile(ids);
+        Ok([self.profile_for(Network::Private, &disks)?, self.profile_for(Network::Legacy, &disks)?])
+    }
+
+    fn profile_for(&self, network: Network, disks: &[(&str, PathBuf)]) -> Result<software_state::Profile> {
         let endpoints =
             Endpoints { api: Path::new("@qmp"), control: Path::new("@control"), backend: Path::new("@vsock-backend"), firmware: Path::new("@firmware") };
-        let command = self.command(Path::new("@engine"), Path::new("@kernel"), Path::new("@rootfs"), &endpoints, network)?;
+        let command = self.command(Path::new("@engine"), Path::new("@kernel"), Path::new("@rootfs"), &endpoints, network, disks)?;
         Ok(software_state::Profile {
             architecture: std::env::consts::ARCH.into(),
             arguments: command
@@ -547,18 +568,18 @@ impl Config {
         })
     }
 
-    pub fn boot(&self, rootfs: &Path, processes: Arc<Processes>) -> Result<Machine> {
+    pub fn boot(&self, rootfs: &Path, processes: Arc<Processes>, disks: Vec<volume::Writer>) -> Result<Machine> {
         let inputs = software_state::Inputs::open(&self.qemu, &self.kernel, rootfs)?;
-        self.launch(inputs, processes, None, Network::Private)
+        self.launch(inputs, processes, None, Network::Private, disks)
     }
 
-    pub fn boot_with_kernel(&self, rootfs: &Path, processes: Arc<Processes>, kernel: software_state::Input) -> Result<Machine> {
+    pub fn boot_with_kernel(&self, rootfs: &Path, processes: Arc<Processes>, kernel: software_state::Input, disks: Vec<volume::Writer>) -> Result<Machine> {
         let inputs = software_state::Inputs::with_kernel(&self.qemu, kernel, rootfs)?;
-        self.launch(inputs, processes, None, Network::Private)
+        self.launch(inputs, processes, None, Network::Private, disks)
     }
 
     /// Load state into a fresh engine, with CPUs paused and public admission closed.
-    pub fn restore(&self, verified: software_state::Verified, processes: Arc<Processes>) -> Result<Machine> {
+    pub fn restore(&self, verified: software_state::Verified, processes: Arc<Processes>, disks: Vec<volume::Writer>) -> Result<Machine> {
         match (&self.parent_kvm, &verified.manifest.parent) {
             (None, None) => {}
             (Some(config), Some(parent))
@@ -568,9 +589,10 @@ impl Config {
         if self.control != Control::Serial {
             bail!("software restore requires serial control");
         }
-        let network = if self.profile_for(Network::Private)? == verified.manifest.profile {
+        let [private, legacy] = self.profiles_for_disk_ids(disks.iter().map(|disk| disk.id.as_str()))?;
+        let network = if private == verified.manifest.profile {
             Network::Private
-        } else if self.profile_for(Network::Legacy)? == verified.manifest.profile {
+        } else if legacy == verified.manifest.profile {
             Network::Legacy
         } else {
             bail!("software restore configuration changed after artifact validation");
@@ -581,8 +603,9 @@ impl Config {
             parent.broker.unchanged()?;
         }
         let incoming = Incoming { state: &verified.state.file, version: &verified.manifest.engine_version, parent: verified.parent.as_ref() };
-        let machine =
-            self.launch(verified.inputs, processes, Some(incoming), network).map_err(|error| format!("software incoming engine load failed: {error}"))?;
+        let machine = self
+            .launch(verified.inputs, processes, Some(incoming), network, disks)
+            .map_err(|error| format!("software incoming engine load failed: {error}"))?;
         verified.state.unchanged()?;
         if let Some(parent) = &verified.parent {
             parent.worker.unchanged()?;
@@ -591,13 +614,21 @@ impl Config {
         Ok(machine)
     }
 
-    fn launch(&self, inputs: software_state::Inputs, processes: Arc<Processes>, incoming: Option<Incoming<'_>>, network: Network) -> Result<Machine> {
+    fn launch(
+        &self,
+        inputs: software_state::Inputs,
+        processes: Arc<Processes>,
+        incoming: Option<Incoming<'_>>,
+        network: Network,
+        disks: Vec<volume::Writer>,
+    ) -> Result<Machine> {
         // Restore uses pinned artifacts and does not require the original input paths.
         self.validate_limits()?;
         inputs.engine.unchanged()?;
         inputs.kernel.unchanged()?;
         inputs.rootfs.unchanged()?;
-        let profile = self.profile_for(network)?;
+        let disk_profile = Self::disk_profile(disks.iter().map(|disk| disk.id.as_str()));
+        let profile = self.profile_for(network, &disk_profile)?;
         let root = SocketRoot::software()?;
         *processes.runtime.lock().unwrap() = Some(Arc::downgrade(&root));
         let sockets = root.allocate()?;
@@ -610,6 +641,7 @@ impl Config {
         let mut inherited = vec![engine_fd, inputs.kernel.file.as_raw_fd(), inputs.rootfs.file.as_raw_fd()];
         let mut machine = Machine {
             inputs: Some(inputs),
+            disks,
             profile,
             network,
             engine_version: Value::Null,
@@ -648,7 +680,16 @@ impl Config {
                 }
             }
             let endpoints = Endpoints { api: &machine.sockets.api, control: &machine.sockets.vsock, backend: &machine.sockets.uffd, firmware: &firmware };
-            let mut cmd = self.command(&engine, &kernel, &rootfs, &endpoints, network)?;
+            let disks: Vec<_> = machine
+                .disks
+                .iter()
+                .map(|disk| {
+                    let fd = disk.file.as_raw_fd();
+                    inherited.push(fd);
+                    (disk.id.as_str(), PathBuf::from(format!("/proc/self/fd/{fd}")))
+                })
+                .collect();
+            let mut cmd = self.command(&engine, &kernel, &rootfs, &endpoints, network, &disks)?;
             let saved_parent = incoming.as_ref().and_then(|state| state.parent);
             if incoming.is_some() && saved_parent.is_none() {
                 cmd.args(["-incoming", "defer", "-S"]);
@@ -994,6 +1035,9 @@ impl Machine {
         } else {
             self.save(&staging.state, deadline)?;
         }
+        // QEMU has paused vCPUs and drained its block layer at the
+        // checkpoint boundary. Keep the writer leases through publication.
+        manifest.disks = staging.capture_disks(&self.disks)?;
         manifest.profile = self.profile.clone();
         manifest.engine_version = self.engine_version.clone();
         let inputs = self.inputs.as_ref().ok_or("software engine has no pinned inputs")?;
@@ -1345,7 +1389,7 @@ mod tests {
             parent_kvm: None,
         };
         let source = Arc::new(Processes::default());
-        let machine = config.boot(&rootfs, source.clone()).unwrap();
+        let machine = config.boot(&rootfs, source.clone(), Vec::new()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(60);
         assert_eq!(machine.message("FENCE 1 42", deadline).unwrap(), b"ok 1");
         let (id, mut output) = machine.start_exec(meta.argv.clone()).unwrap();
@@ -1400,6 +1444,7 @@ mod tests {
             state: blank,
             firmware: std::collections::BTreeMap::new(),
             parent: None,
+            disks: Vec::new(),
             main: software_state::Main::App(software_state::Session { id: id.clone(), offset: 0, claim: 0 }),
             image: meta,
         };
@@ -1416,7 +1461,7 @@ mod tests {
         config.kernel = PathBuf::from("/missing-original-kernel");
         config.qemu = "/missing-original-engine".into();
         let target = Arc::new(Processes::default());
-        let machine = config.restore(verified, target).unwrap();
+        let machine = config.restore(verified, target, Vec::new()).unwrap();
         machine.switch("cont", deadline).unwrap();
         machine.reconnect_control(deadline).unwrap();
         assert_eq!(machine.message("PING", deadline).unwrap(), b"pong");
@@ -1555,6 +1600,7 @@ mod tests {
         fs::create_dir(&logs).unwrap();
         Machine {
             inputs: None,
+            disks: Vec::new(),
             profile: software_state::Profile { architecture: std::env::consts::ARCH.into(), arguments: Vec::new() },
             network: Network::Private,
             engine_version: Value::Null,

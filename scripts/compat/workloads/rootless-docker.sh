@@ -81,7 +81,7 @@ prepare)
         test "$(cat /sys/fs/cgroup/memory.max)" = 67108864
         test "$(cat /sys/fs/cgroup/cpu.max)" = "50000 100000"
         test "$(cat /sys/fs/cgroup/pids.max)" = 64
-        wget -qO /dev/null http://example.com'
+        wget -qO /dev/null https://github.com/robots.txt'
     dock run -d --name compat-server --network compat-net --memory=64m --cpus=.5 --pids-limit=64 -p 18085:8080 -v compat-data:/data -v "$base/bind:/bind:ro" "$image" sh -ec '
         mkdir /www; cp /data/marker /www/index.html; exec httpd -f -p 8080 -h /www'
     dock exec compat-server cat /proc/1/stat > "$base/process"
