@@ -129,7 +129,7 @@ fn relay_session<G: Read + Write>(
 
 /// Where an output frame's bytes end in the session's stream.
 fn output_end(data: &[u8]) -> u64 {
-    data.get(..8).map_or(0, |o| u64::from_le_bytes(o.try_into().unwrap()) + (data.len() - 8) as u64)
+    data.get(..8).map_or(0, |o| u64::from_le_bytes(o.try_into().unwrap()).saturating_add((data.len() - 8) as u64))
 }
 
 /// An exec's way back to its session after a checkpoint cut its connection.
@@ -5206,7 +5206,7 @@ mod tests {
             assert_eq!((p.host.addr(&l, ip).unwrap().rev, p.host.live(&l, ip).unwrap()), (0, Some(2)));
             assert!(!p.host.observe(&l, ip, gen, 1, Some("10.1.0.1".parse().unwrap())).unwrap(), "the target's late announcement");
         }
-        std::fs::remove_dir(&blocker).unwrap();
+        drop(blocker);
     }
 
     /// #585: a suspend records the revision an `advance` failed to, durably, before its claim is
@@ -5220,7 +5220,7 @@ mod tests {
         p.advance(&p.host.lock().unwrap(), 2).unwrap();
         let e = p.record_for_suspend().unwrap_err();
         assert!(e.to_string().contains("recording its revision"), "{e}");
-        std::fs::remove_dir(&blocker).unwrap();
+        drop(blocker);
         p.record_for_suspend().unwrap();
         // As a suspend keeps it: taken out of `addr` first. `keep` takes the host lock, which the
         // revision retry `advance` started may hold while it waits for `addr` (#810).
@@ -5230,12 +5230,10 @@ mod tests {
         assert!(!p.host.unsynced_marker(ip).exists(), "and durably");
     }
 
-    /// The temporary file `util::write_file` makes for `dir/name`, taken by a directory: writing it fails.
-    fn block_write(dir: &std::path::Path, name: &str) -> PathBuf {
+    /// Blocks `util::write_file` for `dir/name` until dropped.
+    fn block_write(dir: &std::path::Path, name: &str) -> crate::util::WriteBlocker {
         std::fs::create_dir_all(dir).unwrap();
-        let blocker = dir.join(format!(".{name}.{}.tmp", crate::util::write_tag()));
-        std::fs::create_dir(&blocker).unwrap();
-        blocker
+        crate::util::block_write(dir.join(name))
     }
 
     /// #533: a revision neither published nor recorded is an error (the abort then leaves the VM
@@ -5252,9 +5250,7 @@ mod tests {
             assert!(e.to_string().contains("publishing it"), "{e}");
             assert_eq!((p.host.addr(&l, ip).unwrap().rev, p.host.live(&l, ip).unwrap()), (0, None));
         }
-        for b in blockers {
-            std::fs::remove_dir(b).unwrap();
-        }
+        drop(blockers);
         let end = Instant::now() + Duration::from_secs(30);
         let both = || {
             let l = p.host.lock().unwrap();
@@ -5280,7 +5276,20 @@ mod tests {
         assert_eq!(p.host.live(&l, x).unwrap(), None);
         drop(l);
         assert_ne!(p.host.mig_status(6).unwrap(), "committed");
-        std::fs::remove_dir(blocker).unwrap();
+        drop(blocker);
+    }
+
+    #[test]
+    fn output_end_saturates_on_untrusted_offset() {
+        let mut frame = u64::MAX.to_le_bytes().to_vec();
+        frame.extend_from_slice(b"hello");
+        assert_eq!(output_end(&frame), u64::MAX);
+
+        let mut normal = 10u64.to_le_bytes().to_vec();
+        normal.extend_from_slice(b"abc");
+        assert_eq!(output_end(&normal), 13);
+
+        assert_eq!(output_end(&[1, 2, 3]), 0);
     }
 
     /// #533: an arrival's revision is its own from its commit, recorded only after its reply and

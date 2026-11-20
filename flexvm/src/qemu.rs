@@ -95,7 +95,7 @@ impl ParentKvm {
             let worker = software_state::Input::open(&self.bundle.join("native-worker").canonicalize()?)?;
             // The runtime directory can be mounted noexec. Keep a descriptor
             // for the locally trusted executable throughout the owner lifetime.
-            let pinned = format!("/proc/{}/fd/{}", std::process::id(), worker.file.as_raw_fd());
+            let pinned = crate::host::fd_path(worker.file.as_raw_fd());
             std::os::unix::fs::symlink(pinned, bundle.join("native-worker"))?;
             Some(worker)
         } else {

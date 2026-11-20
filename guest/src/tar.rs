@@ -599,18 +599,17 @@ fn walk_dir(base: &OwnedFd, comps: &[Vec<u8>], make: Option<Option<(u32, u32)>>)
     for c in comps {
         let name = cstr(c)?;
         let open = |at: RawFd| os(unsafe { libc::openat(at, name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) });
-        let next = match (open(fd.as_raw_fd()), make) {
+        fd = match (open(fd.as_raw_fd()), make) {
             (Err(e), Some(owner)) if e.raw_os_error() == Some(libc::ENOENT) => {
                 os(unsafe { libc::mkdirat(fd.as_raw_fd(), name.as_ptr(), 0o755) })?;
-                let new = open(fd.as_raw_fd())?;
+                let new = unsafe { OwnedFd::from_raw_fd(open(fd.as_raw_fd())?) };
                 if let Some((u, g)) = owner {
-                    os(unsafe { libc::fchown(new, u, g) })?;
+                    os(unsafe { libc::fchown(new.as_raw_fd(), u, g) })?;
                 }
                 new
             }
-            (r, _) => r.map_err(|e| with(String::from_utf8_lossy(c), e))?,
+            (r, _) => unsafe { OwnedFd::from_raw_fd(r.map_err(|e| with(String::from_utf8_lossy(c), e))?) },
         };
-        fd = unsafe { OwnedFd::from_raw_fd(next) };
     }
     Ok(fd)
 }
