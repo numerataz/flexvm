@@ -808,16 +808,30 @@ fn serve(
     result
 }
 
-pub fn restore(host: Host, vm_name: &str, notify: Option<std::fs::File>) -> Result<i32> {
+pub fn restore(host: Host, vm_name: &str, bundle: Option<&Path>, notify: Option<std::fs::File>) -> Result<i32> {
     let notify = notify.map(|file| Startup(Arc::new(Mutex::new(Some(file)))));
     let failure_notify = notify.clone();
     let result = (|| {
         let name = host.take_name(vm_name, true)?;
         let path = host.suspended(vm_name)?;
         let metadata = software_state::metadata(&path)?;
+        let native = metadata.parent.as_ref().is_some_and(|parent| parent.native);
+        let bundle = if native {
+            bundle
+                .filter(|path| !path.as_os_str().is_empty())
+                .ok_or("restoring native parent KVM state requires a local --parent-kvm-bundle DIR")?
+                .canonicalize()?
+        } else {
+            PathBuf::new()
+        };
         let processes = Arc::new(qemu::Processes::default());
         setup_signals(processes.clone());
-        let config = restore_config(&metadata);
+        let mut config = restore_config(&metadata);
+        config.parent_kvm = metadata.parent.as_ref().map(|parent| qemu::ParentKvm {
+            bundle,
+            engine: if parent.native { "kvm" } else { "tcg" }.into(),
+            child_mem_mib: parent.child_memory_mib,
+        });
         let _reservation = Reservation::new(&host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)?;
         let profiles = config.profiles_for_disk_ids(metadata.disks.iter().map(|disk| disk.volume_id.as_str()))?;
         let verified = software_state::open(&path, profiles)?;

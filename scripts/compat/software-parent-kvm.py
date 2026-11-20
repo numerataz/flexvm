@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import re
 import runpy
+import subprocess
 import tempfile
 import time
 
@@ -26,8 +27,8 @@ def main():
     lifecycle.add_argument("--suspend-initial", action="store_true", help="stop and restore a nested VM before its first run")
     args = parser.parse_args()
     suspend = args.suspend or args.suspend_idle or args.suspend_initial
-    if (args.pause or suspend) and args.engine != "tcg":
-        parser.error("--pause and --suspend require the TCG parent provider")
+    if suspend and args.engine == "auto":
+        parser.error("checkpoint testing requires an explicit parent provider")
     binary, kernel, firecracker, qemu, bundle = (
         path.resolve(strict=True) for path in (args.bin, args.kernel, args.firecracker, args.qemu, args.bundle)
     )
@@ -91,7 +92,8 @@ def main():
             during = lambda proc, deadline: pause_nested(proc, deadline, binary, state, name, output, log)
         if suspend:
             suspend_nested(command, prefix, archive, binary, state, output, log,
-                           idle=args.suspend_idle, initial=args.suspend_initial)
+                           idle=args.suspend_idle, initial=args.suspend_initial,
+                           native_bundle=bundle if args.engine == "kvm" else None)
         else:
             HELPERS["run"]([*command, archive], 180, log, during=during)
     transcript = log.read_text(errors="replace")
@@ -123,7 +125,8 @@ def main():
                   if 'native-worker",' in line and '"--supported-cpuid"' in line and "execve(" in line and '/provider/native-worker"' not in line}
         workers -= probes
         expected_workers = len(workers) >= 2 if args.engine == "kvm" else not workers
-        if len(probes) != 1 or not expected_workers or users != workers | probes:
+        expected_probes = 2 if suspend else 1
+        if len(probes) != expected_probes or not expected_workers or users != workers | probes:
             raise RuntimeError("only the expected native worker processes may access host KVM")
     report = {"status": "passed", "engine": "tcg" if args.engine == "auto" else args.engine, "selection": args.engine,
               "nested_vcpus": 2, "nested_starts": 2, "firecracker_sha256": HELPERS["digest"](firecracker),
@@ -139,7 +142,7 @@ def wait_nested_window(proc, deadline, log, marker):
         time.sleep(.01)
 
 
-def suspend_nested(command, prefix, archive, binary, state, output, log, *, idle, initial):
+def suspend_nested(command, prefix, archive, binary, state, output, log, *, idle, initial, native_bundle):
     name = "parent-kvm-suspend"
     source, target = output / "source.log", output / "target.log"
 
@@ -156,11 +159,19 @@ def suspend_nested(command, prefix, archive, binary, state, output, log, *, idle
         manifest = json.loads((checkpoint / "manifest.json").read_text())
         if not (checkpoint / "RETIRED").is_file() or manifest["parent"]["child_memory_mib"] != 128:
             raise RuntimeError("the x86 owner did not retire a complete hierarchy")
+        if manifest["parent"].get("native", False) != (native_bundle is not None):
+            raise RuntimeError("the x86 checkpoint did not record its CPU engine")
         if idle or initial:
             expected = b"FLEXVM x86 worker has not run\n" if initial else b"FLEXVM x86 no nested worker\n"
             if (checkpoint / "parent-worker").read_bytes() != expected:
                 raise RuntimeError("the x86 checkpoint has an unexpected nested worker marker")
-        HELPERS["run"]([*prefix, output / "target.strace", binary, "start", "-a", "--state", state, name], 150, target)
+        command = [binary, "start", "-a", "--state", state]
+        if native_bundle is not None:
+            refused = subprocess.run([*command, name], capture_output=True, timeout=15)
+            if refused.returncode == 0 or b"requires a local --parent-kvm-bundle" not in refused.stderr:
+                raise RuntimeError("the native checkpoint restored without a locally supplied worker")
+            command.extend(["--parent-kvm-bundle", native_bundle])
+        HELPERS["run"]([*prefix, output / "target.strace", *command, name], 150, target)
     finally:
         log.write_bytes(b"".join(part.read_bytes() for part in (source, target) if part.exists()))
 

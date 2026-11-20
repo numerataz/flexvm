@@ -206,7 +206,37 @@ struct native_lane {
     int mapping_bytes;
     struct kvm_run *run;
     struct pending_read input;
+    bool pending_write;
+    bool deferred_exit;
 };
+
+static void send_exit(struct native_lane *lane, int control)
+{
+    lane->input = reply_run(control, lane->run, lane->mapping_bytes);
+    lane->pending_write = !lane->input.length;
+}
+
+static int settle_pending_write(struct native_lane *lane)
+{
+    if (lane->input.length || lane->deferred_exit)
+        return -EAGAIN;
+    if (!lane->pending_write)
+        return 0;
+    lane->run->immediate_exit = 1;
+    int result = ioctl(lane->cpu, KVM_RUN, 0);
+    int error = errno;
+    lane->run->immediate_exit = 0;
+    if (!result) {
+        // A continuation exit still belongs to the next guest KVM_RUN.
+        lane->deferred_exit = true;
+        lane->pending_write = false;
+        return -EAGAIN;
+    }
+    if (error != EINTR)
+        return -error;
+    lane->pending_write = false;
+    return 0;
+}
 
 static void serve_cpu_request(struct native_lane *lane, int control,
                               const unsigned char *request, ssize_t received)
@@ -215,6 +245,12 @@ static void serve_cpu_request(struct native_lane *lane, int control,
     struct pending_read *pending = &lane->input;
     uint32_t sequence;
     const size_t header = 2 + sizeof(sequence);
+
+    if (received == 2 && lane->control >= 0 && request[0] == 'D') {
+        int32_t status = settle_pending_write(lane);
+        check(write(control, &status, sizeof(status)) == sizeof(status), "reply to native I/O fence");
+        return;
+    }
 
     if (request[0] == 'E') {
         check(pending->length && received == (ssize_t)(2 + pending->length),
@@ -233,6 +269,11 @@ static void serve_cpu_request(struct native_lane *lane, int control,
           "invalid run request");
     memcpy(&sequence, request + 2, sizeof(sequence));
     check(sequence > 0 && sequence <= INT_MAX, "invalid run sequence");
+    if (lane->deferred_exit) {
+        lane->deferred_exit = false;
+        send_exit(lane, control);
+        return;
+    }
     if (pending->length) {
         memcpy(pending->data, request + header, pending->length);
         *pending = (struct pending_read){0};
@@ -247,6 +288,7 @@ static void serve_cpu_request(struct native_lane *lane, int control,
         __atomic_store_n(&run->immediate_exit, 1, __ATOMIC_RELAXED);
     int result = ioctl(lane->cpu, KVM_RUN, 0);
     active_run = 0;
+    lane->pending_write = false;
     if (stop_requested)
         return;
     if (result < 0 && errno == EINTR && cancelled_run == (sig_atomic_t)sequence) {
@@ -262,7 +304,7 @@ static void serve_cpu_request(struct native_lane *lane, int control,
     }
 
     check(result == 0, "run host vCPU");
-    *pending = reply_run(control, run, lane->mapping_bytes);
+    send_exit(lane, control);
 }
 
 static void *serve_cpu_lane(void *opaque)
@@ -309,6 +351,10 @@ static int set_irqfds(int vm, const int *descriptors, bool attach)
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "--checkpoint-state")) {
+        puts("flexvm-native-x86-checkpoint-1");
+        return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "--supported-cpuid")) {
         supported_cpuid();
         return 0;
