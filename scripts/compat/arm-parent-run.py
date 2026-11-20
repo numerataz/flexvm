@@ -101,6 +101,10 @@ class CheckpointGate:
                 raise RuntimeError("ARM checkpoint owner disconnected")
         elif request == b"freeze" and not fds and self.phase == "running":
             self.phase = "freezing"
+        elif request == b"ready" and not fds and self.phase == "frozen":
+            self.client.sendall(b"ok")
+        elif request == b"check-save" and not fds and self.phase == "frozen":
+            self.client.sendall(b"ok" if worker and worker.proc else b"no active nested worker")
         elif request == b"thaw" and not fds and self.phase == "frozen":
             if worker:
                 worker.freeze_run_control(False)
@@ -523,7 +527,11 @@ def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=
             options = PARENT["native_query"]([tcg_qemu, "-device", "flexvm-mmio-run,help"])
             checkpoint = b"checkpoint-control" in options.stdout + options.stderr
 
+    if restore and not checkpoint:
+        raise RuntimeError("restoring ARM parent state requires the checkpoint-capable engine")
     with ExitStack() as resources:
+        restore_inputs = resources.enter_context(ExitStack())
+        restore_fds = set(restore or ())
         if control is None:
             runtime = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix="flexvm-arm-kvm-")))
         else:
@@ -581,9 +589,12 @@ def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=
                                 "file": {"driver": "file", "filename": str(frontend)}})
             # The root disk uses virtio-mmio and must remain /dev/vda.
             command.extend(["-blockdev", block, "-device", "virtio-blk-pci,drive=parent-kvm-module,serial=flexvm-pvkvm"])
-        outer = SPAWN(command, pass_fds=(memory, *inherited))
+        outer_fds = [fd for fd in inherited if fd not in restore_fds]
+        outer = SPAWN(command, pass_fds=(memory, *outer_fds))
         for fd in inherited:
-            if use_tcg and fd == emulator_fd:
+            if fd in restore_fds:
+                restore_inputs.callback(os.close, fd)
+            elif use_tcg and fd == emulator_fd:
                 resources.callback(os.close, fd)
             else:
                 os.close(fd)
@@ -620,6 +631,7 @@ def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=
                 restored_worker.restore(record["worker"], memory, irq_fds, child_fd, max_pages, outer_bytes)
                 restore_interrupts(irq_fds, record["pending"])
                 os.eventfd_write(replies, 1)
+                restore_inputs.close()
                 gate.phase = "frozen"
 
         def capture(worker, fds):

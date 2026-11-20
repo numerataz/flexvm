@@ -390,6 +390,7 @@ impl Owner {
                 rootfs: blank.clone(),
                 state: blank,
                 firmware: std::collections::BTreeMap::new(),
+                parent: None,
                 disks: Vec::new(),
                 main: match &self.main_id {
                     Some(id) => software_state::Main::App(software_state::Session {
@@ -594,7 +595,10 @@ fn serve(
 ) -> Result<i32> {
     let machine = Arc::new(machine);
     let epoch = u64::from_str_radix(&util::random_hex(8)?, 16)?;
-    let deadline = Instant::now() + if meta.boot.is_app() { guest::TIMEOUT } else { config.boot_timeout };
+    // A restored VM must reconnect its guest transport after device load.
+    // Allow the same startup budget as a cold boot for that handoff.
+    let timeout = if resumed.is_some() || !meta.boot.is_app() { config.boot_timeout } else { guest::TIMEOUT };
+    let deadline = Instant::now() + timeout;
     let (generation, identity_generation, vm_id, main_id, main_reader, offset, claim, consumed, notify) = match resumed {
         Some(resumed) => {
             // STARTED was synchronized before this first guest instruction.
@@ -813,7 +817,9 @@ pub fn restore(host: Host, vm_name: &str, notify: Option<std::fs::File>) -> Resu
         let metadata = software_state::metadata(&path)?;
         let processes = Arc::new(qemu::Processes::default());
         setup_signals(processes.clone());
-        let config = restore_config(&metadata);
+        let mut config = restore_config(&metadata);
+        config.parent_kvm =
+            metadata.parent.as_ref().map(|parent| qemu::ParentKvm { bundle: PathBuf::new(), engine: "tcg".into(), child_mem_mib: parent.child_memory_mib });
         let _reservation = Reservation::new(&host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)?;
         let profiles = config.profiles_for_disk_ids(metadata.disks.iter().map(|disk| disk.volume_id.as_str()))?;
         let verified = software_state::open(&path, profiles)?;

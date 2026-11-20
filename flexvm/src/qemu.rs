@@ -77,9 +77,21 @@ pub struct ParentKvm {
 }
 
 impl ParentKvm {
-    fn command(&self, qemu: Command, pinned_engine: RawFd, inherited: &[RawFd], runtime: &SocketRoot, memory: u32, qmp: &Path) -> Result<Command> {
+    fn command(
+        &self,
+        qemu: Command,
+        inherited: &[RawFd],
+        incoming: Option<&Incoming<'_>>,
+        runtime: &SocketRoot,
+        memory: u32,
+        qmp: &Path,
+    ) -> Result<(Command, Option<software_state::Input>)> {
         let directory = runtime.dir.join("logs/parent-kvm");
         fs::create_dir(&directory)?;
+        let saved = incoming.and_then(|state| state.parent);
+        let staged_bundle = directory.join("bundle");
+        let frontend = self.stage_frontend(&staged_bundle, saved)?;
+        let bundle = if frontend.is_some() { &staged_bundle } else { &self.bundle };
         let broker = directory.join("parent-kvm-run.py");
         fs::write(&broker, include_bytes!("../../scripts/compat/parent-kvm-run.py"))?;
         fs::write(directory.join("software-boot.py"), include_bytes!("../../scripts/compat/software-boot.py"))?;
@@ -89,15 +101,42 @@ impl ParentKvm {
             fs::write(directory.join("arm-tcg-worker.py"), include_bytes!("../../scripts/compat/arm-tcg-worker.py"))?;
         }
         let mut cmd = Command::new("python3");
-        cmd.arg("-I").arg(broker).args(["--serve", "--bundle"]).arg(&self.bundle).arg("--output").arg(directory);
+        cmd.arg("-I").arg(broker).args(["--serve", "--bundle"]).arg(bundle).arg("--output").arg(directory);
         cmd.arg("--control").arg(runtime.dir.join("k")).arg("--outer-qmp").arg(qmp);
         cmd.args(["--outer-memory", &memory.to_string(), "--child-memory", &self.child_mem_mib.to_string(), "--engine", &self.engine]);
+        let pinned_engine = inherited.first().ok_or("missing parent KVM emulator descriptor")?;
         cmd.args(["--emulator-fd", &pinned_engine.to_string()]);
+        if let Some(fds) = incoming.and_then(Incoming::parent_fds) {
+            cmd.arg("--restore-fds").args(fds.map(|fd| fd.to_string()));
+        }
         for fd in inherited {
             cmd.arg("--inherit").arg(fd.to_string());
         }
         cmd.arg("--").arg(qemu.get_program()).args(qemu.get_args());
-        Ok(cmd)
+        Ok((cmd, frontend))
+    }
+
+    fn stage_frontend(&self, bundle: &Path, saved: Option<&software_state::ParentInputs>) -> Result<Option<software_state::Input>> {
+        if !cfg!(target_arch = "aarch64") {
+            return Ok(None);
+        }
+        fs::create_dir(bundle)?;
+        let frontend = bundle.join("flexvm-pvkvm.img");
+        if let Some(saved) = saved {
+            saved.frontend.copy_to(&frontend, false)?;
+            fs::write(bundle.join("checkpoint.version"), b"1\n")?;
+        } else {
+            software_state::Input::open(&self.bundle.join("flexvm-pvkvm.img").canonicalize()?)?.copy_to(&frontend, false)?;
+            let marker = self.bundle.join("checkpoint.version");
+            if fs::read(marker).is_ok_and(|bytes| bytes == b"1\n") {
+                fs::write(bundle.join("checkpoint.version"), b"1\n")?;
+            }
+            let worker = self.bundle.join("native-worker");
+            if worker.is_file() {
+                std::os::unix::fs::symlink(worker, bundle.join("native-worker"))?;
+            }
+        }
+        Ok(Some(software_state::Input::open(&frontend)?))
     }
 }
 
@@ -295,6 +334,20 @@ pub struct Machine {
     control: Mutex<Option<control::Client>>,
     parent_provider: bool,
     parent_fence: Option<ParentFence>,
+    parent_frontend: Option<software_state::Input>,
+    parent_memory_mib: u32,
+}
+
+struct Incoming<'a> {
+    state: &'a File,
+    version: &'a Value,
+    parent: Option<&'a software_state::ParentInputs>,
+}
+
+impl Incoming<'_> {
+    fn parent_fds(&self) -> Option<[RawFd; 3]> {
+        self.parent.map(|parent| [self.state.as_raw_fd(), parent.worker.file.as_raw_fd(), parent.broker.file.as_raw_fd()])
+    }
 }
 
 struct ParentFence {
@@ -303,8 +356,8 @@ struct ParentFence {
 }
 
 impl ParentFence {
-    fn request(socket: &UnixStream, command: &[u8], deadline: Instant) -> Result<()> {
-        util::send_with_fds(socket, command, &[], deadline)?;
+    fn request(socket: &UnixStream, command: &[u8], fds: &[RawFd], deadline: Instant) -> Result<()> {
+        util::send_with_fds(socket, command, fds, deadline)?;
         socket.set_read_timeout(Some(remaining(deadline)?))?;
         let mut reply = [0; 64];
         let (received, fds) = util::recvmsg_fds(socket.as_raw_fd(), &mut reply)?;
@@ -314,21 +367,39 @@ impl ParentFence {
         Ok(())
     }
 
-    fn freeze(&self, deadline: Instant) -> Result<()> {
+    fn acquire(&self, command: &[u8], deadline: Instant) -> Result<()> {
         let mut lease = self.lease.lock().unwrap();
         if lease.is_none() {
             let socket = util::connect_unix_kind(&self.path, remaining(deadline)?, libc::SOCK_SEQPACKET)?;
-            Self::request(&socket, b"freeze", deadline)?;
+            Self::request(&socket, command, &[], deadline)?;
             *lease = Some(socket);
             crate::info!("software: parent KVM vCPUs quiesced");
         }
         Ok(())
     }
 
+    fn check_save(&self, deadline: Instant) -> Result<()> {
+        let lease = self.lease.lock().unwrap();
+        let socket = lease.as_ref().ok_or("parent KVM checkpoint has no owner lease")?;
+        Self::request(socket, b"check-save", &[], deadline)
+    }
+
+    fn save(&self, fds: &[RawFd; 3], deadline: Instant) -> Result<()> {
+        let lease = self.lease.lock().unwrap();
+        let socket = lease.as_ref().ok_or("parent KVM checkpoint has no owner lease")?;
+        Self::request(socket, b"save", fds, deadline)
+    }
+
+    fn rollback(&self, deadline: Instant) -> Result<()> {
+        let lease = self.lease.lock().unwrap();
+        let socket = lease.as_ref().ok_or("parent KVM rollback has no owner lease")?;
+        Self::request(socket, b"rollback", &[], deadline)
+    }
+
     fn thaw(&self, deadline: Instant) -> Result<()> {
         let mut lease = self.lease.lock().unwrap();
         if let Some(socket) = lease.as_ref() {
-            Self::request(socket, b"thaw", deadline)?;
+            Self::request(socket, b"thaw", &[], deadline)?;
             lease.take();
         }
         Ok(())
@@ -513,8 +584,10 @@ impl Config {
 
     /// Load state into a fresh engine, with CPUs paused and public admission closed.
     pub fn restore(&self, verified: software_state::Verified, processes: Arc<Processes>, disks: Vec<volume::Writer>) -> Result<Machine> {
-        if self.parent_kvm.is_some() {
-            bail!("software restore is unavailable with the parent KVM provider");
+        match (&self.parent_kvm, &verified.manifest.parent) {
+            (None, None) => {}
+            (Some(config), Some(parent)) if cfg!(target_arch = "aarch64") && config.engine == "tcg" && config.child_mem_mib == parent.child_memory_mib => {}
+            _ => bail!("software restore requires the captured parent KVM configuration"),
         }
         if self.control != Control::Serial {
             bail!("software restore requires serial control");
@@ -528,10 +601,19 @@ impl Config {
             bail!("software restore configuration changed after artifact validation");
         };
         verified.state.unchanged()?;
+        if let Some(parent) = &verified.parent {
+            parent.worker.unchanged()?;
+            parent.broker.unchanged()?;
+        }
+        let incoming = Incoming { state: &verified.state.file, version: &verified.manifest.engine_version, parent: verified.parent.as_ref() };
         let machine = self
-            .launch(verified.inputs, processes, Some((&verified.state.file, &verified.manifest.engine_version)), network, disks)
+            .launch(verified.inputs, processes, Some(incoming), network, disks)
             .map_err(|error| format!("software incoming engine load failed: {error}"))?;
         verified.state.unchanged()?;
+        if let Some(parent) = &verified.parent {
+            parent.worker.unchanged()?;
+            parent.broker.unchanged()?;
+        }
         Ok(machine)
     }
 
@@ -539,7 +621,7 @@ impl Config {
         &self,
         inputs: software_state::Inputs,
         processes: Arc<Processes>,
-        incoming: Option<(&File, &Value)>,
+        incoming: Option<Incoming<'_>>,
         network: Network,
         disks: Vec<volume::Writer>,
     ) -> Result<Machine> {
@@ -574,6 +656,8 @@ impl Config {
             control: Mutex::new(None),
             parent_provider: self.parent_kvm.is_some(),
             parent_fence: None,
+            parent_frontend: None,
+            parent_memory_mib: self.parent_kvm.as_ref().map_or(0, |parent| parent.child_mem_mib),
         };
         let firmware = machine.logs.join("firmware");
         let result = (|| -> Result<()> {
@@ -609,11 +693,15 @@ impl Config {
                 })
                 .collect();
             let mut cmd = self.command(&engine, &kernel, &rootfs, &endpoints, network, &disks)?;
-            if incoming.is_some() {
+            let saved_parent = incoming.as_ref().and_then(|state| state.parent);
+            if incoming.is_some() && saved_parent.is_none() {
                 cmd.args(["-incoming", "defer", "-S"]);
             }
             if let Some(provider) = &self.parent_kvm {
-                cmd = provider.command(cmd, engine_fd, &inherited, &root, self.mem_mib, endpoints.api)?;
+                if let Some(fds) = incoming.as_ref().and_then(Incoming::parent_fds) {
+                    inherited.extend(fds);
+                }
+                (cmd, machine.parent_frontend) = provider.command(cmd, &inherited, incoming.as_ref(), &root, self.mem_mib, endpoints.api)?;
             }
             machine.processes.spawn_with_fds(&mut cmd, &machine.logs.join("qemu.log"), &inherited)?;
             while !machine.sockets.api.exists() {
@@ -621,19 +709,26 @@ impl Config {
                 remaining(deadline)?;
                 std::thread::sleep(Duration::from_millis(10));
             }
-            let mut qmp = Qmp::connect(&machine.sockets.api, deadline)?;
-            machine.engine_version = qmp.command("query-version", json!({}), &[])?;
             let parent_fence_path = root.dir.join("k/checkpoint");
             if machine.parent_provider && parent_fence_path.exists() {
                 machine.parent_fence = Some(ParentFence { path: parent_fence_path, lease: Mutex::default() });
             }
-            if let Some((state, expected_version)) = incoming {
-                if machine.engine_version != *expected_version {
+            if saved_parent.is_some() {
+                let fence = machine.parent_fence.as_ref().ok_or("parent KVM restore requires the checkpoint socket")?;
+                // The broker owns the outer monitor until both emulators are restored.
+                fence.acquire(b"ready", deadline)?;
+            }
+            let mut qmp = Qmp::connect(&machine.sockets.api, deadline)?;
+            machine.engine_version = qmp.command("query-version", json!({}), &[])?;
+            if let Some(incoming) = incoming {
+                if machine.engine_version != *incoming.version {
                     bail!("software engine version differs from the captured profile");
                 }
-                qmp.command("getfd", json!({"fdname":"restore"}), &[state.as_raw_fd()])?;
-                qmp.command("migrate-incoming", json!({"uri":"fd:restore"}), &[])?;
-                machine.wait_migration(&mut qmp, deadline, true)?;
+                if incoming.parent.is_none() {
+                    qmp.command("getfd", json!({"fdname":"restore"}), &[incoming.state.as_raw_fd()])?;
+                    qmp.command("migrate-incoming", json!({"uri":"fd:restore"}), &[])?;
+                    machine.wait_migration(&mut qmp, deadline, true)?;
+                }
                 let status = qmp.command("query-status", json!({}), &[])?;
                 if status["running"] != false || status["status"] != "paused" {
                     bail!("restored engine is not paused: {status}");
@@ -804,8 +899,8 @@ impl Machine {
     }
 
     pub fn checkpoint_supported(&self) -> Result<()> {
-        if self.parent_provider {
-            bail!("parent-owned KVM requires a hierarchy checkpoint");
+        if self.parent_provider && (self.parent_fence.is_none() || self.parent_frontend.is_none()) {
+            bail!("parent-owned KVM requires a checkpoint-capable provider and frontend");
         }
         Ok(())
     }
@@ -813,7 +908,9 @@ impl Machine {
     /// The caller owns the admission/CPU boundary and the output artifact. A
     /// failed export does not authorize source resume: cancel and verify first.
     pub fn save(&self, state: &File, deadline: Instant) -> Result<()> {
-        self.checkpoint_supported()?;
+        if self.parent_provider {
+            bail!("parent-owned KVM requires a hierarchy checkpoint");
+        }
         let mut capture = self.capture.lock().unwrap();
         if *capture != Capture::None {
             bail!("software state capture is unresolved");
@@ -865,10 +962,16 @@ impl Machine {
             if status["running"] != false || !matches!(status["status"].as_str(), Some("paused" | "postmigrate")) {
                 bail!("source is not fenced at a paused capture boundary: {status}");
             }
+            if let Some(fence) = &self.parent_fence {
+                fence.rollback(deadline)?;
+            }
             qmp.command("cont", json!({}), &[])?;
             let status = qmp.command("query-status", json!({}), &[])?;
             if status["running"] != true || status["status"] != "running" {
                 bail!("software source did not resume: {status}");
+            }
+            if let Some(fence) = &self.parent_fence {
+                fence.lease.lock().unwrap().take();
             }
             Ok(())
         })();
@@ -906,7 +1009,7 @@ impl Machine {
 
     pub fn checkpoint(
         &self,
-        staging: software_state::Staging,
+        mut staging: software_state::Staging,
         destination: &Path,
         mut manifest: software_state::Manifest,
         previous: Option<&software_state::Consumed>,
@@ -915,7 +1018,24 @@ impl Machine {
         if manifest.source_owner != crate::host::Ident::me() || manifest.source_engine != self.processes.engine_ident()? {
             bail!("software capture metadata does not identify this engine and owner");
         }
-        self.save(&staging.state, deadline)?;
+        self.checkpoint_supported()?;
+        if let (Some(fence), Some(frontend)) = (&self.parent_fence, &self.parent_frontend) {
+            // Refusal here leaves the existing pause lease intact. Once save
+            // is sent, only explicit rollback can authorize source execution.
+            fence.check_save(deadline)?;
+            let outer = staging.state.as_raw_fd();
+            let parent = staging.prepare_parent(frontend, self.parent_memory_mib)?;
+            let fds = [outer, parent.worker.as_raw_fd(), parent.broker.as_raw_fd()];
+            let mut capture = self.capture.lock().unwrap();
+            if *capture != Capture::None {
+                bail!("software state capture is unresolved");
+            }
+            *capture = Capture::Uncertain;
+            fence.save(&fds, deadline)?;
+            *capture = Capture::Exported;
+        } else {
+            self.save(&staging.state, deadline)?;
+        }
         // QEMU has paused vCPUs and drained its block layer at the
         // checkpoint boundary. Keep the writer leases through publication.
         manifest.disks = staging.capture_disks(&self.disks)?;
@@ -1062,7 +1182,7 @@ impl Machine {
         if let Some(fence) = self.parent_fence.as_ref().filter(|_| command == "stop") {
             // Keep ownership through an uncertain QMP stop. The caller can
             // still recover with a confirmed resume on this same lease.
-            fence.freeze(deadline)?;
+            fence.acquire(b"freeze", deadline)?;
         }
         let mut qmp = Qmp::connect(&self.sockets.api, deadline)?;
         qmp.command(command, json!({}), &[])?;
@@ -1324,6 +1444,7 @@ mod tests {
             rootfs: blank.clone(),
             state: blank,
             firmware: std::collections::BTreeMap::new(),
+            parent: None,
             disks: Vec::new(),
             main: software_state::Main::App(software_state::Session { id: id.clone(), offset: 0, claim: 0 }),
             image: meta,
@@ -1492,6 +1613,8 @@ mod tests {
             control: Mutex::new(None),
             parent_provider: false,
             parent_fence: None,
+            parent_frontend: None,
+            parent_memory_mib: 0,
         }
     }
 

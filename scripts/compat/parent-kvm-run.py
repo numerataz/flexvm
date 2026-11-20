@@ -2340,6 +2340,7 @@ def serve_outer(argv):
     parser.add_argument("--emulator-fd", type=int)
     parser.add_argument("--control", type=Path)
     parser.add_argument("--outer-qmp", type=Path)
+    parser.add_argument("--restore-fds", nargs=3, type=int)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     arch = platform.machine()
@@ -2354,6 +2355,9 @@ def serve_outer(argv):
         parser.error("only unique non-standard inherited descriptors are supported")
     for descriptor in args.inherit:
         os.fstat(descriptor)
+    if args.restore_fds and (arch != "aarch64" or args.engine != "tcg" or
+                            len(set(args.restore_fds)) != 3 or not set(args.restore_fds) <= set(args.inherit)):
+        parser.error("restoring parent state requires three inherited descriptors and the ARM TCG worker")
     qemu = command[0]
     if qemu.startswith("/proc/self/fd/") or args.emulator_fd is not None:
         if args.emulator_fd not in args.inherit or qemu != f"/proc/self/fd/{args.emulator_fd}":
@@ -2378,7 +2382,7 @@ def serve_outer(argv):
         result = launch_arm(command, destination / "native-worker", args.outer_memory, args.child_memory,
                             inherited=args.inherit, control=args.control, frontend=destination / "flexvm-pvkvm.img",
                             engine=engine, tcg_qemu=qemu, emulator_fd=args.emulator_fd,
-                            checkpoint=checkpoint, qmp_path=args.outer_qmp)
+                            checkpoint=checkpoint, qmp_path=args.outer_qmp, restore=args.restore_fds)
         return 128 - result if result < 0 else result
     if engine != "tcg":
         worker = bundle / "native-worker"

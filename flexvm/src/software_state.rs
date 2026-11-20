@@ -82,6 +82,21 @@ impl Main {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ParentArtifacts {
+    pub child_memory_mib: u32,
+    pub frontend: Artifact,
+    pub worker: Artifact,
+    pub broker: Artifact,
+}
+
+impl ParentArtifacts {
+    fn members(&self) -> [&Artifact; 3] {
+        [&self.frontend, &self.worker, &self.broker]
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Disk {
     pub volume_id: String,
     pub content: Artifact,
@@ -119,6 +134,8 @@ pub struct Manifest {
     pub rootfs: Artifact,
     pub state: Artifact,
     pub firmware: BTreeMap<String, Artifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<ParentArtifacts>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disks: Vec<Disk>,
     pub main: Main,
@@ -154,9 +171,19 @@ impl Manifest {
         {
             bail!("software state has invalid ownership, session or barrier identity");
         }
+        if let Some(parent) = &self.parent {
+            if self.profile.architecture != "aarch64"
+                || !(1..=self.memory_mib.min(256)).contains(&parent.child_memory_mib)
+                || parent.frontend.bytes > (4 << 20) + 512
+                || parent.broker.bytes > 2 << 20
+            {
+                bail!("invalid parent KVM checkpoint metadata");
+            }
+        }
         if [&self.engine, &self.kernel, &self.rootfs, &self.state]
             .into_iter()
             .chain(self.firmware.values())
+            .chain(self.parent.iter().flat_map(ParentArtifacts::members))
             .chain(self.disks.iter().map(|disk| &disk.content))
             .any(|artifact| {
                 artifact.bytes == 0 || artifact.sha256.len() != 64 || !artifact.sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -238,7 +265,7 @@ impl Input {
         Ok(())
     }
 
-    fn copy_to(&self, path: &Path, executable: bool) -> Result<Artifact> {
+    pub(crate) fn copy_to(&self, path: &Path, executable: bool) -> Result<Artifact> {
         self.unchanged()?;
         let mut out = OpenOptions::new().write(true).read(true).create_new(true).mode(0o600).open(path)?;
         let mut offset = 0;
@@ -339,12 +366,19 @@ fn discover_firmware(engine: &Input) -> Result<BTreeMap<String, Input>> {
         .collect::<Result<_>>()
 }
 
+pub struct ParentInputs {
+    pub frontend: Input,
+    pub worker: Input,
+    pub broker: Input,
+}
+
 /// A completed set of verified open files. QEMU must receive these descriptors;
 /// reopening any manifest-selected pathname would discard the verification.
 pub struct Verified {
     pub manifest: Manifest,
     pub inputs: Inputs,
     pub state: Input,
+    pub parent: Option<ParentInputs>,
     _directory: File,
 }
 
@@ -443,6 +477,17 @@ fn open_pinned(dir: File, profiles: &[Profile]) -> Result<Verified> {
                 .collect::<Result<_>>()?,
         },
         state: Input::read(member(&dir, "state")?, Some(&manifest.state))?,
+        parent: manifest
+            .parent
+            .as_ref()
+            .map(|parent| -> Result<ParentInputs> {
+                Ok(ParentInputs {
+                    frontend: Input::read(member(&dir, "parent-frontend")?, Some(&parent.frontend))?,
+                    worker: Input::read(member(&dir, "parent-worker")?, Some(&parent.worker))?,
+                    broker: Input::read(member(&dir, "parent-broker")?, Some(&parent.broker))?,
+                })
+            })
+            .transpose()?,
         manifest,
         _directory: dir,
     })
@@ -845,13 +890,21 @@ pub fn describe(path: &Path, name: &str) -> Result<serde_json::Value> {
     Ok(value)
 }
 
+pub struct ParentStaging {
+    child_memory_mib: u32,
+    frontend: Artifact,
+    pub worker: File,
+    pub broker: File,
+}
+
 /// Staging is private and never overwrites a committed directory. The caller
 /// serializes name/generation ownership and decides when to publish this snapshot.
 pub struct Staging {
     path: PathBuf,
     pub state: File,
+    parent: Option<ParentStaging>,
     committed: bool,
-    parent: File,
+    parent_directory: File,
     directory: File,
 }
 
@@ -874,7 +927,13 @@ impl Staging {
                 return Err(error.into());
             }
         };
-        Ok(Self { path, state, committed: false, parent, directory })
+        Ok(Self { path, state, parent: None, committed: false, parent_directory: parent, directory })
+    }
+
+    pub fn prepare_parent(&mut self, frontend: &Input, child_memory_mib: u32) -> Result<&ParentStaging> {
+        let create = |name| OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(self.path.join(name));
+        let frontend = frontend.copy_to(&self.path.join("parent-frontend"), false)?;
+        Ok(self.parent.insert(ParentStaging { child_memory_mib, frontend, worker: create("parent-worker")?, broker: create("parent-broker")? }))
     }
 
     pub fn capture_disks(&self, disks: &[crate::volume::Writer]) -> Result<Vec<Disk>> {
@@ -908,11 +967,11 @@ impl Staging {
 
     fn publish(mut self, destination: &Path, inputs: &Inputs, mut manifest: Manifest, previous: Option<&Consumed>) -> Result<Published> {
         let selected_parent = parent_directory(destination.parent().ok_or("software checkpoint has no parent")?)?;
-        let (selected, pinned) = (selected_parent.metadata()?, self.parent.metadata()?);
+        let (selected, pinned) = (selected_parent.metadata()?, self.parent_directory.metadata()?);
         if (selected.dev(), selected.ino()) != (pinned.dev(), pinned.ino()) {
             bail!("software checkpoint destination has a different parent");
         }
-        let target = crate::host::fd_path(self.parent.as_raw_fd()).join(destination.file_name().ok_or("software checkpoint has no name")?);
+        let target = crate::host::fd_path(self.parent_directory.as_raw_fd()).join(destination.file_name().ok_or("software checkpoint has no name")?);
         if let Some(previous) = previous {
             previous.check_replacement(&target, &manifest)?;
         }
@@ -929,9 +988,25 @@ impl Staging {
                 Ok((name.clone(), input.copy_to(&self.path.join(format!("firmware-{name}")), false)?))
             })
             .collect::<Result<_>>()?;
-        manifest.state = Input::read(self.state.try_clone()?, None)?.artifact;
-        self.state.set_permissions(fs::Permissions::from_mode(0o400))?;
-        self.state.sync_all()?;
+        let seal = |file: &File| -> Result<Artifact> {
+            let artifact = Input::read(file.try_clone()?, None)?.artifact;
+            file.set_permissions(fs::Permissions::from_mode(0o400))?;
+            file.sync_all()?;
+            Ok(artifact)
+        };
+        manifest.parent = self
+            .parent
+            .as_ref()
+            .map(|parent| -> Result<_> {
+                Ok(ParentArtifacts {
+                    child_memory_mib: parent.child_memory_mib,
+                    frontend: parent.frontend.clone(),
+                    worker: seal(&parent.worker)?,
+                    broker: seal(&parent.broker)?,
+                })
+            })
+            .transpose()?;
+        manifest.state = seal(&self.state)?;
         let directory = self.directory.try_clone()?;
         write_record(&directory, "SOFTWARE", b"flexvm-qemu-state-1\n", false)?;
         write_record(&directory, "OWNER", &serde_json::to_vec(&manifest.source_owner)?, false)?;
@@ -945,8 +1020,8 @@ impl Staging {
         file.set_permissions(fs::Permissions::from_mode(0o400))?;
         file.sync_all()?;
         util::sync_dir(&self.path)?;
-        let cleanup_parent = previous.map(|_| self.parent.try_clone()).transpose()?;
-        let _publishing = parent_lock(&self.parent, libc::LOCK_EX)?;
+        let cleanup_parent = previous.map(|_| self.parent_directory.try_clone()).transpose()?;
+        let _publishing = parent_lock(&self.parent_directory, libc::LOCK_EX)?;
         if let Some(previous) = previous {
             previous.check_replacement(&target, &manifest)?;
         }
@@ -964,7 +1039,7 @@ impl Staging {
             // safe source rollback and a later capture using these same inputs.
             previous.replaced.lock().unwrap().push((parent, PathBuf::from(self.path.file_name().ok_or("software staging has no name")?)));
         }
-        self.parent.sync_all()?;
+        self.parent_directory.sync_all()?;
         Ok(Published { directory, manifest })
     }
 }
@@ -972,7 +1047,7 @@ impl Staging {
 impl Drop for Staging {
     fn drop(&mut self) {
         if !self.committed {
-            if let Ok(_removing) = parent_lock(&self.parent, libc::LOCK_EX) {
+            if let Ok(_removing) = parent_lock(&self.parent_directory, libc::LOCK_EX) {
                 if let Ok(Some(_records)) = records_exclusive(&self.directory) {
                     let _ = fs::remove_dir_all(&self.path);
                 }
@@ -1117,6 +1192,7 @@ mod tests {
             rootfs: blank.clone(),
             state: blank,
             firmware: BTreeMap::new(),
+            parent: None,
             disks: Vec::new(),
             main: Main::App(Session { id: "saved-main".into(), offset: 19, claim: 2 }),
             image: serde_json::from_value(json!({"source":"local", "digest":"sha256:image", "config_digest":"sha256:config",
@@ -1188,6 +1264,41 @@ mod tests {
         let path = dir.join("checkpoint");
         staging.commit(&path, &inputs, manifest(profile.clone())).unwrap().retire().unwrap();
         (path, profile)
+    }
+
+    #[test]
+    fn verifies_every_parent_checkpoint_member() {
+        let root = TempDir::new("software-parent-artifacts");
+        let inputs = Inputs {
+            engine: source(&root, "source-engine", b"engine"),
+            kernel: source(&root, "source-kernel", b"kernel"),
+            rootfs: source(&root, "source-rootfs", b"rootfs"),
+            firmware: firmware_names().iter().map(|name| (name.to_string(), source(&root, &format!("source-{name}"), name.as_bytes()))).collect(),
+        };
+        let profile = Profile { architecture: "aarch64".into(), arguments: vec!["parent-profile".into()] };
+        let mut staging = Staging::new(&root).unwrap();
+        staging.state.write_all(b"outer").unwrap();
+        let frontend = source(&root, "source-frontend", b"frontend");
+        let parent = staging.prepare_parent(&frontend, 128).unwrap();
+        (&parent.worker).write_all(b"worker").unwrap();
+        (&parent.broker).write_all(b"broker").unwrap();
+        let path = root.join("checkpoint");
+        staging.commit(&path, &inputs, manifest(profile.clone())).unwrap().retire().unwrap();
+        let verified = open(&path, &profile).unwrap();
+        assert_eq!(verified.manifest.parent.as_ref().unwrap().child_memory_mib, 128);
+        assert!(verified.parent.is_some());
+        drop(verified);
+        for (name, bytes) in [("frontend", b"frontend".as_slice()), ("worker", b"worker"), ("broker", b"broker")] {
+            let member = path.join(format!("parent-{name}"));
+            fs::set_permissions(&member, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::write(&member, vec![0; bytes.len()]).unwrap();
+            fs::set_permissions(&member, fs::Permissions::from_mode(0o400)).unwrap();
+            assert!(open(&path, &profile).is_err(), "accepted tampered {name}");
+            fs::set_permissions(&member, fs::Permissions::from_mode(0o600)).unwrap();
+            fs::write(&member, bytes).unwrap();
+            fs::set_permissions(&member, fs::Permissions::from_mode(0o400)).unwrap();
+        }
+        assert!(open(&path, &profile).is_ok());
     }
 
     #[test]
