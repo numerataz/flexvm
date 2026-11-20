@@ -108,7 +108,8 @@ class Suite:
         except (Failure, subprocess.TimeoutExpired):
             if self.args.workload_diagnostics and step == "verify":
                 try:
-                    run("diagnose", 30)
+                    diagnostics = run("diagnose", 30)
+                    print(f"Workload diagnostics for {phase}:\n{diagnostics[-16_384:]}", file=sys.stderr)
                 except (Failure, subprocess.TimeoutExpired, OSError) as error:
                     self.report["workload_diagnostics_error"] = str(error)
             raise

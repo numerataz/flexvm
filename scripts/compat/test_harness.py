@@ -144,6 +144,7 @@ class Harness(unittest.TestCase):
         self.assertIn("verify", report["error"])
         self.assertEqual(report["phases"][0]["status"], "failed")
         self.assertEqual((self.output / "diagnose-run.stdout.log").read_text(), "workload-diagnose\n")
+        self.assertIn("Workload diagnostics for run:\nworkload-diagnose", result.stderr)
         calls = self.calls()
         diagnoses = [i for i, call in enumerate(calls) if call[0] == "exec" and "diagnose" in call]
         removes = [i for i, call in enumerate(calls) if call[0] == "rm"]
