@@ -233,7 +233,7 @@ jobs:
           output="$RUNNER_TEMP/software-managed-disks"
           sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=250% python3 scripts/compat/managed-disk-transfer.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$output" --timeout 360 || {
             status=$?
-            sudo tail -c 16000 -- "$output/report.json" "$output/worker.log" "$output/"*-compile.log || true
+            sudo tail -c 16000 -- "$output/report.json" "$output/worker.log" "$output/"*-compile.log "$output/"*-owner.log || true
             exit "$status"
           }
           cat "$output/report.json"
