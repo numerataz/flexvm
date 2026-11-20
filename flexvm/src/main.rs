@@ -89,6 +89,10 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      record an incoming transfer and its base64 Ed25519 public key
   flexvm software-transfer commit RECEIPT
                                      verify source retirement and commit the destination journal
+  flexvm software-transfer acknowledge-commit OFFER --signing-key FILE
+                                     sign the destination's committed decision
+  flexvm software-transfer finalize COMMIT-ACK --signing-key FILE
+                                     record the completed outgoing handoff and sign its proof
   flexvm software-transfer abort OFFER
                                      durably reject the prepared transfer
   flexvm software-transfer acknowledge-abort OFFER --signing-key FILE
@@ -666,7 +670,7 @@ fn check_applies(args: &Args) -> Result<()> {
                 (Some("id"), 2, (false, false, false))
                     | (Some("prepare"), 3, (true, false, false))
                     | (Some("commit" | "abort" | "recover" | "receive"), 3, (false, false, false))
-                    | (Some("acknowledge-abort"), 3, (false, true, false))
+                    | (Some("acknowledge-abort" | "acknowledge-commit" | "finalize"), 3, (false, true, false))
                     | (Some("offer" | "send" | "activate"), 4, (false, false, false))
                     | (Some("retire"), 4, (false, true, true))
             ) {
@@ -848,6 +852,12 @@ fn real_main(args: &Args) -> Result<()> {
             }
             if name == "acknowledge-abort" {
                 return print(software_state::transfer::acknowledge_abort(&path, Path::new(pos[2]), Path::new(args.get("signing-key").unwrap()))?);
+            }
+            if name == "acknowledge-commit" {
+                return print(software_state::transfer::finalize::acknowledge(&path, Path::new(pos[2]), Path::new(args.get("signing-key").unwrap()))?);
+            }
+            if name == "finalize" {
+                return print(software_state::transfer::finalize::outgoing(&path, Path::new(pos[2]), Path::new(args.get("signing-key").unwrap()))?);
             }
             if name == "recover" {
                 return print(software_state::transfer::recover(&path, Path::new(pos[2]))?);

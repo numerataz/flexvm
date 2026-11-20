@@ -312,6 +312,15 @@ def exercise(args):
         denied_activation('requires a committed destination transfer')
         if destination('commit', receipt)['status'] != 'committed':
             raise RuntimeError('transfer destination did not commit')
+        commit_ack = args.state / 'commit-ack.json'
+        commit_ack.write_text(json.dumps(destination('acknowledge-commit', offer, '--signing-key', destination_secret)))
+        finalize = ('software-transfer', 'finalize', commit_ack, '--signing-key', secret)
+        proof = json.loads(cli(*finalize))
+        if proof['handoff']['offer'] != json.loads(offer.read_text()) or proof['handoff']['destination_key'] != destination_key:
+            raise RuntimeError('finalized proof did not bind the exact offer and destination key')
+        if proof != json.loads(cli(*finalize)):
+            raise RuntimeError('finalized proof changed after a retry')
+        evidence['finalized_transfer_proof'] = 'passed'
         denied_activation('trusted local QEMU does not match', qemu='/bin/true')
         try:
             with (args.output / 'transfer-target.log').open('wb') as log:

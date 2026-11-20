@@ -263,6 +263,15 @@ old name. That checkpoint stays fenced after the return. Only a checkpoint
 captured by the new local owner can start or transfer again. The current return
 protocol covers direct handoffs between the same pair of hosts.
 
+To obtain a finalized handoff proof, run
+`software-transfer acknowledge-commit OFFER --signing-key FILE` with the
+destination signing key. Pass its signed output to
+`software-transfer finalize COMMIT-ACK --signing-key FILE` with the source
+signing key. The source verifies the commit against the pinned destination key
+and records the decision before issuing the proof. The same transfer cannot
+both finalize and recover from an abort. Keep the proof with the transfer
+records for future ownership-chain verification.
+
 After load, use the guest agent to step CLOCK_REALTIME from the current host time.
 Do not reset CLOCK_MONOTONIC through the agent. Preserve the engine virtual clock
 and device timers through migration, and test nondecreasing monotonic time and
