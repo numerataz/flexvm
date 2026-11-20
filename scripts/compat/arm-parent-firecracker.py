@@ -216,8 +216,8 @@ def resume_outer(proc, deadline, runtime):
         monitor.close()
 
 
-def transfer_checkpoint(command, output, log, *, rollback=False, idle=False):
-    checkpoint_window = "ARM checkpoint window before opening the nested VM" if idle else "ARM Firecracker checkpoint window"
+def transfer_checkpoint(command, output, log, *, rollback=False, idle=False, window=None):
+    checkpoint_window = window or ("ARM checkpoint window before opening the nested VM" if idle else "ARM Firecracker checkpoint window")
     with ExitStack() as resources:
         root = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix="flexvm-arm-transfer-")))
         source, target = root / "source", root / "target"

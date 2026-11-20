@@ -32,7 +32,9 @@ def verify(path, metadata):
                 files[name] = entry
         def read(name):
             # No extraction or link following: only regular archive members.
-            entry = files[name]
+            entry = files.get(name)
+            if entry is None:
+                raise ValueError(f'daemon export is missing regular member {name!r}')
             return archive.extractfile(entry).read()
         def document(name):
             data = read(name)
