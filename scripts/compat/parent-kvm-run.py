@@ -6,6 +6,7 @@ import ctypes
 from dataclasses import dataclass
 import errno
 import fcntl
+import hashlib
 import json
 import mmap
 import os
@@ -66,6 +67,7 @@ KVM_EXIT_IO = 2
 KVM_EXIT_MMIO = 6
 IO_PORT = 0x30
 MMIO_BASE = 0xd0000000
+FIRECRACKER_NET_MMIO_BASE = 0xc0001000
 MMIO_WIRE = struct.Struct("<cBQ8s")
 PIO_HEADER = struct.Struct("<cBHI")
 PIO_DATA_AT = 0x86000
@@ -474,7 +476,8 @@ class RegisterChannel:
 
 
 class TcgChild:
-    def __init__(self, qemu, output, socket_path, outer_ram, layouts, slots, cpu_count, mmio, pit_flags, irq_fds):
+    def __init__(self, qemu, output, socket_path, outer_ram, layouts, slots, cpu_count, mmio_base, pit_flags, irq_fds,
+                 fixture_checks):
         self.process = None
         self.channel = None
         self.debugger = None
@@ -483,7 +486,7 @@ class TcgChild:
         debugger_path = socket_path.with_name("registers.sock")
         self.special_monitor_path = socket_path.with_name("special-registers.sock")
         self.memory = outer_ram
-        self.data_offset = slots[-1].offsets[-1] + 0x82
+        self.data_offset = slots[-1].offsets[-1] + 0x82 if fixture_checks else None
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener, (output / "child.log").open("wb") as log:
                 listener.bind(str(socket_path))
@@ -496,8 +499,8 @@ class TcgChild:
                     exit_device += ",keep-pit-ports=on"
                     if pit_flags & KVM_PIT_SPEAKER_DUMMY:
                         exit_device += ",keep-speaker-port=on"
-                if mmio:
-                    exit_device += f",mmio-base={MMIO_BASE}"
+                if mmio_base is not None:
+                    exit_device += f",mmio-base={mmio_base}"
                 pit = "off" if pit_flags is None else "on"
                 command = [
                     qemu, *QEMU_OPTIONS, "-machine", f"pc,accel=tcg,pit={pit}", "-m", "16",
@@ -531,7 +534,8 @@ class TcgChild:
             raise
 
     def run(self, cpu, cancellation, completion):
-        if self.channel.timings and 0xa7 not in self.channel.exits and os.pread(self.memory, 1, self.data_offset) != b"\0":
+        if (self.data_offset is not None and self.channel.timings and 0xa7 not in self.channel.exits and
+                os.pread(self.memory, 1, self.data_offset) != b"\0"):
             raise RuntimeError("child wrote its second result while stopped")
         request = b"D" + completion if completion else bytes((ord("R") + cpu,))
         return self.channel.run(request, cancellation, lambda: self.channel.connection.sendall(b"I"))
@@ -1223,7 +1227,8 @@ def read_slot_table(mailbox, ram_pages, outer_bytes, protected_entry, split_slot
     return slots
 
 
-def start_child(engine, qemu, output, control, outer_ram, slots, cpu_count, mmio, irqchip, pit_flags, irq_fds, tss_gpa):
+def start_child(engine, qemu, output, control, outer_ram, slots, cpu_count, mmio_base, irqchip, pit_flags, irq_fds, tss_gpa,
+                fixture_checks):
     if not irqchip:
         irq_fds = ()
     if tss_gpa is not None and any(slot.gpa < tss_gpa + 3 * PAGE_SIZE and
@@ -1242,8 +1247,8 @@ def start_child(engine, qemu, output, control, outer_ram, slots, cpu_count, mmio
             layouts.append(manifest)
         if engine == "kvm":
             return KvmChild(output, outer_ram, layouts, slots, cpu_count, irqchip, pit_flags, irq_fds, tss_gpa)
-        return TcgChild(qemu, output, control / "child.sock", outer_ram, layouts, slots, cpu_count, mmio,
-                        pit_flags, irq_fds)
+        return TcgChild(qemu, output, control / "child.sock", outer_ram, layouts, slots, cpu_count, mmio_base,
+                        pit_flags, irq_fds, fixture_checks)
 
 
 def verify_slot_spans(pid, slots):
@@ -1275,7 +1280,7 @@ def verify_slot_spans(pid, slots):
 def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry,
              split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs, cpuid, mmio, mmio_read,
              ioeventfd, irqchip, pit, irqfd, zero_slot, tss, lapic, pio, complete_read, pio_boundary, pvh,
-             irqchip_state, pit_state, debugregs, mp_state, xcrs, xsave, vcpu_events, clock):
+             irqchip_state, pit_state, debugregs, mp_state, xcrs, xsave, vcpu_events, clock, firecracker):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
@@ -1436,7 +1441,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
     supported_cpuid = []
     child = None
     slot_size = ram_pages * PAGE_SIZE
-    outer_mib = max(192, (slot_size + MIB - 1) // MIB + 128)
+    outer_mib = max(384 if firecracker else 192, (slot_size + MIB - 1) // MIB + 128)
     outer_ram_size = outer_mib * MIB
     with ExitStack() as cleanup:
         control = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix="flexvm-kvm-")))
@@ -1502,7 +1507,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
             if os.eventfd_read(requests) != 1:
                 raise RuntimeError("multiple outstanding doorbell requests")
             pending, complete, opcode, _, length = struct.unpack_from("<IIIII", mapping, 8)
-            if pending != complete + 1 or len(observed) >= len(expected) or opcode != expected[len(observed)]:
+            if (pending != complete + 1 or
+                    (not firecracker and (len(observed) >= len(expected) or opcode != expected[len(observed)]))):
                 raise RuntimeError(f"unexpected doorbell request {pending}, command {opcode}")
             cpu, = struct.unpack_from("<I", mapping, 44)
             cpu_commands = (CLOSE_CPU, RUN, GET_REGS, GET_SREGS, SET_REGS, GET_FPU, SET_FPU, GET_MSRS, SET_MSRS,
@@ -1735,8 +1741,10 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                     if length != slot_size or len(open_cpus) != cpu_count:
                         raise RuntimeError("unexpected total size of registered RAM")
                     slots = read_slot_table(mapping, ram_pages, outer_ram_size, protected_entry, split_slot, zero_slot)
+                    mmio_base = FIRECRACKER_NET_MMIO_BASE if firecracker else MMIO_BASE if mmio else None
                     child = start_child(parent_engine, qemu, output, control, outer_ram, slots,
-                                        cpu_count, mmio, irqchip_created, pit_flags, irq_fds, tss_gpa)
+                                        cpu_count, mmio_base, irqchip_created, pit_flags, irq_fds, tss_gpa,
+                                        not firecracker)
                     cleanup.callback(child.close)
                     extents = verify_slot_spans(child.process.pid, slots)
                     if staged_clock is not None:
@@ -1764,7 +1772,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                     raise RuntimeError("unexpected slot registration after the first run")
                 if cpu not in started_cpus:
                     cpuid_valid, = struct.unpack_from("<I", mapping, CPUID_VALID_AT)
-                    if cpuid_valid != int(cpuid):
+                    if not firecracker and cpuid_valid != int(cpuid):
                         raise RuntimeError("unexpected staged CPUID table")
                     if cpuid_valid:
                         child.set_cpuid(cpu, unpack_cpuid(mapping[CPUID_AT:CPUID_AT + CPUID_BYTES]))
@@ -1781,17 +1789,17 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                         child.set_protected_entry(cpu, state)
                     child.set_registers(cpu, mapping[64:64 + REGISTERS.size])
                     fpu_valid, = struct.unpack_from("<I", mapping, FPU_VALID_AT)
-                    if fpu_valid != int(fpu):
+                    if not firecracker and fpu_valid != int(fpu):
                         raise RuntimeError("unexpected staged floating-point state")
                     if fpu_valid:
                         child.set_floating_point(cpu, mapping[FPU_AT:FPU_AT + FPU_SIZE])
                     initial_msrs = unpack_msr_batch(mapping[MSR_AT:MSR_AT + MSR_HEADER.size + MSR_ENTRY.size * MSR_BATCH_MAX])
-                    if bool(initial_msrs) != msrs:
+                    if not firecracker and bool(initial_msrs) != msrs:
                         raise RuntimeError("unexpected staged boot MSR state")
                     if initial_msrs and child.access_msrs(cpu, initial_msrs, True) != initial_msrs:
                         raise RuntimeError("worker rejected staged boot MSR state")
                     lapic_valid, = struct.unpack_from("<I", mapping, LAPIC_VALID_AT)
-                    if lapic_valid != int(lapic):
+                    if not firecracker and lapic_valid != int(lapic):
                         raise RuntimeError("unexpected staged LAPIC image")
                     if lapic_valid:
                         child.set_lapic(cpu, mapping[LAPIC_AT:LAPIC_AT + LAPIC_SIZE])
@@ -1801,13 +1809,18 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 try:
                     result = child.run(cpu, RunCancellation(cancellations, mapping, pending, deadline), completion)
                 except TimeoutError as error:
-                    raise TimeoutError(f"KVM_RUN {pending} stopped responding; PIO writes={pio_writes}, "
-                                       f"PIO reads={pio_reads}, last port values={io_events}") from error
+                    raise TimeoutError(f"KVM_RUN {pending} on vCPU {cpu} stopped responding; "
+                                       f"last PIO writes={pio_writes[-12:]}, last PIO reads={pio_reads[-12:]}") from error
                 if result is None:
                     status = -errno.EINTR
                 else:
                     if result.reason == KVM_EXIT_IO:
-                        if result.is_write and result.address == IO_PORT and result.width == 1 and result.count == 1:
+                        if firecracker:
+                            if result.is_write:
+                                pio_writes.append((result.address, result.width, result.data))
+                            else:
+                                pending_read = result
+                        elif result.is_write and result.address == IO_PORT and result.width == 1 and result.count == 1:
                             io_events.append((cpu, result.data[0]))
                         elif not pio:
                             raise RuntimeError("unexpected port I/O exit")
@@ -1829,7 +1842,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                     elif result.is_write:
                         mmio_events.append((result.address, result.data))
                     else:
-                        if not mmio_read or cpu_count != 1:
+                        if not (firecracker or mmio_read):
                             raise RuntimeError("unexpected MMIO read")
                         pending_read = result
                     mapping[EXIT_AT:EXIT_AT + EXIT_RECORD.size] = result.record()
@@ -1886,6 +1899,23 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
             struct.pack_into("<I", mapping, 12, pending)
             os.eventfd_write(replies, 1)
         guest = (output / "outer.log").read_text(errors="replace")
+        if firecracker:
+            if (outer.wait() != 0 or child is None or open_cpus or CLOSE_VM not in observed or
+                    f"FLEXVM_SOFTWARE_INNER_CPUS {cpu_count}\n" not in guest or
+                    child.process is not None or "FLEXVM_SOFTWARE_INNER_COMPLETE" not in guest or
+                    "PASS parent KVM guest shutdown" not in guest):
+                raise RuntimeError(f"unchanged Firecracker did not complete; commands={observed[-32:]}, see outer.log")
+            if "FLEXVM_SOFTWARE_INNER_NETWORK" not in guest or "PASS Firecracker network echo" not in guest:
+                raise RuntimeError("unchanged Firecracker did not exchange the network test datagram")
+            return {
+                "firecracker": True, "nested_network": True, "guest_path": "/dev/kvm",
+                "guest_vmx": False, "guest_svm": False,
+                "parent_accelerator": parent_engine, "vcpu_count": cpu_count, "mapped_extents": extents,
+                "run_count": observed.count(RUN), "control_commands": [op for op in observed if op != RUN],
+                "uart_writes": sum(address == 0x3f8 for address, _, _ in pio_writes),
+                "mmio_addresses": sorted({address for address, _ in mmio_events + completed_reads}),
+                "worker_stopped_before_close_reply": True,
+            }
         if (outer.wait() != 0 or observed != expected or child is None or io_events != expected_io
                 or tuple(mmio_events) != expected_mmio
                 or coalesce_pio(pio_writes) != expected_pio_writes or coalesce_pio(pio_reads) != expected_pio_reads
@@ -2000,6 +2030,7 @@ def main():
     parser.add_argument("--kernel", type=Path, required=True)
     parser.add_argument("--kernel-build", type=Path)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--firecracker", type=Path, help="boot the kernel through an unchanged Firecracker binary")
     parser.add_argument("--native-oracle", action="store_true")
     parser.add_argument("--parent-engine", choices=("tcg", "kvm"), default="tcg")
     parser.add_argument("--ram-pages", type=int, default=2, help=f"number of pages from 1 to {MAX_SLOT_PAGES}")
@@ -2035,6 +2066,12 @@ def main():
     parser.add_argument("--reject-close", action="store_true", help="verify page retention when the parent refuses close")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    firecracker = args.firecracker is not None
+    if firecracker:
+        if args.native_oracle or args.reject_close or args.two_vcpus:
+            parser.error("--firecracker needs a normal parent boot")
+        args.pvh = True
+        args.ram_pages = 32768
     if args.mmio_read or args.ioeventfd:
         args.mmio_write = True
     if args.pio_boundary:
@@ -2111,7 +2148,7 @@ def main():
                                   args.mmio_write, args.mmio_read, args.ioeventfd, args.irqchip, args.pit,
                                   args.irqfd, args.zero_slot, args.tss, args.lapic, args.pio, args.complete_read,
                                   args.pio_boundary, args.pvh, args.irqchip_state, args.pit_state, args.debugregs,
-                                  args.mp_state, args.xcrs, args.xsave, args.vcpu_events, args.clock)))
+                                  args.mp_state, args.xcrs, args.xsave, args.vcpu_events, args.clock, firecracker)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -2256,6 +2293,33 @@ def main():
             files["vcpu-events"] = b""
         if args.clock:
             files["clock"] = b""
+        if firecracker:
+            inner_init = output / "firecracker-init"
+            HELPERS["run"](["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static",
+                            ROOT / "nested-init.c", "-o", inner_init],
+                           20, output / "firecracker-init.log")
+            inner_initrd = HELPERS["initramfs"](inner_init.read_bytes(), files={"firecracker-network": b""})
+            config = {
+                "boot-source": {
+                    "kernel_image_path": "/firecracker-kernel",
+                    "initrd_path": "/firecracker-initrd",
+                    "boot_args": "console=ttyS0 quiet panic=1 rdinit=/init reboot=k",
+                },
+                "machine-config": {"vcpu_count": 1, "mem_size_mib": args.ram_pages * PAGE_SIZE // MIB},
+                "drives": [],
+                "network-interfaces": [
+                    {"iface_id": "eth0", "host_dev_name": "flexvmtap", "guest_mac": "02:00:00:00:00:02"},
+                ],
+            }
+            files.update({
+                "firecracker-network": b"",
+                "firecracker": args.firecracker.read_bytes(),
+                "firecracker-kernel": kernel.read_bytes(),
+                "firecracker-initrd": inner_initrd,
+                "firecracker.json": json.dumps(config).encode(),
+            })
+            report.update(firecracker_sha256=HELPERS["digest"](args.firecracker),
+                          inner_initrd_sha256=hashlib.sha256(inner_initrd).hexdigest())
         image = HELPERS["initramfs"](init.read_bytes(), files=files)
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
@@ -2305,7 +2369,8 @@ def main():
                             *(["--xsave"] if args.xsave else []),
                             *(["--vcpu-events"] if args.vcpu_events else []),
                             *(["--clock"] if args.clock else []),
-                            *(["--reject-close"] if args.reject_close else [])], 75, worker)
+                            *(["--reject-close"] if args.reject_close else []),
+                            *(["--firecracker", args.firecracker] if firecracker else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}
         expected = {"/dev/kvm"} if args.parent_engine == "kvm" else set()
@@ -2319,7 +2384,8 @@ def main():
             model_queries = sum((args.cpuid, args.lapic, args.irqchip_state, args.debugregs, args.xcrs, args.xsave))
             model_queries += int(args.vcpu_events) + int(args.clock)
             model_queries += 2 * int(args.pit_state) + 3 * int(args.mp_state)
-            if len(workers) != 1 + model_queries + reset_queries or kvm_users != workers:
+            if not workers or kvm_users != workers or (
+                    not firecracker and len(workers) != 1 + model_queries + reset_queries):
                 raise RuntimeError("only the native parent worker may use host KVM")
         report.update(json.loads(worker.read_text()), status="passed", host_device_access=bool(devices),
                       host_devices=sorted(devices))
