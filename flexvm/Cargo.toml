@@ -18,6 +18,8 @@ serde_json = { version = "1", features = ["raw_value"] }
 # `unversioned` (resolver, connector) is used, so minor versions are taken by hand.
 ureq = { version = "~3.4.2", default-features = false, features = ["rustls"] }
 base64 = "0.22"
+ring = "0.17"
+zeroize = "1"
 sha2 = "0.10"
 flate2 = "1"
 ruzstd = "0.9.1"
