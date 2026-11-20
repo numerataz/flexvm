@@ -478,8 +478,10 @@ static int cpu_release(struct inode *inode, struct file *file)
 	vm->open_cpus &= ~BIT(cpu->id);
 	if (request_for_cpu(cpu, PVKVM_CLOSE_VCPU, NULL, NULL))
 		mark_provider_dead(p);
+#ifdef CONFIG_X86_64
 	else if (!vm->open_cpus)
 		vm->slots_exposed = false;
+#endif
 	mutex_unlock(&p->lock);
 	kref_put(&vm->refs, vm_free);
 	vfree(cpu->page);

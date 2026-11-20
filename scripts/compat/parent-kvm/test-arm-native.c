@@ -164,6 +164,7 @@ int main(int argc, char *argv[])
         _exit(127);
     }
     close(link[1]);
+    ASSERT(!read_reply(link[0]).status);
 
     struct result result;
     ASSERT(send(link[0], "?", 1, MSG_NOSIGNAL) == 1);
@@ -276,6 +277,12 @@ int main(int argc, char *argv[])
     ASSERT(pread(ram, &observed, sizeof(observed), offsets[1]) == sizeof(observed) && observed == pattern);
     ASSERT(pread(ram, &observed, sizeof(observed), 2 * PAGE) == sizeof(observed) && observed == 0);
 
+    for (unsigned int cpu = 0; cpu < 2; cpu++) {
+        struct flexvm_arm_request close_cpu = {.command = FLEXVM_ARM_CLOSE_VCPU, .cpu = cpu};
+        ASSERT(!exchange(link[0], close_cpu, &result).status);
+    }
+    struct flexvm_arm_request preferred = {.command = FLEXVM_ARM_PREFERRED_TARGET};
+    ASSERT(!exchange(link[0], preferred, &result).status);
     close(link[0]);
     int status;
     ASSERT(waitpid(worker, &status, 0) == worker && WIFEXITED(status) && !WEXITSTATUS(status));

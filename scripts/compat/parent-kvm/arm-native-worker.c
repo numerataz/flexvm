@@ -352,6 +352,30 @@ static int open_lane(struct arm_vm *vm, struct arm_cpu *cpu, struct worker_packe
     return 0;
 }
 
+static void stop_lane(struct arm_cpu *cpu)
+{
+    if (cpu->lane < 0)
+        return;
+    pthread_kill(cpu->thread, SIGUSR1);
+    shutdown(cpu->lane, SHUT_RDWR);
+    pthread_join(cpu->thread, NULL);
+    close(cpu->lane);
+    cpu->lane = -1;
+}
+
+static int close_cpu(struct arm_vm *vm, struct arm_cpu *cpu)
+{
+    if (cpu->fd < 0)
+        return -EBADF;
+    stop_lane(cpu);
+    int status = ioctl_result(munmap(cpu->run, vm->run_bytes));
+    close(cpu->fd);
+    cpu->fd = -1;
+    cpu->run = NULL;
+    cpu->initialized = 0;
+    return status;
+}
+
 static int control_cpu(struct arm_cpu *cpu, const struct flexvm_arm_request *request,
                        struct flexvm_arm_reply *reply, struct kvm_reg_list *list)
 {
@@ -426,6 +450,8 @@ static void serve(struct arm_vm *vm, int control)
             reply.status = -EINVAL;
         } else if (request->command == FLEXVM_ARM_CREATE_VCPU) {
             reply.status = create_cpu(vm, request->cpu);
+        } else if (request->command == FLEXVM_ARM_CLOSE_VCPU) {
+            reply.status = close_cpu(vm, &vm->cpus[request->cpu]);
         } else if (request->command == FLEXVM_ARM_OPEN_LANE) {
             reply.status = open_lane(vm, &vm->cpus[request->cpu], &packet);
         } else if (request->command == FLEXVM_ARM_RUN || request->command == FLEXVM_ARM_COMPLETE_READ) {
@@ -448,8 +474,24 @@ static void serve(struct arm_vm *vm, int control)
     stop_lanes(vm);
 }
 
+static int open_kvm(void)
+{
+    int kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
+    check(kvm >= 0 && ioctl(kvm, KVM_GET_API_VERSION, 0) == KVM_API_VERSION, "open ARM KVM");
+    return kvm;
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "--ipa-bits")) {
+        int kvm = open_kvm();
+        check(ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_IMMEDIATE_EXIT) == 1, "query ARM run cancellation");
+        int bits = ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_ARM_VM_IPA_SIZE);
+        check(bits >= 32 && bits <= 52, "query ARM IPA size");
+        printf("%d\n", bits);
+        close(kvm);
+        return 0;
+    }
     check(argc == 3, "expected ARM worker control FD and VM type");
     int control = number(argv[1], INT_MAX);
     int socket_type;
@@ -468,13 +510,16 @@ int main(int argc, char **argv)
     sigaddset(&signals, SIGRTMIN);
     sigaddset(&signals, SIGUSR1);
     check(pthread_sigmask(SIG_UNBLOCK, &signals, NULL) == 0, "enable ARM worker signals");
-    int kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
-    check(kvm >= 0 && ioctl(kvm, KVM_GET_API_VERSION, 0) == KVM_API_VERSION, "open ARM KVM");
+    int kvm = open_kvm();
     check(ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_IMMEDIATE_EXIT) == 1, "enable ARM KVM run cancellation");
     int run_bytes = ioctl(kvm, KVM_GET_VCPU_MMAP_SIZE, 0);
     check(run_bytes >= (int)sizeof(struct kvm_run), "get the ARM KVM run mapping size");
     struct arm_vm vm = {.fd = ioctl(kvm, KVM_CREATE_VM, type), .run_bytes = run_bytes};
-    check(vm.fd >= 0, "create the ARM KVM VM");
+    struct flexvm_arm_reply startup = {.status = vm.fd < 0 ? -errno : 0};
+    if (startup.status) {
+        check(send(control, &startup, sizeof(startup), MSG_NOSIGNAL) == sizeof(startup), "send ARM VM creation error");
+        return 1;
+    }
     for (uint32_t id = 0; id < FLEXVM_ARM_MAX_CPUS; id++) {
         struct arm_cpu *cpu = &vm.cpus[id];
         cpu->id = id;
@@ -483,6 +528,7 @@ int main(int argc, char **argv)
         atomic_init(&cpu->completed, 0);
         check(pthread_mutex_init(&cpu->execution, NULL) == 0, "initialize ARM vCPU lock");
     }
+    check(send(control, &startup, sizeof(startup), MSG_NOSIGNAL) == sizeof(startup), "announce the ARM VM");
     serve(&vm, control);
     return 0;
 }
