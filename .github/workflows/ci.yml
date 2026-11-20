@@ -393,6 +393,7 @@ jobs:
               --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64" --kernel "$artifacts/vmlinux" \
               --bundle "$bundle" --output "$RUNNER_TEMP/arm-parent-frontend-native"
           fi
+          root=$PWD
           source scripts/versions.sh
           stock="firecracker-$FC_VERSION-$ARCH"
           url="https://github.com/firecracker-microvm/firecracker/releases/download/$FC_VERSION/$stock.tgz"
