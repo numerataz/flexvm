@@ -1,0 +1,214 @@
+--- a/hw/intc/apic.c
++++ b/hw/intc/apic.c
+@@ -631,4 +631,10 @@
+ {
++    CPUState *cpu = CPU(s->cpu);
++
++    if (s->flexvm_mp_managed && !s->flexvm_init_received &&
++        !cpu_test_interrupt(cpu, CPU_INTERRUPT_INIT)) {
++        return;
++    }
+     s->sipi_vector = vector_num;
+-    cpu_interrupt(CPU(s->cpu), CPU_INTERRUPT_SIPI);
++    cpu_interrupt(cpu, CPU_INTERRUPT_SIPI);
+ }
+@@ -637,6 +643,9 @@
+ {
+-    if (!s->wait_for_sipi)
++    if (!s->wait_for_sipi ||
++        (s->flexvm_mp_managed && !s->flexvm_init_received)) {
+         return;
++    }
+     cpu_x86_load_seg_cache_sipi(s->cpu, s->sipi_vector);
+     s->wait_for_sipi = 0;
++    s->flexvm_init_received = false;
+ }
+--- a/hw/intc/apic_common.c
++++ b/hw/intc/apic_common.c
+@@ -206,2 +206,4 @@
+     s->wait_for_sipi = !cpu_is_bsp(s->cpu);
++    s->flexvm_init_received = false;
++    s->flexvm_ap_reset_hold = false;
+
+@@ -301,2 +303,14 @@
+ }
++
++void apic_flexvm_note_init(APICCommonState *s)
++{
++    if (s && s->wait_for_sipi) {
++        s->flexvm_init_received = true;
++    }
++}
++
++bool apic_flexvm_waiting_for_sipi(APICCommonState *s)
++{
++    return s && s->flexvm_mp_managed && s->wait_for_sipi;
++}
+
+--- a/include/hw/i386/apic.h
++++ b/include/hw/i386/apic.h
+@@ -17,2 +17,4 @@
+ void apic_init_reset(APICCommonState *s);
++void apic_flexvm_note_init(APICCommonState *s);
++bool apic_flexvm_waiting_for_sipi(APICCommonState *s);
+ void apic_sipi(APICCommonState *s);
+--- a/include/hw/i386/apic_internal.h
++++ b/include/hw/i386/apic_internal.h
+@@ -185,2 +185,5 @@
+     int wait_for_sipi;
++    bool flexvm_mp_managed;
++    bool flexvm_init_received;
++    bool flexvm_ap_reset_hold;
+
+--- a/qapi/misc-i386.json
++++ b/qapi/misc-i386.json
+@@ -847 +847,25 @@
+   'returns': 'FlexvmX86DebugState', 'features': [ 'unstable' ] }
++
++##
++# @FlexvmX86MpRecord:
++#
++# @state: The x86 KVM multiprocessing state number.
++# @status: Zero on success or a negative Linux errno.
++##
++{ 'struct': 'FlexvmX86MpRecord', 'data': { 'state': 'uint32', 'status': 'int32' } }
++
++##
++# @x-flexvm-access-x86-mp-state:
++#
++# Read or set a stopped x86 vCPU's multiprocessing state.
++#
++# @cpu-index: Index of the stopped vCPU.
++# @state: New KVM multiprocessing state, when writing.
++#
++# Features:
++#
++# @unstable: Experimental FlexVM worker protocol.
++##
++{ 'command': 'x-flexvm-access-x86-mp-state',
++  'data': { 'cpu-index': 'uint16', '*state': 'uint32' },
++  'returns': 'FlexvmX86MpRecord', 'features': [ 'unstable' ] }
+--- a/stubs/monitor-i386-flexvm.c
++++ b/stubs/monitor-i386-flexvm.c
+@@ -102 +102,9 @@
+ }
++
++FlexvmX86MpRecord *qmp_x_flexvm_access_x86_mp_state(uint16_t cpu_index,
++                                                  bool has_state, uint32_t state,
++                                                  Error **errp)
++{
++    error_setg(errp, "FlexVM MP state requires an x86 worker");
++    return NULL;
++}
+--- a/target/i386/cpu.c
++++ b/target/i386/cpu.c
+@@ -9812,2 +9812,8 @@
+     }
++    if (apic_flexvm_waiting_for_sipi(cpu->apic_state)) {
++        if (interrupt_request & CPU_INTERRUPT_INIT) {
++            return CPU_INTERRUPT_INIT;
++        }
++        return interrupt_request & CPU_INTERRUPT_SIPI;
++    }
+     if (interrupt_request & CPU_INTERRUPT_SIPI) {
+--- a/target/i386/helper.c
++++ b/target/i386/helper.c
+@@ -616,2 +616,3 @@
+     apic_init_reset(cpu->apic_state);
++    apic_flexvm_note_init(cpu->apic_state);
+ #endif /* CONFIG_USER_ONLY */
+--- a/target/i386/monitor.c
++++ b/target/i386/monitor.c
+@@ -37,2 +37,3 @@
+ #include "hw/i386/apic.h"
++#include "hw/i386/apic_internal.h"
+ #include "hw/i386/pc.h"
+@@ -1265 +1266,88 @@
+ }
++
++/* Values in the Linux x86 kvm_mp_state userspace ABI. */
++enum {
++    FLEXVM_MP_RUNNABLE = 0,
++    FLEXVM_MP_UNINITIALIZED = 1,
++    FLEXVM_MP_INIT_RECEIVED = 2,
++    FLEXVM_MP_HALTED = 3,
++    FLEXVM_MP_SIPI_RECEIVED = 4,
++    FLEXVM_MP_AP_RESET_HOLD = 9,
++};
++
++typedef struct FlexvmMpAccess {
++    bool write;
++    FlexvmX86MpRecord result;
++} FlexvmMpAccess;
++
++static void flexvm_access_mp_state(CPUState *cpu, run_on_cpu_data data)
++{
++    X86CPU *x86 = X86_CPU(cpu);
++    CPUX86State *env = &x86->env;
++    APICCommonState *apic = x86->apic_state;
++    FlexvmMpAccess *access = data.host_ptr;
++    const uint32_t state = access->result.state;
++    bool startup_blocked = (env->hflags & HF_SMM_MASK) ||
++                           !(env->hflags2 & HF2_GIF_MASK);
++
++    apic->flexvm_mp_managed = true;
++    if (access->write) {
++        if ((state > FLEXVM_MP_SIPI_RECEIVED && state != FLEXVM_MP_AP_RESET_HOLD) ||
++            ((state == FLEXVM_MP_INIT_RECEIVED || state == FLEXVM_MP_SIPI_RECEIVED) &&
++             (startup_blocked || (cpu->interrupt_request & CPU_INTERRUPT_SMI)))) {
++            access->result.status = -EINVAL;
++            return;
++        }
++        cpu->halted = state != FLEXVM_MP_RUNNABLE;
++        apic->wait_for_sipi = state == FLEXVM_MP_UNINITIALIZED ||
++                             state == FLEXVM_MP_INIT_RECEIVED ||
++                             state == FLEXVM_MP_SIPI_RECEIVED;
++        apic->flexvm_init_received = state == FLEXVM_MP_INIT_RECEIVED ||
++                                     state == FLEXVM_MP_SIPI_RECEIVED;
++        apic->flexvm_ap_reset_hold = state == FLEXVM_MP_AP_RESET_HOLD;
++        if (state == FLEXVM_MP_SIPI_RECEIVED) {
++            cpu_interrupt(cpu, CPU_INTERRUPT_SIPI);
++        }
++        return;
++    }
++    /* Like KVM_GET_MP_STATE, consume accepted startup events before reporting. */
++    if (!startup_blocked && (cpu->interrupt_request & CPU_INTERRUPT_INIT)) {
++        cpu_reset_interrupt(cpu, CPU_INTERRUPT_INIT);
++        do_cpu_init(x86);
++    }
++    /* Linux discards SIPIs while INIT/SIPI recognition is blocked. */
++    if (cpu->interrupt_request & CPU_INTERRUPT_SIPI) {
++        cpu_reset_interrupt(cpu, CPU_INTERRUPT_SIPI);
++        if (!startup_blocked && apic->flexvm_init_received) {
++            do_cpu_sipi(x86);
++        }
++    }
++    if (apic->wait_for_sipi) {
++        access->result.state = apic->flexvm_init_received ? FLEXVM_MP_INIT_RECEIVED :
++                                                           FLEXVM_MP_UNINITIALIZED;
++    } else if (cpu->halted) {
++        access->result.state = apic->flexvm_ap_reset_hold ? FLEXVM_MP_AP_RESET_HOLD :
++                                                           FLEXVM_MP_HALTED;
++    } else {
++        apic->flexvm_ap_reset_hold = false;
++        access->result.state = FLEXVM_MP_RUNNABLE;
++    }
++}
++
++FlexvmX86MpRecord *qmp_x_flexvm_access_x86_mp_state(uint16_t cpu_index,
++                                                  bool has_state, uint32_t state,
++                                                  Error **errp)
++{
++    CPUX86State *env = flexvm_stopped_cpu(cpu_index, errp);
++    FlexvmMpAccess access = {.write = has_state, .result.state = state};
++
++    if (!env) {
++        return NULL;
++    }
++    if (!env_archcpu(env)->apic_state) {
++        error_setg(errp, "FlexVM MP state requires an x86 APIC");
++        return NULL;
++    }
++    run_on_cpu(CPU(env_archcpu(env)), flexvm_access_mp_state, RUN_ON_CPU_HOST_PTR(&access));
++    return g_memdup2(&access.result, sizeof(access.result));
++}

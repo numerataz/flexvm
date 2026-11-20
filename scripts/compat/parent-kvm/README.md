@@ -123,6 +123,9 @@ Add `--lapic` to read the reset xAPIC image, stage LINT0 and LINT1 before
 the first run, and update the stopped controller. The guest receives a PIC
 interrupt through the installed state, then changes LINT1 through MMIO.
 The test checks that restoring ICR contents does not send an interrupt.
+Use `--mp-state --protected-entry` to read the startup state, restore the
+vCPU to HALTED and keep it stopped until a real IRQ arrives. The fixture
+also checks the entry offset after restoring a startup IPI.
 Use `--debugregs --protected-entry` to stage a hardware breakpoint,
 handle the ensuing debug exception inside the child, and verify the guest's
 debug register writes from the stopped VMM.

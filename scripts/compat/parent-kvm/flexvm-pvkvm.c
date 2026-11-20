@@ -31,7 +31,7 @@
 
 #define PVKVM_REAL_MODE_FLAGS (X86_EFLAGS_FIXED | X86_EFLAGS_CF | X86_EFLAGS_PF | \
 			       X86_EFLAGS_AF | X86_EFLAGS_ZF | X86_EFLAGS_SF | \
-			       X86_EFLAGS_DF | X86_EFLAGS_OF)
+			       X86_EFLAGS_IF | X86_EFLAGS_DF | X86_EFLAGS_OF)
 
 #define PVKVM_TSS_SIZE (3 * PAGE_SIZE)
 
@@ -123,12 +123,14 @@ struct pvcpu {
 	unsigned long msrs_set;
 	unsigned int id;
 	unsigned int read_bytes;
+	u32 staged_mp_state;
 	bool read_pio;
 	bool ran;
 	bool fpu_set;
 	bool lapic_set;
 	bool sregs_reset_known;
 	bool sregs_set;
+	bool staged_sipi_pending;
 };
 
 static const struct kvm_sregs reset_sregs = {
@@ -963,6 +965,46 @@ static long cpu_debugregs(struct pvcpu *cpu, bool write, struct kvm_debugregs __
 	return result;
 }
 
+static long cpu_mp_state(struct pvcpu *cpu, bool write, struct kvm_mp_state __user *user)
+{
+	struct kvm_mp_state state;
+	int result;
+
+	if (write) {
+		if (copy_from_user(&state, user, sizeof(state)))
+			return -EFAULT;
+		if (state.mp_state != KVM_MP_STATE_RUNNABLE &&
+		    (!READ_ONCE(cpu->vm->irqchip_created) ||
+		     (state.mp_state > KVM_MP_STATE_SIPI_RECEIVED &&
+		      state.mp_state != KVM_MP_STATE_AP_RESET_HOLD)))
+			return -EINVAL;
+		result = write_stopped_registers(cpu, PVKVM_SET_MP_STATE, PVKVM_MP_STATE_AT,
+						 &state, sizeof(state));
+		if (!result && !cpu->ran) {
+			cpu->staged_mp_state = state.mp_state;
+			if (state.mp_state == KVM_MP_STATE_SIPI_RECEIVED)
+				cpu->staged_sipi_pending = true;
+		}
+		return result;
+	}
+	result = read_stopped_registers(cpu, PVKVM_GET_MP_STATE, PVKVM_MP_STATE_AT,
+					&state, sizeof(state));
+	if (!result && !cpu->ran && cpu->staged_sipi_pending) {
+		/* A pre-run query can consume the SIPI with its reset vector. */
+		if (state.mp_state == KVM_MP_STATE_RUNNABLE &&
+		    (cpu->staged_mp_state == KVM_MP_STATE_INIT_RECEIVED ||
+		     cpu->staged_mp_state == KVM_MP_STATE_SIPI_RECEIVED)) {
+			cpu->regs.rip = 0;
+			cpu->sregs.cs.base = 0;
+			cpu->sregs.cs.selector = 0;
+		}
+		cpu->staged_sipi_pending = false;
+	}
+	if (!result && copy_to_user(user, &state, sizeof(state)))
+		return -EFAULT;
+	return result;
+}
+
 static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct pvcpu *cpu = file->private_data;
@@ -1088,6 +1130,10 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case KVM_SET_DEBUGREGS:
 		result = cpu_debugregs(cpu, cmd == KVM_SET_DEBUGREGS, uarg);
 		break;
+	case KVM_GET_MP_STATE:
+	case KVM_SET_MP_STATE:
+		result = cpu_mp_state(cpu, cmd == KVM_SET_MP_STATE, uarg);
+		break;
 	case KVM_RUN:
 		if (arg || cpu->sregs.cs.base || !registers_fit_mode(&cpu->regs, &cpu->sregs) ||
 		    (!(cpu->sregs.cr0 & X86_CR0_PE) && cpu->regs.rip > U16_MAX)) {
@@ -1175,6 +1221,7 @@ static long device_capability(unsigned long capability)
 	case KVM_CAP_SET_TSS_ADDR:
 	case KVM_CAP_IRQCHIP:
 	case KVM_CAP_DEBUGREGS:
+	case KVM_CAP_MP_STATE:
 		return 1;
 	case KVM_CAP_NR_MEMSLOTS:
 		return PVKVM_MAX_SLOTS;
@@ -1798,8 +1845,10 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	BUILD_BUG_ON(sizeof(struct kvm_pit_state2) != PVKVM_PIT_STATE_BYTES);
 	BUILD_BUG_ON(PVKVM_PIT_STATE_AT + PVKVM_PIT_STATE_BYTES > PVKVM_DEBUGREGS_AT);
 	BUILD_BUG_ON(sizeof(struct kvm_debugregs) != PVKVM_DEBUGREGS_BYTES);
+	BUILD_BUG_ON(PVKVM_DEBUGREGS_AT + PVKVM_DEBUGREGS_BYTES > PVKVM_MP_STATE_AT);
+	BUILD_BUG_ON(sizeof(struct kvm_mp_state) != sizeof(u32));
 	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
-	    pci_resource_len(dev, 2) < PVKVM_DEBUGREGS_AT + PVKVM_DEBUGREGS_BYTES)
+	    pci_resource_len(dev, 2) < PVKVM_MP_STATE_AT + sizeof(struct kvm_mp_state))
 		return -ENODEV;
 	result = pcim_enable_device(dev);
 	if (result)
