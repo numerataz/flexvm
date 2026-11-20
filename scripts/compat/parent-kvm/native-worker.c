@@ -78,6 +78,7 @@ static void reset_state(unsigned int id, bool irqchip, unsigned long operation,
         struct kvm_mp_state mp;
         struct kvm_xcrs xcrs;
         struct kvm_xsave xsave;
+        struct kvm_vcpu_events events;
     } state;
     size_t length = sizeof(state.sregs);
     if (operation == KVM_GET_LAPIC)
@@ -90,6 +91,8 @@ static void reset_state(unsigned int id, bool irqchip, unsigned long operation,
         length = sizeof(state.xcrs);
     if (operation == KVM_GET_XSAVE)
         length = sizeof(state.xsave);
+    if (operation == KVM_GET_VCPU_EVENTS)
+        length = sizeof(state.events);
     int kvm = host_kvm();
     int vm = ioctl(kvm, KVM_CREATE_VM, 0);
     check(vm >= 0, "create a host reset-state VM");
@@ -212,6 +215,10 @@ int main(int argc, char **argv)
         reset_state(number(argv[2], PVKVM_MAX_CPUS - 1), false, KVM_GET_XSAVE, NULL, 0);
         return 0;
     }
+    if (argc == 4 && !strcmp(argv[1], "--reset-events")) {
+        reset_state(number(argv[2], PVKVM_MAX_CPUS - 1), number(argv[3], 1), KVM_GET_VCPU_EVENTS, NULL, 0);
+        return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "--reset-irqchips")) {
         reset_irqchips();
         return 0;
@@ -292,6 +299,7 @@ int main(int argc, char **argv)
                    sizeof(struct kvm_debugregs) == PVKVM_DEBUGREGS_BYTES &&
                    sizeof(struct kvm_xcrs) == PVKVM_XCRS_BYTES &&
                    sizeof(struct kvm_xsave) == PVKVM_XSAVE_BYTES && sizeof(cpuid) >= PVKVM_XSAVE_BYTES &&
+                   sizeof(struct kvm_vcpu_events) == PVKVM_VCPU_EVENTS_BYTES &&
                    sizeof(lapic) == PVKVM_LAPIC_BYTES && sizeof(cpuid) >= sizeof(lapic) &&
                    sizeof(cpuid) >= PVKVM_PIO_BYTES + sizeof(uint32_t) &&
                    sizeof(cpuid) >= sizeof(segments) && sizeof(cpuid) >= sizeof(msrs),
@@ -422,6 +430,24 @@ int main(int argc, char **argv)
                 result = -ENOMEM;
             }
             check(write(control, &result, sizeof(result)) == sizeof(result), "return the host XSAVE ioctl result");
+            continue;
+        }
+        if ((received == 2 && request[0] == 'e') ||
+            (received == 2 + sizeof(struct kvm_vcpu_events) && request[0] == 'f')) {
+            struct {
+                int32_t status;
+                struct kvm_vcpu_events events;
+            } reply = {0};
+            unsigned char image[sizeof(reply.status) + sizeof(reply.events)];
+            bool write_state = request[0] == 'f';
+
+            if (write_state)
+                memcpy(&reply.events, request + 2, sizeof(reply.events));
+            if (ioctl(cpu, write_state ? KVM_SET_VCPU_EVENTS : KVM_GET_VCPU_EVENTS, &reply.events) < 0)
+                reply.status = -errno;
+            memcpy(image, &reply.status, sizeof(reply.status));
+            memcpy(image + sizeof(reply.status), &reply.events, sizeof(reply.events));
+            check(write(control, image, sizeof(image)) == sizeof(image), "return the host vCPU event result");
             continue;
         }
         if (received == 2 + sizeof(struct kvm_irq_level) && request[0] == 'L') {
