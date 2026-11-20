@@ -381,6 +381,125 @@ impl Pages {
         n
     }
 
+    /// Claims up to `max` pages (rounded down to whole `granule` host pages) starting at `first`, where each granule
+    /// has all guest pages unclaimed (`BASE | ZERO | REMOTE`) and passes `ok(granule_start, &orig_states)`.
+    /// Returns the original per-guest-page states of every claimed page (length is a multiple of `granule`).
+    pub(super) fn claim_granules(&self, first: usize, max: usize, granule: usize, ok: impl Fn(usize, &[u8]) -> bool) -> Vec<u8> {
+        let mut orig = Vec::new();
+        let limit = (max / granule) * granule;
+        let mut snap = vec![0u8; granule];
+        let mut off = 0;
+        while off + granule <= limit && first + off + granule <= self.states.len() {
+            let h = first + off;
+            let mut claimable = true;
+            for (k, slot) in snap.iter_mut().enumerate() {
+                let s = self.states[h + k].load(Ordering::SeqCst);
+                if !matches!(s, BASE | ZERO | REMOTE) {
+                    claimable = false;
+                    break;
+                }
+                *slot = s;
+            }
+            if !claimable || !ok(h, &snap) {
+                break;
+            }
+            // CAS on the granule's first page acts as the exclusive claim for the whole host page.
+            if snap[0] == BASE {
+                self.touch(h);
+            }
+            if self.states[h].compare_exchange(snap[0], INFLIGHT, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+                break;
+            }
+            orig.push(snap[0]);
+            for k in 1..granule {
+                let p = h + k;
+                if p % CHUNK == 0 {
+                    self.touch(p);
+                }
+                let prev = self.states[p]
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| matches!(s, BASE | ZERO | REMOTE).then_some(INFLIGHT))
+                    .expect("granule page already claimed or present");
+                if prev == BASE {
+                    self.touch(p);
+                }
+                orig.push(prev);
+            }
+            off += granule;
+        }
+        orig
+    }
+
+    /// Gives back claimed pages (with their individual original states) without installing them.
+    pub(super) fn release_granules(&self, first: usize, orig: &[u8]) -> usize {
+        let resolved = orig.iter().enumerate().filter(|&(i, &from)| self.settle(first + i, false, from)).count();
+        self.settled();
+        resolved
+    }
+
+    /// Installs claimed pages `[first, first + orig.len())` in `granule`-page host-page units. Each page settles
+    /// against its own original state in `orig`.
+    pub(super) fn install_granules(
+        &self,
+        first: usize,
+        orig: &[u8],
+        granule: usize,
+        stop: Option<&dyn Fn() -> bool>,
+        mut populate: impl FnMut(usize, usize) -> io::Result<usize>,
+    ) -> (usize, io::Result<()>) {
+        debug_assert_eq!(orig.len() % granule, 0);
+        let copy_run = (COPY_RUN.max(granule) / granule) * granule;
+        let (end, mut resolved, mut i) = (first + orig.len(), 0, first);
+        while i < end {
+            let copy_end = end.min(i + copy_run);
+            let installing = self.events.read().unwrap();
+            if (i..i + granule).any(|p| self.get(p) == DISCARDED) {
+                resolved += (i..i + granule).filter(|&p| self.settle(p, false, orig[p - first])).count();
+                i += granule;
+                continue;
+            }
+            let mut m = granule;
+            while i + m < copy_end && (i + m..i + m + granule).all(|p| self.get(p) == INFLIGHT) {
+                m += granule;
+            }
+            let gen = self.read_gen.load(Ordering::SeqCst);
+            match populate(i, m) {
+                Ok(done) => {
+                    let done = (done / granule * granule).clamp(granule, m);
+                    self.woke(i, done);
+                    self.mark_dirty_range(i, i + done);
+                    resolved += (i..i + done).filter(|&p| self.settle(p, true, orig[p - first])).count();
+                    i += done;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+                    for p in i..i + granule {
+                        let from = orig[p - first];
+                        if from == BASE || from == REMOTE {
+                            self.note_preset(p, from);
+                        }
+                    }
+                    self.mark_dirty_range(i, i + granule);
+                    resolved += (i..i + granule).filter(|&p| self.settle(p, true, orig[p - first])).count();
+                    i += granule;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EAGAIN) && stop.is_some_and(|s| !s()) => {
+                    drop(installing);
+                    self.install_eagain.fetch_add(1, Ordering::Relaxed);
+                    self.wait_events_read(gen);
+                }
+                Err(e) => {
+                    for p in i..i + granule {
+                        if orig[p - first] == REMOTE {
+                            self.note_failure(p);
+                        }
+                    }
+                    return (resolved + self.release_granules(i, &orig[i - first..]), Err(e));
+                }
+            }
+        }
+        self.settled();
+        (resolved, Ok(()))
+    }
+
     /// Applies a REMOVE of pages `[first, end)`, a dirty word at a time (its chunk touched first, as `mark_dirty`).
     /// Returns how many REMOTE pages it resolved.
     pub fn discard(&self, _removing: &RwLockWriteGuard<'_, ()>, mut first: usize, end: usize) -> usize {
@@ -822,5 +941,51 @@ mod tests {
         assert_eq!(pages.claim(CHUNK - 5, 10, BASE, |_| true), 10);
         assert!(pages.touched(0));
         assert!(pages.touched(CHUNK));
+    }
+
+    #[test]
+    fn claim_and_install_granules_with_64k_mixed_states() {
+        const G: usize = 16;
+        // 4 host pages (64 guest pages) with mixed BASE, ZERO, REMOTE states.
+        let mut pages = Pages::new(4 * G);
+        pages.fill(2, 5, REMOTE);
+        pages.fill(10, 3, ZERO);
+        pages.fill(G, G, REMOTE);
+        pages.fill(2 * G + 4, 4, REMOTE);
+        pages.fill(3 * G, 6, ZERO);
+        pages.fill(3 * G + 6, 4, REMOTE);
+
+        let orig = pages.claim_granules(0, 4 * G, G, |_, snap| snap.contains(&REMOTE));
+        assert_eq!(orig.len(), 4 * G);
+        assert!((0..4 * G).all(|p| pages.get(p) == INFLIGHT));
+
+        // Discard host page 1 while claimed: install_granules must skip it and settle its 16 REMOTE pages to ZERO.
+        {
+            let removing = pages.removing();
+            assert_eq!(pages.discard(&removing, G, 2 * G), 0);
+        }
+
+        let mut calls = Vec::new();
+        let (resolved, res) = pages.install_granules(0, &orig, G, None, |p, count| {
+            assert_eq!(p % G, 0);
+            assert_eq!(count % G, 0);
+            calls.push((p, count));
+            match p {
+                0 => Ok(G),
+                p if p == 2 * G => Err(io::Error::from_raw_os_error(libc::EEXIST)),
+                _ => Err(io::Error::from_raw_os_error(libc::EIO)),
+            }
+        });
+        assert_eq!(res.unwrap_err().raw_os_error(), Some(libc::EIO));
+        assert_eq!(calls, [(0, G), (2 * G, 2 * G), (3 * G, G)]);
+        // Resolved REMOTE pages: 5 in host page 0 + 16 discarded in host page 1 + 4 EEXIST in host page 2 = 25.
+        // Host page 3 failed with EIO and was released back to its exact original states.
+        assert_eq!(resolved, 5 + G + 4);
+        assert!((0..G).all(|p| pages.get(p) == PRESENT && pages.is_dirty(p)));
+        assert!((G..2 * G).all(|p| pages.get(p) == ZERO));
+        assert!((2 * G..3 * G).all(|p| pages.get(p) == PRESENT && pages.is_dirty(p)));
+        for k in 0..G {
+            assert_eq!(pages.get(3 * G + k), orig[3 * G + k], "released page {k} keeps its original state");
+        }
     }
 }

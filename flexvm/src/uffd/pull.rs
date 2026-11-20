@@ -1,6 +1,6 @@
 use super::event::PULL;
 use super::fetch::{connect_ahead, Failed, Fetch, FetchFailure, Lane, Link, STREAM_RUN};
-use super::{os, Pager, ALL, FAULT_FETCHERS, PAGE_SIZE, PULL_RUN, PULL_THREADS, REMOTE};
+use super::{align_down_in, align_up_in, os, Pager, ALL, ARM_CHUNK, FAULT_FETCHERS, PAGE_SIZE, PULL_RUN, PULL_THREADS, REMOTE};
 use crate::checkpoint::{Buf, PageFile};
 use std::io;
 use std::sync::atomic::Ordering;
@@ -57,7 +57,7 @@ impl Pager {
                             Some(&p.lanes[i]),
                             off,
                             buf,
-                            if puller { 0 } else { PAGE_SIZE },
+                            if puller { 0 } else { crate::util::host_page_size() },
                             &|| stop.load(Ordering::SeqCst) || p.remote_left() == 0,
                             progress,
                         )
@@ -113,9 +113,13 @@ impl Pager {
             ok = self.pull_next(t, buf, fetch, lane);
         }
         // Runs still queued as the pager gave up go back.
-        while let (Some((i, n, _)), _) = lane.front() {
+        while let (Some(((i, n, _), orig)), _) = lane.front_with() {
             lane.pop();
-            self.pulled(self.pages().release(i, n, REMOTE));
+            let resolved = match orig {
+                Some(orig) => self.pages().release_granules(i, &orig),
+                None => self.pages().release(i, n, REMOTE),
+            };
+            self.pulled(resolved);
         }
     }
 
@@ -139,21 +143,48 @@ impl Pager {
     /// Claims the REMOTE pages of `[i, end)` a run at a time and queues them on `lane`, pulling the oldest whenever
     /// `depth` are. False if the pager gave up.
     #[allow(clippy::too_many_arguments)]
-    fn pull_range(&self, t: usize, mut i: usize, end: usize, depth: usize, buf: &mut [u8], fetch: &mut Fetch, lane: &Lane) -> bool {
+    fn pull_range(&self, t: usize, i: usize, end: usize, depth: usize, buf: &mut [u8], fetch: &mut Fetch, lane: &Lane) -> bool {
         let pages = self.pages();
+        let g = crate::util::pages_per_host_page();
+        let (mut i, end) = if g == 1 {
+            (i, end)
+        } else {
+            let Some(m) = self.locate((i * PAGE_SIZE) as u64) else { return true };
+            let (from, to) = m.span();
+            let lo = align_down_in(i, from, g);
+            let chunk_end = from + ((lo - from) / ARM_CHUNK + 1) * ARM_CHUNK;
+            (lo, align_up_in(end, from, to, g).min(chunk_end))
+        };
         while i < end && self.pulling() {
             // Test faults `fetch_enomem_stuck` (only faults fetch pages) and `fetch_tail_enomem` (until a fault took a run).
             while (self.stuck_from.lock().unwrap().is_some() || self.tail_fail.load(Ordering::SeqCst) == 2) && !self.stop.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_millis(10));
             }
-            let n = pages.claim(i, (end - i).min(PULL_RUN), REMOTE, |_| true);
-            if n == 0 {
-                // On to the next REMOTE page, skipping untouched stretches.
-                i = pages.next_in(REMOTE, i + 1, end);
-                continue;
+            if g == 1 {
+                let n = pages.claim(i, (end - i).min(PULL_RUN), REMOTE, |_| true);
+                if n == 0 {
+                    // On to the next REMOTE page, skipping untouched stretches.
+                    i = pages.next_in(REMOTE, i + 1, end);
+                    continue;
+                }
+                lane.push((i, n, Instant::now()));
+                i += n;
+            } else {
+                let r = pages.next_in(REMOTE, i, end);
+                if r >= end {
+                    break;
+                }
+                let h = r - (r - i) % g;
+                let orig = pages.claim_granules(h, (end - h).min(PULL_RUN), g, |_, snap| snap.contains(&REMOTE));
+                if orig.is_empty() {
+                    i = h + g;
+                    continue;
+                }
+                let n = orig.len();
+                let mixed = orig.iter().any(|&s| s != REMOTE);
+                lane.push_with((h, n, Instant::now()), mixed.then_some(orig));
+                i = h + n;
             }
-            lane.push((i, n, Instant::now()));
-            i += n;
             while lane.front().1 >= depth {
                 if !self.pull_next(t, buf, fetch, lane) {
                     return false;
@@ -165,10 +196,10 @@ impl Pager {
 
     /// Fetches and installs the oldest run queued on `lane`. False if the pager gave up.
     fn pull_next(&self, t: usize, buf: &mut [u8], fetch: &mut Fetch, lane: &Lane) -> bool {
-        let (Some((i, n, _)), _) = lane.front() else { return true };
+        let (Some(((i, n, _), orig)), _) = lane.front_with() else { return true };
         let started = Instant::now();
         // A source that is slow, not gone: on with the rest of the run.
-        let res = self.install_claimed(i, n, buf, fetch, |p, c, src| {
+        let res = self.install_claimed(i, n, orig.as_deref(), buf, fetch, |p, c, src| {
             // Test fault `pull_enomem`.
             if self.pull_fail.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |k| k.checked_sub(1)).is_ok() {
                 return Err(os(libc::ENOMEM));
@@ -188,7 +219,7 @@ impl Pager {
                     return false;
                 }
                 // What went back to REMOTE goes to the back of the queue.
-                self.reclaim(i, n, |job| lane.push(job));
+                self.reclaim(i, n, |job, orig| lane.push_with(job, orig));
                 true
             }
             Err(Failed::Fetch(e)) => {
@@ -215,7 +246,8 @@ fn read_file(
         if stop.load(Ordering::SeqCst) {
             return Err(io::Error::other(FetchFailure::Cancelled));
         }
-        let end = if done == 0 { (STREAM_RUN * PAGE_SIZE).min(buf.len()) } else { buf.len() };
+        let first_chunk = STREAM_RUN.max(crate::util::pages_per_host_page()) * PAGE_SIZE;
+        let end = if done == 0 { first_chunk.min(buf.len()) } else { buf.len() };
         read((off as usize + done) / PAGE_SIZE, &mut buf[done..end])?;
         done = end;
         if !progress(&buf[..done]) {
