@@ -27,7 +27,10 @@ const LINGER: Duration = Duration::from_secs(10);
 const BURST: usize = 1024;
 /// Workers wake for their sockets or `Forwarder::drop`'s eventfd; this only bounds when idle
 /// sessions, stalled connects, acknowledgement samples, and failure deadlines are noticed.
+#[cfg(not(test))]
 const TICK: libc::c_int = 1000;
+#[cfg(test)]
+const TICK: libc::c_int = 200;
 /// Buffered sinks are sampled at most this often, whatever other forwards do.
 const ACK_INTERVAL: Duration = Duration::from_secs(1);
 /// A draining send queue does not wake poll: check it promptly while a reset is pending.
