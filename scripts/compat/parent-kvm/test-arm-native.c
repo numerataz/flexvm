@@ -156,6 +156,17 @@ static void configure_gic(int socket, struct result *result)
     request.device.group = KVM_DEV_ARM_VGIC_GRP_CTRL;
     request.device.attribute = KVM_DEV_ARM_VGIC_CTRL_INIT;
     ASSERT(!exchange(socket, request, result).status);
+
+    request = (struct flexvm_arm_request){.command = FLEXVM_ARM_CREATE_DEVICE, .device = {.type = KVM_DEV_TYPE_ARM_VGIC_ITS}};
+    ASSERT(!exchange(socket, request, result).status);
+    request.command = FLEXVM_ARM_SET_DEVICE_ATTR;
+    request.device.group = KVM_DEV_ARM_VGIC_GRP_ADDR;
+    request.device.attribute = KVM_VGIC_ITS_ADDR_TYPE;
+    request.device.value = UINT64_C(0x3ff90000);
+    ASSERT(!exchange(socket, request, result).status);
+    request.device.group = KVM_DEV_ARM_VGIC_GRP_CTRL;
+    request.device.attribute = KVM_DEV_ARM_VGIC_CTRL_INIT;
+    ASSERT(!exchange(socket, request, result).status);
 }
 
 static void check_gic_checkpoint(int source, int target, struct result *result)
@@ -170,20 +181,26 @@ static void check_gic_checkpoint(int source, int target, struct result *result)
     ASSERT(gic >= 0);
     struct flexvm_arm_request save = {.command = FLEXVM_ARM_SAVE_GIC};
     ASSERT(pass_descriptors(source, save, &gic, 1) == 0 && close(event) == 0);
-    struct flexvm_arm_request restore = {.command = FLEXVM_ARM_RESTORE_GIC};
-    ASSERT(pass_descriptors(target, restore, &gic, 1) == 0 && close(gic) == 0);
-
-    // Read GICD_ISPENDR1 through the target vCPU's actual MMIO mapping.
-    const uint32_t probe[] = {0xd2a7ffe6, 0xb94204c1, 0xd2a20000, 0xb9000001, 0x14000000};
-    const uint64_t offset = 0;
+    // Read GICD_ISPENDR1 and GITS_CBASER through the target's actual MMIO mappings.
+    const uint32_t probe[] = {
+        0xd2a7ffe6, 0xb94204c1, 0xd2a20000, 0xb9000001,
+        0xd2a7ff28, 0xf9404102, 0xf9000402, 0x14000000,
+    };
     const unsigned int seals = F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL;
     int ram = memfd_create("arm-native-gic-probe", MFD_CLOEXEC | MFD_ALLOW_SEALING);
-    int layout = memfd_create("arm-native-gic-layout", MFD_CLOEXEC | MFD_ALLOW_SEALING);
-    ASSERT(ram >= 0 && layout >= 0 && ftruncate(ram, PAGE) == 0 &&
-           pwrite(ram, probe, sizeof(probe), 0) == sizeof(probe) &&
-           fcntl(ram, F_ADD_SEALS, seals) == 0 && write(layout, &offset, sizeof(offset)) == sizeof(offset) &&
-           fcntl(layout, F_ADD_SEALS, seals | F_SEAL_WRITE) == 0);
-    ASSERT(register_slot(target, 0, FLEXVM_ARM_RAM_BASE, ram, layout) == 0 && close(ram) == 0 && close(layout) == 0);
+    ASSERT(ram >= 0 && ftruncate(ram, 2 * PAGE) == 0 &&
+           pwrite(ram, probe, sizeof(probe), 0) == sizeof(probe) && fcntl(ram, F_ADD_SEALS, seals) == 0);
+    const uint64_t addresses[] = {FLEXVM_ARM_RAM_BASE, FLEXVM_ARM_RAM_BASE + 0x10000};
+    for (unsigned int slot = 0; slot < 2; slot++) {
+        uint64_t offset = slot * PAGE;
+        int layout = memfd_create("arm-native-gic-layout", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+        ASSERT(layout >= 0 && write(layout, &offset, sizeof(offset)) == sizeof(offset) &&
+               fcntl(layout, F_ADD_SEALS, seals | F_SEAL_WRITE) == 0);
+        ASSERT(register_slot(target, slot, addresses[slot], ram, layout) == 0 && close(layout) == 0);
+    }
+    ASSERT(close(ram) == 0);
+    struct flexvm_arm_request restore = {.command = FLEXVM_ARM_RESTORE_GIC};
+    ASSERT(pass_descriptors(target, restore, &gic, 1) == 0 && close(gic) == 0);
     set_core(target, result, 0, offsetof(struct kvm_regs, regs.pc), FLEXVM_ARM_RAM_BASE);
     int lane = open_lane(target, 0);
     send_run(lane, (struct flexvm_arm_request){.command = FLEXVM_ARM_RUN, .sequence = 1});
@@ -192,7 +209,15 @@ static void check_gic_checkpoint(int source, int target, struct result *result)
     memcpy(&pending, reply.mmio.data, sizeof(pending));
     ASSERT(!reply.status && reply.exit_reason == KVM_EXIT_MMIO && reply.mmio.is_write &&
            reply.mmio.address == 0x10000000 && reply.mmio.length == sizeof(pending) && (pending & (1u << 3)));
+    send_run(lane, (struct flexvm_arm_request){.command = FLEXVM_ARM_RUN, .sequence = 2});
+    reply = read_reply(lane);
+    uint64_t cbaser;
+    memcpy(&cbaser, reply.mmio.data, sizeof(cbaser));
+    ASSERT(!reply.status && reply.exit_reason == KVM_EXIT_MMIO && reply.mmio.is_write &&
+           reply.mmio.address == 0x10000008 && reply.mmio.length == sizeof(cbaser) &&
+           (cbaser & UINT64_C(0x8000fffffffff000)) == UINT64_C(0x8000000040010000));
     ASSERT(close(lane) == 0);
+    puts("PASS native ARM ITS restored the guest command queue base");
     puts("PASS native ARM GICv3 restored a pending IRQFD interrupt");
 }
 
@@ -213,6 +238,8 @@ int main(int argc, char *argv[])
     const uint32_t code[] = {
         // Configure SPI 35 as edge-triggered in GICD_ICFGR2.
         0xd2a7ffe6, 0x52801007, 0xb90c08c7,
+        // Configure GITS_CBASER with a separate, 64 KiB-aligned guest slot.
+        0xd2a7ff28, 0xd2a80029, 0xf2f00009, 0xf9004109,
         // CPU 0 releases the first flag and waits for CPU 1's flag.
         0x91002043, 0x91003044, 0x52800025, 0x889ffc65, 0x88dffc85, 0x34ffffe5,
         0xb9400001, // ldr w1, [x0] from the VMM's MMIO address
@@ -283,6 +310,11 @@ int main(int argc, char *argv[])
     ASSERT(register_slot(link[0], 1, FLEXVM_ARM_RAM_BASE, ram, layouts[1]) == -EINVAL);
     ASSERT(register_slot(link[0], 1, FLEXVM_ARM_RAM_BASE + 3 * PAGE, ram, layouts[1]) == 0);
     ASSERT(close(layouts[0]) == 0 && close(layouts[1]) == 0);
+    uint64_t queue_offset = 2 * PAGE;
+    int queue = memfd_create("arm-native-its-queue-layout", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    ASSERT(queue >= 0 && write(queue, &queue_offset, sizeof(queue_offset)) == sizeof(queue_offset) &&
+           fcntl(queue, F_ADD_SEALS, seals | F_SEAL_WRITE) == 0);
+    ASSERT(register_slot(link[0], 2, FLEXVM_ARM_RAM_BASE + 0x10000, ram, queue) == 0 && close(queue) == 0);
 
     set_core(link[0], &result, 0, offsetof(struct kvm_regs, regs.pc), FLEXVM_ARM_RAM_BASE);
     set_core(link[0], &result, 0, offsetof(struct kvm_regs, regs.pstate), 0x3c5);

@@ -16,7 +16,7 @@ struct arm_gic_state {
     uint32_t version;
     uint32_t irqs;
     uint32_t count;
-    uint32_t reserved;
+    uint32_t its;
     struct arm_gic_register registers[FLEXVM_ARM_GIC_MAX_REGS];
 };
 
@@ -123,8 +123,15 @@ static int arm_gic_layout(int gic, const int *cpus, struct arm_gic_state *state)
     return status;
 }
 
-static int arm_gic_state_file(int gic, const int *cpus, int fd, bool save)
+static int arm_gic_control(int fd, uint64_t command)
 {
+    struct kvm_device_attr attr = {.group = KVM_DEV_ARM_VGIC_GRP_CTRL, .attr = command};
+    return ioctl(fd, KVM_SET_DEVICE_ATTR, &attr) < 0 ? -errno : 0;
+}
+
+static int arm_gic_state_file(const int *devices, const int *cpus, int fd, bool save)
+{
+    int gic = devices[0], its = devices[1];
     if (gic < 0)
         return -ENODEV;
     struct stat mode;
@@ -146,16 +153,39 @@ static int arm_gic_state_file(int gic, const int *cpus, int fd, bool save)
         goto cleanup;
 
     memcpy(layout->magic, arm_gic_magic, sizeof(layout->magic));
-    layout->version = 1;
+    layout->version = 2;
+    layout->its = its >= 0;
     status = arm_gic_layout(gic, cpus, layout);
+    const uint64_t its_registers[] = {
+        0x0004, 0x0080, 0x0090, 0x0088, // IIDR, CBASER, CREADR, CWRITER
+        0x0100, 0x0108, 0x0110, 0x0118, 0x0120, 0x0128, 0x0130, 0x0138, // BASER
+        0x0000, // CTLR is applied after the tables
+    };
+    for (size_t n = 0; layout->its && n < sizeof(its_registers) / sizeof(its_registers[0]) && !status; n++)
+        status = arm_gic_layout_add(layout, KVM_DEV_ARM_VGIC_GRP_ITS_REGS, its_registers[n], 1);
     if (status)
         goto cleanup;
+    if (save && layout->its) {
+        status = arm_gic_control(gic, KVM_DEV_ARM_VGIC_SAVE_PENDING_TABLES);
+        if (!status)
+            status = arm_gic_control(its, KVM_DEV_ARM_ITS_SAVE_TABLES);
+        if (status)
+            goto cleanup;
+    }
     if (!save) {
+        if (layout->its) {
+            uint64_t control = 0;
+            struct kvm_device_attr attr = {.group = KVM_DEV_ARM_VGIC_GRP_ITS_REGS, .addr = (uintptr_t)&control};
+            if (ioctl(its, KVM_GET_DEVICE_ATTR, &attr) < 0 || (control & 1)) {
+                status = (control & 1) ? -EBUSY : -errno;
+                goto cleanup;
+            }
+        }
         status = arm_state_io(fd, record, sizeof(*record), false);
         if (status)
             goto cleanup;
         if (memcmp(record->magic, layout->magic, sizeof(record->magic)) || record->version != layout->version ||
-            record->irqs != layout->irqs || record->count != layout->count || record->reserved) {
+            record->irqs != layout->irqs || record->count != layout->count || record->its != layout->its) {
             status = -EINVAL;
             goto cleanup;
         }
@@ -170,8 +200,12 @@ static int arm_gic_state_file(int gic, const int *cpus, int fd, bool save)
     for (size_t n = 0; n < record->count && !status; n++) {
         struct arm_gic_register *reg = &record->registers[n];
         struct kvm_device_attr attr = {.group = reg->group, .attr = reg->attribute, .addr = (uintptr_t)&reg->value};
-        if (ioctl(gic, save ? KVM_GET_DEVICE_ATTR : KVM_SET_DEVICE_ATTR, &attr) < 0) {
+        bool its_reg = reg->group == KVM_DEV_ARM_VGIC_GRP_ITS_REGS;
+        if (its_reg && !save && !reg->attribute)
+            status = arm_gic_control(its, KVM_DEV_ARM_ITS_RESTORE_TABLES);
+        if (!status && ioctl(its_reg ? its : gic, save ? KVM_GET_DEVICE_ATTR : KVM_SET_DEVICE_ATTR, &attr) < 0)
             status = -errno;
+        if (status) {
             fprintf(stderr, "native ARM worker: VGIC group %u attribute %#llx: %s\n",
                     reg->group, (unsigned long long)reg->attribute, strerror(-status));
         }
