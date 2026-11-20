@@ -484,7 +484,7 @@ def transfer(monitor, fd, *, incoming=False):
 
 
 def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=None, frontend=None,
-               engine="kvm", tcg_qemu=None, emulator_fd=None, checkpoint=False, restore=None):
+               engine="kvm", tcg_qemu=None, emulator_fd=None, checkpoint=False, restore=None, qmp_path=None):
     ipa_bits = None
     if engine != "tcg":
         try:
@@ -496,6 +496,7 @@ def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=
         if ipa_bits is None and engine == "kvm":
             raise RuntimeError("native ARM parent execution requires an available KVM worker")
     use_tcg = ipa_bits is None
+    checkpoint = checkpoint and use_tcg
     if use_tcg:
         if tcg_qemu is None:
             raise RuntimeError("ARM TCG parent execution requires a software CPU engine")
@@ -503,6 +504,9 @@ def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=
         if any(device not in devices.stdout + devices.stderr for device in (b'"flexvm-mmio-run"', b'"flexvm-shared-ram"')):
             raise RuntimeError("ARM parent TCG requires the patched QEMU engine from scripts/build-qemu.sh")
         ipa_bits = 40
+        if checkpoint and qmp_path is not None:
+            options = PARENT["native_query"]([tcg_qemu, "-device", "flexvm-mmio-run,help"])
+            checkpoint = b"checkpoint-control" in options.stdout + options.stderr
 
     with ExitStack() as resources:
         if control is None:
@@ -518,8 +522,9 @@ def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=
             listener.listen(1)
             gate = CheckpointGate(listener)
             resources.callback(gate.close)
-            outer_qmp = runtime / "outer-qmp"
-            command = [*command, "-qmp", f"unix:{outer_qmp},server=on,wait=off"]
+            outer_qmp = qmp_path if qmp_path is not None else runtime / "outer-qmp"
+            if qmp_path is None:
+                command = [*command, "-qmp", f"unix:{outer_qmp},server=on,wait=off"]
             if restore:
                 command.extend(["-incoming", "defer", "-S"])
         doorbell = runtime / "doorbell"

@@ -26,9 +26,12 @@ def main():
     checkpoint = parser.add_mutually_exclusive_group()
     checkpoint.add_argument("--freeze", action="store_true", help="freeze and thaw the direct ARM TCG run lanes")
     checkpoint.add_argument("--transfer", action="store_true", help="retire and restore the ARM parent and its nested worker")
+    checkpoint.add_argument("--pause", action="store_true", help="pause and resume both VMs through the public command")
     args = parser.parse_args()
     if (args.freeze or args.transfer) and (args.bin or args.engine != "tcg"):
         parser.error("checkpoint tests require the standalone ARM TCG broker")
+    if args.pause and (not args.bin or args.engine != "tcg"):
+        parser.error("--pause needs the public ARM TCG command")
     if args.engine == "auto" and not args.bin:
         parser.error("--engine auto requires --bin")
     output = args.output.resolve()
@@ -38,7 +41,7 @@ def main():
     mode = ["-DFLEXVM_ARM_FIRECRACKER_APP"] if args.bin else []
     HELPERS["run"]([*cc, *mode, ROOT / "parent-kvm/arm-firecracker-init.c", "-o", outer], 30, output / "outer-build.log")
     inner_flags = [f"-DFLEXVM_ARM_TEST_CPUS={args.vcpus}"]
-    if args.freeze or args.transfer:
+    if args.freeze or args.transfer or args.pause:
         inner_flags.append("-DFLEXVM_ARM_TEST_CHECKPOINT")
     HELPERS["run"]([*cc, *inner_flags, ROOT / "parent-kvm/arm-block-init.c", "-o", inner],
                    30, output / "inner-build.log")
@@ -66,11 +69,17 @@ def main():
             "etc/group": (b"root:x:0:\n", 0o644),
         })
         with tempfile.TemporaryDirectory(prefix="flexvm-arm-parent-", dir="/var/lib") as state:
-            HELPERS["run"]([
-                args.bin.resolve(strict=True), "software", "--kernel", kernel, "--qemu", args.qemu, "--state", state,
+            binary = args.bin.resolve(strict=True)
+            command = [
+                binary, "software", "--kernel", kernel, "--qemu", args.qemu, "--state", state,
                 "--parent-kvm-bundle", args.bundle, "--parent-kvm-engine", args.engine, "--parent-kvm-mem", "128",
-                "--mem", "512", archive,
-            ], 180, log)
+                "--mem", "512",
+            ]
+            during = None
+            if args.pause:
+                command.extend(["--name", "arm-kvm-pause", "--verbose"])
+                during = lambda proc, deadline: pause_public(proc, deadline, log, binary, state, output)
+            HELPERS["run"]([*command, archive], 180, log, during=during)
     else:
         cpio = output / "initramfs"
         files["flexvm-pvkvm.ko"] = (args.bundle / "flexvm-pvkvm.ko").read_bytes()
@@ -98,7 +107,7 @@ def main():
         "PASS ARM Firecracker architected timer",
         "PASS stock ARM Firecracker used the parent-owned KVM device",
     )
-    if args.freeze or args.transfer:
+    if args.freeze or args.transfer or args.pause:
         markers += ("PASS ARM Firecracker resumed after checkpoint freeze",)
         before = [line.rsplit(" ", 1)[-1] for line in lines if line.startswith("ARM Firecracker checkpoint canary ")]
         after = [line.rsplit(" ", 1)[-1] for line in lines if line.startswith("ARM Firecracker restored canary ")]
@@ -108,7 +117,7 @@ def main():
         if lines.count(marker) != 1:
             raise RuntimeError(f"missing or repeated {marker}; see {log}")
     report = {"status": "passed", "nested_vcpus": args.vcpus, "parent_engine": args.engine,
-              "checkpoint": "transfer" if args.transfer else "freeze" if args.freeze else None,
+              "checkpoint": "transfer" if args.transfer else "freeze" if args.freeze or args.pause else None,
               "virtio_block": "read-write-flush",
               "arm_timer": "passed", "firecracker_sha256": HELPERS["digest"](args.firecracker)}
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
@@ -153,6 +162,18 @@ def freeze_and_thaw(proc, deadline, runtime, log):
         if proc.poll() is not None or "PASS ARM Firecracker resumed after checkpoint freeze" in log.read_text(errors="replace"):
             raise RuntimeError("the nested guest advanced while its vCPUs were fenced")
         checkpoint_request(control, b"thaw")
+
+
+def pause_public(proc, deadline, log, binary, state, output):
+    wait_checkpoint_window(proc, deadline, log)
+    HELPERS["run"]([binary, "pause", "--state", state, "arm-kvm-pause"], 15, output / "pause.log")
+    hold = log.read_text(errors="replace").rsplit("ARM Firecracker checkpoint window", 1)[-1]
+    if "software: parent KVM vCPUs quiesced" not in hold:
+        raise RuntimeError("the public command did not fence the nested vCPUs")
+    time.sleep(6)
+    if proc.poll() is not None or "PASS ARM Firecracker resumed after checkpoint freeze" in log.read_text(errors="replace"):
+        raise RuntimeError("the nested guest advanced while the outer FlexVM was paused")
+    HELPERS["run"]([binary, "unpause", "--state", state, "arm-kvm-pause"], 15, output / "unpause.log")
 
 
 def transfer_checkpoint(command, output, log):

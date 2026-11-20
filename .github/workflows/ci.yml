@@ -639,12 +639,14 @@ jobs:
             local engine=$1
             local selected_bundle=$2
             local output="$RUNNER_TEMP/arm-parent-firecracker-public-$engine"
+            if [ "${3-}" = --pause ]; then output="$output-pause"; fi
+            shift 2
             sudo systemd-run --scope --collect -p MemoryMax=1400M -p MemorySwapMax=0 -p CPUQuota=200% \
               strace -f -e trace=file -o "$output.strace" python3 scripts/compat/arm-parent-firecracker.py \
               --bin target/release/flexvm --engine "$engine" \
               --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" \
               --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64" --bundle "$selected_bundle" \
-              --firecracker "$RUNNER_TEMP/firecracker-$FC_VERSION-$ARCH" --output "$output" || {
+              --firecracker "$RUNNER_TEMP/firecracker-$FC_VERSION-$ARCH" --output "$output" "$@" || {
               cat "$output/guest.log" >&2 || true
               return 1
             }
@@ -652,6 +654,7 @@ jobs:
             cat "$output/report.json"
           }
           run_public_arm tcg "$bundle"
+          run_public_arm tcg "$bundle" --pause
           software_bundle="$RUNNER_TEMP/arm-parent-software-bundle"
           mkdir "$software_bundle"
           cp "$bundle/flexvm-pvkvm.img" "$software_bundle/"

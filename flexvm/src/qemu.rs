@@ -77,7 +77,7 @@ pub struct ParentKvm {
 }
 
 impl ParentKvm {
-    fn command(&self, qemu: Command, pinned_engine: RawFd, inherited: &[RawFd], runtime: &SocketRoot, memory: u32) -> Result<Command> {
+    fn command(&self, qemu: Command, pinned_engine: RawFd, inherited: &[RawFd], runtime: &SocketRoot, memory: u32, qmp: &Path) -> Result<Command> {
         let directory = runtime.dir.join("logs/parent-kvm");
         fs::create_dir(&directory)?;
         let broker = directory.join("parent-kvm-run.py");
@@ -90,7 +90,7 @@ impl ParentKvm {
         }
         let mut cmd = Command::new("python3");
         cmd.arg("-I").arg(broker).args(["--serve", "--bundle"]).arg(&self.bundle).arg("--output").arg(directory);
-        cmd.arg("--control").arg(runtime.dir.join("k"));
+        cmd.arg("--control").arg(runtime.dir.join("k")).arg("--outer-qmp").arg(qmp);
         cmd.args(["--outer-memory", &memory.to_string(), "--child-memory", &self.child_mem_mib.to_string(), "--engine", &self.engine]);
         cmd.args(["--emulator-fd", &pinned_engine.to_string()]);
         for fd in inherited {
@@ -293,6 +293,46 @@ pub struct Machine {
     logs: PathBuf,
     transport: Control,
     control: Mutex<Option<control::Client>>,
+    parent_provider: bool,
+    parent_fence: Option<ParentFence>,
+}
+
+struct ParentFence {
+    path: PathBuf,
+    lease: Mutex<Option<UnixStream>>,
+}
+
+impl ParentFence {
+    fn request(socket: &UnixStream, command: &[u8], deadline: Instant) -> Result<()> {
+        util::send_with_fds(socket, command, &[], deadline)?;
+        socket.set_read_timeout(Some(remaining(deadline)?))?;
+        let mut reply = [0; 64];
+        let (received, fds) = util::recvmsg_fds(socket.as_raw_fd(), &mut reply)?;
+        if !fds.is_empty() || &reply[..received] != b"ok" {
+            bail!("parent KVM broker rejected {}: {}", String::from_utf8_lossy(command), String::from_utf8_lossy(&reply[..received]));
+        }
+        Ok(())
+    }
+
+    fn freeze(&self, deadline: Instant) -> Result<()> {
+        let mut lease = self.lease.lock().unwrap();
+        if lease.is_none() {
+            let socket = util::connect_unix_kind(&self.path, remaining(deadline)?, libc::SOCK_SEQPACKET)?;
+            Self::request(&socket, b"freeze", deadline)?;
+            *lease = Some(socket);
+            crate::info!("software: parent KVM vCPUs quiesced");
+        }
+        Ok(())
+    }
+
+    fn thaw(&self, deadline: Instant) -> Result<()> {
+        let mut lease = self.lease.lock().unwrap();
+        if let Some(socket) = lease.as_ref() {
+            Self::request(socket, b"thaw", deadline)?;
+            lease.take();
+        }
+        Ok(())
+    }
 }
 
 /// A dead emulator must end an exec even if its device backend still holds the
@@ -530,6 +570,8 @@ impl Config {
             logs,
             transport: self.control,
             control: Mutex::new(None),
+            parent_provider: self.parent_kvm.is_some(),
+            parent_fence: None,
         };
         let firmware = machine.logs.join("firmware");
         let result = (|| -> Result<()> {
@@ -569,7 +611,7 @@ impl Config {
                 cmd.args(["-incoming", "defer", "-S"]);
             }
             if let Some(provider) = &self.parent_kvm {
-                cmd = provider.command(cmd, engine_fd, &inherited, &root, self.mem_mib)?;
+                cmd = provider.command(cmd, engine_fd, &inherited, &root, self.mem_mib, endpoints.api)?;
             }
             machine.processes.spawn_with_fds(&mut cmd, &machine.logs.join("qemu.log"), &inherited)?;
             while !machine.sockets.api.exists() {
@@ -579,6 +621,10 @@ impl Config {
             }
             let mut qmp = Qmp::connect(&machine.sockets.api, deadline)?;
             machine.engine_version = qmp.command("query-version", json!({}), &[])?;
+            let parent_fence_path = root.dir.join("k/checkpoint");
+            if machine.parent_provider && parent_fence_path.exists() {
+                machine.parent_fence = Some(ParentFence { path: parent_fence_path, lease: Mutex::default() });
+            }
             if let Some((state, expected_version)) = incoming {
                 if machine.engine_version != *expected_version {
                     bail!("software engine version differs from the captured profile");
@@ -751,9 +797,21 @@ impl Machine {
         self.network.ip()
     }
 
+    pub fn has_parent_fence(&self) -> bool {
+        self.parent_fence.is_some()
+    }
+
+    pub fn checkpoint_supported(&self) -> Result<()> {
+        if self.parent_provider {
+            bail!("parent-owned KVM requires a hierarchy checkpoint");
+        }
+        Ok(())
+    }
+
     /// The caller owns the admission/CPU boundary and the output artifact. A
     /// failed export does not authorize source resume: cancel and verify first.
     pub fn save(&self, state: &File, deadline: Instant) -> Result<()> {
+        self.checkpoint_supported()?;
         let mut capture = self.capture.lock().unwrap();
         if *capture != Capture::None {
             bail!("software state capture is unresolved");
@@ -999,12 +1057,20 @@ impl Machine {
         if *capture != Capture::None {
             bail!("software state capture must be resolved before changing CPU state");
         }
+        if let Some(fence) = self.parent_fence.as_ref().filter(|_| command == "stop") {
+            // Keep ownership through an uncertain QMP stop. The caller can
+            // still recover with a confirmed resume on this same lease.
+            fence.freeze(deadline)?;
+        }
         let mut qmp = Qmp::connect(&self.sockets.api, deadline)?;
         qmp.command(command, json!({}), &[])?;
         let state = qmp.command("query-status", json!({}), &[])?;
         let expected = if command == "stop" { "paused" } else { "running" };
         if state["status"] != expected {
             bail!("QMP did not enter {expected}: {state}");
+        }
+        if let Some(fence) = self.parent_fence.as_ref().filter(|_| command == "cont") {
+            fence.thaw(deadline)?;
         }
         Ok(())
     }
@@ -1422,6 +1488,8 @@ mod tests {
             logs,
             transport: Control::Vsock,
             control: Mutex::new(None),
+            parent_provider: false,
+            parent_fence: None,
         }
     }
 
