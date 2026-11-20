@@ -98,7 +98,7 @@ def expect(stream, packet):
 
 
 @contextmanager
-def mmio_worker(qemu, program, cpu_count, *, monitor=False):
+def mmio_worker(qemu, program, cpu_count, *, monitor=False, mmio=MMIO, mmio_size=PAGE):
     with ExitStack() as resources:
         ram = memfd(resources, "arm-mmio-ram", PAGE)
         layout = memfd(resources, "arm-mmio-layout", 8)
@@ -111,8 +111,9 @@ def mmio_worker(qemu, program, cpu_count, *, monitor=False):
             qemu, "-machine", "virt,gic-version=3", "-accel", "tcg,thread=multi", "-cpu", "cortex-a72",
             "-m", "16", "-smp", str(cpu_count), "-nodefaults", "-display", "none", "-serial", "none",
             "-monitor", "none", "-S", "-device", f"flexvm-shared-ram,ram-fd={ram},layout-fd={layout},addr={BASE}",
-            "-device", f"loader,addr={BASE},cpu-num=0",
         ]
+        if not monitor:
+            command.extend(["-device", f"loader,addr={BASE},cpu-num=0"])
         for cpu in range(cpu_count):
             listener = resources.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
             path = tmp / f"run{cpu}"
@@ -124,7 +125,7 @@ def mmio_worker(qemu, program, cpu_count, *, monitor=False):
         if monitor:
             command.extend(["-qmp", f"unix:{tmp / 'qmp'},server=on,wait=off"])
         second = ",parallel-chardev=run1" if cpu_count == 2 else ""
-        command.extend(["-device", f"flexvm-mmio-run,chardev=run0,addr={MMIO}{second}"])
+        command.extend(["-device", f"flexvm-mmio-run,chardev=run0,addr={mmio},size={mmio_size}{second}"])
         log = resources.enter_context((tmp / "engine.log").open("w+b"))
         proc = subprocess.Popen(command, stdout=log, stderr=log, pass_fds=(ram, layout))
         try:
@@ -203,7 +204,10 @@ def exercise_parallel_mmio(qemu):
 
 
 def exercise_vgic(qemu, program):
-    with mmio_worker(qemu, program, 1, monitor=True) as (ram, [connection], [stream], qmp):
+    aperture = 0x40000000
+    with mmio_worker(qemu, program, 1, monitor=True, mmio=aperture, mmio_size=2 * PAGE) as (
+        ram, [connection], [stream], qmp
+    ):
         addresses = {"distributor": 0x3fff0000, "redistributor": 0x3ffd0000, "its": 0x3ffb0000}
         for bad in ({"distributor": addresses["its"]}, {"its": 0x3fff0001}, {"its": 0x40000000}):
             try:
@@ -214,14 +218,26 @@ def exercise_vgic(qemu, program):
             else:
                 raise RuntimeError("QEMU accepted an invalid GIC mapping")
         qmp.ask("x-flexvm-map-arm-gic", addresses)
+        boot = {"cpu-index": 0, "pc": BASE, "x0": 0x1122334455667788, "pstate": 0x3c5}
+        for bad in ({"cpu-index": 1}, {"pc": BASE + 2}, {"pstate": 0x3c9}):
+            try:
+                qmp.ask("x-flexvm-set-arm-boot-registers", boot | bad)
+            except RuntimeError as error:
+                if "FlexVM ARM" not in str(error):
+                    raise
+            else:
+                raise RuntimeError("QEMU accepted invalid ARM boot registers")
+        qmp.ask("x-flexvm-set-arm-boot-registers", boot)
         connection.sendall(b"R")
-        expect(stream, struct.pack("<cBQQ", b"M", 4, MMIO + 4, 0))
+        expect(stream, struct.pack("<cBQQ", b"M", 4, aperture + PAGE + 4, 0))
+        if os.pread(ram, 8, 272) != struct.pack("<Q", boot["x0"]):
+            raise RuntimeError("the ARM vCPU did not receive the boot argument")
         revisions = struct.unpack("<3I", os.pread(ram, 12, 256))
         if any(revision & 0xf0 != 0x30 for revision in revisions):
             raise RuntimeError(f"unexpected GICD, GICR and ITS architecture revisions: {revisions}")
         connection.sendall(b"R")
         qmp.ask("x-flexvm-pulse-arm-gsi", {"gsi": 3})
-        expect(stream, struct.pack("<cBQQ", b"M", 4, MMIO + 8, 35))
+        expect(stream, struct.pack("<cBQQ", b"M", 4, aperture + PAGE + 8, 35))
 
 
 if __name__ == "__main__":
