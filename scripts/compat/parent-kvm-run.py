@@ -342,6 +342,7 @@ class OuterLaunch:
     control: Path | None
     checkpoint_qmp: Path | None = None
     restore_fds: tuple[int, ...] = ()
+    native_checkpoint: bool = False
 
 
 def spawn_owned(command, **kwargs):
@@ -530,8 +531,9 @@ class RegisterChannel:
 
 
 class CheckpointGate:
-    def __init__(self, listener):
+    def __init__(self, listener, *, native=False):
         self.listener = listener
+        self.native = native
         self.client = None
         self.phase = "running"
         self.captured_interrupts = {}
@@ -566,7 +568,10 @@ class CheckpointGate:
         elif request == b"ready" and not fds and self.phase == "frozen":
             self.client.sendall(b"ok")
         elif request == b"check-save" and not fds and self.phase == "frozen" and capture is not None:
-            self.client.sendall(b"ok" if worker is None or worker.can_capture() else b"nested state is not ready to capture")
+            if worker is not None and not worker.can_capture():
+                self.client.sendall(b"nested state is not ready to capture")
+            else:
+                self.client.sendall(b"ok:kvm" if self.native else b"ok")
         elif request == b"thaw" and not fds and self.phase == "frozen":
             if worker:
                 worker.freeze_run_control(False)
@@ -643,7 +648,7 @@ def restore_interrupts(irq_fds, pending):
         os.eventfd_write(irq_fds[index], count)
 
 
-def capture_hierarchy(outer, qmp, irq_fds, descriptors, capture_worker):
+def capture_hierarchy(outer, qmp, irq_fds, descriptors, capture_worker, *, before_drain=None):
     outer_fd, worker_fd, metadata_fd = state_fds(descriptors, writing=True)
     if any(os.fstat(fd).st_size for fd in descriptors):
         raise RuntimeError("parent checkpoint output files must be empty")
@@ -652,6 +657,8 @@ def capture_hierarchy(outer, qmp, irq_fds, descriptors, capture_worker):
         monitor.ask("stop")
         if monitor.ask("query-status")["status"] != "paused":
             raise RuntimeError("parent checkpoint could not pause the outer VM")
+        if before_drain:
+            before_drain()
         pending = {}
         for gsi, fd in enumerate(irq_fds):
             try:
@@ -1761,7 +1768,18 @@ def start_child(engine, qemu, output, control, outer_ram, slots, cpu_count, mmio
                         fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SEAL)
             layouts.append(manifest)
         if engine == "kvm":
-            return KvmChild(output, outer_ram, layouts, slots, cpu_count, irqchip, pit_flags, irq_fds, tss_gpa, parallel)
+            child = KvmChild(output, outer_ram, layouts, slots, cpu_count, irqchip, pit_flags, irq_fds, tss_gpa, parallel)
+            if incoming is not None:
+                try:
+                    descriptor, _ = incoming
+                    child.freeze_run_control(True)
+                    child.checkpoint_interrupts(False)
+                    child.checkpoint_file(descriptor, restore=True)
+                    child.checkpoint_interrupts(True)
+                except BaseException:
+                    child.close()
+                    raise
+            return child
         return TcgChild(qemu, output, control, outer_ram, layouts, slots, cpu_count, mmio_base,
                         pit_flags, irq_fds, fixture_checks, parallel, checkpoint=checkpoint, incoming=incoming)
 
@@ -1986,7 +2004,7 @@ def exercise(
             listener = cleanup.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET))
             listener.bind(str(control / "checkpoint"))
             listener.listen(1)
-            gate = CheckpointGate(listener)
+            gate = CheckpointGate(listener, native=parent_engine == "kvm")
             cleanup.callback(gate.close)
         server = cleanup.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
         server.bind(str(control / "doorbell"))
@@ -2068,14 +2086,24 @@ def exercise(
                 slot_bytes = sum(len(slot.offsets) * PAGE_SIZE for slot in slots)
                 if read_registered_slots(mapping, slot_bytes, ram_pages, outer_ram_size) != slots:
                     raise RuntimeError("x86 checkpoint RAM slots changed during execution")
+                if parent_engine == "kvm":
+                    worker.checkpoint_file(descriptor)
+                    engine_state = None
+                else:
+                    engine_state = worker.capture(descriptor)
                 return {"cpus": len(worker.lanes.connections), "slot_bytes": slot_bytes, "irqchip": irqchip_created,
-                        "pit": pit_flags, "tss": tss_gpa, "engine": worker.capture(descriptor)}
-            return capture_hierarchy(outer, launch.checkpoint_qmp, irq_fds, descriptors, capture_worker)
+                        "pit": pit_flags, "tss": tss_gpa, "engine": engine_state}
+            detach = None
+            if worker is not None and parent_engine == "kvm":
+                detach = lambda: worker.checkpoint_interrupts(False)
+            return capture_hierarchy(outer, launch.checkpoint_qmp, irq_fds, descriptors, capture_worker, before_drain=detach)
 
         def rollback(worker, pending):
+            if worker is not None and parent_engine == "kvm":
+                worker.checkpoint_interrupts(True)
+            restore_interrupts(irq_fds, pending)
             if worker is not None:
                 worker.freeze_run_control(False)
-            restore_interrupts(irq_fds, pending)
 
         request_wakeup = False
         if restore_fds:
@@ -2137,6 +2165,8 @@ def exercise(
                     worker_cpus = profile["cpus"]
                     if worker_cpus not in (1, 2):
                         raise RuntimeError("invalid x86 checkpoint worker vCPU topology")
+                    if (profile["engine"] is None) != (parent_engine == "kvm"):
+                        raise RuntimeError("x86 checkpoint CPU engine does not match the destination")
                     slots = read_registered_slots(mapping, profile["slot_bytes"], ram_pages, outer_ram_size)
                     child = start_child(parent_engine, qemu, output, control, outer_ram, slots,
                                         worker_cpus, FIRECRACKER_NET_MMIO_BASE, irqchip_created, pit_flags, irq_fds, tss_gpa,
@@ -2181,7 +2211,8 @@ def exercise(
                 if gate:
                     active_ready = lanes and started_cpus == open_cpus == set(range(len(lanes.connections)))
                     unstarted = child is None and len(staged_irq_levels) <= X86_STAGED_IRQ_LIMIT
-                    capturable = parent_engine == "tcg" and (not active_vm or unstarted or active_ready)
+                    capturable = ((parent_engine != "kvm" or launch.native_checkpoint) and
+                                  (not active_vm or unstarted or active_ready))
                     if gate.service(readable, child, capture if capturable else None, rollback):
                         return 0
                 held = gate is not None and gate.phase != "running"
@@ -2811,9 +2842,9 @@ def serve_outer(argv):
         parser.error("only unique non-standard inherited descriptors are supported")
     for descriptor in args.inherit:
         os.fstat(descriptor)
-    if args.restore_fds and (args.engine != "tcg" or len(set(args.restore_fds)) != 3 or
+    if args.restore_fds and (args.engine == "auto" or len(set(args.restore_fds)) != 3 or
                             not set(args.restore_fds) <= set(args.inherit)):
-        parser.error("restoring parent state requires three inherited descriptors and a TCG worker")
+        parser.error("parent restore requires three inherited descriptors and an explicit worker")
     qemu = command[0]
     if qemu.startswith("/proc/self/fd/") or args.emulator_fd is not None:
         if args.emulator_fd not in args.inherit or qemu != f"/proc/self/fd/{args.emulator_fd}":
@@ -2850,18 +2881,21 @@ def serve_outer(argv):
         if not available and engine == "kvm":
             parser.error("native parent execution requires an available KVM worker")
         engine = "kvm" if available else "tcg"
-    if checkpoint and engine == "tcg":
-        options = native_query([qemu, "-device", "isa-debugcon,help"])
-        checkpoint = b"checkpoint-control" in options.stdout + options.stderr
-    else:
-        checkpoint = False
-    if args.restore_fds and not checkpoint:
+    native_checkpoint = False
+    if checkpoint:
+        if engine == "tcg":
+            options = native_query([qemu, "-device", "isa-debugcon,help"])
+            checkpoint = b"checkpoint-control" in options.stdout + options.stderr
+        else:
+            options = native_query([bundle / "native-worker", "--checkpoint-state"])
+            native_checkpoint = not options.returncode and options.stdout == b"flexvm-native-x86-checkpoint-1\n"
+    if args.restore_fds and (not checkpoint or (engine == "kvm" and not native_checkpoint)):
         parser.error("restoring x86 parent state requires a checkpoint-capable engine and frontend")
     result = exercise(
         qemu, None, output, parent_engine=engine, ram_pages=args.child_memory * MIB // PAGE_SIZE,
         protected_entry=True, pvh=True, cpu_count=2,
         launch=OuterLaunch(tuple(command), tuple(args.inherit), args.outer_memory, args.emulator_fd, args.control,
-                           args.outer_qmp if checkpoint else None, tuple(args.restore_fds or ())),
+                           args.outer_qmp if checkpoint else None, tuple(args.restore_fds or ()), native_checkpoint),
     )
     return 128 - result if result < 0 else result
 

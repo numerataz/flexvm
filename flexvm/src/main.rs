@@ -135,9 +135,10 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
   flexvm stop NAME...                suspend a VM to disk, freeing its memory (as SIGTERM to its process)
   flexvm start [-a] NAME...          resume a stopped VM in the background (-a: in the foreground); an
                                      exited one runs again from its image (its writes were in its memory)
+                                     native parent KVM checkpoints need --parent-kvm-bundle DIR
   flexvm pause NAME...               pause a VM's vCPUs, keeping its memory (as SIGTSTP; Ctrl-Z works too)
   flexvm unpause NAME...             resume a paused VM
-  flexvm restart NAME...             stop, then start a VM (a stopped one is started, an exited one rerun)
+  flexvm restart NAME...             stop, then start a VM (same restore options as start)
   flexvm rename OLD NEW              rename a running, stopped or exited VM (not while it checkpoints or migrates)
   flexvm kill NAME...                destroy a running VM (Ctrl-C or Ctrl-\\ in the foreground)
   flexvm kill -s SIGNAL NAME...      send SIGNAL (TERM, HUP, 9, ...) to the VM's app instead
@@ -566,10 +567,10 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("logs", 2, &["follow", "tail"]),
     ("inspect", NAMES, &[]),
     ("wait", NAMES, &[]),
-    ("restart", NAMES, &[]),
+    ("restart", NAMES, &["parent-kvm-bundle"]),
     ("rename", 3, &[]),
     ("stop", NAMES, &[]),
-    ("start", NAMES, &["attach"]),
+    ("start", NAMES, &["attach", "parent-kvm-bundle"]),
     ("pause", NAMES, &[]),
     ("unpause", NAMES, &[]),
     ("kill", NAMES, &["signal"]),
@@ -919,7 +920,7 @@ fn real_main(args: &Args) -> Result<()> {
                 }
             }
             if software_state::identifies(&host.suspended(name)?) {
-                util::exit(software::restore(host, name, notify_fd())?);
+                util::exit(software::restore(host, name, args.get("parent-kvm-bundle").map(Path::new), notify_fd())?);
             }
             let start = rerun(&host, name)?.unwrap_or(Start::Resume { name: name.into() });
             vmproc::main(host, paths(args)?, start, notify_fd())
@@ -1551,7 +1552,13 @@ fn start(host: &Host, args: &Args, name: &str) -> Result<()> {
     if !host.alive(name) && !host.suspended(name)?.exists() && !host.has_record(name, "exited") {
         return Err(no_vm(host, name));
     }
-    match spawn_detached(host, name, &child_args(args, &["start", "--attach", "--", name]), &log_file(host, name)?, false) {
+    let mut words = vec!["start", "--attach"];
+    let bundle = args.get("parent-kvm-bundle").map(Path::new).map(Path::canonicalize).transpose()?;
+    if let Some(bundle) = &bundle {
+        words.extend(["--parent-kvm-bundle", bundle.to_str().ok_or("native parent KVM bundle path is not UTF-8")?]);
+    }
+    words.extend(["--", name]);
+    match spawn_detached(host, name, &child_args(args, &words), &log_file(host, name)?, false) {
         Ok(v) => print(v),
         Err(e) if host::name_taken(&e) || host.alive(name) => match started_meanwhile(host, name, Instant::now() + Duration::from_secs(60))? {
             true => output(format_args!("{name}\n")),

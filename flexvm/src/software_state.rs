@@ -84,6 +84,8 @@ impl Main {
 #[serde(deny_unknown_fields)]
 pub struct ParentArtifacts {
     pub child_memory_mib: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub native: bool,
     pub frontend: Artifact,
     pub worker: Artifact,
     pub broker: Artifact,
@@ -173,6 +175,7 @@ impl Manifest {
         }
         if let Some(parent) = &self.parent {
             if !matches!(self.profile.architecture.as_str(), "aarch64" | "x86_64")
+                || (parent.native && self.profile.architecture != "x86_64")
                 || !(1..=self.memory_mib.min(256)).contains(&parent.child_memory_mib)
                 || parent.frontend.bytes > (4 << 20) + 512
                 || parent.broker.bytes > 2 << 20
@@ -892,6 +895,7 @@ pub fn describe(path: &Path, name: &str) -> Result<serde_json::Value> {
 
 pub struct ParentStaging {
     child_memory_mib: u32,
+    native: bool,
     frontend: Artifact,
     pub worker: File,
     pub broker: File,
@@ -930,10 +934,10 @@ impl Staging {
         Ok(Self { path, state, parent: None, committed: false, parent_directory: parent, directory })
     }
 
-    pub fn prepare_parent(&mut self, frontend: &Input, child_memory_mib: u32) -> Result<&ParentStaging> {
+    pub fn prepare_parent(&mut self, frontend: &Input, child_memory_mib: u32, native: bool) -> Result<&ParentStaging> {
         let create = |name| OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(self.path.join(name));
         let frontend = frontend.copy_to(&self.path.join("parent-frontend"), false)?;
-        Ok(self.parent.insert(ParentStaging { child_memory_mib, frontend, worker: create("parent-worker")?, broker: create("parent-broker")? }))
+        Ok(self.parent.insert(ParentStaging { child_memory_mib, native, frontend, worker: create("parent-worker")?, broker: create("parent-broker")? }))
     }
 
     pub fn capture_disks(&self, disks: &[crate::volume::Writer]) -> Result<Vec<Disk>> {
@@ -1000,6 +1004,7 @@ impl Staging {
             .map(|parent| -> Result<_> {
                 Ok(ParentArtifacts {
                     child_memory_mib: parent.child_memory_mib,
+                    native: parent.native,
                     frontend: parent.frontend.clone(),
                     worker: seal(&parent.worker)?,
                     broker: seal(&parent.broker)?,
@@ -1279,7 +1284,7 @@ mod tests {
         let mut staging = Staging::new(&root).unwrap();
         staging.state.write_all(b"outer").unwrap();
         let frontend = source(&root, "source-frontend", b"frontend");
-        let parent = staging.prepare_parent(&frontend, 128).unwrap();
+        let parent = staging.prepare_parent(&frontend, 128, false).unwrap();
         (&parent.worker).write_all(b"worker").unwrap();
         (&parent.broker).write_all(b"broker").unwrap();
         let path = root.join("checkpoint");

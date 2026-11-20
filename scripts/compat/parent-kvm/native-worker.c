@@ -351,6 +351,10 @@ static int set_irqfds(int vm, const int *descriptors, bool attach)
 
 int main(int argc, char **argv)
 {
+    if (argc == 2 && !strcmp(argv[1], "--checkpoint-state")) {
+        puts("flexvm-native-x86-checkpoint-1");
+        return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "--supported-cpuid")) {
         supported_cpuid();
         return 0;
