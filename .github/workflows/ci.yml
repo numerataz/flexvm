@@ -421,11 +421,12 @@ jobs:
           tar -xOzf "$archive" "release-$FC_VERSION-$ARCH/$stock" > "$RUNNER_TEMP/$stock"
           run_parent_firecracker() {
             local engine=$1
-            local output="$RUNNER_TEMP/parent-kvm-firecracker-$engine"
+            local cpus=${2:-1}
+            local output="$RUNNER_TEMP/parent-kvm-firecracker-$engine-$cpus"
             sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
               --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
               --kernel-build "$sdk/lib/modules/$release/build" --output "$output" --parent-engine "$engine" \
-              --firecracker "$RUNNER_TEMP/$stock" || {
+              --firecracker "$RUNNER_TEMP/$stock" --firecracker-vcpus "$cpus" || {
               cat "$output/report.json" "$output/worker.log" "$output/outer.log" >&2 || true
               return 1
             }
@@ -515,6 +516,7 @@ jobs:
               --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-zero-slot" --parent-engine kvm --native-oracle --ram-pages 32768 --pvh
             cat "$RUNNER_TEMP/parent-kvm-native-zero-slot/report.json"
             run_parent_firecracker kvm
+            run_parent_firecracker kvm 2
           fi
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
         with:
