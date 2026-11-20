@@ -211,9 +211,9 @@ impl Proc {
         Ok(v)
     }
 
-    /// SIGTERM, `reserved` first. Returns only on failure, with the VM running
+    /// SIGTERM or `"stop"` RPC, `reserved` first. Returns only on failure, with the VM running
     /// on, the reservation let go (after the command's session).
-    pub fn suspend(&self, reserved: crate::vmproc::SuspendReserved) -> Error {
+    pub fn suspend(&self, reserved: crate::vmproc::SuspendReserved, last: Option<&mut dyn std::io::Write>) -> Error {
         let vm = self.vm();
         let mut t = Phases::new();
         let op = self.op();
@@ -283,11 +283,14 @@ impl Proc {
                     if let Err(e) = freed {
                         crate::log!("vm {}: killed while suspending, its checkpoint revoked; freeing its address: {e}", vm.name);
                     }
-                    self.finish(&op, End::Gone, self.destroy_code().unwrap_or(128 + libc::SIGINT), None)
+                    let reply = last.map(|w| (w, json!({"ok": false, "error": format!("vm {} was killed while suspending", vm.name)})));
+                    self.finish(&op, End::Gone, self.destroy_code().unwrap_or(128 + libc::SIGINT), reply)
                 }
                 Err(e) => {
                     crate::log!("vm {}: {how} while suspending, but its checkpoint stays: {e}", vm.name);
-                    self.finish(&op, End::Suspended, crate::vmproc::FAILED, None)
+                    let reply =
+                        last.map(|w| (w, json!({"ok": false, "error": format!("vm {}: {how} while suspending, but its checkpoint stays: {e}", vm.name)})));
+                    self.finish(&op, End::Suspended, crate::vmproc::FAILED, reply)
                 }
             }
         }
@@ -298,7 +301,8 @@ impl Proc {
                     "{}",
                     json!({"name": vm.name, "state": "suspended", "dir": self.host.suspended(&vm.name.get()).ok(), "freed_rss_mib": vm.rss() >> 20, "data_mib": data, "suspend_ms": ms(t.total()), "timings_ms": t.json()})
                 );
-                self.finish(&op, End::Suspended, 128 + libc::SIGTERM, None)
+                let reply = last.map(|w| (w, json!({"ok": true, "result": {"name": vm.name, "state": "suspended"}})));
+                self.finish(&op, End::Suspended, 128 + libc::SIGTERM, reply)
             }
             Err(e) => {
                 drop(cmd_held);

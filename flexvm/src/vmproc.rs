@@ -669,8 +669,6 @@ fn pressure(sessions: usize, execs: usize, refused: Option<Instant>) -> bool {
 /// Page-server requests (peers', forwarded by the listener) refused or served at once: not on `MAX_CONTROL`, so they
 /// never shut out local control requests (#335). Those served are bounded further by the page server.
 const MAX_PAGES: usize = 64;
-/// How long `flexvm unpause` (or `start`) waits for the VM to resume (an arrival's pages come first).
-const RESUME_WAIT: Duration = Duration::from_secs(60);
 static PAGES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// Page-server refusals waiting out their `PAGE_REFUSAL` drain, on neither budget above, so a peer's refused requests
 /// never keep its page connections out (#352); past this many, a refusal does not wait on the client at all.
@@ -839,15 +837,8 @@ pub struct Runtime {
     pub standby_grant: AtomicU64,
     /// Set once the control socket is bound (a failed bind is tried again).
     serving: Mutex<bool>,
-    /// SIGTSTP and SIGCONT, off the signal thread (which a later SIGINT needs).
-    pauses: Latest,
-    /// What came of the SIGCONTs `flexvm unpause` sent, for its answer.
-    resumes: Resumes,
     /// The code of a destroy waiting for `op` (0: none): a pause or resume that gets it first does nothing.
     destroying: AtomicI32,
-    /// Held by the signal thread from taking a signal to reserving a SIGTERM's suspend,
-    /// and by `flexvm unpause` asking: one sent earlier is still pending, queued or reserved.
-    taking: Mutex<()>,
     /// The controller's tick gaps, for `debug status`.
     ticks: Mutex<Ticks>,
     /// How fast the VM's memory grew lately (MiB/s), for eviction's ranking.
@@ -1636,8 +1627,12 @@ impl Proc {
     /// never killed, as the target may still be pulling its memory. One whose
     /// outcome is still unknown is (`end_reconciling`).
     pub fn destroy(&self, code: i32) -> Error {
+        self.destroy_with(code, None)
+    }
+
+    fn destroy_with(&self, code: i32, last: Option<&mut dyn std::io::Write>) -> Error {
         self.destroying.store(code, Ordering::SeqCst);
-        let refused = self.try_destroy(code);
+        let refused = self.try_destroy(code, last);
         let _ = self.destroying.compare_exchange(code, 0, Ordering::SeqCst, Ordering::SeqCst);
         refused
     }
@@ -1662,13 +1657,14 @@ impl Proc {
         }
     }
 
-    fn try_destroy(&self, code: i32) -> Error {
+    fn try_destroy(&self, code: i32, last: Option<&mut dyn std::io::Write>) -> Error {
         let vm = self.vm();
-        let source = || format!("vm {} is the source of a migration in progress; it ends once the target has its memory", vm.name).into();
+        let source =
+            || format!("vm {} is the source of a migration in progress; it ends once the target has its memory (kill it where it runs)", vm.name).into();
         if let State::Source(mig) = vm.state() {
             if self.reconciling.lock().unwrap().as_ref().is_some_and(|(m, _)| *m == mig) {
                 let op = self.op();
-                return self.end_reconciling(&op, mig, code).unwrap_or_else(source);
+                return self.end_reconciling(&op, mig, code, last).unwrap_or_else(source);
             }
             return source();
         }
@@ -1679,13 +1675,14 @@ impl Proc {
         let op = self.op();
         if let State::Source(mig) = vm.state() {
             // It became one while this waited (a migration that holds `op` until its outcome is unknown).
-            let refused = self.end_reconciling(&op, mig, code).unwrap_or_else(source);
+            let refused = self.end_reconciling(&op, mig, code, last).unwrap_or_else(source);
             // Refused: the next checkpoint must not take this kill for its own
             // (one it already cancelled consumed it).
             let _ = vm.cancel_checkpoint.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
             return refused;
         }
-        self.finish(&op, End::Gone, code, None)
+        let reply = last.map(|w| (w, json!({"ok": true, "result": {"name": vm.name, "state": "killed"}})));
+        self.finish(&op, End::Gone, code, reply)
     }
 
     /// Marks migration `mig` to `to` as one whose outcome is unknown, until `known` takes it back.
@@ -1712,7 +1709,7 @@ impl Proc {
     /// the target says (`Host::settle_owed`): released, the loan stays the target's;
     /// aborted, the generation is withdrawn then. Never left lent with no record of
     /// whom: unrecorded, the kill is refused and this process goes on reconciling.
-    fn end_reconciling(&self, op: &Op, mig: u64, code: i32) -> Option<Error> {
+    fn end_reconciling(&self, op: &Op, mig: u64, code: i32, last: Option<&mut dyn std::io::Write>) -> Option<Error> {
         let vm = self.vm();
         let (ip, gen, by) = (vm.ip, self.gen(), self.ident.clone());
         let to = match owe_or_refuse(&self.reconciling, mig, OWE_TRIES, |to| {
@@ -1737,7 +1734,8 @@ impl Proc {
         if let Some(h) = self.holder() {
             h.forget(vm.ip, mig);
         }
-        self.finish(op, End::Owed, code, None)
+        let reply = last.map(|w| (w, json!({"ok": true, "result": {"name": vm.name, "state": "killed"}})));
+        self.finish(op, End::Owed, code, reply)
     }
 
     /// Reserves the one suspend that may run: None if one already is (it
@@ -2046,11 +2044,12 @@ impl Proc {
         loop {
             let next = self.early.lock().unwrap().first().copied();
             let Some(sig) = next else { break };
-            self.dispatch(sig);
+            if matches!(sig, libc::SIGTSTP | libc::SIGCONT) {
+                let _ = self.handle(sig);
+            } else {
+                self.dispatch(sig);
+            }
             self.early.lock().unwrap().remove(0);
-        }
-        while self.pauses.busy.load(Ordering::SeqCst) {
-            thread::sleep(Duration::from_millis(10));
         }
         if self.cmd.lock().unwrap().is_some() {
             spawn(Proc::main_command);
@@ -2071,74 +2070,100 @@ impl Proc {
         self.dispatch(sig);
     }
 
-    /// `flexvm unpause`: whether a SIGTERM sent before it suspends the VM; if none,
-    /// its SIGCONT (which, as a raw one did, discards a Ctrl-Z still pending), and
-    /// what came of it: the VM runs, its resume failed, or it is being destroyed.
+    fn suspend_coming(&self) -> bool {
+        self.early.lock().unwrap().contains(&libc::SIGTERM)
+            || *self.suspending.lock().unwrap() == Suspend::Suspending
+            || crate::util::signal_pending(libc::SIGTERM)
+    }
+
+    /// `flexvm pause` (or `SIGTSTP`): pauses the VM's vCPUs, keeping its memory.
+    fn pause_vm(&self) -> Result<Value> {
+        let vm = self.vm();
+        let _op = self.op_unless_destroyed()?;
+        let res = vm.pause();
+        // A pause that may have landed counts as requested, so unpause / SIGCONT resumes it.
+        if res.is_ok() || vm.switch_unsure() {
+            self.paused_by_request.store(true, Ordering::SeqCst);
+        }
+        res?;
+        self.publish();
+        Ok(json!({"name": vm.name, "state": "paused"}))
+    }
+
+    /// `flexvm unpause` (or `SIGCONT`): resumes a paused VM (or retries a pending address).
+    fn resume_vm(&self) -> Result<Value> {
+        // Not run here, whether paused or running when it left: `flexvm unpause` is told so, not that it runs (#569).
+        if self.leaving.load(Ordering::SeqCst) {
+            bail!("vm {} is migrating away (or ending)", self.name());
+        }
+        let vm = self.vm();
+        // Also through while a new address is pending (a resume that failed to set it): this one retries it.
+        if !(self.paused_by_request.load(Ordering::SeqCst) || vm.pending_net.load(Ordering::SeqCst)) {
+            self.not_destroyed()?;
+            return Ok(json!({"suspending": false}));
+        }
+        self.resume()?;
+        Ok(json!({"suspending": false}))
+    }
+
+    /// `flexvm unpause`: whether a suspend is already coming; if not, resumes directly.
     fn resume_request(&self) -> Result<Value> {
-        let Some(ticket) = self.ask_resume() else { return Ok(json!({"suspending": true})) };
-        match self.resumes.wait(ticket, RESUME_WAIT) {
-            None => bail!("vm {}: its resume is still under way after {}s; see its log", self.name(), RESUME_WAIT.as_secs()),
-            Some(Err(e)) => bail!("{e}"),
-            Some(Ok(())) if self.destroy_code().is_some() => bail!("vm {} is being destroyed", self.name()),
-            Some(Ok(())) => Ok(json!({"suspending": false})),
+        if self.suspend_coming() {
+            return Ok(json!({"suspending": true}));
+        }
+        self.resume_vm()
+    }
+
+    /// `flexvm stop`: suspends the VM to disk and exits after sending the reply.
+    fn stop_request(&self, c: &mut dyn std::io::Write) -> Result<Value> {
+        self.stop_asked.store(true, Ordering::SeqCst);
+        if let Some(vm) = self.vm.get() {
+            if matches!(vm.state(), State::Source(_)) {
+                bail!("vm {} is migrating away; it ends once the target has its memory", vm.name);
+            }
+        }
+        if self.destroy_code().is_some() {
+            let name = self.name();
+            crate::info!("vm {name}: being destroyed; not suspending");
+            return Ok(json!({"suspending": true, "name": name}));
+        }
+        match self.reserve_suspend() {
+            None => Ok(json!({"suspending": true, "name": self.name()})),
+            Some(mut r) => {
+                r.1 = true;
+                self.publish();
+                Err(self.suspend(r, Some(c)))
+            }
         }
     }
 
-    /// None if a suspend is coming; else the SIGCONT is sent, and its ticket returned.
-    fn ask_resume(&self) -> Option<u64> {
-        let _taking = self.taking.lock().unwrap();
-        // Queued first: a replay reserves, then takes it off.
-        let coming = self.early.lock().unwrap().contains(&libc::SIGTERM)
-            || *self.suspending.lock().unwrap() == Suspend::Suspending
-            || crate::util::signal_pending(libc::SIGTERM);
-        (!coming).then(|| {
-            self.resumes.ask(|| {
-                unsafe { libc::kill(libc::getpid(), libc::SIGCONT) };
-            })
-        })
+    /// `flexvm kill`: destroys the VM and exits after sending the reply (or returns the refusal).
+    fn kill_request(&self, c: &mut dyn std::io::Write) -> Result<Value> {
+        Err(self.destroy_with(128 + libc::SIGINT, Some(c)))
     }
 
     fn dispatch(self: &Arc<Self>, sig: i32) {
         if sig == libc::SIGTERM {
             self.stop_asked.store(true, Ordering::SeqCst);
         }
-        if !matches!(sig, libc::SIGTSTP | libc::SIGCONT) {
-            let _ = self.handle(sig);
-            return;
-        }
-        if self.resumes.offer(|| self.pauses.offer(sig)) {
+        if matches!(sig, libc::SIGTSTP | libc::SIGCONT) {
             let p = self.clone();
             if let Err(e) = thread::Builder::new().spawn(move || {
-                while let Some((sig, asked)) = p.resumes.next(|| p.pauses.next()) {
-                    let res = p.handle(sig);
-                    p.resumes.answer(asked, sig, res);
-                }
+                let _ = p.handle(sig);
             }) {
-                self.pauses.busy.store(false, Ordering::SeqCst);
                 crate::log!("vm {}: signal {sig}: {e}", self.name());
             }
+            return;
         }
+        let _ = self.handle(sig);
     }
 
     /// What came of it (logged too).
     fn handle(&self, sig: i32) -> std::result::Result<(), String> {
         let vm = self.vm();
         let res = match sig {
-            libc::SIGTSTP => self.op_unless_destroyed().and_then(|_op| {
-                let res = vm.pause();
-                // A pause that may have landed counts as requested, so SIGCONT resumes it.
-                if res.is_ok() || vm.switch_unsure() {
-                    self.paused_by_request.store(true, Ordering::SeqCst);
-                }
-                res?;
-                self.publish();
-                Ok(())
-            }),
-            // Not run here, whether paused or running when it left: `flexvm unpause` is told so, not that it runs (#569).
-            libc::SIGCONT if self.leaving.load(Ordering::SeqCst) => Err(format!("vm {} is migrating away (or ending)", vm.name).into()),
-            // Also through while a new address is pending (a resume that failed to set it): this one retries it.
-            libc::SIGCONT if !(self.paused_by_request.load(Ordering::SeqCst) || vm.pending_net.load(Ordering::SeqCst)) => Ok(()),
-            libc::SIGCONT => self.resume().map(drop),
+            libc::SIGTSTP => self.pause_vm().map(drop),
+            libc::SIGCONT => self.resume_vm().map(drop),
             libc::SIGTERM if matches!(vm.state(), State::Source(_)) => {
                 crate::info!("vm {}: migrating away; it ends once the target has its memory", vm.name);
                 Ok(())
@@ -2158,7 +2183,7 @@ impl Proc {
                         let p = r.proc().clone();
                         r.1 = true;
                         p.publish();
-                        crate::log!("vm {}: signal {sig}: {}", p.name(), p.suspend(r))
+                        crate::log!("vm {}: signal {sig}: {}", p.name(), p.suspend(r, None))
                     })
                     .map(drop)
                     .map_err(|e| format!("suspending: {e}").into()),
@@ -2212,7 +2237,7 @@ impl Proc {
                 }
             }
             // Bound before a resume or restore runs its VM (`restore_checkpoint`), or an arrival is prepared (`prepare_in`).
-            "checkpoint" | "migrate" | "debug" | "resume" | "signal" | "rename" if self.vm.get().is_none() => {
+            "checkpoint" | "migrate" | "debug" | "pause" | "resume" | "stop" | "kill" | "signal" | "rename" if self.vm.get().is_none() => {
                 Err(Busy(format!("vm {} is starting", self.name())).into())
             }
             "pages" => return self.pages(&req, fds, slot),
@@ -2231,7 +2256,10 @@ impl Proc {
             }),
             "migrate" => self.migrate(req["to"].as_str().unwrap_or(""), req["if_idle"] == true, req["evict"] == true),
             "debug" => self.debug(&req),
-            "resume" => self.resume_request(),
+            "pause" => self.pause_vm().inspect_err(|e| crate::log!("vm {}: pause: {e}", self.name())),
+            "resume" => self.resume_request().inspect_err(|e| crate::log!("vm {}: resume: {e}", self.name())),
+            "stop" => self.stop_request(&mut &c).inspect_err(|e| crate::log!("vm {}: stop: {e}", self.name())),
+            "kill" => self.kill_request(&mut &c).inspect_err(|e| crate::log!("vm {}: kill: {e}", self.name())),
             "signal" => self.signal_app(&req),
             "rename" => self.rename(req["to"].as_str().unwrap_or("")),
             "claim" => Err("this vm is not a standby vm".into()),
@@ -2922,113 +2950,6 @@ impl Drop for SuspendReserved {
     }
 }
 
-/// The newest request offered, taken one at a time by a single worker: a
-/// SIGCONT after a SIGTSTP still waiting for the VM leaves it running.
-#[derive(Default)]
-struct Latest {
-    wanted: AtomicI32,
-    busy: AtomicBool,
-}
-
-impl Latest {
-    /// True if the caller is to start the worker.
-    fn offer(&self, sig: i32) -> bool {
-        self.wanted.store(sig, Ordering::SeqCst);
-        !self.busy.swap(true, Ordering::SeqCst)
-    }
-
-    /// The worker's next request; None once there is none (and it is to stop).
-    fn next(&self) -> Option<i32> {
-        loop {
-            match self.wanted.swap(0, Ordering::SeqCst) {
-                0 => {
-                    self.busy.store(false, Ordering::SeqCst);
-                    // An offer between the two found it busy: this worker takes it, unless a new one started.
-                    if self.wanted.load(Ordering::SeqCst) == 0 || self.busy.swap(true, Ordering::SeqCst) {
-                        return None;
-                    }
-                }
-                sig => return Some(sig),
-            }
-        }
-    }
-}
-
-/// Resume tickets follow signals from `took` (under `taking`, like `ask`) to
-/// the pause worker. A taken signal covers the tickets asked by then: their
-/// SIGCONT is that one, came before it, or was discarded by it (a SIGTSTP sent
-/// after a SIGCONT still pending discards it). Each turn answers all tickets
-/// offered so far: SIGCONT with its outcome, SIGTSTP (a later Ctrl-Z) as paused
-/// again. Outcomes stay until collected.
-#[derive(Default)]
-struct Resumes {
-    state: Mutex<ResumeState>,
-    answered: std::sync::Condvar,
-}
-
-#[derive(Default)]
-struct ResumeState {
-    asked: u64,
-    /// For each SIGTSTP or SIGCONT taken and not yet offered, in order: the tickets asked when it was taken.
-    taken: std::collections::VecDeque<u64>,
-    offered: u64,
-    /// The tickets whose askers still wait, with their outcomes once answered.
-    waiting: std::collections::BTreeMap<u64, Option<std::result::Result<(), String>>>,
-}
-
-impl Resumes {
-    /// A new ticket, `send` (its SIGCONT) sent holding it.
-    fn ask(&self, send: impl FnOnce()) -> u64 {
-        let mut s = self.state.lock().unwrap();
-        s.asked += 1;
-        let ticket = s.asked;
-        s.waiting.insert(ticket, None);
-        send();
-        ticket
-    }
-
-    /// The signal thread took a SIGTSTP or SIGCONT (holding `taking`).
-    fn took(&self) {
-        let mut s = self.state.lock().unwrap();
-        let asked = s.asked;
-        s.taken.push_back(asked);
-    }
-
-    /// `offer` (`Latest::offer`) of the SIGTSTP or SIGCONT taken first of those not yet offered.
-    fn offer(&self, offer: impl FnOnce() -> bool) -> bool {
-        let mut s = self.state.lock().unwrap();
-        if let Some(t) = s.taken.pop_front() {
-            s.offered = s.offered.max(t);
-        }
-        offer()
-    }
-
-    /// The worker's next signal (`Latest::next`), with the tickets offered by then.
-    fn next(&self, next: impl FnOnce() -> Option<i32>) -> Option<(i32, u64)> {
-        let s = self.state.lock().unwrap();
-        next().map(|sig| (sig, s.offered))
-    }
-
-    /// Answers the tickets up to `upto` not answered yet.
-    fn answer(&self, upto: u64, sig: i32, res: std::result::Result<(), String>) {
-        let mut s = self.state.lock().unwrap();
-        let outcome = if sig == libc::SIGCONT { res } else { Err("paused again meanwhile (a later SIGTSTP)".into()) };
-        for (_, o) in s.waiting.range_mut(..=upto) {
-            if o.is_none() {
-                *o = Some(outcome.clone());
-            }
-        }
-        self.answered.notify_all();
-    }
-
-    /// What came of `ticket`, if answered within `wait`; either way it is no longer waited for.
-    fn wait(&self, ticket: u64, wait: Duration) -> Option<std::result::Result<(), String>> {
-        let s = self.state.lock().unwrap();
-        let (mut s, _) = self.answered.wait_timeout_while(s, wait, |s| matches!(s.waiting.get(&ticket), Some(None))).unwrap();
-        s.waiting.remove(&ticket).flatten()
-    }
-}
-
 /// Tries at recording an owed outcome before a kill is refused (`owe_or_refuse`).
 const OWE_TRIES: u32 = 5;
 
@@ -3099,15 +3020,7 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     // Ctrl-\ quits like Ctrl-C: the VM is destroyed, not dumped.
     thread::spawn(move || loop {
         let _ = crate::util::readable(&fd, Duration::from_secs(3600));
-        // Taken, and a SIGTERM's suspend reserved, under `taking` (`ask_resume`).
-        let taking = s.taking.lock().unwrap();
         let Some(sig) = crate::util::take_signal(&signals).filter(|&sig| sig != libc::SIGHUP) else { continue };
-        if matches!(sig, libc::SIGTSTP | libc::SIGCONT) {
-            s.resumes.took();
-        }
-        if sig != libc::SIGTERM {
-            drop(taking);
-        }
         s.signal(sig);
     });
     let op = p.op();
@@ -4873,43 +4786,6 @@ mod tests {
     }
 
     #[test]
-    fn pauses_run_one_at_a_time_the_newest_winning() {
-        let l = Latest::default();
-        assert!(l.offer(libc::SIGTSTP), "the first starts the worker");
-        assert!(!l.offer(libc::SIGCONT), "one worker at a time");
-        assert_eq!(l.next(), Some(libc::SIGCONT), "a SIGCONT after a waiting SIGTSTP wins");
-        assert!(!l.offer(libc::SIGTSTP));
-        assert_eq!(l.next(), Some(libc::SIGTSTP), "taken by the running worker, in order");
-        assert_eq!(l.next(), None);
-        assert!(l.offer(libc::SIGCONT), "stopped: the next offer starts another");
-    }
-
-    #[test]
-    fn no_pause_offer_is_lost_to_a_stopping_worker() {
-        let l = Arc::new(Latest::default());
-        let (handled, workers) = (Arc::new(AtomicI32::new(0)), Arc::new(AtomicI32::new(0)));
-        for i in 1..=2000 {
-            let sig = if i % 2 == 0 { libc::SIGCONT } else { libc::SIGTSTP };
-            if l.offer(sig) {
-                let (l, handled, workers) = (l.clone(), handled.clone(), workers.clone());
-                workers.fetch_add(1, Ordering::SeqCst);
-                thread::spawn(move || {
-                    while let Some(sig) = l.next() {
-                        handled.store(sig, Ordering::SeqCst);
-                    }
-                    workers.fetch_sub(1, Ordering::SeqCst);
-                });
-            }
-            if i % 100 == 0 {
-                wait_until("pause workers to finish", || workers.load(Ordering::SeqCst) == 0);
-            }
-        }
-        wait_until("last pause offer to finish", || workers.load(Ordering::SeqCst) == 0 && !l.busy.load(Ordering::SeqCst));
-        assert_eq!(handled.load(Ordering::SeqCst), libc::SIGCONT, "the last offer was handled");
-        assert_eq!(l.wanted.load(Ordering::SeqCst), 0);
-    }
-
-    #[test]
     fn migrate_in_refuses_peer_ip_before_preparing_anything() {
         let (p, _root) = test_proc("incoming-peer", None);
         let ip = "10.98.0.1";
@@ -5469,120 +5345,71 @@ mod tests {
     }
 
     #[test]
-    fn a_resume_asked_while_a_sigterm_is_taken_waits_for_its_reservation() {
-        let _signals = PROCESS_SIGCONT.lock().unwrap_or_else(|e| e.into_inner());
-        let (p, _root) = test_proc("resume-taking", None);
-        assert!(p.ask_resume().is_some());
-        // The signal thread has taken a SIGTERM (no longer pending) and not yet reserved.
-        let taking = p.taking.lock().unwrap();
-        let q = p.clone();
-        let asked = thread::spawn(move || q.ask_resume());
-        thread::sleep(Duration::from_millis(50));
-        assert!(!asked.is_finished(), "waits for the signal thread");
-        *p.suspending.lock().unwrap() = Suspend::Suspending;
-        drop(taking);
-        assert!(asked.join_within().unwrap().is_none());
-        *p.suspending.lock().unwrap() = Suspend::Idle;
-        p.early.lock().unwrap().push(libc::SIGTERM);
-        assert!(p.ask_resume().is_none(), "queued at startup, still to be replayed");
-    }
-
-    /// Held by tests that send this process a SIGCONT (`ask_resume`), which would discard or
-    /// add to the stop signals another test has pending.
-    static PROCESS_SIGCONT: Mutex<()> = Mutex::new(());
-
-    /// The signal thread's part: takes what is pending, noting and offering each.
-    fn take_and_offer(r: &Resumes, l: &Latest, set: &libc::sigset_t) {
-        while let Some(sig) = crate::util::take_signal(set) {
-            r.took();
-            r.offer(|| l.offer(sig));
+    fn lifecycle_rpcs_report_busy_while_vm_is_starting() {
+        let (p, _root) = test_proc("lifecycle-starting", None);
+        assert!(p.vm.get().is_none());
+        static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        for op in ["pause", "resume", "stop", "kill"] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client.set_read_timeout(Some(WAIT)).unwrap();
+            client.set_write_timeout(Some(WAIT)).unwrap();
+            let q = p.clone();
+            let slot = Slot::take(&COUNT, MAX_CONTROL).unwrap();
+            let worker = thread::spawn(move || q.control(server, slot));
+            use std::io::Write;
+            writeln!(client, "{}", json!({"op": op})).unwrap();
+            let reply = crate::util::recv_json(&mut BufReader::new(client)).unwrap().unwrap();
+            assert_eq!(reply["ok"], false, "{op}: {reply}");
+            assert_eq!(reply["busy"], true, "{op}: {reply}");
+            assert!(reply["error"].as_str().unwrap().contains("is starting"), "{op}: {reply}");
+            worker.join_within().unwrap();
+            assert_eq!(COUNT.load(Ordering::SeqCst), 0);
         }
     }
 
     #[test]
-    fn each_resume_ticket_keeps_its_own_outcome() {
-        let (r, l) = (Resumes::default(), Latest::default());
-        let one = r.ask(|| ());
-        r.took();
-        assert!(r.offer(|| l.offer(libc::SIGCONT)), "starts the worker");
-        let (sig, upto) = r.next(|| l.next()).unwrap();
-        assert_eq!((sig, upto), (libc::SIGCONT, one));
-        // Asked while that one is handled: its own SIGCONT comes next.
-        let two = r.ask(|| ());
-        r.took();
-        assert!(!r.offer(|| l.offer(libc::SIGCONT)));
-        r.answer(upto, sig, Err("resume failed part way".into()));
-        let (sig, upto) = r.next(|| l.next()).unwrap();
-        assert_eq!((sig, upto), (libc::SIGCONT, two));
-        r.answer(upto, sig, Ok(()));
-        // Neither asker had woken: each gets its own.
-        assert_eq!(r.wait(two, Duration::ZERO), Some(Ok(())));
-        assert_eq!(r.wait(one, Duration::ZERO), Some(Err("resume failed part way".into())));
-        // An older handling finishing late changes nothing; one never answered is bounded.
-        let three = r.ask(|| ());
-        r.answer(two, libc::SIGCONT, Ok(()));
-        assert_eq!(r.wait(three, Duration::from_millis(20)), None);
-        assert!(r.next(|| l.next()).is_none(), "the worker stops");
-        assert!(r.state.lock().unwrap().waiting.is_empty(), "nothing kept for askers gone");
-    }
-
-    #[test]
-    fn a_ctrl_z_that_discards_a_pending_resume_answers_it() {
-        let _signals = PROCESS_SIGCONT.lock().unwrap_or_else(|e| e.into_inner());
-        thread::spawn(|| {
-            let set = crate::util::block_signals(&[libc::SIGCONT, libc::SIGTSTP]);
-            let (r, l) = (Resumes::default(), Latest::default());
-            let me = unsafe { libc::pthread_self() };
-            // Sent while still pending (not yet taken), a SIGTSTP discards the SIGCONT.
-            let ticket = r.ask(|| unsafe {
-                libc::pthread_kill(me, libc::SIGCONT);
-            });
-            unsafe { libc::pthread_kill(me, libc::SIGTSTP) };
-            assert!(!crate::util::signal_pending(libc::SIGCONT), "discarded by the kernel");
-            take_and_offer(&r, &l, &set);
-            let (sig, upto) = r.next(|| l.next()).unwrap();
-            assert_eq!((sig, upto), (libc::SIGTSTP, ticket));
-            r.answer(upto, sig, Ok(()));
-            assert!(r.wait(ticket, Duration::ZERO).unwrap().unwrap_err().contains("paused again"));
-            assert!(r.next(|| l.next()).is_none());
-            // A Ctrl-Z taken before the ask answers nothing: the SIGCONT after it does.
-            unsafe { libc::pthread_kill(me, libc::SIGTSTP) };
-            take_and_offer(&r, &l, &set);
-            let ticket = r.ask(|| unsafe {
-                libc::pthread_kill(me, libc::SIGCONT);
-            });
-            let (sig, upto) = r.next(|| l.next()).unwrap();
-            assert_eq!(sig, libc::SIGTSTP);
-            r.answer(upto, sig, Ok(()));
-            assert_eq!(r.wait(ticket, Duration::from_millis(20)), None, "not answered by the older Ctrl-Z");
-            let ticket = r.ask(|| ());
-            take_and_offer(&r, &l, &set);
-            let (sig, upto) = r.next(|| l.next()).unwrap();
-            assert_eq!((sig, upto), (libc::SIGCONT, ticket));
-            r.answer(upto, sig, Ok(()));
-            assert_eq!(r.wait(ticket, Duration::ZERO), Some(Ok(())));
-        })
-        .join_within()
-        .unwrap();
-    }
-
-    #[test]
-    fn a_resume_answers_without_any_signal_taken() {
-        let _signals = PROCESS_SIGCONT.lock().unwrap_or_else(|e| e.into_inner());
-        // No signal thread (nor a SIGCONT a Ctrl-Z could erase): answered at once, from what is pending.
-        let (p, _root) = test_proc("resume-pending", None);
+    fn suspend_coming_detects_early_reserved_and_pending_sigterm() {
+        let (p, _root) = test_proc("suspend-coming", None);
+        assert!(!p.suspend_coming());
+        *p.suspending.lock().unwrap() = Suspend::Suspending;
+        assert!(p.suspend_coming());
+        assert_eq!(p.resume_request().unwrap(), json!({"suspending": true}));
+        *p.suspending.lock().unwrap() = Suspend::Idle;
+        assert!(!p.suspend_coming());
+        p.early.lock().unwrap().push(libc::SIGTERM);
+        assert!(p.suspend_coming(), "queued at startup, still to be replayed");
+        assert_eq!(p.resume_request().unwrap(), json!({"suspending": true}));
+        p.early.lock().unwrap().clear();
         thread::spawn(move || {
             let set = crate::util::block_signals(&[libc::SIGTERM, libc::SIGTSTP]);
             unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGTSTP) };
-            let t = Instant::now();
-            assert!(p.ask_resume().is_some(), "a pending Ctrl-Z is no suspend");
+            assert!(!p.suspend_coming(), "a pending Ctrl-Z is no suspend");
             unsafe { libc::pthread_kill(libc::pthread_self(), libc::SIGTERM) };
-            assert!(p.ask_resume().is_none(), "a SIGTERM not yet taken");
-            assert!(t.elapsed() < Duration::from_secs(1));
+            assert!(p.suspend_coming(), "a SIGTERM not yet taken");
+            assert_eq!(p.resume_request().unwrap(), json!({"suspending": true}));
             while crate::util::take_signal(&set).is_some() {}
         })
         .join_within()
         .unwrap();
+    }
+
+    #[test]
+    fn stop_request_when_destroying_returns_suspending() {
+        let (p, _root) = test_proc("stop-destroying", Some("stop-destroying"));
+        // App exiting on its own sets `destroying` via `exit_with`: `stop` must wait
+        // for the process to finish exiting rather than failing with "is being destroyed".
+        p.destroying.store(4, Ordering::SeqCst);
+        let mut sink = Vec::new();
+        assert_eq!(p.stop_request(&mut sink).unwrap(), json!({"suspending": true, "name": "stop-destroying"}));
+        assert!(p.stop_asked.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn resume_request_refuses_when_leaving() {
+        let (p, _root) = test_proc("resume-leaving", Some("resume-leaving"));
+        p.leaving.store(true, Ordering::SeqCst);
+        let err = p.resume_request().unwrap_err();
+        assert!(err.to_string().contains("migrating away"), "{err}");
     }
 
     #[test]

@@ -5477,7 +5477,7 @@ def resume_readdress_fail():
         code, out = sh(B, n, "ip -4 -o addr show eth0")
         return code == 0 and ip in out and old_ip not in out
 
-    sigcont_failed = lambda: log(B, n).count("signal 18: vm ft-readdr runs, but setting its address")
+    sigcont_failed = lambda: log(B, n).count("resume: vm ft-readdr runs, but setting its address")
     for paused in (True, False):
         what = "held" if paused else "running"
         clear_log(B, n)

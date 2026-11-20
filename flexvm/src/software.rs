@@ -117,6 +117,15 @@ fn wait_for_mem_poll(ended: &AtomicBool, entry: &Mutex<Entry>, changed: &Condvar
     !ended.load(Ordering::SeqCst)
 }
 
+/// Record a management kill as `SIGINT`, wake waiters, and stop the engine processes.
+fn request_kill(ended: &AtomicBool, entry: &Mutex<Entry>, changed: &Condvar, processes: &qemu::Processes, interrupt: impl FnOnce(i32)) {
+    interrupt(libc::SIGINT);
+    ended.store(true, Ordering::SeqCst);
+    drop(entry.lock().unwrap());
+    changed.notify_all();
+    processes.stop();
+}
+
 /// Decide whether a software VM should plug another 2 MiB-aligned virtio-mem step.
 pub(crate) fn elastic_step(avail_mib: u64, total_mib: u64, base_mib: u32, plugged_mib: u64, max_mib: u32) -> Option<u64> {
     let cap = u64::from(max_mib);
@@ -791,11 +800,16 @@ impl Owner {
                     }
                     Ok(json!({"name":self.name.name,"signal":signal}))
                 }
+                "pause" => self.switch(true),
                 "resume" if self.suspended.load(Ordering::SeqCst) || self.entry.lock().unwrap().state == "suspending" => Ok(json!({"suspending":true})),
                 "resume" => self.switch(false),
                 "suspend" => {
                     terminal_reply = true;
                     self.suspend()
+                }
+                "kill" => {
+                    request_kill(&self.ended, &self.entry, &self.changed, &self.processes, crate::template::interrupt);
+                    Ok(json!({"name":self.name.name,"state":"killed"}))
                 }
                 "debug" if req["what"] == "status" => Ok(serde_json::to_value(&*self.entry.lock().unwrap())?),
                 op => bail!("software VM operation {op:?} is not implemented"),
@@ -1383,5 +1397,26 @@ mod tests {
         assert!(start.elapsed() < Duration::from_millis(500), "mem_watcher wait should wake immediately on shutdown");
         // Already ended returns false without waiting.
         assert!(!wait_for_mem_poll(&ended, &entry, &changed, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn request_kill_records_sigint_and_wakes_waiters() {
+        let ended = Arc::new(AtomicBool::new(false));
+        let entry = Arc::new(Mutex::new(Entry::default()));
+        let changed = Arc::new(Condvar::new());
+        let processes = qemu::Processes::default();
+        let recorded = std::sync::atomic::AtomicI32::new(0);
+
+        let (e, m, c) = (ended.clone(), entry.clone(), changed.clone());
+        let start = Instant::now();
+        let handle = std::thread::spawn(move || wait_for_mem_poll(&e, &m, &c, Duration::from_secs(5)));
+
+        std::thread::sleep(Duration::from_millis(20));
+        request_kill(&ended, &entry, &changed, &processes, |sig| recorded.store(sig, Ordering::SeqCst));
+
+        assert_eq!(recorded.load(Ordering::SeqCst), libc::SIGINT);
+        assert!(ended.load(Ordering::SeqCst));
+        assert!(!handle.join().unwrap());
+        assert!(start.elapsed() < Duration::from_millis(500), "request_kill must wake waiters immediately");
     }
 }
