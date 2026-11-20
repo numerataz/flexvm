@@ -371,17 +371,20 @@ jobs:
             local engine=$1
             local cpus=$2
             local output="$RUNNER_TEMP/arm-parent-firecracker-$engine-$cpus"
+            if [ "${3-}" = --freeze ]; then output="$output-freeze"; fi
+            shift 2
             sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% \
               strace -f -e trace=file -o "$output.strace" python3 scripts/compat/arm-parent-firecracker.py \
               --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64" --kernel "$artifacts/vmlinux" \
               --bundle "$bundle" --firecracker "$RUNNER_TEMP/$stock" --engine "$engine" --vcpus "$cpus" \
-              --output "$output" || { cat "$output/guest.log" >&2 || true; return 1; }
+              --output "$output" "$@" || { cat "$output/guest.log" >&2 || true; return 1; }
             if [ "$engine" = tcg ] && sudo grep -F '"/dev/kvm"' "$output.strace"; then return 1; fi
             cat "$output/report.json"
           }
           for cpus in 1 2; do
             run_arm_parent tcg "$cpus"
           done
+          run_arm_parent tcg 2 --freeze
           if sudo "$bundle/native-worker" --ipa-bits >/dev/null 2>&1; then
             for cpus in 1 2; do
               run_arm_parent kvm "$cpus"
