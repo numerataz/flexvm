@@ -156,7 +156,7 @@ jobs:
       - name: Cache fixed x86 software CPU engine
         if: matrix.arch == 'x86_64'
         id: software-qemu
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/software-qemu
           key: software-qemu-x86_64-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch', 'scripts/compat/parent-kvm/slot-map.h') }}
@@ -169,6 +169,12 @@ jobs:
           fi
           sudo ln -sf "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" /usr/local/bin/qemu-system-x86_64
           sudo qemu-system-x86_64 --version
+      - name: Save verified software CPU engine
+        if: matrix.arch == 'x86_64' && steps.software-qemu.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/software-qemu
+          key: ${{ steps.software-qemu.outputs.cache-primary-key }}
       - name: Shared RAM across separate software CPU workers
         if: matrix.arch == 'x86_64'
         run: |
@@ -290,7 +296,7 @@ jobs:
           sudo apt-get install -y -q --no-install-recommends ${{ matrix.qemu }} strace build-essential flex bison bc libelf-dev libssl-dev dwarves xz-utils kmod pkg-config zlib1g-dev libzstd-dev
       - name: Cache fixed software CPU engine
         id: software-qemu
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/software-qemu
           key: software-qemu-${{ matrix.arch }}-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch', 'scripts/compat/parent-kvm/slot-map.h') }}
@@ -306,6 +312,12 @@ jobs:
             sudo ln -sf "$engine" /usr/local/bin/qemu-system-x86_64
           fi
           "$engine" --version
+      - name: Save verified software CPU engine
+        if: steps.software-qemu.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/software-qemu
+          key: ${{ steps.software-qemu.outputs.cache-primary-key }}
       - name: x86 TCG worker resumes from a checkpoint backed by parent RAM
         if: matrix.arch == 'x86_64'
         run: |
@@ -708,7 +720,7 @@ jobs:
       - name: Cache fixed x86 software CPU engine
         if: matrix.arch == 'x86_64'
         id: software-qemu
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/software-qemu
           key: software-qemu-x86_64-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch', 'scripts/compat/parent-kvm/slot-map.h') }}
@@ -721,6 +733,12 @@ jobs:
           fi
           sudo ln -sf "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" /usr/local/bin/qemu-system-x86_64
           sudo qemu-system-x86_64 --version
+      - name: Save verified software CPU engine
+        if: matrix.arch == 'x86_64' && steps.software-qemu.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/software-qemu
+          key: ${{ steps.software-qemu.outputs.cache-primary-key }}
       - name: Kernel artifact directory
         run: sudo install -d -o "$(id -u)" -g "$(id -g)" "$RUNNER_TEMP/software-state/artifacts"
       - name: Matching kernel runtime artifacts
