@@ -272,15 +272,10 @@ where
     empty(StatusCode::NO_CONTENT)
 }
 
-/// `DELETE /containers/{id}?force`: `flexvm rm [-f]`; a created container's record alone.
-pub async fn remove(api: &Arc<Api>, key: &str, q: Query) -> Reply {
-    if q.flag("link", false)? {
-        return Err(Error::unsupported("links"));
-    }
-    let force = q.flag("force", false)?;
-    let (name, v) = found(api, key).await?;
+/// Removes an already-resolved container: `flexvm rm [-f]` if it is a VM, then its created record.
+async fn remove_vm(api: &Arc<Api>, name: String, v: &Value, force: bool) -> Result<(), Error> {
     if v["state"] != "created" {
-        if state(&v).running && !force {
+        if state(v).running && !force {
             return Err(Error::conflict(format!(
                 "cannot remove container \"/{name}\": container is running: stop the container before removing or force remove"
             )));
@@ -296,7 +291,17 @@ pub async fn remove(api: &Arc<Api>, key: &str, q: Query) -> Reply {
         create::remove(api, &name);
         Ok(())
     })
-    .await?;
+    .await
+}
+
+/// `DELETE /containers/{id}?force`: `flexvm rm [-f]`; a created container's record alone.
+pub async fn remove(api: &Arc<Api>, key: &str, q: Query) -> Reply {
+    if q.flag("link", false)? {
+        return Err(Error::unsupported("links"));
+    }
+    let force = q.flag("force", false)?;
+    let (name, v) = found(api, key).await?;
+    remove_vm(api, name, &v, force).await?;
     empty(StatusCode::NO_CONTENT)
 }
 
@@ -307,31 +312,32 @@ pub async fn prune(api: &Arc<Api>, q: Query) -> Reply {
     if let Some((k, _)) = filters.iter().find(|(k, _)| !matches!(k.as_str(), "label" | "label!")) {
         return Err(Error::unsupported(format!("prune filter {k:?}")));
     }
-    let vms = all(api).await?;
     let candidates = api
         .blocking(move |api| {
+            let vms = create::merge(api);
             Ok(vms
                 .into_iter()
                 .filter(|v| !state(v).running)
-                .map(|v| {
-                    let labels = super::containers::Detail::read(api, &v).labels;
-                    (v, labels)
+                .filter(|v| {
+                    if filters.is_empty() {
+                        return true;
+                    }
+                    let labels = super::containers::Detail::read(api, v).labels;
+                    let has = |l: &str| match l.split_once('=') {
+                        Some((k, val)) => labels.get(k).and_then(Value::as_str) == Some(val),
+                        None => labels.contains_key(l),
+                    };
+                    filters.iter().all(|(k, l)| (k == "label") == has(l))
                 })
                 .collect::<Vec<_>>())
         })
         .await?;
     let mut deleted = Vec::new();
-    for (v, labels) in candidates {
-        let has = |l: &str| match l.split_once('=') {
-            Some((k, val)) => labels.get(k).and_then(Value::as_str) == Some(val),
-            None => labels.contains_key(l),
-        };
-        if !filters.iter().all(|(k, l)| (k == "label") == has(l)) {
-            continue;
-        }
-        let name = v["name"].as_str().unwrap_or_default();
-        if remove(api, name, Query::parse("")).await.is_ok() {
-            deleted.push(id_of(name));
+    for v in candidates {
+        let Some(name) = v["name"].as_str().map(String::from) else { continue };
+        let id = id_of(&name);
+        if remove_vm(api, name, &v, false).await.is_ok() {
+            deleted.push(id);
         }
     }
     ok(&json!({"ContainersDeleted": deleted, "SpaceReclaimed": 0}))
@@ -763,5 +769,22 @@ mod tests {
         assert!(create::load(&api, "overridden").is_some());
         prune(&api, Query::parse(r#"filters={"label!":["keep=image"]}"#)).await.unwrap();
         assert!(create::load(&api, "overridden").is_none());
+    }
+
+    #[tokio::test]
+    async fn prune_without_filters_removes_all_created_containers() {
+        let (_d, api) = fixture();
+        for name in ["c1", "c2", "c3"] {
+            let r = create::translate(&api, name, &json!({"Image": "image"})).unwrap();
+            create::store(&api, &r, true).unwrap();
+        }
+        let response = prune(&api, Query::parse("")).await.unwrap();
+        let body: Value = serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let deleted = body["ContainersDeleted"].as_array().unwrap();
+        assert_eq!(deleted.len(), 3);
+        for name in ["c1", "c2", "c3"] {
+            assert!(create::load(&api, name).is_none());
+            assert!(deleted.contains(&json!(id_of(name))));
+        }
     }
 }

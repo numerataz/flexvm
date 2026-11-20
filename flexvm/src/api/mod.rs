@@ -90,9 +90,15 @@ pub struct Api {
     pub globals: Vec<String>,
     /// Both names of each active rename, mapped to their counterpart.
     pub renames: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Cached parsed image configs keyed by blob path, validated against file metadata.
+    pub(crate) image_configs: std::sync::Mutex<std::collections::HashMap<PathBuf, images::CachedConfig>>,
 }
 
 impl Api {
+    pub fn new(host: Host, paths: Paths, globals: Vec<String>) -> Self {
+        Self { host, paths, globals, renames: Default::default(), image_configs: Default::default() }
+    }
+
     /// `f` on a blocking thread: the records are read with the commands' own (blocking) code.
     pub async fn blocking<T: Send + 'static>(self: &Arc<Self>, f: impl FnOnce(&Api) -> Result<T> + Send + 'static) -> std::result::Result<T, Error> {
         let api = self.clone();
@@ -117,7 +123,7 @@ pub fn main(host: Host, paths: Paths, globals: Vec<String>, socket: Option<&str>
         crate::log!("flexvm api: serving the Docker Engine API (v{API_VERSION}) on unix://{}", at.display());
     }
     listener.set_nonblocking(true)?;
-    let api = Arc::new(Api { host, paths, globals, renames: Default::default() });
+    let api = Arc::new(Api::new(host, paths, globals));
     let rt = tokio::runtime::Builder::new_multi_thread().worker_threads(2).max_blocking_threads(64).enable_all().build()?;
     rt.block_on(async { serve(tokio::net::UnixListener::from_std(listener)?, api).await })
 }

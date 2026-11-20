@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use hyper::body::Incoming;
 use hyper::header::{HeaderValue, CONTENT_TYPE};
 use hyper::{Request, Response, StatusCode};
+use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
@@ -178,7 +179,7 @@ pub struct Detail {
 impl Detail {
     pub fn read(api: &Api, vm: &Value) -> Detail {
         let name = vm["name"].as_str().unwrap_or_default().to_string();
-        let record: Option<super::create::Record> = serde_json::from_value(vm["docker"].clone()).ok();
+        let record: Option<super::create::Record> = vm.get("docker").filter(|v| !v.is_null()).and_then(|v| super::create::Record::deserialize(v).ok());
         let created = vm["state"] == "created";
         // A created container has no VM yet: what it will run is its record's.
         let (described, meta) = match (&record, created) {
@@ -196,16 +197,16 @@ impl Detail {
         let config = described["config"].clone();
         let image_id = config["template_id"].as_str().or(vm["template_id"].as_str()).unwrap_or_default().to_string();
         let image_config = meta.as_ref().and_then(|m| images::config(api, m));
-        let argv: Vec<String> = meta.as_ref().and_then(|m| m.image.as_ref()).map(|i| i.argv.clone()).unwrap_or_default();
+        let argv = meta.as_ref().and_then(|m| m.image.as_ref()).map_or(&[][..], |i| i.argv.as_slice());
         let run = &config["run"];
-        let (mut entrypoint, mut cmd, _) = images::app(&argv, image_config.as_ref());
+        let (mut entrypoint, mut cmd, _) = images::app(argv, image_config.as_deref());
         // `--entrypoint` is the app's whole argv; `run IMAGE CMD`'s command is a shell's.
         if run["entrypoint"].is_array() {
             (entrypoint, cmd) = (images::strings(&run["entrypoint"]), Vec::new());
         } else if let Some(c) = config["cmd"].as_str() {
             (entrypoint, cmd) = (Vec::new(), vec!["sh".into(), "-c".into(), c.into()]);
         }
-        let ic = image_config.unwrap_or(Value::Null);
+        let ic = image_config.as_deref().unwrap_or(&Value::Null);
         let mut env = images::strings(&ic["Env"]);
         let overrides = record.as_ref().filter(|_| created).map(|r| &r.config);
         for kv in images::strings(&run["env"]).into_iter().chain(overrides.into_iter().flat_map(|c| images::strings(&c["Env"])).filter(|kv| kv.contains('='))) {
@@ -214,8 +215,8 @@ impl Detail {
             env.push(kv);
         }
         let mut labels = ic["Labels"].as_object().cloned().unwrap_or_default();
-        if let Some(r) = &record {
-            labels.extend(r.config["Labels"].as_object().cloned().unwrap_or_default());
+        if let Some(extra) = record.as_ref().and_then(|r| r.config["Labels"].as_object()) {
+            labels.extend(extra.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
         if let Some(config) = overrides {
             (entrypoint, cmd) = super::create::app(config, entrypoint, cmd);
@@ -262,7 +263,7 @@ impl Detail {
     }
 
     fn ports(&self) -> Vec<crate::ports::Port> {
-        serde_json::from_value(self.config["ports"].clone()).unwrap_or_default()
+        self.config.get("ports").and_then(|v| Vec::deserialize(v).ok()).unwrap_or_default()
     }
 
     fn bindings(&self) -> Vec<(crate::ports::Port, &'static str, String)> {
@@ -494,13 +495,13 @@ pub async fn list(api: &Arc<Api>, q: Query) -> Reply {
             Ok(vms.iter().filter(|v| all || status_filtered || state(v).running).map(|v| Detail::read(api, v)).collect::<Vec<_>>())
         })
         .await?;
+    // Values of one key: any of them; keys: each of them.
+    let mut keys: Vec<&str> = filters.iter().map(|(k, _)| k.as_str()).collect();
+    keys.dedup();
     let mut out = Vec::new();
     for d in &details {
         let mut keep = all || d.state.running || status_filtered;
-        // Values of one key: any of them; keys: each of them.
-        let mut keys: Vec<&str> = filters.iter().map(|(k, _)| k.as_str()).collect();
-        keys.dedup();
-        for key in keys {
+        for &key in &keys {
             let mut any = false;
             for (_, v) in filters.iter().filter(|(k, _)| k == key) {
                 any |= matches(d, key, v)?;
@@ -780,7 +781,7 @@ mod tests {
     fn fixture() -> (crate::test_util::TempDir, Arc<Api>) {
         let d = crate::test_util::TempDir::new("api-containers");
         let host = crate::host::Host::open(&d.join("state"), &d.join("run")).unwrap();
-        let api = Arc::new(Api { host, paths: crate::template::Paths::new(&d.join("state")), globals: vec![], renames: Default::default() });
+        let api = Arc::new(Api::new(host, crate::template::Paths::new(&d.join("state")), vec![]));
         (d, api)
     }
 
