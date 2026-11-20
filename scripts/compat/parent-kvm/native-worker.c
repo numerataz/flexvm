@@ -95,11 +95,12 @@ int main(int argc, char **argv)
         supported_cpuid();
         return 0;
     }
-    check(argc >= 7 && (argc - 4) % 3 == 0 &&
-          (argc - 4) / 3 <= PVKVM_MAX_SLOTS, "expected control, outer RAM, vCPU count, and slot triples");
+    check(argc >= 8 && (argc - 5) % 3 == 0 &&
+          (argc - 5) / 3 <= PVKVM_MAX_SLOTS, "expected control, outer RAM, vCPU count, irqchip, and slots");
     int control = (int)number(argv[1], INT_MAX);
     int outer_ram = (int)number(argv[2], INT_MAX);
     unsigned int cpu_count = number(argv[3], PVKVM_MAX_CPUS);
+    bool irqchip = number(argv[4], 1);
     check(cpu_count > 0, "at least one native vCPU");
 
     int kvm = host_kvm();
@@ -107,7 +108,9 @@ int main(int argc, char **argv)
     check(bytes >= (int)sizeof(struct kvm_run), "KVM run mapping size");
     int vm = ioctl(kvm, KVM_CREATE_VM, 0);
     check(vm >= 0, "create host VM");
-    for (int arg = 4; arg < argc; arg += 3) {
+    if (irqchip)
+        check(ioctl(vm, KVM_CREATE_IRQCHIP, 0) == 0, "create the host irqchip");
+    for (int arg = 5; arg < argc; arg += 3) {
         int layout = (int)number(argv[arg], INT_MAX);
         uint64_t gpa = number(argv[arg + 1], UINT32_MAX);
         uint32_t id = number(argv[arg + 2], PVKVM_MAX_SLOTS - 1);
@@ -191,6 +194,14 @@ int main(int argc, char **argv)
             check(ioctl(cpu, KVM_GET_SREGS, &segments) == 0, "read host special registers after exit");
             check(write(control, &segments, sizeof(segments)) == (ssize_t)sizeof(segments),
                   "return host special registers to the parent");
+            continue;
+        }
+        if (received == 2 + sizeof(struct kvm_irq_level) && request[0] == 'L') {
+            struct kvm_irq_level irq;
+            memcpy(&irq, request + 2, sizeof(irq));
+            check(irqchip && irq.irq < PVKVM_GSI_COUNT && irq.level <= 1 &&
+                  ioctl(vm, KVM_IRQ_LINE, &irq) == 0, "set a host IRQ line");
+            check(write(control, "L", 1) == 1, "acknowledge host IRQ line state");
             continue;
         }
         if (received == 2 && request[0] == 'F') {
