@@ -93,3 +93,13 @@ d0368780d1b0daf7a56a1543b88d5e7b3c3ee7fdadf0ba3dc83a8f3593af7572 https://github.
 b82cf336276ca033cd799a92539273c7dd395c59194957d3081634540bb62705 https://github.com/numerataz/flexvm/releases/download/v0.5.5/kernel-modules-aarch64.tar.gz
 d9db20e2d68d2c3e450c6f5753439cc688a33530044e94363fb59f79198b41e4 https://github.com/numerataz/flexvm/releases/download/v0.5.5/kernel-sdk-aarch64.tar.gz
 b7da72f7a3312152eabf251c43ec11b63f7e287680f7b37c65980297bc18d183 https://github.com/numerataz/flexvm/releases/download/v0.5.5/inputs-aarch64.txt
+126a17eb75ecaa9972be12705ac8c2b65f5a10d36328995b48984fe1d779e4cb https://github.com/numerataz/flexvm/releases/download/v0.5.6/firecracker
+6d90c81b738e0276bc683fcc6d8b8a0d93c26119726118d42d629136f1ec45fd https://github.com/numerataz/flexvm/releases/download/v0.5.6/vmlinux
+3505d304f552c7a62d2cda930ef144338c07f7bd22643629cd17f496459b77ea https://github.com/numerataz/flexvm/releases/download/v0.5.6/kernel-modules.tar.gz
+c9621988d9ad6f7eafe5015d5d5a1644afe28ee3b022e3a17a2ffc058173908e https://github.com/numerataz/flexvm/releases/download/v0.5.6/kernel-sdk.tar.gz
+561ca07ba1b16290e4f0fe64fb9f08375d15ab94248ff08fd27cb1d584524091 https://github.com/numerataz/flexvm/releases/download/v0.5.6/inputs.txt
+85e3023307d9624176d6920a365f7f7e1e7a70c0d59b4ea1eca1cee6b21f1f56 https://github.com/numerataz/flexvm/releases/download/v0.5.6/firecracker-aarch64
+e43013b75c67b69c73a2b4ea93ab941ea33c89ef2acc964103ce5f7410deb6b4 https://github.com/numerataz/flexvm/releases/download/v0.5.6/vmlinux-aarch64
+13832675e87c023901efe226644f7a453ff7c837086621840c9563fa5875a4d5 https://github.com/numerataz/flexvm/releases/download/v0.5.6/kernel-modules-aarch64.tar.gz
+3f83a37e8cd00d0e9f76c38021df240319136c010f38ae00496c418f7827c515 https://github.com/numerataz/flexvm/releases/download/v0.5.6/kernel-sdk-aarch64.tar.gz
+c9bf9c8d1b7ef6755d72c3895cb6dc9f33a596b0e179549d1007b500748c7cd6 https://github.com/numerataz/flexvm/releases/download/v0.5.6/inputs-aarch64.txt

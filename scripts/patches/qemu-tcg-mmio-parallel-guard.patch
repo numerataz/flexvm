@@ -1,0 +1,20 @@
+--- a/hw/char/debugcon.c
++++ b/hw/char/debugcon.c
+@@ -608,6 +608,8 @@
+     if (s->mmio_base) {
+         memory_region_init_io(&s->mmio, OBJECT(dev), &debugcon_mmio_ops, s,
+                               "flexvm-mmio", DEBUGCON_MMIO_SIZE);
++        /* Lanes have separate state when a read drops the BQL. */
++        s->mmio.disable_reentrancy_guard = s->parallel;
+         memory_region_add_subregion(get_system_memory(), s->mmio_base,
+                                     &s->mmio);
+     }
+@@ -758,6 +760,8 @@
+ 
+     memory_region_init_io(&lane->mmio, OBJECT(dev), &debugcon_mmio_ops,
+                           lane, "flexvm-mmio", worker->size);
++    /* Lanes have separate state when a read drops the BQL. */
++    lane->mmio.disable_reentrancy_guard = lane->parallel;
+     memory_region_add_subregion_overlap(get_system_memory(), lane->mmio_base,
+                                         &lane->mmio, 1);
+ }

@@ -111,6 +111,8 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      experimental foreground QEMU TCG execution without host KVM;
                                      defaults to the installed, verified kernel and runtime modules;
                                      --qemu PATH, --vsock-backend PATH, --mem MIB, --vcpus N,
+                                     --parent-kvm-bundle DIR enables a parent-owned /dev/kvm (x86_64, aarch64)
+                                     --parent-kvm-engine auto|tcg|kvm, --parent-kvm-mem MIB (max 256)
                                      --timeout SECS (boot only); image env/workdir/user options apply
                                      --disk VOLUME attaches a managed data disk (repeatable, requires --name)
   flexvm ps [-a] [-q] [--json] [-f, --filter KEY=VALUE]... [--format FORMAT]
@@ -526,7 +528,11 @@ const NAMES: usize = usize::MAX;
 
 /// Each command's words (itself included) at most, and its flags besides `GLOBAL`.
 const COMMANDS: &[(&str, usize, &[&str])] = &[
-    ("software", 2, &["name", "kernel", "qemu", "control", "vsock-backend", "mem", "vcpus", "timeout", "disk"]),
+    (
+        "software",
+        2,
+        &["name", "kernel", "qemu", "control", "vsock-backend", "mem", "vcpus", "timeout", "disk", "parent-kvm-bundle", "parent-kvm-engine", "parent-kvm-mem"],
+    ),
     (
         "run",
         2,
@@ -2446,6 +2452,22 @@ fn software(args: &Args, src: &str) -> Result<i32> {
     if args.has("disk") && !args.has("name") {
         bail!("--disk requires a named software VM");
     }
+    let mem_mib = args.parse_or("mem", 512)?;
+    let parent_kvm = if let Some(bundle) = args.get("parent-kvm-bundle") {
+        if args.get("name").is_some() && !cfg!(target_arch = "aarch64") {
+            bail!("named parent KVM VMs require an ARM TCG worker with hierarchy pause support");
+        }
+        Some(qemu::ParentKvm {
+            bundle: std::fs::canonicalize(bundle).map_err(|error| format!("parent KVM bundle {bundle:?}: {error}"))?,
+            engine: args.get("parent-kvm-engine").unwrap_or("auto").into(),
+            child_mem_mib: args.parse_or("parent-kvm-mem", mem_mib.min(256))?,
+        })
+    } else {
+        if args.has("parent-kvm-engine") || args.has("parent-kvm-mem") {
+            bail!("--parent-kvm-engine and --parent-kvm-mem require --parent-kvm-bundle");
+        }
+        None
+    };
     if args.get("name").is_some() {
         // A shell's background SIGINT/SIGQUIT disposition must not disable the
         // normal management kill operation on a named VM.
@@ -2455,11 +2477,10 @@ fn software(args: &Args, src: &str) -> Result<i32> {
         }
         util::block_signals(&[libc::SIGTSTP, libc::SIGCONT, libc::SIGTERM]);
     }
-    let control = match args.get("control").unwrap_or(if args.get("name").is_some() || args.get("boot").is_some_and(|boot| boot != "app") {
-        "serial"
-    } else {
-        "vsock"
-    }) {
+    let control = match args
+        .get("control")
+        .unwrap_or(if parent_kvm.is_some() || args.get("name").is_some() || args.get("boot").is_some_and(|boot| boot != "app") { "serial" } else { "vsock" })
+    {
         "vsock" => qemu::Control::Vsock,
         "serial" => qemu::Control::Serial,
         other => bail!("unsupported software control transport {other:?}: use vsock or serial"),
@@ -2483,9 +2504,10 @@ fn software(args: &Args, src: &str) -> Result<i32> {
         kernel,
         qemu: args.get("qemu").map(String::from).unwrap_or_else(|| format!("qemu-system-{}", std::env::consts::ARCH)),
         vsock_backend: args.get("vsock-backend").unwrap_or("vhost-device-vsock").into(),
-        mem_mib: args.parse_or("mem", 512)?,
+        mem_mib,
         vcpus: args.parse_or("vcpus", 1)?,
         boot_timeout: Duration::from_secs(args.parse_or("timeout", 90)?),
+        parent_kvm,
     };
     config.validate()?;
     let processes = std::sync::Arc::new(qemu::Processes::default());
@@ -2544,7 +2566,7 @@ fn software(args: &Args, src: &str) -> Result<i32> {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-    machine.exec(meta.argv, |kind, bytes| {
+    let result = machine.exec(meta.argv, |kind, bytes| {
         if kind == guest::FRAME_STDERR {
             let mut out = std::io::stderr().lock();
             out.write_all(bytes)?;
@@ -2555,6 +2577,14 @@ fn software(args: &Args, src: &str) -> Result<i32> {
             out.flush()?;
         }
         Ok(())
+    });
+    result.map_err(|error| {
+        if config.parent_kvm.is_some() {
+            processes.stop();
+            format!("{error}\n{}", machine.diagnostics()).into()
+        } else {
+            error
+        }
     })
 }
 

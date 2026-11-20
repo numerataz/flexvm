@@ -337,6 +337,7 @@ impl Owner {
     }
 
     fn suspend(&self) -> Result<Value> {
+        self.machine.checkpoint_supported()?;
         if !self.reset_capable {
             bail!("software suspend requires a current serial guest agent");
         }
@@ -576,6 +577,9 @@ struct Resume {
 }
 
 pub fn run(host: Host, name: NameLock, machine: qemu::Machine, processes: Arc<qemu::Processes>, config: &qemu::Config, meta: &image::ImageMeta) -> Result<i32> {
+    if config.parent_kvm.is_some() && !machine.has_parent_fence() {
+        bail!("named parent KVM VMs require an ARM TCG worker with hierarchy pause support");
+    }
     serve(host, name, machine, processes, config, meta, None)
 }
 
@@ -837,6 +841,7 @@ fn restore_config(manifest: &software_state::Manifest) -> qemu::Config {
         mem_mib: manifest.memory_mib,
         vcpus: manifest.vcpus,
         boot_timeout: Duration::from_secs(120),
+        parent_kvm: None,
     }
 }
 

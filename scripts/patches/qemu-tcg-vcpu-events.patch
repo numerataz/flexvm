@@ -1,0 +1,384 @@
+--- a/hw/intc/apic.c
++++ b/hw/intc/apic.c
+@@ -227,2 +227,13 @@
+
++static void apic_deliver_init(APICCommonState *apic)
++{
++    CPUX86State *env = &apic->cpu->env;
++
++    if (apic->flexvm_mp_managed && (env->hflags & HF_SMM_MASK)) {
++        env->flexvm_events.latched_init = true;
++    } else {
++        cpu_interrupt(CPU(apic->cpu), CPU_INTERRUPT_INIT);
++    }
++}
++
+ static void apic_bus_deliver(const uint32_t *deliver_bitmask,
+@@ -271,6 +282,3 @@
+             /* normal INIT IPI sent to processors */
+-            foreach_apic(apic_iter, deliver_bitmask,
+-                         cpu_interrupt(CPU(apic_iter->cpu),
+-                                       CPU_INTERRUPT_INIT)
+-            );
++            foreach_apic(apic_iter, deliver_bitmask, apic_deliver_init(apic_iter));
+             return;
+--- a/qapi/misc-i386.json
++++ b/qapi/misc-i386.json
+@@ -919 +919,26 @@
+   'returns': 'FlexvmX86XsaveRecord', 'features': [ 'unstable' ] }
++
++##
++# @FlexvmX86VcpuEvents:
++#
++# @record: Hex-encoded Linux KVM vCPU event record.
++# @status: Zero on success or a negative Linux errno.
++##
++{ 'struct': 'FlexvmX86VcpuEvents', 'data': { 'record': 'str', 'status': 'int32' } }
++
++##
++# @x-flexvm-access-x86-vcpu-events:
++#
++# Read or restore events on a stopped x86 vCPU.
++#
++# @cpu-index: Index of the stopped vCPU.
++# @irqchip: Whether the client created an in-kernel irqchip.
++# @record: New x86 KVM event record, when writing.
++#
++# Features:
++#
++# @unstable: Experimental FlexVM worker protocol.
++##
++{ 'command': 'x-flexvm-access-x86-vcpu-events',
++  'data': { 'cpu-index': 'uint16', 'irqchip': 'bool', '*record': 'str' },
++  'returns': 'FlexvmX86VcpuEvents', 'features': [ 'unstable' ] }
+--- a/stubs/monitor-i386-flexvm.c
++++ b/stubs/monitor-i386-flexvm.c
+@@ -126 +126,10 @@
+ }
++
++FlexvmX86VcpuEvents *qmp_x_flexvm_access_x86_vcpu_events(uint16_t cpu_index,
++                                                        bool irqchip,
++                                                        const char *record,
++                                                        Error **errp)
++{
++    error_setg(errp, "FlexVM vCPU events require an x86 worker");
++    return NULL;
++}
+--- a/target/i386/cpu.c
++++ b/target/i386/cpu.c
+@@ -9821,2 +9821,5 @@
+     }
++    if (interrupt_request & CPU_INTERRUPT_FLEXVM_EVENTS) {
++        return CPU_INTERRUPT_FLEXVM_EVENTS;
++    }
+
+--- a/target/i386/cpu.h
++++ b/target/i386/cpu.h
+@@ -1419,2 +1419,3 @@
+ /* i386-specific interrupt pending bits.  */
++#define CPU_INTERRUPT_FLEXVM_EVENTS CPU_INTERRUPT_TGT_EXT_0
+ #define CPU_INTERRUPT_POLL      CPU_INTERRUPT_TGT_EXT_1
+@@ -2030,2 +2031,14 @@
+     target_ulong exception_next_eip;
++    struct {
++        uint32_t error_code;
++        uint8_t exception_vector;
++        uint8_t interrupt_vector;
++        uint8_t irq_shadow;
++        bool exception_injected;
++        bool exception_has_error;
++        bool interrupt_injected;
++        bool interrupt_soft;
++        bool nmi_injected;
++        bool latched_init;
++    } flexvm_events;
+     target_ulong dr[8]; /* debug registers; note dr4 and dr5 are unused */
+@@ -2868,2 +2881,3 @@
+
++void x86_flexvm_deliver_exception(X86CPU *cpu, unsigned int vector, bool has_error, uint32_t error_code);
+ void do_cpu_sipi(X86CPU *cpu);
+--- a/target/i386/monitor.c
++++ b/target/i386/monitor.c
+@@ -1444 +1444,148 @@
+ }
++
++#define FLEXVM_EVENT_NMI_PENDING 1
++#define FLEXVM_EVENT_SIPI_VECTOR 2
++#define FLEXVM_EVENT_SHADOW 4
++#define FLEXVM_EVENT_SMM 8
++#define FLEXVM_EVENT_READ_FLAGS (FLEXVM_EVENT_NMI_PENDING | FLEXVM_EVENT_SHADOW | FLEXVM_EVENT_SMM)
++
++typedef struct FlexvmEventAccess {
++    bool write;
++    bool irqchip;
++    int status;
++    uint8_t record[64];
++} FlexvmEventAccess;
++
++static void flexvm_event_signal(CPUState *cpu, int interrupt, bool enabled)
++{
++    if (enabled) {
++        cpu_interrupt(cpu, interrupt);
++    } else {
++        cpu_reset_interrupt(cpu, interrupt);
++    }
++}
++
++static void flexvm_write_vcpu_events(CPUState *cpu, FlexvmEventAccess *access)
++{
++    X86CPU *x86 = X86_CPU(cpu);
++    CPUX86State *env = &x86->env;
++    APICCommonState *apic = x86->apic_state;
++    const uint8_t *record = access->record;
++    uint32_t flags = ldl_le_p(record + 20);
++
++    if ((flags & ~(FLEXVM_EVENT_READ_FLAGS | FLEXVM_EVENT_SIPI_VECTOR)) ||
++        (record[0] && (record[1] > 31 || record[1] == EXCP02_NMI)) ||
++        ((flags & FLEXVM_EVENT_SMM) && apic && apic->flexvm_init_received &&
++         (record[24] || record[25]))) {
++        access->status = -EINVAL;
++        return;
++    }
++    env->flexvm_events.exception_injected = record[0];
++    env->flexvm_events.exception_vector = record[1];
++    env->flexvm_events.exception_has_error = record[2];
++    env->flexvm_events.error_code = ldl_le_p(record + 4);
++    env->flexvm_events.interrupt_injected = record[8];
++    env->flexvm_events.interrupt_vector = record[9];
++    env->flexvm_events.interrupt_soft = record[10];
++    env->flexvm_events.nmi_injected = record[12];
++    flexvm_event_signal(cpu, CPU_INTERRUPT_FLEXVM_EVENTS,
++                        record[0] || record[8] || record[12]);
++
++    if (flags & FLEXVM_EVENT_SHADOW) {
++        env->flexvm_events.irq_shadow = record[11] & 3;
++        env->hflags = (env->hflags & ~HF_INHIBIT_IRQ_MASK) |
++                      (env->flexvm_events.irq_shadow ? HF_INHIBIT_IRQ_MASK : 0);
++    }
++    if (flags & FLEXVM_EVENT_NMI_PENDING) {
++        flexvm_event_signal(cpu, CPU_INTERRUPT_NMI, record[13] != 0);
++    }
++    env->hflags2 = (env->hflags2 & ~HF2_NMI_MASK) | (record[14] ? HF2_NMI_MASK : 0);
++    if ((flags & FLEXVM_EVENT_SIPI_VECTOR) && access->irqchip && apic) {
++        apic->sipi_vector = ldl_le_p(record + 16) & 0xff;
++    }
++    if (flags & FLEXVM_EVENT_SMM) {
++        env->hflags = (env->hflags & ~HF_SMM_MASK) | (record[24] ? HF_SMM_MASK : 0);
++        env->hflags2 = (env->hflags2 & ~HF2_SMM_INSIDE_NMI_MASK) |
++                       (record[24] && record[26] ? HF2_SMM_INSIDE_NMI_MASK : 0);
++        flexvm_event_signal(cpu, CPU_INTERRUPT_SMI, record[25] != 0);
++        /* The saved INIT becomes a deliverable event after RSM. */
++        env->flexvm_events.latched_init = access->irqchip && record[24] && record[27];
++        if (access->irqchip) {
++            flexvm_event_signal(cpu, CPU_INTERRUPT_INIT, !record[24] && record[27]);
++        }
++    }
++}
++
++static void flexvm_access_vcpu_events(CPUState *cpu, run_on_cpu_data data)
++{
++    CPUX86State *env = &X86_CPU(cpu)->env;
++    FlexvmEventAccess *access = data.host_ptr;
++    uint8_t *record = access->record;
++
++    if (access->write) {
++        flexvm_write_vcpu_events(cpu, access);
++        return;
++    }
++    /* The Linux KVM GET ABI suppresses software delivery and never returns a SIPI vector. */
++    record[0] = env->flexvm_events.exception_injected &&
++                env->flexvm_events.exception_vector != EXCP03_INT3 &&
++                env->flexvm_events.exception_vector != EXCP04_INTO;
++    record[1] = env->flexvm_events.exception_vector;
++    record[2] = env->flexvm_events.exception_has_error;
++    stl_le_p(record + 4, env->flexvm_events.error_code);
++    record[8] = env->flexvm_events.interrupt_injected && !env->flexvm_events.interrupt_soft;
++    record[9] = env->flexvm_events.interrupt_vector;
++    if (env->hflags & HF_INHIBIT_IRQ_MASK) {
++        record[11] = env->flexvm_events.irq_shadow ?: 3;
++    }
++    record[12] = env->flexvm_events.nmi_injected;
++    record[13] = cpu_test_interrupt(cpu, CPU_INTERRUPT_NMI);
++    record[14] = (env->hflags2 & HF2_NMI_MASK) != 0;
++    stl_le_p(record + 20, FLEXVM_EVENT_READ_FLAGS);
++    record[24] = (env->hflags & HF_SMM_MASK) != 0;
++    record[25] = cpu_test_interrupt(cpu, CPU_INTERRUPT_SMI);
++    record[26] = (env->hflags2 & HF2_SMM_INSIDE_NMI_MASK) != 0;
++    record[27] = access->irqchip && (env->flexvm_events.latched_init ||
++                                       cpu_test_interrupt(cpu, CPU_INTERRUPT_INIT));
++}
++
++FlexvmX86VcpuEvents *qmp_x_flexvm_access_x86_vcpu_events(uint16_t cpu_index,
++                                                        bool irqchip,
++                                                        const char *record,
++                                                        Error **errp)
++{
++    static const char hex[] = "0123456789abcdef";
++    CPUX86State *env = flexvm_stopped_cpu(cpu_index, errp);
++    FlexvmEventAccess access = {.write = record != NULL, .irqchip = irqchip};
++    FlexvmX86VcpuEvents *result;
++
++    if (!env) {
++        return NULL;
++    }
++    if (record) {
++        if (strlen(record) != 2 * sizeof(access.record)) {
++            error_setg(errp, "Invalid FlexVM vCPU event record size");
++            return NULL;
++        }
++        for (size_t i = 0; i < sizeof(access.record); i++) {
++            int high = g_ascii_xdigit_value(record[2 * i]);
++            int low = g_ascii_xdigit_value(record[2 * i + 1]);
++
++            if (high < 0 || low < 0) {
++                error_setg(errp, "Invalid hex in FlexVM vCPU events");
++                return NULL;
++            }
++            access.record[i] = (high << 4) | low;
++        }
++    }
++    run_on_cpu(CPU(env_archcpu(env)), flexvm_access_vcpu_events, RUN_ON_CPU_HOST_PTR(&access));
++    result = g_new0(FlexvmX86VcpuEvents, 1);
++    result->status = access.status;
++    result->record = g_malloc(2 * sizeof(access.record) + 1);
++    for (size_t i = 0; i < sizeof(access.record); i++) {
++        result->record[2 * i] = hex[access.record[i] >> 4];
++        result->record[2 * i + 1] = hex[access.record[i] & 15];
++    }
++    result->record[2 * sizeof(access.record)] = '\0';
++    return result;
++}
+--- a/target/i386/tcg/emit.c.inc
++++ b/target/i386/tcg/emit.c.inc
+@@ -4105,2 +4105,3 @@
+     gen_set_eflags(s, IF_MASK);
++    s->irq_shadow = 2; /* STI. */
+     s->base.is_jmp = DISAS_EOB_INHIBIT_IRQ;
+--- a/target/i386/tcg/seg_helper.c
++++ b/target/i386/tcg/seg_helper.c
+@@ -687,3 +687,3 @@
+                                    int error_code, unsigned int next_eip,
+-                                   int is_hw)
++                                   int is_hw, int error_slot)
+ {
+@@ -699,5 +699,6 @@
+
+-    has_error_code = 0;
+-    if (!is_int && !is_hw) {
+-        has_error_code = exception_has_error_code(intno);
++    if (error_slot >= 0) {
++        has_error_code = error_slot;
++    } else {
++        has_error_code = !is_int && !is_hw && exception_has_error_code(intno);
+     }
+@@ -951,3 +952,4 @@
+ static void do_interrupt64(CPUX86State *env, int intno, int is_int,
+-                           int error_code, target_ulong next_eip, int is_hw)
++                           int error_code, target_ulong next_eip, int is_hw,
++                           int error_slot)
+ {
+@@ -962,5 +964,6 @@
+
+-    has_error_code = 0;
+-    if (!is_int && !is_hw) {
+-        has_error_code = exception_has_error_code(intno);
++    if (error_slot >= 0) {
++        has_error_code = error_slot;
++    } else {
++        has_error_code = !is_int && !is_hw && exception_has_error_code(intno);
+     }
+@@ -1191,4 +1194,5 @@
+  */
+-void do_interrupt_all(X86CPU *cpu, int intno, int is_int,
+-                      int error_code, target_ulong next_eip, int is_hw)
++static void do_interrupt_with_error_slot(X86CPU *cpu, int intno, int is_int,
++                                         int error_code, target_ulong next_eip,
++                                         int is_hw, int error_slot)
+ {
+@@ -1239,3 +1243,3 @@
+         if (env->hflags & HF_LMA_MASK) {
+-            do_interrupt64(env, intno, is_int, error_code, next_eip, is_hw);
++            do_interrupt64(env, intno, is_int, error_code, next_eip, is_hw, error_slot);
+         } else
+@@ -1244,3 +1248,3 @@
+             do_interrupt_protected(env, intno, is_int, error_code, next_eip,
+-                                   is_hw);
++                                   is_hw, error_slot);
+         }
+@@ -1271,2 +1275,15 @@
+
++void do_interrupt_all(X86CPU *cpu, int intno, int is_int,
++                      int error_code, target_ulong next_eip, int is_hw)
++{
++    do_interrupt_with_error_slot(cpu, intno, is_int, error_code, next_eip, is_hw, -1);
++}
++
++#ifndef CONFIG_USER_ONLY
++void x86_flexvm_deliver_exception(X86CPU *cpu, unsigned int vector, bool has_error, uint32_t error_code)
++{
++    do_interrupt_with_error_slot(cpu, vector, 0, error_code, cpu->env.eip, 0, has_error);
++}
++#endif
++
+ void do_interrupt_x86_hardirq(CPUX86State *env, int intno, int is_hw)
+--- a/target/i386/tcg/system/seg_helper.c
++++ b/target/i386/tcg/system/seg_helper.c
+@@ -164,2 +164,28 @@
+
++static void x86_flexvm_inject_event(X86CPU *cpu)
++{
++    CPUX86State *env = &cpu->env;
++
++    if (env->flexvm_events.exception_injected) {
++        env->flexvm_events.exception_injected = false;
++        x86_flexvm_deliver_exception(cpu, env->flexvm_events.exception_vector,
++                                     env->flexvm_events.exception_has_error,
++                                     env->flexvm_events.error_code);
++    } else if (env->flexvm_events.nmi_injected) {
++        env->flexvm_events.nmi_injected = false;
++        env->hflags2 |= HF2_NMI_MASK;
++        do_interrupt_x86_hardirq(env, EXCP02_NMI, 1);
++    } else if (env->flexvm_events.interrupt_injected) {
++        bool soft = env->flexvm_events.interrupt_soft;
++
++        env->flexvm_events.interrupt_injected = false;
++        do_interrupt_all(cpu, env->flexvm_events.interrupt_vector, soft,
++                         0, env->eip, !soft);
++    }
++    if (!env->flexvm_events.exception_injected && !env->flexvm_events.interrupt_injected &&
++        !env->flexvm_events.nmi_injected) {
++        cpu_reset_interrupt(CPU(cpu), CPU_INTERRUPT_FLEXVM_EVENTS);
++    }
++}
++
+ bool x86_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
+@@ -187,2 +213,5 @@
+         break;
++    case CPU_INTERRUPT_FLEXVM_EVENTS:
++        x86_flexvm_inject_event(cpu);
++        break;
+     case CPU_INTERRUPT_SMI:
+--- a/target/i386/tcg/system/smm_helper.c
++++ b/target/i386/tcg/system/smm_helper.c
+@@ -315,2 +315,6 @@
+     env->hflags &= ~HF_SMM_MASK;
++    if (env->flexvm_events.latched_init) {
++        env->flexvm_events.latched_init = false;
++        cpu_interrupt(cs, CPU_INTERRUPT_INIT);
++    }
+
+--- a/target/i386/tcg/translate.c
++++ b/target/i386/tcg/translate.c
+@@ -140,2 +140,3 @@
+
++    uint8_t irq_shadow;
+     sigjmp_buf jmpbuf;
+@@ -2058,2 +2059,3 @@
+     if (inhibit_irq) {
++        s->irq_shadow = 1; /* MOV or POP SS. */
+         s->base.is_jmp = DISAS_EOB_INHIBIT_IRQ;
+@@ -2302,2 +2304,4 @@
+         gen_set_hflag(s, HF_INHIBIT_IRQ_MASK);
++        tcg_gen_st8_i32(tcg_constant_i32(s->irq_shadow), tcg_env,
++                        offsetof(CPUX86State, flexvm_events.irq_shadow));
+     }

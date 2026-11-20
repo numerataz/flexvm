@@ -28,6 +28,29 @@ debugger and QMP register requests. Memory invalidation, additional x86
 CPU state, concurrent vCPU runs, interrupt delivery, and checkpointing remain part of
 [issue #1501](https://github.com/numerataz/flexvm/issues/1501).
 
+## Launch from FlexVM
+
+On x86_64, build the provider against the SDK for the kernel you will boot.
+Use the QEMU build from `scripts/build-qemu.sh` and a host with Python 3.10 or
+later.
+
+```sh
+scripts/compat/parent-kvm/build.sh /path/to/kernel/build /path/to/provider --native
+sudo flexvm software --kernel /path/to/vmlinux --qemu /path/to/qemu-system-x86_64 \
+  --parent-kvm-bundle /path/to/provider --parent-kvm-mem 128 IMAGE
+```
+
+The application can open `/dev/kvm` normally. The parent runs one child at a
+time, with up to two vCPUs and eight pinned RAM slots. The child memory quota
+defaults to the lesser of 256 MiB and the outer VM memory. In `auto` mode,
+FlexVM selects a usable native worker when the bundle contains one and
+otherwise uses TCG. Use `--parent-kvm-engine tcg` to avoid any host KVM access,
+or `--parent-kvm-engine kvm` to require it. The current launch is foreground
+and unnamed. Checkpoint and migration are tracked in
+[issue #1603](https://github.com/numerataz/flexvm/issues/1603).
+
+## Compatibility fixture
+
 Run the fixture on x86 with the QEMU build from `scripts/build-qemu.sh` and
 the prepared kernel build tree for the selected FlexVM kernel.
 
@@ -123,6 +146,17 @@ Add `--lapic` to read the reset xAPIC image, stage LINT0 and LINT1 before
 the first run, and update the stopped controller. The guest receives a PIC
 interrupt through the installed state, then changes LINT1 through MMIO.
 The test checks that restoring ICR contents does not send an interrupt.
+Use `--clock --protected-entry` to restore a clock before creating the
+child worker and again while it is stopped. The guest registers a real
+pvclock page using its KVM MSR and samples RDTSC. The VMM verifies that the
+time derived from the page follows both restored clock values.
+Use `--vcpu-events --protected-entry` to restore a masked pending NMI,
+deliver an exception with its error code and an interrupt, then restore
+SMM flags and a nonzero startup vector from the VMM.
+Use `--xsave --protected-entry` to verify the standard 4 KiB XSAVE image.
+The guest reads the staged and restored x87 control word, MXCSR, and both
+halves of YMM0. The VMM also observes guest changes and checks how the
+legacy FPU ioctl interacts with the staged XSAVE state.
 Use `--xcrs --protected-entry` to stage XCR0, change it in the guest with
 XSETBV, and read back a live restore with XGETBV.
 Use `--mp-state --protected-entry` to read the startup state, restore the

@@ -1,0 +1,83 @@
+--- a/hw/arm/virt.c
++++ b/hw/arm/virt.c
+@@ -859,6 +859,36 @@
+     arm_rebuild_hflags(env);
+ }
+ 
++ArmFlexvmMpState *qmp_x_flexvm_arm_mp_state(uint32_t cpu_index,
++                                           bool has_runnable, bool runnable,
++                                           Error **errp)
++{
++    Object *machine = OBJECT(qdev_get_machine());
++    CPUState *cs = qemu_get_cpu(cpu_index);
++    ARMCPU *cpu;
++    ArmFlexvmMpState *ret;
++
++    if (!tcg_enabled() || !object_dynamic_cast(machine, TYPE_VIRT_MACHINE) ||
++        cpu_index >= 2 || !cs ||
++        (!runstate_check(RUN_STATE_PRELAUNCH) && !cs->stopped)) {
++        error_setg(errp, "FlexVM ARM MP state requires a stopped TCG vCPU");
++        return NULL;
++    }
++    cpu = ARM_CPU(cs);
++    if (cpu->power_state == PSCI_ON_PENDING) {
++        error_setg(errp, "FlexVM ARM vCPU is powering on");
++        return NULL;
++    }
++    if (has_runnable && runnable != (cpu->power_state == PSCI_ON)) {
++        /* Keep architected state intact across the KVM power-state ioctl. */
++        cs->halted = !runnable;
++        cpu->power_state = runnable ? PSCI_ON : PSCI_OFF;
++    }
++    ret = g_new(ArmFlexvmMpState, 1);
++    ret->runnable = cpu->power_state == PSCI_ON;
++    return ret;
++}
++
+ static void create_v2m(VirtMachineState *vms)
+ {
+     int i;
+--- a/qapi/misc-arm.json
++++ b/qapi/misc-arm.json
+@@ -101,3 +101,27 @@
+   'data': { 'cpu-index': 'uint32', 'pc': 'uint64', 'x0': 'uint64',
+             'pstate': 'uint32' },
+   'features': [ 'unstable' ] }
++
++##
++# @ArmFlexvmMpState:
++#
++# @runnable: Whether the ARM vCPU is powered on.
++##
++{ 'struct': 'ArmFlexvmMpState', 'data': { 'runnable': 'bool' } }
++
++##
++# @x-flexvm-arm-mp-state:
++#
++# Read or update the power state of a stopped ARM TCG vCPU.
++#
++# @cpu-index: The vCPU index.
++#
++# @runnable: Optional new power state.
++#
++# Features:
++#
++# @unstable: Experimental FlexVM worker protocol.
++##
++{ 'command': 'x-flexvm-arm-mp-state',
++  'data': { 'cpu-index': 'uint32', '*runnable': 'bool' },
++  'returns': 'ArmFlexvmMpState', 'features': [ 'unstable' ] }
+--- a/stubs/monitor-arm-flexvm.c
++++ b/stubs/monitor-arm-flexvm.c
+@@ -20,3 +20,11 @@
+ {
+     error_setg(errp, "FlexVM ARM boot registers require an ARM virt machine");
+ }
++
++ArmFlexvmMpState *qmp_x_flexvm_arm_mp_state(uint32_t cpu_index,
++                                           bool has_runnable, bool runnable,
++                                           Error **errp)
++{
++    error_setg(errp, "FlexVM ARM MP state requires an ARM virt machine");
++    return NULL;
++}

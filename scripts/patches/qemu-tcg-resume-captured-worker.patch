@@ -1,0 +1,23 @@
+--- a/hw/char/debugcon.c
++++ b/hw/char/debugcon.c
+@@ -224,9 +224,10 @@
+ static void debugcon_run(void *opaque, const uint8_t *buf, int len)
+ {
+     DebugconState *s = opaque;
++    bool checkpoint_member = checkpoint_lane &&
++        (s == checkpoint_lane || s == checkpoint_lane->other_lane);
+ 
+-    if (checkpoint_lane && checkpoint_lane->checkpoint_frozen &&
+-        (s == checkpoint_lane || s == checkpoint_lane->other_lane)) {
++    if (checkpoint_member && checkpoint_lane->checkpoint_frozen) {
+         return;
+     }
+     if (len != 1 || s->completion_ack_pending) {
+@@ -285,6 +286,7 @@
+         buf[0] < 'R' || buf[0] > 'S' ||
+         (!runstate_check(RUN_STATE_PRELAUNCH) &&
+          !runstate_check(RUN_STATE_PAUSED) &&
++         !(checkpoint_member && runstate_check(RUN_STATE_POSTMIGRATE)) &&
+          !(s->parallel && runstate_is_running() && s->run_cpu->stopped))) {
+         debugcon_run_failed(s);
+         return;

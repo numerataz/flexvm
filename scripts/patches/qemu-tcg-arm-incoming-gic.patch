@@ -1,0 +1,25 @@
+--- a/hw/arm/virt.c
++++ b/hw/arm/virt.c
+@@ -52,6 +52,7 @@
+ #include "system/qtest.h"
+ #include "system/system.h"
+ #include "hw/loader.h"
++#include "migration/migration.h"
+ #include "qapi/error.h"
+ #include "qapi/qapi-commands-misc-arm.h"
+ #include "qemu/bitops.h"
+@@ -783,9 +784,12 @@
+     SysBusDevice *its_bus;
+     hwaddr distributor_size, redistributor_size, its_size;
+ 
++    bool awaiting_restore = runstate_check(RUN_STATE_INMIGRATE) &&
++        migration_incoming_get_current()->state == MIGRATION_STATUS_NONE;
++
+     if (!tcg_enabled() || !object_dynamic_cast(machine, TYPE_VIRT_MACHINE) ||
+-        !runstate_check(RUN_STATE_PRELAUNCH)) {
+-        error_setg(errp, "FlexVM GIC mapping requires a prelaunch TCG virt machine");
++        (!runstate_check(RUN_STATE_PRELAUNCH) && !awaiting_restore)) {
++        error_setg(errp, "FlexVM GIC mapping requires a stopped TCG virt machine");
+         return;
+     }
+     vms = VIRT_MACHINE(machine);
