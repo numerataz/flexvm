@@ -347,21 +347,25 @@ extern "C" fn on_winch(_: libc::c_int) {
 
 /// SIGWINCH resizes the guest's pty (through a pipe: a handler can do little else).
 fn watch_resizes(feed: Arc<Feed>) -> Result<()> {
+    watch_resizes_with(feed, |f| std::thread::Builder::new().spawn(f).map(|_| ()))
+}
+
+fn watch_resizes_with(feed: Arc<Feed>, spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>) -> Result<()> {
     let mut fds = [0; 2];
     if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
         return Err(std::io::Error::last_os_error().into());
     }
-    let (woken, notify) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    std::thread::Builder::new().spawn(move || {
+    let (read_fd, write_fd) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    spawn(Box::new(move || {
         let mut buf = [0u8; 64];
         loop {
-            let mut p = libc::pollfd { fd: woken.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            let mut p = libc::pollfd { fd: read_fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
             unsafe { libc::poll(&mut p, 1, -1) };
-            while unsafe { libc::read(woken.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
+            while unsafe { libc::read(read_fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) } > 0 {}
             feed.resized();
         }
-    })?;
-    WINCH.store(notify.into_raw_fd(), Ordering::Release);
+    }))?;
+    WINCH.store(write_fd.into_raw_fd(), Ordering::Release);
     let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
     act.sa_sigaction = on_winch as usize;
     act.sa_flags = libc::SA_RESTART;
@@ -1232,5 +1236,19 @@ mod tests {
         let elapsed = start.elapsed();
         // With 1ms doubling backoff, a 5ms exit completes in ~7-15ms, well under the old 50ms flat sleep.
         assert!(elapsed < Duration::from_millis(35), "ended took {elapsed:?}");
+    }
+
+    #[test]
+    fn watch_resizes_cleans_up_pipe_and_winch_on_spawn_failure() {
+        let feed = Arc::new(Feed { st: Mutex::new(St::default()), cv: Condvar::new(), tty: true, size });
+        let winch_before = WINCH.load(Ordering::Relaxed);
+        let fds_before = std::fs::read_dir("/proc/self/fd").unwrap().count();
+        for _ in 0..256 {
+            let err = watch_resizes_with(feed.clone(), |_| Err(std::io::Error::other("spawn failed"))).unwrap_err();
+            assert!(err.to_string().contains("spawn failed"), "{err}");
+            assert_eq!(WINCH.load(Ordering::Relaxed), winch_before);
+        }
+        let fds_after = std::fs::read_dir("/proc/self/fd").unwrap().count();
+        assert!(fds_after < fds_before + 100, "pipe fds leaked on spawn failure: before={fds_before} after={fds_after}");
     }
 }

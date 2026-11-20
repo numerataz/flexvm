@@ -598,17 +598,20 @@ fn walk_dir(base: &OwnedFd, comps: &[Vec<u8>], make: Option<Option<(u32, u32)>>)
     let mut fd = base.try_clone()?;
     for c in comps {
         let name = cstr(c)?;
-        let open = |at: RawFd| os(unsafe { libc::openat(at, name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) });
+        let open = |at: RawFd| -> io::Result<OwnedFd> {
+            let raw = os(unsafe { libc::openat(at, name.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC) })?;
+            Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+        };
         fd = match (open(fd.as_raw_fd()), make) {
             (Err(e), Some(owner)) if e.raw_os_error() == Some(libc::ENOENT) => {
                 os(unsafe { libc::mkdirat(fd.as_raw_fd(), name.as_ptr(), 0o755) })?;
-                let new = unsafe { OwnedFd::from_raw_fd(open(fd.as_raw_fd())?) };
+                let new = open(fd.as_raw_fd())?;
                 if let Some((u, g)) = owner {
                     os(unsafe { libc::fchown(new.as_raw_fd(), u, g) })?;
                 }
                 new
             }
-            (r, _) => unsafe { OwnedFd::from_raw_fd(r.map_err(|e| with(String::from_utf8_lossy(c), e))?) },
+            (r, _) => r.map_err(|e| with(String::from_utf8_lossy(c), e))?,
         };
     }
     Ok(fd)
@@ -1863,5 +1866,20 @@ mod tests {
         extract(&mut &theirs[..], Dest::Cp(&t.s("fromtar")), Some(unsafe { (libc::getuid(), libc::getgid()) })).unwrap();
         let (want, got) = (listing(Path::new(&src)), listing(&t.0.join("fromtar")));
         assert_eq!(want[1..], got[1..]);
+    }
+
+    #[test]
+    fn walk_dir_closes_fd_on_fchown_error() {
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let t = Tmp::new("walk-fchown-err");
+        let base = into_dir(t.0.to_str().unwrap()).unwrap();
+        let err = walk_dir(&base, &[b"sub".to_vec()], Some(Some((0, 0)))).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EPERM));
+        let leaked_target = t.0.join("sub");
+        let leaked =
+            std::fs::read_dir("/proc/self/fd").unwrap().filter_map(|e| e.ok()).filter_map(|e| std::fs::read_link(e.path()).ok()).any(|p| p == leaked_target);
+        assert!(!leaked, "directory fd leaked after fchown error");
     }
 }
