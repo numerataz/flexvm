@@ -58,6 +58,18 @@ CPUID_ENTRY = struct.Struct("<7I12x")
 CPUID_BYTES = CPUID_HEADER.size + CPUID_ENTRY.size * CPUID_MAX
 CPUID_FIELDS = ("function", "index", "indexed", "eax", "ebx", "ecx", "edx")
 TCG_CHILD_CPU = "qemu64"
+KVM_EXIT_IO = 2
+KVM_EXIT_MMIO = 6
+IO_PORT = 0x30
+MMIO_BASE = 0xd0000000
+MMIO_WIRE = struct.Struct("<cBQ8s")
+EXIT_AT = 0x84000
+EXIT_RECORD = struct.Struct("<IIQ8s")
+MMIO_WRITES = (
+    (MMIO_BASE + 0x10, b"\x39"),
+    (MMIO_BASE + 0x14, b"\x09\x87\x65\x43"),
+    (MMIO_BASE + 0x18, b"\x88\x77\x66\x55\x44\x33\x22\x11"),
+)
 # Linux's x86 struct kvm_regs.
 REGISTERS = struct.Struct("<18Q")
 SEGMENT = struct.Struct("<QIH9Bx")
@@ -95,6 +107,16 @@ class RunCancellation:
         if sequence > self.sequence:
             raise RuntimeError("cancelled a future run")
         return sequence == self.sequence
+
+
+@dataclass(frozen=True)
+class RunExit:
+    reason: int
+    address: int
+    data: bytes
+
+    def record(self):
+        return EXIT_RECORD.pack(self.reason, len(self.data), self.address, self.data)
 
 
 class SignalValue(ctypes.Union):
@@ -200,6 +222,20 @@ class RunChannel:
             self.connection.close()
             raise
 
+    def read_exit(self):
+        if self.connection.type != socket.SOCK_STREAM:
+            return self.connection.recv(MMIO_WIRE.size + 1)
+        data = bytearray()
+        expected = 2
+        while len(data) < expected:
+            chunk = self.connection.recv(expected - len(data))
+            if not chunk:
+                break
+            data.extend(chunk)
+            if data[0] == ord("M"):
+                expected = MMIO_WIRE.size
+        return bytes(data)
+
     def run(self, request, cancellation, interrupt):
         started = time.monotonic()
         if select.select([self.connection], [], [], 0)[0]:
@@ -218,17 +254,22 @@ class RunChannel:
             if cancellation.applies() and not interrupted:
                 interrupt()
                 interrupted = True
-        output = self.connection.recv(2)
-        if len(output) == 1 and self.connection.type == socket.SOCK_STREAM:
-            output += self.connection.recv(1)
+        output = self.read_exit()
         if output == b"I\0" and interrupted:
             self.interruptions.append(round((time.monotonic() - started) * 1000, 3))
             return None
-        if len(output) != 2 or output[0] != ord("O"):
+        if len(output) == 2 and output[0] == ord("O"):
+            self.exits.append(output[1])
+            result = RunExit(KVM_EXIT_IO, IO_PORT, output[1:])
+        elif len(output) == MMIO_WIRE.size and output[0] == ord("M"):
+            _, length, address, data = MMIO_WIRE.unpack(output)
+            if length not in (1, 2, 4, 8):
+                raise RuntimeError("invalid worker MMIO access width")
+            result = RunExit(KVM_EXIT_MMIO, address, data[:length])
+        else:
             raise RuntimeError("parent worker did not return a recognized stopped exit")
-        self.exits.append(output[1])
         self.timings.append(round((time.monotonic() - started) * 1000, 3))
-        return output[1]
+        return result
 
     def close(self):
         self.connection.close()
@@ -289,7 +330,7 @@ class RegisterChannel:
 
 
 class TcgChild:
-    def __init__(self, qemu, output, socket_path, outer_ram, layouts, slots, cpu_count):
+    def __init__(self, qemu, output, socket_path, outer_ram, layouts, slots, cpu_count, mmio):
         self.process = None
         self.channel = None
         self.debugger = None
@@ -303,6 +344,9 @@ class TcgChild:
                 listener.bind(str(socket_path))
                 listener.listen(1)
                 listener.settimeout(3)
+                exit_device = "isa-debugcon,iobase=0x30,chardev=port,run-control=on"
+                if mmio:
+                    exit_device += f",mmio-base={MMIO_BASE}"
                 command = [
                     qemu, *QEMU_OPTIONS, "-machine", "pc,accel=tcg", "-m", "16", "-smp", str(cpu_count), "-serial", "none",
                     "-cpu", TCG_CHILD_CPU,
@@ -310,7 +354,7 @@ class TcgChild:
                     "-chardev", f"socket,id=regs,path={debugger_path},server=on,wait=off",
                     "-gdb", "chardev:regs",
                     "-qmp", f"unix:{self.special_monitor_path},server=on,wait=off",
-                    "-device", "isa-debugcon,iobase=0x30,chardev=port,run-control=on",
+                    "-device", exit_device,
                 ]
                 for slot, layout in zip(slots, layouts, strict=True):
                     command.extend(["-device", f"flexvm-shared-ram,id=slot{slot.identifier},"
@@ -330,7 +374,7 @@ class TcgChild:
             raise
 
     def run(self, cpu, cancellation):
-        if self.channel.exits and os.pread(self.memory, 1, self.data_offset) != b"\0":
+        if self.channel.timings and os.pread(self.memory, 1, self.data_offset) != b"\0":
             raise RuntimeError("child wrote its second result while stopped")
         request = bytes((ord("R") + cpu,))
         return self.channel.run(request, cancellation, lambda: self.channel.connection.sendall(b"I"))
@@ -611,7 +655,7 @@ def read_slot_table(mailbox, ram_pages, outer_bytes, protected_entry, split_slot
     return slots
 
 
-def start_child(engine, qemu, output, control, outer_ram, slots, cpu_count):
+def start_child(engine, qemu, output, control, outer_ram, slots, cpu_count, mmio):
     with ExitStack() as manifests:
         layouts = []
         for slot in slots:
@@ -625,7 +669,7 @@ def start_child(engine, qemu, output, control, outer_ram, slots, cpu_count):
             layouts.append(manifest)
         if engine == "kvm":
             return KvmChild(output, outer_ram, layouts, slots, cpu_count)
-        return TcgChild(qemu, output, control / "child.sock", outer_ram, layouts, slots, cpu_count)
+        return TcgChild(qemu, output, control / "child.sock", outer_ram, layouts, slots, cpu_count, mmio)
 
 
 def verify_slot_spans(pid, slots):
@@ -655,12 +699,13 @@ def verify_slot_spans(pid, slots):
 
 
 def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry,
-             split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs, cpuid):
+             split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs, cpuid, mmio):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
     expected_interruptions = TEST_INTERRUPTS if interrupt_run else 0
-    expected = [OPEN_VM, *([OPEN_CPU] * cpu_count), RUN, GET_REGS, GET_SREGS]
+    expected = [OPEN_VM, *([OPEN_CPU] * cpu_count), *([RUN] * (len(MMIO_WRITES) if mmio else 0)),
+                RUN, GET_REGS, GET_SREGS]
     if cpuid:
         expected.insert(0, GET_SUPPORTED_CPUID)
     expected_counters = [0x1357]
@@ -686,6 +731,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
     observed = []
     counters = []
     io_events = []
+    mmio_events = []
     open_cpus = set()
     started_cpus = set()
     special = None
@@ -704,7 +750,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 17)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 18)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
         os.ftruncate(outer_ram, outer_ram_size)
@@ -772,7 +818,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                     if length != slot_size or len(open_cpus) != cpu_count:
                         raise RuntimeError("unexpected total size of registered RAM")
                     slots = read_slot_table(mapping, ram_pages, outer_ram_size, protected_entry, split_slot)
-                    child = start_child(parent_engine, qemu, output, control, outer_ram, slots, cpu_count)
+                    child = start_child(parent_engine, qemu, output, control, outer_ram, slots, cpu_count, mmio)
                     cleanup.callback(child.close)
                     extents = verify_slot_spans(child.process.pid, slots)
                 elif length:
@@ -798,12 +844,15 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                     if initial_msrs and child.access_msrs(cpu, initial_msrs, True) != initial_msrs:
                         raise RuntimeError("worker rejected staged boot MSR state")
                     started_cpus.add(cpu)
-                value = child.run(cpu, RunCancellation(cancellations, mapping, pending, deadline))
-                if value is None:
+                result = child.run(cpu, RunCancellation(cancellations, mapping, pending, deadline))
+                if result is None:
                     status = -errno.EINTR
                 else:
-                    io_events.append((cpu, value))
-                    struct.pack_into("<I", mapping, 28, value)
+                    if result.reason == KVM_EXIT_IO:
+                        io_events.append((cpu, result.data[0]))
+                    else:
+                        mmio_events.append((result.address, result.data))
+                    mapping[EXIT_AT:EXIT_AT + EXIT_RECORD.size] = result.record()
             elif length:
                 raise RuntimeError(f"unexpected memory argument for command {opcode}")
             elif opcode == GET_REGS:
@@ -851,6 +900,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
             os.eventfd_write(replies, 1)
         guest = (output / "outer.log").read_text(errors="replace")
         if (outer.wait() != 0 or observed != expected or child is None or io_events != expected_io
+                or tuple(mmio_events) != (MMIO_WRITES if mmio else ())
                 or len(child.channel.interruptions) != expected_interruptions or counters != expected_counters
                 or interrupt_run and "PASS stopped and resumed the same running child" not in guest
                 or cpu_count == 2 and "PASS two vCPUs kept independent state in one child" not in guest
@@ -858,6 +908,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 or fpu and "PASS x87 and XMM state reached the parent worker" not in guest
                 or msrs and "PASS x86 boot MSRs reached the parent worker" not in guest
                 or cpuid and "PASS child CPUID instructions used the installed vCPU profiles" not in guest
+                or mmio and "PASS MMIO writes returned physical addresses and exact data" not in guest
                 or "PASS /dev/kvm returned two port I/O exits" not in guest
                 or "PASS parent KVM guest shutdown" not in guest):
             raise RuntimeError(f"parent execution proof failed; commands={observed}, see outer.log")
@@ -881,6 +932,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         "boot_msrs": msrs,
         "configured_cpuid": cpuid,
         "supported_cpuid_entries": len(supported_cpuid),
+        "mmio_writes": [{"address": address, "data": data.hex()} for address, data in mmio_events],
         "register_counters": counters,
         "interrupted_runs": len(child.channel.interruptions),
         "interrupted_run_ms": child.channel.interruptions,
@@ -917,6 +969,7 @@ def main():
     parser.add_argument("--fpu", action="store_true", help="exercise x87 and XMM state in long mode")
     parser.add_argument("--msrs", action="store_true", help="exercise x86 Linux boot MSRs in long mode")
     parser.add_argument("--cpuid", action="store_true", help="query and install x86 CPUID profiles")
+    parser.add_argument("--mmio-write", action="store_true", help="return physical MMIO write exits in long mode")
     parser.add_argument("--reject-close", action="store_true", help="verify page retention when the parent refuses close")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -930,6 +983,8 @@ def main():
         args.protected_entry = True
     if args.cpuid and (not args.protected_entry or args.fpu or args.msrs):
         parser.error("--cpuid requires protected mode and a separate run from --fpu or --msrs")
+    if args.mmio_write and (not args.long_mode or args.cpuid or args.fpu or args.msrs):
+        parser.error("--mmio-write requires a separate long-mode run")
     if not 1 <= args.ram_pages <= MAX_SLOT_PAGES:
         parser.error(f"--ram-pages must be between 1 and {MAX_SLOT_PAGES}")
     if args.ram_pages > MAX_REAL_MODE_PAGES and not args.protected_entry:
@@ -947,7 +1002,8 @@ def main():
     if args.worker:
         print(json.dumps(exercise(qemu, kernel, output, args.reject_close, args.parent_engine, args.ram_pages,
                                   args.protected_entry, args.split_slot, args.interrupt_run,
-                                  2 if args.two_vcpus else 1, args.long_mode, args.fpu, args.msrs, args.cpuid)))
+                                  2 if args.two_vcpus else 1, args.long_mode, args.fpu, args.msrs, args.cpuid,
+                                  args.mmio_write)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -987,6 +1043,8 @@ def main():
                 oracle.append("msrs")
             if args.cpuid:
                 oracle.append("cpuid")
+            if args.mmio_write:
+                oracle.append("mmio")
             HELPERS["run"](oracle, 14 if args.interrupt_run else 8, output / "native-kvm.log")
             report["same_client_passed_native_kvm"] = True
             report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
@@ -1008,6 +1066,8 @@ def main():
             files["boot-msrs"] = b""
         if args.cpuid:
             files["cpuid-profile"] = b""
+        if args.mmio_write:
+            files["mmio-write"] = b""
         image = HELPERS["initramfs"](init.read_bytes(), files=files)
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
@@ -1036,6 +1096,7 @@ def main():
                             *(["--fpu"] if args.fpu else []),
                             *(["--msrs"] if args.msrs else []),
                             *(["--cpuid"] if args.cpuid else []),
+                            *(["--mmio-write"] if args.mmio_write else []),
                             *(["--reject-close"] if args.reject_close else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}

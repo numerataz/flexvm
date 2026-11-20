@@ -25,6 +25,8 @@
 #define MSR_RESUME_OFFSET 0x600
 #define CPUID_ENTRY_OFFSET 0x700
 #define CPUID_SECOND_OFFSET 0x800
+#define MMIO_ENTRY_OFFSET 0x900
+#define MMIO_BASE 0xd0000000ULL
 #define CPUID_TEST_FUNCTION 0x4000007e
 #define CPUID_TEST_RESULT 0x31234500
 #define TSC_START 0x1111222200000000ULL
@@ -105,7 +107,7 @@ static void select_segments(int cpu, bool protected_mode, bool long_mode, uint64
     check(ioctl(cpu, KVM_SET_SREGS, &sregs) == 0, "select the child execution mode");
 }
 
-static void setup_page_tables(unsigned char *ram, uint64_t gpa, uint64_t middle, uint64_t last)
+static void setup_page_tables(unsigned char *ram, uint64_t gpa, uint64_t middle, uint64_t last, bool mmio)
 {
     uint64_t *level4 = (uint64_t *)(ram + 4096);
     uint64_t *level3 = (uint64_t *)(ram + 8192);
@@ -118,6 +120,8 @@ static void setup_page_tables(unsigned char *ram, uint64_t gpa, uint64_t middle,
     level2[entry] = gpa | 0x83;
     level2[entry + 1] = (middle & ~(HUGE_PAGE_SIZE - 1)) | 0x83;
     level2[entry + 2] = (last & ~(HUGE_PAGE_SIZE - 1)) | 0x83;
+    if (mmio)
+        level2[entry + 3] = MMIO_BASE | 0x83;
 }
 
 static void prepare_fpu(int cpu)
@@ -332,6 +336,28 @@ static void check_cpuid_result(const unsigned char *ram, unsigned int id,
     check(absent == expected, "use the configured vendor's out-of-range CPUID behavior");
 }
 
+static void check_mmio_writes(int cpu, const struct kvm_run *run, const unsigned char *ram)
+{
+    const struct {
+        uint64_t address;
+        unsigned int length;
+        uint64_t value;
+    } expected[] = {
+        {MMIO_BASE + 0x10, 1, 0x39},
+        {MMIO_BASE + 0x14, 4, 0x43658709},
+        {MMIO_BASE + 0x18, 8, 0x1122334455667788ULL},
+    };
+
+    for (unsigned int i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
+        timed_run(cpu);
+        check(run->exit_reason == KVM_EXIT_MMIO && run->mmio.is_write &&
+              run->mmio.phys_addr == expected[i].address && run->mmio.len == expected[i].length &&
+              !memcmp(run->mmio.data, &expected[i].value, expected[i].length),
+              "return a guest physical MMIO write and its exact bytes");
+        check(ram[0xf0] == i, "stop before the instruction following each MMIO write");
+    }
+}
+
 struct interrupt_test {
     uint32_t *counter;
     uint32_t baseline;
@@ -402,6 +428,7 @@ int main(int argc, char **argv)
     bool fpu = false;
     bool msrs = false;
     bool cpuid = false;
+    bool mmio = false;
     check(argc == 2 || protected_mode, "specify RAM pages and optional protected or split mode");
     for (int i = 3; i < argc; i++) {
         if (!interrupt_run && !strcmp(argv[i], "interrupt"))
@@ -416,6 +443,8 @@ int main(int argc, char **argv)
             msrs = true;
         else if (!cpuid && !strcmp(argv[i], "cpuid"))
             cpuid = true;
+        else if (!mmio && !strcmp(argv[i], "mmio"))
+            mmio = true;
         else
             check(false, "invalid execution option");
     }
@@ -429,6 +458,7 @@ int main(int argc, char **argv)
     check(!fpu || long_mode, "exercise floating-point state in long mode");
     check(!msrs || (long_mode && !fpu), "exercise boot MSRs in a separate long-mode run");
     check(!cpuid || (protected_mode && !fpu && !msrs), "exercise CPUID in a separate protected-mode run");
+    check(!mmio || (long_mode && !cpuid && !fpu && !msrs), "exercise MMIO in a separate long-mode run");
     size_t pages = count;
     size_t ram_bytes = pages * 4096;
     uint64_t gpa = protected_mode ? PROTECTED_SLOT_GPA : PVKVM_GUEST_START;
@@ -605,6 +635,17 @@ int main(int argc, char **argv)
             0x0f, 0x32,                         /* rdmsr */
             0x89, 0x87, 0xc0, 0, 0, 0,          /* mov [rdi+0xc0], eax */
         };
+        const unsigned char mmio_entry[] = {
+            0x49, 0xb9, 0, 0, 0, 0, 0, 0, 0, 0,     /* mov r9, virtual MMIO address */
+            0x41, 0xc6, 0x41, 0x10, 0x39,           /* mov byte [r9+0x10], 0x39 */
+            0xc6, 0x87, 0xf0, 0, 0, 0, 1,          /* mov byte [rdi+0xf0], 1 */
+            0x41, 0xc7, 0x41, 0x14, 0x09, 0x87, 0x65, 0x43, /* mov dword [r9+0x14], 0x43658709 */
+            0xc6, 0x87, 0xf0, 0, 0, 0, 2,          /* mov byte [rdi+0xf0], 2 */
+            0x49, 0xb8, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, /* mov r8, 0x1122334455667788 */
+            0x4d, 0x89, 0x41, 0x18,                 /* mov [r9+0x18], r8 */
+            0xc6, 0x87, 0xf0, 0, 0, 0, 3,          /* mov byte [rdi+0xf0], 3 */
+            0xb8, 0x41, 0, 0, 0, 0xf9,              /* mov eax, 0x41; stc */
+        };
         size_t startup = 0x10;
         size_t resume = 0x40;
         if (fpu) {
@@ -625,9 +666,14 @@ int main(int argc, char **argv)
             resume += 5;
             memcpy(ram + MSR_RESUME_OFFSET, msr_resume, sizeof(msr_resume));
             install_jump(ram, MSR_RESUME_OFFSET + sizeof(msr_resume), resume);
+        } else if (mmio) {
+            const uint64_t address = LONG_ALIAS + 3 * HUGE_PAGE_SIZE;
+            memcpy(ram + MMIO_ENTRY_OFFSET, mmio_entry, sizeof(mmio_entry));
+            memcpy(ram + MMIO_ENTRY_OFFSET + 2, &address, sizeof(address));
+            install_jump(ram, MMIO_ENTRY_OFFSET + sizeof(mmio_entry), startup);
         }
         if (long_mode) {
-            setup_page_tables(ram, gpa, middle_page, last_page);
+            setup_page_tables(ram, gpa, middle_page, last_page, mmio);
             memcpy(ram + startup, long_prelude, sizeof(long_prelude));
             startup += sizeof(long_prelude);
         }
@@ -656,6 +702,8 @@ int main(int argc, char **argv)
         regs.rip = entry_base + FPU_ENTRY_OFFSET;
     if (msrs)
         regs.rip = entry_base + MSR_ENTRY_OFFSET;
+    if (mmio)
+        regs.rip = entry_base + MMIO_ENTRY_OFFSET;
     if (cpuid) {
         regs.rip = entry_base + CPUID_ENTRY_OFFSET;
         regs.rsp = entry_base + 0xf00;
@@ -700,6 +748,8 @@ int main(int argc, char **argv)
     run->immediate_exit = 1;
     check(ioctl(cpu, KVM_RUN, 0) == -1 && errno == EINTR, "immediate exit");
     run->immediate_exit = 0;
+    if (mmio)
+        check_mmio_writes(cpu, run, ram);
     unsigned long long first = timed_run(cpu);
     check_output(run, size, 0x42);
     struct kvm_regs observed = check_registers(cpu, 0x42, 0x1357, entry_base);
@@ -728,6 +778,8 @@ int main(int argc, char **argv)
     check(!protected_mode || middle[0x78] == 0xb3, "protected child wrote the middle page");
     if (cpuid)
         check_cpuid_result(ram, 0, &supported);
+    if (mmio)
+        check(ram[0xf0] == 3, "resume after the final MMIO write");
     if (two_vcpus) {
         check(data[0xa0] == 0 && data[0xa1] == 0, "second vCPU waited for KVM_RUN");
         timed_run(other_cpu);
@@ -771,6 +823,8 @@ int main(int argc, char **argv)
         check_resumed_msrs(cpu, data);
     if (cpuid)
         puts("PASS child CPUID instructions used the installed vCPU profiles");
+    if (mmio)
+        puts("PASS MMIO writes returned physical addresses and exact data");
     munmap(run, size);
     close(cpu);
     munmap(ram, ram_bytes);

@@ -68,6 +68,25 @@ static void supported_cpuid(void)
     close(kvm);
 }
 
+static void reply_run(int control, const struct kvm_run *run, int mapping_bytes)
+{
+    if (run->exit_reason == KVM_EXIT_MMIO) {
+        unsigned int width = run->mmio.len;
+        check(run->mmio.is_write && (width == 1 || width == 2 || width == 4 || width == 8),
+              "unexpected host MMIO access");
+        unsigned char output[18] = {'M', width};
+        memcpy(output + 2, &run->mmio.phys_addr, sizeof(run->mmio.phys_addr));
+        memcpy(output + 10, run->mmio.data, width);
+        check(write(control, output, sizeof(output)) == sizeof(output), "return a host MMIO write");
+        return;
+    }
+    check(run->exit_reason == KVM_EXIT_IO && run->io.direction == KVM_EXIT_IO_OUT &&
+          run->io.port == PVKVM_IO_PORT && run->io.count == 1 && run->io.size == 1 &&
+          run->io.data_offset < (unsigned long)mapping_bytes, "unexpected host vCPU exit");
+    unsigned char output[] = {'O', ((const unsigned char *)run)[run->io.data_offset]};
+    check(write(control, output, sizeof(output)) == sizeof(output), "return a host port write");
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && !strcmp(argv[1], "--supported-cpuid")) {
@@ -231,11 +250,7 @@ int main(int argc, char **argv)
             continue;
         }
         check(result == 0, "run host vCPU");
-        check(run->exit_reason == KVM_EXIT_IO && run->io.direction == KVM_EXIT_IO_OUT &&
-              run->io.port == 0x30 && run->io.count == 1 && run->io.size == 1 &&
-              run->io.data_offset < (unsigned long)bytes, "unexpected host vCPU exit");
-        unsigned char output[] = {'O', ((unsigned char *)run)[run->io.data_offset]};
-        check(write(control, output, sizeof(output)) == sizeof(output), "reply to the parent");
+        reply_run(control, run, bytes);
     }
     return 0;
 }

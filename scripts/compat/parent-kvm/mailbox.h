@@ -3,7 +3,7 @@
 #define FLEXVM_PVKVM_MAILBOX_H
 
 #define PVKVM_MAGIC        0x4d564b46
-#define PVKVM_VERSION      17
+#define PVKVM_VERSION      18
 #define PVKVM_MAGIC_AT     0
 #define PVKVM_VERSION_AT   4
 #define PVKVM_REQUEST_AT   8
@@ -11,7 +11,6 @@
 #define PVKVM_COMMAND_AT   16
 #define PVKVM_STATUS_AT    20
 #define PVKVM_DATA_SIZE_AT 24
-#define PVKVM_IO_VALUE_AT  28
 #define PVKVM_SLOT_COUNT_AT  32
 #define PVKVM_CANCEL_AT      40
 #define PVKVM_CPU_AT         44
@@ -26,6 +25,7 @@
 #define PVKVM_MSR_BATCH_MAX  64
 #define PVKVM_CPUID_AT       0x82000
 #define PVKVM_CPUID_MAX      128
+#define PVKVM_EXIT_AT        0x84000
 #define PVKVM_REGISTERS_AT   64
 #define PVKVM_INITIAL_SREGISTERS_AT 256
 #define PVKVM_GUEST_PAGE_SIZE 4096
@@ -54,6 +54,13 @@ struct pvkvm_cpuid_table {
 	__u32 count;
 	__u32 reserved;
 	struct kvm_cpuid_entry2 entries[PVKVM_CPUID_MAX];
+};
+
+struct pvkvm_run_exit {
+	__u32 reason;
+	__u32 length;
+	__u64 address;
+	__u8 data[8];
 };
 
 enum pvkvm_command {

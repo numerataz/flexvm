@@ -165,7 +165,7 @@ static void publish_slots(void __iomem *mailbox, const struct pvvm *vm)
 /* The device lock serializes mailbox use, including close and PCI teardown. */
 static int request(struct pvkvm *provider, enum pvkvm_command command,
 		   const struct pvvm *memory,
-		   u8 *io_value)
+		   struct pvkvm_run_exit *exit)
 {
 	void __iomem *m = provider->mailbox;
 	u32 before, seq;
@@ -230,8 +230,8 @@ static int request(struct pvkvm *provider, enum pvkvm_command command,
 		provider->dead = true;
 		return -EIO;
 	}
-	if (!status && io_value)
-		*io_value = readl(m + PVKVM_IO_VALUE_AT);
+	if (!status && exit)
+		memcpy_fromio(exit, m + PVKVM_EXIT_AT, sizeof(*exit));
 	return status;
 }
 
@@ -244,7 +244,7 @@ static bool close_object(struct pvkvm *p, enum pvkvm_command command)
 }
 
 static int request_for_cpu(struct pvcpu *cpu, enum pvkvm_command command,
-			   const struct pvvm *memory, u8 *output)
+			   const struct pvvm *memory, struct pvkvm_run_exit *output)
 {
 	struct pvkvm *p = cpu->vm->provider;
 
@@ -359,11 +359,41 @@ static void publish_initial_msrs(struct pvcpu *cpu)
 	writel(0, mailbox + sizeof(u32));
 }
 
+static int complete_run(struct run_page *page, const struct pvkvm_run_exit *exit)
+{
+	switch (exit->reason) {
+	case KVM_EXIT_IO:
+		if (exit->length != 1 || exit->address != PVKVM_IO_PORT)
+			return -EIO;
+		page->data = exit->data[0];
+		page->run.io.direction = KVM_EXIT_IO_OUT;
+		page->run.io.size = 1;
+		page->run.io.port = PVKVM_IO_PORT;
+		page->run.io.count = 1;
+		page->run.io.data_offset = offsetof(struct run_page, data);
+		break;
+	case KVM_EXIT_MMIO:
+		if (!is_power_of_2(exit->length) || exit->length > sizeof(exit->data))
+			return -EIO;
+		page->run.mmio.phys_addr = exit->address;
+		memset(page->run.mmio.data, 0, sizeof(page->run.mmio.data));
+		memcpy(page->run.mmio.data, exit->data, exit->length);
+		page->run.mmio.len = exit->length;
+		page->run.mmio.is_write = 1;
+		break;
+	default:
+		return -EIO;
+	}
+	page->run.exit_reason = exit->reason;
+	return 0;
+}
+
 static int run_cpu(struct pvcpu *cpu)
 {
 	struct pvvm *vm = cpu->vm;
 	struct pvkvm *p = vm->provider;
 	const struct pvvm *memory;
+	struct pvkvm_run_exit exit;
 	int result;
 
 	result = mutex_lock_interruptible(&p->lock);
@@ -406,9 +436,14 @@ static int run_cpu(struct pvcpu *cpu)
 				    offsetof(struct pvkvm_cpuid_table, entries) +
 				    cpu->cpuid->count * sizeof(cpu->cpuid->entries[0]));
 	}
-	result = request_for_cpu(cpu, PVKVM_RUN, memory, &cpu->page->data);
+	result = request_for_cpu(cpu, PVKVM_RUN, memory, &exit);
 	if (!result || result == -EINTR)
 		cpu->ran = true;
+	if (!result) {
+		result = complete_run(cpu->page, &exit);
+		if (result)
+			p->dead = true;
+	}
 unlock:
 	mutex_unlock(&p->lock);
 	return result;
@@ -743,14 +778,6 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			break;
 		}
 		result = run_cpu(cpu);
-		if (result)
-			break;
-		page->run.io.direction = KVM_EXIT_IO_OUT;
-		page->run.io.size = 1;
-		page->run.io.port = PVKVM_IO_PORT;
-		page->run.io.count = 1;
-		page->run.io.data_offset = offsetof(struct run_page, data);
-		page->run.exit_reason = KVM_EXIT_IO;
 		break;
 	default:
 		result = -ENOTTY;
@@ -1053,8 +1080,9 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	BUILD_BUG_ON(PVKVM_FPU_AT + PVKVM_FPU_BYTES > PVKVM_RAM_ADDRESS_AT);
 	BUILD_BUG_ON(PVKVM_RAM_ADDRESS_AT + PVKVM_MAX_PAGES * sizeof(u64) > PVKVM_MSR_AT);
 	BUILD_BUG_ON(PVKVM_MSR_AT + sizeof(struct pvkvm_msr_batch) > PVKVM_CPUID_AT);
+	BUILD_BUG_ON(PVKVM_CPUID_AT + sizeof(struct pvkvm_cpuid_table) > PVKVM_EXIT_AT);
 	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
-	    pci_resource_len(dev, 2) < PVKVM_CPUID_AT + sizeof(struct pvkvm_cpuid_table))
+	    pci_resource_len(dev, 2) < PVKVM_EXIT_AT + sizeof(struct pvkvm_run_exit))
 		return -ENODEV;
 	result = pcim_enable_device(dev);
 	if (result)
