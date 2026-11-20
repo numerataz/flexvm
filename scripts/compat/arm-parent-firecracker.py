@@ -16,9 +16,12 @@ def main():
     for name in ("qemu", "kernel", "bundle", "firecracker", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--bin", type=Path, help="start the ARM provider through the public FlexVM software command")
+    parser.add_argument("--engine", choices=("auto", "tcg", "kvm"), default="kvm")
     parser.add_argument("--vcpus", type=int, choices=(1, 2), default=2)
     parser.add_argument("--cc", default="cc")
     args = parser.parse_args()
+    if args.engine == "auto" and not args.bin:
+        parser.error("--engine auto requires --bin")
     output = args.output.resolve()
     output.mkdir()
     cc = [args.cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static"]
@@ -53,7 +56,7 @@ def main():
         with tempfile.TemporaryDirectory(prefix="flexvm-arm-parent-", dir="/var/lib") as state:
             HELPERS["run"]([
                 args.bin.resolve(strict=True), "software", "--kernel", kernel, "--qemu", args.qemu, "--state", state,
-                "--parent-kvm-bundle", args.bundle, "--parent-kvm-engine", "kvm", "--parent-kvm-mem", "128",
+                "--parent-kvm-bundle", args.bundle, "--parent-kvm-engine", args.engine, "--parent-kvm-mem", "128",
                 "--mem", "512", archive,
             ], 180, log)
     else:
@@ -61,9 +64,10 @@ def main():
         files["flexvm-pvkvm.ko"] = (args.bundle / "flexvm-pvkvm.ko").read_bytes()
         files["tmp/drive"] = b"ARM outer persistent marker\0".ljust(1 << 20, b"\0")
         cpio.write_bytes(HELPERS["initramfs"](outer.read_bytes(), files=files))
+        options = ["--tcg"] if args.engine == "tcg" else ["--worker", args.bundle / "native-worker"]
         HELPERS["run"]([
             sys.executable, ROOT / "arm-parent-run.py", "--qemu", args.qemu, "--kernel", kernel,
-            "--initrd", cpio, "--worker", args.bundle / "native-worker", "--mem", "384",
+            "--initrd", cpio, "--mem", "384", *options,
         ], 180, log)
     lines = log.read_text(errors="replace").splitlines()
     markers = (
@@ -75,7 +79,8 @@ def main():
     for marker in markers:
         if lines.count(marker) != 1:
             raise RuntimeError(f"missing or repeated {marker}; see {log}")
-    report = {"status": "passed", "nested_vcpus": args.vcpus, "virtio_block": "read-write-flush",
+    report = {"status": "passed", "nested_vcpus": args.vcpus, "parent_engine": args.engine,
+              "virtio_block": "read-write-flush",
               "arm_timer": "passed", "firecracker_sha256": HELPERS["digest"](args.firecracker)}
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print("PASS stock ARM Firecracker executes through the parent KVM device")

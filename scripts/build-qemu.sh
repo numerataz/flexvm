@@ -7,7 +7,7 @@ prefix=${1:?usage: build-qemu.sh INSTALL_PREFIX [x86_64|aarch64]}
 arch=${2:-x86_64}
 case "$arch" in
   x86_64) pkgversion=flexvm-tcg-nested-37 ;;
-  aarch64) pkgversion=flexvm-tcg-arm-6 ;;
+  aarch64) pkgversion=flexvm-tcg-arm-7 ;;
   *) echo "unsupported QEMU target: $arch" >&2; exit 2 ;;
 esac
 scripts_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -63,6 +63,7 @@ patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-arm-mmio-run.patch"
 patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-arm-vgic.patch"
 patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-arm-boot-registers.patch"
 patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-mmio-parallel-guard.patch"
+patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-arm-mp-state.patch"
 cp "$scripts_dir/compat/parent-kvm/slot-map.h" include/hw/misc/flexvm-slot-map.h
 ./configure --prefix="$prefix" --target-list="$arch-softmmu" --with-pkgversion="$pkgversion" \
   --disable-docs --disable-tools --disable-guest-agent --disable-werror \
