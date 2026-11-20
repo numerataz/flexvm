@@ -17,8 +17,8 @@ TOOLS = runpy.run_path(str(ROOT / "arm-shared-ram.py"))
 QMP, memfd, expect = (TOOLS[name] for name in ("QMP", "memfd", "expect"))
 BASE, PAGE, MMIO = (TOOLS[name] for name in ("BASE", "PAGE", "MMIO"))
 SIZE_SEALS = TOOLS["SIZE_SEALS"]
-# Report 41, increment the live register, store to shared RAM, then report 42.
-PROGRAM = struct.pack("<8I", 0x10000003, 0xd2a16004, 0xd2800520, 0xb9000480,
+# Read 41, report it, increment the register, store to shared RAM and report 42.
+PROGRAM = struct.pack("<8I", 0x10000003, 0xd2a16004, 0xb9400080, 0xb9000480,
                       0x91000400, 0xb9010060, 0xb9000880, 0x14000000)
 
 
@@ -35,12 +35,14 @@ def worker(qemu, ram, offset, *, external=False, incoming=False):
         listener.settimeout(5)
         log = resources.enter_context((tmp / "engine.log").open("w+b"))
         slot = f"flexvm-shared-ram,ram-fd={ram},layout-fd={layout},addr={BASE}"
+        device = f"flexvm-mmio-run,chardev=run,addr={MMIO}"
         if external:
             slot += ",external-ram-state=on"
+            device += ",checkpoint-control=on"
         command = [
             qemu, "-machine", "virt,gic-version=3", "-accel", "tcg", "-cpu", "cortex-a72", "-m", "16",
             "-nodefaults", "-display", "none", "-serial", "none", "-nic", "none", "-monitor", "none", "-S",
-            "-chardev", f"socket,id=run,path={tmp / 'run'}", "-device", f"flexvm-mmio-run,chardev=run,addr={MMIO}",
+            "-chardev", f"socket,id=run,path={tmp / 'run'}", "-device", device,
             "-qmp", f"unix:{tmp / 'qmp'},server=on,wait=off", "-device", slot,
             "-device", f"loader,addr={BASE},cpu-num=0",
         ]
@@ -99,9 +101,30 @@ def exercise(qemu):
         with tempfile.TemporaryFile() as state:
             with worker(qemu, source, source_offset, external=True) as (monitor, connection, stream):
                 connection.sendall(b"R")
+                expect(stream, struct.pack("<cBQQ", b"Q", 4, MMIO, 0))
+                try:
+                    monitor.ask("x-flexvm-freeze-run-control", {"frozen": True})
+                except RuntimeError as error:
+                    if "pending execution or I/O" not in str(error):
+                        raise
+                else:
+                    raise RuntimeError("worker fenced an incomplete MMIO read")
+                with tempfile.TemporaryFile() as incomplete:
+                    monitor.send_fd(incomplete.fileno())
+                    try:
+                        monitor.ask("migrate", {"uri": "fd:snapshot"})
+                    except RuntimeError as error:
+                        if "run control is unfenced" not in str(error):
+                            raise
+                    else:
+                        raise RuntimeError("worker migrated without a run-control fence")
+                connection.sendall(b"E" + struct.pack("<I", 41))
+                expect(stream, b"E")
+                connection.sendall(b"R")
                 expect(stream, struct.pack("<cBQQ", b"M", 4, MMIO + 4, 41))
                 if monitor.ask("query-status")["status"] != "paused":
                     raise RuntimeError("the ARM worker is still running")
+                monitor.ask("x-flexvm-freeze-run-control", {"frozen": True})
                 monitor.send_fd(state.fileno())
                 monitor.ask("migrate", {"uri": "fd:snapshot"})
                 wait_transfer(monitor)
@@ -112,11 +135,13 @@ def exercise(qemu):
                 raise RuntimeError("worker migration duplicated parent-owned RAM")
             state.seek(0)
             with worker(qemu, destination, destination_offset, external=True, incoming=True) as (monitor, connection, stream):
+                monitor.ask("x-flexvm-freeze-run-control", {"frozen": True})
                 monitor.send_fd(state.fileno())
                 monitor.ask("migrate-incoming", {"uri": "fd:snapshot"})
                 wait_transfer(monitor)
                 if monitor.ask("query-status")["status"] != "paused":
                     raise RuntimeError("the restored worker ran before the owner's resume")
+                monitor.ask("x-flexvm-freeze-run-control", {"frozen": False})
                 connection.sendall(b"R")
                 expect(stream, struct.pack("<cBQQ", b"M", 4, MMIO + 8, 42))
                 if os.pread(destination, 4, destination_offset + 256) != struct.pack("<I", 42):
