@@ -45,6 +45,9 @@ impl Header {
             bail!("software bundle has an incompatible format, engine or architecture");
         }
         self.manifest.validate()?;
+        if !self.manifest.disks.is_empty() {
+            bail!("software bundle needs managed disk transport support");
+        }
         if self.manifest.firmware.len() != firmware_names().len() || firmware_names().iter().any(|name| !self.manifest.firmware.contains_key(*name)) {
             bail!("software bundle firmware set does not match this architecture profile");
         }
