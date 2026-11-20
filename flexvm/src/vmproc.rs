@@ -3093,10 +3093,7 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
     crate::artifacts::check_pinned(&paths.firecracker, &crate::artifacts::FIRECRACKER)?;
     let p = Proc::new(host, paths)?;
     let host = p.host.clone();
-    thread::spawn(move || {
-        crate::gc::sweep_due(&host);
-        crate::gc::periodic(host);
-    });
+    thread::spawn(move || crate::gc::sweep_due(&host));
     let s = p.clone();
     let fd = crate::util::signal_fd(&signals)?;
     // Ctrl-\ quits like Ctrl-C: the VM is destroyed, not dumped.
@@ -3165,10 +3162,11 @@ pub fn main(host: Host, paths: Paths, start: Start, mut notify: Option<std::fs::
         }
         Start::Standby { template } => crate::standby::serve(&p, &template, &mut notify, &op),
     };
+    let mut _maint = None;
     let res = res.and_then(|v| {
         p.serve_control()?;
         // Once running (a standby once claimed), so a start never competes with a refill.
-        crate::standby::maintain(p.host.clone());
+        _maint = Some(crate::gc::maintain(p.host.clone()));
         Ok(v)
     });
     // Its Firecracker died under the VM before the start was done (#730): it ends as any death does, even

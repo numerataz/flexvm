@@ -1,21 +1,24 @@
 //! Garbage collection beyond what dead processes hold (`Host::collect_garbage`):
 //! logs on the run directory's tmpfs, `NAME.moved` markers, standby
 //! sockets, and templates' leftovers and unused received generations. `sweep` runs once a boot as the host is first opened (`after_boot`), and about every `EVERY` on a host with a listener or
-//! any VM process (as one starts, then through `periodic`), whether or not
+//! any VM process (as one starts, then through `maintain`), whether or not
 //! VMs start. Port forwards own only process sockets (`ports`): process death
 //! releases them before a sweep, leaving no NAT rules or reservations to collect.
 //! Logs are capped by their writers (`util::output`).
 
 use std::fs::File;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::bail;
 use crate::host::{boot_id, probe, unwritten_for, Flock, Host, Ident, Liveness};
 use crate::util::{locked, Result};
 
-/// How often `periodic` sweeps (some process on the host does).
+/// How often `maintain` sweeps (the elected host leader).
 const EVERY: Duration = Duration::from_secs(30);
+/// How often `maintain` runs a standby refill round (the elected host leader).
+const REFILL_EVERY: Duration = Duration::from_secs(5);
 /// Keep a dead arrival's log this long after its last write. The listener
 /// takes its lock before creating the log.
 const ARRIVAL_GRACE: Duration = Duration::from_secs(5);
@@ -31,19 +34,145 @@ pub const LOADSET_TTL: Duration = Duration::from_secs(24 * 3600);
 /// Prefix of an arrival's log until it is accepted (`listen::incoming`).
 pub const ARRIVAL_LOG: &str = ".incoming-";
 
-/// Every `EVERY` (give or take, so the processes on a host take turns),
-/// a sweep if no process on the host swept since.
-pub fn periodic(host: Host) {
-    std::thread::spawn(move || loop {
-        let jitter = Duration::from_millis(std::process::id() as u64 % 5000);
-        std::thread::sleep(EVERY + jitter);
-        // A boot's recovery left incomplete (a saved route not checkable yet: a peer's name not
-        // looked up) is tried again, not only by the next command.
-        if let Err(e) = after_boot(&host, true) {
-            crate::log!("flexvm: recovering after boot: {e}");
+/// Handle for a running host maintenance loop (`maintain`). Dropping it wakes
+/// the thread, releases the leader lock if held, and joins cleanly.
+#[must_use]
+pub struct Maintainer {
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Maintainer {
+    pub fn stop(&mut self) {
+        let (stopped, wake) = &*self.stop;
+        *stopped.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        wake.notify_all();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
-        sweep_due(&host);
-    });
+    }
+}
+
+impl Drop for Maintainer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+/// Non-blocking host maintenance election lock (`RUN/.locks/maint`): at most one
+/// process on the host holds it and runs periodic GC and standby refills.
+fn maint_lock(host: &Host) -> std::io::Result<Option<Flock>> {
+    let path = crate::host::locks(&host.run).join("maint");
+    match Flock::new(crate::host::private_file(&path)?, libc::LOCK_EX | libc::LOCK_NB) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(e) if e.raw_os_error() == Some(libc::EWOULDBLOCK) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Sleeps for `dur` unless `stop` is signalled; returns true if stopped.
+fn wait_or_stop(stop: &(Mutex<bool>, Condvar), dur: Duration) -> bool {
+    let (stopped, wake) = stop;
+    let deadline = Instant::now() + dur;
+    let mut guard = stopped.lock().unwrap_or_else(|e| e.into_inner());
+    while !*guard {
+        let Some(rem) = deadline.checked_duration_since(Instant::now()) else { return false };
+        if rem.is_zero() {
+            return false;
+        }
+        let (g, res) = wake.wait_timeout(guard, rem).unwrap_or_else(|e| e.into_inner());
+        guard = g;
+        if res.timed_out() && !*guard {
+            return false;
+        }
+    }
+    true
+}
+
+/// One host-elected maintenance loop: at most one process on the host holds
+/// `RUN/.locks/maint` and runs periodic standby refills (every `REFILL_EVERY`)
+/// and GC sweeps / boot-recovery retries (every `EVERY`) on a single thread.
+/// Non-leader processes sleep on a condvar and only probe the lock periodically
+/// to fail over cleanly if the leader exits.
+pub fn maintain(host: Host) -> Maintainer {
+    let jitter = Duration::from_millis(std::process::id() as u64 % 5000);
+    maintain_with(
+        host,
+        REFILL_EVERY,
+        EVERY,
+        EVERY + jitter,
+        |h| {
+            // A boot's recovery left incomplete (a saved route not checkable yet: a peer's name not
+            // looked up) is tried again, not only by the next command.
+            if let Err(e) = after_boot(h, true) {
+                crate::log!("flexvm: recovering after boot: {e}");
+            }
+            sweep_due(h);
+        },
+        crate::standby::refill_round,
+    )
+}
+
+fn maintain_with(
+    host: Host,
+    refill_every: Duration,
+    gc_every: Duration,
+    elect_every: Duration,
+    mut run_gc: impl FnMut(&Host) + Send + 'static,
+    mut run_refill: impl FnMut(&Host) + Send + 'static,
+) -> Maintainer {
+    let stop = Arc::new((Mutex::new(false), Condvar::new()));
+    let signal = Arc::clone(&stop);
+    let thread = std::thread::Builder::new()
+        .name("maint".into())
+        .spawn(move || loop {
+            let lock = match maint_lock(&host) {
+                Ok(Some(lock)) => lock,
+                Ok(None) => {
+                    if wait_or_stop(&signal, elect_every) {
+                        break;
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    crate::log!("flexvm: maintenance lock: {e}");
+                    if wait_or_stop(&signal, elect_every) {
+                        break;
+                    }
+                    continue;
+                }
+            };
+            let now = Instant::now();
+            let mut next_refill = now + refill_every;
+            let mut next_gc = now + gc_every;
+            loop {
+                let now = Instant::now();
+                let next = next_refill.min(next_gc);
+                if let Some(wait) = next.checked_duration_since(now) {
+                    if wait_or_stop(&signal, wait) {
+                        drop(lock);
+                        return;
+                    }
+                } else if *signal.0.lock().unwrap_or_else(|e| e.into_inner()) {
+                    drop(lock);
+                    return;
+                }
+                if Instant::now() >= next_refill {
+                    run_refill(&host);
+                    next_refill = Instant::now() + refill_every;
+                }
+                if *signal.0.lock().unwrap_or_else(|e| e.into_inner()) {
+                    drop(lock);
+                    return;
+                }
+                if Instant::now() >= next_gc {
+                    run_gc(&host);
+                    next_gc = Instant::now() + gc_every;
+                }
+            }
+        })
+        .expect("spawn maintenance thread");
+    Maintainer { stop, thread: Some(thread) }
 }
 
 /// Until this boot's recovery is complete, every opener of the host as root: `Host::after_boot`,
@@ -905,5 +1034,111 @@ mod tests {
         vm_files(&host);
         assert!(!log.exists(), "orphan log removed in pass 2");
         assert!(!exit.exists(), "stale exit removed in pass 3 in the same sweep");
+    }
+
+    #[test]
+    fn host_maintenance_elects_single_leader_and_fails_over() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let d = dir("maint-elect");
+        let host = Host::open(&d.join("state"), &d.join("run")).unwrap();
+        let gc_hits: Vec<Arc<AtomicUsize>> = (0..3).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+        let refill_hits: Vec<Arc<AtomicUsize>> = (0..3).map(|_| Arc::new(AtomicUsize::new(0))).collect();
+        let mut maintainers: Vec<Option<Maintainer>> = (0..3)
+            .map(|i| {
+                let gc = Arc::clone(&gc_hits[i]);
+                let refill = Arc::clone(&refill_hits[i]);
+                Some(maintain_with(
+                    host.clone(),
+                    Duration::from_millis(15),
+                    Duration::from_millis(30),
+                    Duration::from_millis(15),
+                    move |_| {
+                        gc.fetch_add(1, Ordering::SeqCst);
+                    },
+                    move |_| {
+                        refill.fetch_add(1, Ordering::SeqCst);
+                    },
+                ))
+            })
+            .collect();
+
+        let wait_for = |pred: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !pred() {
+                assert!(Instant::now() < deadline, "timed out waiting for maintenance loop");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+
+        // Wait until the elected leader has run both GC and standby refill ticks.
+        wait_for(&|| (0..3).any(|i| gc_hits[i].load(Ordering::SeqCst) >= 2 && refill_hits[i].load(Ordering::SeqCst) >= 2));
+        let active: Vec<usize> = (0..3).filter(|&i| gc_hits[i].load(Ordering::SeqCst) > 0 || refill_hits[i].load(Ordering::SeqCst) > 0).collect();
+        assert_eq!(active.len(), 1, "only one process may be elected leader: active={active:?}");
+        let leader = active[0];
+        assert!(maint_lock(&host).unwrap().is_none(), "leader holds the host maintenance lock");
+
+        // Stop the leader and verify one follower fails over cleanly and runs both GC and refill.
+        maintainers[leader].take().unwrap().stop();
+        wait_for(&|| (0..3).any(|i| i != leader && gc_hits[i].load(Ordering::SeqCst) >= 2 && refill_hits[i].load(Ordering::SeqCst) >= 2));
+        let successors: Vec<usize> =
+            (0..3).filter(|&i| i != leader && (gc_hits[i].load(Ordering::SeqCst) > 0 || refill_hits[i].load(Ordering::SeqCst) > 0)).collect();
+        assert_eq!(successors.len(), 1, "only one follower may take over: successors={successors:?}");
+
+        // Stopping all remaining maintainers releases the lock immediately.
+        for m in maintainers.into_iter().flatten() {
+            drop(m);
+        }
+        assert!(maint_lock(&host).unwrap().is_some(), "maintenance lock released on shutdown");
+    }
+
+    #[test]
+    fn host_maintenance_runs_gc_and_standby_refill_on_one_loop() {
+        let d = dir("maint-unified");
+        let mut host = Host::open(&d.join("state"), &d.join("run")).unwrap();
+        // Reserve high enough that standby refill exercises discovery + lock + pool creation
+        // without spawning a child VM process.
+        host.cfg.reserve_mib = Some(u64::MAX / 2);
+        crate::util::write_file(&host.state.join("standby"), "default", b"1", true).unwrap();
+        let marker = host.vms("gone", "moved").unwrap();
+        File::create(&marker).unwrap().set_modified(SystemTime::now() - MOVED_TTL - Duration::from_secs(1)).unwrap();
+        let pool_marker = crate::standby::dir(&host, "default").join(".template");
+        assert!(!pool_marker.exists());
+
+        let mut maint = maintain_with(
+            host.clone(),
+            Duration::from_millis(15),
+            Duration::from_millis(25),
+            Duration::from_millis(15),
+            sweep_due,
+            crate::standby::refill_round,
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while marker.exists() || !pool_marker.exists() {
+            assert!(Instant::now() < deadline, "unified loop did not run both GC and standby refill");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        maint.stop();
+        assert!(!marker.exists(), "GC sweep collected expired marker");
+        assert!(pool_marker.exists(), "standby refill_round ran from the same loop");
+    }
+
+    #[test]
+    fn host_maintenance_shutdown_wakes_leader_and_follower_immediately() {
+        let d = dir("maint-stop");
+        let host = Host::open(&d.join("state"), &d.join("run")).unwrap();
+        let long = Duration::from_secs(3600);
+        let leader = maintain_with(host.clone(), long, long, long, |_| {}, |_| {});
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while maint_lock(&host).unwrap().is_some() {
+            assert!(Instant::now() < deadline, "leader did not acquire maintenance lock");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let follower = maintain_with(host.clone(), long, long, long, |_| {}, |_| {});
+        let start = Instant::now();
+        drop(follower);
+        drop(leader);
+        assert!(start.elapsed() < Duration::from_secs(2), "shutdown did not wake condvar promptly: {:?}", start.elapsed());
+        assert!(maint_lock(&host).unwrap().is_some(), "leader released maintenance lock on stop");
     }
 }
