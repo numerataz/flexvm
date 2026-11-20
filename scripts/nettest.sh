@@ -24,7 +24,8 @@
 #      MAX_UDP_LOSS (default 0), PORT (listeners, default 7070), WORK (keep logs under this
 #      directory, default /tmp), TEMPLATE (default small: the test image, see scripts/faults.py),
 #      V6 (default 0), NET6 (default fd5e::), PREFIX6 (default fd5e:0:0:1::),
-#      STALL_SLACK_MS (default 0; a loaded host's scheduling, beside a short downtime)
+#      STALL_SLACK_MS (default 0; a loaded host's scheduling, beside a short downtime),
+#      CAPTURE_TCP (default 0; keep TCP and neighbour-discovery captures on failure)
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -42,6 +43,7 @@ PORT=${PORT:-7070}
 V6=${V6:-0}
 NET6=${NET6:-fd5e::}
 PREFIX6=${PREFIX6:-fd5e:0:0:1::}
+CAPTURE_TCP=${CAPTURE_TCP:-0}
 if [[ $V6 == 1 ]]; then
     host_A=[${NET6}1]:$PORT
     host_B=[${NET6}2]:$PORT
@@ -82,7 +84,7 @@ wait_within() {
 }
 
 teardown() {
-    local pid
+    local pid site
     trap - EXIT INT TERM
     set +e
     for pid in "${bg_pids[@]}"; do kill "$pid" 2>/dev/null; done
@@ -96,7 +98,21 @@ teardown() {
     cp "$dir_B"/run/vms/*.log "$work/log/B/" 2>/dev/null
     forget_states "$dir_A" "$dir_B"
     rm -rf "$dir_A" "$dir_B"
-    if (( failed )); then say "logs kept in $work/log/A and $work/log/B"; else rm -rf "$work"; fi
+    if (( failed )); then
+        say "logs kept in $work"
+        if [[ -d $work/packets ]]; then
+            for site in A B C lan; do
+                [[ -f $work/packets/$site.links ]] || continue
+                say "=== $site: interfaces, route changes, and last captured packets ==="
+                tail -n 20 "$work/packets/$site.links" "$work/packets/$site.netlink" "$work/packets/$site.log"
+                if [[ -s $work/packets/$site.pcap ]]; then
+                    timeout 4s tcpdump -nn -tt -r "$work/packets/$site.pcap" | tail -n 40
+                fi
+            done
+        fi
+    else
+        rm -rf "$work"
+    fi
 }
 
 [[ $EUID == 0 ]] || die 'run as root'
@@ -123,6 +139,29 @@ for spec in A:1 B:2 C:10; do
 done
 # The client resolves the VMs' prefix on the LAN (proxy NDP answers), as it does their IPv4 addresses.
 [[ $V6 != 1 ]] || ip -n "${P}C" -6 route add "$PREFIX6/96" dev eth0
+if [[ $CAPTURE_TCP == 1 ]]; then
+    command -v tcpdump > /dev/null || die 'CAPTURE_TCP requires tcpdump'
+    mkdir -p "$work/packets"
+    for site in A B C lan; do
+        # Cooked captures store interface indices. Record the names and route changes
+        # from the original namespace so they can be resolved after teardown.
+        ip -n "$P$site" -o link show > "$work/packets/$site.links"
+        ip -ts -n "$P$site" monitor link route neigh > "$work/packets/$site.netlink" 2>&1 &
+        bg_pids+=("$!")
+        # Open the output here so tcpdump may drop privileges while capturing.
+        LC_ALL=C ip netns exec "$P$site" tcpdump -n -i any -s 128 -U -c 60000 -w - 'tcp port 19012 or icmp6' \
+            > "$work/packets/$site.pcap" 2> "$work/packets/$site.log" &
+        capture_pid=$!
+        bg_pids+=("$capture_pid")
+        deadline=$((SECONDS + 5))
+        until grep -Fsq 'listening on ' "$work/packets/$site.log"; do
+            if ! kill -0 "$capture_pid" 2>/dev/null || (( SECONDS >= deadline )); then
+                die "tcpdump did not start in namespace $P$site"
+            fi
+            sleep 0.1
+        done
+    done
+fi
 start_listener() {
     local ns=$1 dir=$2 listen=$3 peer=$4 ips=$5
     mkdir -p "$dir/state" "$dir/run"

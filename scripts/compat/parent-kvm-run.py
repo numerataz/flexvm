@@ -1186,7 +1186,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
     if xcrs:
         expected.extend((GET_XCRS, SET_XCRS, GET_XCRS))
     if xsave:
-        expected.extend((GET_XSAVE, SET_XSAVE, GET_XSAVE, SET_XSAVE))
+        expected.extend((SET_XCRS, GET_XSAVE, SET_XSAVE, GET_XSAVE, SET_XSAVE))
     if lapic:
         expected.append(GET_LAPIC)
     expected_counters = []
@@ -2103,6 +2103,7 @@ def main():
                       host_devices=sorted(devices))
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         report.update(status="failed", error=str(error))
+        print(error, file=sys.stderr)
     report_path.write_text(json.dumps(report, indent=2) + "\n")
     print(f"{report['status'].upper()}: {report_path}")
     return int(report["status"] != "passed")
