@@ -1048,6 +1048,15 @@ class KvmChild:
             self.close()
             raise
 
+    def checkpoint_ready(self):
+        return self.lanes.checkpoint_ready()
+
+    def freeze_run_control(self, frozen):
+        # The native worker can only enter KVM_RUN through these broker lanes.
+        # No worker command can start a vCPU until the owner releases the hold.
+        if frozen and not self.checkpoint_ready():
+            raise RuntimeError("native x86 worker still has pending execution")
+
     def run(self, cpu, cancellation, completion):
         sequence = cancellation.sequence
         if not 0 < sequence < 1 << 31:
@@ -1966,6 +1975,7 @@ def exercise(
                 if length or not active_vm or open_cpus or (child is not None and child.process is not None):
                     raise RuntimeError("nested VM closed before all vCPUs stopped")
                 active_vm = False
+                child = None
             elif launch and not active_vm and opcode != GET_SUPPORTED_CPUID:
                 raise RuntimeError("command requires an open nested VM")
             elif opcode == GET_SUPPORTED_CPUID:
@@ -2573,8 +2583,6 @@ def serve_outer(argv):
     if checkpoint and engine == "tcg":
         options = native_query([qemu, "-device", "isa-debugcon,help"])
         checkpoint = b"checkpoint-control" in options.stdout + options.stderr
-    else:
-        checkpoint = False
     result = exercise(
         qemu, None, output, parent_engine=engine, ram_pages=args.child_memory * MIB // PAGE_SIZE,
         protected_entry=True, pvh=True, cpu_count=2,
