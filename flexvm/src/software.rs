@@ -390,6 +390,7 @@ impl Owner {
                 rootfs: blank.clone(),
                 state: blank,
                 firmware: std::collections::BTreeMap::new(),
+                parent: None,
                 disks: Vec::new(),
                 main: match &self.main_id {
                     Some(id) => software_state::Main::App(software_state::Session {
@@ -578,7 +579,7 @@ struct Resume {
 
 pub fn run(host: Host, name: NameLock, machine: qemu::Machine, processes: Arc<qemu::Processes>, config: &qemu::Config, meta: &image::ImageMeta) -> Result<i32> {
     if config.parent_kvm.is_some() && !machine.has_parent_fence() {
-        bail!("named parent KVM VMs require an ARM TCG worker with hierarchy pause support");
+        bail!("named parent KVM VMs require a worker with hierarchy pause support");
     }
     serve(host, name, machine, processes, config, meta, None)
 }
@@ -594,7 +595,10 @@ fn serve(
 ) -> Result<i32> {
     let machine = Arc::new(machine);
     let epoch = u64::from_str_radix(&util::random_hex(8)?, 16)?;
-    let deadline = Instant::now() + if meta.boot.is_app() { guest::TIMEOUT } else { config.boot_timeout };
+    // A restored VM must reconnect its guest transport after device load.
+    // Allow the same startup budget as a cold boot for that handoff.
+    let timeout = if resumed.is_some() || !meta.boot.is_app() { config.boot_timeout } else { guest::TIMEOUT };
+    let deadline = Instant::now() + timeout;
     let (generation, identity_generation, vm_id, main_id, main_reader, offset, claim, consumed, notify) = match resumed {
         Some(resumed) => {
             // STARTED was synchronized before this first guest instruction.
@@ -804,16 +808,30 @@ fn serve(
     result
 }
 
-pub fn restore(host: Host, vm_name: &str, notify: Option<std::fs::File>) -> Result<i32> {
+pub fn restore(host: Host, vm_name: &str, bundle: Option<&Path>, notify: Option<std::fs::File>) -> Result<i32> {
     let notify = notify.map(|file| Startup(Arc::new(Mutex::new(Some(file)))));
     let failure_notify = notify.clone();
     let result = (|| {
         let name = host.take_name(vm_name, true)?;
         let path = host.suspended(vm_name)?;
         let metadata = software_state::metadata(&path)?;
+        let native = metadata.parent.as_ref().is_some_and(|parent| parent.native);
+        let bundle = if native {
+            bundle
+                .filter(|path| !path.as_os_str().is_empty())
+                .ok_or("restoring native parent KVM state requires a local --parent-kvm-bundle DIR")?
+                .canonicalize()?
+        } else {
+            PathBuf::new()
+        };
         let processes = Arc::new(qemu::Processes::default());
         setup_signals(processes.clone());
-        let config = restore_config(&metadata);
+        let mut config = restore_config(&metadata);
+        config.parent_kvm = metadata.parent.as_ref().map(|parent| qemu::ParentKvm {
+            bundle,
+            engine: if parent.native { "kvm" } else { "tcg" }.into(),
+            child_mem_mib: parent.child_memory_mib,
+        });
         let _reservation = Reservation::new(&host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)?;
         let profiles = config.profiles_for_disk_ids(metadata.disks.iter().map(|disk| disk.volume_id.as_str()))?;
         let verified = software_state::open(&path, profiles)?;

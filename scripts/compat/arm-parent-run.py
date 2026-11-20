@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run an ARM guest with the parent-owned KVM device and native child worker."""
 import argparse
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack
 from dataclasses import dataclass
 import errno
 import fcntl
@@ -14,7 +14,6 @@ import runpy
 import select
 import shutil
 import socket
-import stat
 import struct
 import subprocess
 import tempfile
@@ -67,74 +66,7 @@ class Lane:
     completion_only: bool = False
 
 
-class CheckpointGate:
-    def __init__(self, listener):
-        self.listener = listener
-        self.client = None
-        self.phase = "running"
-        self.captured_interrupts = {}
-
-    def descriptor(self):
-        return self.client if self.client is not None else self.listener
-
-    def service(self, ready, worker, capture, rollback):
-        if self.descriptor() not in ready:
-            return False
-        if self.client is None:
-            self.client, _ = self.listener.accept()
-            return False
-        request, fds, flags, _ = socket.recv_fds(self.client, 16, 3, socket.MSG_CMSG_CLOEXEC)
-        with ExitStack() as descriptors:
-            for fd in fds:
-                descriptors.callback(os.close, fd)
-                os.set_inheritable(fd, False)
-            if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
-                raise RuntimeError("truncated ARM checkpoint request")
-            return self.handle(request, fds, worker, capture, rollback)
-
-    def handle(self, request, fds, worker, capture, rollback):
-        if not request:
-            self.close()
-            if self.phase != "running":
-                # The requester may have committed a captured VM elsewhere.
-                # Unwind the broker and both owned emulators on disconnect.
-                raise RuntimeError("ARM checkpoint owner disconnected")
-        elif request == b"freeze" and not fds and self.phase == "running":
-            self.phase = "freezing"
-        elif request == b"thaw" and not fds and self.phase == "frozen":
-            if worker:
-                worker.freeze_run_control(False)
-            self.phase = "running"
-            self.client.sendall(b"ok")
-        elif request == b"save" and len(fds) == 3 and self.phase == "frozen":
-            self.captured_interrupts = capture(worker, fds)
-            self.phase = "captured"
-            self.client.sendall(b"ok")
-        elif request == b"rollback" and not fds and self.phase == "captured":
-            rollback(worker, self.captured_interrupts)
-            self.captured_interrupts = {}
-            self.phase = "running"
-            self.client.sendall(b"ok")
-        elif request == b"retire" and not fds and self.phase == "captured":
-            return True
-        else:
-            self.client.sendall(b"invalid checkpoint command")
-        return False
-
-    def finish_freeze(self, worker):
-        if self.phase != "freezing":
-            return
-        if worker:
-            if worker.read_width or any(lane.live is not None for lane in worker.lanes.values()):
-                return
-            worker.freeze_run_control(True)
-        self.phase = "frozen"
-        self.client.sendall(b"ok")
-
-    def close(self):
-        if self.client is not None:
-            self.client.close()
-            self.client = None
+CheckpointGate = PARENT["CheckpointGate"]
 
 
 class NativeArm:
@@ -142,6 +74,7 @@ class NativeArm:
         self.control, peer = socket.socketpair(type=socket.SOCK_SEQPACKET)
         self.control.settimeout(3)
         self.lanes = {}
+        self.read_width = {}
         proc = None
         try:
             with peer:
@@ -204,7 +137,22 @@ class NativeArm:
         status, reason, payload, extra = reply_from(self.lanes[cpu].socket)
         if extra or (reason and (status or operation != PARENT["RUN"])):
             raise RuntimeError("invalid native ARM vCPU reply")
+        completed = (operation == PARENT["RUN"] and status in (0, -errno.EINTR, -errno.EAGAIN)
+                     or operation == PARENT["COMPLETE_READ"] and status == 0)
+        if completed:
+            self.read_width.pop(cpu, None)
+        if reason == PARENT["KVM_EXIT_MMIO"]:
+            _, length, writing = struct.unpack_from("<QII", payload)
+            if not writing:
+                self.read_width[cpu] = length
         return status, reason, payload
+
+    def checkpoint_ready(self):
+        return not self.read_width and all(lane.live is None for lane in self.lanes.values())
+
+    def freeze_run_control(self, frozen):
+        if frozen and not self.checkpoint_ready():
+            raise RuntimeError("native ARM worker still has pending execution")
 
     def cancel(self, cpu):
         self.require(CANCEL_RUN, cpu=cpu, sequence=self.lanes[cpu].sequence)
@@ -216,6 +164,7 @@ class NativeArm:
             raise RuntimeError(f"failed to stop native ARM vCPU {cpu}") from error
         finally:
             lane = self.lanes.pop(cpu, None)
+            self.read_width.pop(cpu, None)
             if lane:
                 lane.socket.close()
 
@@ -350,7 +299,7 @@ def serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, cr
                    gate=None, capture=None, rollback=None, worker=None):
     vm_open = worker is not None
     cpus = set(worker.cpus) if worker else set()
-    registered = worker is not None
+    registered = worker is not None and bool(worker.slots)
     exited = os.pidfd_open(outer.pid)
     try:
         while True:
@@ -432,70 +381,25 @@ def serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, cr
             os.close(exited)
 
 
-def state_fds(fds, *, writing=False):
-    identities = set()
-    for fd in fds:
-        mode = os.fstat(fd)
-        identity = mode.st_dev, mode.st_ino
-        access = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE
-        if not stat.S_ISREG(mode.st_mode) or identity in identities or os.lseek(fd, 0, os.SEEK_CUR):
-            raise RuntimeError("ARM checkpoint needs distinct regular files positioned at zero")
-        if (writing and access == os.O_RDONLY) or (not writing and access == os.O_WRONLY):
-            raise RuntimeError("ARM checkpoint file access mode is invalid")
-        identities.add(identity)
-    return fds
+state_fds = PARENT["state_fds"]
+restore_interrupts = PARENT["restore_interrupts"]
+transfer = PARENT["transfer_state"]
+IDLE_WORKER_STATE = b"FLEXVM ARM no nested worker\n"
 
 
 def capture_state(outer, qmp, irq_fds, worker, fds):
-    outer_fd, child_fd, metadata = state_fds(fds, writing=True)
-    if worker is None or worker.proc is None:
-        raise RuntimeError("ARM checkpoint needs an active nested worker")
-    if any(os.fstat(fd).st_size for fd in fds):
-        raise RuntimeError("ARM checkpoint output files must be empty")
-    monitor = PARENT["HELPERS"]["QMP"](qmp, outer, time.monotonic() + 30)
-    try:
-        monitor.ask("stop")
-        if monitor.ask("query-status")["status"] != "paused":
-            raise RuntimeError("ARM checkpoint could not pause the outer VM")
-        pending = {}
-        for gsi, fd in enumerate(irq_fds):
-            try:
-                pending[gsi] = os.eventfd_read(fd)
-            except BlockingIOError:
-                pass
-        worker.capture(child_fd)
-        record = json.dumps({"version": 1, "worker": worker.profile(), "pending": pending}).encode()
-        if os.write(metadata, record) != len(record):
-            raise RuntimeError("short ARM checkpoint metadata write")
-        transfer(monitor, outer_fd)
-    finally:
-        monitor.close()
-    return pending
+    if worker is not None and worker.proc is None:
+        raise RuntimeError("ARM checkpoint cannot capture a worker that is still starting")
 
+    def capture_worker(fd):
+        if worker is None:
+            if os.write(fd, IDLE_WORKER_STATE) != len(IDLE_WORKER_STATE):
+                raise RuntimeError("short ARM idle worker state write")
+            return None
+        worker.capture(fd)
+        return worker.profile()
 
-def restore_interrupts(irq_fds, pending):
-    for gsi, count in pending.items():
-        index = int(gsi)
-        if not 0 <= index < len(irq_fds) or not 0 < count < (1 << 64) - 1:
-            raise RuntimeError("invalid ARM checkpoint pending interrupt")
-        os.eventfd_write(irq_fds[index], count)
-
-
-def transfer(monitor, fd, *, incoming=False):
-    monitor.send_fd(fd)
-    try:
-        monitor.ask("migrate-incoming" if incoming else "migrate", {"uri": "fd:snapshot"})
-    except BaseException:
-        with suppress(Exception):
-            monitor.ask("closefd", {"fdname": "snapshot"})
-        raise
-    while True:
-        result = monitor.ask("query-migrate")
-        if result["status"] == "completed":
-            return
-        if result["status"] not in ("setup", "active", "device"):
-            raise RuntimeError(f"ARM checkpoint state transfer failed: {result}")
-        time.sleep(min(.01, monitor.remaining()))
+    return PARENT["capture_hierarchy"](outer, qmp, irq_fds, fds, capture_worker)
 
 
 def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=None, frontend=None,
@@ -511,7 +415,6 @@ def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=
         if ipa_bits is None and engine == "kvm":
             raise RuntimeError("native ARM parent execution requires an available KVM worker")
     use_tcg = ipa_bits is None
-    checkpoint = checkpoint and use_tcg
     if use_tcg:
         if tcg_qemu is None:
             raise RuntimeError("ARM TCG parent execution requires a software CPU engine")
@@ -523,7 +426,11 @@ def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=
             options = PARENT["native_query"]([tcg_qemu, "-device", "flexvm-mmio-run,help"])
             checkpoint = b"checkpoint-control" in options.stdout + options.stderr
 
+    if restore and (not checkpoint or not use_tcg):
+        raise RuntimeError("restoring ARM parent state requires the checkpoint-capable engine")
     with ExitStack() as resources:
+        restore_inputs = resources.enter_context(ExitStack())
+        restore_fds = set(restore or ())
         if control is None:
             runtime = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix="flexvm-arm-kvm-")))
         else:
@@ -581,9 +488,12 @@ def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=
                                 "file": {"driver": "file", "filename": str(frontend)}})
             # The root disk uses virtio-mmio and must remain /dev/vda.
             command.extend(["-blockdev", block, "-device", "virtio-blk-pci,drive=parent-kvm-module,serial=flexvm-pvkvm"])
-        outer = SPAWN(command, pass_fds=(memory, *inherited))
+        outer_fds = [fd for fd in inherited if fd not in restore_fds]
+        outer = SPAWN(command, pass_fds=(memory, *outer_fds))
         for fd in inherited:
-            if use_tcg and fd == emulator_fd:
+            if fd in restore_fds:
+                restore_inputs.callback(os.close, fd)
+            elif use_tcg and fd == emulator_fd:
                 resources.callback(os.close, fd)
             else:
                 os.close(fd)
@@ -615,23 +525,31 @@ def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=
                         raise RuntimeError("restored ARM outer VM is not paused")
                 finally:
                     monitor.close()
-                restored_worker = create_worker(record["worker"]["vm_type"])
-                resources.callback(restored_worker.close)
-                restored_worker.restore(record["worker"], memory, irq_fds, child_fd, max_pages, outer_bytes)
+                profile = record["worker"]
+                if profile is None:
+                    size = len(IDLE_WORKER_STATE)
+                    if os.fstat(child_fd).st_size != size or os.pread(child_fd, size, 0) != IDLE_WORKER_STATE:
+                        raise RuntimeError("invalid ARM idle worker state")
+                else:
+                    restored_worker = create_worker(profile["vm_type"])
+                    resources.callback(restored_worker.close)
+                    restored_worker.restore(profile, memory, irq_fds, child_fd, max_pages, outer_bytes)
                 restore_interrupts(irq_fds, record["pending"])
                 os.eventfd_write(replies, 1)
+                restore_inputs.close()
                 gate.phase = "frozen"
 
         def capture(worker, fds):
             return capture_state(outer, outer_qmp, irq_fds, worker, fds)
 
         def rollback(worker, pending):
-            worker.freeze_run_control(False)
+            if worker is not None:
+                worker.freeze_run_control(False)
             restore_interrupts(irq_fds, pending)
 
         return serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, create_worker,
-                              memory, outer_bytes, max_pages, gate=gate, capture=capture,
-                              rollback=rollback, worker=restored_worker)
+                              memory, outer_bytes, max_pages, gate=gate, capture=capture if use_tcg else None,
+                              rollback=rollback if use_tcg else None, worker=restored_worker)
 
 
 def main():
