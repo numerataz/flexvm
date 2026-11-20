@@ -2,6 +2,7 @@
 // cc -std=c11 -O2 -Wall -Wextra -Werror -static -pthread kvm-abi.c -o kvm-abi
 #define _GNU_SOURCE
 #include <errno.h>
+#include <cpuid.h>
 #include <fcntl.h>
 #include <linux/kvm.h>
 #include <pthread.h>
@@ -161,6 +162,34 @@ static void concurrent_ram(int kvm, const struct kvm_cpuid2 *cpuid) {
     pass("live shared RAM handshake and atomic updates without VM-exit synchronization");
 }
 
+static void advertised_feature_control(int kvm, int cpu) {
+    struct kvm_msr_list query = {0};
+    REQUIRE(ioctl(kvm, KVM_GET_MSR_INDEX_LIST, &query) == -1 && errno == E2BIG);
+    REQUIRE(query.nmsrs > 0 && query.nmsrs <= 4096);
+    struct kvm_msr_list *list = calloc(1, sizeof(*list) + query.nmsrs * sizeof(uint32_t));
+    REQUIRE(list != NULL);
+    list->nmsrs = query.nmsrs;
+    REQUIRE(ioctl(kvm, KVM_GET_MSR_INDEX_LIST, list) == 0);
+    int advertised = 0;
+    for (unsigned i = 0; i < list->nmsrs; i++) advertised |= list->indices[i] == 0x3a;
+    struct kvm_msrs *msrs = calloc(1, sizeof(*msrs) + sizeof(struct kvm_msr_entry));
+    REQUIRE(msrs != NULL);
+    msrs->nmsrs = 1;
+    msrs->entries[0].index = 0x3a;
+    int received = ioctl(cpu, KVM_GET_MSRS, msrs);
+    unsigned a, b, c, d;
+    REQUIRE(__get_cpuid(0, &a, &b, &c, &d));
+    char vendor[13] = {0};
+    memcpy(vendor, &b, 4); memcpy(vendor + 4, &d, 4); memcpy(vendor + 8, &c, 4);
+    printf("KVM_FEATURE_CONTROL vendor=%s advertised=%d received=%d value=%llx\n",
+           vendor, advertised, received, (unsigned long long)msrs->entries[0].data);
+    REQUIRE(received == 0 || received == 1);
+    REQUIRE(!advertised || received == 1);
+    free(msrs);
+    free(list);
+    pass("advertised feature-control MSR is readable for snapshot state");
+}
+
 int main(int argc, char **argv) {
     // Preserve the last completed case when the watchdog must use _exit().
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -187,7 +216,20 @@ int main(int argc, char **argv) {
     pass("supported CPU configuration");
 
     struct machine a = create(kvm, cpuid, 0x41);
+    advertised_feature_control(kvm, a.cpu);
     struct machine b = create(kvm, cpuid, 0x61);
+    REQUIRE(ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_IMMEDIATE_EXIT) > 0);
+    a.run->immediate_exit = 1;
+    alarm(10);
+    int cancelled = ioctl(a.cpu, KVM_RUN, 0);
+    int cancel_errno = errno;
+    alarm(0);
+    REQUIRE(cancelled == -1 && cancel_errno == EINTR);
+    struct kvm_regs stopped;
+    REQUIRE(ioctl(a.cpu, KVM_GET_REGS, &stopped) == 0 && stopped.rip == CODE_ADDR);
+    REQUIRE(a.ram[DATA_ADDR] == 0x41);
+    a.run->immediate_exit = 0;
+    pass("vCPU run-page cancellation before guest execution");
     output(&a, 0x41);
     // The stopped vCPU must see a caller write immediately when it resumes.
     a.ram[DATA_ADDR] = 0x50;
