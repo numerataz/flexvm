@@ -150,11 +150,14 @@ fn extra_with(base: &std::path::Path, me: &Ident, target: usize, scan: impl FnOn
         return Some(false);
     }
     // Under this pool's rank lock, every unpublished snapshot of it is abandoned, even a live pid's:
-    // `write_file`'s `.NAME.TAG.tmp`, any `write_tag`, or an older version's bare pid. Once per scan, not per check.
+    // `write_file`'s `.NAME.[SEQ.]TAG.tmp`, any `write_tag`, or an older version's bare pid. Once per scan, not per check.
     let name = path.file_name()?.to_str()?;
     for e in std::fs::read_dir(path.parent()?).into_iter().flatten().flatten() {
         let n = e.file_name();
-        let tag = n.to_str().and_then(|n| n.strip_prefix('.')?.strip_prefix(name)?.strip_prefix('.')?.strip_suffix(".tmp"));
+        let tag = n
+            .to_str()
+            .and_then(|n| n.strip_prefix('.')?.strip_prefix(name)?.strip_prefix('.')?.strip_suffix(".tmp"))
+            .map(|t| t.split_once('.').filter(|(seq, _)| !seq.is_empty() && seq.bytes().all(|b| b.is_ascii_digit())).map_or(t, |(_, rest)| rest));
         if tag.is_some_and(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b) || b == b'-')) {
             let _ = std::fs::remove_file(e.path());
         }
@@ -1765,6 +1768,7 @@ mod tests {
             ".default.ranks.123.tmp".to_string(),
             ".default.ranks.123-456-abcdef01.tmp".to_string(),
             format!(".default.ranks.{}.tmp", crate::util::write_tag()),
+            format!(".default.ranks.42.{}.tmp", crate::util::write_tag()),
         ];
         let kept = [
             ".other.ranks.123.tmp",

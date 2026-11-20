@@ -7337,12 +7337,9 @@ pub(crate) mod tests {
         let exited = crate::app::Exited::new(0, "image".into(), None, Default::default(), spec.clone(), 1);
         for ext in ["json", "exited"] {
             let path = base.join(format!("private.{ext}"));
-            // Upgrade a public record and a leftover public temporary file, too.
+            // Upgrade a public record to mode 0600.
             std::fs::write(&path, b"old").unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-            let tmp = path.parent().unwrap().join(format!(".private.{ext}.{}.tmp", crate::util::write_tag()));
-            std::fs::write(&tmp, b"old temporary data").unwrap();
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644)).unwrap();
             if ext == "json" {
                 store_private(&path, &entry, false).unwrap();
                 assert_eq!(load::<Entry>(&path).unwrap().unwrap().spec, spec);
@@ -7351,7 +7348,7 @@ pub(crate) mod tests {
                 assert_eq!(crate::app::Exited::read(&path).unwrap().spec, spec);
             }
             assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
-            assert!(!tmp.exists());
+            assert!(std::fs::read_dir(path.parent().unwrap()).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")));
         }
     }
 
@@ -7511,7 +7508,7 @@ pub(crate) mod tests {
         }
         let tmp = h.run.join(format!(".record.{}.tmp", crate::util::write_tag()));
         std::os::unix::fs::symlink(&victim, tmp).unwrap();
-        assert!(crate::util::write_file(&h.run, "record", b"replace", false).is_err());
+        crate::util::write_file(&h.run, "record", b"replace", false).unwrap();
         assert_eq!(std::fs::read_to_string(victim).unwrap(), "keep");
     }
 
@@ -9052,15 +9049,14 @@ pub(crate) mod tests {
                 "owe" => h.owed_path(10),
                 _ => h.addr_path(x),
             };
-            let blocked = path.with_file_name(format!(".{}.{}.tmp", path.file_name().unwrap().to_str().unwrap(), crate::util::write_tag()));
-            std::fs::create_dir(&blocked).unwrap();
+            let blocked = crate::util::block_write(path.clone());
             let error = h.collect_garbage_with(false).unwrap_err().to_string();
             assert!(error.contains(path.to_str().unwrap()), "{case}: {error}");
             let l = h.lock().unwrap();
             assert_eq!(h.addr(&l, x).unwrap(), a, "{case}: failed write keeps its claim");
             assert!(h.addr(&l, y).unwrap().withdrawn, "{case}: sweep continues after errors");
             drop(l);
-            std::fs::remove_dir(&blocked).unwrap();
+            drop(blocked);
             if case == "release-owed" {
                 wait_until("owed release to settle", || {
                     h.settle_owed_with(5, |_, _| Ok("released".into()), |_, _| (), |_, _| ());
@@ -9083,8 +9079,7 @@ pub(crate) mod tests {
         h.put_addr(y, &Addr { holder: Some("healthy".into()), holder_id: Some(gone), ..a.clone() }, false).unwrap();
         // The record's write, which both withdraws and lets go of the claim, fails.
         let path = h.addr_path(x);
-        let blocked = path.with_file_name(format!(".{}.{}.tmp", path.file_name().unwrap().to_str().unwrap(), crate::util::write_tag()));
-        std::fs::create_dir(&blocked).unwrap();
+        let blocked = crate::util::block_write(path.clone());
         for _ in 0..2 {
             let error = h.collect_garbage_with(false).unwrap_err().to_string();
             assert!(error.contains(path.to_str().unwrap()), "{error}");
@@ -9094,7 +9089,7 @@ pub(crate) mod tests {
             let other = h.addr(&l, y).unwrap();
             assert!(other.withdrawn && other.holder.is_none(), "sweep continues after errors: {other:?}");
         }
-        std::fs::remove_dir(&blocked).unwrap();
+        drop(blocked);
         assert_eq!(h.collect_garbage_with(false).unwrap(), vec![("failed".to_string(), x, 4)]);
         let a = h.addr(&h.lock().unwrap(), x).unwrap();
         assert!(a.withdrawn && a.holder.is_none() && a.holder_id.is_none(), "retried: {a:?}");

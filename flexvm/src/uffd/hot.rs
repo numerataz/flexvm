@@ -240,14 +240,15 @@ const SCAN_BUDGET: usize = 16;
 /// included, so it may copy fewer. It runs during the pause, and a large guest can have millions. Returns ascending pages for
 /// copying runs and binary searches. Bitmap words without candidates are still skipped by the iterator.
 fn select_hot(candidates: impl Iterator<Item = usize>, prev: &[usize], candidate: impl Fn(usize) -> bool, cap: usize) -> Vec<usize> {
-    let mut hot: Vec<usize> = prev.iter().copied().take(cap).filter(|&p| candidate(p)).collect();
+    let taken = &prev[..prev.len().min(cap)];
+    let mut hot: Vec<usize> = taken.iter().copied().filter(|&p| candidate(p)).collect();
     let mut j = 0;
     let others = candidates
         .take(SCAN_BUDGET * cap)
         .filter(|&p| candidate(p))
         .filter(|&p| {
-            j += prev[j..].partition_point(|&q| q < p);
-            prev.get(j) != Some(&p)
+            j += taken[j..].partition_point(|&q| q < p);
+            taken.get(j) != Some(&p)
         })
         .take(cap - hot.len());
     hot.extend(others);
@@ -393,6 +394,8 @@ mod tests {
         // Under the cap, every candidate.
         assert_eq!(select_hot([3, 5, 9].into_iter(), &[5, 7], |p| p != 7, 4), [3, 5, 9]);
         assert_eq!(select_hot([3, 5, 9].into_iter(), &[9], all, 2), [3, 9]);
+        // Pages in prev past cap were not taken up front, so they remain eligible when scanned.
+        assert_eq!(select_hot([1, 2, 3, 4].into_iter(), &[1, 2, 3, 4], |p| p >= 3, 2), [3, 4]);
     }
 
     /// A guest of `n` pages, each filled with its own byte.

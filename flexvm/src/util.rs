@@ -1436,16 +1436,46 @@ pub fn write_tag() -> String {
     tag
 }
 
+static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+static BLOCKED_WRITES: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Test guard that causes `write_file_mode` to fail for `path` until dropped.
+#[cfg(test)]
+pub struct WriteBlocker(std::path::PathBuf);
+
+#[cfg(test)]
+pub fn block_write(path: std::path::PathBuf) -> WriteBlocker {
+    BLOCKED_WRITES.lock().unwrap_or_else(|e| e.into_inner()).push(path.clone());
+    WriteBlocker(path)
+}
+
+#[cfg(test)]
+impl Drop for WriteBlocker {
+    fn drop(&mut self) {
+        let mut blocked = BLOCKED_WRITES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pos) = blocked.iter().position(|p| p == &self.0) {
+            blocked.swap_remove(pos);
+        }
+    }
+}
+
 /// Durably: the file is fsynced before the rename, its directory after.
 pub fn write_file(dir: &Path, name: &str, data: &[u8], durable: bool) -> io::Result<()> {
     write_file_mode(dir, name, data, durable, 0o644)
 }
 
-/// Like `write_file`, with a creation mode; 0600 also secures a reused temporary file.
+/// Like `write_file`, with a creation mode.
 pub fn write_file_mode(dir: &Path, name: &str, data: &[u8], durable: bool, mode: u32) -> io::Result<()> {
-    let tmp = dir.join(format!(".{name}.{}.tmp", write_tag()));
+    #[cfg(test)]
+    if BLOCKED_WRITES.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p == &dir.join(name)) {
+        return Err(io::Error::other(format!("{}: write blocked by test", dir.join(name).display())));
+    }
+    let seq = WRITE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.{seq}.{}.tmp", write_tag()));
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut f = std::fs::File::options().write(true).create(true).truncate(true).mode(mode).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
+    let mut f = std::fs::File::options().write(true).create_new(true).mode(mode).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
     let res = (|| {
         if mode == 0o600 {
             f.set_permissions(std::fs::Permissions::from_mode(mode))?;
@@ -2292,7 +2322,31 @@ mod tests {
         let dir = crate::test_util::TempDir::new("write-file");
         std::fs::create_dir_all(dir.join("dest")).unwrap();
         assert!(write_file(&dir, "dest", b"data", true).is_err());
-        assert!(!dir.join(format!(".dest.{}.tmp", write_tag())).exists());
+        assert!(std::fs::read_dir(&dir).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")));
+    }
+
+    #[test]
+    fn concurrent_write_file_same_target_does_not_collide() {
+        let dir = crate::test_util::TempDir::new("write-file-concurrent");
+        std::thread::scope(|scope| {
+            let threads: Vec<_> = (0..8)
+                .map(|t| {
+                    let dir = &dir;
+                    scope.spawn(move || {
+                        let payload = format!("thread-{t}-payload").repeat(16);
+                        for _ in 0..50 {
+                            write_file(dir, "shared", payload.as_bytes(), false).unwrap();
+                        }
+                    })
+                })
+                .collect();
+            for handle in threads {
+                handle.join().unwrap();
+            }
+        });
+        let final_bytes = std::fs::read_to_string(dir.join("shared")).unwrap();
+        assert!((0..8).any(|t| final_bytes == format!("thread-{t}-payload").repeat(16)));
+        assert!(std::fs::read_dir(&dir).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")));
     }
 
     #[test]
