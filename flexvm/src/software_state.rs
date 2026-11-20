@@ -1,7 +1,7 @@
 //! Private, content-verified software state. Manifests contain identities, never
 //! paths: every artifact is opened relative to its pinned directory descriptor.
 use std::collections::BTreeMap;
-use std::fs::{self, File, Metadata, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, FileExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::template::Stamp;
 use crate::util::Result;
 use crate::{bail, util};
 
@@ -229,15 +230,6 @@ pub struct Input {
     pub file: File,
     pub artifact: Artifact,
     stamp: Stamp,
-}
-
-#[derive(PartialEq, Eq)]
-struct Stamp(u64, u64, u64, i64, i64, i64, i64);
-
-impl Stamp {
-    fn of(m: &Metadata) -> Self {
-        Self(m.dev(), m.ino(), m.len(), m.ctime(), m.ctime_nsec(), m.mtime(), m.mtime_nsec())
-    }
 }
 
 impl Input {
@@ -970,9 +962,10 @@ impl Staging {
                 let path = self.path.join(format!("disk-{}", disk.id));
                 let target = OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(path)?;
                 target.set_len(disk.size)?;
-                let before = Stamp::of(&disk.file.metadata()?);
+                let meta = disk.file.metadata()?;
+                let before = Stamp::of(&meta);
                 let hashed = crate::volume::copy_raw_hashed(&disk.file, &target, disk.size)?;
-                if before != Stamp::of(&disk.file.metadata()?) || before.2 != disk.size {
+                if before != Stamp::of(&disk.file.metadata()?) || meta.len() != disk.size {
                     bail!("managed disk changed while capturing its checkpoint");
                 }
                 let content = match hashed {

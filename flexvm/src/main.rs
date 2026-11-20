@@ -627,7 +627,6 @@ fn check_applies(args: &Args) -> Result<()> {
                 bail!("{cmd} needs NAME")
             }
             "rename" => bail!("rename needs OLD NEW"),
-            "cp" => bail!("cp needs SRC DST"),
             _ => {}
         }
     }
