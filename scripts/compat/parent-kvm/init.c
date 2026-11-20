@@ -46,11 +46,13 @@ int main(void)
         else if (access("/protected-entry", F_OK) == 0)
             mode = "protected";
         const char *interrupt = access("/interrupt-run", F_OK) == 0 ? "interrupt" : NULL;
-        const char *smp = access("/two-vcpus", F_OK) == 0 ? "smp" : NULL;
+        const char *cpu_mode = access("/two-vcpus", F_OK) == 0 ? "smp" : NULL;
+        if (access("/long-mode", F_OK) == 0)
+            cpu_mode = "long";
         if (interrupt)
-            execl("/kvm-run", "kvm-run", pages, mode, interrupt, smp, NULL);
+            execl("/kvm-run", "kvm-run", pages, mode, interrupt, cpu_mode, NULL);
         else
-            execl("/kvm-run", "kvm-run", pages, mode, smp, NULL);
+            execl("/kvm-run", "kvm-run", pages, mode, cpu_mode, NULL);
         _exit(127);
     }
     int status;
