@@ -697,6 +697,9 @@ jobs:
           cp "$bundle/flexvm-pvkvm.img" "$software_bundle/"
           run_public_arm auto "$software_bundle"
           if sudo "$bundle/native-worker" --ipa-bits >/dev/null 2>&1; then
+            cc -std=c11 -O2 -Wall -Wextra -Werror -static -pthread scripts/compat/parent-kvm/test-arm-native.c -o "$RUNNER_TEMP/test-arm-native"
+            sudo systemd-run --scope --collect -p MemoryMax=256M -p MemorySwapMax=0 -p CPUQuota=150% \
+              "$RUNNER_TEMP/test-arm-native" "$bundle/native-worker"
             run_public_arm kvm "$bundle"
             run_public_arm kvm "$bundle" --pause
           fi

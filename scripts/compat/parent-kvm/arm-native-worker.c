@@ -13,6 +13,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include "arm-native-wire.h"
+#include "arm-native-state.h"
 #include "arm-vgic.h"
 #include "slot-map.h"
 
@@ -472,6 +473,22 @@ static int control_cpu(struct arm_cpu *cpu, const struct flexvm_arm_request *req
     return result;
 }
 
+static int checkpoint_core(struct arm_cpu *cpu, const struct flexvm_arm_request *request, int fd, struct kvm_reg_list *list)
+{
+    int lock = pthread_mutex_trylock(&cpu->execution);
+    if (lock)
+        return -lock;
+    int status;
+    if (!cpu->initialized)
+        status = -ENOEXEC;
+    else if (cpu->pending_read || atomic_load(&cpu->admitted) != atomic_load(&cpu->completed))
+        status = -EBUSY;
+    else
+        status = arm_core_state_file(cpu->fd, fd, list, request->command == FLEXVM_ARM_SAVE_CORE);
+    pthread_mutex_unlock(&cpu->execution);
+    return status;
+}
+
 static void stop_lanes(struct arm_vm *vm)
 {
     for (uint32_t id = 0; id < FLEXVM_ARM_MAX_CPUS; id++) {
@@ -508,7 +525,8 @@ static void serve(struct arm_vm *vm, int control)
         unsigned int descriptors_needed = 0;
         if (request->command == FLEXVM_ARM_REGISTER_RAM)
             descriptors_needed = 2;
-        else if (request->command == FLEXVM_ARM_OPEN_LANE || request->command == FLEXVM_ARM_BIND_IRQFD)
+        else if (request->command == FLEXVM_ARM_OPEN_LANE || request->command == FLEXVM_ARM_BIND_IRQFD ||
+                 request->command == FLEXVM_ARM_SAVE_CORE || request->command == FLEXVM_ARM_RESTORE_CORE)
             descriptors_needed = 1;
         if (!packet.well_formed || packet.count != descriptors_needed || request->reserved ||
             (request->sequence && request->command != FLEXVM_ARM_CANCEL_RUN)) {
@@ -523,6 +541,8 @@ static void serve(struct arm_vm *vm, int control)
             reply.status = ioctl_result(ioctl(vm->fd, KVM_ARM_PREFERRED_TARGET, &reply.init));
         } else if (request->cpu >= FLEXVM_ARM_MAX_CPUS) {
             reply.status = -EINVAL;
+        } else if (request->command == FLEXVM_ARM_SAVE_CORE || request->command == FLEXVM_ARM_RESTORE_CORE) {
+            reply.status = checkpoint_core(&vm->cpus[request->cpu], request, packet.descriptors[0], list);
         } else if (request->command == FLEXVM_ARM_CREATE_VCPU) {
             reply.status = create_cpu(vm, request->cpu);
         } else if (request->command == FLEXVM_ARM_CLOSE_VCPU) {
