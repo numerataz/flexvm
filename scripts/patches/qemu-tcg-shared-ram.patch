@@ -1,0 +1,102 @@
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -4,2 +4,3 @@
+ system_ss.add(when: 'CONFIG_ISA_DEBUG', if_true: files('debugexit.c'))
++system_ss.add(when: 'CONFIG_ISA_DEBUG', if_true: files('flexvm-shared-ram.c'))
+ system_ss.add(when: 'CONFIG_ISA_TESTDEV', if_true: files('pc-testdev.c'))
+--- /dev/null
++++ b/hw/misc/flexvm-shared-ram.c
+@@ -0,0 +1,93 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qemu/module.h"
++#include "hw/qdev-core.h"
++#include "hw/qdev-properties.h"
++#include "migration/blocker.h"
++#include "system/address-spaces.h"
++#include "system/hostmem.h"
++
++#define TYPE_FLEXVM_SHARED_RAM "flexvm-shared-ram"
++OBJECT_DECLARE_SIMPLE_TYPE(FlexvmSharedRam, FLEXVM_SHARED_RAM)
++
++struct FlexvmSharedRam {
++    DeviceState parent_obj;
++    HostMemoryBackend *backend;
++    MemoryRegion alias;
++    Error *migration_blocker;
++    uint64_t address;
++};
++
++static void flexvm_shared_ram_realize(DeviceState *dev, Error **errp)
++{
++    FlexvmSharedRam *s = FLEXVM_SHARED_RAM(dev);
++    MemoryRegion *memory;
++
++    if (!s->backend || host_memory_backend_is_mapped(s->backend)) {
++        error_setg(errp, "flexvm-shared-ram needs an unused memdev");
++        return;
++    }
++    if (s->address < 4096 || s->address > UINT64_MAX - 4096 ||
++        s->address % 4096) {
++        error_setg(errp, "flexvm-shared-ram needs a page-aligned RAM address");
++        return;
++    }
++    memory = host_memory_backend_get_memory(s->backend);
++    if (!memory_region_is_ram(memory) || memory_region_size(memory) != 4096) {
++        error_setg(errp, "flexvm-shared-ram needs a single 4 KiB RAM page");
++        return;
++    }
++
++    error_setg(&s->migration_blocker,
++               "flexvm-shared-ram is backed by another worker's live RAM");
++    if (migrate_add_blocker(&s->migration_blocker, errp) < 0) {
++        return;
++    }
++
++    memory_region_init_alias(&s->alias, OBJECT(dev), "flexvm.shared-ram",
++                             memory, 0, 4096);
++    memory_region_add_subregion_overlap(get_system_memory(), s->address,
++                                        &s->alias, 1);
++    host_memory_backend_set_mapped(s->backend, true);
++}
++
++static void flexvm_shared_ram_unrealize(DeviceState *dev)
++{
++    FlexvmSharedRam *s = FLEXVM_SHARED_RAM(dev);
++
++    memory_region_del_subregion(get_system_memory(), &s->alias);
++    object_unparent(OBJECT(&s->alias));
++    host_memory_backend_set_mapped(s->backend, false);
++    migrate_del_blocker(&s->migration_blocker);
++}
++
++static const Property flexvm_shared_ram_properties[] = {
++    DEFINE_PROP_UINT64("addr", FlexvmSharedRam, address, 0x1000),
++    DEFINE_PROP_LINK("memdev", FlexvmSharedRam, backend, TYPE_MEMORY_BACKEND,
++                     HostMemoryBackend *),
++};
++
++static void flexvm_shared_ram_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = flexvm_shared_ram_realize;
++    dc->unrealize = flexvm_shared_ram_unrealize;
++    dc->hotpluggable = false;
++    device_class_set_props(dc, flexvm_shared_ram_properties);
++}
++
++static const TypeInfo flexvm_shared_ram_info = {
++    .name = TYPE_FLEXVM_SHARED_RAM,
++    .parent = TYPE_DEVICE,
++    .instance_size = sizeof(FlexvmSharedRam),
++    .class_init = flexvm_shared_ram_class_init,
++};
++
++static void flexvm_shared_ram_register(void)
++{
++    type_register_static(&flexvm_shared_ram_info);
++}
++
++type_init(flexvm_shared_ram_register)

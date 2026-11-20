@@ -1,0 +1,61 @@
+--- a/qapi/misc-i386.json
++++ b/qapi/misc-i386.json
+@@ -538,4 +538,5 @@
+ # @gdt-base: The address of the guest descriptor table.
+-# @gdt-limit: The table limit for three descriptors.
++# @gdt-limit: The table limit for three or four descriptors.
+ # @page-table-root: Guest physical address of the level-four table.
++# @pvh-idt-base: The guest address of the 32-bit PVH boot IDT.
+ #
+@@ -547,3 +548,4 @@
+   'data': { 'cpu-index': 'uint16', 'gdt-base': 'uint32',
+-            'gdt-limit': 'uint16', '*page-table-root': 'uint32' },
++            'gdt-limit': 'uint16', '*page-table-root': 'uint32',
++            '*pvh-idt-base': 'uint32' },
+   'features': [ 'unstable' ] }
+--- a/target/i386/monitor.c
++++ b/target/i386/monitor.c
+@@ -659,4 +659,5 @@
+     if (!cpu || !tcg_enabled() ||
+-        !runstate_check(RUN_STATE_PAUSED)) {
+-        error_setg(errp, "FlexVM requires a paused x86 TCG vCPU");
++        (!runstate_check(RUN_STATE_PRELAUNCH) &&
++         !runstate_check(RUN_STATE_PAUSED))) {
++        error_setg(errp, "FlexVM requires a stopped x86 TCG vCPU");
+         return NULL;
+@@ -699,3 +700,5 @@
+                                         bool has_page_table_root,
+-                                        uint32_t page_table_root, Error **errp)
++                                        uint32_t page_table_root,
++                                        bool has_pvh_idt_base,
++                                        uint32_t pvh_idt_base, Error **errp)
+ {
+@@ -715,3 +718,5 @@
+     env = &X86_CPU(cpu)->env;
+-    if ((env->cr[0] & (CR0_PE_MASK | CR0_PG_MASK)) || gdt_limit != 23) {
++    if ((env->cr[0] & (CR0_PE_MASK | CR0_PG_MASK)) ||
++        gdt_limit != (has_pvh_idt_base ? 31 : 23) ||
++        (has_pvh_idt_base && has_page_table_root)) {
+         error_setg(errp, "FlexVM requires initial flat protected-mode state");
+@@ -729,2 +734,12 @@
+     cr0 = env->cr[0] | CR0_PE_MASK;
++    if (has_pvh_idt_base) {
++        cr0 = CR0_ET_MASK | CR0_PE_MASK;
++        env->idt.base = pvh_idt_base;
++        env->idt.limit = 7;
++        env->tr = (SegmentCache) {
++            .selector = 24,
++            .limit = 103,
++            .flags = DESC_P_MASK | (11 << DESC_TYPE_SHIFT),
++        };
++    }
+     if (has_page_table_root) {
+--- a/stubs/monitor-i386-flexvm.c
++++ b/stubs/monitor-i386-flexvm.c
+@@ -15,3 +15,5 @@
+                                         bool has_page_table_root,
+-                                        uint32_t page_table_root, Error **errp)
++                                        uint32_t page_table_root,
++                                        bool has_pvh_idt_base,
++                                        uint32_t pvh_idt_base, Error **errp)
+ {

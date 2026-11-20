@@ -1,0 +1,195 @@
+--- a/include/system/runstate.h
++++ b/include/system/runstate.h
+@@ -98,6 +98,7 @@
+ }
+
+ void vm_start(void);
++bool vm_start_one_tcg_cpu(CPUState *cpu);
+
+ /**
+  * vm_prepare_start: Prepare for starting/resuming the VM
+--- a/system/cpus.c
++++ b/system/cpus.c
+@@ -42,6 +42,7 @@
+ #include "hw/nmi.h"
+ #include "system/replay.h"
+ #include "system/runstate.h"
++#include "system/tcg.h"
+ #include "system/cpu-timers.h"
+ #include "system/whpx.h"
+ #include "hw/boards.h"
+@@ -805,6 +806,19 @@
+     }
+ }
+
++/* FlexVM's run-control device owns one stopped-CPU entry at a time. */
++bool vm_start_one_tcg_cpu(CPUState *cpu)
++{
++    if (!tcg_enabled() || vm_prepare_start(false) || !runstate_is_running()) {
++        return false;
++    }
++
++    qemu_clock_enable(QEMU_CLOCK_VIRTUAL, true);
++    /* Preserve the vCPU halt state across userspace exits. */
++    cpu_resume(cpu);
++    return true;
++}
++
+ void vm_resume(RunState state)
+ {
+     if (runstate_is_live(state)) {
+--- a/hw/char/debugcon.c
++++ b/hw/char/debugcon.c
+@@ -26,6 +26,7 @@
+
+ #include "qemu/osdep.h"
+ #include "qapi/error.h"
++#include "hw/core/cpu.h"
+ #include "qemu/error-report.h"
+ #include "qemu/module.h"
+ #include "chardev/char-fe.h"
+@@ -50,6 +51,7 @@
+     bool run_failed;
+     bool output_pending;
+     bool cancel_pending;
++    CPUState *run_cpu;
+     uint8_t output;
+     VMChangeStateEntry *run_state;
+ } DebugconState;
+@@ -87,15 +89,23 @@
+         }
+         return;
+     }
+-    if (s->run_failed || s->run_active || len != 1 || buf[0] != 'R' ||
++    if (s->run_failed || s->run_active || len != 1 ||
++        buf[0] < 'R' || buf[0] > 'S' ||
+         (!runstate_check(RUN_STATE_PRELAUNCH) &&
+          !runstate_check(RUN_STATE_PAUSED))) {
+         debugcon_run_failed(s);
+         return;
+     }
+
++    s->run_cpu = qemu_get_cpu(buf[0] - 'R');
++    if (!s->run_cpu) {
++        debugcon_run_failed(s);
++        return;
++    }
+     s->run_active = true;
+-    vm_start();
++    if (!vm_start_one_tcg_cpu(s->run_cpu)) {
++        debugcon_run_failed(s);
++    }
+ }
+
+ static void debugcon_run_event(void *opaque, QEMUChrEvent event)
+@@ -142,7 +152,8 @@
+ #endif
+
+     if (s->run_control) {
+-        if (s->run_active && !s->run_failed && !s->output_pending) {
++        if (s->run_active && !s->run_failed && !s->output_pending &&
++            current_cpu == s->run_cpu) {
+             s->output = ch;
+             s->output_pending = true;
+         } else {
+--- a/qapi/misc-i386.json
++++ b/qapi/misc-i386.json
+@@ -516,13 +516,16 @@
+ #
+ # Query special registers from the experimental FlexVM TCG worker.
+ #
++# @cpu-index: The vCPU to inspect.
++#
+ # Features:
+ #
+ # @unstable: Experimental FlexVM worker protocol.
+ #
+-# Returns: Special registers of the single stopped vCPU.
++# Returns: Special registers of the stopped vCPU.
+ ##
+ { 'command': 'x-flexvm-query-x86-sregs',
++  'data': { 'cpu-index': 'uint16' },
+   'returns': 'FlexvmX86SpecialRegisters', 'features': [ 'unstable' ] }
+
+ ##
+@@ -531,6 +534,7 @@
+ # Initialize the flat ring-zero protected-mode entry state of the
+ # experimental FlexVM TCG worker before it runs.
+ #
++# @cpu-index: The vCPU to initialize.
+ # @gdt-base: The address of the guest descriptor table.
+ # @gdt-limit: The table limit for three descriptors.
+ #
+@@ -539,5 +543,6 @@
+ # @unstable: Experimental FlexVM worker protocol.
+ ##
+ { 'command': 'x-flexvm-set-x86-protected-entry',
+-  'data': { 'gdt-base': 'uint32', 'gdt-limit': 'uint16' },
++  'data': { 'cpu-index': 'uint16', 'gdt-base': 'uint32',
++            'gdt-limit': 'uint16' },
+   'features': [ 'unstable' ] }
+--- a/target/i386/monitor.c
++++ b/target/i386/monitor.c
+@@ -646,17 +646,17 @@
+     return monitor_defs;
+ }
+
+-FlexvmX86SpecialRegisters *qmp_x_flexvm_query_x86_sregs(Error **errp)
++FlexvmX86SpecialRegisters *qmp_x_flexvm_query_x86_sregs(uint16_t cpu_index, Error **errp)
+ {
+-    CPUState *cpu = first_cpu;
++    CPUState *cpu = qemu_get_cpu(cpu_index);
+     X86CPU *x86;
+     CPUX86State *env;
+     FlexvmX86SpecialRegisters *result;
+     FlexvmX86SegmentList **tail;
+
+-    if (!cpu || CPU_NEXT(cpu) || !tcg_enabled() ||
++    if (!cpu || !tcg_enabled() ||
+         !runstate_check(RUN_STATE_PAUSED)) {
+-        error_setg(errp, "FlexVM requires one paused x86 TCG vCPU");
++        error_setg(errp, "FlexVM requires a paused x86 TCG vCPU");
+         return NULL;
+     }
+     x86 = X86_CPU(cpu);
+@@ -692,18 +692,18 @@
+     return result;
+ }
+
+-void qmp_x_flexvm_set_x86_protected_entry(uint32_t gdt_base,
++void qmp_x_flexvm_set_x86_protected_entry(uint16_t cpu_index, uint32_t gdt_base,
+                                          uint16_t gdt_limit, Error **errp)
+ {
+-    CPUState *cpu = first_cpu;
++    CPUState *cpu = qemu_get_cpu(cpu_index);
+     CPUX86State *env;
+     const uint32_t data_flags = DESC_G_MASK | DESC_B_MASK | DESC_P_MASK |
+                                 DESC_S_MASK | DESC_W_MASK | DESC_A_MASK;
+
+-    if (!cpu || CPU_NEXT(cpu) || !tcg_enabled() ||
++    if (!cpu || !tcg_enabled() ||
+         (!runstate_check(RUN_STATE_PRELAUNCH) &&
+          !runstate_check(RUN_STATE_PAUSED))) {
+-        error_setg(errp, "FlexVM requires one stopped x86 TCG vCPU");
++        error_setg(errp, "FlexVM requires a stopped x86 TCG vCPU");
+         return;
+     }
+     env = &X86_CPU(cpu)->env;
+--- a/stubs/monitor-i386-flexvm.c
++++ b/stubs/monitor-i386-flexvm.c
+@@ -4,13 +4,13 @@
+ #include "qapi/error.h"
+ #include "qapi/qapi-commands-misc-i386.h"
+
+-FlexvmX86SpecialRegisters *qmp_x_flexvm_query_x86_sregs(Error **errp)
++FlexvmX86SpecialRegisters *qmp_x_flexvm_query_x86_sregs(uint16_t cpu_index, Error **errp)
+ {
+     error_setg(errp, "FlexVM special registers require an x86 worker");
+     return NULL;
+ }
+
+-void qmp_x_flexvm_set_x86_protected_entry(uint32_t gdt_base,
++void qmp_x_flexvm_set_x86_protected_entry(uint16_t cpu_index, uint32_t gdt_base,
+                                          uint16_t gdt_limit, Error **errp)
+ {
+     error_setg(errp, "FlexVM protected entry requires an x86 worker");

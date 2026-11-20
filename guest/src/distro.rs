@@ -51,10 +51,14 @@ pub(crate) fn boot(profile: BootProfile) -> io::Result<()> {
             Ok(())
         });
     }
-    let _broker = command.spawn()?;
+    let broker = command.spawn().inspect_err(|error| {
+        crate::log(&format!("cannot spawn the distro broker: {error}"));
+    })?;
     drop(child);
     parent.set_read_timeout(Some(Duration::from_secs(15)))?;
-    receive(&mut parent, b'B')?;
+    receive(&mut parent, b'B').inspect_err(|error| {
+        crate::log(&format!("distro broker PID {} did not acknowledge startup: {error}", broker.id()));
+    })?;
     // /vm is still a leaf here. Enabling its controllers before this move
     // would reject PID 1 with EBUSY because of the no-internal-processes rule.
     fs::write(format!("{}/cgroup.procs", mem::CGROUP), "0")?;

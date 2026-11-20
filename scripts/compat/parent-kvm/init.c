@@ -30,10 +30,71 @@ int main(void)
     check(syscall(SYS_finit_module, module, "", 0) == 0, "load provider");
     close(module);
     check(chmod("/kvm-run", 0700) == 0, "make the client executable");
+    int fixture = open("/ram-pages", O_RDONLY | O_CLOEXEC);
+    check(fixture >= 0, "open fixture configuration");
+    char pages[8];
+    ssize_t page_bytes = read(fixture, pages, sizeof(pages));
+    check(page_bytes > 0 && page_bytes < (ssize_t)sizeof(pages), "read fixture page count");
+    pages[page_bytes] = '\0';
+    close(fixture);
     pid_t child = fork();
     check(child >= 0, "fork the KVM client");
     if (child == 0) {
-        execl("/kvm-run", "kvm-run", NULL);
+        char *arguments[28] = {"kvm-run", pages};
+        unsigned int next = 2;
+        if (access("/split-slot", F_OK) == 0)
+            arguments[next++] = "split";
+        else if (access("/protected-entry", F_OK) == 0)
+            arguments[next++] = "protected";
+        if (access("/interrupt-run", F_OK) == 0)
+            arguments[next++] = "interrupt";
+        if (access("/two-vcpus", F_OK) == 0)
+            arguments[next++] = "smp";
+        if (access("/long-mode", F_OK) == 0)
+            arguments[next++] = "long";
+        if (access("/floating-point", F_OK) == 0)
+            arguments[next++] = "fpu";
+        if (access("/boot-msrs", F_OK) == 0)
+            arguments[next++] = "msrs";
+        if (access("/cpuid-profile", F_OK) == 0)
+            arguments[next++] = "cpuid";
+        if (access("/mmio-write", F_OK) == 0)
+            arguments[next++] = "mmio";
+        if (access("/mmio-read", F_OK) == 0)
+            arguments[next++] = "mmio-read";
+        if (access("/ioeventfd", F_OK) == 0)
+            arguments[next++] = "ioeventfd";
+        if (access("/irqchip", F_OK) == 0)
+            arguments[next++] = "irqchip";
+        if (access("/pit", F_OK) == 0)
+            arguments[next++] = "pit";
+        if (access("/irqfd", F_OK) == 0)
+            arguments[next++] = "irqfd";
+        if (access("/zero-slot", F_OK) == 0)
+            arguments[next++] = "zero-slot";
+        if (access("/tss", F_OK) == 0)
+            arguments[next++] = "provider-tss";
+        if (access("/lapic", F_OK) == 0)
+            arguments[next++] = "lapic";
+        if (access("/pio", F_OK) == 0)
+            arguments[next++] = "pio";
+        if (access("/complete-read", F_OK) == 0)
+            arguments[next++] = "complete-read";
+        if (access("/pio-boundary", F_OK) == 0)
+            arguments[next++] = "pio-boundary";
+        if (access("/pvh", F_OK) == 0)
+            arguments[next++] = "pvh";
+        if (access("/irqchip-state", F_OK) == 0)
+            arguments[next++] = "irqchip-state";
+        if (access("/pit-state", F_OK) == 0)
+            arguments[next++] = "pit-state";
+        if (access("/debugregs", F_OK) == 0)
+            arguments[next++] = "debugregs";
+        if (access("/mp-state", F_OK) == 0)
+            arguments[next++] = "mp-state";
+        if (access("/xcrs", F_OK) == 0)
+            arguments[next++] = "xcrs";
+        execv("/kvm-run", arguments);
         _exit(127);
     }
     int status;

@@ -18,10 +18,10 @@ permissions:
   contents: read
 
 concurrency:
-  # The nightly run never holds up (or is held up by) a push to main.
-  group: ci-${{ github.event_name == 'schedule' && 'nightly-' || '' }}${{ github.ref }}
-  # Runs on main are never cancelled.
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # Keep nightly and on-demand runs independent of automatic verification.
+  group: ci-${{ github.event_name == 'schedule' && 'nightly-' || github.event_name == 'workflow_dispatch' && 'manual-' || '' }}${{ github.ref }}
+  # A newer PR revision or main tip supersedes its older automatic run.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -159,7 +159,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/software-qemu
-          key: software-qemu-x86_64-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch') }}
+          key: software-qemu-x86_64-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch', 'scripts/compat/parent-kvm/slot-map.h') }}
       - name: Install fixed x86 software CPU engine
         if: matrix.arch == 'x86_64'
         run: |
@@ -169,6 +169,11 @@ jobs:
           fi
           sudo ln -sf "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" /usr/local/bin/qemu-system-x86_64
           sudo qemu-system-x86_64 --version
+      - name: Shared RAM across separate software CPU workers
+        if: matrix.arch == 'x86_64'
+        run: |
+          sudo python3 scripts/compat/software-parent-ram.py --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --output "$RUNNER_TEMP/software-parent-ram"
+          cat "$RUNNER_TEMP/software-parent-ram/report.json"
       - name: Software state directory
         run: sudo install -d -o "$(id -u)" -g "$(id -g)" "$RUNNER_TEMP/software-state/artifacts"
       - name: Cache kernel
@@ -289,7 +294,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/software-qemu
-          key: software-qemu-x86_64-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch') }}
+          key: software-qemu-x86_64-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch', 'scripts/compat/parent-kvm/slot-map.h') }}
       - name: Install fixed x86 software CPU engine
         if: matrix.arch == 'x86_64'
         run: |
@@ -320,6 +325,140 @@ jobs:
             --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
             --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-run"
           cat "$RUNNER_TEMP/parent-kvm-run/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-scattered" --ram-pages 64
+          cat "$RUNNER_TEMP/parent-kvm-scattered/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-protected" --ram-pages 49152 --protected-entry
+          cat "$RUNNER_TEMP/parent-kvm-protected/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-split" --ram-pages 49152 --protected-entry --split-slot
+          cat "$RUNNER_TEMP/parent-kvm-split/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-cancel" --ram-pages 64 --protected-entry --split-slot --interrupt-run
+          cat "$RUNNER_TEMP/parent-kvm-cancel/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-smp" --ram-pages 64 --protected-entry --split-slot --two-vcpus --cpuid
+          cat "$RUNNER_TEMP/parent-kvm-smp/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-long" --ram-pages 64 --split-slot --long-mode --fpu
+          cat "$RUNNER_TEMP/parent-kvm-long/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-msrs" --ram-pages 64 --split-slot --long-mode --msrs
+          cat "$RUNNER_TEMP/parent-kvm-msrs/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-mmio" --ram-pages 64 --split-slot --long-mode --mmio-read --ioeventfd --complete-read
+          cat "$RUNNER_TEMP/parent-kvm-mmio/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-irqchip" --ram-pages 64 --split-slot --protected-entry --pit --tss --lapic --pio-boundary --complete-read
+          cat "$RUNNER_TEMP/parent-kvm-irqchip/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-irqchip-state" --ram-pages 64 --split-slot --protected-entry --irqchip-state --lapic
+          cat "$RUNNER_TEMP/parent-kvm-irqchip-state/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-pit-state" --ram-pages 64 --split-slot --protected-entry --pit-state --lapic
+          cat "$RUNNER_TEMP/parent-kvm-pit-state/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-debugregs" --ram-pages 64 --split-slot --protected-entry --debugregs
+          cat "$RUNNER_TEMP/parent-kvm-debugregs/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-mp-state" --ram-pages 64 --split-slot --protected-entry --mp-state --lapic
+          cat "$RUNNER_TEMP/parent-kvm-mp-state/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-xcrs" --ram-pages 64 --split-slot --protected-entry --xcrs
+          cat "$RUNNER_TEMP/parent-kvm-xcrs/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-irqfd" --ram-pages 64 --split-slot --protected-entry --irqfd
+          cat "$RUNNER_TEMP/parent-kvm-irqfd/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-zero-slot" --ram-pages 32768 --pvh
+          cat "$RUNNER_TEMP/parent-kvm-zero-slot/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-single-page" --ram-pages 1
+          cat "$RUNNER_TEMP/parent-kvm-single-page/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-reject-close" --reject-close
+          cat "$RUNNER_TEMP/parent-kvm-reject-close/report.json"
+          if sudo python3 -c 'import fcntl, os; fd = os.open("/dev/kvm", os.O_RDWR); assert fcntl.ioctl(fd, 0xAE00) == 12; fcntl.ioctl(fd, 0xAE01, 0)' 2>/dev/null; then
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-worker" --parent-engine kvm --native-oracle --ram-pages 64
+            cat "$RUNNER_TEMP/parent-kvm-native-worker/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-protected" --parent-engine kvm --native-oracle --ram-pages 49152 --protected-entry --split-slot
+            cat "$RUNNER_TEMP/parent-kvm-native-protected/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-cancel" --parent-engine kvm --native-oracle --ram-pages 64 --protected-entry --split-slot --interrupt-run
+            cat "$RUNNER_TEMP/parent-kvm-native-cancel/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-smp" --parent-engine kvm --native-oracle --ram-pages 64 --protected-entry --split-slot --two-vcpus --cpuid
+            cat "$RUNNER_TEMP/parent-kvm-native-smp/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-long" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --long-mode --fpu
+            cat "$RUNNER_TEMP/parent-kvm-native-long/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-msrs" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --long-mode --msrs
+            cat "$RUNNER_TEMP/parent-kvm-native-msrs/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-mmio" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --long-mode --mmio-read --ioeventfd --complete-read
+            cat "$RUNNER_TEMP/parent-kvm-native-mmio/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-irqchip" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --protected-entry --pit --tss --lapic --pio-boundary --complete-read
+            cat "$RUNNER_TEMP/parent-kvm-native-irqchip/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-irqchip-state" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --protected-entry --irqchip-state --lapic
+            cat "$RUNNER_TEMP/parent-kvm-native-irqchip-state/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-pit-state" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --protected-entry --pit-state --lapic
+            cat "$RUNNER_TEMP/parent-kvm-native-pit-state/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-debugregs" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --protected-entry --debugregs
+            cat "$RUNNER_TEMP/parent-kvm-native-debugregs/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-mp-state" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --protected-entry --mp-state --lapic
+            cat "$RUNNER_TEMP/parent-kvm-native-mp-state/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-xcrs" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --protected-entry --xcrs
+            cat "$RUNNER_TEMP/parent-kvm-native-xcrs/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-irqfd" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --protected-entry --irqfd
+            cat "$RUNNER_TEMP/parent-kvm-native-irqfd/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-zero-slot" --parent-engine kvm --native-oracle --ram-pages 32768 --pvh
+            cat "$RUNNER_TEMP/parent-kvm-native-zero-slot/report.json"
+          fi
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -331,11 +470,13 @@ jobs:
           sudo systemd-run --scope --collect -p MemoryMax=4G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-modules.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-modules" --timeout 1800
           cat "$RUNNER_TEMP/software-modules/report.json"
 
-  # A pull request runs one workload of each kind, on x86_64: a container runtime under flexvm-init
+  # A pull request into main runs one workload of each kind, on x86_64: a container runtime under flexvm-init
   # (podman), a rootless one under systemd (rootless-containerd), a container manager (nspawn) and
   # Kubernetes (k3s). Every workload on both architectures (22 jobs, most of a run's runner time) runs
   # on main, nightly, and on request for a branch: gh workflow run ci.yml --ref <branch>.
+  # Stacked PRs still run formatting, unit tests, software execution and guest modules on both architectures.
   software-workloads:
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
     name: guest workload without KVM (${{ matrix.arch }}, ${{ matrix.workload }})
     runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: ${{ (matrix.workload == 'k3s' || matrix.workload == 'kind') && 80 || 45 }}
@@ -363,7 +504,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/software-qemu
-          key: software-qemu-x86_64-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch') }}
+          key: software-qemu-x86_64-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch', 'scripts/compat/parent-kvm/slot-map.h') }}
       - name: Install fixed x86 software CPU engine
         if: matrix.arch == 'x86_64'
         run: |
@@ -412,20 +553,20 @@ jobs:
           fi
           sha256sum "$RUNNER_TEMP/nested-state/artifacts/firecracker"
       - name: Restore immutable workload fixture
-        if: (matrix.workload == 'kind' || matrix.workload == 'k3s')
+        if: matrix.workload == 'kind' || matrix.workload == 'k3s' || matrix.workload == 'rootless-containerd'
         id: workload-fixture-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/workload-fixture-cache
           key: busybox-fixture-v1-${{ runner.arch }}-${{ hashFiles('scripts/compat/workload-fixture.py') }}
       - name: Verify and export immutable workload fixture
-        if: (matrix.workload == 'kind' || matrix.workload == 'k3s')
+        if: matrix.workload == 'kind' || matrix.workload == 'k3s' || matrix.workload == 'rootless-containerd'
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends skopeo
           python3 scripts/compat/workload-fixture.py --cache "$RUNNER_TEMP/workload-fixture-cache/oci" --output "$RUNNER_TEMP/workload-fixture"
       - name: Save verified workload fixture
-        if: (matrix.workload == 'kind' || matrix.workload == 'k3s') && steps.workload-fixture-cache.outputs.cache-hit != 'true'
+        if: (matrix.workload == 'kind' || matrix.workload == 'k3s' || matrix.workload == 'rootless-containerd') && steps.workload-fixture-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/workload-fixture-cache
@@ -482,16 +623,24 @@ jobs:
             done
             workload_args+=(--seed "$RUNNER_TEMP/nested-inputs/child.tar" /nested-input/child.tar)
           fi
-          if [[ "${{ matrix.workload }}" == kind || "${{ matrix.workload }}" == k3s ]]; then
+          if [[ "${{ matrix.workload }}" == kind || "${{ matrix.workload }}" == k3s || "${{ matrix.workload }}" == rootless-containerd ]]; then
             for name in busybox.tar busybox.json; do
               workload_args+=(--seed "$RUNNER_TEMP/workload-fixture/$name" "/nested-input/$name")
             done
             workload_args+=(--seed scripts/compat/verify-fixture-import.py /nested-input/verify-fixture-import.py)
           fi
+          if [[ "${{ matrix.workload }}" == rootless-containerd ]]; then
+            layout="$RUNNER_TEMP/workload-fixture-cache/oci"
+            for path in "$layout"/{oci-layout,index.json,upstream-index.json,blobs/sha256/*}; do
+              workload_args+=(--seed "$path" "/nested-input/busybox-oci/${path#"$layout"/}")
+            done
+            workload_args+=(--seed scripts/compat/workload-fixture.py /nested-input/workload-fixture.py)
+          fi
           sudo systemd-run --scope --collect -p "MemoryMax=$memory_limit" -p MemorySwapMax=0 -p "CPUQuota=$cpu_quota" python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --workload "scripts/compat/workloads/${{ matrix.workload }}.sh" "${workload_args[@]}" --require storage.fuse --output "$RUNNER_TEMP/software-workload" --timeout "$workload_timeout"
           cat "$RUNNER_TEMP/software-workload/report.json"
 
   e2e:
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
     # Shards (scripts/e2e.py --shard): pr (the cases, and the main and recovery scenarios) in four
     # splits side by side, balanced by e2e.py's COST; the scheduled run takes heavy (GiB-scale
     # guests, long windows) one scenario at a time.
@@ -765,7 +914,7 @@ jobs:
         if: env.KVM == 'true'
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends skopeo
+          sudo apt-get install -y -q --no-install-recommends skopeo tcpdump
           python3 scripts/compat/workload-fixture.py --cache "$RUNNER_TEMP/workload-fixture-cache/oci" --output "$RUNNER_TEMP/workload-fixture"
       - name: Save verified workload fixture
         if: env.KVM == 'true' && steps.workload-fixture-cache.outputs.cache-hit != 'true'
@@ -860,6 +1009,7 @@ jobs:
   # Firecracker for aarch64-unknown-linux-musl (cached as e2e's is), the aarch64 artifacts fetched and
   # checked against their pins, the test image, and what needs no KVM (e2e.py --no-kvm).
   e2e-aarch64:
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
     name: end-to-end (aarch64, ${{ matrix.shard }})
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45

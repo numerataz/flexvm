@@ -1,0 +1,87 @@
+--- a/qapi/misc-i386.json
++++ b/qapi/misc-i386.json
+@@ -531,12 +531,13 @@
+ ##
+ # @x-flexvm-set-x86-protected-entry:
+ #
+-# Initialize the flat ring-zero protected-mode entry state of the
+-# experimental FlexVM TCG worker before it runs.
++# Initialize the experimental FlexVM TCG worker in ring-zero protected
++# mode before it runs.  A page-table root enables 64-bit mode.
+ #
+ # @cpu-index: The vCPU to initialize.
+ # @gdt-base: The address of the guest descriptor table.
+ # @gdt-limit: The table limit for three descriptors.
++# @page-table-root: Guest physical address of the level-four table.
+ #
+ # Features:
+ #
+@@ -544,5 +545,5 @@
+ ##
+ { 'command': 'x-flexvm-set-x86-protected-entry',
+   'data': { 'cpu-index': 'uint16', 'gdt-base': 'uint32',
+-            'gdt-limit': 'uint16' },
++            'gdt-limit': 'uint16', '*page-table-root': 'uint32' },
+   'features': [ 'unstable' ] }
+--- a/target/i386/monitor.c
++++ b/target/i386/monitor.c
+@@ -693,12 +693,16 @@
+ }
+
+ void qmp_x_flexvm_set_x86_protected_entry(uint16_t cpu_index, uint32_t gdt_base,
+-                                         uint16_t gdt_limit, Error **errp)
++                                        uint16_t gdt_limit,
++                                        bool has_page_table_root,
++                                        uint32_t page_table_root, Error **errp)
+ {
+     CPUState *cpu = qemu_get_cpu(cpu_index);
+     CPUX86State *env;
+     const uint32_t data_flags = DESC_G_MASK | DESC_B_MASK | DESC_P_MASK |
+                                 DESC_S_MASK | DESC_W_MASK | DESC_A_MASK;
++    uint32_t code_flags = data_flags | DESC_CS_MASK;
++    uint32_t cr0;
+
+     if (!cpu || !tcg_enabled() ||
+         (!runstate_check(RUN_STATE_PRELAUNCH) &&
+@@ -711,12 +715,25 @@
+         error_setg(errp, "FlexVM requires initial flat protected-mode state");
+         return;
+     }
++    if (has_page_table_root &&
++        (!(env->features[FEAT_8000_0001_EDX] & CPUID_EXT2_LM) ||
++         (page_table_root & 0xfff))) {
++        error_setg(errp, "FlexVM requires a long-mode CPU and aligned CR3");
++        return;
++    }
+
+     env->gdt.base = gdt_base;
+     env->gdt.limit = gdt_limit;
+-    cpu_x86_update_cr0(env, env->cr[0] | CR0_PE_MASK);
+-    cpu_x86_load_seg_cache(env, R_CS, 8, 0, UINT32_MAX,
+-                          data_flags | DESC_CS_MASK);
++    cr0 = env->cr[0] | CR0_PE_MASK;
++    if (has_page_table_root) {
++        cpu_x86_update_cr4(env, env->cr[4] | CR4_PAE_MASK);
++        cpu_x86_update_cr3(env, page_table_root);
++        cpu_load_efer(env, env->efer | MSR_EFER_LME);
++        cr0 |= CR0_PG_MASK;
++        code_flags = (code_flags & ~DESC_B_MASK) | DESC_L_MASK;
++    }
++    cpu_x86_update_cr0(env, cr0);
++    cpu_x86_load_seg_cache(env, R_CS, 8, 0, UINT32_MAX, code_flags);
+     const X86Seg data_registers[] = { R_DS, R_ES, R_FS, R_GS, R_SS };
+     for (size_t i = 0; i < ARRAY_SIZE(data_registers); i++) {
+         cpu_x86_load_seg_cache(env, data_registers[i], 16, 0, UINT32_MAX,
+--- a/stubs/monitor-i386-flexvm.c
++++ b/stubs/monitor-i386-flexvm.c
+@@ -11,7 +11,9 @@
+ }
+
+ void qmp_x_flexvm_set_x86_protected_entry(uint16_t cpu_index, uint32_t gdt_base,
+-                                         uint16_t gdt_limit, Error **errp)
++                                        uint16_t gdt_limit,
++                                        bool has_page_table_root,
++                                        uint32_t page_table_root, Error **errp)
+ {
+     error_setg(errp, "FlexVM protected entry requires an x86 worker");
+ }

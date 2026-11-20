@@ -1,0 +1,128 @@
+--- a/hw/char/debugcon.c
++++ b/hw/char/debugcon.c
+@@ -28,2 +28,3 @@
+ #include "qapi/error.h"
++#include "qemu/error-report.h"
+ #include "qemu/module.h"
+@@ -46,2 +47,8 @@
+     bool stop_on_write;
++    bool run_control;
++    bool run_active;
++    bool run_failed;
++    bool output_pending;
++    uint8_t output;
++    VMChangeStateEntry *run_state;
+ } DebugconState;
+@@ -55,2 +62,58 @@
+
++static int debugcon_can_run(void *opaque)
++{
++    return 1;
++}
++
++static void debugcon_run_failed(DebugconState *s)
++{
++    if (!s->run_failed) {
++        s->run_failed = true;
++        if (s->run_active && runstate_is_running()) {
++            vm_stop(RUN_STATE_PAUSED);
++        }
++    }
++}
++
++static void debugcon_run(void *opaque, const uint8_t *buf, int len)
++{
++    DebugconState *s = opaque;
++
++    if (s->run_failed || s->run_active || len != 1 || buf[0] != 'R' ||
++        (!runstate_check(RUN_STATE_PRELAUNCH) &&
++         !runstate_check(RUN_STATE_PAUSED))) {
++        debugcon_run_failed(s);
++        return;
++    }
++
++    s->run_active = true;
++    vm_start();
++}
++
++static void debugcon_run_event(void *opaque, QEMUChrEvent event)
++{
++    DebugconState *s = opaque;
++
++    if (event == CHR_EVENT_CLOSED) {
++        debugcon_run_failed(s);
++    }
++}
++
++static void debugcon_run_state(void *opaque, bool running, RunState state)
++{
++    DebugconState *s = opaque;
++
++    if (running || !s->run_active) {
++        return;
++    }
++
++    s->run_active = false;
++    if (!s->run_failed && s->output_pending && state == RUN_STATE_PAUSED &&
++        qemu_chr_fe_write(&s->chr, &s->output, 1) != 1) {
++        error_report("debugcon run control could not deliver port output");
++        s->run_failed = true;
++    }
++    s->output_pending = false;
++}
++
+ static void debugcon_ioport_write(void *opaque, hwaddr addr, uint64_t val,
+@@ -65,2 +128,13 @@
+
++    if (s->run_control) {
++        if (s->run_active && !s->run_failed && !s->output_pending) {
++            s->output = ch;
++            s->output_pending = true;
++        } else {
++            s->run_failed = true;
++        }
++        vm_stop(RUN_STATE_PAUSED);
++        return;
++    }
++
+     /* XXX this blocks entire thread. Rewrite to use
+@@ -104,3 +178,15 @@
+
+-    qemu_chr_fe_set_handlers(&s->chr, NULL, NULL, NULL, NULL, s, NULL, true);
++    if (s->run_control) {
++        const uint8_t ready = 'R';
++
++        if (qemu_chr_fe_write(&s->chr, &ready, 1) != 1) {
++            error_setg(errp, "debugcon run control requires a connected peer");
++            return;
++        }
++        s->run_state = qemu_add_vm_change_state_handler(debugcon_run_state, s);
++        qemu_chr_fe_set_handlers(&s->chr, debugcon_can_run, debugcon_run,
++                                 debugcon_run_event, NULL, s, NULL, true);
++    } else {
++        qemu_chr_fe_set_handlers(&s->chr, NULL, NULL, NULL, NULL, s, NULL, true);
++    }
+ }
+@@ -125,2 +211,14 @@
+
++static void debugcon_isa_unrealize(DeviceState *dev)
++{
++    DebugconState *s = &ISA_DEBUGCON_DEVICE(dev)->state;
++
++    if (s->run_state) {
++        qemu_chr_fe_set_handlers(&s->chr, NULL, NULL, NULL, NULL,
++                                 NULL, NULL, false);
++        qemu_del_vm_change_state_handler(s->run_state);
++        s->run_state = NULL;
++    }
++}
++
+ static const Property debugcon_isa_properties[] = {
+@@ -130,2 +228,3 @@
+     DEFINE_PROP_BOOL("stop-on-write", ISADebugconState, state.stop_on_write, false),
++    DEFINE_PROP_BOOL("run-control", ISADebugconState, state.run_control, false),
+ };
+@@ -137,2 +236,3 @@
+     dc->realize = debugcon_isa_realizefn;
++    dc->unrealize = debugcon_isa_unrealize;
+     device_class_set_props(dc, debugcon_isa_properties);

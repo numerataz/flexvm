@@ -270,6 +270,17 @@ class Host:
     def wait_state(self, vm, state, timeout=60):
         assert wait_for(lambda: self.ps().get(vm, {}).get("state") == state, timeout), (vm, self.ps().get(vm))
 
+    def wait_local_memory(self, vm):
+        status = {}
+
+        def pulled():
+            nonlocal status
+            status = json.loads(self.cli("debug", vm, "status", timeout=5).stdout)
+            return status["failed"] is not None or status["remote_left"] == 0
+
+        ready = wait_for(pulled, 60)
+        check("all restored pages are local", ready and status["failed"] is None, status)
+
     # VM commands
     def run_json(self, vm=None, template=None, ip=None, extra=()):
         """Starts a VM (in the background; without a name flexvm makes one up); returns its JSON."""
@@ -1495,6 +1506,7 @@ def guest_poweroff():
     """Unchanged Linux reboot(RB_POWER_OFF) terminates the VMM after each restore path."""
     for phase in ("run", "suspend", "checkpoint", "migration"):
         vm, host = f"e2e-poweroff-{phase}", A
+        release_blocked = False
         A.run(vm)
         try:
             if phase == "suspend":
@@ -1504,6 +1516,10 @@ def guest_poweroff():
                 saved = A.checkpoint(vm, stop=True)
                 A.restore(saved["id"])
             elif phase == "migration":
+                # Let the guest migrate and shut down while the old owner
+                # cannot yet learn that the destination released its memory.
+                release_blocked = True
+                B.cli("debug", "fault", "status", "120000")
                 A.migrate(vm, B)
                 host = B
             entry = host.ps()[vm]
@@ -1520,13 +1536,47 @@ def guest_poweroff():
                 result = host.exec(vm, "python3 -c " + shlex.quote(poweroff), timeout=30)
                 check(f"{phase}: actual VMM exits on guest poweroff", bool(poll.poll(10000)), result)
                 check(f"{phase}: owner retires after VMM exits", wait_for(lambda: not alive(entry["pid"]), 10), host.ps().get(vm))
+                if phase == "migration":
+                    source = A.ps().get(vm)
+                    check("migration: source is retained after target poweroff", source and source["state"] == "source", source)
+                    refused = A.rm(vm, force=True, check=False)
+                    check("migration: force-remove refuses a retained source",
+                          refused.returncode != 0 and "source of a migration in progress" in refused.stderr, refused)
+                    B.cli("debug", "fault", "status", "0")
+                    release_blocked = False
+
+                    def source_retired():
+                        source = A.ps().get(vm)
+                        if source and source.get("state") != "source":
+                            raise AssertionError(f"migration: unexpected source state after target poweroff: {source}")
+                        return source is None
+
+                    check("migration: source retires after target poweroff",
+                          wait_for(source_retired, 10), A.ps().get(vm))
             finally:
                 os.close(fd)
         finally:
-            A.rm(vm, force=True, check=False)
-            B.rm(vm, force=True, check=False)
-            clear_checkpoints(A, B)
-            check(f"{phase}: no VM records left", vm not in A.ps() and vm not in B.ps())
+            original_error = sys.exc_info()[1]
+            try:
+                if release_blocked:
+                    cleared = B.cli("debug", "fault", "status", "0", check=False)
+                    if cleared.returncode:
+                        print(f"{phase}: could not restore migration status replies: {cleared.stderr.strip()}", flush=True)
+                for label, peer in (("B", B), ("A", A)):
+                    if phase == "migration" and label == "A":
+                        if not wait_for(lambda: A.ps().get(vm, {}).get("state") != "source", 10):
+                            print(f"{phase}: source still retained during cleanup: {A.ps().get(vm)}", flush=True)
+                    removed = peer.rm(vm, force=True, check=False)
+                    print(f"{phase}: cleanup {label}: exit={removed.returncode} stdout={removed.stdout!r} stderr={removed.stderr!r}", flush=True)
+                clear_checkpoints(A, B)
+                records = {label: peer.ps().get(vm) for label, peer in (("A", A), ("B", B))}
+                if any(records.values()):
+                    print(f"{phase}: remaining VM records: {records}", flush=True)
+            except Exception as cleanup_error:
+                if original_error is None:
+                    raise
+                print(f"{phase}: cleanup failed: {cleanup_error}", file=sys.stderr, flush=True)
+        check(f"{phase}: no VM records left", not any(records.values()), records)
 
 
 @case
@@ -1668,7 +1718,8 @@ def nettest_ipv6():
     CI saw 113-181 ms beside 30-46 ms downtimes with nothing lost, while a lost segment of the one-segment
     ping-pong costs at least 200 ms (the minimum retransmit timeout, and a loss probe's delayed-ACK allowance)."""
     env = {**ENV, "V6": "1", "FLEXVM": BIN, "STATE": BUILD, "TEMPLATE": args.template, "P": f"fv6{A.port}", "ROUNDS": "1",
-           "STALL_SLACK_MS": "190", "WORK": os.path.join(args.log_dir, "nettest-ipv6")}
+           "STALL_SLACK_MS": "190", "WORK": os.path.join(args.log_dir, "nettest-ipv6"),
+           "CAPTURE_TCP": "1" if shutil.which("tcpdump") else "0"}
     p = subprocess.Popen([os.path.join(ROOT, "scripts", "nettest.sh")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                          env=env, start_new_session=True)
     try:
@@ -1682,7 +1733,10 @@ def nettest_ipv6():
             os.killpg(p.pid, signal.SIGKILL)
             out, _ = p.communicate()
         out += "\n(timed out after 300 s)"
-    check("nettest V6=1: passes", p.returncode == 0 and "PASS" in out.splitlines(), out[-3000:])
+    passed = p.returncode == 0 and "PASS" in out.splitlines()
+    if not passed:
+        print(out[-64_000:], flush=True)
+    check("nettest V6=1: passes", passed)
 
 
 @case
@@ -2712,6 +2766,7 @@ def distro_openrc():
         saved = A.checkpoint(vm, stop=True)
         A.restore(saved["id"])
         observe("checkpoint")
+        A.wait_local_memory(vm)
         A.migrate(vm, B)
         host = B
         observe("migration")
@@ -2869,6 +2924,7 @@ def distro_systemd():
         saved = A.checkpoint(vm, stop=True)
         A.restore(saved["id"])
         observe("checkpoint")
+        A.wait_local_memory(vm)
         A.migrate(vm, B)
         host = B
         observe("migration")
@@ -2899,6 +2955,7 @@ def distro_systemd():
         dns = json.load(open(os.path.join(host.state_dir, "host.json"))).get("dns")
         try:
             host.configure(dns=["203.0.113.53"])
+            host.wait_local_memory(vm)
             saved = host.checkpoint(vm, stop=True)
             host.restore(saved["id"], ip="auto")
             execute("cat /etc/resolv.conf; grep -Fx 'nameserver 203.0.113.53' /etc/resolv.conf")
@@ -3014,6 +3071,7 @@ def compat_workload(workload, boot="app", memory_mib=2048):
             "--to-state", B.state_dir, "--to-run", B.run_dir,
             "--vcpus", "2", "--memory-mib", str(memory_mib), "--require", "storage.fuse",
             "--output", output, *fixture_args,
+            *(["--workload-diagnostics"] if workload == "kind" else []),
         ], check=True, timeout=1500, env=ENV)
     finally:
         for host, dns in previous_dns:

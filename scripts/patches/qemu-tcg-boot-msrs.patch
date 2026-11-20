@@ -1,0 +1,162 @@
+--- a/qapi/misc-i386.json
++++ b/qapi/misc-i386.json
+@@ -588,3 +588,43 @@
+ { 'command': 'x-flexvm-set-x86-fpu',
+   'data': { 'cpu-index': 'uint16', 'record': 'str' },
+   'features': [ 'unstable' ] }
++
++##
++# @FlexvmX86Msr:
++#
++# An x86 model-specific register and value.
++#
++# @index: The register number.
++#
++# @value: The register contents.
++##
++{ 'struct': 'FlexvmX86Msr', 'data': { 'index': 'uint32', 'value': 'uint64' } }
++
++##
++# @FlexvmX86MsrResult:
++#
++# The outcome of a batched x86 model-specific register operation.
++#
++# @entries: The completed prefix of the requested batch.
++##
++{ 'struct': 'FlexvmX86MsrResult', 'data': { 'entries': [ 'FlexvmX86Msr' ] } }
++
++##
++# @x-flexvm-access-x86-msrs:
++#
++# Read or write boot MSRs on a stopped FlexVM TCG vCPU.
++#
++# @cpu-index: The vCPU to access.
++#
++# @write: Whether to apply the supplied values.
++#
++# @entries: The requested registers in order.
++#
++# Features:
++#
++# @unstable: Experimental FlexVM worker protocol.
++##
++{ 'command': 'x-flexvm-access-x86-msrs',
++  'data': { 'cpu-index': 'uint16', 'write': 'bool',
++            'entries': [ 'FlexvmX86Msr' ] },
++  'returns': 'FlexvmX86MsrResult', 'features': [ 'unstable' ] }
+--- a/target/i386/monitor.c
++++ b/target/i386/monitor.c
+@@ -757,7 +757,7 @@
+
+ G_STATIC_ASSERT(sizeof(FlexvmKvmFpu) == 416);
+
+-static CPUX86State *flexvm_fpu_cpu(uint16_t cpu_index, Error **errp)
++static CPUX86State *flexvm_stopped_cpu(uint16_t cpu_index, Error **errp)
+ {
+     CPUState *cpu = qemu_get_cpu(cpu_index);
+
+@@ -773,7 +773,7 @@
+ FlexvmX86FpuRecord *qmp_x_flexvm_query_x86_fpu(uint16_t cpu_index,
+                                                Error **errp)
+ {
+-    CPUX86State *env = flexvm_fpu_cpu(cpu_index, errp);
++    CPUX86State *env = flexvm_stopped_cpu(cpu_index, errp);
+     FlexvmKvmFpu state = { 0 };
+     const uint8_t *bytes = (const uint8_t *)&state;
+     static const char hex[] = "0123456789abcdef";
+@@ -809,7 +809,7 @@
+ void qmp_x_flexvm_set_x86_fpu(uint16_t cpu_index, const char *record,
+                              Error **errp)
+ {
+-    CPUX86State *env = flexvm_fpu_cpu(cpu_index, errp);
++    CPUX86State *env = flexvm_stopped_cpu(cpu_index, errp);
+     FlexvmKvmFpu state;
+     uint8_t *bytes = (uint8_t *)&state;
+     uint16_t status;
+@@ -848,3 +848,71 @@
+     }
+     /* Linux's KVM_FPU ioctl leaves MXCSR unchanged. */
+ }
++
++static bool flexvm_access_boot_msr(CPUX86State *env, uint32_t index,
++                                   bool set, uint64_t *value)
++{
++#define ACCESS_MSR(index, field) \
++    case index: \
++        if (set) { \
++            env->field = *value; \
++        } else { \
++            *value = env->field; \
++        } \
++        return true
++    switch (index) {
++    ACCESS_MSR(MSR_IA32_SYSENTER_CS, sysenter_cs);
++    ACCESS_MSR(MSR_IA32_SYSENTER_ESP, sysenter_esp);
++    ACCESS_MSR(MSR_IA32_SYSENTER_EIP, sysenter_eip);
++    ACCESS_MSR(MSR_STAR, star);
++#ifdef TARGET_X86_64
++    ACCESS_MSR(MSR_CSTAR, cstar);
++    ACCESS_MSR(MSR_KERNELGSBASE, kernelgsbase);
++    ACCESS_MSR(MSR_FMASK, fmask);
++    ACCESS_MSR(MSR_LSTAR, lstar);
++#endif
++    ACCESS_MSR(MSR_IA32_MISC_ENABLE, msr_ia32_misc_enable);
++    ACCESS_MSR(MSR_MTRRdefType, mtrr_deftype);
++    case MSR_IA32_TSC:
++        if (set) {
++            env->tsc_offset = *value - cpu_get_tsc(env);
++        } else {
++            *value = cpu_get_tsc(env) + env->tsc_offset;
++        }
++        return true;
++    default:
++        return false;
++    }
++#undef ACCESS_MSR
++}
++
++FlexvmX86MsrResult *qmp_x_flexvm_access_x86_msrs(uint16_t cpu_index,
++                                                 bool write,
++                                                 FlexvmX86MsrList *entries,
++                                                 Error **errp)
++{
++    CPUX86State *env = flexvm_stopped_cpu(cpu_index, errp);
++    FlexvmX86MsrResult *result;
++    FlexvmX86MsrList **tail;
++    unsigned int count = 0;
++
++    if (!env) {
++        return NULL;
++    }
++    result = g_new0(FlexvmX86MsrResult, 1);
++    tail = &result->entries;
++    for (; entries && count < 64; entries = entries->next, count++) {
++        FlexvmX86Msr *entry = entries->value;
++        uint64_t value = entry->value;
++        FlexvmX86Msr *actual;
++
++        if (!flexvm_access_boot_msr(env, entry->index, write, &value)) {
++            break;
++        }
++        actual = g_new0(FlexvmX86Msr, 1);
++        actual->index = entry->index;
++        actual->value = value;
++        QAPI_LIST_APPEND(tail, actual);
++    }
++    return result;
++}
+--- a/stubs/monitor-i386-flexvm.c
++++ b/stubs/monitor-i386-flexvm.c
+@@ -30,3 +30,12 @@
+ {
+     error_setg(errp, "FlexVM floating-point state requires an x86 worker");
+ }
++
++FlexvmX86MsrResult *qmp_x_flexvm_access_x86_msrs(uint16_t cpu_index,
++                                                 bool write,
++                                                 FlexvmX86MsrList *entries,
++                                                 Error **errp)
++{
++    error_setg(errp, "FlexVM boot MSRs require an x86 worker");
++    return NULL;
++}

@@ -1,0 +1,81 @@
+--- a/qapi/misc-i386.json
++++ b/qapi/misc-i386.json
+@@ -712,3 +712,18 @@
+ { 'command': 'x-flexvm-set-x86-gsi',
+   'data': { 'gsi': 'uint32', 'level': 'bool' },
+   'features': [ 'unstable' ] }
++
++##
++# @x-flexvm-pulse-x86-gsi:
++#
++# Deliver an edge to the TCG PC interrupt controller during execution.
++#
++# @gsi: The global system interrupt number.
++#
++# Features:
++#
++# @unstable: Experimental FlexVM worker protocol.
++##
++{ 'command': 'x-flexvm-pulse-x86-gsi',
++  'data': { 'gsi': 'uint32' },
++  'features': [ 'unstable' ] }
+--- a/target/i386/monitor.c
++++ b/target/i386/monitor.c
+@@ -986,17 +986,41 @@
+     cpu->flexvm_cpuid = g_steal_pointer(&profile);
+ }
+
+-void qmp_x_flexvm_set_x86_gsi(uint32_t gsi, bool level, Error **errp)
++static qemu_irq flexvm_pc_gsi(uint32_t gsi, Error **errp)
+ {
+     Object *machine = OBJECT(qdev_get_machine());
+
+-    if (!flexvm_stopped_cpu(0, errp)) {
+-        return;
+-    }
+     if (!object_dynamic_cast(machine, TYPE_PC_MACHINE) ||
+         gsi >= IOAPIC_NUM_PINS || !X86_MACHINE(machine)->gsi) {
+         error_setg(errp, "FlexVM requires a PC global interrupt line");
++        return NULL;
++    }
++    return X86_MACHINE(machine)->gsi[gsi];
++}
++
++void qmp_x_flexvm_set_x86_gsi(uint32_t gsi, bool level, Error **errp)
++{
++    qemu_irq irq;
++
++    if (!flexvm_stopped_cpu(0, errp)) {
+         return;
+     }
+-    qemu_set_irq(X86_MACHINE(machine)->gsi[gsi], level);
++    irq = flexvm_pc_gsi(gsi, errp);
++    if (irq) {
++        qemu_set_irq(irq, level);
++    }
++}
++
++void qmp_x_flexvm_pulse_x86_gsi(uint32_t gsi, Error **errp)
++{
++    qemu_irq irq;
++
++    if (!tcg_enabled()) {
++        error_setg(errp, "FlexVM IRQ pulses require a TCG worker");
++        return;
++    }
++    irq = flexvm_pc_gsi(gsi, errp);
++    if (irq) {
++        qemu_irq_pulse(irq);
++    }
+ }
+--- a/stubs/monitor-i386-flexvm.c
++++ b/stubs/monitor-i386-flexvm.c
+@@ -58,3 +58,8 @@
+ {
+     error_setg(errp, "FlexVM interrupts require an x86 PC worker");
+ }
++
++void qmp_x_flexvm_pulse_x86_gsi(uint32_t gsi, Error **errp)
++{
++    error_setg(errp, "FlexVM interrupts require an x86 PC worker");
++}

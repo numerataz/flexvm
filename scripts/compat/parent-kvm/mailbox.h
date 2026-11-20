@@ -3,7 +3,7 @@
 #define FLEXVM_PVKVM_MAILBOX_H
 
 #define PVKVM_MAGIC        0x4d564b46
-#define PVKVM_VERSION      2
+#define PVKVM_VERSION      32
 #define PVKVM_MAGIC_AT     0
 #define PVKVM_VERSION_AT   4
 #define PVKVM_REQUEST_AT   8
@@ -11,15 +11,84 @@
 #define PVKVM_COMMAND_AT   16
 #define PVKVM_STATUS_AT    20
 #define PVKVM_DATA_SIZE_AT 24
-#define PVKVM_IO_VALUE_AT  28
-#define PVKVM_MEMORY_AT    4096
-#define PVKVM_MEMORY_LEN   4096
+#define PVKVM_SLOT_COUNT_AT  32
+#define PVKVM_CANCEL_AT      40
+#define PVKVM_CPU_AT         44
+#define PVKVM_FPU_VALID_AT   48
+#define PVKVM_CPUID_VALID_AT 52
+#define PVKVM_LAPIC_VALID_AT 56
+#define PVKVM_SLOT_TABLE_AT  640
+#define PVKVM_SLOT_RECORD_SIZE 16
+#define PVKVM_FPU_AT         768
+#define PVKVM_FPU_BYTES      416
+#define PVKVM_RAM_ADDRESS_AT 1280
+#define PVKVM_MSR_AT         0x81000
+#define PVKVM_MSR_BATCH_MAX  64
+#define PVKVM_CPUID_AT       0x82000
+#define PVKVM_CPUID_MAX      128
+#define PVKVM_EXIT_AT        0x84000
+#define PVKVM_COMPLETION_AT  0x84100
+#define PVKVM_IRQ_AT         0x84200
+#define PVKVM_PIT_FLAGS_AT   0x84208
+#define PVKVM_TSS_AT         0x8420c
+#define PVKVM_LAPIC_AT       0x85000
+#define PVKVM_LAPIC_BYTES    1024
+#define PVKVM_PIO_DATA_AT    0x86000
+#define PVKVM_PIO_BYTES      4096
+#define PVKVM_IRQCHIP_AT     0x87000
+#define PVKVM_IRQCHIP_BYTES  520
+#define PVKVM_PIT_STATE_AT   0x87300
+#define PVKVM_PIT_STATE_BYTES 112
+#define PVKVM_DEBUGREGS_AT   0x87400
+#define PVKVM_DEBUGREGS_BYTES 128
+#define PVKVM_MP_STATE_AT     0x87480
+#define PVKVM_XCRS_AT         0x87500
+#define PVKVM_XCRS_BYTES      392
+#define PVKVM_IOAPIC_GPA     0xfec00000ULL
+#define PVKVM_GSI_COUNT      24
+#define PVKVM_REGISTERS_AT   64
+#define PVKVM_INITIAL_SREGISTERS_AT 256
+#define PVKVM_GUEST_PAGE_SIZE 4096
+#define PVKVM_REAL_MODE_MAX_PAGES 128
+#define PVKVM_MAX_PAGES    65536
+#define PVKVM_MAX_SLOTS    8
+#define PVKVM_MAX_CPUS     2
 #define PVKVM_GUEST_START  4096
+#define PVKVM_PC_HIGH_RAM_LIMIT 0xc0000000
 #define PVKVM_IO_PORT      0x30
 #define PVKVM_IVPOSITION_AT 8
 #define PVKVM_DOORBELL_AT   12
 #define PVKVM_GUEST_POSITION 1
 #define PVKVM_HOST_VECTOR    0
+#define PVKVM_CANCEL_VECTOR  1
+#define PVKVM_IRQFD_VECTOR   2
+
+struct pvkvm_msr_batch {
+	__u32 count;
+	__u32 reserved;
+	struct kvm_msr_entry entries[PVKVM_MSR_BATCH_MAX];
+};
+
+struct pvkvm_cpuid_table {
+	__u32 count;
+	__u32 reserved;
+	struct kvm_cpuid_entry2 entries[PVKVM_CPUID_MAX];
+};
+
+struct pvkvm_run_exit {
+	__u32 reason;
+	__u32 length;
+	__u64 address;
+	__u8 data[8];
+	__u32 is_write;
+	__u32 count;
+};
+
+struct pvkvm_read_completion {
+	__u32 length;
+	__u32 reserved;
+	__u8 data[8];
+};
 
 enum pvkvm_command {
 	PVKVM_CREATE_VM = 1,
@@ -27,6 +96,31 @@ enum pvkvm_command {
 	PVKVM_CREATE_VCPU,
 	PVKVM_CLOSE_VCPU,
 	PVKVM_RUN,
+	PVKVM_GET_REGS,
+	PVKVM_SET_REGS,
+	PVKVM_GET_SREGS,
+	PVKVM_GET_FPU,
+	PVKVM_SET_FPU,
+	PVKVM_GET_MSRS,
+	PVKVM_SET_MSRS,
+	PVKVM_GET_SUPPORTED_CPUID,
+	PVKVM_CREATE_IRQCHIP,
+	PVKVM_SET_IRQ_LINE,
+	PVKVM_CREATE_PIT,
+	PVKVM_SET_TSS_ADDR,
+	PVKVM_GET_LAPIC,
+	PVKVM_SET_LAPIC,
+	PVKVM_COMPLETE_READ,
+	PVKVM_GET_IRQCHIP,
+	PVKVM_SET_IRQCHIP,
+	PVKVM_GET_PIT,
+	PVKVM_SET_PIT,
+	PVKVM_GET_DEBUGREGS,
+	PVKVM_SET_DEBUGREGS,
+	PVKVM_GET_MP_STATE,
+	PVKVM_SET_MP_STATE,
+	PVKVM_GET_XCRS,
+	PVKVM_SET_XCRS,
 };
 
 #endif

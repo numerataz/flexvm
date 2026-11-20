@@ -1,0 +1,64 @@
+--- a/qapi/misc-i386.json
++++ b/qapi/misc-i386.json
+@@ -695,3 +695,20 @@
+ { 'command': 'x-flexvm-set-x86-cpuid',
+   'data': { 'cpu-index': 'uint16', 'entries': [ 'FlexvmX86CpuidLeaf' ] },
+   'features': [ 'unstable' ] }
++
++##
++# @x-flexvm-set-x86-gsi:
++#
++# Set a line on the stopped TCG PC interrupt controller.
++#
++# @gsi: The global system interrupt number.
++#
++# @level: Whether the interrupt line is high.
++#
++# Features:
++#
++# @unstable: Experimental FlexVM worker protocol.
++##
++{ 'command': 'x-flexvm-set-x86-gsi',
++  'data': { 'gsi': 'uint32', 'level': 'bool' },
++  'features': [ 'unstable' ] }
+--- a/target/i386/monitor.c
++++ b/target/i386/monitor.c
+@@ -34,6 +34,8 @@
+ #include "qapi/qapi-commands-misc-i386.h"
+ #include "qapi/util.h"
+ #include "hw/i386/apic.h"
++#include "hw/i386/pc.h"
++#include "hw/irq.h"
+ #include "system/runstate.h"
+ #include "system/tcg.h"
+
+@@ -983,3 +985,18 @@
+     }
+     cpu->flexvm_cpuid = g_steal_pointer(&profile);
+ }
++
++void qmp_x_flexvm_set_x86_gsi(uint32_t gsi, bool level, Error **errp)
++{
++    Object *machine = OBJECT(qdev_get_machine());
++
++    if (!flexvm_stopped_cpu(0, errp)) {
++        return;
++    }
++    if (!object_dynamic_cast(machine, TYPE_PC_MACHINE) ||
++        gsi >= IOAPIC_NUM_PINS || !X86_MACHINE(machine)->gsi) {
++        error_setg(errp, "FlexVM requires a PC global interrupt line");
++        return;
++    }
++    qemu_set_irq(X86_MACHINE(machine)->gsi[gsi], level);
++}
+--- a/stubs/monitor-i386-flexvm.c
++++ b/stubs/monitor-i386-flexvm.c
+@@ -53,3 +53,8 @@
+ {
+     error_setg(errp, "FlexVM CPUID requires an x86 worker");
+ }
++
++void qmp_x_flexvm_set_x86_gsi(uint32_t gsi, bool level, Error **errp)
++{
++    error_setg(errp, "FlexVM interrupts require an x86 PC worker");
++}

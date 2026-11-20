@@ -1,0 +1,342 @@
+--- a/qapi/misc-i386.json
++++ b/qapi/misc-i386.json
+@@ -628,3 +628,70 @@
+   'data': { 'cpu-index': 'uint16', 'write': 'bool',
+             'entries': [ 'FlexvmX86Msr' ] },
+   'returns': 'FlexvmX86MsrResult', 'features': [ 'unstable' ] }
++
++##
++# @FlexvmX86CpuidLeaf:
++#
++# An x86 CPUID result for an optional subleaf.
++#
++# @function: The CPUID function number supplied in EAX.
++#
++# @index: The subleaf supplied in ECX.
++#
++# @indexed: Whether to match the subleaf when applying the entry.
++#
++# @eax: The result in EAX.
++#
++# @ebx: The result in EBX.
++#
++# @ecx: The result in ECX.
++#
++# @edx: The result in EDX.
++##
++{ 'struct': 'FlexvmX86CpuidLeaf',
++  'data': { 'function': 'uint32', 'index': 'uint32', 'indexed': 'bool',
++            'eax': 'uint32', 'ebx': 'uint32', 'ecx': 'uint32',
++            'edx': 'uint32' } }
++
++##
++# @FlexvmX86CpuidResult:
++#
++# A CPU model's answers to the requested CPUID functions.
++#
++# @entries: The CPUID results in request order.
++##
++{ 'struct': 'FlexvmX86CpuidResult', 'data': { 'entries': [ 'FlexvmX86CpuidLeaf' ] } }
++
++##
++# @x-flexvm-query-x86-cpuid:
++#
++# Query CPUID functions from the unmodified stopped TCG CPU model.
++#
++# @cpu-index: The vCPU used to query the model.
++#
++# @entries: Functions and optional subleaves for the query.
++#
++# Features:
++#
++# @unstable: Experimental FlexVM worker protocol.
++##
++{ 'command': 'x-flexvm-query-x86-cpuid',
++  'data': { 'cpu-index': 'uint16', 'entries': [ 'FlexvmX86CpuidLeaf' ] },
++  'returns': 'FlexvmX86CpuidResult', 'features': [ 'unstable' ] }
++
++##
++# @x-flexvm-set-x86-cpuid:
++#
++# Install the CPUID instructions' lookup table before the vCPU runs.
++#
++# @cpu-index: The vCPU to configure.
++#
++# @entries: The configured CPUID results.
++#
++# Features:
++#
++# @unstable: Experimental FlexVM worker protocol.
++##
++{ 'command': 'x-flexvm-set-x86-cpuid',
++  'data': { 'cpu-index': 'uint16', 'entries': [ 'FlexvmX86CpuidLeaf' ] },
++  'features': [ 'unstable' ] }
+--- a/target/i386/monitor.c
++++ b/target/i386/monitor.c
+@@ -916,3 +916,70 @@
+     }
+     return result;
+ }
++
++FlexvmX86CpuidResult *qmp_x_flexvm_query_x86_cpuid(uint16_t cpu_index,
++                                                     FlexvmX86CpuidLeafList *entries,
++                                                     Error **errp)
++{
++    CPUX86State *env = flexvm_stopped_cpu(cpu_index, errp);
++    FlexvmX86CpuidResult *result;
++    FlexvmX86CpuidLeafList **tail;
++
++    if (!env) {
++        return NULL;
++    }
++    result = g_new0(FlexvmX86CpuidResult, 1);
++    tail = &result->entries;
++    for (; entries; entries = entries->next) {
++        FlexvmX86CpuidLeaf *leaf = g_memdup2(entries->value, sizeof(*leaf));
++
++        cpu_x86_cpuid(env, leaf->function, leaf->index,
++                      &leaf->eax, &leaf->ebx, &leaf->ecx, &leaf->edx);
++        QAPI_LIST_APPEND(tail, leaf);
++    }
++    return result;
++}
++
++void qmp_x_flexvm_set_x86_cpuid(uint16_t cpu_index,
++                                FlexvmX86CpuidLeafList *entries, Error **errp)
++{
++    CPUX86State *env = flexvm_stopped_cpu(cpu_index, errp);
++    g_autoptr(GArray) profile = NULL;
++    X86CPU *cpu;
++
++    if (!env) {
++        return;
++    }
++    cpu = env_archcpu(env);
++    if (cpu->flexvm_cpuid) {
++        error_setg(errp, "FlexVM CPUID state is already configured");
++        return;
++    }
++    profile = g_array_new(false, false, sizeof(FlexvmCpuidEntry));
++    for (; entries; entries = entries->next) {
++        const FlexvmX86CpuidLeaf *leaf = entries->value;
++        FlexvmCpuidEntry entry = {
++            .function = leaf->function, .index = leaf->index,
++            .eax = leaf->eax, .ebx = leaf->ebx, .ecx = leaf->ecx,
++            .edx = leaf->edx, .indexed = leaf->indexed,
++        };
++
++        if (profile->len == 128) {
++            error_setg(errp, "FlexVM requires a bounded CPUID table");
++            return;
++        }
++        for (unsigned int i = 0; i < profile->len; i++) {
++            const FlexvmCpuidEntry *prior =
++                &g_array_index(profile, FlexvmCpuidEntry, i);
++
++            if (entry.function == prior->function &&
++                (!entry.indexed || !prior->indexed ||
++                 entry.index == prior->index)) {
++                error_setg(errp, "FlexVM CPUID functions must be distinct");
++                return;
++            }
++        }
++        g_array_append_val(profile, entry);
++    }
++    cpu->flexvm_cpuid = g_steal_pointer(&profile);
++}
+--- a/target/i386/cpu.h
++++ b/target/i386/cpu.h
+@@ -2165,6 +2165,12 @@
+
+ struct kvm_msrs;
+
++typedef struct FlexvmCpuidEntry {
++    uint32_t function, index;
++    uint32_t eax, ebx, ecx, edx;
++    bool indexed;
++} FlexvmCpuidEntry;
++
+ /**
+  * X86CPU:
+  * @env: #CPUX86State
+@@ -2178,6 +2184,7 @@
+     CPUState parent_obj;
+
+     CPUX86State env;
++    GArray *flexvm_cpuid;
+     VMChangeStateEntry *vmsentry;
+
+     uint64_t ucode_rev;
+--- a/target/i386/cpu.c
++++ b/target/i386/cpu.c
+@@ -10163,6 +10163,11 @@
+     }
+ }
+
++static void x86_cpu_finalizefn(Object *obj)
++{
++    g_clear_pointer(&X86_CPU(obj)->flexvm_cpuid, g_array_unref);
++}
++
+ static const TypeInfo x86_cpu_type_info = {
+     .name = TYPE_X86_CPU,
+     .parent = TYPE_CPU,
+@@ -10170,6 +10175,7 @@
+     .instance_align = __alignof(X86CPU),
+     .instance_init = x86_cpu_initfn,
+     .instance_post_init = x86_cpu_post_initfn,
++    .instance_finalize = x86_cpu_finalizefn,
+
+     .abstract = true,
+     .class_size = sizeof(X86CPUClass),
+--- a/target/i386/tcg/misc_helper.c
++++ b/target/i386/tcg/misc_helper.c
+@@ -47,14 +47,126 @@
+     }
+ }
+
++static const FlexvmCpuidEntry *find_flexvm_cpuid(const GArray *profile,
++                                                uint32_t function,
++                                                uint32_t index)
++{
++    for (unsigned int i = 0; i < profile->len; i++) {
++        const FlexvmCpuidEntry *entry =
++            &g_array_index(profile, FlexvmCpuidEntry, i);
++
++        if (entry->function == function &&
++            (!entry->indexed || entry->index == index)) {
++            return entry;
++        }
++    }
++    return NULL;
++}
++
++static bool flexvm_cpuid_vendor_is_amd(const FlexvmCpuidEntry *root)
++{
++    char vendor[12];
++
++    stl_le_p(vendor, root->ebx);
++    stl_le_p(vendor + 4, root->edx);
++    stl_le_p(vendor + 8, root->ecx);
++    return !memcmp(vendor, CPUID_VENDOR_AMD, sizeof(vendor)) ||
++           !memcmp(vendor, CPUID_VENDOR_HYGON, sizeof(vendor));
++}
++
++static const FlexvmCpuidEntry *flexvm_cpuid_fallback(const GArray *profile,
++                                                   uint32_t *function,
++                                                   uint32_t index)
++{
++    const FlexvmCpuidEntry *root = find_flexvm_cpuid(profile, 0, 0);
++    const FlexvmCpuidEntry *range;
++    uint32_t base;
++
++    if (!root || flexvm_cpuid_vendor_is_amd(root)) {
++        return NULL;
++    }
++    if (*function >= 0x40000000 && *function < 0x50000000) {
++        base = *function & 0xffffff00;
++    } else if (*function >= 0xc0000000) {
++        base = 0xc0000000;
++    } else {
++        base = *function & 0x80000000;
++    }
++    range = find_flexvm_cpuid(profile, base, 0);
++    if (range && *function <= range->eax) {
++        return NULL;
++    }
++    *function = root->eax;
++    return find_flexvm_cpuid(profile, *function, index);
++}
++
++static uint32_t flexvm_xsave_size(const GArray *profile, CPUX86State *env,
++                                uint32_t index, const FlexvmCpuidEntry *entry)
++{
++    const FlexvmCpuidEntry *root = find_flexvm_cpuid(profile, 0xd, 0);
++    uint64_t enabled, supervisor;
++
++    if (!root || !(root->eax || root->edx)) {
++        return entry->ebx;
++    }
++    enabled = env->xcr0 & (((uint64_t)root->edx << 32) | root->eax);
++    if (!index) {
++        return xsave_area_size(enabled, false);
++    }
++    if (!(entry->eax & (CPUID_XSAVE_XSAVEC | CPUID_XSAVE_XSAVES))) {
++        return entry->ebx;
++    }
++    supervisor = env->xss & (((uint64_t)entry->edx << 32) | entry->ecx);
++    return xsave_area_size(enabled | supervisor, true);
++}
++
+ void helper_cpuid(CPUX86State *env)
+ {
+     uint32_t eax, ebx, ecx, edx;
++    uint32_t function = env->regs[R_EAX];
++    uint32_t index = env->regs[R_ECX];
++    const GArray *profile = env_archcpu(env)->flexvm_cpuid;
+
+     cpu_svm_check_intercept_param(env, SVM_EXIT_CPUID, 0, GETPC());
+
+-    cpu_x86_cpuid(env, (uint32_t)env->regs[R_EAX], (uint32_t)env->regs[R_ECX],
+-                  &eax, &ebx, &ecx, &edx);
++    if (profile) {
++        const FlexvmCpuidEntry *entry =
++            find_flexvm_cpuid(profile, function, index);
++
++        if (!entry) {
++            entry = flexvm_cpuid_fallback(profile, &function, index);
++        }
++        eax = ebx = ecx = edx = 0;
++        if (entry) {
++            eax = entry->eax;
++            ebx = entry->ebx;
++            ecx = entry->ecx;
++            edx = entry->edx;
++            if (function == 0xd && index < 2) {
++                ebx = flexvm_xsave_size(profile, env, index, entry);
++            }
++        } else if (function == 0xb || function == 0x1f) {
++            entry = find_flexvm_cpuid(profile, function, 1);
++            if (entry) {
++                ecx = index & 0xff;
++                edx = entry->edx;
++            }
++        }
++        if (function == 1) {
++            ecx &= ~CPUID_EXT_OSXSAVE;
++            if ((ecx & CPUID_EXT_XSAVE) && (env->cr[4] & CR4_OSXSAVE_MASK)) {
++                ecx |= CPUID_EXT_OSXSAVE;
++            }
++        }
++        if (function == 7 && !index) {
++            ecx &= ~CPUID_7_0_ECX_OSPKE;
++            if ((ecx & CPUID_7_0_ECX_PKU) && (env->cr[4] & CR4_PKE_MASK)) {
++                ecx |= CPUID_7_0_ECX_OSPKE;
++            }
++        }
++    } else {
++        cpu_x86_cpuid(env, function, index, &eax, &ebx, &ecx, &edx);
++    }
+     env->regs[R_EAX] = eax;
+     env->regs[R_EBX] = ebx;
+     env->regs[R_ECX] = ecx;
+--- a/stubs/monitor-i386-flexvm.c
++++ b/stubs/monitor-i386-flexvm.c
+@@ -39,3 +39,17 @@
+     error_setg(errp, "FlexVM boot MSRs require an x86 worker");
+     return NULL;
+ }
++
++FlexvmX86CpuidResult *qmp_x_flexvm_query_x86_cpuid(uint16_t cpu_index,
++                                                     FlexvmX86CpuidLeafList *entries,
++                                                     Error **errp)
++{
++    error_setg(errp, "FlexVM CPUID requires an x86 worker");
++    return NULL;
++}
++
++void qmp_x_flexvm_set_x86_cpuid(uint16_t cpu_index,
++                                FlexvmX86CpuidLeafList *entries, Error **errp)
++{
++    error_setg(errp, "FlexVM CPUID requires an x86 worker");
++}

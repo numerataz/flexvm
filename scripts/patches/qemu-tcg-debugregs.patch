@@ -1,0 +1,92 @@
+--- a/qapi/misc-i386.json
++++ b/qapi/misc-i386.json
+@@ -817 +817,31 @@
+   'returns': 'FlexvmX86PitRecord', 'features': [ 'unstable' ] }
++
++##
++# @FlexvmX86DebugState:
++#
++# @dr0: Debug breakpoint address 0.
++# @dr1: Debug breakpoint address 1.
++# @dr2: Debug breakpoint address 2.
++# @dr3: Debug breakpoint address 3.
++# @dr6: Debug status.
++# @dr7: Debug control.
++##
++{ 'struct': 'FlexvmX86DebugState',
++  'data': { 'dr0': 'uint64', 'dr1': 'uint64', 'dr2': 'uint64', 'dr3': 'uint64',
++            'dr6': 'uint32', 'dr7': 'uint32' } }
++
++##
++# @x-flexvm-access-x86-debugregs:
++#
++# Read or install a stopped x86 vCPU's guest debug registers.
++#
++# @cpu-index: Index of the stopped vCPU.
++# @state: New debug registers, when writing.
++#
++# Features:
++#
++# @unstable: Experimental FlexVM worker protocol.
++##
++{ 'command': 'x-flexvm-access-x86-debugregs',
++  'data': { 'cpu-index': 'uint16', '*state': 'FlexvmX86DebugState' },
++  'returns': 'FlexvmX86DebugState', 'features': [ 'unstable' ] }
+--- a/stubs/monitor-i386-flexvm.c
++++ b/stubs/monitor-i386-flexvm.c
+@@ -94 +94,9 @@
+ }
++
++FlexvmX86DebugState *qmp_x_flexvm_access_x86_debugregs(uint16_t cpu_index,
++                                                     FlexvmX86DebugState *state,
++                                                     Error **errp)
++{
++    error_setg(errp, "FlexVM debug registers require an x86 worker");
++    return NULL;
++}
+--- a/target/i386/monitor.c
++++ b/target/i386/monitor.c
+@@ -1223 +1223,43 @@
+ }
++
++#ifdef CONFIG_TCG
++static void flexvm_set_debugregs(CPUState *cpu, run_on_cpu_data data)
++{
++    CPUX86State *env = &X86_CPU(cpu)->env;
++    const FlexvmX86DebugState *state = data.host_ptr;
++
++    /* Remove old breakpoints before changing the addresses. */
++    cpu_x86_update_dr7(env, DR7_FIXED_1);
++    env->dr[0] = state->dr0;
++    env->dr[1] = state->dr1;
++    env->dr[2] = state->dr2;
++    env->dr[3] = state->dr3;
++    env->dr[6] = state->dr6;
++    cpu_x86_update_dr7(env, state->dr7);
++    /* Preserve the ioctl image, including the guest's reserved bit 10. */
++    env->dr[7] = state->dr7;
++}
++#endif
++
++FlexvmX86DebugState *qmp_x_flexvm_access_x86_debugregs(uint16_t cpu_index,
++                                                     FlexvmX86DebugState *state,
++                                                     Error **errp)
++{
++    CPUX86State *env = flexvm_stopped_cpu(cpu_index, errp);
++    FlexvmX86DebugState *result;
++
++    if (!env) {
++        return NULL;
++    }
++#ifdef CONFIG_TCG
++    if (state) {
++        run_on_cpu(CPU(env_archcpu(env)), flexvm_set_debugregs, RUN_ON_CPU_HOST_PTR(state));
++    }
++#endif
++    result = g_new(FlexvmX86DebugState, 1);
++    *result = (FlexvmX86DebugState) {
++        .dr0 = env->dr[0], .dr1 = env->dr[1], .dr2 = env->dr[2], .dr3 = env->dr[3],
++        .dr6 = env->dr[6], .dr7 = env->dr[7],
++    };
++    return result;
++}
