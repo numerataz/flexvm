@@ -104,7 +104,7 @@ class CheckpointGate:
         elif request == b"ready" and not fds and self.phase == "frozen":
             self.client.sendall(b"ok")
         elif request == b"check-save" and not fds and self.phase == "frozen":
-            self.client.sendall(b"ok" if worker and worker.proc else b"no active nested worker")
+            self.client.sendall(b"ok" if worker is None or worker.proc else b"nested worker is still starting")
         elif request == b"thaw" and not fds and self.phase == "frozen":
             if worker:
                 worker.freeze_run_control(False)
@@ -450,10 +450,13 @@ def state_fds(fds, *, writing=False):
     return fds
 
 
+IDLE_WORKER_STATE = b"FLEXVM ARM no nested worker\n"
+
+
 def capture_state(outer, qmp, irq_fds, worker, fds):
     outer_fd, child_fd, metadata = state_fds(fds, writing=True)
-    if worker is None or worker.proc is None:
-        raise RuntimeError("ARM checkpoint needs an active nested worker")
+    if worker is not None and worker.proc is None:
+        raise RuntimeError("ARM checkpoint cannot capture a worker that is still starting")
     if any(os.fstat(fd).st_size for fd in fds):
         raise RuntimeError("ARM checkpoint output files must be empty")
     monitor = PARENT["HELPERS"]["QMP"](qmp, outer, time.monotonic() + 30)
@@ -467,8 +470,12 @@ def capture_state(outer, qmp, irq_fds, worker, fds):
                 pending[gsi] = os.eventfd_read(fd)
             except BlockingIOError:
                 pass
-        worker.capture(child_fd)
-        record = json.dumps({"version": 1, "worker": worker.profile(), "pending": pending}).encode()
+        if worker is None:
+            if os.write(child_fd, IDLE_WORKER_STATE) != len(IDLE_WORKER_STATE):
+                raise RuntimeError("short ARM idle worker state write")
+        else:
+            worker.capture(child_fd)
+        record = json.dumps({"version": 1, "worker": worker.profile() if worker else None, "pending": pending}).encode()
         if os.write(metadata, record) != len(record):
             raise RuntimeError("short ARM checkpoint metadata write")
         transfer(monitor, outer_fd)
@@ -626,9 +633,15 @@ def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=
                         raise RuntimeError("restored ARM outer VM is not paused")
                 finally:
                     monitor.close()
-                restored_worker = create_worker(record["worker"]["vm_type"])
-                resources.callback(restored_worker.close)
-                restored_worker.restore(record["worker"], memory, irq_fds, child_fd, max_pages, outer_bytes)
+                profile = record["worker"]
+                if profile is None:
+                    size = len(IDLE_WORKER_STATE)
+                    if os.fstat(child_fd).st_size != size or os.pread(child_fd, size, 0) != IDLE_WORKER_STATE:
+                        raise RuntimeError("invalid ARM idle worker state")
+                else:
+                    restored_worker = create_worker(profile["vm_type"])
+                    resources.callback(restored_worker.close)
+                    restored_worker.restore(profile, memory, irq_fds, child_fd, max_pages, outer_bytes)
                 restore_interrupts(irq_fds, record["pending"])
                 os.eventfd_write(replies, 1)
                 restore_inputs.close()
@@ -638,7 +651,8 @@ def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=
             return capture_state(outer, outer_qmp, irq_fds, worker, fds)
 
         def rollback(worker, pending):
-            worker.freeze_run_control(False)
+            if worker is not None:
+                worker.freeze_run_control(False)
             restore_interrupts(irq_fds, pending)
 
         return serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, create_worker,

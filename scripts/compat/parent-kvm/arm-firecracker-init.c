@@ -8,6 +8,7 @@
 #include <sys/reboot.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static void check(int ok, const char *why)
@@ -38,6 +39,12 @@ int main(void)
     int module = open("/flexvm-pvkvm.ko", O_RDONLY | O_CLOEXEC);
     check(module >= 0 && syscall(SYS_finit_module, module, "", 0) == 0, "load ARM provider");
     close(module);
+#endif
+#ifdef FLEXVM_ARM_TEST_IDLE_CHECKPOINT
+    puts("ARM checkpoint window before opening the nested VM");
+    struct timespec wait = { .tv_sec = 4 };
+    while (nanosleep(&wait, &wait) == -1)
+        check(errno == EINTR, "wait for idle checkpoint");
 #endif
     pid_t child = fork();
     check(child >= 0, "fork ARM Firecracker");

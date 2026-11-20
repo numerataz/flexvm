@@ -29,9 +29,10 @@ def main():
     checkpoint.add_argument("--pause", action="store_true", help="pause and resume both VMs through the public command")
     checkpoint.add_argument("--rollback", action="store_true", help="resume the source after aborting a completed capture")
     checkpoint.add_argument("--suspend", action="store_true", help="stop and restore both VMs through the public command")
+    checkpoint.add_argument("--idle-transfer", action="store_true", help="restore before creating a nested ARM worker")
     args = parser.parse_args()
     checkpoint_test = args.freeze or args.transfer or args.rollback
-    if checkpoint_test and (args.bin or args.engine != "tcg"):
+    if (checkpoint_test or args.idle_transfer) and (args.bin or args.engine != "tcg"):
         parser.error("checkpoint tests require the standalone ARM TCG broker")
     public_checkpoint = args.pause or args.suspend
     if public_checkpoint and (not args.bin or args.engine != "tcg"):
@@ -43,6 +44,8 @@ def main():
     cc = [args.cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static"]
     outer, inner = output / "outer-init", output / "inner-init"
     mode = ["-DFLEXVM_ARM_FIRECRACKER_APP"] if args.bin else []
+    if args.idle_transfer:
+        mode.append("-DFLEXVM_ARM_TEST_IDLE_CHECKPOINT")
     HELPERS["run"]([*cc, *mode, ROOT / "parent-kvm/arm-firecracker-init.c", "-o", outer], 30, output / "outer-build.log")
     inner_flags = [f"-DFLEXVM_ARM_TEST_CPUS={args.vcpus}"]
     if checkpoint_test or public_checkpoint:
@@ -97,8 +100,8 @@ def main():
             sys.executable, ROOT / "arm-parent-run.py", "--qemu", args.qemu, "--kernel", kernel,
             "--initrd", cpio, "--mem", "384", *options,
         ]
-        if args.transfer or args.rollback:
-            transfer_checkpoint(command, output, log, rollback=args.rollback)
+        if args.transfer or args.rollback or args.idle_transfer:
+            transfer_checkpoint(command, output, log, rollback=args.rollback, idle=args.idle_transfer)
         elif args.freeze:
             with tempfile.TemporaryDirectory(prefix="flexvm-arm-freeze-") as directory:
                 runtime = Path(directory) / "parent"
@@ -124,15 +127,15 @@ def main():
         if lines.count(marker) != 1:
             raise RuntimeError(f"missing or repeated {marker}; see {log}")
     report = {"status": "passed", "nested_vcpus": args.vcpus, "parent_engine": args.engine,
-              "checkpoint": next((mode for mode in ("transfer", "freeze", "rollback", "pause", "suspend") if getattr(args, mode)), None),
+              "checkpoint": next((mode for mode in ("transfer", "freeze", "rollback", "pause", "suspend", "idle_transfer") if getattr(args, mode)), None),
               "virtio_block": "read-write-flush",
               "arm_timer": "passed", "firecracker_sha256": HELPERS["digest"](args.firecracker)}
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print("PASS stock ARM Firecracker executes through the parent KVM device")
 
 
-def wait_checkpoint_window(proc, deadline, log):
-    while "ARM Firecracker checkpoint window" not in log.read_text(errors="replace"):
+def wait_checkpoint_window(proc, deadline, log, marker="ARM Firecracker checkpoint window"):
+    while marker not in log.read_text(errors="replace"):
         if proc.poll() is not None or time.monotonic() >= deadline:
             raise RuntimeError("ARM nested guest did not enter the checkpoint window")
         time.sleep(.01)
@@ -213,7 +216,8 @@ def resume_outer(proc, deadline, runtime):
         monitor.close()
 
 
-def transfer_checkpoint(command, output, log, *, rollback=False):
+def transfer_checkpoint(command, output, log, *, rollback=False, idle=False):
+    checkpoint_window = "ARM checkpoint window before opening the nested VM" if idle else "ARM Firecracker checkpoint window"
     with ExitStack() as resources:
         root = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix="flexvm-arm-transfer-")))
         source, target = root / "source", root / "target"
@@ -222,7 +226,7 @@ def transfer_checkpoint(command, output, log, *, rollback=False):
         fds = tuple(file.fileno() for file in files)
 
         def capture(proc, deadline):
-            wait_checkpoint_window(proc, deadline, source_log)
+            wait_checkpoint_window(proc, deadline, source_log, checkpoint_window)
             with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as control:
                 connect_checkpoint(control, proc, deadline, source)
                 checkpoint_request(control, b"freeze")
@@ -241,6 +245,11 @@ def transfer_checkpoint(command, output, log, *, rollback=False):
             return
         for file in files:
             file.seek(0)
+        if idle:
+            record = json.load(files[2])
+            files[2].seek(0)
+            if record["worker"] is not None:
+                raise RuntimeError("idle transfer captured an initialized nested worker")
         if "PASS ARM Firecracker resumed" in source_log.read_text(errors="replace"):
             raise RuntimeError("the source resumed after capture")
 
