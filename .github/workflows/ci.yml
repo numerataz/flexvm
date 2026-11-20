@@ -809,7 +809,7 @@ jobs:
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/nested-docker-cache
-          key: nested-docker-dind-27-${{ matrix.arch }}-v1
+          key: nested-docker-dind-27-${{ matrix.arch }}-v2
       - name: Export nested Docker DinD image archive
         if: matrix.workload == 'nested-flexvm-docker' && steps.nested-docker-cache.outputs.cache-hit != 'true'
         run: |
@@ -817,7 +817,7 @@ jobs:
           sudo apt-get install -y -q --no-install-recommends skopeo
           mkdir -p "$RUNNER_TEMP/nested-docker-cache"
           arch=$([ "${{ matrix.arch }}" = aarch64 ] && echo arm64 || echo amd64)
-          skopeo copy --override-os linux --override-arch "$arch" docker://docker.io/library/docker:27-dind "docker-archive:$RUNNER_TEMP/nested-docker-cache/docker-dind.tar:docker:27-dind"
+          skopeo copy --override-os linux --override-arch "$arch" docker://docker.io/library/docker:27-dind "oci-archive:$RUNNER_TEMP/nested-docker-cache/docker-dind.tar:docker:27-dind"
       - name: Save nested Docker DinD image archive
         if: matrix.workload == 'nested-flexvm-docker' && steps.nested-docker-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
