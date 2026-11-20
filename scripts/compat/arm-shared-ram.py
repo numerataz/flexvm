@@ -177,26 +177,25 @@ def exercise_mmio(qemu):
 
 
 def exercise_parallel_mmio(qemu):
-    # CPU 0 starts CPU 1 via PSCI and waits on shared RAM. CPU 1 writes the
-    # shared marker. Both CPUs report it at separate MMIO offsets.
+    # CPU 0 starts CPU 1 via PSCI and holds an MMIO read open. CPU 1
+    # writes to the same aperture before the first read completes.
     program = struct.pack(
-        "<20I",
-        0x10000004, 0xd2a16005, 0x10000162, 0xd2800021, 0xd2800060,
-        0xf2b88000, 0xd4000002, 0xb9010080, 0x91041086, 0x88dffcc7,
-        0x34ffffe7, 0xb90004a7, 0x14000000, 0x10fffe64, 0xd2a16005,
-        0x52930ec7, 0x91041086, 0x889ffcc7, 0xb90008a7, 0x14000000,
+        "<15I",
+        0x10000004, 0xd2a16005, 0x10000122, 0xd2800021, 0xd2800060,
+        0xf2b88000, 0xd4000002, 0xb9010080, 0xb94004a7, 0xb90004a7,
+        0x14000000, 0xd2a16005, 0x52930ec7, 0xb90008a7, 0x14000000,
     )
     with mmio_worker(qemu, program, 2) as (ram, [first, second], [first_reply, second_reply], _):
         os.pwrite(ram, b"\xff" * 4, 256)
         first.sendall(b"R")
-        deadline = time.monotonic() + 5
-        while os.pread(ram, 4, 256) != bytes(4):
-            if time.monotonic() >= deadline:
-                raise RuntimeError("PSCI failed to start the second ARM vCPU")
-            time.sleep(.01)
+        expect(first_reply, struct.pack("<cBQQ", b"Q", 4, MMIO + 4, 0))
+        if os.pread(ram, 4, 256) != bytes(4):
+            raise RuntimeError("PSCI failed to start the second ARM vCPU")
         second.sendall(b"S")
-        expect(first_reply, struct.pack("<cBQQ", b"M", 4, MMIO + 4, 0x9876))
         expect(second_reply, struct.pack("<cBQQ", b"M", 4, MMIO + 8, 0x9876))
+        data = struct.pack("<I", 0xa246)
+        first.sendall(b"D" + data)
+        expect(first_reply, struct.pack("<cBQQ", b"M", 4, MMIO + 4, 0xa246))
         first.sendall(b"RI")
         second.sendall(b"SI")
         expect(first_reply, b"I\0")
@@ -253,7 +252,7 @@ if __name__ == "__main__":
         exercise_mmio(qemu)
         print("PASS ARM TCG MMIO exits, read completion and run cancellation")
         exercise_parallel_mmio(qemu)
-        print("PASS ARM TCG vCPUs run concurrently and report independent MMIO exits")
+        print("PASS ARM TCG vCPUs share an MMIO region while a read is pending")
     if args.vgic_program:
         exercise_vgic(qemu, args.vgic_program.read_bytes())
         print("PASS ARM TCG guest received an interrupt through the remapped GICv3")
