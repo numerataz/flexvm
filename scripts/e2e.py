@@ -1707,7 +1707,8 @@ def nettest_ipv6():
     CI saw 113-181 ms beside 30-46 ms downtimes with nothing lost, while a lost segment of the one-segment
     ping-pong costs at least 200 ms (the minimum retransmit timeout, and a loss probe's delayed-ACK allowance)."""
     env = {**ENV, "V6": "1", "FLEXVM": BIN, "STATE": BUILD, "TEMPLATE": args.template, "P": f"fv6{A.port}", "ROUNDS": "1",
-           "STALL_SLACK_MS": "190", "WORK": os.path.join(args.log_dir, "nettest-ipv6")}
+           "STALL_SLACK_MS": "190", "WORK": os.path.join(args.log_dir, "nettest-ipv6"),
+           "CAPTURE_TCP": "1" if shutil.which("tcpdump") else "0"}
     p = subprocess.Popen([os.path.join(ROOT, "scripts", "nettest.sh")], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                          env=env, start_new_session=True)
     try:
@@ -1721,7 +1722,10 @@ def nettest_ipv6():
             os.killpg(p.pid, signal.SIGKILL)
             out, _ = p.communicate()
         out += "\n(timed out after 300 s)"
-    check("nettest V6=1: passes", p.returncode == 0 and "PASS" in out.splitlines(), out[-3000:])
+    passed = p.returncode == 0 and "PASS" in out.splitlines()
+    if not passed:
+        print(out[-64_000:], flush=True)
+    check("nettest V6=1: passes", passed)
 
 
 @case

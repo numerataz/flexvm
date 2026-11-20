@@ -734,7 +734,7 @@ jobs:
         if: env.KVM == 'true'
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends skopeo
+          sudo apt-get install -y -q --no-install-recommends skopeo tcpdump
           python3 scripts/compat/workload-fixture.py --cache "$RUNNER_TEMP/workload-fixture-cache/oci" --output "$RUNNER_TEMP/workload-fixture"
       - name: Save verified workload fixture
         if: env.KVM == 'true' && steps.workload-fixture-cache.outputs.cache-hit != 'true'
