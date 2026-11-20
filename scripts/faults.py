@@ -1743,7 +1743,10 @@ def exec_background():
     sessions = lambda: cli_json(A, "debug", n, "sessions").get("result") or {}
     # A client that reads its exit and then stays silent, its connection open, holds the relay and the
     # guest's handler for 2 s at most; its session stays, exited and unacknowledged, for a reattach.
-    before = sessions().get("unacknowledged", 0)
+    # Earlier exec relays acknowledge exits asynchronously. The only session
+    # this phase inherits is the deliberately stalled output stream.
+    quiet = wait_for(lambda: sessions() == {"live": 1, "unacknowledged": 0}, 10)
+    check("exec bg: only the deliberately stalled session remains before testing silent exits", quiet, sessions())
     with raw_exec(os.urandom(16).hex(), "echo hi") as s:
         f = s.makefile("rb")
         f.readline()
@@ -1757,7 +1760,7 @@ def exec_background():
         hung_up = s.recv(1) == b""
         took = time.time() - t
         check("exec bg: the relay lets go of a client silent after its exit", kind == 3 and hung_up and took < 4, (kind, hung_up, took))
-        check("exec bg: the session stays, unacknowledged", wait_for(lambda: sessions().get("unacknowledged") == before + 1, 3), sessions())
+        check("exec bg: the session stays, unacknowledged", wait_for(lambda: sessions().get("unacknowledged") == 1, 3), sessions())
         f.close()
     # Piped into a slow reader, the CLI acknowledges its exit only once it wrote all output out, after the
     # guest stopped waiting. Such exits do not count towards the 64 running sessions: with 70 at once,
@@ -1791,7 +1794,7 @@ def exec_background():
         for r in readers:
             r.start()
             time.sleep(0.02)
-        full = wait_for(lambda: sessions().get("unacknowledged", 0) >= before + 1 + 64, 15)
+        full = wait_for(lambda: sessions().get("unacknowledged", 0) >= 65, 15)
         check("exec bg: 64 and more slow readers' exits are unacknowledged at once", full and not drained, (sessions(), time.time() - start))
         t = time.time()
         r = sh(A, n, "echo hi")
@@ -1809,14 +1812,14 @@ def exec_background():
             os.unlink(release)
     bad = [d for d in drained if d[1] != (0, str(d[0]), "")]
     check("exec bg: 70 slow readers all get all their output and status", len(drained) == 70 and not bad, bad[:3])
-    check("exec bg: their acknowledgements release their sessions", wait_for(lambda: sessions().get("unacknowledged") == before + 1, 10), sessions())
+    check("exec bg: their acknowledgements release their sessions", wait_for(lambda: sessions().get("unacknowledged") == 1, 10), sessions())
     # #1030: output that fits the socket buffers, its exit right behind it, to a reader back after 5 s: its
     # acknowledgement is waited for once it has read the exit, and, too late for the guest by then, is passed
     # on as a CLOSE, so the session does not stay.
     drained.clear()
     slow_reader(150000, 5)
     check("exec bg: 150 KB to a reader back after 5 s all arrive", drained == [(150000, (0, "150000", ""))], drained)
-    released = wait_for(lambda: sessions().get("unacknowledged") == before + 1, 10)
+    released = wait_for(lambda: sessions().get("unacknowledged") == 1, 10)
     check("exec bg: its late acknowledgement still releases its session", released, sessions())
     # More output than the guest keeps for a session (4 MiB): the command waits for its reader, and the
     # reader, back after 15 s (well past Firecracker's 2 s vsock shutdown expiry), gets all of it.
