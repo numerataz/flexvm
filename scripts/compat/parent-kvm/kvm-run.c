@@ -23,6 +23,10 @@
 #define FPU_RESUME_OFFSET 0x480
 #define MSR_ENTRY_OFFSET 0x500
 #define MSR_RESUME_OFFSET 0x600
+#define CPUID_ENTRY_OFFSET 0x700
+#define CPUID_SECOND_OFFSET 0x800
+#define CPUID_TEST_FUNCTION 0x4000007e
+#define CPUID_TEST_RESULT 0x31234500
 #define TSC_START 0x1111222200000000ULL
 #define MSR_KERNEL_GS_BASE 0xc0000102U
 #define MSR_MTRR_DEFAULT 0x2ff
@@ -260,6 +264,74 @@ static void check_resumed_msrs(int cpu, const unsigned char *data)
     puts("PASS x86 boot MSRs reached the parent worker");
 }
 
+static void get_supported_cpuid(int kvm, struct pvkvm_cpuid_table *table)
+{
+    struct kvm_cpuid2 small = {0};
+    check(ioctl(kvm, KVM_GET_SUPPORTED_CPUID, &small) == -1 && errno == E2BIG,
+          "reject a short supported CPUID buffer");
+    table->count = PVKVM_CPUID_MAX;
+    check(ioctl(kvm, KVM_GET_SUPPORTED_CPUID, table) == 0 &&
+          table->count >= 4 && table->count <= PVKVM_CPUID_MAX - 2,
+          "read the engine's supported CPUID table");
+    bool vendor = false, features = false;
+    for (unsigned int i = 0; i < table->count; i++) {
+        const struct kvm_cpuid_entry2 *entry = &table->entries[i];
+        if (entry->function == 0)
+            vendor = entry->eax >= 1 && entry->ebx && entry->ecx && entry->edx;
+        if (entry->function == 1)
+            features = entry->eax != 0;
+        check(entry->function != CPUID_TEST_FUNCTION, "choose an unused synthetic CPUID function");
+    }
+    check(vendor && features, "read native CPU identification and features");
+}
+
+static void install_cpuid(int cpu, unsigned int id, const struct pvkvm_cpuid_table *supported)
+{
+    struct pvkvm_cpuid_table configured = *supported;
+    for (unsigned int i = 1; i <= 2; i++) {
+        configured.entries[configured.count++] = (struct kvm_cpuid_entry2){
+            .function = CPUID_TEST_FUNCTION, .index = i, .flags = KVM_CPUID_FLAG_SIGNIFCANT_INDEX,
+            .eax = CPUID_TEST_RESULT + 16 * id + i,
+        };
+    }
+    check(ioctl(cpu, KVM_SET_CPUID2, &configured) == 0, "install a per-vCPU CPUID profile");
+    struct kvm_cpuid2 small = {0};
+    check(ioctl(cpu, KVM_GET_CPUID2, &small) == -1 && errno == E2BIG, "reject a short vCPU CPUID buffer");
+    struct pvkvm_cpuid_table readback = {.count = PVKVM_CPUID_MAX};
+    check(ioctl(cpu, KVM_GET_CPUID2, &readback) == 0 && readback.count == configured.count,
+          "read the configured vCPU CPUID table");
+    check(!memcmp(readback.entries + readback.count - 2, configured.entries + configured.count - 2,
+                  2 * sizeof(readback.entries[0])), "read back both indexed CPUID results");
+}
+
+static void check_cpuid_result(const unsigned char *ram, unsigned int id,
+                               const struct pvkvm_cpuid_table *supported)
+{
+    uint32_t first, second, absent;
+    memcpy(&first, ram + 0xe0, sizeof(first));
+    memcpy(&second, ram + 0xe4, sizeof(second));
+    memcpy(&absent, ram + 0xe8, sizeof(absent));
+    check(first == CPUID_TEST_RESULT + 16 * id + 1 && second == CPUID_TEST_RESULT + 16 * id + 2,
+          "the running vCPU selected its own configured CPUID subleaves");
+    const struct kvm_cpuid_entry2 *root = NULL;
+    for (unsigned int i = 0; i < supported->count; i++)
+        if (!supported->entries[i].function)
+            root = &supported->entries[i];
+    check(root != NULL, "find the basic CPUID range for the running vCPU");
+    const uint32_t vendor[] = {root->ebx, root->edx, root->ecx};
+    uint32_t expected = 0;
+    if (memcmp(vendor, "AuthenticAMD", sizeof(vendor)) && memcmp(vendor, "HygonGenuine", sizeof(vendor))) {
+        for (unsigned int i = 0; i < supported->count; i++) {
+            const struct kvm_cpuid_entry2 *entry = &supported->entries[i];
+            if (entry->function == root->eax && (!(entry->flags & KVM_CPUID_FLAG_SIGNIFCANT_INDEX) || !entry->index)) {
+                expected = entry->eax;
+                break;
+            }
+        }
+    }
+    check(absent == expected, "use the configured vendor's out-of-range CPUID behavior");
+}
+
 struct interrupt_test {
     uint32_t *counter;
     uint32_t baseline;
@@ -329,6 +401,7 @@ int main(int argc, char **argv)
     bool long_mode = false;
     bool fpu = false;
     bool msrs = false;
+    bool cpuid = false;
     check(argc == 2 || protected_mode, "specify RAM pages and optional protected or split mode");
     for (int i = 3; i < argc; i++) {
         if (!interrupt_run && !strcmp(argv[i], "interrupt"))
@@ -341,6 +414,8 @@ int main(int argc, char **argv)
             fpu = true;
         else if (!msrs && !strcmp(argv[i], "msrs"))
             msrs = true;
+        else if (!cpuid && !strcmp(argv[i], "cpuid"))
+            cpuid = true;
         else
             check(false, "invalid execution option");
     }
@@ -353,6 +428,7 @@ int main(int argc, char **argv)
     check(!long_mode || (!two_vcpus && count >= (split_slot ? 8 : 4)), "reserve four low pages for long mode");
     check(!fpu || long_mode, "exercise floating-point state in long mode");
     check(!msrs || (long_mode && !fpu), "exercise boot MSRs in a separate long-mode run");
+    check(!cpuid || (protected_mode && !fpu && !msrs), "exercise CPUID in a separate protected-mode run");
     size_t pages = count;
     size_t ram_bytes = pages * 4096;
     uint64_t gpa = protected_mode ? PROTECTED_SLOT_GPA : PVKVM_GUEST_START;
@@ -371,6 +447,9 @@ int main(int argc, char **argv)
     check(ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_USER_MEMORY) == 1 &&
           ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_NR_MEMSLOTS) >= PVKVM_MAX_SLOTS,
           "query system KVM memory capabilities");
+    struct pvkvm_cpuid_table supported = {0};
+    if (cpuid)
+        get_supported_cpuid(kvm, &supported);
     int size = ioctl(kvm, KVM_GET_VCPU_MMAP_SIZE, 0);
     check(size >= (int)sizeof(struct kvm_run), "run mapping size");
     int vm = ioctl(kvm, KVM_CREATE_VM, 0);
@@ -462,6 +541,23 @@ int main(int argc, char **argv)
         0xc6, 0x87, 0xa1, 0, 0, 0, 0xff, /* mov byte [edi+0xa1], 0xff */
         0xf4,
     };
+    const unsigned char cpuid_entry[] = {
+        0x53,                               /* push bx (32-bit or 64-bit) */
+        0xb8, 0x7e, 0, 0, 0x40,            /* mov eax, 0x4000007e */
+        0xb9, 0x01, 0, 0, 0,               /* mov ecx, 1 */
+        0x0f, 0xa2,                         /* cpuid */
+        0x89, 0x87, 0xe0, 0, 0, 0,          /* mov [edi+0xe0], eax */
+        0xb8, 0x7e, 0, 0, 0x40,            /* mov eax, 0x4000007e */
+        0xb9, 0x02, 0, 0, 0,               /* mov ecx, 2 */
+        0x0f, 0xa2,                         /* cpuid */
+        0x89, 0x87, 0xe4, 0, 0, 0,          /* mov [edi+0xe4], eax */
+        0xb8, 0xff, 0xff, 0xff, 0x3f,       /* mov eax, 0x3fffffff */
+        0x31, 0xc9,                         /* xor ecx, ecx */
+        0x0f, 0xa2,                         /* cpuid */
+        0x89, 0x87, 0xe8, 0, 0, 0,          /* mov [edi+0xe8], eax */
+        0x5b,                               /* pop bx (32-bit or 64-bit) */
+        0xb8, 0x41, 0, 0, 0, 0xf9,          /* mov eax, 0x41; stc */
+    };
     unsigned char *data = ram + ram_bytes - 4096;
     unsigned char *middle = ram + (pages / 2) * 4096;
     const unsigned char gdtr[] = {0x2f, 0x00, 0x80, 0x34, 0x12, 0x00};
@@ -548,6 +644,11 @@ int main(int argc, char **argv)
     int cpu = ioctl(vm, KVM_CREATE_VCPU, 0);
     check(cpu >= 0 && (fcntl(cpu, F_GETFD) & FD_CLOEXEC), "vCPU file descriptor");
     check(ioctl(vm, KVM_CREATE_VCPU, 0) == -1 && errno == EEXIST, "reject duplicate vCPU");
+    if (cpuid) {
+        memcpy(ram + CPUID_ENTRY_OFFSET, cpuid_entry, sizeof(cpuid_entry));
+        install_jump(ram, CPUID_ENTRY_OFFSET + sizeof(cpuid_entry), 0x10);
+        install_cpuid(cpu, 0, &supported);
+    }
     struct kvm_run *run = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, cpu, 0);
     check(run != MAP_FAILED, "map kvm_run");
     struct kvm_regs regs = {.rax = 0x41, .rip = entry_base + 0x10, .rflags = 3};
@@ -555,6 +656,10 @@ int main(int argc, char **argv)
         regs.rip = entry_base + FPU_ENTRY_OFFSET;
     if (msrs)
         regs.rip = entry_base + MSR_ENTRY_OFFSET;
+    if (cpuid) {
+        regs.rip = entry_base + CPUID_ENTRY_OFFSET;
+        regs.rsp = entry_base + 0xf00;
+    }
     if (protected_mode) {
         regs.rbx = data_address;
         regs.rdi = entry_base;
@@ -580,7 +685,14 @@ int main(int argc, char **argv)
         check(other_cpu >= 0 && (fcntl(other_cpu, F_GETFD) & FD_CLOEXEC), "second vCPU file descriptor");
         other_run = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, other_cpu, 0);
         check(other_run != MAP_FAILED, "map second kvm_run");
-        const struct kvm_regs other_regs = {.rdi = last_page, .rip = gpa + SECOND_CPU_OFFSET, .rflags = 2};
+        struct kvm_regs other_regs = {.rdi = last_page, .rip = gpa + SECOND_CPU_OFFSET, .rflags = 2};
+        if (cpuid) {
+            memcpy(ram + CPUID_SECOND_OFFSET, cpuid_entry, sizeof(cpuid_entry));
+            install_jump(ram, CPUID_SECOND_OFFSET + sizeof(cpuid_entry), SECOND_CPU_OFFSET);
+            install_cpuid(other_cpu, 1, &supported);
+            other_regs.rip = gpa + CPUID_SECOND_OFFSET;
+            other_regs.rsp = gpa + 0xf00;
+        }
         check(ioctl(other_cpu, KVM_SET_REGS, &other_regs) == 0, "set second vCPU registers");
         select_segments(other_cpu, true, false, gpa);
     }
@@ -614,6 +726,8 @@ int main(int argc, char **argv)
     check(ram[0x90] == 0x57 && data[0x80] == 0x56 && data[0x82] == 0,
           "child wrote the first and last pages and stopped after its first output");
     check(!protected_mode || middle[0x78] == 0xb3, "protected child wrote the middle page");
+    if (cpuid)
+        check_cpuid_result(ram, 0, &supported);
     if (two_vcpus) {
         check(data[0xa0] == 0 && data[0xa1] == 0, "second vCPU waited for KVM_RUN");
         timed_run(other_cpu);
@@ -621,6 +735,8 @@ int main(int argc, char **argv)
         check_registers(other_cpu, 0x56, 0x3344, gpa + SECOND_CPU_OFFSET);
         check_registers(cpu, 0x42, 0x1357, gpa);
         check(data[0xa0] == 0x56 && data[0xa1] == 0, "second vCPU read shared RAM and stopped at its exit");
+        if (cpuid)
+            check_cpuid_result(data, 1, &supported);
         check(munmap(other_run, size) == 0 && close(other_cpu) == 0, "close the second vCPU");
     }
     if (fpu)
@@ -653,6 +769,8 @@ int main(int argc, char **argv)
         check_resumed_fpu(cpu, data);
     if (msrs)
         check_resumed_msrs(cpu, data);
+    if (cpuid)
+        puts("PASS child CPUID instructions used the installed vCPU profiles");
     munmap(run, size);
     close(cpu);
     munmap(ram, ram_bytes);

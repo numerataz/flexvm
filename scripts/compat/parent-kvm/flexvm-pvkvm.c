@@ -77,6 +77,7 @@ struct pvcpu {
 	struct kvm_regs regs;
 	struct kvm_sregs sregs;
 	struct kvm_fpu fpu;
+	struct pvkvm_cpuid_table *cpuid;
 	u64 msrs[ARRAY_SIZE(boot_msr_indices)];
 	unsigned long msrs_set;
 	unsigned int id;
@@ -308,6 +309,7 @@ static int cpu_release(struct inode *inode, struct file *file)
 	mutex_unlock(&p->lock);
 	kref_put(&vm->refs, vm_free);
 	vfree(cpu->page);
+	kfree(cpu->cpuid);
 	kfree(cpu);
 	return 0;
 }
@@ -398,6 +400,11 @@ static int run_cpu(struct pvcpu *cpu)
 		if (cpu->fpu_set)
 			memcpy_toio(p->mailbox + PVKVM_FPU_AT, &cpu->fpu, sizeof(cpu->fpu));
 		publish_initial_msrs(cpu);
+		writel(!!cpu->cpuid, p->mailbox + PVKVM_CPUID_VALID_AT);
+		if (cpu->cpuid)
+			memcpy_toio(p->mailbox + PVKVM_CPUID_AT, cpu->cpuid,
+				    offsetof(struct pvkvm_cpuid_table, entries) +
+				    cpu->cpuid->count * sizeof(cpu->cpuid->entries[0]));
 	}
 	result = request_for_cpu(cpu, PVKVM_RUN, memory, &cpu->page->data);
 	if (!result || result == -EINTR)
@@ -553,6 +560,71 @@ out:
 	return result;
 }
 
+static long copy_cpuid(struct kvm_cpuid2 __user *user,
+		       const struct pvkvm_cpuid_table *table, u32 capacity)
+{
+	u32 count = table ? table->count : 0;
+
+	if (capacity < count)
+		return -E2BIG;
+	if (count && copy_to_user(user->entries, table->entries, count * sizeof(table->entries[0])))
+		return -EFAULT;
+	return put_user(count, &user->nent) ? -EFAULT : 0;
+}
+
+static bool valid_cpuid_table(const struct pvkvm_cpuid_table *table)
+{
+	unsigned int i, j;
+
+	for (i = 0; i < table->count; i++) {
+		const struct kvm_cpuid_entry2 *entry = &table->entries[i];
+
+		if (entry->flags & ~KVM_CPUID_FLAG_SIGNIFCANT_INDEX ||
+		    entry->padding[0] || entry->padding[1] || entry->padding[2])
+			return false;
+		for (j = 0; j < i; j++) {
+			const struct kvm_cpuid_entry2 *prior = &table->entries[j];
+
+			if (entry->function == prior->function &&
+			    (!(entry->flags & prior->flags & KVM_CPUID_FLAG_SIGNIFCANT_INDEX) ||
+			     entry->index == prior->index))
+				return false;
+		}
+	}
+	return true;
+}
+
+static long cpu_cpuid(struct pvcpu *cpu, bool write, struct kvm_cpuid2 __user *user)
+{
+	struct pvkvm_cpuid_table *table;
+	u32 count;
+	size_t bytes;
+	long result = 0;
+
+	if (get_user(count, &user->nent))
+		return -EFAULT;
+	if (!write)
+		return copy_cpuid(user, cpu->cpuid, count);
+	if (count > PVKVM_CPUID_MAX)
+		return -E2BIG;
+	table = kzalloc(sizeof(*table), GFP_KERNEL);
+	if (!table)
+		return -ENOMEM;
+	table->count = count;
+	bytes = count * sizeof(table->entries[0]);
+	if (copy_from_user(table->entries, user->entries, bytes))
+		result = -EFAULT;
+	else if (!valid_cpuid_table(table))
+		result = -EINVAL;
+	else if (cpu->ran && (!cpu->cpuid || cpu->cpuid->count != count ||
+			      memcmp(cpu->cpuid->entries, table->entries, bytes)))
+		result = -EBUSY;
+	else
+		swap(cpu->cpuid, table);
+	kfree(table);
+	return result;
+}
+
 static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct pvcpu *cpu = file->private_data;
@@ -655,6 +727,10 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case KVM_GET_MSRS:
 	case KVM_SET_MSRS:
 		result = cpu_msrs(cpu, cmd == KVM_SET_MSRS, uarg);
+		break;
+	case KVM_GET_CPUID2:
+	case KVM_SET_CPUID2:
+		result = cpu_cpuid(cpu, cmd == KVM_SET_CPUID2, uarg);
 		break;
 	case KVM_RUN:
 		if (arg || cpu->sregs.cs.base || !registers_fit_mode(&cpu->regs, &cpu->sregs) ||
@@ -889,6 +965,38 @@ static int device_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
+static long supported_cpuid(struct pvkvm *p, struct kvm_cpuid2 __user *user)
+{
+	struct pvkvm_cpuid_table *table;
+	u32 capacity;
+	long result;
+
+	if (get_user(capacity, &user->nent))
+		return -EFAULT;
+	if (!capacity)
+		return -E2BIG;
+	table = kmalloc(sizeof(*table), GFP_KERNEL);
+	if (!table)
+		return -ENOMEM;
+	result = mutex_lock_interruptible(&p->lock);
+	if (result)
+		goto out;
+	result = request(p, PVKVM_GET_SUPPORTED_CPUID, NULL, NULL);
+	if (!result) {
+		memcpy_fromio(table, p->mailbox + PVKVM_CPUID_AT, sizeof(*table));
+		if (!table->count || table->count > PVKVM_CPUID_MAX || table->reserved || !valid_cpuid_table(table)) {
+			p->dead = true;
+			result = -EIO;
+		}
+	}
+	mutex_unlock(&p->lock);
+	if (!result)
+		result = copy_cpuid(user, table, capacity);
+out:
+	kfree(table);
+	return result;
+}
+
 static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	switch (cmd) {
@@ -908,6 +1016,8 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			return -E2BIG;
 		return copy_to_user(list->indices, boot_msr_indices, sizeof(boot_msr_indices)) ? -EFAULT : 0;
 	}
+	case KVM_GET_SUPPORTED_CPUID:
+		return supported_cpuid(file->private_data, (void __user *)arg);
 	case KVM_CREATE_VM:
 		return new_vm(file->private_data, arg);
 	default:
@@ -942,8 +1052,9 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	BUILD_BUG_ON(sizeof(struct kvm_fpu) != PVKVM_FPU_BYTES);
 	BUILD_BUG_ON(PVKVM_FPU_AT + PVKVM_FPU_BYTES > PVKVM_RAM_ADDRESS_AT);
 	BUILD_BUG_ON(PVKVM_RAM_ADDRESS_AT + PVKVM_MAX_PAGES * sizeof(u64) > PVKVM_MSR_AT);
+	BUILD_BUG_ON(PVKVM_MSR_AT + sizeof(struct pvkvm_msr_batch) > PVKVM_CPUID_AT);
 	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
-	    pci_resource_len(dev, 2) < PVKVM_MSR_AT + sizeof(struct pvkvm_msr_batch))
+	    pci_resource_len(dev, 2) < PVKVM_CPUID_AT + sizeof(struct pvkvm_cpuid_table))
 		return -ENODEV;
 	result = pcim_enable_device(dev);
 	if (result)

@@ -32,8 +32,9 @@ patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-per-vcpu-run.patch"
 patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-long-mode-entry.patch"
 patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-fpu-state.patch"
 patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-boot-msrs.patch"
+patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-cpuid-profile.patch"
 cp "$scripts_dir/compat/parent-kvm/slot-map.h" include/hw/misc/flexvm-slot-map.h
-./configure --prefix="$prefix" --target-list=x86_64-softmmu --with-pkgversion=flexvm-tcg-nested-15 \
+./configure --prefix="$prefix" --target-list=x86_64-softmmu --with-pkgversion=flexvm-tcg-nested-16 \
   --disable-docs --disable-tools --disable-guest-agent --disable-werror \
   --disable-download --disable-gtk --disable-sdl --disable-vnc \
   --disable-opengl --disable-curses --enable-slirp --enable-seccomp

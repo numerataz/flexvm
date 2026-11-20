@@ -343,7 +343,7 @@ jobs:
           cat "$RUNNER_TEMP/parent-kvm-cancel/report.json"
           sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
             --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
-            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-smp" --ram-pages 64 --protected-entry --split-slot --two-vcpus
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-smp" --ram-pages 64 --protected-entry --split-slot --two-vcpus --cpuid
           cat "$RUNNER_TEMP/parent-kvm-smp/report.json"
           sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
             --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
@@ -376,7 +376,7 @@ jobs:
             cat "$RUNNER_TEMP/parent-kvm-native-cancel/report.json"
             sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
               --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
-              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-smp" --parent-engine kvm --native-oracle --ram-pages 64 --protected-entry --split-slot --two-vcpus
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-smp" --parent-engine kvm --native-oracle --ram-pages 64 --protected-entry --split-slot --two-vcpus --cpuid
             cat "$RUNNER_TEMP/parent-kvm-native-smp/report.json"
             sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
               --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
