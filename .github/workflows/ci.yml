@@ -265,9 +265,6 @@ jobs:
           sudo python3 scripts/compat/software-lifecycle.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --firecracker "$RUNNER_TEMP/software-state/artifacts/firecracker" --output "$RUNNER_TEMP/software-nested-lifecycle" --timeout 900
           cat "$RUNNER_TEMP/software-nested-lifecycle/report.json"
 
-  # Whether the aarch64 runner can run VMs: it decides what e2e-aarch64 runs (the KVM shards, or what
-  # needs no KVM). Never fails; it reports.
-
   software-modules:
     name: guest kernel modules without KVM (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -464,36 +461,12 @@ jobs:
           sudo systemd-run --scope --collect -p "MemoryMax=$memory_limit" -p MemorySwapMax=0 -p "CPUQuota=$cpu_quota" python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --workload "scripts/compat/workloads/${{ matrix.workload }}.sh" "${workload_args[@]}" --require storage.fuse --output "$RUNNER_TEMP/software-workload" --timeout "$workload_timeout"
           cat "$RUNNER_TEMP/software-workload/report.json"
 
-  kvm-aarch64:
-    name: KVM probe (aarch64)
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 5
-    outputs:
-      kvm: ${{ steps.probe.outputs.kvm }}
-    steps:
-      - name: Probe KVM
-        id: probe
-        run: |
-          uname -r; nproc; free -m; getconf PAGESIZE
-          grep -m1 -E 'CPU part|Features' /proc/cpuinfo || true
-          grep -E 'HAVE_ARCH_USERFAULTFD_WP|USERFAULTFD' "/boot/config-$(uname -r)" || true
-          kvm=false
-          if [ -e /dev/kvm ]; then
-            # As scripts/e2e.py decides (kvm_unusable): KVM_GET_API_VERSION answers 12, and KVM_CREATE_VM works.
-            sudo chmod 0666 /dev/kvm
-            python3 -c 'import fcntl, os; fd = os.open("/dev/kvm", os.O_RDWR); v = fcntl.ioctl(fd, 0xAE00); vm = fcntl.ioctl(fd, 0xAE01, 0); print("KVM API", v, "vm fd", vm); assert v == 12' \
-              && kvm=true && echo "::notice::aarch64 runner has KVM: the aarch64 end-to-end shards run" \
-              || echo "::warning::aarch64 runner has /dev/kvm but KVM_CREATE_VM fails"
-          else
-            echo "::warning::aarch64 runner has no /dev/kvm: aarch64 end-to-end runs only what needs no KVM"
-          fi
-          echo "kvm=$kvm" >> "$GITHUB_OUTPUT"
-
   e2e:
     # Shards (scripts/e2e.py --shard): pr (the cases, and the main and recovery scenarios) in four
     # splits side by side, balanced by e2e.py's COST; the scheduled run takes heavy (GiB-scale
     # guests, long windows) one scenario at a time.
-    # The steps are e2e-aarch64's too: KVM (in env) says whether this job runs VMs.
+    # The steps are e2e-aarch64's too: KVM (in env) says whether this job runs VMs; e2e-aarch64 leaves
+    # it unset, and "Probe KVM" sets it.
     name: end-to-end (KVM, ${{ matrix.shard }})
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ matrix.shard == 'heavy' && 150 || 45 }}
@@ -507,6 +480,27 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # Whether the runner can run VMs, where the job does not say (e2e-aarch64): it decides what the job
+      # runs (the pr shard on KVM, or what needs no KVM). Never fails; it reports. A step, not a job of
+      # its own that e2e-aarch64 needs: that job waited in the queue twice, once behind the probe.
+      - name: Probe KVM
+        if: env.KVM == ''
+        run: |
+          uname -r; nproc; free -m; getconf PAGESIZE
+          grep -m1 -E 'CPU part|Features' /proc/cpuinfo || true
+          grep -E 'HAVE_ARCH_USERFAULTFD_WP|USERFAULTFD' "/boot/config-$(uname -r)" || true
+          kvm=false
+          if [ -e /dev/kvm ]; then
+            # As scripts/e2e.py decides (kvm_unusable): KVM_GET_API_VERSION answers 12, and KVM_CREATE_VM works.
+            sudo chmod 0666 /dev/kvm
+            python3 -c 'import fcntl, os; fd = os.open("/dev/kvm", os.O_RDWR); v = fcntl.ioctl(fd, 0xAE00); vm = fcntl.ioctl(fd, 0xAE01, 0); print("KVM API", v, "vm fd", vm); assert v == 12' \
+              && kvm=true && echo "::warning::this runner has KVM: the pr shard runs here unsplit, and heavy never; split e2e-aarch64 as e2e is" \
+              || echo "::warning::this runner has /dev/kvm but KVM_CREATE_VM fails"
+          else
+            echo "::notice::this runner has no /dev/kvm: end-to-end runs only what needs no KVM"
+          fi
+          echo "KVM=$kvm" >> "$GITHUB_ENV"
 
       - name: Enable KVM
         if: env.KVM == 'true'
@@ -825,19 +819,16 @@ jobs:
           # The background release build's output, also when "Build flexvm" never ran.
           cp "$RUNNER_TEMP/build.log" "$RUNNER_TEMP/e2e-logs/build.log" || true
 
-  # e2e's steps on the aarch64 runner. With KVM (kvm-aarch64 decides) it runs e2e's shards; without (GitHub's
-  # arm runners have none) everything else, in one job: the release build, the patched Firecracker for
-  # aarch64-unknown-linux-musl (cached as e2e's is), the aarch64 artifacts fetched and checked against their
-  # pins, the test image, and what needs no KVM (e2e.py --no-kvm).
+  # e2e's steps on the aarch64 runner, in one job. "Probe KVM" decides what it runs: with KVM, the pr shard
+  # unsplit; without (GitHub's arm runners have none) everything else: the release build, the patched
+  # Firecracker for aarch64-unknown-linux-musl (cached as e2e's is), the aarch64 artifacts fetched and
+  # checked against their pins, the test image, and what needs no KVM (e2e.py --no-kvm).
   e2e-aarch64:
-    name: end-to-end (${{ needs.kvm-aarch64.outputs.kvm == 'true' && 'KVM' || 'no KVM' }}, aarch64, ${{ matrix.shard }})
-    needs: kvm-aarch64
+    name: end-to-end (aarch64, ${{ matrix.shard }})
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: ${{ matrix.shard == 'heavy' && 150 || 45 }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        shard: ${{ fromJSON(needs.kvm-aarch64.outputs.kvm != 'true' && '["pr"]' || (github.event_name == 'schedule' || inputs.heavy) && '["heavy"]' || '["pr 1/4", "pr 2/4", "pr 3/4", "pr 4/4"]') }}
-    env:
-      KVM: ${{ needs.kvm-aarch64.outputs.kvm }}
+        shard: [pr]
     steps: *e2e-steps
