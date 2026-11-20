@@ -96,11 +96,12 @@ verify)
     set -- $(cat "$base/ready")
     test "$1" = "$holder_pid"
     test -n "${2:-}"
-    grown=$(cat "$base/grown-mib")
+    initial=$(cat "$base/initial-mib")
     now=$(mem_total_mib)
-    # Restored VM must retain the plugged virtio-mem capacity.
-    test "$now" -ge $((grown - 16))
-    printf 'ELASTIC_PHASE_OK %s initial=%s now=%s pid=%s digest=%s\n' "$phase" "$(cat "$base/initial-mib")" "$now" "$holder_pid" "$2"
+    # Restored VM must retain the plugged virtio-mem capacity above initial boot RAM,
+    # allowing legitimate post-prepare reclaim of excess free RAM.
+    test "$now" -gt $((initial + 200))
+    printf 'ELASTIC_PHASE_OK %s initial=%s now=%s pid=%s digest=%s\n' "$phase" "$initial" "$now" "$holder_pid" "$2"
     ;;
 *) exit 2 ;;
 esac

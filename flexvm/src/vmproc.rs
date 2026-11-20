@@ -3616,6 +3616,12 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut O
     }
     let active = host.run.join("evict.active");
     let evicting = active.exists();
+    if cfg.peers.is_empty() {
+        if evicting {
+            let _ = std::fs::remove_file(&active);
+        }
+        return;
+    }
     if (avail >= at && !evicting && !starved_here) || EVICTING.load(Ordering::SeqCst) {
         return;
     }
@@ -3636,7 +3642,7 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut O
     }
     let last = host.state.join("evict.last");
     let recent = std::fs::metadata(&last).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok());
-    if cfg.peers.is_empty() || recent.is_some_and(|d| d < Duration::from_secs(5)) {
+    if recent.is_some_and(|d| d < Duration::from_secs(5)) {
         return;
     }
     if fault("no_evict") {
@@ -5663,7 +5669,8 @@ mod tests {
     #[test]
     fn a_standby_that_has_not_exited_marks_the_pressure_and_holds_eviction_off_a_second_without_waiting() {
         let base = crate::test_util::TempDir::new("relieve-pending");
-        let host = Host::open(&base.join("state"), &base.join("run")).unwrap();
+        let mut host = Host::open(&base.join("state"), &base.join("run")).unwrap();
+        host.cfg.peers = vec!["127.0.0.1:1".into()];
         let (mut child, _lock) = standby(&host, libc::SIG_IGN);
         // Loading, or claimed since enumeration: a delivered signal proves neither stopped,
         // but it will stop, so it is not refilled meanwhile.
@@ -5691,6 +5698,21 @@ mod tests {
         assert!(took < Duration::from_secs(5), "{took:?}");
         assert!(second, "held off a second: {by:?} from {start:?}");
         assert!(pressure && !held && evicting && running && stopping.is_none());
+    }
+
+    #[test]
+    fn standalone_host_without_peers_does_not_mark_evict_active() {
+        let base = crate::test_util::TempDir::new("relieve-no-peers");
+        let host = Host::open(&base.join("state"), &base.join("run")).unwrap();
+        assert!(host.cfg.peers.is_empty());
+        let active = host.run.join("evict.active");
+        let mut stopping = None;
+        relieve(&host, Some(0), false, &mut stopping);
+        assert!(!active.exists(), "standalone host must not create evict.active");
+        // If peers were removed while evict.active existed, relieve cleans it up.
+        crate::host::write_record(&active, b"").unwrap();
+        relieve(&host, Some(0), false, &mut stopping);
+        assert!(!active.exists(), "standalone host must clear stale evict.active");
     }
 
     #[test]

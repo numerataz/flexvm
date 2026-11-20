@@ -849,7 +849,7 @@ pub fn describe(path: &Path, name: &str) -> Result<serde_json::Value> {
         gen: manifest.identity_generation,
         vcpus: manifest.vcpus,
         max_mib: u64::from(manifest.max_memory_mib.unwrap_or(manifest.memory_mib)),
-        cmd: true,
+        cmd: manifest.image.boot.is_app(),
         state: if grant.is_some() { "quarantined" } else { "suspended" }.into(),
         ..Default::default()
     };
@@ -1641,5 +1641,31 @@ mod tests {
         let elastic = describe(&elastic_path, "elastic-vm").unwrap();
         assert_eq!(elastic["backend"]["ram_mib"], json!(768));
         assert_eq!(elastic["max_mib"], json!(2048));
+    }
+
+    #[test]
+    fn describe_sets_cmd_from_image_boot_profile() {
+        let root = TempDir::new("software-describe-cmd");
+        let (app_path, _profile) = checkpoint(&root);
+        let app = describe(&app_path, "app-vm").unwrap();
+        assert_eq!(app["cmd"], json!(true));
+
+        let inputs = Inputs {
+            engine: source(&root, "distro-engine", b"engine"),
+            kernel: source(&root, "distro-kernel", b"kernel"),
+            rootfs: source(&root, "distro-rootfs", b"rootfs"),
+            firmware: firmware_names().iter().map(|name| (name.to_string(), source(&root, &format!("distro-{name}"), name.as_bytes()))).collect(),
+        };
+        let profile = Profile { architecture: std::env::consts::ARCH.into(), arguments: vec!["native-profile".into()] };
+        let mut m = manifest(profile);
+        m.image.boot = crate::image::BootProfile::Systemd;
+        m.main = Main::Distro(Distro { boot: crate::image::BootProfile::Systemd });
+        let mut staging = Staging::new(&root).unwrap();
+        staging.state.write_all(b"saved-state").unwrap();
+        let distro_path = root.join("distro-checkpoint");
+        staging.commit(&distro_path, &inputs, m).unwrap().retire().unwrap();
+
+        let distro = describe(&distro_path, "distro-vm").unwrap();
+        assert_eq!(distro["cmd"], json!(false));
     }
 }

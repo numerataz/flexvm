@@ -372,9 +372,64 @@ fn has_virtio_mem() -> bool {
         .any(|entry| entry.file_name().to_str().is_some_and(|n| n.starts_with("virtio")))
 }
 
+fn cmdline_tmpfs_mib(cmdline: &str) -> Option<u64> {
+    cmdline.split_whitespace().find_map(|arg| arg.strip_prefix("flexvm.tmpfs_mib=")?.parse::<u64>().ok()).filter(|&n| n > 0)
+}
+
+fn effective_total_mib(mem_total_mib: Option<u64>, cmdline: Option<&str>, virtio_mem: bool) -> u64 {
+    let Some(total) = mem_total_mib else {
+        return u64::MAX;
+    };
+    if virtio_mem {
+        if let Some(ceiling) = cmdline.and_then(cmdline_tmpfs_mib) {
+            return total.max(ceiling);
+        }
+    }
+    total
+}
+
+/// Effective host RAM in MiB: `MemTotal`, or the outer elastic guest's `flexvm.tmpfs_mib`
+/// ceiling when running inside a `virtio-mem` guest. Returns `u64::MAX` if `MemTotal` is unreadable.
+fn host_total_mib() -> u64 {
+    let mem_total_mib = meminfo_mib("MemTotal");
+    let virtio_mem = has_virtio_mem();
+    let cmdline = virtio_mem.then(|| std::fs::read_to_string("/proc/cmdline").ok()).flatten();
+    effective_total_mib(mem_total_mib, cmdline.as_deref(), virtio_mem)
+}
+
 const VIRTIO_MEM_HEADROOM_MIB: u64 = 64;
 const VIRTIO_MEM_CHUNK_MIB: u64 = 256;
 const VIRTIO_MEM_MIN_PROBE_MIB: u64 = 16;
+const VIRTIO_MEM_COOLDOWN_MS: u64 = 30_000;
+
+fn parse_virtio_mem_cooldown(text: &str) -> Option<(u64, u64)> {
+    let mut parts = text.split_whitespace();
+    let until_ms = parts.next()?.parse::<u64>().ok()?;
+    let total_mib = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((until_ms, total_mib))
+}
+
+fn virtio_mem_cooldown_active(cooldown: Option<(u64, u64)>, now_ms: u64, current_total_mib: u64) -> bool {
+    cooldown.is_some_and(|(until_ms, recorded_total_mib)| now_ms < until_ms && current_total_mib == recorded_total_mib)
+}
+
+fn read_virtio_mem_cooldown(file: &mut File) -> Option<(u64, u64)> {
+    use std::io::{Read, Seek};
+    file.seek(std::io::SeekFrom::Start(0)).ok()?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).ok()?;
+    parse_virtio_mem_cooldown(&buf)
+}
+
+fn write_virtio_mem_cooldown(file: &mut File, until_ms: u64, total_mib: u64) {
+    use std::io::{Seek, Write};
+    if file.set_len(0).is_ok() && file.seek(std::io::SeekFrom::Start(0)).is_ok() {
+        let _ = writeln!(file, "{until_ms} {total_mib}");
+    }
+}
 
 /// Next probe chunk size (MiB) to push `MemAvailable` down toward `VIRTIO_MEM_HEADROOM_MIB`
 /// without overshooting into OOM or hitting a fixed total cap.
@@ -436,9 +491,14 @@ fn request_virtio_mem_growth(run: &Path, need_mib: u64, deadline: Option<std::ti
     // Serialize concurrent callers across threads and processes so parallel starts do not
     // stack probes into OOM; a waiter that acquires the lock after growth immediately sees
     // `MemAvailable >= need_mib` and returns without probing again.
-    let Ok(_guard) = flock_by(&locks(run).join("virtio-mem-grow"), limit).map(Flock) else {
+    let Ok(mut guard) = flock_by(&locks(run).join("virtio-mem-grow"), limit).map(Flock) else {
         return;
     };
+    if let Some(current_total_mib) = meminfo_mib("MemTotal") {
+        if virtio_mem_cooldown_active(read_virtio_mem_cooldown(&mut guard.0), boottime_ms(), current_total_mib) {
+            return;
+        }
+    }
     for _ in 0..16 {
         if std::time::Instant::now() >= limit {
             break;
@@ -487,8 +547,11 @@ fn request_virtio_mem_growth(run: &Path, need_mib: u64, deadline: Option<std::ti
         }
         drop(probes);
         if !grew {
+            let final_total_mib = meminfo_mib("MemTotal").unwrap_or(total_mib);
+            write_virtio_mem_cooldown(&mut guard.0, boottime_ms().saturating_add(VIRTIO_MEM_COOLDOWN_MS), final_total_mib);
             break;
         }
+        let _ = guard.0.set_len(0);
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
@@ -697,6 +760,10 @@ impl Config {
 
     /// `here`: this host's own addresses and next hops (`here`).
     fn warnings_by(&self, local: impl Fn(IpAddr) -> Result<bool>, here: Result<Vec<(IpAddr, &str)>>) -> Vec<String> {
+        self.warnings_with_total(local, here, host_total_mib())
+    }
+
+    fn warnings_with_total(&self, local: impl Fn(IpAddr) -> Result<bool>, here: Result<Vec<(IpAddr, &str)>>, total: u64) -> Vec<String> {
         let mut w = Vec::new();
         // Never handed out (`claim_new_in`), so likely a range meant for elsewhere (#1078).
         match (self.range(), here) {
@@ -734,7 +801,6 @@ impl Config {
             w.push(format!("flexvm: the eviction mark {e} MiB is under the {} MiB reserve: eviction starts at the reserve", self.reserve()));
         }
         // Valid (a host.json copied from a larger host), but every start would be refused.
-        let total = crate::util::proc_kb("/proc/meminfo", "MemTotal").map_or(u64::MAX, |b| b >> 20);
         if let Some(r) = self.reserve_mib.filter(|&r| r > total) {
             w.push(format!("flexvm: warning: reserve_mib {r} is more than this host's {total} MiB of RAM: every start is refused"));
         }
@@ -12402,5 +12468,59 @@ pub(crate) mod tests {
             assert_eq!(*guard.ptr.add(4096), 1);
         }
         drop(guard);
+    }
+
+    #[test]
+    fn virtio_mem_cooldown_roundtrip_and_invalidation() {
+        assert_eq!(parse_virtio_mem_cooldown(""), None);
+        assert_eq!(parse_virtio_mem_cooldown("1000"), None);
+        assert_eq!(parse_virtio_mem_cooldown("1000 2048 extra"), None);
+        assert_eq!(parse_virtio_mem_cooldown("bad 2048"), None);
+        assert_eq!(parse_virtio_mem_cooldown("10000 4096\n"), Some((10_000, 4096)));
+
+        let dir = crate::test_util::TempDir::new("virtio-mem-cooldown");
+        let mut f = private_file(&dir.join("virtio-mem-grow")).unwrap();
+        assert_eq!(read_virtio_mem_cooldown(&mut f), None);
+
+        write_virtio_mem_cooldown(&mut f, 50_000, 2048);
+        let state = read_virtio_mem_cooldown(&mut f);
+        assert_eq!(state, Some((50_000, 2048)));
+
+        // Active before deadline while MemTotal is unchanged.
+        assert!(virtio_mem_cooldown_active(state, 49_999, 2048));
+        // Expired at or after deadline.
+        assert!(!virtio_mem_cooldown_active(state, 50_000, 2048));
+        assert!(!virtio_mem_cooldown_active(state, 60_000, 2048));
+        // Invalidated if MemTotal changed (growth or unplug).
+        assert!(!virtio_mem_cooldown_active(state, 49_999, 3072));
+        assert!(!virtio_mem_cooldown_active(state, 49_999, 1024));
+        assert!(!virtio_mem_cooldown_active(None, 49_999, 2048));
+    }
+
+    #[test]
+    fn warnings_uses_virtio_mem_ceiling_for_reserve_mib() {
+        let cmdline = "console=ttyS0 quiet flexvm.tmpfs_mib=8192 flexvm.control=serial";
+        assert_eq!(cmdline_tmpfs_mib(cmdline), Some(8192));
+        assert_eq!(cmdline_tmpfs_mib("console=ttyS0 flexvm.tmpfs_mib=0"), None);
+        assert_eq!(cmdline_tmpfs_mib("console=ttyS0 quiet"), None);
+
+        assert_eq!(effective_total_mib(Some(1024), Some(cmdline), true), 8192);
+        assert_eq!(effective_total_mib(Some(16384), Some(cmdline), true), 16384);
+        assert_eq!(effective_total_mib(Some(1024), Some(cmdline), false), 1024);
+        assert_eq!(effective_total_mib(None, Some(cmdline), true), u64::MAX);
+
+        let mut cfg = Config::default();
+        cfg.reserve_mib = Some(2048);
+        // Inside an elastic virtio-mem guest whose MemTotal is currently 1024 MiB but ceiling is 8192 MiB: no warning.
+        let w = cfg.warnings_with_total(|_| Ok(false), Ok(vec![]), effective_total_mib(Some(1024), Some(cmdline), true)).join("\n");
+        assert!(!w.contains("reserve_mib"), "{w}");
+        // Reserve above the elastic ceiling still warns.
+        cfg.reserve_mib = Some(16384);
+        let w = cfg.warnings_with_total(|_| Ok(false), Ok(vec![]), effective_total_mib(Some(1024), Some(cmdline), true)).join("\n");
+        assert!(w.contains("reserve_mib 16384 is more than this host's 8192 MiB of RAM"), "{w}");
+        // Without virtio-mem, MemTotal is used directly.
+        cfg.reserve_mib = Some(2048);
+        let w = cfg.warnings_with_total(|_| Ok(false), Ok(vec![]), effective_total_mib(Some(1024), Some(cmdline), false)).join("\n");
+        assert!(w.contains("reserve_mib 2048 is more than this host's 1024 MiB of RAM"), "{w}");
     }
 }

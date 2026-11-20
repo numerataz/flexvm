@@ -21,41 +21,53 @@ const DETACHED: u8 = 1;
 const EXITED: u8 = 2;
 const OUTPUT_FAILED: u8 = 3;
 
-/// Hold the admitted RAM grant for a software VM's lifetime, growing as
-/// elastic virtio-mem steps are admitted against the host reserve.
+/// Admit and protect a software VM's initial boot/restore RAM via a `Hold`
+/// until `serve()` is live (and `MemAvailable` reflects the resident pages),
+/// then admit elastic virtio-mem growth steps via expiring grants so resident
+/// guest RAM is never double-counted against `MemAvailable`.
 pub struct Reservation {
     host: Host,
     grant_id: u64,
-    mib: u64,
     hold: Mutex<Option<crate::host::Hold>>,
 }
 
 impl Reservation {
     pub fn new(host: &Host, mib: u32, deadline: Instant, processes: &qemu::Processes) -> Result<Self> {
         let (grant_id, hold) = host.grant_start(u64::from(mib), crate::host::Floor::Reserve, true, Some(deadline))?;
-        let reservation = Self { host: host.clone(), grant_id, mib: u64::from(mib), hold: Mutex::new(hold) };
+        let reservation = Self { host: host.clone(), grant_id, hold: Mutex::new(hold) };
         if let Some(hold) = reservation.hold.lock().unwrap().as_ref() {
             processes.inherit_lease(hold.inherit()?);
         }
         Ok(reservation)
     }
 
-    pub fn grow(&mut self, add_mib: u64, deadline: Instant) -> Result<()> {
-        if add_mib == 0 {
-            return Ok(());
-        }
-        self.host.grow_hold(&self.hold, add_mib, crate::host::Floor::Reserve, Some(deadline))??;
-        self.mib = self.mib.saturating_add(add_mib);
-        Ok(())
+    /// Release the initial boot/restore `Hold` and refund its startup grant once
+    /// QEMU is live and its resident pages are reflected in `MemAvailable`.
+    /// Dropping `Hold` unlinks the hold file so `live_holds` immediately stops
+    /// counting it even while QEMU retains the inherited lease fd.
+    pub fn settle_boot(&mut self) {
+        self.host.release_hold(&self.hold);
+        self.grant_id = 0;
     }
 
-    pub fn shrink(&mut self, refund_mib: u64) {
-        let next = self.mib.saturating_sub(refund_mib);
-        if next == self.mib {
-            return;
+    /// Admit an elastic growth step with an expiring grant (no permanent `Hold`),
+    /// bridging the window until the guest faults in the newly plugged pages.
+    /// Returns the grant ID (or `0` when `add_mib == 0`) for rollback via `refund`.
+    pub fn grow(&self, add_mib: u64, deadline: Instant) -> Result<u64> {
+        if add_mib == 0 {
+            return Ok(0);
         }
-        if self.host.shrink_hold(&self.hold, next).is_ok() {
-            self.mib = next;
+        match self.host.grant(add_mib, Some(deadline))? {
+            Some(grant_id) => Ok(grant_id),
+            None => bail!("not enough memory here for {add_mib} MiB above the reserve"),
+        }
+    }
+
+    /// Refund a specific in-flight growth grant when `set_virtio_mem` fails or
+    /// the VM pauses/ends before the step is applied.
+    pub fn refund(&self, grant_id: u64) {
+        if grant_id != 0 {
+            self.host.refund_by(grant_id, Some(Instant::now() + Duration::from_secs(2)));
         }
     }
 }
@@ -63,12 +75,47 @@ impl Reservation {
 impl Drop for Reservation {
     fn drop(&mut self) {
         let _ = self.hold.get_mut().map(Option::take);
-        self.host.refund_by(self.grant_id, Some(Instant::now() + Duration::from_secs(2)));
+        if self.grant_id != 0 {
+            self.host.refund_by(self.grant_id, Some(Instant::now() + Duration::from_secs(2)));
+        }
     }
 }
 
 const SHRINK_COOLDOWN: Duration = Duration::from_secs(5);
 const GROW_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reconcile {
+    /// Still waiting for an in-flight growth step to settle.
+    Wait,
+    /// `actual_mib == plugged_mib`; clear `growing`.
+    Synced,
+    /// `actual_mib < plugged_mib` while stalled during growth: clamp QEMU's
+    /// requested size back to `actual_mib` and update `plugged_mib`.
+    ClampDown(u64),
+    /// `actual_mib != plugged_mib` outside an active growth: sync `plugged_mib`
+    /// to QEMU's actual plugged size (up or down).
+    SyncTo(u64),
+}
+
+fn reconcile_plugged(actual_mib: u64, plugged_mib: u64, growing: bool, stalled: bool) -> Reconcile {
+    match actual_mib.cmp(&plugged_mib) {
+        std::cmp::Ordering::Less if growing && !stalled => Reconcile::Wait,
+        std::cmp::Ordering::Less if growing => Reconcile::ClampDown(actual_mib),
+        std::cmp::Ordering::Less | std::cmp::Ordering::Greater => Reconcile::SyncTo(actual_mib),
+        std::cmp::Ordering::Equal => Reconcile::Synced,
+    }
+}
+
+/// Wait up to `interval` on `changed`, returning `false` as soon as `ended` is set.
+fn wait_for_mem_poll(ended: &AtomicBool, entry: &Mutex<Entry>, changed: &Condvar, interval: Duration) -> bool {
+    let guard = entry.lock().unwrap();
+    if ended.load(Ordering::SeqCst) {
+        return false;
+    }
+    let _ = changed.wait_timeout(guard, interval).unwrap();
+    !ended.load(Ordering::SeqCst)
+}
 
 /// Decide whether a software VM should plug another 2 MiB-aligned virtio-mem step.
 pub(crate) fn elastic_step(avail_mib: u64, total_mib: u64, base_mib: u32, plugged_mib: u64, max_mib: u32) -> Option<u64> {
@@ -244,49 +291,53 @@ impl Owner {
         let (avail_mib, total_mib) = (avail_kib >> 10, total_kib >> 10);
         let actual_mib = actual_bytes >> 20;
         let mut plugged = self.plugged_mib.load(Ordering::SeqCst);
-        if actual_mib < plugged {
-            if self.growing.load(Ordering::SeqCst) {
-                let stalled = self.last_grow.lock().unwrap().is_some_and(|t| t.elapsed() >= GROW_SETTLE_TIMEOUT);
-                if !stalled {
-                    return true;
-                }
+        let stalled = self.last_grow.lock().unwrap().is_some_and(|t| t.elapsed() >= GROW_SETTLE_TIMEOUT);
+        match reconcile_plugged(actual_mib, plugged, self.growing.load(Ordering::SeqCst), stalled) {
+            Reconcile::Wait => return true,
+            Reconcile::Synced => {
+                self.growing.store(false, Ordering::SeqCst);
+            }
+            Reconcile::ClampDown(actual) => {
                 let Ok(_op) = self.op.try_read() else { return true };
                 if self.ended.load(Ordering::SeqCst) || self.entry.lock().unwrap().state != "running" {
                     return true;
                 }
-                let _ = self.machine.set_virtio_mem(actual_mib << 20, Instant::now() + Duration::from_secs(2));
+                let _ = self.machine.set_virtio_mem(actual << 20, Instant::now() + Duration::from_secs(2));
                 self.growing.store(false, Ordering::SeqCst);
-                let freed = plugged - actual_mib;
-                self.reservation.lock().unwrap().shrink(freed);
-                self.update_plugged(actual_mib);
-                plugged = actual_mib;
-            } else {
-                let freed = plugged - actual_mib;
-                self.reservation.lock().unwrap().shrink(freed);
-                self.update_plugged(actual_mib);
-                crate::info!("software VM {}: reconciled memory -{freed} MiB (plugged {actual_mib} MiB)", self.name.name);
-                plugged = actual_mib;
+                self.update_plugged(actual);
+                plugged = actual;
             }
-        } else {
-            self.growing.store(false, Ordering::SeqCst);
+            Reconcile::SyncTo(actual) => {
+                self.growing.store(false, Ordering::SeqCst);
+                self.update_plugged(actual);
+                if actual > plugged {
+                    crate::info!("software VM {}: reconciled memory +{} MiB (plugged {actual} MiB)", self.name.name, actual - plugged);
+                } else {
+                    crate::info!("software VM {}: reconciled memory -{} MiB (plugged {actual} MiB)", self.name.name, plugged - actual);
+                }
+                plugged = actual;
+            }
         }
         if let Some(add) = elastic_step(avail_mib, total_mib, self.memory_mib, plugged, self.max_memory_mib) {
             let deadline = Instant::now() + Duration::from_secs(5);
-            if let Err(error) = self.reservation.lock().unwrap().grow(add, deadline) {
-                crate::log!("software VM {}: elastic memory +{add} MiB refused: {error}", self.name.name);
-                return true;
-            }
+            let grant_id = match self.reservation.lock().unwrap().grow(add, deadline) {
+                Ok(id) => id,
+                Err(error) => {
+                    crate::log!("software VM {}: elastic memory +{add} MiB refused: {error}", self.name.name);
+                    return true;
+                }
+            };
             let Ok(_op) = self.op.try_read() else {
-                self.reservation.lock().unwrap().shrink(add);
+                self.reservation.lock().unwrap().refund(grant_id);
                 return true;
             };
             if self.ended.load(Ordering::SeqCst) || self.entry.lock().unwrap().state != "running" {
-                self.reservation.lock().unwrap().shrink(add);
+                self.reservation.lock().unwrap().refund(grant_id);
                 return true;
             }
             let next = plugged + add;
             if let Err(error) = self.machine.set_virtio_mem(next << 20, deadline) {
-                self.reservation.lock().unwrap().shrink(add);
+                self.reservation.lock().unwrap().refund(grant_id);
                 crate::log!("software VM {}: virtio-mem resize to {} MiB failed: {error}", self.name.name, u64::from(self.memory_mib) + next);
                 return true;
             }
@@ -333,7 +384,6 @@ impl Owner {
             }
             if actual < plugged {
                 let freed = plugged - actual;
-                self.reservation.lock().unwrap().shrink(freed);
                 self.update_plugged(actual);
                 crate::info!("software VM {}: shrunk memory -{freed} MiB (plugged {actual} MiB)", self.name.name);
             }
@@ -818,12 +868,14 @@ fn serve(
     let epoch = u64::from_str_radix(&util::random_hex(8)?, 16)?;
     let deadline = Instant::now() + if meta.boot.is_app() { guest::TIMEOUT } else { config.boot_timeout };
     let max_memory_mib = config.effective_max_mib();
+    // QEMU has finished booting (or loading restored RAM via migrate-incoming),
+    // so resident pages are already reflected in MemAvailable; release the boot
+    // hold so it does not double-count resident guest RAM for the VM's lifetime.
+    reservation.settle_boot();
     let initial_plugged = match (&resumed, max_memory_mib > config.mem_mib) {
         (Some(r), true) => {
             let actual = machine.virtio_mem_size(deadline).map(|b| b >> 20).unwrap_or(r.manifest.plugged_mib);
-            if actual < r.manifest.plugged_mib {
-                reservation.shrink(r.manifest.plugged_mib - actual);
-            } else if actual > r.manifest.plugged_mib {
+            if actual > r.manifest.plugged_mib {
                 reservation.grow(actual - r.manifest.plugged_mib, deadline)?;
             }
             actual
@@ -975,7 +1027,9 @@ fn serve(
                 if owner.ended.load(Ordering::SeqCst) || !owner.adjust_memory() {
                     break;
                 }
-                std::thread::sleep(Duration::from_millis(500));
+                if !wait_for_mem_poll(&owner.ended, &owner.entry, &owner.changed, Duration::from_millis(500)) {
+                    break;
+                }
             }
         })?)
     } else {
@@ -1002,6 +1056,8 @@ fn serve(
                 Err(e) => {
                     crate::log!("software owner listener failed: {e}");
                     serving.ended.store(true, Ordering::SeqCst);
+                    drop(serving.entry.lock().unwrap());
+                    serving.changed.notify_all();
                     serving.processes.stop();
                     break;
                 }
@@ -1023,6 +1079,8 @@ fn serve(
         }
     });
     owner.ended.store(true, Ordering::SeqCst);
+    drop(owner.entry.lock().unwrap());
+    owner.changed.notify_all();
     {
         let _op = owner.op.write().unwrap();
         if !owner.suspended.load(Ordering::SeqCst) {
@@ -1218,5 +1276,97 @@ mod tests {
         assert_eq!(admitted_memory_mib(512, 1024).unwrap(), 1536);
         assert!(admitted_memory_mib(512, u64::from(u32::MAX) + 1).is_err());
         assert!(admitted_memory_mib(u32::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn reservation_settles_boot_hold_and_uses_expiring_grants_for_growth() {
+        let base = crate::test_util::TempDir::new("software-reservation");
+        let host = Host::open(&base.join("state"), &base.join("run")).unwrap();
+        let holds_dir = crate::host::locks(&host.run).join("holds");
+        let hold_count = || {
+            std::fs::read_dir(&holds_dir)
+                .map(|entries| entries.flatten().count())
+                .unwrap_or(0)
+        };
+        let grant_ids = || -> Vec<u64> {
+            let Ok(bytes) = std::fs::read(host.grants()) else { return Vec::new() };
+            serde_json::from_slice::<Vec<(u64, u64, u64)>>(&bytes)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, _, id)| id)
+                .collect()
+        };
+
+        let processes = qemu::Processes::default();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut reservation = Reservation::new(&host, 1, deadline, &processes).unwrap();
+        let boot_id = reservation.grant_id;
+        assert_eq!(hold_count(), 1, "boot reservation should hold a lock file until settled");
+        assert!(grant_ids().contains(&boot_id));
+
+        // Settling unlinks the hold file and refunds the startup grant even though
+        // `processes` still holds the inherited lease fd.
+        reservation.settle_boot();
+        assert_eq!(hold_count(), 0, "settle_boot must unlink the boot hold so resident RAM is not double-counted");
+        assert!(!grant_ids().contains(&boot_id));
+
+        // Elastic growth uses an expiring grant (no permanent Hold) and supports
+        // targeted rollback via refund(grant_id).
+        assert_eq!(reservation.grow(0, deadline).unwrap(), 0);
+        let grow_id = reservation.grow(1, deadline).unwrap();
+        assert_ne!(grow_id, 0);
+        assert_eq!(hold_count(), 0, "elastic growth must not create a permanent Hold");
+        assert!(grant_ids().contains(&grow_id));
+
+        reservation.refund(grow_id);
+        assert!(!grant_ids().contains(&grow_id));
+        drop(reservation);
+
+        // Dropping an unsettled reservation also cleans up its hold and grant.
+        let unsettled = Reservation::new(&host, 1, deadline, &processes).unwrap();
+        let unsettled_id = unsettled.grant_id;
+        assert_eq!(hold_count(), 1);
+        assert!(grant_ids().contains(&unsettled_id));
+        drop(unsettled);
+        assert_eq!(hold_count(), 0);
+        assert!(!grant_ids().contains(&unsettled_id));
+    }
+
+    #[test]
+    fn reconcile_plugged_syncs_when_actual_exceeds_plugged() {
+        // #1698: when QEMU's actual plugged size exceeds our tracked `plugged_mib`,
+        // reconcile up to `actual_mib` regardless of `growing` so `elastic_step`
+        // never computes `next < actual_mib`.
+        assert_eq!(reconcile_plugged(512, 256, false, false), Reconcile::SyncTo(512));
+        assert_eq!(reconcile_plugged(512, 256, true, false), Reconcile::SyncTo(512));
+        // Equal clears growing without changing plugged_mib.
+        assert_eq!(reconcile_plugged(256, 256, true, false), Reconcile::Synced);
+        assert_eq!(reconcile_plugged(256, 256, false, false), Reconcile::Synced);
+        // Less waits while an active growth has not stalled, clamps when stalled,
+        // and syncs down when not growing.
+        assert_eq!(reconcile_plugged(128, 256, true, false), Reconcile::Wait);
+        assert_eq!(reconcile_plugged(128, 256, true, true), Reconcile::ClampDown(128));
+        assert_eq!(reconcile_plugged(128, 256, false, false), Reconcile::SyncTo(128));
+    }
+
+    #[test]
+    fn wait_for_mem_poll_wakes_immediately_on_ended() {
+        let ended = Arc::new(AtomicBool::new(false));
+        let entry = Arc::new(Mutex::new(Entry::default()));
+        let changed = Arc::new(Condvar::new());
+
+        let (e, m, c) = (ended.clone(), entry.clone(), changed.clone());
+        let start = Instant::now();
+        let handle = std::thread::spawn(move || wait_for_mem_poll(&e, &m, &c, Duration::from_secs(5)));
+
+        std::thread::sleep(Duration::from_millis(20));
+        ended.store(true, Ordering::SeqCst);
+        drop(entry.lock().unwrap());
+        changed.notify_all();
+
+        assert!(!handle.join().unwrap());
+        assert!(start.elapsed() < Duration::from_millis(500), "mem_watcher wait should wake immediately on shutdown");
+        // Already ended returns false without waiting.
+        assert!(!wait_for_mem_poll(&ended, &entry, &changed, Duration::from_secs(5)));
     }
 }

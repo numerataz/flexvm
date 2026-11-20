@@ -374,6 +374,16 @@ impl Config {
         };
         let max_mib = self.effective_max_mib();
         let hotplug_mib = max_mib - self.mem_mib;
+        // QEMU x86_64 TCG defaults to 40-bit physical addresses (1 TiB), which
+        // is too small once the 32-bit PCI hole and hotplug device-memory
+        // alignment push guest RAM above 1 TiB. Request 42-bit physical
+        // addresses (4 TiB) for elastic or >512 GiB x86_64 VMs while keeping
+        // the legacy CPU profile unchanged for smaller fixed-memory checkpoints.
+        let cpu = if arch == "x86_64" && (hotplug_mib > 0 || max_mib > 524_288) {
+            "max,svm=on,npt=on,enforce=on,phys-bits=42"
+        } else {
+            cpu
+        };
         let mut cmd = Command::new(engine);
         cmd.arg("-L").arg(endpoints.firmware);
         cmd.args(["-machine", &format!("{board},memory-backend=ram"), "-accel", "tcg,thread=multi", "-cpu", cpu]);
@@ -384,7 +394,10 @@ impl Config {
         }
         cmd.args(["-object", &json!({"qom-type":"memory-backend-memfd", "id":"ram", "size":u64::from(self.mem_mib)<<20, "share":true}).to_string()]);
         if hotplug_mib > 0 {
-            cmd.args(["-object", &json!({"qom-type":"memory-backend-memfd", "id":"hotplug", "size":u64::from(hotplug_mib)<<20, "share":true}).to_string()]);
+            cmd.args([
+                "-object",
+                &json!({"qom-type":"memory-backend-memfd", "id":"hotplug", "size":u64::from(hotplug_mib)<<20, "share":true, "reserve":false}).to_string(),
+            ]);
             cmd.args(["-device", "virtio-mem-pci,id=vmem0,memdev=hotplug,requested-size=0,block-size=2M"]);
             cmd.args(["-device", &format!("{balloon},free-page-reporting=on")]);
         }
@@ -1595,11 +1608,48 @@ mod tests {
         let profile = config.profile().unwrap();
         let m_arg = profile.arguments.windows(2).find(|args| args[0] == "-m").unwrap()[1].as_str();
         assert_eq!(m_arg, "size=512M,slots=1,maxmem=2048M");
+        let hotplug_obj: Value = profile
+            .arguments
+            .windows(2)
+            .filter(|args| args[0] == "-object")
+            .filter_map(|args| serde_json::from_str::<Value>(&args[1]).ok())
+            .find(|obj| obj["id"] == "hotplug")
+            .unwrap();
+        assert_eq!(hotplug_obj["qom-type"], "memory-backend-memfd");
+        assert_eq!(hotplug_obj["size"], json!(1536u64 << 20));
+        assert_eq!(hotplug_obj["share"], json!(true));
+        assert_eq!(hotplug_obj["reserve"], json!(false));
         assert!(profile.arguments.iter().any(|a| a.contains("virtio-mem-pci,id=vmem0,memdev=hotplug,requested-size=0,block-size=2M")));
         assert!(profile.arguments.iter().any(|a| a.contains("free-page-reporting=on")));
         let append = profile.arguments.windows(2).find(|args| args[0] == "-append").unwrap()[1].as_str();
         assert!(append.contains("flexvm.tmpfs_mib=2048"), "{append}");
         assert!(append.contains("memhp_default_state=online"), "{append}");
+
+        if cfg!(target_arch = "x86_64") {
+            let make_config = |mem_mib, max_mib| Config {
+                control: Control::Serial,
+                kernel: PathBuf::new(),
+                qemu: String::new(),
+                vsock_backend: String::new(),
+                mem_mib,
+                max_mib,
+                vcpus: 1,
+                boot_timeout: Duration::from_secs(120),
+            };
+            let cpu_arg = |cfg: &Config| cfg.profile().unwrap().arguments.windows(2).find(|args| args[0] == "-cpu").unwrap()[1].clone();
+            assert_eq!(cpu_arg(&config), "max,svm=on,npt=on,enforce=on,phys-bits=42");
+
+            let one_tib_elastic = make_config(ELASTIC_BASE_MIB, 1_048_576);
+            one_tib_elastic.validate_limits().unwrap();
+            assert_eq!(cpu_arg(&one_tib_elastic), "max,svm=on,npt=on,enforce=on,phys-bits=42");
+
+            let one_tib_fixed = make_config(1_048_576, 1_048_576);
+            one_tib_fixed.validate_limits().unwrap();
+            assert_eq!(cpu_arg(&one_tib_fixed), "max,svm=on,npt=on,enforce=on,phys-bits=42");
+
+            let small_fixed = make_config(512, 512);
+            assert_eq!(cpu_arg(&small_fixed), "max,svm=on,npt=on,enforce=on");
+        }
 
         config.max_mib = 256;
         let err = config.validate_limits().unwrap_err().to_string();
