@@ -6,14 +6,25 @@ import json
 import os
 from pathlib import Path
 import platform
+import runpy
 import signal
 import subprocess
 import tempfile
 import time
 
-IMAGE = 'public.ecr.aws/docker/library/alpine@sha256:469c9ea410b9215eaee7976ba6c0639039b444be8e5d638f7abbada189971eb2'
+FIXTURES = runpy.run_path(str(Path(__file__).with_name('workload-fixture.py')))
+IMAGE = FIXTURES['ALPINE']
 PACKAGES = ['openrc', 'openrc-init', 'dbus', 'dbus-openrc', 'eudev', 'udev-init-scripts',
             'python3', 'iproute2', 'procps', 'util-linux']
+
+
+def base_image(layout):
+    if not layout:
+        return IMAGE
+    source = Path(layout).absolute()
+    architecture = {'x86_64': 'amd64', 'aarch64': 'arm64'}[platform.machine()]
+    FIXTURES['validate_cache'](source, architecture, IMAGE)
+    return str(source)
 
 
 def prepare(base, name, output, deadline):
@@ -71,11 +82,13 @@ def main():
     parser.add_argument('--bin', type=Path, required=True)
     parser.add_argument('--kernel', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--alpine-layout', type=Path, help='use the cached OCI layout of the pinned Alpine base')
     parser.add_argument('--timeout', type=int, default=600)
     args = parser.parse_args()
     if os.geteuid() != 0 or not 1 <= args.timeout <= 1800:
         parser.error('run as root, with --timeout in 1..1800')
     binary, kernel = args.bin.resolve(strict=True), args.kernel.resolve(strict=True)
+    image = base_image(args.alpine_layout)
     output = args.output.absolute()
     deadline = time.monotonic() + args.timeout
 
@@ -89,7 +102,7 @@ def main():
         name = 'openrc-image-builder'
         with (state / 'owner.log').open('w+') as log:
             owner = subprocess.Popen([*base, 'software', '--name', name, '--control', 'serial', '--kernel', str(kernel),
-                                      '--mem', '1024', IMAGE, '/bin/sleep', '1800'], stdout=log, stderr=subprocess.STDOUT)
+                                      '--mem', '1024', image, '/bin/sleep', '1800'], stdout=log, stderr=subprocess.STDOUT)
             try:
                 while time.monotonic() < deadline:
                     if owner.poll() is not None:
