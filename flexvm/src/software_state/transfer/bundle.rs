@@ -45,9 +45,6 @@ impl Header {
             bail!("software bundle has an incompatible format, engine or architecture");
         }
         self.manifest.validate()?;
-        if !self.manifest.disks.is_empty() {
-            bail!("software bundle needs managed disk transport support");
-        }
         if self.manifest.firmware.len() != firmware_names().len() || firmware_names().iter().any(|name| !self.manifest.firmware.contains_key(*name)) {
             bail!("software bundle firmware set does not match this architecture profile");
         }
@@ -59,6 +56,7 @@ impl Header {
         [("engine".into(), &manifest.engine), ("kernel".into(), &manifest.kernel), ("rootfs".into(), &manifest.rootfs), ("state".into(), &manifest.state)]
             .into_iter()
             .chain(manifest.firmware.iter().map(|(name, artifact)| (format!("firmware-{name}"), artifact)))
+            .chain(manifest.disks.iter().map(|disk| (disk.filename(), &disk.content)))
     }
 
     fn bytes(&self, limit: u64) -> Result<u64> {
@@ -130,7 +128,8 @@ pub(crate) fn send(host: &Host, vm: &str, input: &Path, output: &mut dyn Write) 
     let header = {
         let _transfer = parent_lock(&state, libc::LOCK_EX)?;
         let (manifest, _) = retired_checkpoint(&checkpoint)?;
-        if host_id_in(&state)? != offer.source_host || !read_fence(&state, &offer.vm_id)?.is_some_and(|fence| !fence.recovered && fence.offer == offer) {
+        let fence = read_fence(&state, &offer.vm_id)?.filter(|fence| fence.offer == offer).ok_or("software bundle needs an exact fenced source")?;
+        if host_id_in(&state)? != offer.source_host || !fence.active(&state)? {
             bail!("software bundle needs an exact fenced source");
         }
         let header = Header { offer, manifest };

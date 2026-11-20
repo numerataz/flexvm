@@ -2,7 +2,7 @@
 
 The catalog creates retained sparse raw storage independently of VM lifetime.
 Named software VMs can attach a volume as a writable virtio-blk data disk.
-Automatic cross-host disk transfer is tracked in #1329.
+The software transfer protocol carries the data disks with the VM.
 
 ```sh
 flexvm volume create database --size 1073741824
@@ -80,3 +80,19 @@ copy of each managed disk with the RAM and device state. Local start acquires
 the original disk's writer lease and verifies its bytes against that checkpoint
 before running the guest. Changing the catalog volume while the VM is stopped
 causes restore to fail rather than combine saved RAM with newer disk contents.
+
+
+## Transfer disks with a software VM
+
+Use the ordinary `software-transfer` commands for a stopped VM with managed
+volumes. The source verifies the current disk bytes and fences the whole disk
+set when it signs the retirement receipt. A catalog writer or removal stays
+blocked there until a signed abort authorizes recovery or a newer verified
+return grants local ownership.
+
+The destination verifies and writes the managed disk copies before granting
+the restored VM execution. Its catalog records the original volume IDs and
+uses the same guest device order. A new destination uses a generated catalog
+name based on the ID. On a return, the local names are preserved and the
+previous fenced disk directories are exchanged atomically with complete copies.
+Imports can be retried under the same committed offer.

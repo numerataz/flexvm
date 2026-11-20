@@ -1,6 +1,6 @@
 //! A destination grant survives the imported directory and the VM name.
 //! A recovered or retried command cannot grant execution a second time.
-use std::fs::File;
+use std::fs::{self, File};
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::Mutex;
@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{bundle_name, Header, INCOMING};
 use crate::host::{Ident, NameLock, PidFd};
-use crate::software_state::transfer::{committed_return_fence, read_input, Offer};
+use crate::software_state::transfer::{committed_return_fence, read_fence, read_input, require_disk_source, Offer};
 use crate::software_state::{
     open_pinned, parent_directory, parent_lock, present, private_directory, read_manifest, record, write_record, Consumed, Grant, Input, Manifest, Profile,
     Verified,
@@ -27,6 +27,8 @@ struct Decision {
     return_fence: Option<Offer>,
     #[serde(default)]
     finished: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    disks: Vec<crate::software_state::Disk>,
 }
 
 pub(crate) struct Activation<'a> {
@@ -37,8 +39,26 @@ pub(crate) struct Activation<'a> {
     _name: &'a NameLock,
 }
 
+const DECISION_PREFIX: &str = ".software-activation-v1-";
+
 fn decision_name(vm_id: &str) -> String {
-    format!(".software-activation-v1-{vm_id}")
+    format!("{DECISION_PREFIX}{vm_id}")
+}
+
+/// Read only while holding source and destination authority for this state root.
+pub(in crate::software_state::transfer) fn require_disk_not_reserved(state: &File, disk_id: &str, same_vm: Option<&str>) -> Result<()> {
+    for entry in fs::read_dir(crate::host::fd_path(state.as_raw_fd()))? {
+        let name = entry?.file_name();
+        let Some((name, vm_id)) = name.to_str().and_then(|name| name.strip_prefix(DECISION_PREFIX).map(|id| (name, id))) else { continue };
+        if !crate::volume::valid_id(vm_id) || Some(vm_id) == same_vm {
+            continue;
+        }
+        let decision: Decision = record(state, name)?;
+        if decision.grant.is_none() && decision.disks.iter().any(|disk| disk.volume_id == disk_id) {
+            bail!("managed volume {disk_id} is reserved for a pending software activation");
+        }
+    }
+    Ok(())
 }
 
 fn read_decision(state: &File, vm_id: &str) -> Result<Option<Decision>> {
@@ -79,6 +99,14 @@ pub(super) fn reclaimable(state: &File, offer: &Offer, obsolete: bool) -> Result
 pub(in crate::software_state::transfer) fn return_grant_generation(state: &File, outgoing: &Offer) -> Result<Option<u64>> {
     let decision = read_decision(state, &outgoing.vm_id)?;
     Ok(decision.filter(|decision| decision.return_fence.as_ref() == Some(outgoing)).and_then(|decision| decision.grant).map(|grant| grant.generation))
+}
+
+fn returning_disks(state: &File, offer: &Offer, anchor: Option<&Offer>) -> Result<Vec<crate::software_state::Disk>> {
+    Ok(read_fence(state, &offer.vm_id)?.filter(|fence| Some(&fence.offer) == anchor && !fence.recovered).map_or_else(Vec::new, |fence| fence.disks))
+}
+
+fn import_id(offer: &Offer) -> crate::volume::ImportId {
+    crate::volume::ImportId { vm_id: offer.vm_id.clone(), transfer_id: offer.transfer_id.clone() }
 }
 
 pub(in crate::software_state) struct Import {
@@ -142,9 +170,24 @@ impl<'a> Activation<'a> {
         }
         let header = Header { offer: offer.clone(), manifest: read_manifest(&directory)? };
         header.check(&offer)?;
+        if !header.manifest.disks.is_empty() {
+            let catalog = crate::volume::Catalog::from_state(state.try_clone()?)?;
+            let returning = returning_disks(&state, &offer, return_fence.as_ref())?;
+            let tag = import_id(&offer);
+            for disk in &header.manifest.disks {
+                require_disk_not_reserved(&state, &disk.volume_id, Some(&offer.vm_id))?;
+                require_disk_source(&state, &disk.volume_id, return_fence.as_ref())?;
+                catalog.check_adoption(&disk.volume_id, &tag, returning.iter().any(|old| old.volume_id == disk.volume_id))?;
+            }
+        }
         let generation = floor.checked_add(1).ok_or("software activation generation exhausted")?;
-        let decision = Decision { offer, name: name.name.clone(), generation, grant: None, return_fence, finished: false };
-        write_record(&state, &key, &serde_json::to_vec(&decision)?, previous.is_some())?;
+        let decision =
+            Decision { offer, name: name.name.clone(), generation, grant: None, return_fence, finished: false, disks: header.manifest.disks.clone() };
+        let bytes = serde_json::to_vec(&decision)?;
+        if bytes.len() > 8192 {
+            bail!("software disk activation decision is too large");
+        }
+        write_record(&state, &key, &bytes, previous.is_some())?;
         Ok(Self { state, directory, header, decision, _name: name })
     }
 
@@ -164,6 +207,32 @@ impl<'a> Activation<'a> {
         // host binary the destination runs. Launch from this local descriptor.
         verified.inputs.engine = local;
         Ok(verified)
+    }
+
+    pub(crate) fn adopt_disks(&self) -> Result<Vec<crate::volume::Writer>> {
+        if self.decision.disks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let returning = {
+            let _transfer = parent_lock(&self.state, libc::LOCK_EX)?;
+            if committed_return_fence(&self.state, &self.decision.offer)? != self.decision.return_fence
+                || record::<Decision>(&self.state, &decision_name(&self.decision.offer.vm_id))? != self.decision
+            {
+                bail!("software disk activation preparation was superseded");
+            }
+            returning_disks(&self.state, &self.decision.offer, self.decision.return_fence.as_ref())?
+        };
+        let tag = import_id(&self.decision.offer);
+        let catalog = crate::volume::Catalog::from_state(self.state.try_clone()?)?;
+        self.decision
+            .disks
+            .iter()
+            .map(|disk| {
+                let source = crate::software_state::member(&self.directory, &disk.filename())?;
+                let may_replace = returning.iter().any(|previous| previous.volume_id == disk.volume_id);
+                disk.verify_writer(catalog.adopt(&disk.volume_id, disk.content.bytes, &source, &tag, may_replace)?)
+            })
+            .collect()
     }
 
     pub(crate) fn grant(mut self, engine: Ident) -> Result<(u64, Consumed)> {
@@ -187,7 +256,11 @@ impl<'a> Activation<'a> {
             engine,
         };
         self.decision.grant = Some(grant.clone());
-        write_record(&self.state, &key, &serde_json::to_vec(&self.decision)?, true)?;
+        let bytes = serde_json::to_vec(&self.decision)?;
+        if bytes.len() > 8192 {
+            bail!("software disk activation grant is too large");
+        }
+        write_record(&self.state, &key, &bytes, true)?;
         let import = Import { state: self.state, offer: self.decision.offer };
         Ok((generation, Consumed { directory: self.directory, grant, manifest: self.header.manifest, replaced: Mutex::new(Vec::new()), import: Some(import) }))
     }

@@ -1,7 +1,8 @@
 //! Source and destination ownership journals for software checkpoint transfers.
 use std::collections::HashSet;
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
@@ -158,10 +159,61 @@ struct SourceFence {
     finalized: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     predecessor: Option<Offer>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    disks: Vec<super::Disk>,
 }
 
+impl SourceFence {
+    fn active(&self, state: &File) -> Result<bool> {
+        if self.recovered {
+            return Ok(false);
+        }
+        Ok(bundle::activate::return_grant_generation(state, &self.offer)?.is_none_or(|generation| generation <= self.offer.generation))
+    }
+}
+
+const SOURCE_FENCE_PREFIX: &str = ".software-transfer-source-v1-";
+
 fn source_record(vm_id: &str) -> String {
-    format!(".software-transfer-source-v1-{vm_id}")
+    format!("{SOURCE_FENCE_PREFIX}{vm_id}")
+}
+
+pub(crate) struct DiskAdmission<'a> {
+    state: &'a File,
+    _lock: crate::host::HeldLock,
+}
+
+impl<'a> DiskAdmission<'a> {
+    pub(crate) fn new(state: &'a File) -> Result<Self> {
+        Ok(Self { state, _lock: parent_lock(state, libc::LOCK_EX)? })
+    }
+
+    pub(crate) fn require(&self, volume_id: &str) -> Result<()> {
+        require_local_disk(self.state, volume_id)
+    }
+}
+
+/// Call while holding the software state lock. Retirement records the entire
+/// disk set atomically before releasing any of their per-file writer leases.
+fn require_local_disk(state: &File, volume_id: &str) -> Result<()> {
+    bundle::activate::require_disk_not_reserved(state, volume_id, None)?;
+    require_disk_source(state, volume_id, None)
+}
+
+fn require_disk_source(state: &File, volume_id: &str, allowed_return: Option<&Offer>) -> Result<()> {
+    for entry in fs::read_dir(crate::host::fd_path(state.as_raw_fd()))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some((name, vm_id)) = name.to_str().and_then(|name| name.strip_prefix(SOURCE_FENCE_PREFIX).map(|id| (name, id))) else { continue };
+        if !crate::volume::valid_id(vm_id) {
+            continue;
+        }
+        let fence = record::<SourceFence>(state, name)?;
+        if Some(&fence.offer) != allowed_return && fence.disks.iter().any(|disk| disk.volume_id == volume_id) && fence.active(state)? {
+            bail!("managed volume {volume_id} is fenced by software VM transfer");
+        }
+    }
+    Ok(())
 }
 
 fn return_fence(state: &File, offer: &Offer, source_key: &str, chain: &[finalize::Finalized]) -> Result<Option<Offer>> {
@@ -234,9 +286,6 @@ pub(super) fn local_restart_floor(state: &File, manifest: &Manifest) -> Result<u
 
 fn retired_checkpoint(checkpoint: &File) -> Result<(Manifest, Retirement)> {
     let manifest = read_manifest(checkpoint)?;
-    if !manifest.disks.is_empty() {
-        bail!("software transfer needs managed disk transport support");
-    }
     let retirement = Retirement::of(&manifest)?;
     if present(checkpoint, "STARTED")? || present(checkpoint, "DISCARDED")? {
         bail!("software transfer needs an unconsumed checkpoint");
@@ -302,6 +351,7 @@ fn issue(state: &File, checkpoint: &File, offer: Offer, key: &Ed25519KeyPair, de
         recovered: false,
         finalized: false,
         predecessor: bundle::activate::preceding_grant(state, &manifest)?,
+        disks: manifest.disks.clone(),
     };
     let previous = read_fence(state, &fence.offer.vm_id)?;
     match &previous {
@@ -309,8 +359,12 @@ fn issue(state: &File, checkpoint: &File, offer: Offer, key: &Ed25519KeyPair, de
             if existing.offer == fence.offer
                 && existing.source_key == fence.source_key
                 && existing.destination_key == fence.destination_key
+                && existing.disks == fence.disks
                 && !existing.recovered =>
         {
+            if !existing.active(state)? {
+                bail!("software transfer already returned to this source");
+            }
             state.sync_all()?
         }
         _ => {
@@ -318,7 +372,24 @@ fn issue(state: &File, checkpoint: &File, offer: Offer, key: &Ed25519KeyPair, de
             if fence.offer.generation <= floor || previous.as_ref().is_some_and(|existing| fence.offer.transfer_id == existing.offer.transfer_id) {
                 bail!("software VM already has a newer or conflicting transfer fence");
             }
-            write_record(state, &path, &serde_json::to_vec(&fence)?, previous.is_some())?;
+            let _writers = if fence.disks.is_empty() {
+                Vec::new()
+            } else {
+                let catalog = crate::volume::Catalog::from_state(state.try_clone()?)?;
+                fence
+                    .disks
+                    .iter()
+                    .map(|disk| {
+                        require_local_disk(state, &disk.volume_id)?;
+                        disk.verify_writer(catalog.writer_for_retirement(&disk.volume_id)?)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            };
+            let bytes = serde_json::to_vec(&fence)?;
+            if bytes.len() > 8192 {
+                bail!("software transfer source fence is too large");
+            }
+            write_record(state, &path, &bytes, previous.is_some())?;
         }
     }
     signed_receipt(fence.offer, key, RECEIPT_DOMAIN)
@@ -582,6 +653,7 @@ mod tests {
             recovered: false,
             finalized: false,
             predecessor: None,
+            disks: Vec::new(),
         };
         let path = source_record(&first.vm_id);
         write_record(&local, &path, &serde_json::to_vec(&outgoing).unwrap(), false).unwrap();
@@ -696,6 +768,61 @@ mod tests {
         assert!(prepared.grant(crate::host::Ident::me()).err().unwrap().to_string().contains("cannot restart"));
         assert!(verified.prepare(&name, &manifest.host_id).err().unwrap().to_string().contains("cannot restart"));
         assert_eq!(transition(&target, first.offer, Action::Commit(first.signature)).unwrap(), Status::Committed);
+    }
+
+    #[test]
+    fn source_disk_fencing_verifies_bytes_and_excludes_catalog_writers_until_abort() {
+        let root = TempDir::new("transfer-disk-source");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let destination = TempDir::new("transfer-disk-target");
+        let catalog = crate::volume::Catalog::open(&host.state).unwrap();
+        catalog.create("database", 512).unwrap();
+        let writer = catalog.writer("database").unwrap();
+        use std::os::unix::fs::FileExt;
+        writer.file.write_all_at(b"checkpoint", 0).unwrap();
+        let disk = super::super::Input::read(writer.file.try_clone().unwrap(), None).unwrap().artifact;
+
+        let (path, _) = super::super::tests::checkpoint(&root);
+        let checkpoint = private_directory(&path).unwrap();
+        let mut manifest = read_manifest(&checkpoint).unwrap();
+        manifest.host_id = host_id(&host.state).unwrap();
+        manifest.source_owner = manifest.source_engine.clone();
+        manifest.disks.push(super::super::Disk { volume_id: writer.id.clone(), content: disk });
+        rewrite_manifest(&checkpoint, &manifest);
+        let proposal = Offer {
+            vm_id: manifest.vm_id.clone(),
+            source_host: manifest.host_id,
+            manifest_sha256: Retirement::of(&read_manifest(&checkpoint).unwrap()).unwrap().manifest_sha256,
+            generation: manifest.owner_generation + 1,
+            ..offer(&destination)
+        };
+        let state = parent_directory(&host.state).unwrap();
+        let source_key = key(7);
+        let dest_key = key(8);
+        let dest_pub = STANDARD.encode(dest_key.public_key());
+        assert!(issue(&state, &checkpoint, proposal.clone(), &source_key, &dest_pub).unwrap_err().to_string().contains("still in use"));
+        assert!(read_fence(&state, &proposal.vm_id).unwrap().is_none());
+
+        writer.file.write_all_at(b"different!", 0).unwrap();
+        crate::host::flock(&writer.file, libc::LOCK_UN).unwrap();
+        assert!(issue(&state, &checkpoint, proposal.clone(), &source_key, &dest_pub).unwrap_err().to_string().contains("changed since checkpoint"));
+        assert!(read_fence(&state, &proposal.vm_id).unwrap().is_none());
+
+        let fixed = catalog.writer("database").unwrap();
+        fixed.file.write_all_at(b"checkpoint", 0).unwrap();
+        crate::host::flock(&fixed.file, libc::LOCK_UN).unwrap();
+        let receipt = issue(&state, &checkpoint, proposal.clone(), &source_key, &dest_pub).unwrap();
+        let retry = issue(&state, &checkpoint, proposal.clone(), &source_key, &dest_pub).unwrap();
+        assert_eq!(receipt.signature, retry.signature);
+        assert!(catalog.writer("database").err().unwrap().to_string().contains("fenced"));
+        assert!(catalog.remove("database").unwrap_err().to_string().contains("fenced"));
+        assert!(recover_source(&state, signed_receipt(proposal.clone(), &source_key, ABORT_DOMAIN).unwrap()).is_err());
+        assert!(catalog.writer("database").is_err());
+
+        transition(&destination, proposal.clone(), public_key(&source_key)).unwrap();
+        transition(&destination, proposal.clone(), Action::Abort).unwrap();
+        recover_source(&state, signed_receipt(proposal, &dest_key, ABORT_DOMAIN).unwrap()).unwrap();
+        assert!(catalog.writer("database").is_ok());
     }
 
     #[test]

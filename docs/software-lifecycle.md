@@ -11,9 +11,9 @@ quarantined; it is never silently restarted from the older state.
 
 Stopped software VMs can transfer across hosts with signed ownership handoffs.
 Software snapshots currently use private user networking, and open host network
-connections close on a move. Persistent disk transfer, routed network continuity,
-elastic memory, hierarchy ownership and explicit quarantine recovery remain work
-to implement. Unknown or older guest agents cannot checkpoint; a
+connections close on a move. Managed data disks transfer with stopped software
+VMs. Routed network continuity, elastic memory, hierarchy ownership and explicit
+quarantine recovery remain work to implement. Unknown or older guest agents cannot checkpoint; a
 current serial agent must acknowledge its request and transport barriers.
 
 `scripts/compat/software-lifecycle.py` exercises two normal CLI stop/start cycles
@@ -243,8 +243,8 @@ the same transfer rechecks the stored bytes.
 The stream starts with `flexvm-software-bundle-v1` and a newline, followed by
 the four-byte big-endian header length and a JSON object with `offer` and
 `manifest`. Raw members follow in the order engine, kernel, root filesystem,
-VM state, and firmware in manifest key order. The manifest supplies every
-length and digest. A truncated, extended or corrupted stream fails verification.
+VM state, firmware in manifest key order, and managed disks in device order.
+The manifest supplies every length and digest. A truncated, extended or corrupted stream fails verification.
 The published bundle carries artifacts and the offer identity. After the
 destination commits the retirement receipt, run
 `software-transfer activate OFFER VM --qemu FILE` there. Choose a locally

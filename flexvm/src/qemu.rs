@@ -471,10 +471,12 @@ impl Config {
         Ok(cmd)
     }
 
+    #[cfg(test)]
     pub fn profile(&self) -> Result<software_state::Profile> {
         self.profile_for(Network::Private, &[])
     }
 
+    #[cfg(test)]
     pub fn profiles(&self) -> Result<[software_state::Profile; 2]> {
         Ok([self.profile()?, self.profile_for(Network::Legacy, &[])?])
     }

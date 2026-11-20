@@ -80,7 +80,7 @@ impl Main {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Disk {
     pub volume_id: String,
@@ -90,6 +90,15 @@ pub struct Disk {
 impl Disk {
     fn filename(&self) -> String {
         format!("disk-{}", self.volume_id)
+    }
+
+    fn verify_writer(&self, writer: crate::volume::Writer) -> Result<crate::volume::Writer> {
+        if writer.id != self.volume_id {
+            bail!("managed volume identity differs from the checkpoint");
+        }
+        Input::read(writer.file.try_clone()?, Some(&self.content))
+            .map_err(|error| format!("managed volume {} changed since checkpoint: {error}", self.volume_id))?;
+        Ok(writer)
     }
 }
 
@@ -131,15 +140,7 @@ impl Manifest {
             return Ok(Vec::new());
         }
         let catalog = crate::volume::Catalog::open(state)?;
-        self.disks
-            .iter()
-            .map(|disk| {
-                let writer = catalog.writer(&disk.volume_id)?;
-                let _verified = Input::read(writer.file.try_clone()?, Some(&disk.content))
-                    .map_err(|error| format!("managed volume {} changed since checkpoint: {error}", disk.volume_id))?;
-                Ok(writer)
-            })
-            .collect()
+        self.disks.iter().map(|disk| disk.verify_writer(catalog.writer(&disk.volume_id)?)).collect()
     }
 
     fn validate(&self) -> Result<()> {
