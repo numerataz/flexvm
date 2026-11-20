@@ -818,6 +818,8 @@ class RunLanes:
         self.connections = connections
         self.live = {}
         self.cancelling = set()
+        self.checkpoint_cancelling = set()
+        self.completion_only = set()
         self.pending_inputs = {}
         self.read_pio = []
         self.written_pio = []
@@ -829,7 +831,7 @@ class RunLanes:
     def descriptors(self):
         return [self.connections[cpu].connection for cpu in self.live]
 
-    def service(self, mailbox, ready, open_cpus, started_cpus, replies):
+    def service(self, mailbox, ready, open_cpus, started_cpus, replies, *, hold=False):
         for cpu, channel in enumerate(self.connections):
             offset = LANES_AT + cpu * LANE_STRIDE
             seq, completed, command, _, cancelled = struct.unpack_from("<IIIiI", mailbox, offset)
@@ -837,9 +839,12 @@ class RunLanes:
                 if self.live[cpu] != (seq, command) or cancelled > seq:
                     raise RuntimeError("parallel vCPU changed an outstanding run")
                 if channel.connection in ready:
-                    packet = channel.connection.recv(2) if command == COMPLETE_READ else channel.read_exit()
+                    completion = command == COMPLETE_READ or cpu in self.completion_only
+                    packet = channel.connection.recv(2) if completion else channel.read_exit()
                     self.complete(cpu, packet, cancelled, mailbox, offset, replies)
-                elif command == RUN and seq == cancelled:
+                elif command == RUN and cpu not in self.completion_only and (seq == cancelled or hold):
+                    if hold:
+                        self.checkpoint_cancelling.add(cpu)
                     self.cancel(cpu, seq)
                 continue
             if seq == completed:
@@ -849,10 +854,15 @@ class RunLanes:
                 raise RuntimeError("invalid parallel vCPU request")
             completion = read_completion(mailbox, self.pending_inputs.pop(cpu, None), self.read_pio,
                                          self.read_mmio, offset + LANE_COMPLETION, offset + LANE_PIO)
-            if command == COMPLETE_READ:
+            if hold and command == RUN and not completion:
+                self.acknowledge(mailbox, offset, seq, -errno.EINTR, replies)
+                continue
+            if command == COMPLETE_READ or hold:
                 if not completion:
                     raise RuntimeError("parallel completion needs outstanding I/O")
                 request = bytes((ord("E"), cpu)) if self.native_control else b"E"
+                if command == RUN:
+                    self.completion_only.add(cpu)
             else:
                 self.run_count += 1
                 if self.native_control:
@@ -863,8 +873,11 @@ class RunLanes:
             channel.connection.sendall(request)
             self.live[cpu] = (seq, command)
             self.max_in_flight = max(self.max_in_flight, len(self.live))
-            if command == RUN and seq == cancelled:
+            if command == RUN and not hold and seq == cancelled:
                 self.cancel(cpu, seq)
+
+    def checkpoint_ready(self):
+        return not self.live and not self.pending_inputs
 
     def cancel(self, cpu, seq):
         if cpu not in self.cancelling:
@@ -877,11 +890,17 @@ class RunLanes:
     def complete(self, cpu, packet, cancelled, mailbox, offset, replies):
         seq, command = self.live.pop(cpu)
         self.cancelling.discard(cpu)
+        checkpoint_cancel = cpu in self.checkpoint_cancelling
+        self.checkpoint_cancelling.discard(cpu)
+        completion_only = cpu in self.completion_only
+        self.completion_only.discard(cpu)
         status = 0
-        if command == COMPLETE_READ:
+        if command == COMPLETE_READ or completion_only:
             if packet != b"E":
                 raise RuntimeError("invalid parallel read completion response")
-        elif packet == b"I\0" and cancelled == seq:
+            if completion_only:
+                status = -errno.EINTR
+        elif packet == b"I\0" and (cancelled == seq or checkpoint_cancel):
             status = -errno.EINTR
         elif packet == b"A\0":
             status = -errno.EAGAIN
@@ -897,6 +916,10 @@ class RunLanes:
                 self.written_mmio.append((result.address, result.data))
             exit_at = offset + LANE_EXIT
             mailbox[exit_at:exit_at + EXIT_RECORD.size] = result.record()
+        self.acknowledge(mailbox, offset, seq, status, replies)
+
+    @staticmethod
+    def acknowledge(mailbox, offset, seq, status, replies):
         struct.pack_into("<i", mailbox, offset + 12, status)
         struct.pack_into("<I", mailbox, offset + 4, seq)
         os.eventfd_write(replies, 1)
