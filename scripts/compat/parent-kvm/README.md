@@ -19,8 +19,10 @@ until the outer VM exits.
 The worker supports byte output to one port and a subset of x86 real-mode
 registers. The client writes those registers through `KVM_SET_REGS` before
 and between runs and reads actual worker state through `KVM_GET_REGS`.
-TCG register requests use a private Unix debugger socket. Memory invalidation,
-protected and long mode state, interrupts, and checkpointing remain part of
+After an exit, `KVM_GET_SREGS` also returns live segment caches, descriptor
+tables, and control registers. The TCG worker uses private Unix sockets for
+debugger and QMP register requests. Memory invalidation, protected and long
+mode state, interrupts, and checkpointing remain part of
 [issue #1501](https://github.com/numerataz/flexvm/issues/1501).
 
 Run the fixture on x86 with the QEMU build from `scripts/build-qemu.sh` and

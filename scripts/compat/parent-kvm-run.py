@@ -30,9 +30,13 @@ PAGE_SIZE = 4096
 MAX_SLOT_PAGES = 128
 OUTER_RAM_SIZE = 192 * MIB
 IO_VALUES = (0x42, 0xa7)
-OPEN_VM, CLOSE_VM, OPEN_CPU, CLOSE_CPU, RUN, GET_REGS, SET_REGS = range(1, 8)
+OPEN_VM, CLOSE_VM, OPEN_CPU, CLOSE_CPU, RUN, GET_REGS, SET_REGS, GET_SREGS = range(1, 9)
 # Linux's x86 struct kvm_regs. The fixture runs in real mode.
 REGISTERS = struct.Struct("<18Q")
+SEGMENT = struct.Struct("<QIH9Bx")
+DESCRIPTOR_TABLE = struct.Struct("<QH6x")
+CONTROL_REGISTERS = struct.Struct("<7Q32x")
+SPECIAL_REGISTERS_SIZE = 8 * SEGMENT.size + 2 * DESCRIPTOR_TABLE.size + CONTROL_REGISTERS.size
 # (GDB index, KVM index, bytes) from QEMU's i386-64bit.xml.
 GDB_REGISTERS = (
     (0, 0, 8), (1, 1, 8), (2, 2, 8), (3, 3, 8), (4, 4, 8), (5, 5, 8),
@@ -42,6 +46,25 @@ QEMU_OPTIONS = [
     "-nodefaults", "-display", "none", "-monitor", "none", "-nic", "none",
     "-smp", "1", "-no-reboot", "-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
 ]
+
+
+def pack_special_registers(snapshot):
+    if len(snapshot["segments"]) != 8:
+        raise RuntimeError("QEMU did not return eight x86 segment caches")
+    segments = []
+    for segment in snapshot["segments"]:
+        flags = segment["flags"]
+        present = (flags >> 15) & 1
+        segments.append(SEGMENT.pack(segment["base"], segment["limit"], segment["selector"],
+                                     (flags >> 8) & 15, present, (flags >> 13) & 3,
+                                     (flags >> 22) & 1, (flags >> 12) & 1, (flags >> 21) & 1,
+                                     (flags >> 23) & 1, (flags >> 20) & 1, 1 - present))
+    gdt = DESCRIPTOR_TABLE.pack(snapshot["gdt-base"], snapshot["gdt-limit"])
+    idt = DESCRIPTOR_TABLE.pack(snapshot["idt-base"], snapshot["idt-limit"])
+    # The fixture has no external interrupt injection, so the bitmap stays zero.
+    controls = CONTROL_REGISTERS.pack(*(snapshot[name] for name in
+                                       ("cr0", "cr2", "cr3", "cr4", "cr8", "efer", "apic-base")))
+    return b"".join((*segments, gdt, idt, controls))
 
 
 def stop_process(process):
@@ -131,7 +154,9 @@ class TcgChild:
         self.process = None
         self.channel = None
         self.debugger = None
+        self.special_monitor = None
         debugger_path = socket_path.with_name("registers.sock")
+        self.special_monitor_path = socket_path.with_name("special-registers.sock")
         self.memory = outer_ram
         self.offsets = offsets
         try:
@@ -144,6 +169,7 @@ class TcgChild:
                     "-bios", output / "reset.rom", "-S", "-chardev", f"socket,id=port,path={socket_path}",
                     "-chardev", f"socket,id=regs,path={debugger_path},server=on,wait=off",
                     "-gdb", "chardev:regs",
+                    "-qmp", f"unix:{self.special_monitor_path},server=on,wait=off",
                     "-device", "isa-debugcon,iobase=0x30,chardev=port,run-control=on",
                     "-device", f"flexvm-shared-ram,ram-fd={outer_ram},layout-fd={layout}",
                 ]
@@ -175,8 +201,18 @@ class TcgChild:
         for peer_index, index, size in GDB_REGISTERS:
             self.debugger.write(peer_index, size, registers[index])
 
+    def special_registers(self):
+        deadline = time.monotonic() + 3
+        if self.special_monitor is None:
+            self.special_monitor = HELPERS["QMP"](self.special_monitor_path, self.process, deadline)
+        self.special_monitor.deadline = deadline
+        return pack_special_registers(self.special_monitor.ask("x-flexvm-query-x86-sregs"))
+
     def close(self):
         try:
+            if self.special_monitor is not None:
+                self.special_monitor.close()
+                self.special_monitor = None
             if self.debugger is not None:
                 self.debugger.close()
                 self.debugger = None
@@ -219,6 +255,13 @@ class KvmChild:
         self.channel.connection.sendall(b"S" + record)
         if self.channel.connection.recv(2) != b"S":
             raise RuntimeError("native parent worker did not acknowledge the register write")
+
+    def special_registers(self):
+        self.channel.connection.sendall(b"X")
+        registers = self.channel.connection.recv(SPECIAL_REGISTERS_SIZE + 1)
+        if len(registers) != SPECIAL_REGISTERS_SIZE:
+            raise RuntimeError("native parent worker did not return a special register record")
+        return registers
 
     def close(self):
         if self.channel is not None:
@@ -288,11 +331,12 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
-    expected = (OPEN_VM, OPEN_CPU, RUN, GET_REGS, SET_REGS, GET_REGS, RUN, GET_REGS, CLOSE_CPU, CLOSE_VM)
+    expected = (OPEN_VM, OPEN_CPU, RUN, GET_REGS, GET_SREGS, SET_REGS, GET_REGS, RUN, GET_REGS, CLOSE_CPU, CLOSE_VM)
     if reject_close:
         expected = expected[:-1]
     observed = []
     counters = []
+    special = None
     child = None
     with ExitStack() as cleanup:
         control = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix="flexvm-kvm-")))
@@ -304,7 +348,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages):
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 7)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 8)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
         os.ftruncate(outer_ram, OUTER_RAM_SIZE)
@@ -363,6 +407,14 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages):
                 counters.append(REGISTERS.unpack(registers)[2])
             elif opcode == SET_REGS:
                 child.set_registers(mapping[64:64 + REGISTERS.size])
+            elif opcode == GET_SREGS:
+                registers = child.special_registers()
+                mapping[64:64 + SPECIAL_REGISTERS_SIZE] = registers
+                special = {
+                    "ds_base": SEGMENT.unpack_from(registers, SEGMENT.size)[0],
+                    "gdt_base": DESCRIPTOR_TABLE.unpack_from(registers, 8 * SEGMENT.size)[0],
+                    "cr2": CONTROL_REGISTERS.unpack_from(registers, 8 * SEGMENT.size + 2 * DESCRIPTOR_TABLE.size)[1],
+                }
             elif opcode == CLOSE_CPU:
                 # The guest can unpin its page as soon as it sees this reply.
                 if reject_close:
@@ -391,6 +443,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages):
         "parent_accelerator": parent_engine, "parent_commands": observed, "transport": "eventfd and MSI-X",
         "io_values": child.channel.exits, "child_memory_write_visible": True, "same_child_worker": True,
         "register_counters": counters,
+        "special_registers": special,
         "page_alias": True, "mapped_page_bytes": ram_pages * PAGE_SIZE, "outer_page_offsets": child.offsets,
         "mapped_extents": extents,
         "worker_stopped_before_close_reply": not reject_close, "page_retained_on_rejected_close": retained,
