@@ -1,4 +1,5 @@
 //! Source and destination ownership journals for software checkpoint transfers.
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -77,7 +78,7 @@ struct Journal {
 }
 
 enum Action {
-    Prepare(String),
+    Prepare(String, Vec<finalize::Finalized>),
     Commit(String),
     Abort,
 }
@@ -94,7 +95,7 @@ fn transition(state: &Path, offer: Offer, action: Action) -> Result<Status> {
     let name = incoming_record(&offer);
     let previous = read_incoming(&dir, &offer)?;
     let next = match action {
-        Action::Prepare(source_key) => {
+        Action::Prepare(source_key, chain) => {
             decode::<32>(&source_key, "source public key")?;
             if let Some(current) = &previous {
                 if current.offer == offer && current.source_key == source_key {
@@ -105,7 +106,7 @@ fn transition(state: &Path, offer: Offer, action: Action) -> Result<Status> {
                     bail!("software transfer conflicts with the destination journal");
                 }
             }
-            let return_fence = return_fence(&dir, &offer, &source_key)?;
+            let return_fence = return_fence(&dir, &offer, &source_key, &chain)?;
             if let Some(current) = previous.as_ref().filter(|previous| previous.status == Status::Committed) {
                 if return_fence.as_ref().is_none_or(|fence| fence.generation <= current.offer.generation) {
                     bail!("software transfer conflicts with the committed destination journal");
@@ -155,27 +156,49 @@ struct SourceFence {
     recovered: bool,
     #[serde(default)]
     finalized: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    predecessor: Option<Offer>,
 }
 
 fn source_record(vm_id: &str) -> String {
     format!(".software-transfer-source-v1-{vm_id}")
 }
 
-fn return_fence(state: &File, offer: &Offer, source_key: &str) -> Result<Option<Offer>> {
-    let Some(fence) = read_fence(state, &offer.vm_id)? else { return Ok(None) };
-    if fence.recovered
-        || fence.offer.destination_host != offer.source_host
-        || fence.destination_key != source_key
-        || fence.offer.generation >= offer.generation
-        || fence.offer.transfer_id == offer.transfer_id
-    {
+fn return_fence(state: &File, offer: &Offer, source_key: &str, chain: &[finalize::Finalized]) -> Result<Option<Offer>> {
+    let Some(fence) = read_fence(state, &offer.vm_id)? else {
+        if !chain.is_empty() {
+            bail!("software handoff chain has no local outgoing anchor");
+        }
+        return Ok(None);
+    };
+    if fence.recovered {
+        bail!("recovered software transfer cannot anchor an incoming return");
+    }
+
+    let mut transfer_ids = HashSet::from([fence.offer.transfer_id.as_str(), offer.transfer_id.as_str()]);
+    if transfer_ids.len() != 2 {
+        bail!("software return reuses the outgoing transfer identity");
+    }
+    let mut previous = &fence.offer;
+    let mut key = fence.destination_key.as_str();
+    for proof in chain {
+        let (link, successor) = proof.verify_successor(previous, key)?;
+        if !transfer_ids.insert(&link.transfer_id) {
+            bail!("software handoff chain reuses a transfer identity");
+        }
+        (previous, key) = (link, successor);
+    }
+    if previous.destination_host != offer.source_host || key != source_key || previous.generation >= offer.generation {
         bail!("software return transfer does not extend the pinned outgoing handoff");
     }
     Ok(Some(fence.offer))
 }
 
 fn require_unchanged_return_fence(state: &File, journal: &Journal) -> Result<()> {
-    if return_fence(state, &journal.offer, &journal.source_key)? != journal.return_fence {
+    // Preparation authenticated the source key against the chain. The
+    // journal pins that result, and the current fence must still anchor it.
+    let current = read_fence(state, &journal.offer.vm_id)?;
+    if current.as_ref().is_some_and(|fence| fence.recovered) || current.as_ref().map(|fence| &fence.offer) != journal.return_fence.as_ref() {
         bail!("software transfer outgoing handoff changed after preparation");
     }
     Ok(())
@@ -269,8 +292,14 @@ fn issue(state: &File, checkpoint: &File, offer: Offer, key: &Ed25519KeyPair, de
         bail!("transfer offer does not match the retired software checkpoint");
     }
     let path = source_record(&offer.vm_id);
-    let fence =
-        SourceFence { offer, source_key: STANDARD.encode(key.public_key()), destination_key: destination_key.into(), recovered: false, finalized: false };
+    let fence = SourceFence {
+        offer,
+        source_key: STANDARD.encode(key.public_key()),
+        destination_key: destination_key.into(),
+        recovered: false,
+        finalized: false,
+        predecessor: bundle::activate::preceding_grant(state, &manifest)?,
+    };
     let previous = read_fence(state, &fence.offer.vm_id)?;
     match &previous {
         Some(existing)
@@ -409,22 +438,32 @@ fn decode<const N: usize>(value: &str, label: &str) -> Result<[u8; N]> {
 }
 
 fn read_input<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    read_bounded_input(path, 8192)
+}
+
+fn read_bounded_input<T: DeserializeOwned>(path: &Path, limit: u64) -> Result<T> {
     let file = OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?;
     if !file.metadata()?.is_file() {
         bail!("software transfer input must be a regular file");
     }
     let mut bytes = Vec::new();
-    file.take(8193).read_to_end(&mut bytes)?;
-    if bytes.len() > 8192 {
-        bail!("software transfer input exceeds 8 KiB");
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        bail!("software transfer input exceeds {limit} bytes");
     }
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-pub(crate) fn command(state: &Path, operation: &str, input: &Path, source_key: Option<&str>) -> Result<serde_json::Value> {
+pub(crate) fn command(state: &Path, operation: &str, input: &Path, source_key: Option<&str>, chain: Option<&Path>) -> Result<serde_json::Value> {
     let (offer, action) = match operation {
         "id" => return Ok(serde_json::json!({"host_id": host_id(state)?})),
-        "prepare" => (read_input(input)?, Action::Prepare(source_key.ok_or("missing source key")?.into())),
+        "prepare" => (
+            read_input(input)?,
+            Action::Prepare(
+                source_key.ok_or("missing source key")?.into(),
+                chain.map(|path| read_bounded_input(path, 64 * 1024)).transpose()?.unwrap_or_default(),
+            ),
+        ),
         "commit" => {
             let Receipt { offer, signature } = read_input(input)?;
             (offer, Action::Commit(signature))
@@ -457,7 +496,7 @@ mod tests {
     }
 
     fn public_key(key: &Ed25519KeyPair) -> Action {
-        Action::Prepare(STANDARD.encode(key.public_key()))
+        Action::Prepare(STANDARD.encode(key.public_key()), Vec::new())
     }
 
     fn sign(key: &Ed25519KeyPair, offer: &Offer) -> Action {
@@ -536,6 +575,7 @@ mod tests {
             destination_key: STANDARD.encode(peer.public_key()),
             recovered: false,
             finalized: false,
+            predecessor: None,
         };
         let path = source_record(&first.vm_id);
         write_record(&local, &path, &serde_json::to_vec(&outgoing).unwrap(), false).unwrap();

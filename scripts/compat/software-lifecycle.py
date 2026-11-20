@@ -228,6 +228,8 @@ def exercise(args):
         if engine is None:
             raise RuntimeError('trusted local QEMU was not found')
         remote = 'received-test'
+        intermediary_base = [str(args.bin), '--state', str(args.state / 'intermediary'),
+                             '--run', str(args.state / 'intermediary-run')]
 
         def target_cli(*words):
             return subprocess.check_output([*destination_base, *words], text=True, timeout=max(.1, deadline - time.monotonic()))
@@ -253,7 +255,7 @@ def exercise(args):
             raise RuntimeError('destination guest did not make fresh progress')
 
         def repeat_transfer(sender, receiver, old_name, new_name, sender_key, receiver_key,
-                            signer, previous, destination_host, *, abort_first=False):
+                            signer, previous, destination_host, *, abort_first=False, finalize_with=None, handoff_chain=None):
             proposed = args.state / f'{new_name}-offer.json'
             accepted = args.state / f'{new_name}-receipt.json'
             previous_offer = None
@@ -264,8 +266,13 @@ def exercise(args):
                 current_offer = json.loads(offer_text)
                 if previous_offer and current_offer['generation'] <= previous_offer['generation']:
                     raise RuntimeError('return offer did not advance the aborted generation')
-                prepared = json.loads(subprocess.check_output([*receiver, 'software-transfer', 'prepare', proposed,
-                                                               '--source-key', sender_key], timeout=30))
+                prepare = [*receiver, 'software-transfer', 'prepare', proposed, '--source-key', sender_key]
+                if handoff_chain:
+                    denied = subprocess.run(prepare, capture_output=True, text=True, timeout=30)
+                    if denied.returncode == 0 or 'does not extend the pinned outgoing handoff' not in denied.stderr:
+                        raise RuntimeError(f'return from an unrecognized source unexpectedly prepared: {denied}')
+                    prepare += ['--handoff-chain', handoff_chain]
+                prepared = json.loads(subprocess.check_output(prepare, timeout=30))
                 if prepared['status'] != 'pending':
                     raise RuntimeError('return transfer did not prepare')
                 accepted.write_bytes(subprocess.check_output([*sender, 'software-transfer', 'retire', old_name, proposed,
@@ -289,6 +296,13 @@ def exercise(args):
                         if source.poll() is None:
                             source.kill()
             subprocess.check_call([*receiver, 'software-transfer', 'commit', accepted], timeout=30, stdout=subprocess.DEVNULL)
+            proof = None
+            if finalize_with:
+                acknowledgment = args.state / f'{new_name}-commit-ack.json'
+                acknowledgment.write_bytes(subprocess.check_output([*receiver, 'software-transfer', 'acknowledge-commit',
+                                                                   proposed, '--signing-key', finalize_with], timeout=30))
+                proof = json.loads(subprocess.check_output([*sender, 'software-transfer', 'finalize', acknowledgment,
+                                                          '--signing-key', signer], timeout=30))
             with (args.output / f'{new_name}-owner.log').open('wb') as log:
                 activated = subprocess.Popen([*receiver, 'software-transfer', 'activate', proposed, new_name, '--qemu', engine],
                                              stdout=log, stderr=log)
@@ -307,7 +321,7 @@ def exercise(args):
             control('stop', new_name)
             if activated.wait(timeout=15) != 0:
                 raise RuntimeError(f'return owner failed to stop {new_name}')
-            return seen
+            return (seen, proof)
 
         denied_activation('requires a committed destination transfer')
         if destination('commit', receipt)['status'] != 'committed':
@@ -351,20 +365,34 @@ def exercise(args):
             # Retain each host's original checkpoint while the new owner returns
             # under another name, then prove both old checkpoints remain fenced.
             local_id = json.loads(cli('software-transfer', 'id'))['host_id']
-            returned = repeat_transfer(destination_base, base, remote, 'returned-test', destination_key, public_key,
-                                       destination_secret, activated_state, local_id, abort_first=True)
+            returned, _ = repeat_transfer(destination_base, base, remote, 'returned-test', destination_key, public_key,
+                                          destination_secret, activated_state, local_id, abort_first=True)
             require_refused('start', 'state-test', error='predates the return transfer grant')
-            repeat_transfer(base, destination_base, 'returned-test', 'received-again', public_key, destination_key,
-                            secret, returned, target_id)
+            back_on_peer, _ = repeat_transfer(base, destination_base, 'returned-test', 'received-again', public_key, destination_key,
+                                              secret, returned, target_id)
             refused = subprocess.run([*destination_base, 'start', remote], capture_output=True, text=True, timeout=30)
             if refused.returncode == 0 or 'predates the return transfer grant' not in refused.stderr:
                 raise RuntimeError(f'old destination checkpoint was not fenced: {refused}')
             denied_activation('does not match a prepared destination', vm='duplicate')
             evidence['repeated_transfer'] = 'passed'
+
+            intermediary_secret = args.state / 'intermediary-key.der'
+            intermediary_key = key_pair(intermediary_secret)
+            intermediary = json.loads(subprocess.check_output([*intermediary_base, 'software-transfer', 'id'], timeout=30))['host_id']
+            on_intermediary, proof = repeat_transfer(destination_base, intermediary_base, 'received-again', 'third-host',
+                                                       destination_key, intermediary_key, destination_secret, back_on_peer,
+                                                       intermediary, finalize_with=intermediary_secret)
+            chain = args.state / 'handoff-chain.json'
+            chain.write_text(json.dumps([proof]))
+            repeat_transfer(intermediary_base, base, 'third-host', 'returned-via-third', intermediary_key, public_key,
+                            intermediary_secret, on_intermediary, local_id, handoff_chain=chain)
+            require_refused('start', 'returned-test', error='predates the return transfer grant')
+            evidence['intermediary_transfer'] = 'passed'
         finally:
             for name in (remote, 'received-again'):
                 subprocess.run([*destination_base, 'rm', '-f', name], capture_output=True, timeout=20)
-            cli('rm', '-f', 'returned-test')
+            subprocess.run([*intermediary_base, 'rm', '-f', 'third-host'], capture_output=True, timeout=20)
+            cli('rm', '-f', 'returned-test', 'returned-via-third', pending=True)
         cli('rm', '-f', 'state-test')
 
     evidence = {'cycles': []}
