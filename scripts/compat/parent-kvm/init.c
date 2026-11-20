@@ -30,10 +30,11 @@ int main(void)
     check(syscall(SYS_finit_module, module, "", 0) == 0, "load provider");
     close(module);
     check(chmod("/kvm-run", 0700) == 0, "make the client executable");
+    const char *pages = access("/single-page", F_OK) == 0 ? "1" : "2";
     pid_t child = fork();
     check(child >= 0, "fork the KVM client");
     if (child == 0) {
-        execl("/kvm-run", "kvm-run", NULL);
+        execl("/kvm-run", "kvm-run", pages, NULL);
         _exit(127);
     }
     int status;

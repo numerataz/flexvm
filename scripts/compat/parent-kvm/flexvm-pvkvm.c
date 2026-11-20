@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Experimental x86 proof for a KVM client and a parent CPU worker.
- * One VM, one vCPU, one pinned real-mode 4 KiB slot, and port-output exits.
+ * One VM, one vCPU, one pinned real-mode RAM slot, and port-output exits.
  */
 #include <linux/anon_inodes.h>
 #include <linux/atomic.h>
@@ -38,7 +38,8 @@ struct pvvm {
 	struct kref refs;
 	struct pvkvm *provider;
 	struct mm_struct *owner;
-	struct page *slot;
+	struct page *slot[PVKVM_MAX_PAGES];
+	unsigned int pages;
 	bool slot_exposed;
 	bool cpu_open;
 };
@@ -67,13 +68,15 @@ static const struct kvm_sregs reset_sregs = {
 };
 
 /* The device lock serializes mailbox use, including close and PCI teardown. */
-static int request(struct pvkvm *provider, enum pvkvm_command command, u64 address,
+static int request(struct pvkvm *provider, enum pvkvm_command command,
+		   const struct pvvm *memory,
 		   u8 *io_value)
 {
 	void __iomem *m = provider->mailbox;
 	u32 before, seq;
 	long waited;
 	int status, interrupts;
+	unsigned int index, pages = memory ? memory->pages : 0;
 
 	if (provider->dead)
 		return -ENODEV;
@@ -84,9 +87,14 @@ static int request(struct pvkvm *provider, enum pvkvm_command command, u64 addre
 	}
 	seq = before + 1;
 	interrupts = atomic_read(&provider->interrupt_count);
-	writel(lower_32_bits(address), m + PVKVM_RAM_ADDRESS_AT);
-	writel(upper_32_bits(address), m + PVKVM_RAM_ADDRESS_AT + sizeof(u32));
-	writel(command == PVKVM_RUN ? PVKVM_MEMORY_LEN : 0, m + PVKVM_DATA_SIZE_AT);
+	for (index = 0; index < PVKVM_MAX_PAGES; index++) {
+		u64 address = index < pages ? PFN_PHYS(page_to_pfn(memory->slot[index])) : 0;
+		void __iomem *entry = m + PVKVM_RAM_ADDRESS_AT + index * sizeof(u64);
+
+		writel(lower_32_bits(address), entry);
+		writel(upper_32_bits(address), entry + sizeof(u32));
+	}
+	writel(pages * PAGE_SIZE, m + PVKVM_DATA_SIZE_AT);
 	writel(command, m + PVKVM_COMMAND_AT);
 	wmb();
 	writel(seq, m + PVKVM_REQUEST_AT);
@@ -140,11 +148,11 @@ static void vm_free(struct kref *ref)
 	closed = close_object(p, PVKVM_CLOSE_VM);
 	p->vm_open = false;
 	mutex_unlock(&p->lock);
-	if (vm->slot) {
+	if (vm->pages) {
 		if (closed || !vm->slot_exposed)
-			unpin_user_pages_dirty_lock(&vm->slot, 1, true);
+			unpin_user_pages_dirty_lock(vm->slot, vm->pages, true);
 		else
-			pr_warn("flexvm-pvkvm: retaining a RAM page until the enclosing VM exits\n");
+			pr_warn("flexvm-pvkvm: retaining registered RAM until the enclosing VM exits\n");
 	}
 	kref_put(&p->refs, provider_free);
 	mmdrop(vm->owner);
@@ -202,12 +210,12 @@ static int run_cpu(struct pvcpu *cpu)
 		result = -EINTR;
 		goto unlock;
 	}
-	if (!vm->slot) {
+	if (!vm->pages) {
 		result = -EINVAL;
 		goto unlock;
 	}
 	vm->slot_exposed = true;
-	result = request(p, PVKVM_RUN, PFN_PHYS(page_to_pfn(vm->slot)), &cpu->page->data);
+	result = request(p, PVKVM_RUN, vm, &cpu->page->data);
 	if (!result)
 		cpu->ran = true;
 unlock:
@@ -345,7 +353,8 @@ static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	struct pvvm *vm = file->private_data;
 	struct pvkvm *p = vm->provider;
 	struct kvm_userspace_memory_region memory;
-	struct page *slot;
+	struct page *slot[PVKVM_MAX_PAGES];
+	unsigned int pages;
 	long pinned;
 	int result;
 
@@ -358,19 +367,26 @@ static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	if (copy_from_user(&memory, (void __user *)arg, sizeof(memory)))
 		return -EFAULT;
 	if (memory.slot || memory.flags || memory.guest_phys_addr != PVKVM_GUEST_START ||
-	    memory.memory_size != PVKVM_MEMORY_LEN || !memory.userspace_addr ||
+	    !memory.memory_size || memory.memory_size > PVKVM_MAX_PAGES * PAGE_SIZE ||
+	    !PAGE_ALIGNED(memory.memory_size) || !memory.userspace_addr ||
 	    !PAGE_ALIGNED(memory.userspace_addr))
 		return -EINVAL;
-	pinned = pin_user_pages_fast(memory.userspace_addr, 1, FOLL_WRITE | FOLL_LONGTERM, &slot);
-	if (pinned != 1)
+	pages = memory.memory_size / PAGE_SIZE;
+	pinned = pin_user_pages_fast(memory.userspace_addr, pages, FOLL_WRITE | FOLL_LONGTERM, slot);
+	if (pinned != pages) {
+		if (pinned > 0)
+			unpin_user_pages(slot, pinned);
 		return pinned < 0 ? pinned : -EFAULT;
+	}
 	mutex_lock(&p->lock);
-	result = p->dead ? -ENODEV : vm->slot ? -EEXIST : 0;
-	if (!result)
-		vm->slot = slot;
+	result = p->dead ? -ENODEV : vm->pages ? -EEXIST : 0;
+	if (!result) {
+		memcpy(vm->slot, slot, pages * sizeof(slot[0]));
+		vm->pages = pages;
+	}
 	mutex_unlock(&p->lock);
 	if (result)
-		unpin_user_page(slot);
+		unpin_user_pages(slot, pages);
 	return result;
 }
 
@@ -471,7 +487,7 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	BUILD_BUG_ON(sizeof(struct run_page) > PAGE_SIZE);
 	BUILD_BUG_ON(PAGE_SIZE != PVKVM_MEMORY_LEN);
 	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
-	    pci_resource_len(dev, 2) < PVKVM_RAM_ADDRESS_AT + sizeof(u64))
+	    pci_resource_len(dev, 2) < PVKVM_RAM_ADDRESS_AT + PVKVM_MAX_PAGES * sizeof(u64))
 		return -ENODEV;
 	result = pcim_enable_device(dev);
 	if (result)

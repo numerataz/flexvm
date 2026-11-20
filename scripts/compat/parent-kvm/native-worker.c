@@ -31,13 +31,19 @@ static unsigned long number(const char *text, unsigned long maximum)
 
 int main(int argc, char **argv)
 {
-    check(argc == 4, "expected control fd, outer RAM fd, and page offset");
+    check(argc == 4 || argc == 5, "expected control fd, outer RAM fd, and one or two page offsets");
     int control = (int)number(argv[1], INT_MAX);
     int outer_ram = (int)number(argv[2], INT_MAX);
-    off_t offset = (off_t)number(argv[3], LONG_MAX);
-    check(offset % 4096 == 0, "unaligned outer RAM offset");
-    void *slot = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, outer_ram, offset);
-    check(slot != MAP_FAILED, "map outer RAM page");
+    size_t slot_bytes = (size_t)(argc - 3) * 4096;
+    unsigned char *slot = mmap(NULL, slot_bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    check(slot != MAP_FAILED, "reserve a contiguous address range for guest RAM");
+    for (int arg = 3; arg < argc; arg++) {
+        off_t offset = (off_t)number(argv[arg], LONG_MAX);
+        check(offset % 4096 == 0, "unaligned outer RAM offset");
+        void *address = slot + (arg - 3) * 4096;
+        check(mmap(address, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
+                   outer_ram, offset) == address, "map outer RAM page");
+    }
 
     int kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     check(kvm >= 0 && ioctl(kvm, KVM_GET_API_VERSION, 0) == KVM_API_VERSION,
@@ -47,7 +53,7 @@ int main(int argc, char **argv)
     int vm = ioctl(kvm, KVM_CREATE_VM, 0);
     check(vm >= 0, "create host VM");
     struct kvm_userspace_memory_region memory = {
-        .guest_phys_addr = 4096, .memory_size = 4096, .userspace_addr = (uintptr_t)slot,
+        .guest_phys_addr = 4096, .memory_size = slot_bytes, .userspace_addr = (uintptr_t)slot,
     };
     check(ioctl(vm, KVM_SET_USER_MEMORY_REGION, &memory) == 0, "register shared page");
     int cpu = ioctl(vm, KVM_CREATE_VCPU, 0);

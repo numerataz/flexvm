@@ -35,8 +35,11 @@ static void check_output(struct kvm_run *run, int bytes, unsigned char value)
           ((unsigned char *)run)[run->io.data_offset] == value, "KVM I/O exit");
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    check(argc == 2 && (!strcmp(argv[1], "1") || !strcmp(argv[1], "2")), "select one or two RAM pages");
+    size_t pages = (size_t)(argv[1][0] - '0');
+    size_t ram_bytes = pages * 4096;
     int kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     check(kvm >= 0, "open /dev/kvm");
     check(ioctl(kvm, KVM_GET_API_VERSION, 0) == KVM_API_VERSION, "API version");
@@ -44,20 +47,34 @@ int main(void)
     check(size >= (int)sizeof(struct kvm_run), "run mapping size");
     int vm = ioctl(kvm, KVM_CREATE_VM, 0);
     check(vm >= 0 && (fcntl(vm, F_GETFD) & FD_CLOEXEC), "VM file descriptor");
-    unsigned char *ram = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    unsigned char *ram = mmap(NULL, ram_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     check(ram != MAP_FAILED, "map client RAM");
+    volatile unsigned char *scratch = NULL;
+    if (pages == 2) {
+        volatile unsigned char *touch = ram;
+        touch[4096] = 0;
+        scratch = mmap(NULL, 32 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        check(scratch != MAP_FAILED, "allocate intervening pages");
+        for (size_t byte = 0; byte < 32 * 4096; byte += 4096)
+            scratch[byte] = 1;
+        touch[0] = 0;
+    }
     struct kvm_userspace_memory_region region = {
-        .guest_phys_addr = 4096, .memory_size = 4096, .userspace_addr = (unsigned long)ram,
+        .guest_phys_addr = 4096, .memory_size = ram_bytes, .userspace_addr = (unsigned long)ram,
     };
     check(ioctl(vm, KVM_SET_USER_MEMORY_REGION, &region) == 0, "register client RAM");
-    static const unsigned char code[] = {
-        0xc6, 0x06, 0x20, 0x10, 0x56, /* mov byte [0x1020], 0x56 */
+    if (scratch)
+        check(munmap((void *)scratch, 32 * 4096) == 0, "release intervening pages");
+    unsigned char data_address = (unsigned char)(pages * 0x10);
+    const unsigned char code[] = {
+        0xc6, 0x06, 0x20, data_address, 0x56, /* mov byte [data+0x20], 0x56 */
         0xb0, 0x42, 0xe6, 0x30,       /* mov al, 0x42; out 0x30, al */
-        0xa0, 0x21, 0x10,             /* mov al, [0x1021] */
-        0xa2, 0x22, 0x10,             /* mov [0x1022], al */
+        0xa0, 0x21, data_address,     /* mov al, [data+0x21] */
+        0xa2, 0x22, data_address,     /* mov [data+0x22], al */
         0xe6, 0x30, 0xf4,             /* out 0x30, al; hlt */
     };
     memcpy(ram, code, sizeof(code));
+    unsigned char *data = ram + ram_bytes - 4096;
     int cpu = ioctl(vm, KVM_CREATE_VCPU, 0);
     check(cpu >= 0 && (fcntl(cpu, F_GETFD) & FD_CLOEXEC), "vCPU file descriptor");
     check(ioctl(vm, KVM_CREATE_VCPU, 0) == -1 && errno == EEXIST, "reject duplicate vCPU");
@@ -76,14 +93,14 @@ int main(void)
     run->immediate_exit = 0;
     unsigned long long first = timed_run(cpu);
     check_output(run, size, 0x42);
-    check(ram[0x20] == 0x56 && ram[0x22] == 0, "child stopped after its first output");
-    ram[0x21] = 0xa7;
+    check(data[0x20] == 0x56 && data[0x22] == 0, "child stopped after its first output");
+    data[0x21] = 0xa7;
     unsigned long long second = timed_run(cpu);
     check_output(run, size, 0xa7);
-    check(ram[0x22] == 0xa7, "child saw the client's write during re-entry");
+    check(data[0x22] == 0xa7, "child saw the client's write during re-entry");
     munmap(run, size);
     close(cpu);
-    munmap(ram, 4096);
+    munmap(ram, ram_bytes);
     close(kvm);
     printf("KVM_RUN_NS first=%llu warm=%llu\n", first, second);
     puts("PASS /dev/kvm returned two port I/O exits");
