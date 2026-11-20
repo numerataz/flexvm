@@ -15,6 +15,9 @@ enum flexvm_arm_command {
     FLEXVM_ARM_SET_ONE_REG,
     FLEXVM_ARM_RUN,
     FLEXVM_ARM_REGISTER_RAM,
+    FLEXVM_ARM_OPEN_LANE,
+    FLEXVM_ARM_CANCEL_RUN,
+    FLEXVM_ARM_COMPLETE_READ,
 };
 
 #define FLEXVM_ARM_MAX_REGS 4096
@@ -27,6 +30,8 @@ enum flexvm_arm_command {
 struct flexvm_arm_request {
     uint32_t command;
     uint32_t cpu;
+    uint32_t sequence;
+    uint32_t reserved;
     union {
         struct kvm_vcpu_init init;
         struct {
@@ -64,7 +69,7 @@ struct flexvm_arm_reply {
     };
 };
 
-_Static_assert(sizeof(struct flexvm_arm_request) == 272, "ARM worker request layout");
+_Static_assert(sizeof(struct flexvm_arm_request) == 280, "ARM worker request layout");
 _Static_assert(sizeof(struct flexvm_arm_reply) == 264, "ARM worker reply layout");
 
 #endif
