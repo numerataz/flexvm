@@ -1424,9 +1424,43 @@ pub fn write_file(dir: &Path, name: &str, data: &[u8], durable: bool) -> io::Res
 
 /// Like `write_file`, with a creation mode; 0600 also secures a reused temporary file.
 pub fn write_file_mode(dir: &Path, name: &str, data: &[u8], durable: bool, mode: u32) -> io::Result<()> {
-    let tmp = dir.join(format!(".{name}.{}.tmp", write_tag()));
+    #[cfg(test)]
+    if BLOCKED_WRITES.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|p| p == &dir.join(name)) {
+        return Err(io::Error::new(io::ErrorKind::IsADirectory, "write blocked by test"));
+    }
+    static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.{seq}.{}.tmp", write_tag()));
+    write_file_at(dir, name, &tmp, data, durable, mode)
+}
+
+#[cfg(test)]
+static BLOCKED_WRITES: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) struct WriteBlocker(std::path::PathBuf);
+
+#[cfg(test)]
+impl Drop for WriteBlocker {
+    fn drop(&mut self) {
+        let mut blocked = BLOCKED_WRITES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = blocked.iter().position(|p| p == &self.0) {
+            blocked.remove(i);
+        }
+    }
+}
+
+/// Makes `write_file_mode` fail for `dir/name` until the returned guard is dropped.
+#[cfg(test)]
+pub(crate) fn block_write(dir: &Path, name: &str) -> WriteBlocker {
+    let path = dir.join(name);
+    BLOCKED_WRITES.lock().unwrap_or_else(|e| e.into_inner()).push(path.clone());
+    WriteBlocker(path)
+}
+
+pub(crate) fn write_file_at(dir: &Path, name: &str, tmp: &Path, data: &[u8], durable: bool, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut f = std::fs::File::options().write(true).create(true).truncate(true).mode(mode).custom_flags(libc::O_NOFOLLOW).open(&tmp)?;
+    let mut f = std::fs::File::options().write(true).create(true).truncate(true).mode(mode).custom_flags(libc::O_NOFOLLOW).open(tmp)?;
     let res = (|| {
         if mode == 0o600 {
             f.set_permissions(std::fs::Permissions::from_mode(mode))?;
@@ -1435,10 +1469,10 @@ pub fn write_file_mode(dir: &Path, name: &str, data: &[u8], durable: bool, mode:
         if durable {
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, dir.join(name))
+        std::fs::rename(tmp, dir.join(name))
     })();
     if res.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(tmp);
     }
     res?;
     if durable {
@@ -2273,7 +2307,37 @@ mod tests {
         let dir = crate::test_util::TempDir::new("write-file");
         std::fs::create_dir_all(dir.join("dest")).unwrap();
         assert!(write_file(&dir, "dest", b"data", true).is_err());
-        assert!(!dir.join(format!(".dest.{}.tmp", write_tag())).exists());
+        let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("dest")]);
+    }
+
+    #[test]
+    fn concurrent_write_file_on_same_target_does_not_race() {
+        let dir = crate::test_util::TempDir::new("write-file-race");
+        let threads = 8usize;
+        let iters = 50usize;
+        let barrier = std::sync::Barrier::new(threads);
+        std::thread::scope(|s| {
+            for t in 0..threads {
+                let dir = &dir;
+                let barrier = &barrier;
+                s.spawn(move || {
+                    barrier.wait();
+                    for i in 0..iters {
+                        let line = format!("thread-{t:02}-iter-{i:04}\n");
+                        let payload = line.repeat(64);
+                        write_file(dir, "extents.json", payload.as_bytes(), false)
+                            .unwrap_or_else(|e| panic!("thread {t} iter {i} failed: {e}"));
+                    }
+                });
+            }
+        });
+        let final_content = std::fs::read_to_string(dir.join("extents.json")).unwrap();
+        let lines: Vec<_> = final_content.lines().collect();
+        assert_eq!(lines.len(), 64, "final file must contain a complete payload");
+        assert!(lines.iter().all(|l| *l == lines[0]), "final file must not mix writes from different threads");
+        let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("extents.json")], "no temp files left behind");
     }
 
     #[test]

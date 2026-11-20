@@ -5143,7 +5143,7 @@ mod tests {
         let claim = p.host.claim_new(&p.host.lock().unwrap(), "abort", None).unwrap();
         let gen = claim.gen;
         let ip = p.set_addr(claim);
-        // The record's write fails: its temporary file's name is taken.
+        // The record's write fails: blocked for this test.
         let blocker = block_write(&p.host.state.join("addrs"), &ip.to_string());
         {
             let l = p.host.lock().unwrap();
@@ -5151,7 +5151,7 @@ mod tests {
             assert_eq!((p.host.addr(&l, ip).unwrap().rev, p.host.live(&l, ip).unwrap()), (0, Some(2)));
             assert!(!p.host.observe(&l, ip, gen, 1, Some("10.1.0.1".parse().unwrap())).unwrap(), "the target's late announcement");
         }
-        std::fs::remove_dir(&blocker).unwrap();
+        drop(blocker);
     }
 
     /// #585: a suspend records the revision an `advance` failed to, durably, before its claim is
@@ -5165,7 +5165,7 @@ mod tests {
         p.advance(&p.host.lock().unwrap(), 2).unwrap();
         let e = p.record_for_suspend().unwrap_err();
         assert!(e.to_string().contains("recording its revision"), "{e}");
-        std::fs::remove_dir(&blocker).unwrap();
+        drop(blocker);
         p.record_for_suspend().unwrap();
         // As a suspend keeps it: taken out of `addr` first. `keep` takes the host lock, which the
         // revision retry `advance` started may hold while it waits for `addr` (#810).
@@ -5175,12 +5175,10 @@ mod tests {
         assert!(!p.host.unsynced_marker(ip).exists(), "and durably");
     }
 
-    /// The temporary file `util::write_file` makes for `dir/name`, taken by a directory: writing it fails.
-    fn block_write(dir: &std::path::Path, name: &str) -> PathBuf {
+    /// Blocks `util::write_file` for `dir/name` until the guard is dropped.
+    fn block_write(dir: &std::path::Path, name: &str) -> crate::util::WriteBlocker {
         std::fs::create_dir_all(dir).unwrap();
-        let blocker = dir.join(format!(".{name}.{}.tmp", crate::util::write_tag()));
-        std::fs::create_dir(&blocker).unwrap();
-        blocker
+        crate::util::block_write(dir, name)
     }
 
     /// #533: a revision neither published nor recorded is an error (the abort then leaves the VM
@@ -5197,9 +5195,7 @@ mod tests {
             assert!(e.to_string().contains("publishing it"), "{e}");
             assert_eq!((p.host.addr(&l, ip).unwrap().rev, p.host.live(&l, ip).unwrap()), (0, None));
         }
-        for b in blockers {
-            std::fs::remove_dir(b).unwrap();
-        }
+        drop(blockers);
         let end = Instant::now() + Duration::from_secs(30);
         let both = || {
             let l = p.host.lock().unwrap();
@@ -5225,7 +5221,7 @@ mod tests {
         assert_eq!(p.host.live(&l, x).unwrap(), None);
         drop(l);
         assert_ne!(p.host.mig_status(6).unwrap(), "committed");
-        std::fs::remove_dir(blocker).unwrap();
+        drop(blocker);
     }
 
     /// #533: an arrival's revision is its own from its commit, recorded only after its reply and
