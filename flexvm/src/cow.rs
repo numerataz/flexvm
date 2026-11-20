@@ -654,7 +654,11 @@ const SLOT_CHUNK: usize = 2 << 20;
 /// aligns it and requests `MADV_HUGEPAGE`), or `0` (ordinary pages) when `huge_page > SLOT_CHUNK` (e.g. 512 MiB on
 /// 64 KiB-page kernels, which would exceed `BUDGET_MIB`).
 fn slot_chunk_align(huge_page: usize) -> usize {
-    if huge_page <= SLOT_CHUNK { huge_page } else { 0 }
+    if huge_page <= SLOT_CHUNK {
+        huge_page
+    } else {
+        0
+    }
 }
 
 /// What host memory rescue memory, hot pages' memory and writer buffers may still take, in MiB. That memory is not
