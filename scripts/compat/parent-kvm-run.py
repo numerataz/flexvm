@@ -29,7 +29,10 @@ MAILBOX_SIZE = 64 << 10
 PAGE_SIZE = 4096
 OUTER_RAM_SIZE = 192 * MIB
 IO_VALUES = (0x42, 0xa7)
-OPEN_VM, CLOSE_VM, OPEN_CPU, CLOSE_CPU, RUN = range(1, 6)
+OPEN_VM, CLOSE_VM, OPEN_CPU, CLOSE_CPU, RUN, GET_REGS = range(1, 7)
+# Linux's x86 struct kvm_regs. The fixture runs in real mode.
+REGISTERS = struct.Struct("<18Q")
+LOW_REGISTERS = ("EAX", "EBX", "ECX", "EDX", "ESI", "EDI", "ESP", "EBP")
 QEMU_OPTIONS = [
     "-nodefaults", "-display", "none", "-monitor", "none", "-nic", "none",
     "-smp", "1", "-no-reboot", "-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
@@ -75,6 +78,8 @@ class TcgChild:
     def __init__(self, qemu, output, socket_path, outer_ram, offsets):
         self.process = None
         self.channel = None
+        self.monitor = None
+        self.monitor_path = socket_path.with_name("registers.sock")
         self.memory = outer_ram
         self.offsets = offsets
         try:
@@ -85,6 +90,7 @@ class TcgChild:
                 command = [
                     qemu, *QEMU_OPTIONS, "-machine", "pc,accel=tcg", "-m", "16", "-serial", "none",
                     "-bios", output / "reset.rom", "-S", "-chardev", f"socket,id=port,path={socket_path}",
+                    "-qmp", f"unix:{self.monitor_path},server=on,wait=off",
                     "-device", "isa-debugcon,iobase=0x30,chardev=port,run-control=on",
                 ]
                 for index, offset in enumerate(offsets):
@@ -104,12 +110,31 @@ class TcgChild:
             raise RuntimeError("child wrote its second result while stopped")
         return self.channel.run()
 
+    def registers(self):
+        deadline = time.monotonic() + 3
+        if self.monitor is None:
+            self.monitor = HELPERS["QMP"](self.monitor_path, self.process, deadline)
+        self.monitor.deadline = deadline
+        if self.monitor.ask("query-status")["status"] != "paused":
+            raise RuntimeError("registers can only be read from the stopped TCG worker")
+        dump = self.monitor.ask("human-monitor-command", {"command-line": "info registers"})
+        fields = {name: int(value, 16) for name, value in re.findall(r"\b([A-Z][A-Z0-9]+)=([0-9a-fA-F]+)", dump)}
+        if any(name not in fields for name in (*LOW_REGISTERS, "EIP", "EFL")):
+            raise RuntimeError("TCG worker did not report the expected real-mode registers")
+        return REGISTERS.pack(*(fields[name] for name in LOW_REGISTERS),
+                              *([0] * 8), fields["EIP"], fields["EFL"])
+
     def close(self):
-        if self.channel is not None:
-            self.channel.close()
-        if self.process is not None:
-            stop_process(self.process)
-            self.process = None
+        try:
+            if self.monitor is not None:
+                self.monitor.close()
+                self.monitor = None
+        finally:
+            if self.channel is not None:
+                self.channel.close()
+            if self.process is not None:
+                stop_process(self.process)
+                self.process = None
 
 
 class KvmChild:
@@ -131,6 +156,13 @@ class KvmChild:
 
     def run(self):
         return self.channel.run()
+
+    def registers(self):
+        self.channel.connection.sendall(b"G")
+        registers = self.channel.connection.recv(REGISTERS.size + 1)
+        if len(registers) != REGISTERS.size:
+            raise RuntimeError("native parent worker did not return a register record")
+        return registers
 
     def close(self):
         if self.channel is not None:
@@ -166,10 +198,11 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages):
     # The reset vector far-jumps to 0000:1000, the client's guest RAM.
     reset[0xfff0:0xfff5] = bytes.fromhex("ea00100000")
     (output / "reset.rom").write_bytes(reset)
-    expected = (OPEN_VM, OPEN_CPU, RUN, RUN, CLOSE_CPU, CLOSE_VM)
+    expected = (OPEN_VM, OPEN_CPU, RUN, GET_REGS, RUN, GET_REGS, CLOSE_CPU, CLOSE_VM)
     if reject_close:
         expected = expected[:-1]
     observed = []
+    counters = []
     child = None
     with ExitStack() as cleanup:
         control = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix="flexvm-kvm-")))
@@ -181,7 +214,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages):
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 4)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 5)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
         os.ftruncate(outer_ram, OUTER_RAM_SIZE)
@@ -236,6 +269,10 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages):
                 struct.pack_into("<I", mapping, 28, child.run())
             elif length or any(slots):
                 raise RuntimeError(f"unexpected memory argument for command {opcode}")
+            elif opcode == GET_REGS:
+                registers = child.registers()
+                mapping[64:64 + REGISTERS.size] = registers
+                counters.append(REGISTERS.unpack(registers)[2])
             elif opcode == CLOSE_CPU:
                 # The guest can unpin its page as soon as it sees this reply.
                 if reject_close:
@@ -250,6 +287,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages):
             os.eventfd_write(replies, 1)
         guest = (output / "outer.log").read_text(errors="replace")
         if (outer.wait() != 0 or tuple(observed) != expected or child is None or tuple(child.channel.exits) != IO_VALUES
+                or counters != [0x1357, 0x2468]
                 or "PASS /dev/kvm returned two port I/O exits" not in guest
                 or "PASS parent KVM guest shutdown" not in guest):
             raise RuntimeError(f"parent execution proof failed; commands={observed}, see outer.log")
@@ -262,6 +300,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages):
         "guest_path": "/dev/kvm", "guest_vmx": False, "guest_svm": False,
         "parent_accelerator": parent_engine, "parent_commands": observed, "transport": "eventfd and MSI-X",
         "io_values": child.channel.exits, "child_memory_write_visible": True, "same_child_worker": True,
+        "register_counters": counters,
         "page_alias": True, "mapped_page_bytes": ram_pages * PAGE_SIZE, "outer_page_offsets": child.offsets,
         "worker_stopped_before_close_reply": not reject_close, "page_retained_on_rejected_close": retained,
         "client_run_ns": client_timings(guest), "worker_run_ms": child.channel.timings, "worker_control": "direct socket",

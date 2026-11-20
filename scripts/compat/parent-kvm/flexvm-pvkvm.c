@@ -99,7 +99,7 @@ static int request(struct pvkvm *provider, enum pvkvm_command command,
 	wmb();
 	writel(seq, m + PVKVM_REQUEST_AT);
 	writel(PVKVM_HOST_VECTOR, provider->doorbell + PVKVM_DOORBELL_AT);
-	if (command == PVKVM_RUN)
+	if (command == PVKVM_RUN || command == PVKVM_GET_REGS)
 		waited = wait_event_interruptible_timeout(provider->replied,
 				atomic_read(&provider->interrupt_count) != interrupts &&
 				readl(m + PVKVM_REPLY_AT) == seq, 5 * HZ);
@@ -226,6 +226,7 @@ unlock:
 static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct pvcpu *cpu = file->private_data;
+	struct pvkvm *p = cpu->vm->provider;
 	struct run_page *page = cpu->page;
 	struct kvm_sregs sregs, wanted;
 	struct kvm_regs regs;
@@ -237,13 +238,26 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	result = mutex_lock_interruptible(&cpu->execution);
 	if (result)
 		return -EINTR;
-	if (cpu->ran && cmd != KVM_RUN) {
+	if (cpu->ran && cmd != KVM_RUN && cmd != KVM_GET_REGS) {
 		mutex_unlock(&cpu->execution);
 		return -EOPNOTSUPP;
 	}
 	switch (cmd) {
 	case KVM_GET_REGS:
-		result = copy_to_user(uarg, &cpu->regs, sizeof(cpu->regs)) ? -EFAULT : 0;
+		regs = cpu->regs;
+		if (cpu->ran) {
+			if (mutex_lock_interruptible(&p->lock)) {
+				result = -EINTR;
+				break;
+			}
+			result = request(p, PVKVM_GET_REGS, NULL, NULL);
+			if (!result)
+				memcpy_fromio(&regs, p->mailbox + PVKVM_REGISTERS_AT, sizeof(regs));
+			mutex_unlock(&p->lock);
+			if (result)
+				break;
+		}
+		result = copy_to_user(uarg, &regs, sizeof(regs)) ? -EFAULT : 0;
 		break;
 	case KVM_SET_REGS:
 		if (copy_from_user(&regs, uarg, sizeof(regs))) {
@@ -487,7 +501,7 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	BUILD_BUG_ON(sizeof(struct run_page) > PAGE_SIZE);
 	BUILD_BUG_ON(PAGE_SIZE != PVKVM_MEMORY_LEN);
 	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
-	    pci_resource_len(dev, 2) < PVKVM_RAM_ADDRESS_AT + PVKVM_MAX_PAGES * sizeof(u64))
+	    pci_resource_len(dev, 2) < PVKVM_REGISTERS_AT + sizeof(struct kvm_regs))
 		return -ENODEV;
 	result = pcim_enable_device(dev);
 	if (result)

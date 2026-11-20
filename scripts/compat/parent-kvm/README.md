@@ -14,8 +14,10 @@ the outer VM's memory file. The parent stops the child before acknowledging
 release of the slot. If it cannot confirm release, the pages stay pinned
 until the outer VM exits.
 The worker supports byte output to one port with a fixed entry point.
-Full register state, memory invalidation, interrupts, and checkpointing
-remain part of [issue #1501](https://github.com/numerataz/flexvm/issues/1501).
+After each exit, the client reads the stopped worker's actual real-mode
+general registers through `KVM_GET_REGS`. Register writes beyond the fixed
+entry point, memory invalidation, interrupts, and checkpointing remain part
+of [issue #1501](https://github.com/numerataz/flexvm/issues/1501).
 
 Run the fixture on x86 with the QEMU build from `scripts/build-qemu.sh` and
 the prepared kernel build tree for the selected FlexVM kernel.

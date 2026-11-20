@@ -35,6 +35,15 @@ static void check_output(struct kvm_run *run, int bytes, unsigned char value)
           ((unsigned char *)run)[run->io.data_offset] == value, "KVM I/O exit");
 }
 
+static void check_registers(int cpu, unsigned char accumulator, unsigned int counter)
+{
+    struct kvm_regs regs;
+
+    check(ioctl(cpu, KVM_GET_REGS, &regs) == 0, "read actual registers after exit");
+    check((regs.rax & 0xff) == accumulator && regs.rcx == counter &&
+          regs.rip >= 4096 && (regs.rflags & 2), "check actual registers after exit");
+}
+
 int main(int argc, char **argv)
 {
     check(argc == 2 && (!strcmp(argv[1], "1") || !strcmp(argv[1], "2")), "select one or two RAM pages");
@@ -68,9 +77,11 @@ int main(int argc, char **argv)
     unsigned char data_address = (unsigned char)(pages * 0x10);
     const unsigned char code[] = {
         0xc6, 0x06, 0x20, data_address, 0x56, /* mov byte [data+0x20], 0x56 */
+        0xb9, 0x57, 0x13,             /* mov cx, 0x1357 */
         0xb0, 0x42, 0xe6, 0x30,       /* mov al, 0x42; out 0x30, al */
         0xa0, 0x21, data_address,     /* mov al, [data+0x21] */
         0xa2, 0x22, data_address,     /* mov [data+0x22], al */
+        0xb9, 0x68, 0x24,             /* mov cx, 0x2468 */
         0xe6, 0x30, 0xf4,             /* out 0x30, al; hlt */
     };
     memcpy(ram, code, sizeof(code));
@@ -93,10 +104,12 @@ int main(int argc, char **argv)
     run->immediate_exit = 0;
     unsigned long long first = timed_run(cpu);
     check_output(run, size, 0x42);
+    check_registers(cpu, 0x42, 0x1357);
     check(data[0x20] == 0x56 && data[0x22] == 0, "child stopped after its first output");
     data[0x21] = 0xa7;
     unsigned long long second = timed_run(cpu);
     check_output(run, size, 0xa7);
+    check_registers(cpu, 0xa7, 0x2468);
     check(data[0x22] == 0xa7, "child saw the client's write during re-entry");
     munmap(run, size);
     close(cpu);
