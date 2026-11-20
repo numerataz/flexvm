@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 use crate::util::Result;
 use crate::{bail, util};
 
+pub(crate) mod transfer;
+
 const MAX_MANIFEST: u64 = 8 << 20;
 // Earlier writers did not take directory leases. Never sweep their names.
 const STAGING_PREFIX: &str = ".software-stage-v2-";
@@ -97,6 +99,19 @@ impl ParentArtifacts {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Disk {
+    pub volume_id: String,
+    pub content: Artifact,
+}
+
+impl Disk {
+    fn filename(&self) -> String {
+        format!("disk-{}", self.volume_id)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Manifest {
     pub format: u32,
     pub backend: String,
@@ -123,11 +138,29 @@ pub struct Manifest {
     pub firmware: BTreeMap<String, Artifact>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<ParentArtifacts>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disks: Vec<Disk>,
     pub main: Main,
     pub image: crate::image::ImageMeta,
 }
 
 impl Manifest {
+    pub fn open_disks(&self, state: &Path) -> Result<Vec<crate::volume::Writer>> {
+        if self.disks.is_empty() {
+            return Ok(Vec::new());
+        }
+        let catalog = crate::volume::Catalog::open(state)?;
+        self.disks
+            .iter()
+            .map(|disk| {
+                let writer = catalog.writer(&disk.volume_id)?;
+                let _verified = Input::read(writer.file.try_clone()?, Some(&disk.content))
+                    .map_err(|error| format!("managed volume {} changed since checkpoint: {error}", disk.volume_id))?;
+                Ok(writer)
+            })
+            .collect()
+    }
+
     fn validate(&self) -> Result<()> {
         if [&self.vm_id, &self.snapshot_id, &self.host_id].iter().any(|id| id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()))
             || !self.terminal
@@ -154,11 +187,18 @@ impl Manifest {
             .into_iter()
             .chain(self.firmware.values())
             .chain(self.parent.iter().flat_map(ParentArtifacts::members))
+            .chain(self.disks.iter().map(|disk| &disk.content))
             .any(|artifact| {
                 artifact.bytes == 0 || artifact.sha256.len() != 64 || !artifact.sha256.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
             })
         {
             bail!("software state has an empty artifact or invalid content digest");
+        }
+        let mut disk_ids = std::collections::HashSet::new();
+        for disk in &self.disks {
+            if !crate::volume::valid_id(&disk.volume_id) || !disk_ids.insert(&disk.volume_id) || disk.content.bytes % 512 != 0 {
+                bail!("software checkpoint has an invalid or repeated managed disk");
+            }
         }
         self.main.validate(&self.image)?;
         self.image.check_kernel(&self.kernel.sha256)?;
@@ -416,11 +456,17 @@ pub fn metadata(path: &Path) -> Result<Manifest> {
 }
 
 pub fn open(path: &Path, profiles: impl AsRef<[Profile]>) -> Result<Verified> {
-    let dir = private_directory(path)?;
+    open_pinned(private_directory(path)?, profiles.as_ref())
+}
+
+fn open_pinned(dir: File, profiles: &[Profile]) -> Result<Verified> {
     crate::host::flock(&dir, libc::LOCK_SH)?;
     let manifest = read_manifest(&dir)?;
-    if !profiles.as_ref().contains(&manifest.profile) {
+    if !profiles.contains(&manifest.profile) {
         bail!("software state execution profile does not match");
+    }
+    for disk in &manifest.disks {
+        Input::read(member(&dir, &disk.filename())?, Some(&disk.content))?;
     }
     Ok(Verified {
         inputs: Inputs {
@@ -511,15 +557,18 @@ fn write_record(dir: &File, name: &str, bytes: &[u8], replace: bool) -> Result<(
 }
 
 pub fn host_id(state: &Path) -> Result<String> {
-    let dir = parent_directory(state)?;
-    if !present(&dir, ".software-host-id")? {
+    host_id_in(&parent_directory(state)?)
+}
+
+fn host_id_in(dir: &File) -> Result<String> {
+    if !present(dir, ".software-host-id")? {
         let id = util::random_hex(16)?;
-        match write_record(&dir, ".software-host-id", &serde_json::to_vec(&id)?, false) {
+        match write_record(dir, ".software-host-id", &serde_json::to_vec(&id)?, false) {
             Err(error) if error.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::AlreadyExists) => {}
             result => result?,
         }
     }
-    let id: String = record(&dir, ".software-host-id")?;
+    let id: String = record(dir, ".software-host-id")?;
     if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
         bail!("invalid software host identity");
     }
@@ -585,7 +634,7 @@ pub struct Prepared<'a> {
     directory: File,
     manifest: Manifest,
     pub generation: u64,
-    _name: &'a crate::host::NameLock,
+    name: &'a crate::host::NameLock,
 }
 
 pub struct Consumed {
@@ -593,6 +642,7 @@ pub struct Consumed {
     grant: Grant,
     manifest: Manifest,
     replaced: std::sync::Mutex<Vec<(File, PathBuf)>>,
+    import: Option<transfer::bundle::activate::Import>,
 }
 
 impl Verified {
@@ -603,6 +653,9 @@ impl Verified {
         if self.manifest.host_id != local_host {
             bail!("software checkpoint belongs to another host; cross-host transfer is not enabled");
         }
+        let host = parent_directory(name.state_path())?;
+        let _transfer = parent_lock(&host, libc::LOCK_EX)?;
+        let floor = transfer::local_restart_floor(&host, &self.manifest)?;
         if present(dir, "DISCARDED")? {
             bail!("software checkpoint was discarded");
         }
@@ -628,15 +681,18 @@ impl Verified {
             bail!("retired software source engine is still alive");
         }
         let highest = if present(dir, "HIGHEST")? { record::<u64>(dir, "HIGHEST")? } else { self.manifest.owner_generation };
-        let generation = highest.max(self.manifest.owner_generation).checked_add(1).ok_or("software owner generation exhausted")?;
+        let generation = highest.max(self.manifest.owner_generation).max(floor).checked_add(1).ok_or("software owner generation exhausted")?;
         write_record(dir, "HIGHEST", &serde_json::to_vec(&generation)?, true)?;
-        Ok(Prepared { directory: dir.try_clone()?, manifest: self.manifest.clone(), generation, _name: name })
+        Ok(Prepared { directory: dir.try_clone()?, manifest: self.manifest.clone(), generation, name })
     }
 }
 
 impl Prepared<'_> {
     pub fn grant(self, engine: crate::host::Ident) -> Result<Consumed> {
-        if record::<u64>(&self.directory, "HIGHEST")? != self.generation {
+        let host = parent_directory(self.name.state_path())?;
+        let _transfer = parent_lock(&host, libc::LOCK_EX)?;
+        let floor = transfer::local_restart_floor(&host, &self.manifest)?;
+        if self.generation <= floor || record::<u64>(&self.directory, "HIGHEST")? != self.generation {
             bail!("software owner preparation was superseded");
         }
         if present(&self.directory, "DISCARDED")? {
@@ -653,7 +709,7 @@ impl Prepared<'_> {
             engine,
         };
         write_record(&self.directory, "STARTED", &serde_json::to_vec(&grant)?, false)?;
-        Ok(Consumed { directory: self.directory, grant, manifest: self.manifest, replaced: std::sync::Mutex::new(Vec::new()) })
+        Ok(Consumed { directory: self.directory, grant, manifest: self.manifest, replaced: std::sync::Mutex::new(Vec::new()), import: None })
     }
 }
 
@@ -664,6 +720,15 @@ impl Drop for Consumed {
 }
 
 impl Consumed {
+    /// On a clean retirement, the grant remains but its inputs can be swept.
+    pub fn complete_import(&self) {
+        if let Some(import) = &self.import {
+            if let Err(error) = import.finish(&self.grant) {
+                crate::log!("software checkpoint import retirement: {error}");
+            }
+        }
+    }
+
     /// Release exchanged inputs before reporting retirement, even when a
     /// finishing control request still holds a reference to the owner.
     pub fn release_replaced_inputs(&self) {
@@ -694,6 +759,7 @@ impl Consumed {
         if self.grant.owner != crate::host::Ident::me() || crate::host::PidFd::open(&self.grant.engine)?.is_some() {
             bail!("software execution has not retired");
         }
+        self.complete_import();
         if !path.exists() {
             return Ok(());
         }
@@ -874,6 +940,27 @@ impl Staging {
         Ok(self.parent.insert(ParentStaging { child_memory_mib, native, frontend, worker: create("parent-worker")?, broker: create("parent-broker")? }))
     }
 
+    pub fn capture_disks(&self, disks: &[crate::volume::Writer]) -> Result<Vec<Disk>> {
+        disks
+            .iter()
+            .map(|disk| {
+                disk.file.sync_all()?;
+                let path = self.path.join(format!("disk-{}", disk.id));
+                let target = OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(path)?;
+                target.set_len(disk.size)?;
+                let before = Stamp::of(&disk.file.metadata()?);
+                crate::volume::copy_raw(&disk.file, &target, disk.size)?;
+                if before != Stamp::of(&disk.file.metadata()?) || before.2 != disk.size {
+                    bail!("managed disk changed while capturing its checkpoint");
+                }
+                let content = Input::read(target.try_clone()?, None)?.artifact;
+                target.set_permissions(fs::Permissions::from_mode(0o400))?;
+                target.sync_all()?;
+                Ok(Disk { volume_id: disk.id.clone(), content })
+            })
+            .collect()
+    }
+
     pub fn commit(self, destination: &Path, inputs: &Inputs, manifest: Manifest) -> Result<Published> {
         self.publish(destination, inputs, manifest, None)
     }
@@ -981,6 +1068,11 @@ pub fn sweep(state: &Path) -> Result<()> {
     let suspended = state.join("suspended");
     if suspended.exists() {
         sweep_directory(&suspended, true)?;
+    }
+    let incoming = state.join(transfer::bundle::INCOMING);
+    if incoming.exists() {
+        sweep_directory(&incoming, true)?;
+        transfer::bundle::sweep_retired(state, &incoming)?;
     }
     Ok(())
 }
@@ -1106,11 +1198,42 @@ mod tests {
             state: blank,
             firmware: BTreeMap::new(),
             parent: None,
+            disks: Vec::new(),
             main: Main::App(Session { id: "saved-main".into(), offset: 19, claim: 2 }),
             image: serde_json::from_value(json!({"source":"local", "digest":"sha256:image", "config_digest":"sha256:config",
                 "app_conf":"", "argv":["/probe"], "warm":false}))
             .unwrap(),
         }
+    }
+
+    #[test]
+    fn managed_disk_restore_requires_the_captured_contents_and_a_writer_lease() {
+        let root = TempDir::new("software-disk-capture");
+        let catalog = crate::volume::Catalog::open(&root).unwrap();
+        catalog.create("data", 1 << 20).unwrap();
+        let writer = catalog.writer("data").unwrap();
+        writer.file.write_all_at(b"before", 4096).unwrap();
+
+        let staging = Staging::new(&root).unwrap();
+        let mut manifest = manifest(Profile { architecture: std::env::consts::ARCH.into(), arguments: Vec::new() });
+        manifest.disks = staging.capture_disks(std::slice::from_ref(&writer)).unwrap();
+        let disk = &manifest.disks[0];
+        let captured = member(&staging.directory, &disk.filename()).unwrap();
+        let mut contents = [0; 6];
+        captured.read_exact_at(&mut contents, 4096).unwrap();
+        assert_eq!(&contents, b"before");
+
+        assert!(manifest.open_disks(&root).err().unwrap().to_string().contains("still in use"));
+        // There is no engine in this fixture. Release explicitly so an
+        // unrelated test fork cannot retain the original file description.
+        crate::host::flock(&writer.file, libc::LOCK_UN).unwrap();
+        let active = manifest.open_disks(&root).unwrap();
+        assert_eq!(active[0].id, disk.volume_id);
+        active[0].file.write_all_at(b"after!", 4096).unwrap();
+        crate::host::flock(&active[0].file, libc::LOCK_UN).unwrap();
+        assert!(manifest.open_disks(&root).err().unwrap().to_string().contains("changed since checkpoint"));
+        captured.read_exact_at(&mut contents, 4096).unwrap();
+        assert_eq!(&contents, b"before");
     }
 
     #[test]
@@ -1133,7 +1256,7 @@ mod tests {
         assert!(serde_json::from_value::<Main>(json!({"boot":"systemd", "id":"saved-main", "offset":19, "claim":2})).is_err());
     }
 
-    fn checkpoint(dir: &Path) -> (PathBuf, Profile) {
+    pub(super) fn checkpoint(dir: &Path) -> (PathBuf, Profile) {
         let inputs = Inputs {
             engine: source(dir, "source-engine", b"engine"),
             kernel: source(dir, "source-kernel", b"kernel"),

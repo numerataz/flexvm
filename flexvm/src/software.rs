@@ -391,6 +391,7 @@ impl Owner {
                 state: blank,
                 firmware: std::collections::BTreeMap::new(),
                 parent: None,
+                disks: Vec::new(),
                 main: match &self.main_id {
                     Some(id) => software_state::Main::App(software_state::Session {
                         id: id.clone(),
@@ -409,6 +410,7 @@ impl Owner {
             let published = self.machine.checkpoint(staging, &checkpoint, manifest, previous, Instant::now() + Duration::from_secs(600))?;
             self.machine.retire(&published)?;
             if let Some(consumed) = &self.consumed {
+                consumed.complete_import();
                 consumed.release_replaced_inputs();
             }
             self.suspended.store(true, Ordering::SeqCst);
@@ -824,26 +826,20 @@ pub fn restore(host: Host, vm_name: &str, bundle: Option<&Path>, notify: Option<
         };
         let processes = Arc::new(qemu::Processes::default());
         setup_signals(processes.clone());
-        let config = qemu::Config {
-            control: qemu::Control::Serial,
-            kernel: PathBuf::new(),
-            qemu: String::new(),
-            vsock_backend: String::new(),
-            mem_mib: metadata.memory_mib,
-            vcpus: metadata.vcpus,
-            boot_timeout: Duration::from_secs(120),
-            parent_kvm: metadata.parent.as_ref().map(|parent| qemu::ParentKvm {
-                bundle,
-                engine: if parent.native { "kvm" } else { "tcg" }.into(),
-                child_mem_mib: parent.child_memory_mib,
-            }),
-        };
+        let mut config = restore_config(&metadata);
+        config.parent_kvm = metadata.parent.as_ref().map(|parent| qemu::ParentKvm {
+            bundle,
+            engine: if parent.native { "kvm" } else { "tcg" }.into(),
+            child_mem_mib: parent.child_memory_mib,
+        });
         let _reservation = Reservation::new(&host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)?;
-        let verified = software_state::open(&path, config.profiles()?)?;
+        let profiles = config.profiles_for_disk_ids(metadata.disks.iter().map(|disk| disk.volume_id.as_str()))?;
+        let verified = software_state::open(&path, profiles)?;
+        let disks = verified.manifest.open_disks(&host.state)?;
         let manifest = verified.manifest.clone();
         let prepared = verified.prepare(&name, &software_state::host_id(&host.state)?)?;
         let generation = prepared.generation;
-        let machine = config.restore(verified, processes.clone())?;
+        let machine = config.restore(verified, processes.clone(), disks)?;
         let consumed = prepared.grant(processes.engine_ident()?)?;
         let meta = manifest.image.clone();
         serve(host, name, machine, processes, &config, &meta, Some(Resume { manifest, generation, consumed, notify }))
@@ -852,6 +848,34 @@ pub fn restore(host: Host, vm_name: &str, bundle: Option<&Path>, notify: Option<
         let _ = file.send(&json!({"ok":false,"error":error.to_string()}));
     }
     result
+}
+
+fn restore_config(manifest: &software_state::Manifest) -> qemu::Config {
+    qemu::Config {
+        control: qemu::Control::Serial,
+        kernel: PathBuf::new(),
+        qemu: String::new(),
+        vsock_backend: String::new(),
+        mem_mib: manifest.memory_mib,
+        vcpus: manifest.vcpus,
+        boot_timeout: Duration::from_secs(120),
+        parent_kvm: None,
+    }
+}
+
+pub fn activate(host: Host, vm: &str, offer: &Path, trusted_engine: &Path) -> Result<i32> {
+    let name = host.take_name(vm, false)?;
+    let activation = software_state::transfer::bundle::activate::Activation::prepare(&name, offer)?;
+    let manifest = activation.manifest().clone();
+    let config = restore_config(&manifest);
+    let processes = Arc::new(qemu::Processes::default());
+    setup_signals(processes.clone());
+    let _reservation = Reservation::new(&host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)?;
+    let verified = activation.verify_inputs(&config.profiles()?, trusted_engine)?;
+    let machine = config.restore(verified, processes.clone(), Vec::new())?;
+    let (generation, consumed) = activation.grant(processes.engine_ident()?)?;
+    let meta = manifest.image.clone();
+    serve(host, name, machine, processes, &config, &meta, Some(Resume { manifest, generation, consumed, notify: None }))
 }
 
 pub fn setup_signals(processes: Arc<qemu::Processes>) {

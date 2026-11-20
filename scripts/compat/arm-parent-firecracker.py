@@ -35,8 +35,10 @@ def main():
     if (checkpoint_test or args.idle_transfer) and (args.bin or args.engine != "tcg"):
         parser.error("checkpoint tests require the standalone ARM TCG broker")
     public_checkpoint = args.pause or args.suspend
-    if public_checkpoint and (not args.bin or args.engine != "tcg"):
-        parser.error("--pause and --suspend need the public ARM TCG command")
+    if public_checkpoint and not args.bin:
+        parser.error("--pause and --suspend need the public ARM command")
+    if args.suspend and args.engine != "tcg":
+        parser.error("--suspend needs the ARM TCG provider")
     if args.engine == "auto" and not args.bin:
         parser.error("--engine auto requires --bin")
     output = args.output.resolve()
@@ -216,8 +218,8 @@ def resume_outer(proc, deadline, runtime):
         monitor.close()
 
 
-def transfer_checkpoint(command, output, log, *, rollback=False, idle=False):
-    checkpoint_window = "ARM checkpoint window before opening the nested VM" if idle else "ARM Firecracker checkpoint window"
+def transfer_checkpoint(command, output, log, *, rollback=False, idle=False, window=None):
+    checkpoint_window = window or ("ARM checkpoint window before opening the nested VM" if idle else "ARM Firecracker checkpoint window")
     with ExitStack() as resources:
         root = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix="flexvm-arm-transfer-")))
         source, target = root / "source", root / "target"
