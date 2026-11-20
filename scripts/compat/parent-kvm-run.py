@@ -706,15 +706,19 @@ def verify_slot_spans(pid, slots):
 
 
 def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry,
-             split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs, cpuid, mmio, mmio_read):
+             split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs, cpuid, mmio, mmio_read, ioeventfd):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
     expected_interruptions = TEST_INTERRUPTS if interrupt_run else 0
     expected = [OPEN_VM, *([OPEN_CPU] * cpu_count)]
     expected_counters = []
+    expected_mmio = MMIO_WRITES if mmio else ()
+    if ioeventfd:
+        expected.append(RUN)
+        expected_mmio += (MMIO_WRITES[0],)
     if mmio:
-        expected.extend([RUN] * len(MMIO_WRITES))
+        expected.extend([RUN] * len(expected_mmio))
     if mmio_read:
         expected.extend((RUN, GET_REGS) * len(MMIO_READS))
         expected_counters.extend([0] * len(MMIO_READS))
@@ -722,7 +726,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
     if cpuid:
         expected.insert(0, GET_SUPPORTED_CPUID)
     expected_counters.append(0x1357)
-    expected_io = [(0, 0x42)]
+    expected_io = [(0, 0xcc)] if ioeventfd else []
+    expected_io.append((0, 0x42))
     if cpu_count == 2:
         expected.extend((RUN, GET_REGS, GET_REGS, CLOSE_CPU))
         expected_counters.extend((0x3344, 0x1357))
@@ -927,7 +932,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
             os.eventfd_write(replies, 1)
         guest = (output / "outer.log").read_text(errors="replace")
         if (outer.wait() != 0 or observed != expected or child is None or io_events != expected_io
-                or tuple(mmio_events) != (MMIO_WRITES if mmio else ())
+                or tuple(mmio_events) != expected_mmio
                 or pending_read is not None or tuple(completed_reads) != (MMIO_READS if mmio_read else ())
                 or len(child.channel.interruptions) != expected_interruptions or counters != expected_counters
                 or interrupt_run and "PASS stopped and resumed the same running child" not in guest
@@ -938,6 +943,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 or cpuid and "PASS child CPUID instructions used the installed vCPU profiles" not in guest
                 or mmio and "PASS MMIO writes returned physical addresses and exact data" not in guest
                 or mmio_read and "PASS MMIO reads continued with VMM-supplied bytes" not in guest
+                or ioeventfd and "PASS KVM_IOEVENTFD signaled matched MMIO and PIO writes" not in guest
                 or "PASS /dev/kvm returned two port I/O exits" not in guest
                 or "PASS parent KVM guest shutdown" not in guest):
             raise RuntimeError(f"parent execution proof failed; commands={observed}, see outer.log")
@@ -963,6 +969,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         "supported_cpuid_entries": len(supported_cpuid),
         "mmio_writes": [{"address": address, "data": data.hex()} for address, data in mmio_events],
         "mmio_reads": [{"address": address, "data": data.hex()} for address, data in completed_reads],
+        "ioeventfd": ioeventfd,
         "register_counters": counters,
         "interrupted_runs": len(child.channel.interruptions),
         "interrupted_run_ms": child.channel.interruptions,
@@ -1001,10 +1008,11 @@ def main():
     parser.add_argument("--cpuid", action="store_true", help="query and install x86 CPUID profiles")
     parser.add_argument("--mmio-write", action="store_true", help="return physical MMIO write exits in long mode")
     parser.add_argument("--mmio-read", action="store_true", help="complete physical MMIO reads after the write exits")
+    parser.add_argument("--ioeventfd", action="store_true", help="signal guest eventfds for MMIO and port writes")
     parser.add_argument("--reject-close", action="store_true", help="verify page retention when the parent refuses close")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
-    if args.mmio_read:
+    if args.mmio_read or args.ioeventfd:
         args.mmio_write = True
     if args.fpu and not args.long_mode:
         parser.error("--fpu requires long mode")
@@ -1036,7 +1044,7 @@ def main():
         print(json.dumps(exercise(qemu, kernel, output, args.reject_close, args.parent_engine, args.ram_pages,
                                   args.protected_entry, args.split_slot, args.interrupt_run,
                                   2 if args.two_vcpus else 1, args.long_mode, args.fpu, args.msrs, args.cpuid,
-                                  args.mmio_write, args.mmio_read)))
+                                  args.mmio_write, args.mmio_read, args.ioeventfd)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -1080,6 +1088,8 @@ def main():
                 oracle.append("mmio")
             if args.mmio_read:
                 oracle.append("mmio-read")
+            if args.ioeventfd:
+                oracle.append("ioeventfd")
             HELPERS["run"](oracle, 14 if args.interrupt_run else 8, output / "native-kvm.log")
             report["same_client_passed_native_kvm"] = True
             report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
@@ -1105,6 +1115,8 @@ def main():
             files["mmio-write"] = b""
         if args.mmio_read:
             files["mmio-read"] = b""
+        if args.ioeventfd:
+            files["ioeventfd"] = b""
         image = HELPERS["initramfs"](init.read_bytes(), files=files)
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
@@ -1135,6 +1147,7 @@ def main():
                             *(["--cpuid"] if args.cpuid else []),
                             *(["--mmio-write"] if args.mmio_write else []),
                             *(["--mmio-read"] if args.mmio_read else []),
+                            *(["--ioeventfd"] if args.ioeventfd else []),
                             *(["--reject-close"] if args.reject_close else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}

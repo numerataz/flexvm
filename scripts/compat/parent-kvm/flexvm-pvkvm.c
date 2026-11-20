@@ -5,11 +5,13 @@
  */
 #include <linux/anon_inodes.h>
 #include <linux/atomic.h>
+#include <linux/eventfd.h>
 #include <linux/fs.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/kref.h>
 #include <linux/kvm.h>
+#include <linux/list.h>
 #include <linux/miscdevice.h>
 #include <linux/mm.h>
 #include <linux/module.h>
@@ -47,11 +49,23 @@ struct pvslot {
 	unsigned int count;
 };
 
+struct pv_ioeventfd {
+	struct list_head node;
+	struct eventfd_ctx *eventfd;
+	u64 address;
+	u64 data;
+	u32 length;
+	bool pio;
+	bool datamatch;
+};
+
 struct pvvm {
 	struct kref refs;
 	struct pvkvm *provider;
 	struct mm_struct *owner;
 	struct pvslot slots[PVKVM_MAX_SLOTS];
+	struct mutex ioevent_lock;
+	struct list_head ioevents;
 	unsigned int total_pages;
 	bool slots_exposed;
 	bool topology_frozen;
@@ -260,12 +274,19 @@ static void provider_free(struct kref *ref)
 	kfree(container_of(ref, struct pvkvm, refs));
 }
 
+static void release_ioeventfd(struct pv_ioeventfd *entry)
+{
+	eventfd_ctx_put(entry->eventfd);
+	kfree(entry);
+}
+
 static void vm_free(struct kref *ref)
 {
 	struct pvvm *vm = container_of(ref, struct pvvm, refs);
 	struct pvkvm *p = vm->provider;
 	bool closed;
 	unsigned int id;
+	struct pv_ioeventfd *entry, *next;
 
 	mutex_lock(&p->lock);
 	closed = close_object(p, PVKVM_CLOSE_VM);
@@ -281,6 +302,10 @@ static void vm_free(struct kref *ref)
 		if (closed || !vm->slots_exposed)
 			unpin_user_pages_dirty_lock(slot->pages, slot->count, true);
 		kvfree(slot->pages);
+	}
+	list_for_each_entry_safe(entry, next, &vm->ioevents, node) {
+		list_del(&entry->node);
+		release_ioeventfd(entry);
 	}
 	kref_put(&p->refs, provider_free);
 	mmdrop(vm->owner);
@@ -360,6 +385,32 @@ static void publish_initial_msrs(struct pvcpu *cpu)
 	writel(0, mailbox + sizeof(u32));
 }
 
+static bool signal_ioeventfd(struct pvvm *vm, const struct pvkvm_run_exit *exit)
+{
+	struct pv_ioeventfd *entry;
+	u64 value = 0;
+	bool handled = false;
+
+	if (!exit->is_write)
+		return false;
+	memcpy(&value, exit->data, exit->length);
+	mutex_lock(&vm->ioevent_lock);
+	list_for_each_entry(entry, &vm->ioevents, node) {
+		if (entry->pio != (exit->reason == KVM_EXIT_IO) ||
+		    entry->address != exit->address ||
+		    (entry->length && entry->length != exit->length) ||
+		    (entry->datamatch && entry->data != value))
+			continue;
+		eventfd_signal(entry->eventfd, 1);
+		handled = true;
+		break;
+	}
+	mutex_unlock(&vm->ioevent_lock);
+	return handled;
+}
+
+enum { PVKVM_IOEVENT_HANDLED = 1 };
+
 static int complete_run(struct pvcpu *cpu, const struct pvkvm_run_exit *exit)
 {
 	struct run_page *page = cpu->page;
@@ -370,6 +421,8 @@ static int complete_run(struct pvcpu *cpu, const struct pvkvm_run_exit *exit)
 	case KVM_EXIT_IO:
 		if (exit->length != 1 || exit->address != PVKVM_IO_PORT || !exit->is_write)
 			return -EIO;
+		if (signal_ioeventfd(cpu->vm, exit))
+			return PVKVM_IOEVENT_HANDLED;
 		page->data = exit->data[0];
 		page->run.io.direction = KVM_EXIT_IO_OUT;
 		page->run.io.size = 1;
@@ -380,6 +433,8 @@ static int complete_run(struct pvcpu *cpu, const struct pvkvm_run_exit *exit)
 	case KVM_EXIT_MMIO:
 		if (!is_power_of_2(exit->length) || exit->length > sizeof(exit->data))
 			return -EIO;
+		if (signal_ioeventfd(cpu->vm, exit))
+			return PVKVM_IOEVENT_HANDLED;
 		if (!exit->is_write && hweight_long(cpu->vm->open_cpus) > 1)
 			return -EOPNOTSUPP;
 		page->run.mmio.phys_addr = exit->address;
@@ -404,7 +459,6 @@ static int run_cpu(struct pvcpu *cpu)
 	struct pvkvm *p = vm->provider;
 	const struct pvvm *memory;
 	struct pvkvm_run_exit exit;
-	struct pvkvm_mmio_completion completion = {};
 	int result;
 
 	result = mutex_lock_interruptible(&p->lock);
@@ -447,20 +501,27 @@ static int run_cpu(struct pvcpu *cpu)
 				    offsetof(struct pvkvm_cpuid_table, entries) +
 				    cpu->cpuid->count * sizeof(cpu->cpuid->entries[0]));
 	}
-	completion.length = cpu->mmio_read_width;
-	if (completion.length)
-		memcpy(completion.data, cpu->page->run.mmio.data, completion.length);
-	memcpy_toio(p->mailbox + PVKVM_COMPLETION_AT, &completion, sizeof(completion));
-	result = request_for_cpu(cpu, PVKVM_RUN, memory, &exit);
-	if (!result || result == -EINTR) {
-		cpu->ran = true;
-		cpu->mmio_read_width = 0;
-	}
-	if (!result) {
-		result = complete_run(cpu, &exit);
+	do {
+		struct pvkvm_mmio_completion completion = { .length = cpu->mmio_read_width };
+
+		if (completion.length)
+			memcpy(completion.data, cpu->page->run.mmio.data, completion.length);
+		memcpy_toio(p->mailbox + PVKVM_COMPLETION_AT, &completion, sizeof(completion));
+		result = request_for_cpu(cpu, PVKVM_RUN, memory, &exit);
+		if (!result || result == -EINTR) {
+			cpu->ran = true;
+			cpu->mmio_read_width = 0;
+		}
 		if (result)
+			break;
+		result = complete_run(cpu, &exit);
+		if (result < 0)
 			p->dead = true;
-	}
+		if (result == PVKVM_IOEVENT_HANDLED &&
+		    (READ_ONCE(cpu->page->run.immediate_exit) || signal_pending(current)))
+			result = -EINTR;
+		memory = NULL;
+	} while (result == PVKVM_IOEVENT_HANDLED);
 unlock:
 	mutex_unlock(&p->lock);
 	return result;
@@ -865,6 +926,9 @@ static long device_capability(unsigned long capability)
 	case KVM_CAP_USER_MEMORY:
 	case KVM_CAP_CHECK_EXTENSION_VM:
 	case KVM_CAP_IMMEDIATE_EXIT:
+	case KVM_CAP_IOEVENTFD:
+	case KVM_CAP_IOEVENTFD_NO_LENGTH:
+	case KVM_CAP_IOEVENTFD_ANY_LENGTH:
 		return 1;
 	case KVM_CAP_NR_MEMSLOTS:
 		return PVKVM_MAX_SLOTS;
@@ -902,6 +966,78 @@ static int install_slot(struct pvvm *vm, unsigned int id, u64 gpa,
 	return 0;
 }
 
+static long vm_ioeventfd(struct pvvm *vm, struct kvm_ioeventfd __user *user)
+{
+	const u32 allowed = KVM_IOEVENTFD_FLAG_DATAMATCH | KVM_IOEVENTFD_FLAG_PIO |
+			    KVM_IOEVENTFD_FLAG_DEASSIGN;
+	struct kvm_ioeventfd argument;
+	struct eventfd_ctx *eventfd;
+	struct pv_ioeventfd *entry, *new = NULL;
+	bool remove, pio, datamatch;
+	long result;
+
+	if (copy_from_user(&argument, user, sizeof(argument)))
+		return -EFAULT;
+	remove = argument.flags & KVM_IOEVENTFD_FLAG_DEASSIGN;
+	pio = argument.flags & KVM_IOEVENTFD_FLAG_PIO;
+	datamatch = argument.flags & KVM_IOEVENTFD_FLAG_DATAMATCH;
+	if (argument.flags & ~allowed ||
+	    (argument.len && (!is_power_of_2(argument.len) || argument.len > sizeof(u64))) ||
+	    (!argument.len && datamatch) || argument.addr + argument.len < argument.addr)
+		return -EINVAL;
+	eventfd = eventfd_ctx_fdget(argument.fd);
+	if (IS_ERR(eventfd))
+		return PTR_ERR(eventfd);
+	if (!remove) {
+		new = kzalloc(sizeof(*new), GFP_KERNEL_ACCOUNT);
+		if (!new) {
+			result = -ENOMEM;
+			goto out;
+		}
+		new->eventfd = eventfd;
+		new->address = argument.addr;
+		new->data = argument.datamatch;
+		new->length = argument.len;
+		new->pio = pio;
+		new->datamatch = datamatch;
+	}
+	result = mutex_lock_interruptible(&vm->ioevent_lock);
+	if (result)
+		goto out;
+	list_for_each_entry(entry, &vm->ioevents, node) {
+		if (entry->address != argument.addr || entry->pio != pio)
+			continue;
+		if (remove) {
+			if (entry->eventfd != eventfd || entry->length != argument.len ||
+			    entry->datamatch != datamatch ||
+			    (datamatch && entry->data != argument.datamatch))
+				continue;
+			list_del(&entry->node);
+			release_ioeventfd(entry);
+			goto unlock;
+		}
+		if (!entry->length || !argument.len ||
+		    (entry->length == argument.len &&
+		     (!entry->datamatch || !datamatch || entry->data == argument.datamatch))) {
+			result = -EEXIST;
+			goto unlock;
+		}
+	}
+	if (remove) {
+		result = -ENOENT;
+	} else {
+		list_add_tail(&new->node, &vm->ioevents);
+		mutex_unlock(&vm->ioevent_lock);
+		return 0;
+	}
+unlock:
+	mutex_unlock(&vm->ioevent_lock);
+out:
+	eventfd_ctx_put(eventfd);
+	kfree(new);
+	return result;
+}
+
 static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct pvvm *vm = file->private_data;
@@ -918,6 +1054,8 @@ static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return new_cpu(vm, arg);
 	if (cmd == KVM_CHECK_EXTENSION)
 		return device_capability(arg);
+	if (cmd == KVM_IOEVENTFD)
+		return vm_ioeventfd(vm, (void __user *)arg);
 	if (cmd != KVM_SET_USER_MEMORY_REGION)
 		return -ENOTTY;
 	if (copy_from_user(&memory, (void __user *)arg, sizeof(memory)))
@@ -970,6 +1108,8 @@ static int new_vm(struct pvkvm *p, unsigned long type)
 		return -ENOMEM;
 	vm->provider = p;
 	vm->owner = current->mm;
+	mutex_init(&vm->ioevent_lock);
+	INIT_LIST_HEAD(&vm->ioevents);
 	mmgrab(vm->owner);
 	kref_init(&vm->refs);
 	mutex_lock(&p->lock);

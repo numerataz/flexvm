@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <time.h>
@@ -27,6 +28,8 @@
 #define CPUID_SECOND_OFFSET 0x800
 #define MMIO_ENTRY_OFFSET 0x900
 #define MMIO_READ_OFFSET 0xa00
+#define PIO_EVENTFD_OFFSET 0xb00
+#define MMIO_DEASSIGNED_OFFSET 0xb80
 #define MMIO_BASE 0xd0000000ULL
 #define MMIO_FIRST_VALUE 0x5a443322U
 #define MMIO_SECOND_VALUE 0xaabbccddeeff0011ULL
@@ -339,6 +342,13 @@ static void check_cpuid_result(const unsigned char *ram, unsigned int id,
     check(absent == expected, "use the configured vendor's out-of-range CPUID behavior");
 }
 
+static void check_mmio_write(const struct kvm_run *run, uint64_t address, unsigned int length, uint64_t value)
+{
+    check(run->exit_reason == KVM_EXIT_MMIO && run->mmio.is_write &&
+          run->mmio.phys_addr == address && run->mmio.len == length &&
+          !memcmp(run->mmio.data, &value, length), "return a guest physical MMIO write and its exact bytes");
+}
+
 static void check_mmio_writes(int cpu, const struct kvm_run *run, const unsigned char *ram)
 {
     const struct {
@@ -353,12 +363,72 @@ static void check_mmio_writes(int cpu, const struct kvm_run *run, const unsigned
 
     for (unsigned int i = 0; i < sizeof(expected) / sizeof(expected[0]); i++) {
         timed_run(cpu);
-        check(run->exit_reason == KVM_EXIT_MMIO && run->mmio.is_write &&
-              run->mmio.phys_addr == expected[i].address && run->mmio.len == expected[i].length &&
-              !memcmp(run->mmio.data, &expected[i].value, expected[i].length),
-              "return a guest physical MMIO write and its exact bytes");
+        check_mmio_write(run, expected[i].address, expected[i].length, expected[i].value);
         check(ram[0xf0] == i, "stop before the instruction following each MMIO write");
     }
+}
+
+enum { MATCHED_MMIO, OTHER_DATA, WILDCARD_MMIO, MATCHED_PIO, EVENT_COUNT };
+
+struct ioevent_test {
+    struct kvm_ioeventfd settings[EVENT_COUNT];
+};
+
+static struct ioevent_test install_ioeventfds(int vm)
+{
+    struct ioevent_test test = {.settings = {
+        [MATCHED_MMIO] = {.addr = MMIO_BASE + 0x10, .len = 1, .datamatch = 0x39, .flags = KVM_IOEVENTFD_FLAG_DATAMATCH},
+        [OTHER_DATA] = {.addr = MMIO_BASE + 0x10, .len = 1, .datamatch = 0x3a, .flags = KVM_IOEVENTFD_FLAG_DATAMATCH},
+        [WILDCARD_MMIO] = {.addr = MMIO_BASE + 0x14},
+        [MATCHED_PIO] = {.addr = PVKVM_IO_PORT, .len = 1, .datamatch = 0xcc,
+                         .flags = KVM_IOEVENTFD_FLAG_DATAMATCH | KVM_IOEVENTFD_FLAG_PIO},
+    }};
+
+    check(ioctl(vm, KVM_CHECK_EXTENSION, KVM_CAP_IOEVENTFD) == 1 &&
+          ioctl(vm, KVM_CHECK_EXTENSION, KVM_CAP_IOEVENTFD_ANY_LENGTH) == 1, "query eventfd write capabilities");
+    for (unsigned int i = 0; i < EVENT_COUNT; i++) {
+        test.settings[i].fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        check(test.settings[i].fd >= 0 && ioctl(vm, KVM_IOEVENTFD, &test.settings[i]) == 0,
+              "register a guest VMM eventfd");
+    }
+    check(ioctl(vm, KVM_IOEVENTFD, &test.settings[MATCHED_MMIO]) == -1 && errno == EEXIST,
+          "reject a duplicate eventfd filter");
+    return test;
+}
+
+static void check_ioeventfds(int vm, int cpu, const struct kvm_run *run,
+                             const unsigned char *ram, const struct ioevent_test *test)
+{
+    eventfd_t value;
+
+    timed_run(cpu);
+    check_mmio_write(run, MMIO_BASE + 0x18, 8, 0x1122334455667788ULL);
+    check(ram[0xf0] == 2, "continue after the three matching eventfd writes");
+    for (unsigned int i = 0; i < EVENT_COUNT; i++) {
+        if (i == OTHER_DATA) {
+            check(eventfd_read(test->settings[i].fd, &value) == -1 && errno == EAGAIN,
+                  "do not signal a different data filter at the same address");
+        } else {
+            check(eventfd_read(test->settings[i].fd, &value) == 0 && value == 1,
+                  "signal the actual guest eventfd once for the matching write");
+        }
+    }
+    struct kvm_ioeventfd removal = test->settings[MATCHED_MMIO];
+    removal.flags |= KVM_IOEVENTFD_FLAG_DEASSIGN;
+    removal.fd = test->settings[OTHER_DATA].fd;
+    check(ioctl(vm, KVM_IOEVENTFD, &removal) == -1 && errno == ENOENT, "match eventfd identity on deassignment");
+    removal.fd = test->settings[MATCHED_MMIO].fd;
+    check(ioctl(vm, KVM_IOEVENTFD, &removal) == 0, "deassign the matching MMIO eventfd");
+    check(ioctl(vm, KVM_IOEVENTFD, &removal) == -1 && errno == ENOENT, "reject repeated eventfd deassignment");
+
+    timed_run(cpu);
+    check_mmio_write(run, MMIO_BASE + 0x10, 1, 0x39);
+    check(ram[0xf0] == 3, "return the write after eventfd deassignment");
+    check(eventfd_read(test->settings[MATCHED_MMIO].fd, &value) == -1 && errno == EAGAIN,
+          "do not notify a deassigned eventfd");
+    for (unsigned int i = 0; i < EVENT_COUNT; i++)
+        close(test->settings[i].fd);
+    puts("PASS KVM_IOEVENTFD signaled matched MMIO and PIO writes");
 }
 
 static void complete_mmio_reads(int cpu, struct kvm_run *run, const unsigned char *ram, uint64_t entry_base)
@@ -464,6 +534,7 @@ int main(int argc, char **argv)
     bool cpuid = false;
     bool mmio = false;
     bool mmio_read = false;
+    bool ioeventfd = false;
     check(argc == 2 || protected_mode, "specify RAM pages and optional protected or split mode");
     for (int i = 3; i < argc; i++) {
         if (!interrupt_run && !strcmp(argv[i], "interrupt"))
@@ -482,6 +553,8 @@ int main(int argc, char **argv)
             mmio = true;
         else if (!mmio_read && !strcmp(argv[i], "mmio-read"))
             mmio_read = true;
+        else if (!ioeventfd && !strcmp(argv[i], "ioeventfd"))
+            ioeventfd = true;
         else
             check(false, "invalid execution option");
     }
@@ -497,6 +570,7 @@ int main(int argc, char **argv)
     check(!cpuid || (protected_mode && !fpu && !msrs), "exercise CPUID in a separate protected-mode run");
     check(!mmio || (long_mode && !cpuid && !fpu && !msrs), "exercise MMIO in a separate long-mode run");
     check(!mmio_read || mmio, "test MMIO reads after the write exits");
+    check(!ioeventfd || mmio, "test eventfd notifications in the MMIO fixture");
     size_t pages = count;
     size_t ram_bytes = pages * 4096;
     uint64_t gpa = protected_mode ? PROTECTED_SLOT_GPA : PVKVM_GUEST_START;
@@ -691,6 +765,8 @@ int main(int argc, char **argv)
             0x48, 0x89, 0x87, 0x08, 0x01, 0, 0, /* mov [rdi+0x108], rax */
             0xb8, 0x41, 0, 0, 0, 0xf9,           /* mov eax, 0x41; stc */
         };
+        const unsigned char pio_notification[] = {0xb0, 0xcc, 0xe6, 0x30}; /* mov al, 0xcc; out 0x30, al */
+        const unsigned char deassigned_write[] = {0x41, 0xc6, 0x41, 0x10, 0x39}; /* mov byte [r9+0x10], 0x39 */
         size_t startup = 0x10;
         size_t resume = 0x40;
         if (fpu) {
@@ -713,9 +789,17 @@ int main(int argc, char **argv)
             install_jump(ram, MSR_RESUME_OFFSET + sizeof(msr_resume), resume);
         } else if (mmio) {
             const uint64_t address = LONG_ALIAS + 3 * HUGE_PAGE_SIZE;
+            int after_writes = mmio_read ? MMIO_READ_OFFSET : (int)startup;
             memcpy(ram + MMIO_ENTRY_OFFSET, mmio_entry, sizeof(mmio_entry));
             memcpy(ram + MMIO_ENTRY_OFFSET + 2, &address, sizeof(address));
-            install_jump(ram, MMIO_ENTRY_OFFSET + sizeof(mmio_entry), mmio_read ? MMIO_READ_OFFSET : startup);
+            install_jump(ram, MMIO_ENTRY_OFFSET + sizeof(mmio_entry),
+                         ioeventfd ? MMIO_DEASSIGNED_OFFSET : after_writes);
+            if (ioeventfd) {
+                memcpy(ram + PIO_EVENTFD_OFFSET, pio_notification, sizeof(pio_notification));
+                install_jump(ram, PIO_EVENTFD_OFFSET + sizeof(pio_notification), MMIO_ENTRY_OFFSET);
+                memcpy(ram + MMIO_DEASSIGNED_OFFSET, deassigned_write, sizeof(deassigned_write));
+                install_jump(ram, MMIO_DEASSIGNED_OFFSET + sizeof(deassigned_write), after_writes);
+            }
             if (mmio_read) {
                 memcpy(ram + MMIO_READ_OFFSET, mmio_read_code, sizeof(mmio_read_code));
                 install_jump(ram, MMIO_READ_OFFSET + sizeof(mmio_read_code), startup);
@@ -752,7 +836,7 @@ int main(int argc, char **argv)
     if (msrs)
         regs.rip = entry_base + MSR_ENTRY_OFFSET;
     if (mmio)
-        regs.rip = entry_base + MMIO_ENTRY_OFFSET;
+        regs.rip = entry_base + (ioeventfd ? PIO_EVENTFD_OFFSET : MMIO_ENTRY_OFFSET);
     if (cpuid) {
         regs.rip = entry_base + CPUID_ENTRY_OFFSET;
         regs.rsp = entry_base + 0xf00;
@@ -793,12 +877,20 @@ int main(int argc, char **argv)
         check(ioctl(other_cpu, KVM_SET_REGS, &other_regs) == 0, "set second vCPU registers");
         select_segments(other_cpu, true, false, gpa);
     }
-    close(vm);
+    struct ioevent_test notifications;
+    if (ioeventfd)
+        notifications = install_ioeventfds(vm);
+    else
+        close(vm);
     run->immediate_exit = 1;
     check(ioctl(cpu, KVM_RUN, 0) == -1 && errno == EINTR, "immediate exit");
     run->immediate_exit = 0;
-    if (mmio)
+    if (ioeventfd) {
+        check_ioeventfds(vm, cpu, run, ram, &notifications);
+        close(vm);
+    } else if (mmio) {
         check_mmio_writes(cpu, run, ram);
+    }
     if (mmio_read)
         complete_mmio_reads(cpu, run, ram, entry_base);
     unsigned long long first = timed_run(cpu);

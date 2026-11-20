@@ -88,6 +88,10 @@ Use `--mmio-read` to exercise both writes and reads. The single vCPU stops
 at each read. On the next ordinary `KVM_RUN`, it completes the access with
 the bytes written by the client into the mapped `kvm_run` page. Completion
 with a pending signal and parallel vCPU entry remain part of #1501.
+Add `--ioeventfd` to exercise real eventfd notifications on matching MMIO and
+port writes. The VM's registry supports address, access width, data matches
+and any-length writes. Matching writes signal the eventfd and continue the
+same vCPU. The fixture checks that a deassigned write returns to userspace.
 The worker uses one host mapping per consecutive extent. Highly fragmented
 slots can reach the host's mapping limit. A failed mapping releases the
 partially mapped worker span.
