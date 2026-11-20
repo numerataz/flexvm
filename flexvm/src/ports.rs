@@ -646,7 +646,7 @@ fn recv_datagram(socket: &UdpSocket, buf: &mut [u8]) -> io::Result<(usize, Socke
         let mut msg: libc::msghdr = std::mem::zeroed();
         (msg.msg_name, msg.msg_namelen) = ((&raw mut addr).cast(), size_of_val(&addr) as _);
         (msg.msg_iov, msg.msg_iovlen) = (&mut iov, 1);
-        (msg.msg_control, msg.msg_controllen) = (control.as_mut_ptr().cast(), size_of_val(&control));
+        (msg.msg_control, msg.msg_controllen) = (control.as_mut_ptr().cast(), size_of_val(&control) as _);
         let n = libc::recvmsg(socket.as_raw_fd(), &mut msg, 0);
         if n < 0 {
             return Err(io::Error::last_os_error());
@@ -689,7 +689,7 @@ fn send_datagram(socket: &UdpSocket, data: &[u8], peer: SocketAddr, local: Optio
         let mut iov = libc::iovec { iov_base: data.as_ptr().cast_mut().cast(), iov_len: data.len() };
         let mut msg: libc::msghdr = std::mem::zeroed();
         (msg.msg_name, msg.msg_iov, msg.msg_iovlen) = ((&raw mut addr).cast(), &mut iov, 1);
-        (msg.msg_control, msg.msg_controllen) = (control.as_mut_ptr().cast(), size_of_val(&control));
+        (msg.msg_control, msg.msg_controllen) = (control.as_mut_ptr().cast(), size_of_val(&control) as _);
         let c = &mut *libc::CMSG_FIRSTHDR(&msg);
         let len = match (peer, ip) {
             (SocketAddr::V4(peer), IpAddr::V4(ip)) => {

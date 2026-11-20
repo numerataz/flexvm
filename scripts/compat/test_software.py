@@ -255,7 +255,7 @@ class SoftwareCheck(unittest.TestCase):
     def test_c_checks_compile_with_strict_warnings(self):
         sources = ['software-init.c', 'nested-init.c']
         if platform.machine() == 'x86_64':
-            sources.extend(('kvm-abi.c', 'kvm-tsc.c'))
+            sources.extend(('kvm-abi.c', 'kvm-tsc.c', 'kvm-clock.c'))
         elif platform.machine() == 'aarch64':
             sources.append('kvm-arm.c')
         for source in sources:

@@ -13,7 +13,9 @@ These are configuration inputs, not Amazon Linux source or patches. The recipe
 applies `features.config` and `features-ARCH.config` to the pinned Linux tree,
 runs `olddefconfig`, and rejects any required setting that is not retained.
 The common fragment includes FlexVM's pmem/DAX root, memory hotplug, namespaces,
-cgroups and container facilities. Required drivers are built in, so stock OCI
+cgroups and container facilities. The fragment also requires `clsact`, classic
+BPF traffic filters and the plug qdisc so the normal nested FlexVM CLI can guard
+its TAP devices and queue traffic while suspending a child. Required drivers are built in, so stock OCI
 images do not need a matching modules package. `CONFIG_MODULES` allows additional
 user-supplied modules built for this exact kernel.
 

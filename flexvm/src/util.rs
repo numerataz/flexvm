@@ -1380,11 +1380,17 @@ pub fn is_nonce(s: &str) -> bool {
     s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Linux renameat2 is not exported by every libc, including musl. Both names
+/// stay valid C strings for the synchronous syscall; its result is 0 or -1.
+pub fn rename_at(from_dir: RawFd, from: &CStr, to_dir: RawFd, to: &CStr, flags: libc::c_uint) -> libc::c_int {
+    unsafe { libc::syscall(libc::SYS_renameat2, from_dir, from.as_ptr(), to_dir, to.as_ptr(), flags) as libc::c_int }
+}
+
 /// False if `path` exists.
 pub fn rename_noreplace(tmp: &Path, path: &Path) -> io::Result<bool> {
     use std::os::unix::ffi::OsStrExt;
     let (src, dest) = (std::ffi::CString::new(tmp.as_os_str().as_bytes())?, std::ffi::CString::new(path.as_os_str().as_bytes())?);
-    match eintr(|| unsafe { libc::renameat2(libc::AT_FDCWD, src.as_ptr(), libc::AT_FDCWD, dest.as_ptr(), libc::RENAME_NOREPLACE) }) {
+    match eintr(|| rename_at(libc::AT_FDCWD, &src, libc::AT_FDCWD, &dest, libc::RENAME_NOREPLACE)) {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
         res => res.map(|_| true),
     }
