@@ -1173,29 +1173,40 @@ class KvmChild:
             raise RuntimeError("native x86 worker still has pending execution")
         self.frozen = frozen
 
+    def can_capture(self):
+        if not self.frozen or not self.checkpoint_ready():
+            return False
+        for cpu, channel in enumerate(self.lanes.connections):
+            channel.connection.sendall(bytes((ord("D"), cpu)))
+            if self.checkpoint_status(channel.connection, retry=True) == -errno.EAGAIN:
+                return False
+        return True
+
     def checkpoint_interrupts(self, attached):
         if not self.frozen or not self.checkpoint_ready():
             raise RuntimeError("native IRQFD handoff requires fenced vCPU lanes")
         connection = self.channel.connection
         connection.sendall(bytes((ord("i"), 0, attached)))
-        self.checkpoint_status()
+        self.checkpoint_status(connection)
 
     def checkpoint_file(self, fd, *, restore=False):
-        if not self.frozen or not self.checkpoint_ready():
-            raise RuntimeError("native x86 checkpoint requires fenced vCPU lanes")
+        if not self.frozen or not self.checkpoint_ready() or (not restore and not self.can_capture()):
+            raise RuntimeError("native x86 checkpoint requires completed I/O and fenced vCPU lanes")
         connection = self.channel.connection
         packet = b"b\0" if restore else b"a\0"
         if socket.send_fds(connection, [packet], [fd]) != len(packet):
             raise RuntimeError("short native x86 checkpoint request")
-        self.checkpoint_status()
+        self.checkpoint_status(connection)
 
-    def checkpoint_status(self):
-        response = self.channel.connection.recv(5)
+    @staticmethod
+    def checkpoint_status(connection, *, retry=False):
+        response = connection.recv(5)
         if len(response) != 4:
             raise RuntimeError("invalid native x86 checkpoint response")
         status, = struct.unpack("<i", response)
-        if status:
+        if status and not (retry and status == -errno.EAGAIN):
             raise OSError(-status, os.strerror(-status))
+        return status
 
     def run(self, cpu, cancellation, completion):
         sequence = cancellation.sequence

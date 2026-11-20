@@ -103,12 +103,9 @@ def main():
             finish(1)
             if child.lanes.written_pio != [(PORT, 1, b"\x21")]:
                 raise RuntimeError("native source did not reach the first I/O exit")
-            begin(2)
-            # Observe entry into the loop before sending the cancellation.
-            # A cancelled vCPU may otherwise report an interrupt before entry.
-            select.select(child.lanes.descriptors(), (), (), .02)
-            finish(2, -errno.EINTR, hold=True)
             child.freeze_run_control(True)
+            if not child.can_capture():
+                raise RuntimeError("native I/O fence did not complete the outstanding OUT")
             original = child.registers(0)
             child.checkpoint_interrupts(False)
             os.eventfd_write(interrupts[6], 1)
