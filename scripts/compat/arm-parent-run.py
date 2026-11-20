@@ -74,6 +74,7 @@ class NativeArm:
         self.control, peer = socket.socketpair(type=socket.SOCK_SEQPACKET)
         self.control.settimeout(3)
         self.lanes = {}
+        self.read_width = {}
         proc = None
         try:
             with peer:
@@ -136,7 +137,22 @@ class NativeArm:
         status, reason, payload, extra = reply_from(self.lanes[cpu].socket)
         if extra or (reason and (status or operation != PARENT["RUN"])):
             raise RuntimeError("invalid native ARM vCPU reply")
+        completed = (operation == PARENT["RUN"] and status in (0, -errno.EINTR, -errno.EAGAIN)
+                     or operation == PARENT["COMPLETE_READ"] and status == 0)
+        if completed:
+            self.read_width.pop(cpu, None)
+        if reason == PARENT["KVM_EXIT_MMIO"]:
+            _, length, writing = struct.unpack_from("<QII", payload)
+            if not writing:
+                self.read_width[cpu] = length
         return status, reason, payload
+
+    def checkpoint_ready(self):
+        return not self.read_width and all(lane.live is None for lane in self.lanes.values())
+
+    def freeze_run_control(self, frozen):
+        if frozen and not self.checkpoint_ready():
+            raise RuntimeError("native ARM worker still has pending execution")
 
     def cancel(self, cpu):
         self.require(CANCEL_RUN, cpu=cpu, sequence=self.lanes[cpu].sequence)
@@ -148,6 +164,7 @@ class NativeArm:
             raise RuntimeError(f"failed to stop native ARM vCPU {cpu}") from error
         finally:
             lane = self.lanes.pop(cpu, None)
+            self.read_width.pop(cpu, None)
             if lane:
                 lane.socket.close()
 
@@ -398,7 +415,6 @@ def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=
         if ipa_bits is None and engine == "kvm":
             raise RuntimeError("native ARM parent execution requires an available KVM worker")
     use_tcg = ipa_bits is None
-    checkpoint = checkpoint and use_tcg
     if use_tcg:
         if tcg_qemu is None:
             raise RuntimeError("ARM TCG parent execution requires a software CPU engine")
@@ -410,7 +426,7 @@ def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=
             options = PARENT["native_query"]([tcg_qemu, "-device", "flexvm-mmio-run,help"])
             checkpoint = b"checkpoint-control" in options.stdout + options.stderr
 
-    if restore and not checkpoint:
+    if restore and (not checkpoint or not use_tcg):
         raise RuntimeError("restoring ARM parent state requires the checkpoint-capable engine")
     with ExitStack() as resources:
         restore_inputs = resources.enter_context(ExitStack())
@@ -532,8 +548,8 @@ def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=
             restore_interrupts(irq_fds, pending)
 
         return serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, create_worker,
-                              memory, outer_bytes, max_pages, gate=gate, capture=capture,
-                              rollback=rollback, worker=restored_worker)
+                              memory, outer_bytes, max_pages, gate=gate, capture=capture if use_tcg else None,
+                              rollback=rollback if use_tcg else None, worker=restored_worker)
 
 
 def main():
