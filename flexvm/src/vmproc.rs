@@ -789,6 +789,8 @@ pub struct Runtime {
     restart_kept: Mutex<Option<(String, Vec<u8>)>>,
     /// A SIGTERM (`flexvm stop`) came: an app's exit as it lands is never restarted (a stop ends a restart loop).
     stop_asked: AtomicBool,
+    /// A distro guest completed a clean reboot (`LINUX_REBOOT_CMD_RESTART`) rather than a power-off.
+    guest_reboot: AtomicBool,
     /// Its `run`'s stdin is a terminal: no hint when its app exits at once.
     pub tty: AtomicBool,
     /// In the foreground (a `run` or `start -a` follows it): it leaves no exited record.
@@ -1576,7 +1578,13 @@ impl Proc {
         };
         // How long its app ran: a resumed VM's, started by another process, ran at least that long.
         let ran = self.app_started.lock().unwrap().map_or(crate::app::RAN_LONG, |t| t.elapsed());
-        let again = !self.stop_asked.load(Ordering::SeqCst) && crate::restart::on_exit(&mut rec, ran);
+        let stopped = self.stop_asked.load(Ordering::SeqCst);
+        let policy_again = !stopped && crate::restart::on_exit(&mut rec, ran);
+        let reboot_again = !policy_again && !stopped && self.guest_reboot.load(Ordering::SeqCst);
+        if reboot_again {
+            crate::restart::on_guest_reboot(&mut rec, ran);
+        }
+        let again = policy_again || reboot_again;
         if let Err(e) = crate::host::store_private(&path, &rec, true) {
             crate::log!("vm {}: its exited record {}: {e}", vm.name, path.display());
             return false;
@@ -1584,8 +1592,10 @@ impl Proc {
         if !again {
             return false;
         }
-        if let Err(e) = crate::restart::keep(&self.host, &name, &rec) {
-            crate::log!("vm {name}: keeping its restart policy's record: {e}");
+        if policy_again {
+            if let Err(e) = crate::restart::keep(&self.host, &name, &rec) {
+                crate::log!("vm {name}: keeping its restart policy's record: {e}");
+            }
         }
         match crate::restart::schedule(&self.host, &name) {
             Ok(()) => true,
@@ -2504,10 +2514,18 @@ impl Proc {
     /// Death's end: why goes in `RUN/vms/NAME.failed`, exit 124.
     pub fn end_died(&self, op: &Op, last: Option<(&mut dyn std::io::Write, Value)>) -> ! {
         let vm = self.vm();
-        if vm.pager.failed().is_none() && vm.distro_powered_off() {
-            crate::log!("vm {}: guest powered off", vm.name);
-            *self.exiting.lock().unwrap() = Some(0);
-            self.finish(op, End::Gone, 0, last)
+        if vm.pager.failed().is_none() {
+            if let Some(shutdown) = vm.distro_shutdown() {
+                match shutdown {
+                    crate::fc::GuestShutdown::PowerOff => crate::log!("vm {}: guest powered off", vm.name),
+                    crate::fc::GuestShutdown::Reboot => {
+                        crate::log!("vm {}: guest rebooted", vm.name);
+                        self.guest_reboot.store(true, Ordering::SeqCst);
+                    }
+                }
+                *self.exiting.lock().unwrap() = Some(0);
+                self.finish(op, End::Gone, 0, last)
+            }
         }
         let why = format!("{}; {}", vm.pager.failed().unwrap_or("its firecracker exited"), vm.post_mortem());
         crate::log!("vm {}: died: {why}", vm.name);

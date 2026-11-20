@@ -368,7 +368,7 @@ class TcgArm:
         return not self.read_width and all(lane.live is None for lane in self.lanes.values())
 
     def can_capture(self):
-        return self.proc is not None
+        return self.proc is None or self.proc.poll() is None
 
     def freeze_run_control(self, frozen):
         if self.qmp and self.proc.poll() is None:
