@@ -567,6 +567,20 @@ mod tests {
 
     #[test]
     fn inherited_disk_lock_survives_owner_descriptor_close() {
+        const CHILD: &str = "FLEXVM_TEST_VOLUME_WRITER_LEASE";
+        if std::env::var_os(CHILD).is_none() {
+            // Other tests can fork while the lease is open. Run the lease
+            // owner alone so only its designated child can inherit the fd.
+            let status = crate::test_util::status(
+                Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "volume::tests::inherited_disk_lock_survives_owner_descriptor_close"])
+                    .env(CHILD, "1"),
+            )
+            .unwrap();
+            assert!(status.success(), "volume writer lease helper: {status}");
+            return;
+        }
+
         let state = crate::test_util::TempDir::new("volume-lease");
         let catalog = Catalog::open(&state).unwrap();
         let id = catalog.create("busy", 512).unwrap().metadata.id;

@@ -49,9 +49,10 @@ alternates between a sustained CPU loop and timer sleeps. Observations retain th
 outer supervisor and VMM PID/start time, inner process identity, separate RAM
 canaries, an inner counter and monotonic time. The test repeats normal
 pause/unpause, fresh-owner stop/start, rollback and publication-owner-death
-recovery, and checks that the inner guest boots once. This extends the earlier
-input-gated raw-emulator experiment; cross-host and accelerated nested migration
-still have separate acceptance gates.
+recovery, and checks that the inner guest boots once. It also transfers a
+checkpoint with the inner CPU loop active, checks that both levels retain
+their process and memory identity, and requires fresh inner timer and CPU
+progress before an orderly shutdown.
 
 ## Execution and state identity
 
@@ -82,7 +83,7 @@ owned by the host and inaccessible for writes by guests or other principals. No 
 
 The x86 profile keeps SVM and NPT enabled and requires QEMU 9.2 or newer for real
 mode nested page walks. The pinned x86 engine is 10.2.1 with the TCG SVM restore fix from
-`scripts/build-qemu.sh` (package `flexvm-tcg-nested-1`). Stock Linux builds can
+`scripts/build-qemu.sh` (package `flexvm-tcg-nested-2`). Stock Linux builds can
 incorrectly require KVM's opaque nested-state blob when restoring TCG while a
 vCPU is in SVM guest mode. The patch restricts that validation to the KVM
 accelerator; TCG's architectural SVM/NPT state uses its existing serialization.
@@ -377,3 +378,15 @@ canonical profiles generated locally for these two layouts. It rebuilds the
 engine command from the matched layout and fresh host endpoints, preserving
 the selected layout on subsequent captures. Manifest arguments are never
 executed directly. Active and saved guest metadata report the selected address.
+
+Package `flexvm-tcg-nested-2` also faults Intel's feature-control MSR on SVM
+CPUs. The old unknown-MSR default returned zero, causing the guest Linux KVM
+driver to advertise state it could not read back during an unchanged client's
+snapshot. The x86 ABI acceptance checks advertised feature-control state and
+runs ten reference checks. Read/write interception still precedes the fault;
+non-SVM behavior is unchanged.
+
+Use the updated engine for newly booted software guests. A restored older guest
+retains the kernel capability list captured in its RAM; changing an engine does
+not repair that cached list. Keep the engine recorded by existing checkpoints
+available, and retain normal engine-identity fencing.

@@ -125,7 +125,7 @@ FILTER
     curl --fail --silent --show-error --retry 20 --retry-connrefused --retry-delay 1 http://127.0.0.1:18083/cookie > "$base/gvisor-cookie"
     pod exec sandbox-server cat /proc/1/stat > "$base/gvisor-process"
     pod run --rm --network sandbox-net --cgroup-parent=/sandbox-parent "$image" wget -qO- http://sandbox-server:8080/cookie | cmp - "$base/gvisor-cookie"
-    pod run --rm --network sandbox-net --cgroup-parent=/sandbox-parent "$image" wget -qO /dev/null http://example.com
+    pod run --rm --network sandbox-net --cgroup-parent=/sandbox-parent "$image" wget -qO /dev/null https://github.com/robots.txt
     ;;
 verify)
     chroot "$base/chroot" /bin/sh -ec 'test ! -e "$1"; test "$(cat /marker)" = "$2"' sh "$base/guest-marker" "$nonce"

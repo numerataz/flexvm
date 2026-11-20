@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import shlex
 import signal
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,7 @@ import time
 import uuid
 
 ROOT = Path(__file__).resolve().parent.parent
+seed_files = runpy.run_path(str(ROOT / 'scripts/compat/inputs.py'))['seed_files']
 BASELINE = {"namespace." + name for name in ("user", "mount", "pid", "network", "ipc", "uts", "cgroup")}
 BASELINE |= {"cgroup.delegation", "storage.overlay", "storage.capacity", "security.seccomp", "kernel.pidfd", "kernel.memfd"}
 
@@ -96,9 +98,21 @@ class Suite:
                                        "sha256": hashlib.sha256(self.workload.encode()).hexdigest()}
 
     def workload_step(self, step, phase="run"):
-        return self.host.call("exec", "-i", self.name, "sh", "-s", "--", step, self.nonce, phase,
-                              stdin=self.workload, timeout=900 if step == "prepare" else 180,
-                              output=self.output / f"{step}-{phase}")
+        def run(action, timeout):
+            return self.host.call("exec", "-i", self.name, "sh", "-s", "--", action, self.nonce, phase,
+                                  stdin=self.workload, timeout=timeout,
+                                  output=self.output / f"{action}-{phase}")
+
+        try:
+            return run(step, 900 if step == "prepare" else 180)
+        except (Failure, subprocess.TimeoutExpired):
+            if self.args.workload_diagnostics and step == "verify":
+                try:
+                    diagnostics = run("diagnose", 30)
+                    print(f"Workload diagnostics for {phase}:\n{diagnostics[-16_384:]}", file=sys.stderr)
+                except (Failure, subprocess.TimeoutExpired, OSError) as error:
+                    self.report["workload_diagnostics_error"] = str(error)
+            raise
 
     def exec(self, *argv, **kw):
         return self.host.call("exec", self.name, *argv, **kw)
@@ -113,6 +127,15 @@ class Suite:
                              *(["--entrypoint", '["sleep","infinity"]'] if self.args.boot == "app" else []), self.image)
         self.probe_attempted = True
         self.source.call("cp", str(probe), f"{self.name}:{self.probe}")
+        self.report['seed_files'] = []
+        for source, destination in getattr(self.args, 'seed', []):
+            self.source.call('exec', self.name, 'mkdir', '-p', str(Path(destination).parent))
+            self.source.call('cp', str(source), f'{self.name}:{destination}')
+            expected = hashlib.sha256(source.read_bytes()).hexdigest()
+            actual = self.source.call('exec', self.name, 'sha256sum', destination).split()[0]
+            if expected != actual:
+                raise Failure(f'seed digest changed: {destination}')
+            self.report['seed_files'].append(dict(destination=destination, sha256=expected))
         if self.workload is not None:
             self.report["root_filesystem"] = self.host.call("exec", "-i", self.name, "sh", "-s", "--", "prepare", self.nonce,
                                                             stdin=self.inode_probe)
@@ -248,6 +271,9 @@ def parse_args(argv=None):
     p.add_argument("--image", default="ubuntu:24.04")
     p.add_argument("--boot", choices=("app", "systemd", "openrc"), default="app", help="init profile for an owned VM")
     p.add_argument("--workload", type=Path, help="guest shell script: prepare/verify NONCE PHASE; runs only in an owned VM")
+    p.add_argument("--workload-diagnostics", action="store_true",
+                   help="run the workload's diagnose action after failed verification")
+    p.add_argument('--seed', nargs=2, action='append', default=[], metavar=('SOURCE', 'DEST'))
     p.add_argument("--vm", help="probe an existing VM without changing its lifecycle")
     p.add_argument("--case", dest="cases", action="append", choices=("capabilities", "namespaces"))
     p.add_argument("--require", action="append", default=[], metavar="PROBE", help="fail unless this probe succeeds")
@@ -261,10 +287,18 @@ def parse_args(argv=None):
     p.add_argument("--cc", default=os.environ.get("CC", "cc"))
     p.add_argument("--output", type=Path, required=True)
     args = p.parse_args(argv)
+    try:
+        args.seed = seed_files(args.seed)
+    except (OSError, ValueError) as error:
+        p.error(str(error))
+    if args.vm and args.seed:
+        p.error('--seed requires an isolated owned VM')
     args.phases = args.phases.split(",")
     args.cases = args.cases or (["capabilities"] if args.vm else ["capabilities", "namespaces"])
     if not args.phases or args.phases[0] != "run" or len(set(args.phases)) != len(args.phases) or set(args.phases) - {"run", "suspend", "checkpoint", "migration"}:
         p.error("phases must start with run and contain each supported phase at most once")
+    if args.workload_diagnostics and not args.workload:
+        p.error("--workload-diagnostics requires --workload")
     if args.vm and args.workload:
         p.error("--workload requires an isolated owned VM")
     if args.vm and (args.phases != ["run"] or "namespaces" in args.cases):
