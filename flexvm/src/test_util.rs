@@ -137,12 +137,25 @@ fn helper_process_is_killed_and_reaped_on_unwind() {
 #[derive(Debug)]
 pub struct TempDir(PathBuf);
 
+fn temp_root() -> &'static Path {
+    static ROOT: std::sync::OnceLock<&'static Path> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let shm = Path::new("/dev/shm");
+        if shm.is_dir() && unsafe { libc::access(c"/dev/shm".as_ptr(), libc::W_OK | libc::X_OK) } == 0 {
+            shm
+        } else {
+            Path::new("/tmp")
+        }
+    })
+}
+
 impl TempDir {
     pub fn new(name: &str) -> Self {
         static SWEEP: Once = Once::new();
-        // Unix socket fixtures must fit sun_path regardless of TMPDIR.
-        let root = Path::new("/tmp");
-        // /tmp can be shared by PID namespaces: a live test elsewhere may look dead
+        // Unix socket fixtures must fit sun_path regardless of TMPDIR; prefer /dev/shm (tmpfs)
+        // when writable to avoid disk fsync overhead, falling back to /tmp.
+        let root = temp_root();
+        // /dev/shm and /tmp can be shared by PID namespaces: a live test elsewhere may look dead
         // here. Never sweep another freshly started suite's fixtures.
         SWEEP.call_once(|| sweep(root, std::time::Duration::from_secs(24 * 60 * 60)));
         Self::new_in(root, name)
@@ -151,7 +164,7 @@ impl TempDir {
     pub fn new_in(root: &Path, name: &str) -> Self {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         loop {
-            let dir = root.join(format!("flexvm-test-{name}-{}-{}", NEXT.fetch_add(1, Ordering::Relaxed), std::process::id()));
+            let dir = root.join(format!("fvt-{name}-{}-{}", NEXT.fetch_add(1, Ordering::Relaxed), std::process::id()));
             match fs::DirBuilder::new().mode(0o700).create(&dir) {
                 Ok(()) => return Self(dir),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -194,6 +207,7 @@ fn sweep(root: &Path, minimum_age: std::time::Duration) {
         let Some(name) = name.to_str() else { continue };
         // Only test fixtures: in particular, flexvm-s-<uid> is a production socket root.
         const PREFIXES: &[&str] = &[
+            "fvt-",
             "flexvm-test-",
             "flexvm-host-",
             "flexvm-standby-",
@@ -248,7 +262,7 @@ fn sweep(root: &Path, minimum_age: std::time::Duration) {
 #[test]
 fn temporary_directories_are_unique_and_removed_on_unwind() {
     let first = TempDir::new("guard");
-    assert_eq!(first.parent(), Some(Path::new("/tmp")), "socket fixtures need a short root regardless of TMPDIR");
+    assert_eq!(first.parent(), Some(temp_root()), "socket fixtures need a short root regardless of TMPDIR");
     let path = first.to_path_buf();
     let other = TempDir::new("guard");
     assert_ne!(*first, *other);
@@ -277,6 +291,7 @@ fn sweep_removes_dead_fixtures_and_preserves_live_and_unrelated_directories() {
         format!("flexvm-identity-{dead}-2"),
         format!("flexvm-api-{dead}-3"),
         format!("fvs-test-{dead}-4"),
+        format!("fvt-guard-5-{dead}"),
         format!("flexvm-test-guard-5-{dead}"),
     ];
     let kept = [format!("flexvm-host-live-{}", std::process::id()), format!("unrelated-{dead}"), "flexvm-host-no-pid".into(), format!("flexvm-s-{dead}")];

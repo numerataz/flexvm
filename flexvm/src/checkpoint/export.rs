@@ -1318,7 +1318,8 @@ mod tests {
         // A flipped byte in a page, in a manifest, in the template's memory.
         let page = tar.windows(PAGE_SIZE.min(64)).position(|w| w[..8] == [1, 32, 63, 94, 125, 156, 187, 218]).unwrap();
         let manifest = tar.windows(12).position(|w| w == b"\"data_pages\"").unwrap() + 15;
-        let mem = tar.len() - 2 * BLOCK - 100;
+        // Flip the last non-zero byte of the archive payload (avoids landing in trailing 512-byte tar padding).
+        let mem = tar[..tar.len() - 2 * BLOCK].iter().rposition(|&b| b != 0).unwrap();
         for (at, want) in [(page, "data page 0 does not match"), (manifest, "manifest checksum mismatch"), (mem, "")] {
             let mut bad = tar.clone();
             bad[at] ^= 0x40;
