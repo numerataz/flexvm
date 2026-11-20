@@ -322,6 +322,21 @@ jobs:
           key: module-artifacts-${{ matrix.arch }}-${{ hashFiles('scripts/build-kernel.sh', 'scripts/package-kernel-modules.sh', 'scripts/fetch.sh', 'scripts/versions.sh', 'scripts/checksums.sha256', 'kernel/config/*', 'kernel/features*.config', 'kernel/source.env', 'kernel/patches/*', 'scripts/apply-kernel-patches.sh') }}
       - name: Fetch matching kernel, runtime modules and SDK
         run: scripts/fetch.sh --kernel-sdk --state "$RUNNER_TEMP/software-state"
+      - name: ARM guest negotiates parent KVM VM control
+        if: matrix.arch == 'aarch64'
+        run: |
+          sdk=$(mktemp -d "$RUNNER_TEMP/arm-parent-kvm-sdk.XXXXXXXX")
+          trap 'rm -rf "$sdk"' EXIT
+          artifacts="$RUNNER_TEMP/software-state/artifacts"
+          tar --extract --gzip --no-same-owner --file="$artifacts/kernel-sdk.tar.gz" --directory="$sdk"
+          release=$(jq -er '.release' "$sdk/usr/lib/flexvm/kernel-modules.json")
+          bundle="$RUNNER_TEMP/arm-parent-kvm-bundle"
+          scripts/compat/parent-kvm/build.sh "$sdk/lib/modules/$release/build" "$bundle" --native
+          trace="$RUNNER_TEMP/arm-parent-frontend.strace"
+          strace -f -e trace=file -o "$trace" python3 scripts/compat/arm-parent-frontend.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64" --kernel "$artifacts/vmlinux" \
+            --bundle "$bundle" --output "$RUNNER_TEMP/arm-parent-frontend"
+          if grep -F '"/dev/kvm"' "$trace"; then exit 1; fi
       - name: Parent TCG worker through the guest KVM API
         if: matrix.arch == 'x86_64'
         run: |
