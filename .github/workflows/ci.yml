@@ -18,10 +18,10 @@ permissions:
   contents: read
 
 concurrency:
-  # The nightly run never holds up (or is held up by) a push to main.
-  group: ci-${{ github.event_name == 'schedule' && 'nightly-' || '' }}${{ github.ref }}
-  # Runs on main are never cancelled.
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # Keep nightly and on-demand runs independent of automatic verification.
+  group: ci-${{ github.event_name == 'schedule' && 'nightly-' || github.event_name == 'workflow_dispatch' && 'manual-' || '' }}${{ github.ref }}
+  # A newer PR revision or main tip supersedes its older automatic run.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -340,11 +340,13 @@ jobs:
           sudo systemd-run --scope --collect -p MemoryMax=4G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-modules.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-modules" --timeout 1800
           cat "$RUNNER_TEMP/software-modules/report.json"
 
-  # A pull request runs one workload of each kind, on x86_64: a container runtime under flexvm-init
+  # A pull request into main runs one workload of each kind, on x86_64: a container runtime under flexvm-init
   # (podman), a rootless one under systemd (rootless-containerd), a container manager (nspawn) and
   # Kubernetes (k3s). Every workload on both architectures (22 jobs, most of a run's runner time) runs
   # on main, nightly, and on request for a branch: gh workflow run ci.yml --ref <branch>.
+  # Stacked PRs still run formatting, unit tests, software execution and guest modules on both architectures.
   software-workloads:
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
     name: guest workload without KVM (${{ matrix.arch }}, ${{ matrix.workload }})
     runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: ${{ (matrix.workload == 'k3s' || matrix.workload == 'kind') && 80 || 45 }}
@@ -478,6 +480,7 @@ jobs:
           cat "$RUNNER_TEMP/software-workload/report.json"
 
   e2e:
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
     # Shards (scripts/e2e.py --shard): pr (the cases, and the main and recovery scenarios) in four
     # splits side by side, balanced by e2e.py's COST; the scheduled run takes heavy (GiB-scale
     # guests, long windows) one scenario at a time.
@@ -840,6 +843,7 @@ jobs:
   # Firecracker for aarch64-unknown-linux-musl (cached as e2e's is), the aarch64 artifacts fetched and
   # checked against their pins, the test image, and what needs no KVM (e2e.py --no-kvm).
   e2e-aarch64:
+    if: github.event_name != 'pull_request' || github.base_ref == 'main'
     name: end-to-end (aarch64, ${{ matrix.shard }})
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
