@@ -461,14 +461,34 @@ async fn forward(io: &mut tokio::net::UnixStream, stream: &mut Channel, side: Si
     };
     tokio::pin!(outgoing, incoming, cancellation);
     tokio::select! {
-        result = &mut outgoing => {
-            if !result? { tokio::select! { result = &mut incoming => { result?; }, result = &mut cancellation => result?, } }
-            Ok(())
-        }
-        result = &mut incoming => {
-            if !result? { tokio::select! { result = &mut outgoing => { result?; }, result = &mut cancellation => result?, } }
-            Ok(())
-        }
+        result = &mut outgoing => match result {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                tokio::select! { result = &mut incoming => { result?; }, result = &mut cancellation => result?, }
+                Ok(())
+            }
+            // A remote reset after sending a reply fails client writes with
+            // WriteZero while the response is still buffered to drain.
+            Err(_) if matches!(side, Side::Client) => {
+                tokio::select! { result = &mut incoming => { result?; }, result = &mut cancellation => result?, }
+                Ok(())
+            }
+            Err(error) => Err(error),
+        },
+        result = &mut incoming => match result {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                tokio::select! { result = &mut outgoing => { result?; }, result = &mut cancellation => result?, }
+                Ok(())
+            }
+            // An early agent reply and close fails incoming writes with EPIPE
+            // while the reply is still buffered in the local socket pair.
+            Err(_) if matches!(side, Side::Agent) => {
+                tokio::select! { result = &mut outgoing => { result?; }, result = &mut cancellation => result?, }
+                Ok(())
+            }
+            Err(error) => Err(error),
+        },
         result = &mut cancellation => result,
     }
 }
@@ -933,5 +953,127 @@ mod tests {
         }
         drop(client);
         done.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+    }
+
+    #[test]
+    fn client_drains_buffered_reply_when_write_hits_remote_reset() {
+        runtime().unwrap().block_on(async {
+            let (host_wire, guest_wire) = UnixStream::pair().unwrap();
+            host_wire.set_nonblocking(true).unwrap();
+            guest_wire.set_nonblocking(true).unwrap();
+            let host_wire = tokio::net::UnixStream::from_std(host_wire).unwrap();
+            let guest_wire = tokio::net::UnixStream::from_std(guest_wire).unwrap();
+            let mut client_conn = yamux::Connection::new(host_wire.compat(), yamux::Config::default(), yamux::Mode::Client);
+            let mut server_conn = yamux::Connection::new(guest_wire.compat(), yamux::Config::default(), yamux::Mode::Server);
+
+            let client_stream = poll_fn(|cx| client_conn.poll_new_outbound(cx)).await.unwrap();
+            let mut client_ch = Channel::new(client_stream);
+            client_ch.write_all(b"hi").await.unwrap();
+            client_ch.flush().await.unwrap();
+
+            let server_task = tokio::spawn(async move {
+                let server_stream = poll_fn(|cx| server_conn.poll_next_inbound(cx)).await.unwrap().unwrap();
+                let reply_task = tokio::spawn(async move {
+                    let mut server_ch = Channel::new(server_stream);
+                    let mut buf = [0; 2];
+                    server_ch.read_exact(&mut buf).await.unwrap();
+                    server_ch.write_all(b"error: reply").await.unwrap();
+                    server_ch.flush().await.unwrap();
+                    // Dropping server_ch sends RST right after the reply frame.
+                });
+                while let Some(Ok(_)) = poll_fn(|cx| server_conn.poll_next_inbound(cx)).await {}
+                reply_task.await.unwrap();
+            });
+
+            let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+            let client_driver = tokio::spawn(async move {
+                let mut closed_tx = Some(closed_tx);
+                loop {
+                    let _ = tokio::time::timeout(Duration::from_millis(5), poll_fn(|cx| client_conn.poll_next_inbound(cx))).await;
+                    if let Some(tx) = closed_tx.take() {
+                        if tx.send(()).is_err() {
+                            break;
+                        }
+                    }
+                    break;
+                }
+                while let Some(Ok(_)) = poll_fn(|cx| client_conn.poll_next_inbound(cx)).await {}
+            });
+            let _ = closed_rx.await;
+            // Wait until the client stream has buffered both the reply and RST.
+            let until = Instant::now() + Duration::from_secs(3);
+            while !client_ch.framed.get_ref().get_ref().is_closed() {
+                assert!(Instant::now() < until, "client stream did not observe remote reset");
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+
+            let (mut peer, io) = UnixStream::pair().unwrap();
+            io.set_nonblocking(true).unwrap();
+            let mut io = tokio::net::UnixStream::from_std(io).unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            // Client already queued its request into the local socket pair before
+            // forward() polls outgoing against the reset Yamux stream.
+            peer.write_all(b"FENCE 2 123\n").unwrap();
+            let _ = forward(&mut io, &mut client_ch, Side::Client).await;
+            drop(io);
+            drop(client_ch);
+            let mut reply = [0; 12];
+            peer.read_exact(&mut reply).unwrap();
+            assert_eq!(&reply, b"error: reply");
+            client_driver.abort();
+            server_task.abort();
+        });
+    }
+
+    #[test]
+    fn agent_drains_buffered_reply_when_incoming_write_hits_local_close() {
+        runtime().unwrap().block_on(async {
+            let (host_wire, guest_wire) = UnixStream::pair().unwrap();
+            host_wire.set_nonblocking(true).unwrap();
+            guest_wire.set_nonblocking(true).unwrap();
+            let host_wire = tokio::net::UnixStream::from_std(host_wire).unwrap();
+            let guest_wire = tokio::net::UnixStream::from_std(guest_wire).unwrap();
+            let mut client_conn = yamux::Connection::new(host_wire.compat(), yamux::Config::default(), yamux::Mode::Client);
+            let mut server_conn = yamux::Connection::new(guest_wire.compat(), yamux::Config::default(), yamux::Mode::Server);
+
+            let client_stream = poll_fn(|cx| client_conn.poll_new_outbound(cx)).await.unwrap();
+            let mut client_ch = Channel::new(client_stream);
+            client_ch.write_all(b"extra request body").await.unwrap();
+            client_ch.flush().await.unwrap();
+
+            let client_driver = tokio::spawn(async move {
+                while let Some(Ok(_)) = poll_fn(|cx| client_conn.poll_next_inbound(cx)).await {}
+            });
+
+            let server_stream = poll_fn(|cx| server_conn.poll_next_inbound(cx)).await.unwrap().unwrap();
+            let server_driver = tokio::spawn(async move {
+                while let Some(Ok(_)) = poll_fn(|cx| server_conn.poll_next_inbound(cx)).await {}
+            });
+
+            let mut server_ch = Channel::new(server_stream);
+            // Wait until the server stream has buffered the client's extra request
+            // bytes, so incoming immediately hits EPIPE on its first write to io.
+            let mut first = [0];
+            server_ch.read_exact(&mut first).await.unwrap();
+            assert_eq!(&first, b"e");
+            // Agent wrote a multi-chunk reply and closed its local socket before
+            // consuming the remaining request bytes.
+            let expected = vec![b'r'; 64 * 1024];
+            let (mut peer, io) = UnixStream::pair().unwrap();
+            io.set_nonblocking(true).unwrap();
+            let mut io = tokio::net::UnixStream::from_std(io).unwrap();
+            peer.write_all(&expected).unwrap();
+            drop(peer);
+
+            let _ = forward(&mut io, &mut server_ch, Side::Agent).await;
+            drop(io);
+            drop(server_ch);
+
+            let mut reply = Vec::new();
+            tokio::time::timeout(Duration::from_secs(3), client_ch.read_to_end(&mut reply)).await.unwrap().unwrap();
+            assert_eq!(reply, expected);
+            client_driver.abort();
+            server_driver.abort();
+        });
     }
 }
