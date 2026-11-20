@@ -1020,6 +1020,9 @@ static void write_xsave_pattern(int cpu, uint16_t control, uint32_t mxcsr,
 static void stage_xsave(int kvm, int cpu)
 {
     check(ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_XSAVE) > 0, "check XSAVE support");
+    /* Enable the restored components before the first entry can load guest FP state. */
+    const struct kvm_xcrs avx = {.nr_xcrs = 1, .xcrs = {{.value = 7}}};
+    check(ioctl(cpu, KVM_SET_XCRS, &avx) == 0, "enable AVX before staging XSAVE");
     struct kvm_xsave reset = read_xsave(cpu);
     uint16_t control;
 
