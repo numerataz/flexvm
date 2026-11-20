@@ -69,6 +69,11 @@ Add `--fpu` to exercise `KVM_GET_FPU` and `KVM_SET_FPU` in long mode. The
 client sets an x87 stack value and an XMM register, checks the effect of guest
 instructions, then writes new values and checks them after re-entry. The
 worker preserves MXCSR as the Linux KVM_FPU ioctl does.
+Add `--msrs` in a separate long-mode run to exercise the Linux boot MSR set.
+The client reads and writes MSRs from the guest, measures TSC progress, and
+checks the completed prefix of batches with an unsupported index. This
+fixture supports up to 64 entries per request and returns staged values before
+the first run. The worker provides live values after it starts.
 The worker uses one host mapping per consecutive extent. Highly fragmented
 slots can reach the host's mapping limit. A failed mapping releases the
 partially mapped worker span.
