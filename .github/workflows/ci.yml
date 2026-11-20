@@ -400,20 +400,20 @@ jobs:
           scripts/fetch.sh --state "$RUNNER_TEMP/software-state"
           sudo python3 scripts/test-image.py --state "$RUNNER_TEMP/software-state" "$RUNNER_TEMP/software-distro-image"
       - name: Restore immutable workload fixture
-        if: (matrix.workload == 'kind' || matrix.workload == 'k3s')
+        if: matrix.workload == 'kind' || matrix.workload == 'k3s' || matrix.workload == 'rootless-containerd'
         id: workload-fixture-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/workload-fixture-cache
           key: busybox-fixture-v1-${{ runner.arch }}-${{ hashFiles('scripts/compat/workload-fixture.py') }}
       - name: Verify and export immutable workload fixture
-        if: (matrix.workload == 'kind' || matrix.workload == 'k3s')
+        if: matrix.workload == 'kind' || matrix.workload == 'k3s' || matrix.workload == 'rootless-containerd'
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends skopeo
           python3 scripts/compat/workload-fixture.py --cache "$RUNNER_TEMP/workload-fixture-cache/oci" --output "$RUNNER_TEMP/workload-fixture"
       - name: Save verified workload fixture
-        if: (matrix.workload == 'kind' || matrix.workload == 'k3s') && steps.workload-fixture-cache.outputs.cache-hit != 'true'
+        if: (matrix.workload == 'kind' || matrix.workload == 'k3s' || matrix.workload == 'rootless-containerd') && steps.workload-fixture-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/workload-fixture-cache
@@ -461,11 +461,18 @@ jobs:
           if [[ "${{ matrix.workload }}" == incus ]]; then
             workload_args+=(--mem 3072 --poweroff-timeout 180)
           fi
-          if [[ "${{ matrix.workload }}" == kind || "${{ matrix.workload }}" == k3s ]]; then
+          if [[ "${{ matrix.workload }}" == kind || "${{ matrix.workload }}" == k3s || "${{ matrix.workload }}" == rootless-containerd ]]; then
             for name in busybox.tar busybox.json; do
               workload_args+=(--seed "$RUNNER_TEMP/workload-fixture/$name" "/nested-input/$name")
             done
             workload_args+=(--seed scripts/compat/verify-fixture-import.py /nested-input/verify-fixture-import.py)
+          fi
+          if [[ "${{ matrix.workload }}" == rootless-containerd ]]; then
+            layout="$RUNNER_TEMP/workload-fixture-cache/oci"
+            for path in "$layout"/{oci-layout,index.json,upstream-index.json,blobs/sha256/*}; do
+              workload_args+=(--seed "$path" "/nested-input/busybox-oci/${path#"$layout"/}")
+            done
+            workload_args+=(--seed scripts/compat/workload-fixture.py /nested-input/workload-fixture.py)
           fi
           sudo systemd-run --scope --collect -p "MemoryMax=$memory_limit" -p MemorySwapMax=0 -p "CPUQuota=$cpu_quota" python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --workload "scripts/compat/workloads/${{ matrix.workload }}.sh" "${workload_args[@]}" --require storage.fuse --output "$RUNNER_TEMP/software-workload" --timeout "$workload_timeout"
           cat "$RUNNER_TEMP/software-workload/report.json"
