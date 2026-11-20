@@ -255,6 +255,53 @@ class Harness(unittest.TestCase):
         time.sleep(.8)
         self.assertFalse(marker.exists())
 
+    def test_command_timeout_preserves_partial_output_on_exception_and_logs(self):
+        script = 'import sys, time; print("partial-out", flush=True); print("partial-err", file=sys.stderr, flush=True); time.sleep(10)'
+        prefix = self.root / "timed-out"
+        with self.assertRaises(subprocess.TimeoutExpired) as ctx:
+            compat.command([sys.executable, '-c', script], timeout=.2, output=prefix)
+        self.assertIn("partial-out", ctx.exception.output)
+        self.assertIn("partial-err", ctx.exception.stderr)
+        self.assertIn("partial-out", (self.root / "timed-out.stdout.log").read_text())
+        self.assertIn("partial-err", (self.root / "timed-out.stderr.log").read_text())
+
+    def test_bounded_preserves_head_and_tail(self):
+        text = "HEAD-MARKER" + ("x" * 20_000) + "TAIL-MARKER"
+        result = compat.bounded(text, limit=1000)
+        self.assertIn("HEAD-MARKER", result)
+        self.assertIn("TAIL-MARKER", result)
+        self.assertIn("bytes truncated", result)
+
+    def test_workload_timeout_prints_partial_output_and_head_of_diagnostics(self):
+        workload = self.root / 'workload.sh'
+        workload.write_text('exit 0\n')
+        args = compat.parse_args(['--bin', str(self.fake), '--workload', str(workload),
+                                  '--workload-diagnostics', '--output', str(self.root)])
+        suite = compat.Suite(args, self.root)
+        calls = []
+
+        def fake_call(*argv, **kw):
+            calls.append(argv)
+            if 'verify' in argv:
+                raise subprocess.TimeoutExpired(argv, 180, output="1 of 2 updated replicas are available\n",
+                                                stderr="+ k rollout status deployment/web --timeout=180s\n")
+            if 'diagnose' in argv:
+                return "POD-DESCRIBE-HEAD\n" + ("k" * 20_000) + "\nKUBELET-TAIL\n"
+            return ""
+
+        suite.host.call = fake_call
+        import io
+        from contextlib import redirect_stderr
+        buf = io.StringIO()
+        with redirect_stderr(buf), self.assertRaises(subprocess.TimeoutExpired):
+            suite.workload_step("verify", "checkpoint")
+        logged = buf.getvalue()
+        self.assertIn("Partial output for timed-out verify (checkpoint):", logged)
+        self.assertIn("+ k rollout status deployment/web --timeout=180s", logged)
+        self.assertIn("1 of 2 updated replicas are available", logged)
+        self.assertIn("POD-DESCRIBE-HEAD", logged)
+        self.assertIn("KUBELET-TAIL", logged)
+
 
 class Probe(unittest.TestCase):
     @classmethod

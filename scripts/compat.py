@@ -37,6 +37,14 @@ class Interrupted(Exception):
     pass
 
 
+def bounded(text, limit=16_384):
+    if len(text) <= limit:
+        return text
+    head = limit // 2
+    tail = limit - head
+    return f"{text[:head]}\n... [{len(text) - limit} bytes truncated] ...\n{text[-tail:]}"
+
+
 def command(argv, timeout=120, stdin=None, output=None):
     """Bound and reap the whole host CLI process group, including on interruption."""
     proc = subprocess.Popen(argv, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
@@ -45,12 +53,15 @@ def command(argv, timeout=120, stdin=None, output=None):
     out = err = ""
     try:
         out, err = proc.communicate(stdin, timeout=timeout)
-    except BaseException:
+    except BaseException as exc:
         try:
             os.killpg(proc.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         out, err = proc.communicate()
+        if isinstance(exc, subprocess.TimeoutExpired):
+            exc.output = out
+            exc.stderr = err
         raise
     finally:
         if output is not None:
@@ -105,11 +116,17 @@ class Suite:
 
         try:
             return run(step, 900 if step == "prepare" else 180)
-        except (Failure, subprocess.TimeoutExpired):
+        except (Failure, subprocess.TimeoutExpired) as exc:
+            if isinstance(exc, subprocess.TimeoutExpired):
+                err = exc.stderr or ""
+                out = exc.output or ""
+                if err or out:
+                    print(f"Partial output for timed-out {step} ({phase}):\n{err[-4000:]}\n{out[-2000:]}",
+                          file=sys.stderr)
             if self.args.workload_diagnostics and step == "verify":
                 try:
                     diagnostics = run("diagnose", 30)
-                    print(f"Workload diagnostics for {phase}:\n{diagnostics[-16_384:]}", file=sys.stderr)
+                    print(f"Workload diagnostics for {phase}:\n{bounded(diagnostics)}", file=sys.stderr)
                 except (Failure, subprocess.TimeoutExpired, OSError) as error:
                     self.report["workload_diagnostics_error"] = str(error)
             raise
