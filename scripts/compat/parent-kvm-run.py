@@ -1091,14 +1091,17 @@ class KvmChild:
         return None
 
 
-def doorbell_peer(server, memory, requests, cancellations, irq_fds, replies):
+def doorbell_peer(server, memory, requests, cancellations, irq_fds, replies, *, guest_position=1):
+    if guest_position not in (0, 1):
+        raise ValueError("invalid parent KVM guest peer position")
+    parent_position = guest_position ^ 1
     peer, _ = server.accept()
     try:
         peer.settimeout(3)
-        # ivshmem protocol 0. The parent is peer 0 and the outer guest is peer 1.
-        peer.sendall(struct.pack("<qq", 0, 1))
-        for value, descriptor in ((-1, memory), (0, requests), (0, cancellations),
-                                  *((0, fd) for fd in irq_fds), (1, replies)):
+        # ivshmem protocol 0, with the other peer ID reserved for the broker.
+        peer.sendall(struct.pack("<qq", 0, guest_position))
+        for value, descriptor in ((-1, memory), (parent_position, requests), (parent_position, cancellations),
+                                  *((parent_position, fd) for fd in irq_fds), (guest_position, replies)):
             if socket.send_fds(peer, [struct.pack("<q", value)], [descriptor]) != 8:
                 raise RuntimeError("short ivshmem setup message")
         return peer
