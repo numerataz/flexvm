@@ -388,9 +388,6 @@ IDLE_WORKER_STATE = b"FLEXVM ARM no nested worker\n"
 
 
 def capture_state(outer, qmp, irq_fds, worker, fds):
-    if worker is not None and worker.proc is None:
-        raise RuntimeError("ARM checkpoint cannot capture a worker that is still starting")
-
     def capture_worker(fd):
         if worker is None:
             if os.write(fd, IDLE_WORKER_STATE) != len(IDLE_WORKER_STATE):
