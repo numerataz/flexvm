@@ -18,6 +18,7 @@
 #define PROTECTED_SLOT_GPA 0x1000000
 #define SPLIT_SLOT_GPA 0x20000000
 #define GDT_OFFSET 0x200
+#define SECOND_CPU_OFFSET 0x300
 #define TEST_INTERRUPTS 3
 
 static void check(bool valid, const char *why)
@@ -141,9 +142,17 @@ int main(int argc, char **argv)
 {
     bool split_slot = argc >= 3 && !strcmp(argv[2], "split");
     bool protected_mode = split_slot || (argc >= 3 && !strcmp(argv[2], "protected"));
-    bool interrupt_run = argc == 4 && !strcmp(argv[3], "interrupt");
-    check(argc == 2 || (protected_mode && (argc == 3 || interrupt_run)),
-          "specify RAM pages and optional protected or split mode with interruption");
+    bool interrupt_run = false;
+    bool two_vcpus = false;
+    check(argc == 2 || protected_mode, "specify RAM pages and optional protected or split mode");
+    for (int i = 3; i < argc; i++) {
+        if (!interrupt_run && !strcmp(argv[i], "interrupt"))
+            interrupt_run = true;
+        else if (!two_vcpus && !strcmp(argv[i], "smp"))
+            two_vcpus = true;
+        else
+            check(false, "invalid execution option");
+    }
     char *end;
     errno = 0;
     long count = strtol(argv[1], &end, 10);
@@ -248,6 +257,14 @@ int main(int argc, char **argv)
         0x74, 0xf1,                     /* je to the increment */
         0xeb, 0xcf,                     /* jmp to the resumed code at 0x40 */
     };
+    const unsigned char second_cpu_code[] = {
+        0xb9, 0x44, 0x33, 0, 0,         /* mov ecx, 0x3344 */
+        0x8a, 0x87, 0x80, 0, 0, 0,     /* mov al, [edi+0x80] */
+        0x88, 0x87, 0xa0, 0, 0, 0,     /* mov [edi+0xa0], al */
+        0xe6, 0x30,                    /* out 0x30, al */
+        0xc6, 0x87, 0xa1, 0, 0, 0, 0xff, /* mov byte [edi+0xa1], 0xff */
+        0xf4,
+    };
     unsigned char *data = ram + ram_bytes - 4096;
     unsigned char *middle = ram + (pages / 2) * 4096;
     const unsigned char gdtr[] = {0x2f, 0x00, 0x80, 0x34, 0x12, 0x00};
@@ -279,6 +296,19 @@ int main(int argc, char **argv)
     check(ioctl(cpu, KVM_GET_REGS, &readback) == 0 && !memcmp(&readback, &regs, sizeof(regs)),
           "read back initial registers");
     select_segments(cpu, protected_mode, gpa);
+    int other_cpu = -1;
+    struct kvm_run *other_run = NULL;
+    if (two_vcpus) {
+        check(ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_MAX_VCPUS) >= 2, "query two-vCPU support");
+        memcpy(ram + SECOND_CPU_OFFSET, second_cpu_code, sizeof(second_cpu_code));
+        other_cpu = ioctl(vm, KVM_CREATE_VCPU, 1);
+        check(other_cpu >= 0 && (fcntl(other_cpu, F_GETFD) & FD_CLOEXEC), "second vCPU file descriptor");
+        other_run = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, other_cpu, 0);
+        check(other_run != MAP_FAILED, "map second kvm_run");
+        const struct kvm_regs other_regs = {.rdi = last_page, .rip = gpa + SECOND_CPU_OFFSET, .rflags = 2};
+        check(ioctl(other_cpu, KVM_SET_REGS, &other_regs) == 0, "set second vCPU registers");
+        select_segments(other_cpu, true, gpa);
+    }
     close(vm);
     run->immediate_exit = 1;
     check(ioctl(cpu, KVM_RUN, 0) == -1 && errno == EINTR, "immediate exit");
@@ -303,6 +333,15 @@ int main(int argc, char **argv)
     check(ram[0x90] == 0x57 && data[0x80] == 0x56 && data[0x82] == 0,
           "child wrote the first and last pages and stopped after its first output");
     check(!protected_mode || middle[0x78] == 0xb3, "protected child wrote the middle page");
+    if (two_vcpus) {
+        check(data[0xa0] == 0 && data[0xa1] == 0, "second vCPU waited for KVM_RUN");
+        timed_run(other_cpu);
+        check_output(other_run, size, 0x56);
+        check_registers(other_cpu, 0x56, 0x3344, gpa + SECOND_CPU_OFFSET);
+        check_registers(cpu, 0x42, 0x1357, gpa);
+        check(data[0xa0] == 0x56 && data[0xa1] == 0, "second vCPU read shared RAM and stopped at its exit");
+        check(munmap(other_run, size) == 0 && close(other_cpu) == 0, "close the second vCPU");
+    }
     data[0x81] = 0x52;
     const struct kvm_regs update = {
         .rbx = 0xf5, .rcx = 0x3579, .rsp = 0x1f00, .rbp = 0x12345678,
@@ -317,6 +356,10 @@ int main(int argc, char **argv)
     check_output(run, size, 0xa7);
     check_registers(cpu, 0xa7, 0x2468, gpa);
     check(data[0x82] == 0x52, "child saw the client's write during re-entry");
+    if (two_vcpus) {
+        check(data[0xa1] == 0, "closing a vCPU leaves it stopped during another vCPU's run");
+        puts("PASS two vCPUs kept independent state in one child");
+    }
     if (interrupt_run)
         puts("PASS stopped and resumed the same running child");
     munmap(run, size);

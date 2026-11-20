@@ -9,7 +9,7 @@ I/O exit. The client changes a byte in shared RAM and updates the stopped
 child's registers, including its instruction pointer. A second `KVM_RUN`
 resumes the same child. It uses both updates to produce the next I/O byte.
 
-The module supports one VM, one vCPU and up to eight pinned slots with a
+The module supports one VM, up to two vCPUs and up to eight pinned slots with a
 combined limit of 256 MiB. The initial RAM layout stays fixed while the
 worker runs.
 The parent validates the physical offsets and seals their ordered
@@ -24,7 +24,7 @@ and between runs and reads actual worker state through `KVM_GET_REGS`.
 After an exit, `KVM_GET_SREGS` also returns live segment caches, descriptor
 tables, and control registers. The TCG worker uses private Unix sockets for
 debugger and QMP register requests. Memory invalidation, paging and long
-mode state, interrupts, and checkpointing remain part of
+mode state, concurrent vCPU runs, interrupt delivery, and checkpointing remain part of
 [issue #1501](https://github.com/numerataz/flexvm/issues/1501).
 
 Run the fixture on x86 with the QEMU build from `scripts/build-qemu.sh` and
@@ -58,6 +58,9 @@ Add `--interrupt-run` in protected mode to interrupt a running vCPU three
 times with a signal. Each return is acknowledged after the worker stops.
 The client checks that shared-memory writes cease on every stop and resume
 on subsequent runs, then releases the loop and receives an I/O exit.
+Add `--two-vcpus` in protected mode to alternate between two vCPUs in one
+worker. The client checks shared RAM, independent register state, and continued
+execution of the first vCPU after closing the second vCPU's descriptor.
 The worker uses one host mapping per consecutive extent. Highly fragmented
 slots can reach the host's mapping limit. A failed mapping releases the
 partially mapped worker span.

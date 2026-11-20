@@ -50,10 +50,12 @@ static unsigned long number(const char *text, unsigned long maximum)
 
 int main(int argc, char **argv)
 {
-    check(argc >= 6 && (argc - 3) % 3 == 0 &&
-          (argc - 3) / 3 <= PVKVM_MAX_SLOTS, "expected control, outer RAM, and slot triples");
+    check(argc >= 7 && (argc - 4) % 3 == 0 &&
+          (argc - 4) / 3 <= PVKVM_MAX_SLOTS, "expected control, outer RAM, vCPU count, and slot triples");
     int control = (int)number(argv[1], INT_MAX);
     int outer_ram = (int)number(argv[2], INT_MAX);
+    unsigned int cpu_count = number(argv[3], PVKVM_MAX_CPUS);
+    check(cpu_count > 0, "at least one native vCPU");
 
     int kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     check(kvm >= 0 && ioctl(kvm, KVM_GET_API_VERSION, 0) == KVM_API_VERSION,
@@ -62,7 +64,7 @@ int main(int argc, char **argv)
     check(bytes >= (int)sizeof(struct kvm_run), "KVM run mapping size");
     int vm = ioctl(kvm, KVM_CREATE_VM, 0);
     check(vm >= 0, "create host VM");
-    for (int arg = 3; arg < argc; arg += 3) {
+    for (int arg = 4; arg < argc; arg += 3) {
         int layout = (int)number(argv[arg], INT_MAX);
         uint64_t gpa = number(argv[arg + 1], UINT32_MAX);
         uint32_t id = number(argv[arg + 2], PVKVM_MAX_SLOTS - 1);
@@ -77,35 +79,42 @@ int main(int argc, char **argv)
         check(ioctl(vm, KVM_SET_USER_MEMORY_REGION, &memory) == 0, "register a shared RAM slot");
     }
     close(outer_ram);
-    int cpu = ioctl(vm, KVM_CREATE_VCPU, 0);
-    check(cpu >= 0, "create host vCPU");
-    struct kvm_run *run = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, cpu, 0);
-    check(run != MAP_FAILED, "map host kvm_run");
-    run_page = run;
+    int cpus[PVKVM_MAX_CPUS];
+    struct kvm_run *runs[PVKVM_MAX_CPUS];
+    struct kvm_sregs segments;
+    for (unsigned int id = 0; id < cpu_count; id++) {
+        cpus[id] = ioctl(vm, KVM_CREATE_VCPU, id);
+        check(cpus[id] >= 0, "create host vCPU");
+        runs[id] = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, cpus[id], 0);
+        check(runs[id] != MAP_FAILED, "map host kvm_run");
+        check(ioctl(cpus[id], KVM_GET_SREGS, &segments) == 0, "read reset segments");
+        segments.cs.base = 0;
+        segments.cs.selector = 0;
+        check(ioctl(cpus[id], KVM_SET_SREGS, &segments) == 0, "select real-mode code segment");
+    }
     struct sigaction action = {.sa_sigaction = interrupt_run, .sa_flags = SA_SIGINFO | SA_RESTART};
     check(sigemptyset(&action.sa_mask) == 0 && sigaction(SIGRTMIN, &action, NULL) == 0,
           "install the native run interrupt handler");
-    struct kvm_sregs segments;
-    check(ioctl(cpu, KVM_GET_SREGS, &segments) == 0, "read reset segments");
-    segments.cs.base = 0;
-    segments.cs.selector = 0;
-    check(ioctl(cpu, KVM_SET_SREGS, &segments) == 0, "select real-mode code segment");
     struct kvm_regs registers;
 
     check(write(control, "R", 1) == 1, "announce worker readiness");
-    unsigned char request[1 + sizeof(segments)];
+    unsigned char request[2 + sizeof(segments)];
     ssize_t received;
     while ((received = recv(control, request, sizeof(request), MSG_TRUNC)) != 0) {
         if (received < 0 && errno == EINTR) continue;
-        if (received == 1 + sizeof(registers) && request[0] == 'S') {
-            memcpy(&registers, request + 1, sizeof(registers));
+        check(received >= 2 && request[1] < cpu_count, "invalid vCPU selector");
+        int cpu = cpus[request[1]];
+        struct kvm_run *run = runs[request[1]];
+        if (received == 2 + sizeof(registers) && request[0] == 'S') {
+            memcpy(&registers, request + 2, sizeof(registers));
             check(ioctl(cpu, KVM_SET_REGS, &registers) == 0, "write host registers");
             check(write(control, "S", 1) == 1, "acknowledge host register write");
             continue;
         }
         if (received == sizeof(request) && request[0] == 'P') {
             struct kvm_sregs setup;
-            memcpy(&setup, request + 1, sizeof(setup));
+            memcpy(&setup, request + 2, sizeof(setup));
+            check(ioctl(cpu, KVM_GET_SREGS, &segments) == 0, "read host protected-entry baseline");
             segments.cs = setup.cs;
             segments.ds = setup.ds;
             segments.es = setup.es;
@@ -118,22 +127,23 @@ int main(int argc, char **argv)
             check(write(control, "P", 1) == 1, "acknowledge host protected mode");
             continue;
         }
-        if (received == 1 && request[0] == 'G') {
+        if (received == 2 && request[0] == 'G') {
             check(ioctl(cpu, KVM_GET_REGS, &registers) == 0, "read host registers after exit");
             check(write(control, &registers, sizeof(registers)) == (ssize_t)sizeof(registers),
                   "return host registers to the parent");
             continue;
         }
-        if (received == 1 && request[0] == 'X') {
+        if (received == 2 && request[0] == 'X') {
             check(ioctl(cpu, KVM_GET_SREGS, &segments) == 0, "read host special registers after exit");
             check(write(control, &segments, sizeof(segments)) == (ssize_t)sizeof(segments),
                   "return host special registers to the parent");
             continue;
         }
         uint32_t sequence;
-        check(received == 1 + sizeof(sequence) && request[0] == 'R', "invalid run request");
-        memcpy(&sequence, request + 1, sizeof(sequence));
+        check(received == 2 + sizeof(sequence) && request[0] == 'R', "invalid run request");
+        memcpy(&sequence, request + 2, sizeof(sequence));
         check(sequence > 0 && sequence <= INT_MAX, "invalid run sequence");
+        run_page = run;
         __atomic_store_n(&run->immediate_exit, 0, __ATOMIC_RELAXED);
         /* The signal handler may publish an interrupt as soon as this
          * sequence becomes active. Finish clearing the old value first.
