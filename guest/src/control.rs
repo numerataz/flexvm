@@ -1,55 +1,58 @@
 //! Concurrent agent sockets over a private, flow-controlled virtio-serial link.
 //!
 //! Shared by the host and guest. Socket pairs preserve the agent's existing
-//! deadlines, half-close and attachment cancellation semantics. Yamux bounds
-//! receive buffering and prevents a stalled stream from blocking other requests.
+//! deadlines, half-close and attachment cancellation semantics. A single
+//! synchronous `poll(2)` loop multiplexes bounded binary frames with per-stream
+//! credit flow control so a stalled stream never blocks other requests.
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
-use std::future::Future;
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
+use std::net::Shutdown;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::pin::Pin;
-use std::sync::mpsc::{self, SyncSender};
-use std::sync::Mutex;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
-use std::task::{Context, Poll};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use bytes::{Buf, Bytes, BytesMut};
-use futures_util::future::poll_fn;
-use futures_util::{Sink, Stream};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{mpsc as channel, watch};
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
-use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
-
 const STREAMS: usize = 64;
+const HEADER_LEN: usize = 9;
+const MAX_FRAME_LEN: usize = 16 * 1024;
+const INITIAL_WINDOW: u32 = 256 * 1024;
+const WINDOW_UPDATE_THRESHOLD: u32 = INITIAL_WINDOW / 2;
+const TX_BUF_LIMIT: usize = 256 * 1024;
+const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(5);
+const GOAWAY_TIMEOUT: Duration = Duration::from_secs(1);
+const RECONNECT_BACKOFF: Duration = Duration::from_millis(10);
+
+const FRAME_OPEN: u8 = 1;
+const FRAME_ACK: u8 = 2;
+const FRAME_DATA: u8 = 3;
+const FRAME_FIN: u8 = 4;
+const FRAME_RST: u8 = 5;
+const FRAME_WINDOW: u8 = 6;
+const FRAME_GOAWAY: u8 = 7;
+
 pub const PORT_NAME: &str = "org.flexvm.control";
+
 type Reply = SyncSender<io::Result<UnixStream>>;
+
 struct Open {
     reply: Reply,
     deadline: Instant,
 }
 
-struct Pending {
-    open: Open,
-    timer: Pin<Box<tokio::time::Sleep>>,
-}
-
 pub struct Client {
-    requests: channel::Sender<Open>,
-    stop: watch::Sender<bool>,
+    requests: SyncSender<Open>,
+    stop: Arc<AtomicBool>,
+    wake: OwnedFd,
     thread: Option<JoinHandle<()>>,
 }
 
 pub struct IncomingRequest {
     peer: UnixStream,
-    payload: mpsc::Receiver<()>,
+    payload: Receiver<()>,
 }
 
 impl IncomingRequest {
@@ -60,19 +63,57 @@ impl IncomingRequest {
     }
 }
 
+fn wake_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
+fn signal_wake(fd: RawFd) {
+    let byte = [1u8];
+    loop {
+        let n = unsafe { libc::write(fd, byte.as_ptr().cast(), 1) };
+        if n >= 0 {
+            return;
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return;
+        }
+    }
+}
+
+fn drain_wake(fd: RawFd) {
+    let mut buf = [0u8; 64];
+    loop {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n > 0 {
+            continue;
+        }
+        if n == 0 {
+            return;
+        }
+        let err = io::Error::last_os_error();
+        if err.kind() != io::ErrorKind::Interrupted {
+            return;
+        }
+    }
+}
+
 impl Client {
     pub fn connect(io: UnixStream) -> io::Result<Self> {
-        let runtime = runtime()?;
         io.set_nonblocking(true)?;
-        let entered = runtime.enter();
-        let io = tokio::net::UnixStream::from_std(io)?;
-        drop(entered);
-        let (requests, incoming) = channel::channel(STREAMS);
-        let (stop, stopped) = watch::channel(false);
+        let (wake_rx, wake_tx) = wake_pipe()?;
+        let (requests, incoming) = mpsc::sync_channel(STREAMS);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
         let thread = std::thread::Builder::new().name("serial-control".into()).spawn(move || {
-            let _ = runtime.block_on(drive(io, Some(incoming), None, stopped));
+            let mut mux = Mux::new(Transport::Unix(io), Side::Client, Some(incoming), None, Some(stopped), Some(wake_rx));
+            let _ = mux.run();
         })?;
-        Ok(Self { requests, stop, thread: Some(thread) })
+        Ok(Self { requests, stop, wake: wake_tx, thread: Some(thread) })
     }
 
     pub fn open(&self, deadline: Instant) -> io::Result<UnixStream> {
@@ -82,9 +123,10 @@ impl Client {
         }
         let (reply, answer) = mpsc::sync_channel(1);
         self.requests.try_send(Open { reply, deadline }).map_err(|e| match e {
-            channel::error::TrySendError::Full(_) => io::Error::new(io::ErrorKind::WouldBlock, "serial control request queue is full"),
-            channel::error::TrySendError::Closed(_) => io::Error::new(io::ErrorKind::BrokenPipe, "serial control disconnected"),
+            TrySendError::Full(_) => io::Error::new(io::ErrorKind::WouldBlock, "serial control request queue is full"),
+            TrySendError::Disconnected(_) => io::Error::new(io::ErrorKind::BrokenPipe, "serial control disconnected"),
         })?;
+        signal_wake(self.wake.as_raw_fd());
         answer.recv_timeout(left).map_err(|e| match e {
             mpsc::RecvTimeoutError::Timeout => io::ErrorKind::TimedOut,
             mpsc::RecvTimeoutError::Disconnected => io::ErrorKind::BrokenPipe,
@@ -94,109 +136,11 @@ impl Client {
 
 impl Drop for Client {
     fn drop(&mut self) {
-        let _ = self.stop.send(true);
+        self.stop.store(true, Ordering::Release);
+        signal_wake(self.wake.as_raw_fd());
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
-    }
-}
-
-fn runtime() -> io::Result<tokio::runtime::Runtime> {
-    tokio::runtime::Builder::new_current_thread().enable_all().build()
-}
-
-/// Virtio RX can arrive before the deferred host-open control message. Confirm
-/// the live peer through current poll state or successful TX before treating EOF
-/// as the end of a connection; received bytes alone are insufficient.
-struct Serial {
-    fd: tokio::io::unix::AsyncFd<File>,
-    connected: bool,
-    retry: Pin<Box<tokio::time::Sleep>>,
-}
-
-impl Serial {
-    fn new(fd: tokio::io::unix::AsyncFd<File>) -> Self {
-        Self { fd, connected: false, retry: Box::pin(tokio::time::sleep(Duration::from_millis(10))) }
-    }
-
-    fn confirm_connection(&mut self) -> io::Result<()> {
-        if !self.connected && !hung_up(self.fd.as_raw_fd())? {
-            self.connected = true;
-        }
-        Ok(())
-    }
-
-    fn wait<T>(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<T>> {
-        // Tokio retains closed readiness permanently, but virtio-serial HUP
-        // means a reconnectable host peer. Its nonblocking I/O can still return
-        // EAGAIN. Yield and arrange a retry instead of spinning on cached HUP.
-        if self.retry.as_mut().poll(cx).is_ready() {
-            self.retry.as_mut().reset(tokio::time::Instant::now() + Duration::from_millis(10));
-            let _ = self.retry.as_mut().poll(cx);
-        }
-        Poll::Pending
-    }
-}
-
-impl AsyncRead for Serial {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        this.confirm_connection()?;
-        loop {
-            let mut ready = std::task::ready!(this.fd.poll_read_ready_mut(cx))?;
-            match ready.try_io(|fd| fd.get_mut().read(buf.initialize_unfilled())) {
-                Ok(Ok(0)) if !this.connected => {
-                    ready.clear_ready();
-                    drop(ready);
-                    return this.wait(cx);
-                }
-                Ok(Ok(n)) => {
-                    buf.advance(n);
-                    return Poll::Ready(Ok(()));
-                }
-                Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Ok(Err(e)) => return Poll::Ready(Err(e)),
-                Err(_) => {
-                    drop(ready);
-                    return this.wait(cx);
-                }
-            }
-        }
-    }
-}
-
-impl AsyncWrite for Serial {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        this.confirm_connection()?;
-        loop {
-            let mut ready = std::task::ready!(this.fd.poll_write_ready_mut(cx))?;
-            match ready.try_io(|fd| fd.get_mut().write(buf)) {
-                Ok(Err(e)) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Ok(Ok(n)) => {
-                    this.connected |= n != 0;
-                    return Poll::Ready(Ok(n));
-                }
-                Ok(Err(error)) => return Poll::Ready(Err(error)),
-                Err(_) => {
-                    drop(ready);
-                    // A disconnected virtio port reports HUP while writes
-                    // return EAGAIN. End an established parser so it can reset.
-                    if this.connected && hung_up(this.fd.as_raw_fd())? {
-                        return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
-                    }
-                    return this.wait(cx);
-                }
-            }
-        }
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Poll::Ready(Ok(()))
     }
 }
 
@@ -205,275 +149,11 @@ pub fn serve(port: File, incoming: SyncSender<IncomingRequest>) -> io::Result<()
     if flags < 0 || unsafe { libc::fcntl(port.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    runtime()?.block_on(async {
-        // File owns the descriptor; it is never replaced or closed separately
-        // while registered with the reactor.
-        let fd = unsafe { tokio::io::unix::AsyncFd::register(port)? };
-        let io = Serial::new(fd);
-        let (_alive, stop) = watch::channel(false);
-        drive(io, None, Some(incoming), stop).await
-    })
+    let mut mux = Mux::new(Transport::Serial(Serial::new(port)), Side::Agent, None, Some(incoming), None, None);
+    mux.run()
 }
 
-enum Event {
-    Open(yamux::Stream, Open),
-    Incoming(yamux::Stream),
-    End(io::Result<()>),
-}
-
-async fn drive<T>(
-    io: T,
-    mut requests: Option<channel::Receiver<Open>>,
-    incoming: Option<SyncSender<IncomingRequest>>,
-    mut stop: watch::Receiver<bool>,
-) -> io::Result<()>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    let mut config = yamux::Config::default();
-    config.set_max_num_streams(STREAMS).set_max_connection_receive_window(Some(STREAMS * 256 * 1024)).set_split_send_size(16 * 1024);
-    let mode = if requests.is_some() { yamux::Mode::Client } else { yamux::Mode::Server };
-    let mut connection = yamux::Connection::new(io.compat(), config, mode);
-    let mut pending = None;
-    loop {
-        // Both operations must be polled: creating streams alone does not drive
-        // Yamux's I/O, window updates or the existing stream bridges.
-        let event = tokio::select! {
-            _ = stop.changed() => {
-                // A device disconnect is not reliably surfaced as EOF by every
-                // virtio-serial implementation. Explicitly terminate the old
-                // parser on the wire before closing the host character device.
-                let _ = tokio::time::timeout(Duration::from_secs(1), poll_fn(|cx| connection.poll_close(cx))).await;
-                return Ok(());
-            },
-            event = poll_fn(|cx| {
-                if pending.is_none() {
-                    if let Some(requests) = &mut requests {
-                        match requests.poll_recv(cx) {
-                            Poll::Ready(Some(open)) => {
-                                let timer = Box::pin(tokio::time::sleep_until(tokio::time::Instant::from_std(open.deadline)));
-                                pending = Some(Pending { open, timer });
-                            }
-                            Poll::Ready(None) => return Poll::Ready(Event::End(Ok(()))),
-                            Poll::Pending => {}
-                        }
-                    }
-                }
-                if pending.as_mut().is_some_and(|p| p.timer.as_mut().poll(cx).is_ready()) {
-                    let _ = pending.take().unwrap().open.reply.send(Err(io::ErrorKind::TimedOut.into()));
-                    cx.waker().wake_by_ref();
-                } else if pending.is_some() {
-                    match connection.poll_new_outbound(cx) {
-                        Poll::Ready(Ok(stream)) => return Poll::Ready(Event::Open(stream, pending.take().unwrap().open)),
-                        Poll::Ready(Err(e)) => {
-                            let kind = if matches!(e, yamux::ConnectionError::TooManyStreams) { io::ErrorKind::WouldBlock } else { io::ErrorKind::BrokenPipe };
-                            let _ = pending.take().unwrap().open.reply.send(Err(io::Error::new(kind, e)));
-                            cx.waker().wake_by_ref();
-                        }
-                        Poll::Pending => {}
-                    }
-                }
-                match connection.poll_next_inbound(cx) {
-                    Poll::Ready(Some(Ok(stream))) => Poll::Ready(Event::Incoming(stream)),
-                    Poll::Ready(Some(Err(e))) => Poll::Ready(Event::End(Err(io::Error::new(io::ErrorKind::BrokenPipe, e)))),
-                    Poll::Ready(None) => Poll::Ready(Event::End(Ok(()))),
-                    Poll::Pending => Poll::Pending,
-                }
-            }) => event,
-        };
-        match event {
-            Event::End(result) => return result,
-            Event::Open(stream, reply) => {
-                bridge(stream, Endpoint::Outgoing(reply));
-            }
-            Event::Incoming(stream) => {
-                let Some(incoming) = &incoming else {
-                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "guest opened an unsolicited control stream"));
-                };
-                bridge(stream, Endpoint::Incoming(incoming.clone()));
-            }
-        }
-    }
-}
-
-/// Shared polling handles, like an I/O split, also allow the cancellation
-/// watcher to inspect closure while a direction is backpressured. The mutex
-/// is held only during a nonblocking poll, never across an await.
-struct Shared<T>(Arc<Mutex<T>>);
-impl<T> Clone for Shared<T> {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
-impl<T: AsyncRead + Unpin> AsyncRead for Shared<T> {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut *self.0.lock().unwrap()).poll_read(cx, buf)
-    }
-}
-impl<T: AsyncWrite + Unpin> AsyncWrite for Shared<T> {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        Pin::new(&mut *self.0.lock().unwrap()).poll_write(cx, buf)
-    }
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut *self.0.lock().unwrap()).poll_flush(cx)
-    }
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut *self.0.lock().unwrap()).poll_shutdown(cx)
-    }
-}
-
-enum Endpoint {
-    Outgoing(Open),
-    Incoming(SyncSender<IncomingRequest>),
-}
-
-/// Record framing preserves Unix write-half closure without sending Yamux FIN.
-/// Yamux does not reset a dropped stream after FIN until the peer writes again;
-/// keeping it open lets full cancellation promptly reset even a silent peer.
-/// Empty records mean EOF, while data records are bounded to one frame.
-struct Channel {
-    framed: Framed<tokio_util::compat::Compat<yamux::Stream>, LengthDelimitedCodec>,
-    buffered: BytesMut,
-    read_eof: bool,
-    write_eof: bool,
-}
-
-impl Channel {
-    fn new(stream: yamux::Stream) -> Self {
-        let codec = LengthDelimitedCodec::builder().little_endian().max_frame_length(16 * 1024).new_codec();
-        Self { framed: Framed::new(stream.compat(), codec), buffered: BytesMut::new(), read_eof: false, write_eof: false }
-    }
-}
-
-impl AsyncRead for Channel {
-    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        if buf.remaining() == 0 {
-            return Poll::Ready(Ok(()));
-        }
-        if !this.buffered.is_empty() {
-            let n = this.buffered.len().min(buf.remaining());
-            buf.put_slice(&this.buffered[..n]);
-            this.buffered.advance(n);
-            return Poll::Ready(Ok(()));
-        }
-        match Pin::new(&mut this.framed).poll_next(cx) {
-            Poll::Ready(Some(Ok(frame))) => {
-                if this.read_eof {
-                    return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "control record after EOF")));
-                }
-                if frame.is_empty() {
-                    this.read_eof = true;
-                    return Poll::Ready(Ok(()));
-                }
-                this.buffered = frame;
-                let n = this.buffered.len().min(buf.remaining());
-                buf.put_slice(&this.buffered[..n]);
-                this.buffered.advance(n);
-                Poll::Ready(Ok(()))
-            }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(e)),
-            Poll::Ready(None) => Poll::Ready(Ok(())),
-            Poll::Pending if this.read_eof => Poll::Ready(Ok(())),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
-impl AsyncWrite for Channel {
-    fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
-        let this = self.get_mut();
-        if this.write_eof {
-            return Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()));
-        }
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
-        }
-        std::task::ready!(Sink::<Bytes>::poll_ready(Pin::new(&mut this.framed), cx))?;
-        let n = buf.len().min(16 * 1024);
-        Pin::new(&mut this.framed).start_send(Bytes::copy_from_slice(&buf[..n]))?;
-        Poll::Ready(Ok(n))
-    }
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Sink::<Bytes>::poll_flush(Pin::new(&mut self.get_mut().framed), cx)
-    }
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let this = self.get_mut();
-        if !this.write_eof {
-            std::task::ready!(Sink::<Bytes>::poll_ready(Pin::new(&mut this.framed), cx))?;
-            Pin::new(&mut this.framed).start_send(Bytes::new())?;
-            this.write_eof = true;
-        }
-        Sink::<Bytes>::poll_flush(Pin::new(&mut this.framed), cx)
-    }
-}
-
-/// Drain each direction before acting on EOF. Returning a synthetic read error
-/// at EOF could discard bytes already buffered by the copier.
-#[derive(Clone, Copy)]
-enum Side {
-    Client,
-    Agent,
-}
-
-async fn forward(io: &mut tokio::net::UnixStream, stream: &mut Channel, side: Side) -> io::Result<()> {
-    let local = Shared(Arc::new(Mutex::new(io)));
-    let remote = Shared(Arc::new(Mutex::new(stream)));
-    let drained = AtomicBool::new(false);
-    let mut input = local.clone();
-    let mut output = local.clone();
-    let mut received = remote.clone();
-    let mut sent = remote.clone();
-    let outgoing = async {
-        tokio::io::copy(&mut input, &mut sent).await?;
-        sent.flush().await?;
-        drained.store(true, Ordering::Relaxed);
-        if hung_up(local.0.lock().unwrap().as_raw_fd())? {
-            return Ok::<_, io::Error>(true);
-        }
-        sent.shutdown().await?;
-        Ok(false)
-    };
-    let incoming = async {
-        tokio::io::copy(&mut received, &mut output).await?;
-        output.flush().await?;
-        if remote.0.lock().unwrap().framed.get_ref().get_ref().is_closed() {
-            return Ok::<_, io::Error>(true);
-        }
-        output.shutdown().await?;
-        Ok(false)
-    };
-    let cancellation = async {
-        loop {
-            let local_closed = hung_up(local.0.lock().unwrap().as_raw_fd())?;
-            let cancelled = match side {
-                // The caller is gone, so buffered request input may be discarded.
-                Side::Client => local_closed,
-                // Preserve a finished agent's buffered response. A client reset,
-                // however, must interrupt even a backpressured request writer.
-                Side::Agent => remote.0.lock().unwrap().framed.get_ref().get_ref().is_closed() || (local_closed && drained.load(Ordering::Relaxed)),
-            };
-            if cancelled {
-                return Ok::<_, io::Error>(());
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        }
-    };
-    tokio::pin!(outgoing, incoming, cancellation);
-    tokio::select! {
-        result = &mut outgoing => {
-            if !result? { tokio::select! { result = &mut incoming => { result?; }, result = &mut cancellation => result?, } }
-            Ok(())
-        }
-        result = &mut incoming => {
-            if !result? { tokio::select! { result = &mut outgoing => { result?; }, result = &mut cancellation => result?, } }
-            Ok(())
-        }
-        result = &mut cancellation => result,
-    }
-}
-
-pub(crate) fn hung_up(fd: std::os::fd::RawFd) -> io::Result<bool> {
+pub(crate) fn hung_up(fd: RawFd) -> io::Result<bool> {
     let mut poll = libc::pollfd { fd, events: 0, revents: 0 };
     loop {
         if unsafe { libc::poll(&mut poll, 1, 0) } >= 0 {
@@ -486,76 +166,906 @@ pub(crate) fn hung_up(fd: std::os::fd::RawFd) -> io::Result<bool> {
     }
 }
 
-fn bridge(stream: yamux::Stream, endpoint: Endpoint) {
-    const HELLO: &[u8; 4] = b"FVS\x01";
-    let pair = (|| -> io::Result<_> {
-        let (peer, io) = UnixStream::pair()?;
-        io.set_nonblocking(true)?;
-        Ok((peer, tokio::net::UnixStream::from_std(io)?))
-    })();
-    let (peer, mut io) = match pair {
-        Ok(pair) => pair,
-        Err(e) => {
-            if let Endpoint::Outgoing(open) = endpoint {
-                let _ = open.reply.send(Err(e));
+fn poll_fds(fds: &mut [libc::pollfd], timeout_ms: i32) -> io::Result<usize> {
+    loop {
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+        if rc >= 0 {
+            return Ok(rc as usize);
+        }
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+enum ReadOutcome {
+    Data(usize),
+    Eof,
+    WouldBlock,
+    WaitReconnect,
+}
+
+enum WriteOutcome {
+    Wrote(usize),
+    WouldBlock,
+    WaitReconnect,
+}
+
+/// Virtio RX can arrive before the deferred host-open control message. Confirm
+/// the live peer through current poll state or successful TX before treating EOF
+/// as the end of a connection; received bytes alone are insufficient.
+struct Serial {
+    file: File,
+    connected: bool,
+}
+
+impl Serial {
+    fn new(file: File) -> Self {
+        Self { file, connected: false }
+    }
+
+    fn as_raw_fd(&self) -> RawFd {
+        self.file.as_raw_fd()
+    }
+
+    fn confirm_connection(&mut self) -> io::Result<()> {
+        if !self.connected && !hung_up(self.file.as_raw_fd())? {
+            self.connected = true;
+        }
+        Ok(())
+    }
+
+    fn try_read(&mut self, buf: &mut [u8]) -> io::Result<ReadOutcome> {
+        self.confirm_connection()?;
+        loop {
+            match self.file.read(buf) {
+                Ok(0) if !self.connected => return Ok(ReadOutcome::WaitReconnect),
+                Ok(0) => return Ok(ReadOutcome::Eof),
+                Ok(n) => return Ok(ReadOutcome::Data(n)),
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if !self.connected && hung_up(self.file.as_raw_fd())? {
+                        return Ok(ReadOutcome::WaitReconnect);
+                    }
+                    return Ok(ReadOutcome::WouldBlock);
+                }
+                Err(e) => return Err(e),
             }
+        }
+    }
+
+    fn try_write(&mut self, buf: &[u8]) -> io::Result<WriteOutcome> {
+        self.confirm_connection()?;
+        loop {
+            match self.file.write(buf) {
+                Ok(n) => {
+                    self.connected |= n != 0;
+                    return Ok(WriteOutcome::Wrote(n));
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // A disconnected virtio port reports HUP while writes
+                    // return EAGAIN. End an established parser so it can reset.
+                    if self.connected && hung_up(self.file.as_raw_fd())? {
+                        return Err(io::ErrorKind::BrokenPipe.into());
+                    }
+                    if !self.connected && hung_up(self.file.as_raw_fd())? {
+                        return Ok(WriteOutcome::WaitReconnect);
+                    }
+                    return Ok(WriteOutcome::WouldBlock);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn read_timeout(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<Option<usize>> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self.try_read(buf)? {
+                ReadOutcome::Data(n) => return Ok(Some(n)),
+                ReadOutcome::Eof => return Ok(Some(0)),
+                ReadOutcome::WaitReconnect => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Ok(None);
+                    }
+                    std::thread::sleep(left.min(RECONNECT_BACKOFF));
+                }
+                ReadOutcome::WouldBlock => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Ok(None);
+                    }
+                    let ms = left.as_millis().min(i32::MAX as u128).max(1) as i32;
+                    let mut pfd = [libc::pollfd { fd: self.as_raw_fd(), events: libc::POLLIN, revents: 0 }];
+                    poll_fds(&mut pfd, ms)?;
+                }
+            }
+        }
+    }
+}
+
+enum Transport {
+    Unix(UnixStream),
+    Serial(Serial),
+}
+
+impl Transport {
+    fn as_raw_fd(&self) -> RawFd {
+        match self {
+            Self::Unix(s) => s.as_raw_fd(),
+            Self::Serial(s) => s.as_raw_fd(),
+        }
+    }
+
+    fn try_read(&mut self, buf: &mut [u8]) -> io::Result<ReadOutcome> {
+        match self {
+            Self::Unix(s) => loop {
+                match s.read(buf) {
+                    Ok(0) => return Ok(ReadOutcome::Eof),
+                    Ok(n) => return Ok(ReadOutcome::Data(n)),
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(ReadOutcome::WouldBlock),
+                    Err(e) => return Err(e),
+                }
+            },
+            Self::Serial(s) => s.try_read(buf),
+        }
+    }
+
+    fn try_write(&mut self, buf: &[u8]) -> io::Result<WriteOutcome> {
+        match self {
+            Self::Unix(s) => loop {
+                match s.write(buf) {
+                    Ok(n) => return Ok(WriteOutcome::Wrote(n)),
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(WriteOutcome::WouldBlock),
+                    Err(e) => return Err(e),
+                }
+            },
+            Self::Serial(s) => s.try_write(buf),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Side {
+    Client,
+    Agent,
+}
+
+struct ActiveStream {
+    local: UnixStream,
+    to_local: VecDeque<u8>,
+    send_window: u32,
+    recv_window: u32,
+    recv_consumed: u32,
+    local_read_eof: bool,
+    local_hup: bool,
+    local_write_shutdown: bool,
+    remote_fin: bool,
+    remote_rst: bool,
+    ready: Option<mpsc::Sender<()>>,
+    first_byte_deadline: Option<Instant>,
+}
+
+impl ActiveStream {
+    fn new(local: UnixStream, ready: Option<mpsc::Sender<()>>, first_byte_deadline: Option<Instant>) -> Self {
+        Self {
+            local,
+            to_local: VecDeque::new(),
+            send_window: INITIAL_WINDOW,
+            recv_window: INITIAL_WINDOW,
+            recv_consumed: 0,
+            local_read_eof: false,
+            local_hup: false,
+            local_write_shutdown: false,
+            remote_fin: false,
+            remote_rst: false,
+            ready,
+            first_byte_deadline,
+        }
+    }
+}
+
+enum StreamEntry {
+    Opening { reply: Reply, deadline: Instant },
+    Open(ActiveStream),
+}
+
+struct Mux {
+    transport: Transport,
+    side: Side,
+    requests: Option<Receiver<Open>>,
+    incoming: Option<SyncSender<IncomingRequest>>,
+    stop: Option<Arc<AtomicBool>>,
+    wake: Option<OwnedFd>,
+    pending_opens: VecDeque<Open>,
+    streams: BTreeMap<u32, StreamEntry>,
+    next_stream_id: u32,
+    rr_cursor: u32,
+    rx_buf: Vec<u8>,
+    rx_pos: usize,
+    tx_buf: VecDeque<u8>,
+    serial_backoff_until: Option<Instant>,
+}
+
+impl Mux {
+    fn new(
+        transport: Transport,
+        side: Side,
+        requests: Option<Receiver<Open>>,
+        incoming: Option<SyncSender<IncomingRequest>>,
+        stop: Option<Arc<AtomicBool>>,
+        wake: Option<OwnedFd>,
+    ) -> Self {
+        Self {
+            transport,
+            side,
+            requests,
+            incoming,
+            stop,
+            wake,
+            pending_opens: VecDeque::new(),
+            streams: BTreeMap::new(),
+            next_stream_id: 1,
+            rr_cursor: 0,
+            rx_buf: Vec::with_capacity(32 * 1024),
+            rx_pos: 0,
+            tx_buf: VecDeque::with_capacity(32 * 1024),
+            serial_backoff_until: None,
+        }
+    }
+
+    fn queue_frame(&mut self, kind: u8, stream_id: u32, len: u32, payload: &[u8]) {
+        let mut header = [0u8; HEADER_LEN];
+        header[0] = kind;
+        header[1..5].copy_from_slice(&stream_id.to_le_bytes());
+        header[5..9].copy_from_slice(&len.to_le_bytes());
+        self.tx_buf.extend(header);
+        self.tx_buf.extend(payload);
+    }
+
+    fn alloc_stream_id(&mut self) -> u32 {
+        loop {
+            let id = self.next_stream_id;
+            self.next_stream_id = self.next_stream_id.wrapping_add(1);
+            if self.next_stream_id == 0 {
+                self.next_stream_id = 1;
+            }
+            if !self.streams.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    fn in_serial_backoff(&mut self, now: Instant) -> bool {
+        if let Some(until) = self.serial_backoff_until {
+            if now < until {
+                return true;
+            }
+            self.serial_backoff_until = None;
+        }
+        false
+    }
+
+    fn drain_requests(&mut self) -> bool {
+        let Some(requests) = &self.requests else {
+            return true;
+        };
+        loop {
+            match requests.try_recv() {
+                Ok(open) => self.pending_opens.push_back(open),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return false,
+            }
+        }
+        let now = Instant::now();
+        while let Some(front) = self.pending_opens.front() {
+            if now >= front.deadline {
+                let expired = self.pending_opens.pop_front().unwrap();
+                let _ = expired.reply.send(Err(io::ErrorKind::TimedOut.into()));
+                continue;
+            }
+            if self.streams.len() >= STREAMS {
+                break;
+            }
+            let open = self.pending_opens.pop_front().unwrap();
+            let id = self.alloc_stream_id();
+            self.streams.insert(id, StreamEntry::Opening { reply: open.reply, deadline: open.deadline });
+            self.queue_frame(FRAME_OPEN, id, 0, &[]);
+        }
+        true
+    }
+
+    fn check_deadlines(&mut self, now: Instant) {
+        let mut expired_opens = Vec::new();
+        let mut expired_first_byte = Vec::new();
+        for (&id, entry) in &self.streams {
+            match entry {
+                StreamEntry::Opening { deadline, .. } if now >= *deadline => expired_opens.push(id),
+                StreamEntry::Open(s) if s.first_byte_deadline.is_some_and(|d| now >= d) => expired_first_byte.push(id),
+                _ => {}
+            }
+        }
+        for id in expired_opens {
+            if let Some(StreamEntry::Opening { reply, .. }) = self.streams.remove(&id) {
+                let _ = reply.send(Err(io::ErrorKind::TimedOut.into()));
+                self.queue_frame(FRAME_RST, id, 0, &[]);
+            }
+        }
+        for id in expired_first_byte {
+            self.streams.remove(&id);
+            self.queue_frame(FRAME_RST, id, 0, &[]);
+        }
+        while self.pending_opens.front().is_some_and(|o| now >= o.deadline) {
+            let expired = self.pending_opens.pop_front().unwrap();
+            let _ = expired.reply.send(Err(io::ErrorKind::TimedOut.into()));
+        }
+        while self.streams.len() < STREAMS {
+            let Some(open) = self.pending_opens.pop_front() else {
+                break;
+            };
+            if now >= open.deadline {
+                let _ = open.reply.send(Err(io::ErrorKind::TimedOut.into()));
+                continue;
+            }
+            let id = self.alloc_stream_id();
+            self.streams.insert(id, StreamEntry::Opening { reply: open.reply, deadline: open.deadline });
+            self.queue_frame(FRAME_OPEN, id, 0, &[]);
+        }
+    }
+
+    fn next_timeout_ms(&self, now: Instant) -> i32 {
+        let mut earliest: Option<Instant> = self.serial_backoff_until;
+        let mut consider = |t: Instant| {
+            earliest = Some(match earliest {
+                Some(cur) => cur.min(t),
+                None => t,
+            });
+        };
+        if let Some(front) = self.pending_opens.front() {
+            consider(front.deadline);
+        }
+        for entry in self.streams.values() {
+            match entry {
+                StreamEntry::Opening { deadline, .. } => consider(*deadline),
+                StreamEntry::Open(s) => {
+                    if let Some(d) = s.first_byte_deadline {
+                        consider(d);
+                    }
+                }
+            }
+        }
+        match earliest {
+            None => -1,
+            Some(t) => {
+                let dur = t.saturating_duration_since(now);
+                if dur.is_zero() {
+                    0
+                } else {
+                    dur.as_millis().min(i32::MAX as u128).max(1) as i32
+                }
+            }
+        }
+    }
+
+    fn flush_transport(&mut self) -> io::Result<()> {
+        while !self.tx_buf.is_empty() {
+            let (front, _) = self.tx_buf.as_slices();
+            match self.transport.try_write(front)? {
+                WriteOutcome::Wrote(0) => return Err(io::ErrorKind::WriteZero.into()),
+                WriteOutcome::Wrote(n) => {
+                    self.tx_buf.drain(..n);
+                }
+                WriteOutcome::WouldBlock => break,
+                WriteOutcome::WaitReconnect => {
+                    self.serial_backoff_until = Some(Instant::now() + RECONNECT_BACKOFF);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn flush_goaway(&mut self) {
+        // A device disconnect is not reliably surfaced as EOF by every
+        // virtio-serial implementation. Explicitly terminate the old
+        // parser on the wire before closing the host character device.
+        self.queue_frame(FRAME_GOAWAY, 0, 0, &[]);
+        let deadline = Instant::now() + GOAWAY_TIMEOUT;
+        while !self.tx_buf.is_empty() {
+            match self.flush_transport() {
+                Ok(()) if self.tx_buf.is_empty() => break,
+                Ok(()) => {}
+                Err(_) => break,
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let ms = left.as_millis().min(i32::MAX as u128).max(1) as i32;
+            let mut pfd = [libc::pollfd { fd: self.transport.as_raw_fd(), events: libc::POLLOUT, revents: 0 }];
+            if poll_fds(&mut pfd, ms).is_err() {
+                break;
+            }
+            if pfd[0].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                break;
+            }
+        }
+    }
+
+    fn try_write_local(&mut self, id: u32) {
+        let mut window_update = 0u32;
+        let mut remove = false;
+        let mut send_rst = false;
+        if let Some(StreamEntry::Open(stream)) = self.streams.get_mut(&id) {
+            while !stream.to_local.is_empty() {
+                let (front, _) = stream.to_local.as_slices();
+                match stream.local.write(front) {
+                    Ok(0) => {
+                        if self.side == Side::Client {
+                            send_rst = true;
+                            remove = true;
+                        } else {
+                            stream.to_local.clear();
+                            stream.local_write_shutdown = true;
+                        }
+                        break;
+                    }
+                    Ok(n) => {
+                        stream.to_local.drain(..n);
+                        stream.recv_consumed = stream.recv_consumed.saturating_add(n as u32);
+                        if let Some(ready) = stream.ready.take() {
+                            stream.first_byte_deadline = None;
+                            let _ = ready.send(());
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(_) => {
+                        if self.side == Side::Client {
+                            send_rst = true;
+                            remove = true;
+                        } else {
+                            stream.to_local.clear();
+                            stream.local_write_shutdown = true;
+                        }
+                        break;
+                    }
+                }
+            }
+            if !remove {
+                if stream.recv_consumed >= WINDOW_UPDATE_THRESHOLD && !stream.remote_fin && !stream.remote_rst {
+                    window_update = stream.recv_consumed;
+                    stream.recv_window = stream.recv_window.saturating_add(window_update);
+                    stream.recv_consumed = 0;
+                }
+                if stream.to_local.is_empty() {
+                    if stream.remote_rst {
+                        remove = true;
+                    } else if stream.remote_fin {
+                        if !stream.local_write_shutdown {
+                            let _ = stream.local.shutdown(Shutdown::Write);
+                            stream.local_write_shutdown = true;
+                        }
+                        if stream.local_read_eof {
+                            remove = true;
+                        }
+                    }
+                }
+            }
+        }
+        if window_update > 0 {
+            self.queue_frame(FRAME_WINDOW, id, window_update, &[]);
+        }
+        if remove {
+            self.streams.remove(&id);
+            if send_rst {
+                self.queue_frame(FRAME_RST, id, 0, &[]);
+            }
+        }
+    }
+
+    fn read_local_once(&mut self, id: u32, scratch: &mut [u8; MAX_FRAME_LEN]) -> bool {
+        let mut data_len = 0usize;
+        let mut hit_eof = false;
+        let mut hit_err = false;
+        let mut local_hup = false;
+        if let Some(StreamEntry::Open(stream)) = self.streams.get_mut(&id) {
+            if stream.local_read_eof || stream.send_window == 0 || self.tx_buf.len() >= TX_BUF_LIMIT {
+                return false;
+            }
+            let max_read = (stream.send_window as usize).min(MAX_FRAME_LEN);
+            loop {
+                match stream.local.read(&mut scratch[..max_read]) {
+                    Ok(0) => {
+                        stream.local_read_eof = true;
+                        hit_eof = true;
+                        local_hup = stream.local_hup || hung_up(stream.local.as_raw_fd()).unwrap_or(true);
+                        break;
+                    }
+                    Ok(n) => {
+                        stream.send_window -= n as u32;
+                        data_len = n;
+                        break;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return false,
+                    Err(_) => {
+                        hit_err = true;
+                        break;
+                    }
+                }
+            }
+        } else {
+            return false;
+        }
+        if data_len > 0 {
+            self.queue_frame(FRAME_DATA, id, data_len as u32, &scratch[..data_len]);
+            return true;
+        }
+        if hit_err {
+            self.streams.remove(&id);
+            self.queue_frame(FRAME_RST, id, 0, &[]);
+            return false;
+        }
+        if hit_eof {
+            if self.side == Side::Client && local_hup {
+                self.streams.remove(&id);
+                self.queue_frame(FRAME_RST, id, 0, &[]);
+            } else {
+                self.queue_frame(FRAME_FIN, id, 0, &[]);
+                if self.side == Side::Agent && local_hup {
+                    self.streams.remove(&id);
+                    self.queue_frame(FRAME_RST, id, 0, &[]);
+                } else if let Some(StreamEntry::Open(s)) = self.streams.get(&id) {
+                    if s.remote_fin && s.to_local.is_empty() {
+                        self.streams.remove(&id);
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    fn drain_hup_agent_streams(&mut self, scratch: &mut [u8; MAX_FRAME_LEN]) {
+        if self.side != Side::Agent {
             return;
         }
-    };
-    match endpoint {
-        Endpoint::Outgoing(open) => {
-            let Open { reply, deadline } = open;
-            tokio::spawn(async move {
-                let mut stream = Channel::new(stream);
-                // Do not expose the socket until the guest has queued it with
-                // its ordered dispatcher. A timed-out earlier request cannot
-                // arrive after a later retry just because its SYN was delayed.
-                let handshake = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
-                    stream.write_all(HELLO).await?;
-                    stream.flush().await?;
-                    let mut ack = [0; 4];
-                    stream.read_exact(&mut ack).await?;
-                    if &ack != HELLO {
-                        return Err(io::Error::new(io::ErrorKind::InvalidData, "unsupported serial control protocol"));
-                    }
-                    Ok(())
-                })
-                .await
-                .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into()));
-                if let Err(e) = handshake {
-                    let _ = reply.send(Err(e));
-                    return;
-                }
-                if reply.send(Ok(peer)).is_ok() {
-                    let _ = forward(&mut io, &mut stream, Side::Client).await;
-                }
-            });
+        let ids: Vec<u32> = self
+            .streams
+            .iter()
+            .filter_map(|(&id, entry)| match entry {
+                StreamEntry::Open(s) if s.local_hup && !s.local_read_eof && s.send_window > 0 => Some(id),
+                _ => None,
+            })
+            .collect();
+        for id in ids {
+            while self.tx_buf.len() < TX_BUF_LIMIT && self.read_local_once(id, scratch) {}
         }
-        Endpoint::Incoming(incoming) => {
-            let (ready, payload) = mpsc::channel();
-            if incoming.try_send(IncomingRequest { peer, payload }).is_err() {
-                return;
-            }
-            tokio::spawn(async move {
-                let mut stream = Channel::new(stream);
-                let handshake = tokio::time::timeout(Duration::from_secs(5), async {
-                    let mut hello = [0; 4];
-                    stream.read_exact(&mut hello).await?;
-                    if &hello != HELLO {
-                        return Err(io::ErrorKind::InvalidData.into());
+    }
+
+    fn read_transport(&mut self) -> io::Result<bool> {
+        let mut scratch = [0u8; 32 * 1024];
+        loop {
+            match self.transport.try_read(&mut scratch)? {
+                ReadOutcome::Data(n) => {
+                    self.rx_buf.extend_from_slice(&scratch[..n]);
+                    if !self.dispatch_frames()? {
+                        return Ok(false);
                     }
-                    stream.write_all(HELLO).await?;
-                    stream.flush().await?;
-                    let mut first = [0];
-                    stream.read_exact(&mut first).await?;
-                    io.write_all(&first).await
-                })
-                .await;
-                if !matches!(handshake, Ok(Ok(()))) || ready.send(()).is_err() {
-                    return;
                 }
-                let _ = forward(&mut io, &mut stream, Side::Agent).await;
-            });
+                ReadOutcome::Eof => return Ok(false),
+                ReadOutcome::WouldBlock => return Ok(true),
+                ReadOutcome::WaitReconnect => {
+                    self.serial_backoff_until = Some(Instant::now() + RECONNECT_BACKOFF);
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
+    fn dispatch_frames(&mut self) -> io::Result<bool> {
+        loop {
+            let avail = self.rx_buf.len() - self.rx_pos;
+            if avail < HEADER_LEN {
+                break;
+            }
+            let h = &self.rx_buf[self.rx_pos..self.rx_pos + HEADER_LEN];
+            let kind = h[0];
+            let stream_id = u32::from_le_bytes([h[1], h[2], h[3], h[4]]);
+            let len = u32::from_le_bytes([h[5], h[6], h[7], h[8]]);
+            let payload_len = match kind {
+                FRAME_DATA => {
+                    if len == 0 || len as usize > MAX_FRAME_LEN {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid control data frame length"));
+                    }
+                    len as usize
+                }
+                FRAME_OPEN | FRAME_ACK | FRAME_FIN | FRAME_RST | FRAME_GOAWAY => {
+                    if len != 0 {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected control frame payload"));
+                    }
+                    0
+                }
+                FRAME_WINDOW => {
+                    if len == 0 {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, "zero control window update"));
+                    }
+                    0
+                }
+                _ => return Err(io::Error::new(io::ErrorKind::InvalidData, "unknown control frame kind")),
+            };
+            if avail < HEADER_LEN + payload_len {
+                break;
+            }
+            let payload_start = self.rx_pos + HEADER_LEN;
+            self.rx_pos = payload_start + payload_len;
+            match kind {
+                FRAME_GOAWAY => return Ok(false),
+                FRAME_OPEN => self.handle_open(stream_id)?,
+                FRAME_ACK => self.handle_ack(stream_id),
+                FRAME_DATA => {
+                    let payload = self.rx_buf[payload_start..payload_start + payload_len].to_vec();
+                    self.handle_data(stream_id, &payload)?;
+                }
+                FRAME_FIN => self.handle_fin(stream_id),
+                FRAME_RST => self.handle_rst(stream_id),
+                FRAME_WINDOW => self.handle_window(stream_id, len)?,
+                _ => unreachable!(),
+            }
+        }
+        if self.rx_pos == self.rx_buf.len() {
+            self.rx_buf.clear();
+            self.rx_pos = 0;
+        } else if self.rx_pos >= 16 * 1024 {
+            self.rx_buf.drain(..self.rx_pos);
+            self.rx_pos = 0;
+        }
+        Ok(true)
+    }
+
+    fn handle_open(&mut self, id: u32) -> io::Result<()> {
+        let Some(incoming) = &self.incoming else {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "guest opened an unsolicited control stream"));
+        };
+        if id == 0 || self.streams.len() >= STREAMS || self.streams.contains_key(&id) {
+            self.queue_frame(FRAME_RST, id, 0, &[]);
+            return Ok(());
+        }
+        let (peer, local) = match UnixStream::pair().and_then(|(p, l)| {
+            l.set_nonblocking(true)?;
+            Ok((p, l))
+        }) {
+            Ok(pair) => pair,
+            Err(_) => {
+                self.queue_frame(FRAME_RST, id, 0, &[]);
+                return Ok(());
+            }
+        };
+        let (ready, payload) = mpsc::channel();
+        if incoming.try_send(IncomingRequest { peer, payload }).is_err() {
+            self.queue_frame(FRAME_RST, id, 0, &[]);
+            return Ok(());
+        }
+        let active = ActiveStream::new(local, Some(ready), Some(Instant::now() + FIRST_BYTE_TIMEOUT));
+        self.streams.insert(id, StreamEntry::Open(active));
+        self.queue_frame(FRAME_ACK, id, 0, &[]);
+        Ok(())
+    }
+
+    fn handle_ack(&mut self, id: u32) {
+        let Some(entry) = self.streams.remove(&id) else {
+            self.queue_frame(FRAME_RST, id, 0, &[]);
+            return;
+        };
+        let StreamEntry::Opening { reply, .. } = entry else {
+            self.streams.insert(id, entry);
+            return;
+        };
+        let pair = UnixStream::pair().and_then(|(peer, local)| {
+            local.set_nonblocking(true)?;
+            Ok((peer, local))
+        });
+        match pair {
+            Ok((peer, local)) => {
+                if reply.send(Ok(peer)).is_ok() {
+                    self.streams.insert(id, StreamEntry::Open(ActiveStream::new(local, None, None)));
+                } else {
+                    self.queue_frame(FRAME_RST, id, 0, &[]);
+                }
+            }
+            Err(e) => {
+                let _ = reply.send(Err(e));
+                self.queue_frame(FRAME_RST, id, 0, &[]);
+            }
+        }
+    }
+
+    fn handle_data(&mut self, id: u32, payload: &[u8]) -> io::Result<()> {
+        let Some(StreamEntry::Open(stream)) = self.streams.get_mut(&id) else {
+            return Ok(());
+        };
+        if stream.remote_fin {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "control data after EOF"));
+        }
+        if payload.len() > stream.recv_window as usize {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "control stream window exceeded"));
+        }
+        stream.recv_window -= payload.len() as u32;
+        stream.to_local.extend(payload);
+        self.try_write_local(id);
+        Ok(())
+    }
+
+    fn handle_fin(&mut self, id: u32) {
+        if let Some(StreamEntry::Open(stream)) = self.streams.get_mut(&id) {
+            stream.remote_fin = true;
+            if stream.to_local.is_empty() {
+                if !stream.local_write_shutdown {
+                    let _ = stream.local.shutdown(Shutdown::Write);
+                    stream.local_write_shutdown = true;
+                }
+                if stream.local_read_eof {
+                    self.streams.remove(&id);
+                }
+            }
+        }
+    }
+
+    fn handle_rst(&mut self, id: u32) {
+        match self.streams.get_mut(&id) {
+            Some(StreamEntry::Opening { .. }) => {
+                if let Some(StreamEntry::Opening { reply, .. }) = self.streams.remove(&id) {
+                    let _ = reply.send(Err(io::ErrorKind::UnexpectedEof.into()));
+                }
+            }
+            Some(StreamEntry::Open(stream)) => {
+                if self.side == Side::Agent || stream.to_local.is_empty() {
+                    self.streams.remove(&id);
+                } else {
+                    stream.remote_rst = true;
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn handle_window(&mut self, id: u32, delta: u32) -> io::Result<()> {
+        if let Some(StreamEntry::Open(stream)) = self.streams.get_mut(&id) {
+            stream.send_window = stream.send_window.checked_add(delta).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "control window overflow"))?;
+        }
+        Ok(())
+    }
+
+    fn run(&mut self) -> io::Result<()> {
+        let mut pollfds = Vec::with_capacity(STREAMS + 2);
+        let mut polled_streams = Vec::with_capacity(STREAMS);
+        let mut read_scratch = [0u8; MAX_FRAME_LEN];
+        loop {
+            if self.stop.as_ref().is_some_and(|s| s.load(Ordering::Acquire)) {
+                self.flush_goaway();
+                return Ok(());
+            }
+            if !self.drain_requests() {
+                self.flush_goaway();
+                return Ok(());
+            }
+            let now = Instant::now();
+            self.check_deadlines(now);
+            let backoff = self.in_serial_backoff(now);
+            if !backoff && !self.tx_buf.is_empty() {
+                self.flush_transport()?;
+            }
+            self.drain_hup_agent_streams(&mut read_scratch);
+            let backoff = self.in_serial_backoff(Instant::now());
+            if !backoff && !self.tx_buf.is_empty() {
+                self.flush_transport()?;
+            }
+
+            pollfds.clear();
+            polled_streams.clear();
+            let wake_idx = if let Some(wake) = &self.wake {
+                let idx = pollfds.len();
+                pollfds.push(libc::pollfd { fd: wake.as_raw_fd(), events: libc::POLLIN, revents: 0 });
+                Some(idx)
+            } else {
+                None
+            };
+            let transport_idx = if !backoff {
+                let idx = pollfds.len();
+                let mut events = libc::POLLIN;
+                if !self.tx_buf.is_empty() {
+                    events |= libc::POLLOUT;
+                }
+                pollfds.push(libc::pollfd { fd: self.transport.as_raw_fd(), events, revents: 0 });
+                Some(idx)
+            } else {
+                None
+            };
+            let can_read_local = self.tx_buf.len() < TX_BUF_LIMIT;
+            for (&id, entry) in &self.streams {
+                let StreamEntry::Open(stream) = entry else {
+                    continue;
+                };
+                if self.side == Side::Agent && stream.local_hup && !stream.local_read_eof {
+                    continue;
+                }
+                let mut events = 0i16;
+                if can_read_local && !stream.local_read_eof && stream.send_window > 0 {
+                    events |= libc::POLLIN;
+                }
+                if !stream.to_local.is_empty() {
+                    events |= libc::POLLOUT;
+                }
+                polled_streams.push((id, pollfds.len()));
+                pollfds.push(libc::pollfd { fd: stream.local.as_raw_fd(), events, revents: 0 });
+            }
+
+            let timeout_ms = self.next_timeout_ms(Instant::now());
+            poll_fds(&mut pollfds, timeout_ms)?;
+
+            if let Some(idx) = wake_idx {
+                if pollfds[idx].revents & libc::POLLIN != 0 {
+                    if let Some(wake) = &self.wake {
+                        drain_wake(wake.as_raw_fd());
+                    }
+                }
+            }
+
+            if let Some(idx) = transport_idx {
+                let revents = pollfds[idx].revents;
+                if revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 && !self.read_transport()? {
+                    return Ok(());
+                }
+                if revents & libc::POLLOUT != 0 && !self.tx_buf.is_empty() {
+                    self.flush_transport()?;
+                }
+            }
+
+            // Round-robin stream handling so one busy stream cannot starve others.
+            let split = polled_streams.partition_point(|&(id, _)| id <= self.rr_cursor);
+            let mut last_read = None;
+            for &(id, idx) in polled_streams[split..].iter().chain(&polled_streams[..split]) {
+                let revents = pollfds[idx].revents;
+                if revents == 0 {
+                    continue;
+                }
+                if revents & libc::POLLOUT != 0 {
+                    self.try_write_local(id);
+                }
+                if revents & libc::POLLIN != 0 && self.tx_buf.len() < TX_BUF_LIMIT && self.read_local_once(id, &mut read_scratch) {
+                    last_read = Some(id);
+                }
+                if revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+                    match self.side {
+                        Side::Client => {
+                            if self.streams.remove(&id).is_some() {
+                                self.queue_frame(FRAME_RST, id, 0, &[]);
+                            }
+                        }
+                        Side::Agent => {
+                            let done = if let Some(StreamEntry::Open(s)) = self.streams.get_mut(&id) {
+                                s.local_hup = true;
+                                s.local_read_eof
+                            } else {
+                                false
+                            };
+                            if done {
+                                self.streams.remove(&id);
+                                self.queue_frame(FRAME_RST, id, 0, &[]);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(id) = last_read {
+                self.rr_cursor = id;
+            }
         }
     }
 }
@@ -584,7 +1094,6 @@ mod tests {
         let mut host = client.open(Instant::now() + Duration::from_secs(3)).unwrap();
         host.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
         host.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
-        // Yamux sends the stream's SYN with its first data/window frame.
         host.write_all(b"x").unwrap();
         let mut guest = requests.recv_timeout(Duration::from_secs(3)).unwrap().wait_for_payload().unwrap();
         guest.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
@@ -627,39 +1136,31 @@ mod tests {
     fn serial_reconnect_does_not_spin_on_cached_hangup_readiness() {
         let (fifo, reader) = Fifo::new();
         drop(fifo.writer());
-        runtime().unwrap().block_on(async {
-            let fd = unsafe { tokio::io::unix::AsyncFd::register(reader).unwrap() };
-            // Cache HUP, then reconnect the FIFO. The descriptor is unchanged,
-            // but reads now return EAGAIN: the same transition as virtio-serial.
-            fd.readable().await.unwrap().clear_ready();
-            let mut writer = fifo.writer();
-            let writing = std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(150));
-                writer.write_all(b"x")?;
-                Ok::<_, io::Error>(writer)
-            });
-            let mut serial = Serial::new(fd);
-            let mut bytes = [0];
-            fn cpu_time() -> u64 {
-                let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
-                assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) }, 0);
-                time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
-            }
-            let before = cpu_time();
-            let result = tokio::time::timeout(Duration::from_millis(30), serial.read(&mut bytes)).await;
-            let cpu_ns = cpu_time() - before;
-            let writer = writing.join().unwrap().unwrap();
-            assert!(cpu_ns < 10_000_000, "idle serial read burned {cpu_ns} ns of thread CPU in a 30 ms wait");
-            // A heavily descheduled test thread may see data before polling
-            // its expired timer. Either outcome must retain the byte exactly once.
-            match result {
-                Err(_) => assert_eq!(serial.read(&mut bytes).await.unwrap(), 1),
-                Ok(read) => assert_eq!(read.unwrap(), 1),
-            }
-            assert_eq!(&bytes, b"x");
-            drop(writer);
-            assert_eq!(serial.read(&mut bytes).await.unwrap(), 0);
+        let mut writer = fifo.writer();
+        let writing = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            writer.write_all(b"x")?;
+            Ok::<_, io::Error>(writer)
         });
+        let mut serial = Serial::new(reader);
+        let mut bytes = [0];
+        fn cpu_time() -> u64 {
+            let mut time = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+            assert_eq!(unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) }, 0);
+            time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
+        }
+        let before = cpu_time();
+        let result = serial.read_timeout(&mut bytes, Duration::from_millis(30)).unwrap();
+        let cpu_ns = cpu_time() - before;
+        let writer = writing.join().unwrap().unwrap();
+        assert!(cpu_ns < 10_000_000, "idle serial read burned {cpu_ns} ns of thread CPU in a 30 ms wait");
+        match result {
+            None => assert_eq!(serial.read_timeout(&mut bytes, Duration::from_secs(3)).unwrap(), Some(1)),
+            Some(read) => assert_eq!(read, 1),
+        }
+        assert_eq!(&bytes, b"x");
+        drop(writer);
+        assert_eq!(serial.read_timeout(&mut bytes, Duration::from_secs(3)).unwrap(), Some(0));
     }
 
     #[test]
@@ -668,31 +1169,28 @@ mod tests {
         let mut first = fifo.writer();
         first.write_all(b"x").unwrap();
         drop(first);
-        runtime().unwrap().block_on(async {
-            let fd = unsafe { tokio::io::unix::AsyncFd::register(reader).unwrap() };
-            let mut serial = Serial::new(fd);
-            let mut bytes = [0];
-            assert_eq!(serial.read(&mut bytes).await.unwrap(), 1);
-            assert_eq!(&bytes, b"x");
-            // Data arrived before the kernel's open state, modeled by buffered
-            // FIFO data plus HUP. A later writer represents the deferred open.
-            let path = fifo.0.clone();
-            let writing = std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(150));
-                let mut writer = File::options().write(true).custom_flags(libc::O_NONBLOCK).open(path)?;
-                writer.write_all(b"y")?;
-                Ok::<_, io::Error>(writer)
-            });
-            let result = tokio::time::timeout(Duration::from_millis(30), serial.read(&mut bytes)).await;
-            let writer = writing.join().unwrap().unwrap();
-            match result {
-                Err(_) => assert_eq!(serial.read(&mut bytes).await.unwrap(), 1),
-                Ok(read) => assert_eq!(read.unwrap(), 1, "buffered RX incorrectly turned pre-open EOF into disconnect"),
-            }
-            assert_eq!(&bytes, b"y");
-            drop(writer);
-            assert_eq!(serial.read(&mut bytes).await.unwrap(), 0);
+        let mut serial = Serial::new(reader);
+        let mut bytes = [0];
+        assert_eq!(serial.read_timeout(&mut bytes, Duration::from_secs(3)).unwrap(), Some(1));
+        assert_eq!(&bytes, b"x");
+        // Data arrived before the kernel's open state, modeled by buffered
+        // FIFO data plus HUP. A later writer represents the deferred open.
+        let path = fifo.0.clone();
+        let writing = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let mut writer = File::options().write(true).custom_flags(libc::O_NONBLOCK).open(path)?;
+            writer.write_all(b"y")?;
+            Ok::<_, io::Error>(writer)
         });
+        let result = serial.read_timeout(&mut bytes, Duration::from_millis(30)).unwrap();
+        let writer = writing.join().unwrap().unwrap();
+        match result {
+            None => assert_eq!(serial.read_timeout(&mut bytes, Duration::from_secs(3)).unwrap(), Some(1)),
+            Some(read) => assert_eq!(read, 1, "buffered RX incorrectly turned pre-open EOF into disconnect"),
+        }
+        assert_eq!(&bytes, b"y");
+        drop(writer);
+        assert_eq!(serial.read_timeout(&mut bytes, Duration::from_secs(3)).unwrap(), Some(0));
     }
 
     #[test]
@@ -701,19 +1199,9 @@ mod tests {
         device.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
         let client = Client::connect(host).unwrap();
         drop(client);
-        let mut saw_goaway = false;
-        for _ in 0..8 {
-            let mut header = [0; 12];
-            device.read_exact(&mut header).unwrap();
-            if header[1] == 3 {
-                assert_eq!(header, [0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-                saw_goaway = true;
-                break;
-            }
-            // Yamux may have queued its initial keepalive before cancellation.
-            assert_eq!(header[1], 2, "unexpected non-ping frame before shutdown");
-        }
-        assert!(saw_goaway, "transport closed without a protocol shutdown");
+        let mut header = [0; HEADER_LEN];
+        device.read_exact(&mut header).unwrap();
+        assert_eq!(header, [FRAME_GOAWAY, 0, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(device.read(&mut [0]).unwrap(), 0);
     }
 
