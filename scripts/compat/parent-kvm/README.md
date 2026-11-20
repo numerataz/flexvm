@@ -123,6 +123,10 @@ Add `--lapic` to read the reset xAPIC image, stage LINT0 and LINT1 before
 the first run, and update the stopped controller. The guest receives a PIC
 interrupt through the installed state, then changes LINT1 through MMIO.
 The test checks that restoring ICR contents does not send an interrupt.
+Use `--xsave --protected-entry` to verify the standard 4 KiB XSAVE image.
+The guest reads the staged and restored x87 control word, MXCSR, and both
+halves of YMM0. The VMM also observes guest changes and checks how the
+legacy FPU ioctl interacts with the staged XSAVE state.
 Use `--xcrs --protected-entry` to stage XCR0, change it in the guest with
 XSETBV, and read back a live restore with XGETBV.
 Use `--mp-state --protected-entry` to read the startup state, restore the
