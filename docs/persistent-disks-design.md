@@ -42,7 +42,7 @@ paths to logical disk slots in canonical profiles; never persist a transient
 `/proc/.../fd/N` value as the execution contract.
 
 Native Firecracker currently restores a prepared template with a fixed device
-layout. Its confinement patch deliberately rejects every block device. Adding a
+layout. Its default confinement policy rejects every block device. Adding a
 path override alone is therefore insufficient. The native prototype must first
 provide a trusted disk-enabled boot/layout and a constrained restore API. A cold
 boot for disk-enabled VMs is acceptable initially; the existing shared-template
@@ -161,3 +161,26 @@ actual OS poweroff. CI boots separate backing files with the same serial.
 This verifies the device foundation; it does not expose managed volumes or
 verify checkpoint consistency, crash recovery or disk migration. Those remain
 required by #1329 and the stages above.
+
+## Native confinement foundation (#1439)
+
+The opt-in `confined_blocks` snapshot-load field declares ordered raw block
+slots with caller-selected `disk-N` aliases, stable serials, fixed capacity and
+read-only/root policy. Restores require a locally trusted prepared layout or
+device-reference file and reject changed identity, paths, capacity, MMIO layout,
+features or Writeback policy. Vhost-user blocks are unsupported. Empty bindings
+retain the existing rejection. The selected backing must be a regular file of
+the exact declared capacity. Snapshot data cannot set the transient file check.
+
+`scripts/compat/native-block-restore.py` exercises the patched VMM directly.
+It boots a small guest, saves a trusted reference and later checkpoint, retires
+the original VMM, copies disk state into a distinct inode, and restores into a
+fresh VMM. Checks cover inherited exclusive leases, missing-reference rejection
+before opening the disk, actual backing-length rejection, stable serial and RAM
+identity, host flushes, preserved disk contents and a new write that leaves the
+retired source unchanged. Guest poweroff must complete with status zero.
+
+This establishes the restore primitive. The oracle supplies its own trusted
+layout, files and leases. Managed VM attachments, durable ownership fencing,
+coherent disk generations, automatic migration transfer and software-backend disk
+integration remain required under #1329 before exposing managed attachments.
