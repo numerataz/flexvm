@@ -27,6 +27,7 @@
 #include <linux/workqueue.h>
 #include <asm/msr-index.h>
 #include <asm/processor-flags.h>
+#include <asm/fpu/types.h>
 #include "mailbox.h"
 
 #define PVKVM_REAL_MODE_FLAGS (X86_EFLAGS_FIXED | X86_EFLAGS_CF | X86_EFLAGS_PF | \
@@ -1005,6 +1006,65 @@ static long cpu_mp_state(struct pvcpu *cpu, bool write, struct kvm_mp_state __us
 	return result;
 }
 
+/* Serialized with KVM_SET_CPUID2 by cpu_ioctl's execution mutex. */
+static bool valid_xcr0(const struct pvcpu *cpu, u64 value)
+{
+	u64 allowed = XFEATURE_MASK_FP;
+	unsigned int i;
+
+	if (cpu->cpuid) {
+		for (i = 0; i < cpu->cpuid->count; i++) {
+			const struct kvm_cpuid_entry2 *entry = &cpu->cpuid->entries[i];
+
+			if (entry->function == 0xd && entry->index == 0) {
+				allowed |= entry->eax | ((u64)entry->edx << 32);
+				break;
+			}
+		}
+	}
+	return (value & XFEATURE_MASK_FP) && !(value & ~allowed) &&
+	       (!(value & XFEATURE_MASK_YMM) || (value & XFEATURE_MASK_SSE)) &&
+	       (!!(value & XFEATURE_MASK_BNDREGS) == !!(value & XFEATURE_MASK_BNDCSR)) &&
+	       (!(value & XFEATURE_MASK_AVX512) ||
+		((value & XFEATURE_MASK_AVX512) == XFEATURE_MASK_AVX512 && (value & XFEATURE_MASK_YMM))) &&
+	       (!(value & XFEATURE_MASK_XTILE) || (value & XFEATURE_MASK_XTILE) == XFEATURE_MASK_XTILE);
+}
+
+static long cpu_xcrs(struct pvcpu *cpu, bool write, struct kvm_xcrs __user *user)
+{
+	struct kvm_xcrs state;
+	unsigned int i;
+	int result;
+
+	if (write) {
+		if (copy_from_user(&state, user, sizeof(state)))
+			return -EFAULT;
+		if (state.flags || state.nr_xcrs > ARRAY_SIZE(state.xcrs))
+			return -EINVAL;
+		for (i = 0; i < state.nr_xcrs; i++) {
+			struct kvm_xcr xcr = state.xcrs[i];
+
+			if (xcr.xcr)
+				continue;
+			if (!valid_xcr0(cpu, xcr.value))
+				return -EINVAL;
+			/* Linux uses the first XCR0 entry, including when a later one repeats it. */
+			memset(&state, 0, sizeof(state));
+			state.nr_xcrs = 1;
+			state.xcrs[0].value = xcr.value;
+			return write_stopped_registers(cpu, PVKVM_SET_XCRS, PVKVM_XCRS_AT,
+						       &state, sizeof(state));
+		}
+		/* The x86 KVM ioctl ignores unsupported XCR indices. */
+		return 0;
+	}
+	result = read_stopped_registers(cpu, PVKVM_GET_XCRS, PVKVM_XCRS_AT,
+					&state, sizeof(state));
+	if (!result && copy_to_user(user, &state, sizeof(state)))
+		return -EFAULT;
+	return result;
+}
+
 static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct pvcpu *cpu = file->private_data;
@@ -1134,6 +1194,10 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case KVM_SET_MP_STATE:
 		result = cpu_mp_state(cpu, cmd == KVM_SET_MP_STATE, uarg);
 		break;
+	case KVM_GET_XCRS:
+	case KVM_SET_XCRS:
+		result = cpu_xcrs(cpu, cmd == KVM_SET_XCRS, uarg);
+		break;
 	case KVM_RUN:
 		if (arg || cpu->sregs.cs.base || !registers_fit_mode(&cpu->regs, &cpu->sregs) ||
 		    (!(cpu->sregs.cr0 & X86_CR0_PE) && cpu->regs.rip > U16_MAX)) {
@@ -1222,6 +1286,7 @@ static long device_capability(unsigned long capability)
 	case KVM_CAP_IRQCHIP:
 	case KVM_CAP_DEBUGREGS:
 	case KVM_CAP_MP_STATE:
+	case KVM_CAP_XCRS:
 		return 1;
 	case KVM_CAP_NR_MEMSLOTS:
 		return PVKVM_MAX_SLOTS;
@@ -1847,8 +1912,10 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	BUILD_BUG_ON(sizeof(struct kvm_debugregs) != PVKVM_DEBUGREGS_BYTES);
 	BUILD_BUG_ON(PVKVM_DEBUGREGS_AT + PVKVM_DEBUGREGS_BYTES > PVKVM_MP_STATE_AT);
 	BUILD_BUG_ON(sizeof(struct kvm_mp_state) != sizeof(u32));
+	BUILD_BUG_ON(PVKVM_MP_STATE_AT + sizeof(struct kvm_mp_state) > PVKVM_XCRS_AT);
+	BUILD_BUG_ON(sizeof(struct kvm_xcrs) != PVKVM_XCRS_BYTES);
 	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
-	    pci_resource_len(dev, 2) < PVKVM_MP_STATE_AT + sizeof(struct kvm_mp_state))
+	    pci_resource_len(dev, 2) < PVKVM_XCRS_AT + PVKVM_XCRS_BYTES)
 		return -ENODEV;
 	result = pcim_enable_device(dev);
 	if (result)

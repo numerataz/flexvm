@@ -76,6 +76,7 @@ static void reset_state(unsigned int id, bool irqchip, unsigned long operation,
         struct kvm_sregs sregs;
         struct kvm_debugregs debugregs;
         struct kvm_mp_state mp;
+        struct kvm_xcrs xcrs;
     } state;
     size_t length = sizeof(state.sregs);
     if (operation == KVM_GET_LAPIC)
@@ -84,6 +85,8 @@ static void reset_state(unsigned int id, bool irqchip, unsigned long operation,
         length = sizeof(state.debugregs);
     if (operation == KVM_GET_MP_STATE)
         length = sizeof(state.mp);
+    if (operation == KVM_GET_XCRS)
+        length = sizeof(state.xcrs);
     int kvm = host_kvm();
     int vm = ioctl(kvm, KVM_CREATE_VM, 0);
     check(vm >= 0, "create a host reset-state VM");
@@ -198,6 +201,10 @@ int main(int argc, char **argv)
         reset_state(number(argv[2], PVKVM_MAX_CPUS - 1), number(argv[3], 1), KVM_GET_MP_STATE, states, count);
         return 0;
     }
+    if (argc == 3 && !strcmp(argv[1], "--reset-xcrs")) {
+        reset_state(number(argv[2], PVKVM_MAX_CPUS - 1), false, KVM_GET_XCRS, NULL, 0);
+        return 0;
+    }
     if (argc == 2 && !strcmp(argv[1], "--reset-irqchips")) {
         reset_irqchips();
         return 0;
@@ -276,6 +283,7 @@ int main(int argc, char **argv)
     _Static_assert(sizeof(fpu) == PVKVM_FPU_BYTES && sizeof(cpuid) >= sizeof(fpu) &&
                    sizeof(struct kvm_pit_state2) == PVKVM_PIT_STATE_BYTES &&
                    sizeof(struct kvm_debugregs) == PVKVM_DEBUGREGS_BYTES &&
+                   sizeof(struct kvm_xcrs) == PVKVM_XCRS_BYTES &&
                    sizeof(lapic) == PVKVM_LAPIC_BYTES && sizeof(cpuid) >= sizeof(lapic) &&
                    sizeof(cpuid) >= PVKVM_PIO_BYTES + sizeof(uint32_t) &&
                    sizeof(cpuid) >= sizeof(segments) && sizeof(cpuid) >= sizeof(msrs),
@@ -359,6 +367,23 @@ int main(int argc, char **argv)
             if (ioctl(cpu, write_state ? KVM_SET_MP_STATE : KVM_GET_MP_STATE, &reply.state) < 0)
                 reply.status = -errno;
             check(write(control, &reply, sizeof(reply)) == sizeof(reply), "return the host MP state result");
+            continue;
+        }
+        if (received == 2 && request[0] == 's') {
+            struct kvm_xcrs xcrs = {0};
+
+            check(ioctl(cpu, KVM_GET_XCRS, &xcrs) == 0, "read actual host XCRs");
+            check(write(control, &xcrs, sizeof(xcrs)) == sizeof(xcrs), "return the host XCR state");
+            continue;
+        }
+        if (received == 2 + sizeof(struct kvm_xcrs) && request[0] == 't') {
+            struct kvm_xcrs xcrs;
+            int32_t result = 0;
+
+            memcpy(&xcrs, request + 2, sizeof(xcrs));
+            if (ioctl(cpu, KVM_SET_XCRS, &xcrs) < 0)
+                result = -errno;
+            check(write(control, &result, sizeof(result)) == sizeof(result), "return the host XCR ioctl result");
             continue;
         }
         if (received == 2 + sizeof(struct kvm_irq_level) && request[0] == 'L') {

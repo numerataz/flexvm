@@ -3,7 +3,7 @@
 #define FLEXVM_PVKVM_MAILBOX_H
 
 #define PVKVM_MAGIC        0x4d564b46
-#define PVKVM_VERSION      31
+#define PVKVM_VERSION      32
 #define PVKVM_MAGIC_AT     0
 #define PVKVM_VERSION_AT   4
 #define PVKVM_REQUEST_AT   8
@@ -42,6 +42,8 @@
 #define PVKVM_DEBUGREGS_AT   0x87400
 #define PVKVM_DEBUGREGS_BYTES 128
 #define PVKVM_MP_STATE_AT     0x87480
+#define PVKVM_XCRS_AT         0x87500
+#define PVKVM_XCRS_BYTES      392
 #define PVKVM_IOAPIC_GPA     0xfec00000ULL
 #define PVKVM_GSI_COUNT      24
 #define PVKVM_REGISTERS_AT   64
@@ -117,6 +119,8 @@ enum pvkvm_command {
 	PVKVM_SET_DEBUGREGS,
 	PVKVM_GET_MP_STATE,
 	PVKVM_SET_MP_STATE,
+	PVKVM_GET_XCRS,
+	PVKVM_SET_XCRS,
 };
 
 #endif
