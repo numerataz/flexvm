@@ -1,15 +1,17 @@
 //! Ordered checkpoint stream. The manifest fixes the member names, sizes and
 //! digests. There are no paths, links, or authority records in the byte stream.
-use std::fs::{File, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{host_id_in, parent_directory, parent_lock, present, private_directory, read_fence, read_input, retired_checkpoint, Host, Offer};
+use super::{
+    host_id_in, parent_directory, parent_lock, present, private_directory, read_fence, read_incoming, read_input, retired_checkpoint, Host, Offer, Status,
+};
 use crate::software_state::{firmware_names, member, read_manifest, write_record, Artifact, Manifest, Retirement, Staging, MAX_MANIFEST};
 use crate::{
     bail,
@@ -190,8 +192,7 @@ fn receive(state: &Path, expected: &Offer, reader: &mut dyn Read, limit: u64) ->
     state.sync_all()?;
     let incoming_path = crate::host::fd_path(incoming.as_raw_fd());
     let name = bundle_name(expected);
-    let _bundle =
-        crate::host::lock_at(crate::host::host_locks()?, &crate::host::keyed("software-bundle", &util::fstat(incoming.as_raw_fd())?, &name), libc::LOCK_EX)?;
+    let _bundle = crate::host::lock_at(crate::host::host_locks()?, &bundle_key(&incoming, &name)?, libc::LOCK_EX)?;
     let target = incoming_path.join(&name);
     let mut buffer = vec![0; 1 << 20];
     let staging = if present(&incoming, &name)? {
@@ -231,6 +232,61 @@ fn bundle_name(offer: &Offer) -> String {
     format!("{}-{}", offer.vm_id, offer.transfer_id)
 }
 
+fn bundle_key(incoming: &File, name: &str) -> std::io::Result<String> {
+    Ok(crate::host::keyed("software-bundle", &util::fstat(incoming.as_raw_fd())?, name))
+}
+
+pub(in crate::software_state) fn sweep_retired(state: &Path, incoming: &Path) -> Result<()> {
+    if fs::symlink_metadata(incoming)?.uid() != unsafe { libc::geteuid() } {
+        return Ok(());
+    }
+    let state = parent_directory(state)?;
+    let incoming = private_directory(incoming)?;
+    for entry in fs::read_dir(crate::host::fd_path(incoming.as_raw_fd()))? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some((name, (vm_id, transfer_id))) = name.to_str().and_then(|name| name.split_once('-').map(|ids| (name, ids))) else { continue };
+        if [vm_id, transfer_id].into_iter().any(|id| id.len() != 32 || !id.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))) {
+            continue;
+        }
+        let Some(_bundle) = crate::host::try_lock_at(crate::host::host_locks()?, &bundle_key(&incoming, name)?)? else { continue };
+        let _transfer = parent_lock(&state, libc::LOCK_EX)?;
+        let path = entry.path();
+        let Ok(directory) = private_directory(&path) else { continue };
+        if crate::host::flock(&directory, libc::LOCK_EX | libc::LOCK_NB).is_err() {
+            continue;
+        }
+        let Ok(offer) = super::record::<Offer>(&directory, "OFFER") else { continue };
+        if offer.validate().is_err() || bundle_name(&offer) != name || offer.destination_host != host_id_in(&state)? {
+            continue;
+        }
+        let obsolete = read_incoming(&state, &offer)?
+            .is_some_and(|journal| journal.offer.generation > offer.generation || journal.offer == offer && journal.status == Status::Aborted);
+        if !activate::reclaimable(&state, &offer, obsolete)? {
+            continue;
+        }
+        let pinned = directory.metadata()?;
+        if !fs::symlink_metadata(&path).is_ok_and(|selected| selected.is_dir() && (selected.dev(), selected.ino()) == (pinned.dev(), pinned.ino())) {
+            continue;
+        }
+        // Move the retired bundle to the existing crash-recoverable staging
+        // namespace before removing members. The selected name cannot reappear
+        // because receive checks the same destination journal under this lock.
+        let parent = crate::host::fd_path(incoming.as_raw_fd());
+        let _staging = parent_lock(&incoming, libc::LOCK_EX)?;
+        let retired = parent.join(format!("{}{}", crate::software_state::STAGING_PREFIX, util::random_hex(16)?));
+        if util::rename_noreplace(&path, &retired)? {
+            incoming.sync_all()?;
+            fs::remove_dir_all(retired)?;
+            incoming.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn import(state: &Path, offer: &Path, reader: &mut dyn Read, max_mib: Option<&str>) -> Result<serde_json::Value> {
     let max_mib: u64 = max_mib.unwrap_or("16384").parse()?;
     let limit = max_mib.checked_mul(1 << 20).filter(|bytes| *bytes > 0 && *bytes <= i64::MAX as u64).ok_or("invalid software bundle size limit")?;
@@ -265,6 +321,38 @@ mod tests {
             member(&checkpoint, &name).unwrap().read_to_end(&mut wire).unwrap();
         }
         (offer, wire)
+    }
+
+    #[test]
+    fn collection_keeps_pending_or_pinned_imports_and_reclaims_aborted_or_superseded_ones() {
+        for supersede in [false, true] {
+            let source = TempDir::new("transfer-collect-source");
+            let target = TempDir::new("transfer-collect-target");
+            let (offer, bytes) = wire(&source, &target);
+            let key = STANDARD.encode([2; 32]);
+            transition(&target, offer.clone(), Action::Prepare(key.clone(), Vec::new())).unwrap();
+            receive(&target, &offer, &mut bytes.as_slice(), 1 << 20).unwrap();
+            let path = target.join(INCOMING).join(bundle_name(&offer));
+            crate::software_state::sweep(&target).unwrap();
+            assert!(path.exists());
+
+            let pinned = private_directory(&path).unwrap();
+            crate::host::flock(&pinned, libc::LOCK_SH).unwrap();
+            transition(&target, offer.clone(), Action::Abort).unwrap();
+            if supersede {
+                let next = Offer { transfer_id: "55".repeat(16), generation: offer.generation + 1, ..offer.clone() };
+                transition(&target, next, Action::Prepare(key, Vec::new())).unwrap();
+            }
+            crate::software_state::sweep(&target).unwrap();
+            assert!(path.exists());
+
+            drop(pinned);
+            crate::software_state::sweep(&target).unwrap();
+            assert!(!path.exists());
+            assert!(receive(&target, &offer, &mut bytes.as_slice(), 1 << 20).is_err());
+            let state = parent_directory(&target).unwrap();
+            assert!(read_incoming(&state, &offer).unwrap().is_some());
+        }
     }
 
     #[test]

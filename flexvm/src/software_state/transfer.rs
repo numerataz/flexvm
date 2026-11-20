@@ -405,6 +405,9 @@ fn require_incoming(state: &File, offer: &Offer) -> Result<()> {
     if incoming_status(state, offer)? == Status::Aborted {
         bail!("software transfer was aborted");
     }
+    if bundle::activate::finished(state, offer)? {
+        bail!("software transfer was already activated and its import was retired");
+    }
     Ok(())
 }
 

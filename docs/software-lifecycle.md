@@ -254,6 +254,13 @@ resuming. A retry before the grant uses the same destination name and a newer
 generation. The grant survives removal of the VM or its imported artifacts.
 After activation, ordinary destination `stop` and `start` use local checkpoints.
 
+The destination can reclaim an import after a clean shutdown or after
+retirement publishes its replacement local checkpoint. `flexvm debug gc`
+collects those imports and obsolete destination bundles once their
+readers and engines have exited. The durable activation decision remains.
+If the owner failed without a clean retirement, the import is retained
+for recovery.
+
 To return to the previous host, repeat the same commands with source and
 destination reversed. The returning offer must advance the generation and
 use the host identity and signing key pinned by the last outbound handoff.

@@ -549,6 +549,7 @@ pub struct Consumed {
     grant: Grant,
     manifest: Manifest,
     replaced: std::sync::Mutex<Vec<(File, PathBuf)>>,
+    import: Option<transfer::bundle::activate::Import>,
 }
 
 impl Verified {
@@ -615,7 +616,7 @@ impl Prepared<'_> {
             engine,
         };
         write_record(&self.directory, "STARTED", &serde_json::to_vec(&grant)?, false)?;
-        Ok(Consumed { directory: self.directory, grant, manifest: self.manifest, replaced: std::sync::Mutex::new(Vec::new()) })
+        Ok(Consumed { directory: self.directory, grant, manifest: self.manifest, replaced: std::sync::Mutex::new(Vec::new()), import: None })
     }
 }
 
@@ -626,6 +627,15 @@ impl Drop for Consumed {
 }
 
 impl Consumed {
+    /// On a clean retirement, the grant remains but its inputs can be swept.
+    pub fn complete_import(&self) {
+        if let Some(import) = &self.import {
+            if let Err(error) = import.finish(&self.grant) {
+                crate::log!("software checkpoint import retirement: {error}");
+            }
+        }
+    }
+
     /// Release exchanged inputs before reporting retirement, even when a
     /// finishing control request still holds a reference to the owner.
     pub fn release_replaced_inputs(&self) {
@@ -656,6 +666,7 @@ impl Consumed {
         if self.grant.owner != crate::host::Ident::me() || crate::host::PidFd::open(&self.grant.engine)?.is_some() {
             bail!("software execution has not retired");
         }
+        self.complete_import();
         if !path.exists() {
             return Ok(());
         }
@@ -915,6 +926,7 @@ pub fn sweep(state: &Path) -> Result<()> {
     let incoming = state.join(transfer::bundle::INCOMING);
     if incoming.exists() {
         sweep_directory(&incoming, true)?;
+        transfer::bundle::sweep_retired(state, &incoming)?;
     }
     Ok(())
 }
