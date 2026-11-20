@@ -4,10 +4,6 @@ members = ["flexvm", "guest"]
 
 [workspace.dependencies]
 libc = "0.2"
-bytes = "1"
-yamux = "0.14"
-futures-util = { version = "0.3", features = ["io", "sink"] }
-tokio-util = { version = "0.7", features = ["compat", "codec"] }
 
 [profile.release]
 opt-level = 3

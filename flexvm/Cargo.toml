@@ -8,9 +8,6 @@ publish = false
 
 [dependencies]
 libc.workspace = true
-yamux.workspace = true
-futures-util.workspace = true
-tokio-util.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 # Container image templates: registry pulls over HTTPS, digests, layer formats.
