@@ -40,6 +40,18 @@ cp -- "$source_dir"/{Makefile,mailbox.h,flexvm-pvkvm.c} "$work/module/"
 env -u KVM -u LOCALVERSION make -j2 -C "$kernel_build" "M=$work/module" modules
 install -m 0644 -- "$work/module/flexvm-pvkvm.ko" "$publish/bundle/"
 printf '%s\n' "$release" > "$publish/bundle/kernel.release"
+python3 - "$publish/bundle" <<'PYMODULE'
+from pathlib import Path
+import struct
+import sys
+
+bundle = Path(sys.argv[1])
+module = (bundle / "flexvm-pvkvm.ko").read_bytes()
+if not 0 < len(module) <= 4 << 20:
+    raise SystemExit("parent KVM module exceeds its block attachment limit")
+image = struct.pack("<8sI", b"FLEXKVM1", len(module)) + module
+(bundle / "flexvm-pvkvm.img").write_bytes(image + bytes(-len(image) % 512))
+PYMODULE
 if [[ ${3:-} == --native ]]; then
   cc -std=c11 -O2 -Wall -Wextra -Werror -static -pthread "$source_dir/native-worker.c" -o "$publish/bundle/native-worker"
 fi
