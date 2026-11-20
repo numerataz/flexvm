@@ -1,0 +1,32 @@
+--- a/hw/misc/flexvm-shared-ram.c
++++ b/hw/misc/flexvm-shared-ram.c
+@@ -38,7 +38,7 @@
+     void *address;
+
+     if (qemu_real_host_page_size() != FLEXVM_SLOT_PAGE_SIZE ||
+-        s->address < FLEXVM_SLOT_PAGE_SIZE || s->address >= 0xc0000000 ||
++        s->address >= 0xc0000000 ||
+         s->address % FLEXVM_SLOT_PAGE_SIZE) {
+         error_setg(errp, "flexvm-shared-ram needs a page-aligned PC RAM address");
+         return;
+@@ -48,8 +48,7 @@
+         error_setg_errno(errp, errno, "cannot map flexvm-shared-ram");
+         return;
+     }
+-    uint64_t end = s->address + size;
+-    if (end > 0xc0000000 || (s->address < 0x100000 && end > 0xa0000)) {
++    if (size > 0xc0000000 - s->address) {
+         error_setg(errp, "flexvm-shared-ram overlaps the PC device aperture");
+         munmap(address, size);
+         return;
+@@ -64,8 +63,9 @@
+
+     memory_region_init_ram_ptr_owned(&s->slot, OBJECT(dev), "flexvm.shared-ram",
+                                      size, address, flexvm_slot_unmap);
++    /* The KVM slot owns the bytes even in the legacy PC ROM window. */
+     memory_region_add_subregion_overlap(get_system_memory(), s->address,
+-                                        &s->slot, 1);
++                                        &s->slot, 2);
+ #else
+     error_setg(errp, "flexvm-shared-ram requires a Linux host");
+ #endif
