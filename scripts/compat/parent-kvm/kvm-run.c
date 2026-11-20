@@ -14,6 +14,7 @@
 #include "mailbox.h"
 
 #define PROTECTED_SLOT_GPA 0x1000000
+#define SPLIT_SLOT_GPA 0x20000000
 #define GDT_OFFSET 0x200
 
 static void check(bool valid, const char *why)
@@ -75,25 +76,36 @@ static void select_segments(int cpu, bool protected_mode, uint64_t gpa)
 
 int main(int argc, char **argv)
 {
-    bool protected_mode = argc == 3 && !strcmp(argv[2], "protected");
-    check(argc == 2 || protected_mode, "specify the RAM page count and optional protected mode");
+    bool split_slot = argc == 3 && !strcmp(argv[2], "split");
+    bool protected_mode = split_slot || (argc == 3 && !strcmp(argv[2], "protected"));
+    check(argc == 2 || protected_mode, "specify the RAM page count and optional protected or split mode");
     char *end;
     errno = 0;
     long count = strtol(argv[1], &end, 10);
     check(!errno && !*end && count > 0 && count <= PVKVM_MAX_PAGES, "select the RAM page count");
     check(protected_mode || count <= PVKVM_REAL_MODE_MAX_PAGES, "select protected mode for a large slot");
+    check(!split_slot || count >= 2, "split mode needs at least two RAM pages");
     size_t pages = count;
     size_t ram_bytes = pages * 4096;
     uint64_t gpa = protected_mode ? PROTECTED_SLOT_GPA : PVKVM_GUEST_START;
-    uint64_t last_page = gpa + ram_bytes - 4096;
     uint64_t middle_page = gpa + (pages / 2) * 4096;
+    uint64_t last_page = gpa + ram_bytes - 4096;
+    if (split_slot) {
+        middle_page = SPLIT_SLOT_GPA;
+        last_page = SPLIT_SLOT_GPA + (pages - pages / 2 - 1) * 4096;
+    }
     int kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     check(kvm >= 0, "open /dev/kvm");
     check(ioctl(kvm, KVM_GET_API_VERSION, 0) == KVM_API_VERSION, "API version");
+    check(ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_USER_MEMORY) == 1 &&
+          ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_NR_MEMSLOTS) >= PVKVM_MAX_SLOTS,
+          "query system KVM memory capabilities");
     int size = ioctl(kvm, KVM_GET_VCPU_MMAP_SIZE, 0);
     check(size >= (int)sizeof(struct kvm_run), "run mapping size");
     int vm = ioctl(kvm, KVM_CREATE_VM, 0);
     check(vm >= 0 && (fcntl(vm, F_GETFD) & FD_CLOEXEC), "VM file descriptor");
+    check(ioctl(vm, KVM_CHECK_EXTENSION, KVM_CAP_USER_MEMORY) == 1,
+          "query the VM's memory capability");
     unsigned char *ram = mmap(NULL, ram_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     check(ram != MAP_FAILED, "map client RAM");
     volatile unsigned char *scratch = NULL;
@@ -112,8 +124,21 @@ int main(int argc, char **argv)
         for (size_t i = 0; i < pages - separated_pages; i++)
             touch[i * 4096] = 0;
     }
+    size_t first_bytes = split_slot ? (pages / 2) * 4096 : ram_bytes;
+    if (split_slot) {
+        struct kvm_userspace_memory_region second = {
+            .slot = 5, .guest_phys_addr = SPLIT_SLOT_GPA, .memory_size = ram_bytes - first_bytes,
+            .userspace_addr = (unsigned long)(ram + first_bytes),
+        };
+        check(ioctl(vm, KVM_SET_USER_MEMORY_REGION, &second) == 0, "register the high RAM slot first");
+        struct kvm_userspace_memory_region overlapping = second;
+        overlapping.slot = 6;
+        overlapping.memory_size = 4096;
+        check(ioctl(vm, KVM_SET_USER_MEMORY_REGION, &overlapping) == -1 && errno == EEXIST,
+              "reject an overlapping guest-physical slot");
+    }
     struct kvm_userspace_memory_region region = {
-        .guest_phys_addr = gpa, .memory_size = ram_bytes, .userspace_addr = (unsigned long)ram,
+        .guest_phys_addr = gpa, .memory_size = first_bytes, .userspace_addr = (unsigned long)ram,
     };
     check(ioctl(vm, KVM_SET_USER_MEMORY_REGION, &region) == 0, "register client RAM");
     if (scratch)

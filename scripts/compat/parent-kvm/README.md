@@ -9,7 +9,9 @@ I/O exit. The client changes a byte in shared RAM and updates the stopped
 child's registers, including its instruction pointer. A second `KVM_RUN`
 resumes the same child. It uses both updates to produce the next I/O byte.
 
-The module supports one VM, one vCPU and one pinned slot of up to 256 MiB.
+The module supports one VM, one vCPU and up to eight pinned slots with a
+combined limit of 256 MiB. The initial RAM layout stays fixed while the
+worker runs.
 The parent validates the physical offsets and seals their ordered
 layout in a file. Both engines fill one contiguous address interval with
 shared mappings of the outer VM RAM and combine consecutive offsets into
@@ -50,6 +52,8 @@ Add `--protected-entry` to set initial x86 protected mode through
 `KVM_SET_SREGS` and execute a 32-bit program at 16 MiB.
 Use `--protected-entry --ram-pages 49152` to map a 192 MiB slot and verify
 child writes to the first, middle, and last pages.
+Add `--split-slot` to divide the RAM between slots 0 and 5 at guest
+physical addresses 16 MiB and 512 MiB.
 The worker uses one host mapping per consecutive extent. Highly fragmented
 slots can reach the host's mapping limit. A failed mapping releases the
 partially mapped worker span.

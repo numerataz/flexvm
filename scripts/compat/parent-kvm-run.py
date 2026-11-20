@@ -2,6 +2,7 @@
 """Run a parent worker against a pinned KVM memory slot in shared outer RAM."""
 import argparse
 from contextlib import ExitStack
+from dataclasses import dataclass
 import errno
 import fcntl
 import json
@@ -30,6 +31,8 @@ PAGE_SIZE = 4096
 MAX_REAL_MODE_PAGES = 128
 MAX_SLOT_PAGES = 65536
 PROTECTED_GPA = 16 * MIB
+SPLIT_GPA = 512 * MIB
+MAX_SLOTS = 8
 IO_VALUES = (0x42, 0xa7)
 OPEN_VM, CLOSE_VM, OPEN_CPU, CLOSE_CPU, RUN, GET_REGS, SET_REGS, GET_SREGS = range(1, 9)
 # Linux's x86 struct kvm_regs. The fixture runs in real mode.
@@ -47,6 +50,13 @@ QEMU_OPTIONS = [
     "-nodefaults", "-display", "none", "-monitor", "none", "-nic", "none",
     "-smp", "1", "-no-reboot", "-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
 ]
+
+
+@dataclass(frozen=True)
+class SlotLayout:
+    identifier: int
+    gpa: int
+    offsets: tuple[int, ...]
 
 
 def pack_special_registers(snapshot):
@@ -165,7 +175,7 @@ class RegisterChannel:
 
 
 class TcgChild:
-    def __init__(self, qemu, output, socket_path, outer_ram, layout, offsets, gpa):
+    def __init__(self, qemu, output, socket_path, outer_ram, layouts, slots):
         self.process = None
         self.channel = None
         self.debugger = None
@@ -173,7 +183,7 @@ class TcgChild:
         debugger_path = socket_path.with_name("registers.sock")
         self.special_monitor_path = socket_path.with_name("special-registers.sock")
         self.memory = outer_ram
-        self.offsets = offsets
+        self.data_offset = slots[-1].offsets[-1] + 0x82
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener, (output / "child.log").open("wb") as log:
                 listener.bind(str(socket_path))
@@ -186,9 +196,11 @@ class TcgChild:
                     "-gdb", "chardev:regs",
                     "-qmp", f"unix:{self.special_monitor_path},server=on,wait=off",
                     "-device", "isa-debugcon,iobase=0x30,chardev=port,run-control=on",
-                    "-device", f"flexvm-shared-ram,ram-fd={outer_ram},layout-fd={layout},addr={gpa}",
                 ]
-                self.process = subprocess.Popen(command, pass_fds=(outer_ram, layout), stdout=log, stderr=log)
+                for slot, layout in zip(slots, layouts, strict=True):
+                    command.extend(["-device", f"flexvm-shared-ram,id=slot{slot.identifier},"
+                                    f"ram-fd={outer_ram},layout-fd={layout},addr={slot.gpa}"])
+                self.process = subprocess.Popen(command, pass_fds=(outer_ram, *layouts), stdout=log, stderr=log)
                 connection, _ = listener.accept()
                 self.channel = RunChannel(connection)
                 self.debugger = RegisterChannel(debugger_path)
@@ -201,7 +213,7 @@ class TcgChild:
             raise
 
     def run(self):
-        if self.channel.exits and os.pread(self.memory, 1, self.offsets[-1] + 0x82) != b"\0":
+        if self.channel.exits and os.pread(self.memory, 1, self.data_offset) != b"\0":
             raise RuntimeError("child wrote its second result while stopped")
         return self.channel.run()
 
@@ -247,16 +259,17 @@ class TcgChild:
 
 
 class KvmChild:
-    def __init__(self, output, outer_ram, layout, offsets, gpa):
+    def __init__(self, output, outer_ram, layouts, slots):
         self.process = None
         self.channel = None
-        self.offsets = offsets
         connection, worker = socket.socketpair(type=socket.SOCK_SEQPACKET)
         try:
             with worker, (output / "child.log").open("wb") as log:
                 control = worker.fileno()
-                command = [output / "native-worker", str(control), str(outer_ram), str(layout), str(gpa)]
-                self.process = subprocess.Popen(command, pass_fds=(control, outer_ram, layout), stdout=log, stderr=log)
+                command = [output / "native-worker", str(control), str(outer_ram)]
+                for slot, layout in zip(slots, layouts, strict=True):
+                    command.extend(map(str, (layout, slot.gpa, slot.identifier)))
+                self.process = subprocess.Popen(command, pass_fds=(control, outer_ram, *layouts), stdout=log, stderr=log)
             self.channel = RunChannel(connection)
         except BaseException:
             connection.close()
@@ -319,24 +332,53 @@ def doorbell_peer(server, memory, requests, replies):
         raise
 
 
-def start_child(engine, qemu, output, control, outer_ram, offsets, gpa):
-    manifest = os.memfd_create("flexvm-slot-layout", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
-    try:
-        layout = struct.pack(f"<{len(offsets)}Q", *offsets)
-        if os.write(manifest, layout) != len(layout):
-            raise RuntimeError("short write of the RAM slot layout")
-        fcntl.fcntl(manifest, fcntl.F_ADD_SEALS,
-                    fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SEAL)
+def read_slot_table(mailbox, ram_pages, outer_bytes, protected_entry, split_slot):
+    first_gpa = PROTECTED_GPA if protected_entry else PAGE_SIZE
+    expected = [(0, ram_pages, first_gpa)]
+    if split_slot:
+        first_pages = ram_pages // 2
+        expected = [(0, first_pages, first_gpa), (5, ram_pages - first_pages, SPLIT_GPA)]
+    count, = struct.unpack_from("<I", mailbox, 32)
+    if count != len(expected) or count > MAX_SLOTS:
+        raise RuntimeError("unexpected number of registered RAM slots")
+    slots = []
+    used_offsets = set()
+    offset_position = 1024
+    for index, record in enumerate(expected):
+        identifier, pages, gpa = struct.unpack_from("<IIQ", mailbox, 640 + index * 16)
+        if (identifier, pages, gpa) != record:
+            raise RuntimeError("unexpected guest physical slot layout")
+        offsets = struct.unpack_from(f"<{pages}Q", mailbox, offset_position)
+        offset_position += 8 * pages
+        for offset in offsets:
+            if (offset % PAGE_SIZE or not MIB <= offset <= outer_bytes - PAGE_SIZE or
+                    offset in used_offsets):
+                raise RuntimeError("registered slot page is outside outer RAM or repeated")
+            used_offsets.add(offset)
+        slots.append(SlotLayout(identifier, gpa, offsets))
+    return slots
+
+
+def start_child(engine, qemu, output, control, outer_ram, slots):
+    with ExitStack() as manifests:
+        layouts = []
+        for slot in slots:
+            manifest = os.memfd_create("flexvm-slot-layout", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
+            manifests.callback(os.close, manifest)
+            layout = struct.pack(f"<{len(slot.offsets)}Q", *slot.offsets)
+            if os.write(manifest, layout) != len(layout):
+                raise RuntimeError("short write of the RAM slot layout")
+            fcntl.fcntl(manifest, fcntl.F_ADD_SEALS,
+                        fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SEAL)
+            layouts.append(manifest)
         if engine == "kvm":
-            return KvmChild(output, outer_ram, manifest, offsets, gpa)
-        return TcgChild(qemu, output, control / "child.sock", outer_ram, manifest, offsets, gpa)
-    finally:
-        os.close(manifest)
+            return KvmChild(output, outer_ram, layouts, slots)
+        return TcgChild(qemu, output, control / "child.sock", outer_ram, layouts, slots)
 
 
-def verify_slot_span(pid, offsets):
-    spans = []
-    mapped_offsets = []
+def verify_slot_spans(pid, slots):
+    mappings = {}
+    extents = 0
     for line in Path(f"/proc/{pid}/maps").read_text().splitlines():
         fields = line.split(maxsplit=5)
         if len(fields) != 6 or fields[5] != "/memfd:flexvm-outer-ram (deleted)":
@@ -344,17 +386,23 @@ def verify_slot_span(pid, offsets):
         if fields[1] != "rw-s":
             raise RuntimeError("parent worker RAM is not a writable shared mapping")
         start, end = (int(address, 16) for address in fields[0].split("-"))
-        if spans and spans[-1][1] != start:
-            raise RuntimeError("parent worker RAM does not occupy one address interval")
-        spans.append((start, end))
         offset = int(fields[2], 16)
-        mapped_offsets.extend(range(offset, offset + end - start, PAGE_SIZE))
-    if tuple(mapped_offsets) != offsets:
-        raise RuntimeError("parent worker RAM layout differs from the guest slot")
-    return len(spans)
+        for delta in range(0, end - start, PAGE_SIZE):
+            if offset + delta in mappings:
+                raise RuntimeError("parent worker RAM maps the same page twice")
+            mappings[offset + delta] = start + delta
+        extents += 1
+    if len(mappings) != sum(len(slot.offsets) for slot in slots):
+        raise RuntimeError("parent worker mapped the wrong number of pages")
+    for slot in slots:
+        start = mappings.get(slot.offsets[0], -1)
+        if start < 0 or any(mappings.get(offset) != start + index * PAGE_SIZE
+                            for index, offset in enumerate(slot.offsets)):
+            raise RuntimeError(f"parent worker RAM does not match slot {slot.identifier}")
+    return extents
 
 
-def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry):
+def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry, split_slot):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
@@ -378,7 +426,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 10)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 11)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
         os.ftruncate(outer_ram, outer_ram_size)
@@ -417,18 +465,16 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
             status = 0
             if opcode == RUN:
                 if child is None:
-                    gpa, = struct.unpack_from("<Q", mapping, 32)
-                    if gpa != (PROTECTED_GPA if protected_entry else PAGE_SIZE):
-                        raise RuntimeError("unexpected guest physical address for the slot")
-                    offsets = struct.unpack_from(f"<{ram_pages}Q", mapping, 1024)
-                    if length != slot_size or len(set(offsets)) != ram_pages:
-                        raise RuntimeError("unexpected physical page list for the registered slot")
-                    if any(offset % PAGE_SIZE or not MIB <= offset <= outer_ram_size - PAGE_SIZE for offset in offsets):
-                        raise RuntimeError("registered pages are outside the outer VM RAM")
-                    state = read_protected_entry(mapping, gpa, length) if protected_entry else None
-                    child = start_child(parent_engine, qemu, output, control, outer_ram, offsets, gpa)
+                    if length != slot_size:
+                        raise RuntimeError("unexpected total size of registered RAM")
+                    slots = read_slot_table(mapping, ram_pages, outer_ram_size, protected_entry, split_slot)
+                    if protected_entry:
+                        state = read_protected_entry(mapping, slots[0].gpa, len(slots[0].offsets) * PAGE_SIZE)
+                    else:
+                        state = None
+                    child = start_child(parent_engine, qemu, output, control, outer_ram, slots)
                     cleanup.callback(child.close)
-                    extents = verify_slot_span(child.process.pid, offsets)
+                    extents = verify_slot_spans(child.process.pid, slots)
                     if state is not None:
                         child.set_protected_entry(state)
                     child.set_registers(mapping[64:64 + REGISTERS.size])
@@ -477,12 +523,13 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         if reject_close and (child.process is None or child.process.poll() is not None):
             raise RuntimeError("rejected close did not retain the child until enclosing cleanup")
     if ram_pages <= MAX_REAL_MODE_PAGES:
-        layout_summary = {"outer_page_offsets": child.offsets}
+        layout_summary = {"outer_page_offsets": [offset for slot in slots for offset in slot.offsets]}
     else:
-        layout_summary = {"sample_outer_page_offsets": (child.offsets[0], child.offsets[ram_pages // 2], child.offsets[-1])}
+        layout_summary = {"sample_outer_page_offsets": [(slot.offsets[0], slot.offsets[-1]) for slot in slots]}
     return {
         "guest_path": "/dev/kvm", "guest_vmx": False, "guest_svm": False,
-        "boot_mode": "protected" if protected_entry else "real", "slot_gpa": gpa,
+        "boot_mode": "protected" if protected_entry else "real", "slot_gpa": slots[0].gpa,
+        "guest_slots": [{"id": slot.identifier, "gpa": slot.gpa, "pages": len(slot.offsets)} for slot in slots],
         "parent_accelerator": parent_engine, "parent_commands": observed, "transport": "eventfd and MSI-X",
         "io_values": child.channel.exits, "child_memory_write_visible": True, "same_child_worker": True,
         "register_counters": counters,
@@ -512,6 +559,7 @@ def main():
     parser.add_argument("--parent-engine", choices=("tcg", "kvm"), default="tcg")
     parser.add_argument("--ram-pages", type=int, default=2, help=f"number of pages from 1 to {MAX_SLOT_PAGES}")
     parser.add_argument("--protected-entry", action="store_true", help="execute a 32-bit child above 16 MiB")
+    parser.add_argument("--split-slot", action="store_true", help="divide memory between two discontiguous GPAs")
     parser.add_argument("--reject-close", action="store_true", help="verify page retention when the parent refuses close")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -519,13 +567,15 @@ def main():
         parser.error(f"--ram-pages must be between 1 and {MAX_SLOT_PAGES}")
     if args.ram_pages > MAX_REAL_MODE_PAGES and not args.protected_entry:
         parser.error(f"--protected-entry is required above {MAX_REAL_MODE_PAGES} pages")
+    if args.split_slot and (not args.protected_entry or args.ram_pages < 2):
+        parser.error("--split-slot requires protected mode and at least two pages")
     qemu, kernel = (path.resolve(strict=True) for path in (args.qemu, args.kernel))
     output = args.output.resolve()
     if os.geteuid() != 0 or platform.machine() != "x86_64":
         parser.error("run as root on x86_64")
     if args.worker:
         print(json.dumps(exercise(qemu, kernel, output, args.reject_close, args.parent_engine, args.ram_pages,
-                                  args.protected_entry)))
+                                  args.protected_entry, args.split_slot)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -552,7 +602,7 @@ def main():
         if args.native_oracle:
             oracle = [client, str(args.ram_pages)]
             if args.protected_entry:
-                oracle.append("protected")
+                oracle.append("split" if args.split_slot else "protected")
             HELPERS["run"](oracle, 8, output / "native-kvm.log")
             report["same_client_passed_native_kvm"] = True
             report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
@@ -561,7 +611,7 @@ def main():
             "ram-pages": str(args.ram_pages).encode("ascii"),
         }
         if args.protected_entry:
-            files["protected-entry"] = b""
+            files["split-slot" if args.split_slot else "protected-entry"] = b""
         image = HELPERS["initramfs"](init.read_bytes(), files=files)
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
@@ -583,6 +633,7 @@ def main():
                             "--output", output, "--parent-engine", args.parent_engine,
                             "--ram-pages", str(args.ram_pages),
                             *(["--protected-entry"] if args.protected_entry else []),
+                            *(["--split-slot"] if args.split_slot else []),
                             *(["--reject-close"] if args.reject_close else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}
