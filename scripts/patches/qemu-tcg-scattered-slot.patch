@@ -1,0 +1,169 @@
+--- a/include/system/memory.h
++++ b/include/system/memory.h
+@@ -1535,6 +1535,18 @@
+                                 void *ptr);
+
+ /**
++ * memory_region_init_ram_ptr_owned: Initialize a RAM region from a mapping.
++ *
++ * The parameters match memory_region_init_ram_ptr(), except that the RAM
++ * block takes ownership of @ptr and calls @release when it is reclaimed.
++ * @ptr and @size must be page aligned. @release may run on the RCU thread.
++ */
++void memory_region_init_ram_ptr_owned(MemoryRegion *mr, Object *owner,
++                                      const char *name, uint64_t size,
++                                      void *ptr,
++                                      void (*release)(void *ptr, size_t size));
++
++/**
+  * memory_region_init_ram_device_ptr:  Initialize RAM device memory region from
+  *                                     a user-provided pointer.
+  *
+--- a/include/system/ramblock.h
++++ b/include/system/ramblock.h
+@@ -26,6 +26,7 @@
+     struct rcu_head rcu;
+     struct MemoryRegion *mr;
+     uint8_t *host;
++    void (*release_host)(void *host, size_t size);
+     uint8_t *colo_cache; /* For colo, VM's ram cache */
+     ram_addr_t offset;
+     ram_addr_t used_length;
+--- a/system/memory.c
++++ b/system/memory.c
+@@ -1702,6 +1702,15 @@
+     mr->ram_block = qemu_ram_alloc_from_ptr(size, ptr, mr, &error_abort);
+ }
+
++void memory_region_init_ram_ptr_owned(MemoryRegion *mr, Object *owner,
++                                      const char *name, uint64_t size,
++                                      void *ptr,
++                                      void (*release)(void *ptr, size_t size))
++{
++    memory_region_init_ram_ptr(mr, owner, name, size, ptr);
++    mr->ram_block->release_host = release;
++}
++
+ void memory_region_init_ram_device_ptr(MemoryRegion *mr,
+                                        Object *owner,
+                                        const char *name,
+--- a/system/physmem.c
++++ b/system/physmem.c
+@@ -2589,7 +2589,9 @@
+ static void reclaim_ramblock(RAMBlock *block)
+ {
+     if (block->flags & RAM_PREALLOC) {
+-        ;
++        if (block->release_host) {
++            block->release_host(block->host, block->max_length);
++        }
+     } else if (xen_enabled()) {
+         xen_invalidate_map_cache_entry(block->host);
+ #if !defined(_WIN32) && !defined(EMSCRIPTEN)
+--- a/hw/misc/flexvm-shared-ram.c
++++ b/hw/misc/flexvm-shared-ram.c
+@@ -6,66 +6,83 @@
+ #include "hw/qdev-properties.h"
+ #include "migration/blocker.h"
+ #include "system/address-spaces.h"
+-#include "system/hostmem.h"
++#include "system/memory.h"
++#ifdef CONFIG_LINUX
++#include "hw/misc/flexvm-slot-map.h"
++#endif
+
+ #define TYPE_FLEXVM_SHARED_RAM "flexvm-shared-ram"
+ OBJECT_DECLARE_SIMPLE_TYPE(FlexvmSharedRam, FLEXVM_SHARED_RAM)
+
+ struct FlexvmSharedRam {
+     DeviceState parent_obj;
+-    HostMemoryBackend *backend;
+-    MemoryRegion alias;
++    MemoryRegion slot;
+     Error *migration_blocker;
+     uint64_t address;
++    int32_t ram_fd;
++    int32_t layout_fd;
+ };
+
++#ifdef CONFIG_LINUX
++static void flexvm_slot_unmap(void *address, size_t size)
++{
++    munmap(address, size);
++}
++#endif
++
+ static void flexvm_shared_ram_realize(DeviceState *dev, Error **errp)
+ {
++#ifdef CONFIG_LINUX
+     FlexvmSharedRam *s = FLEXVM_SHARED_RAM(dev);
+-    MemoryRegion *memory;
++    size_t size;
++    void *address;
+
+-    if (!s->backend || host_memory_backend_is_mapped(s->backend)) {
+-        error_setg(errp, "flexvm-shared-ram needs an unused memdev");
++    if (qemu_real_host_page_size() != FLEXVM_SLOT_PAGE_SIZE ||
++        s->address < FLEXVM_SLOT_PAGE_SIZE || s->address >= 0xa0000 ||
++        s->address % FLEXVM_SLOT_PAGE_SIZE) {
++        error_setg(errp, "flexvm-shared-ram needs 4 KiB pages within PC low RAM");
+         return;
+     }
+-    if (s->address < 4096 || s->address > UINT64_MAX - 4096 ||
+-        s->address % 4096) {
+-        error_setg(errp, "flexvm-shared-ram needs a page-aligned RAM address");
++    address = flexvm_map_slot(s->ram_fd, s->layout_fd, &size);
++    if (address == MAP_FAILED) {
++        error_setg_errno(errp, errno, "cannot map flexvm-shared-ram");
+         return;
+     }
+-    memory = host_memory_backend_get_memory(s->backend);
+-    if (!memory_region_is_ram(memory) || memory_region_size(memory) != 4096) {
+-        error_setg(errp, "flexvm-shared-ram needs a single 4 KiB RAM page");
++    if (size > 0xa0000 - s->address) {
++        error_setg(errp, "flexvm-shared-ram crosses the PC low RAM limit");
++        munmap(address, size);
+         return;
+     }
+
+     error_setg(&s->migration_blocker,
+                "flexvm-shared-ram is backed by another worker's live RAM");
+     if (migrate_add_blocker(&s->migration_blocker, errp) < 0) {
++        munmap(address, size);
+         return;
+     }
+
+-    memory_region_init_alias(&s->alias, OBJECT(dev), "flexvm.shared-ram",
+-                             memory, 0, 4096);
++    memory_region_init_ram_ptr_owned(&s->slot, OBJECT(dev), "flexvm.shared-ram",
++                                     size, address, flexvm_slot_unmap);
+     memory_region_add_subregion_overlap(get_system_memory(), s->address,
+-                                        &s->alias, 1);
+-    host_memory_backend_set_mapped(s->backend, true);
++                                        &s->slot, 1);
++#else
++    error_setg(errp, "flexvm-shared-ram requires a Linux host");
++#endif
+ }
+
+ static void flexvm_shared_ram_unrealize(DeviceState *dev)
+ {
+     FlexvmSharedRam *s = FLEXVM_SHARED_RAM(dev);
+
+-    memory_region_del_subregion(get_system_memory(), &s->alias);
+-    object_unparent(OBJECT(&s->alias));
+-    host_memory_backend_set_mapped(s->backend, false);
++    memory_region_del_subregion(get_system_memory(), &s->slot);
++    object_unparent(OBJECT(&s->slot));
+     migrate_del_blocker(&s->migration_blocker);
+ }
+
+ static const Property flexvm_shared_ram_properties[] = {
+     DEFINE_PROP_UINT64("addr", FlexvmSharedRam, address, 0x1000),
+-    DEFINE_PROP_LINK("memdev", FlexvmSharedRam, backend, TYPE_MEMORY_BACKEND,
+-                     HostMemoryBackend *),
++    DEFINE_PROP_INT32("ram-fd", FlexvmSharedRam, ram_fd, -1),
++    DEFINE_PROP_INT32("layout-fd", FlexvmSharedRam, layout_fd, -1),
+ };
+
+ static void flexvm_shared_ram_class_init(ObjectClass *klass, const void *data)

@@ -918,6 +918,10 @@ impl<S: Timed + Write> Write for Paced<S> {
 
 /// Connects within `timeout`: a blocking connect waits while the listener's backlog is full.
 pub fn connect_unix(path: &std::path::Path, timeout: Duration) -> io::Result<UnixStream> {
+    connect_unix_kind(path, timeout, libc::SOCK_STREAM)
+}
+
+pub fn connect_unix_kind(path: &std::path::Path, timeout: Duration, kind: libc::c_int) -> io::Result<UnixStream> {
     use std::os::unix::ffi::OsStrExt;
     let deadline = Instant::now() + timeout;
     let mut sa: libc::sockaddr_un = unsafe { std::mem::zeroed() };
@@ -927,7 +931,7 @@ pub fn connect_unix(path: &std::path::Path, timeout: Duration) -> io::Result<Uni
     for (d, s) in sa.sun_path.iter_mut().zip(bytes) {
         *d = *s as libc::c_char;
     }
-    let fd = eintr(|| unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) })?;
+    let fd = eintr(|| unsafe { libc::socket(libc::AF_UNIX, kind | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK, 0) })?;
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
     // A non-blocking unix connect fails with EAGAIN while the backlog is full.

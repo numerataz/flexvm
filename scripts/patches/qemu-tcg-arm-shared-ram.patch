@@ -1,0 +1,32 @@
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -4,3 +4,4 @@
+ system_ss.add(when: 'CONFIG_ISA_DEBUG', if_true: files('debugexit.c'))
+ system_ss.add(when: 'CONFIG_ISA_DEBUG', if_true: files('flexvm-shared-ram.c'))
++system_ss.add(when: 'CONFIG_ARM_VIRT', if_true: files('flexvm-shared-ram.c'))
+ system_ss.add(when: 'CONFIG_ISA_TESTDEV', if_true: files('pc-testdev.c'))
+--- a/hw/misc/flexvm-shared-ram.c
++++ b/hw/misc/flexvm-shared-ram.c
+@@ -40,6 +40,11 @@
++    /* The ARM virt machine places platform devices below its 1 GiB RAM base. */
++    uint64_t minimum_address =
++        object_dynamic_cast(OBJECT(qdev_get_machine()), "virt-machine")
++        ? 0x40000000 : 0;
++
+     if (qemu_real_host_page_size() != FLEXVM_SLOT_PAGE_SIZE ||
+-        s->address >= 0xc0000000 ||
++        s->address < minimum_address || s->address >= 0xc0000000 ||
+         s->address % FLEXVM_SLOT_PAGE_SIZE) {
+-        error_setg(errp, "flexvm-shared-ram needs a page-aligned PC RAM address");
++        error_setg(errp, "flexvm-shared-ram needs a page-aligned guest RAM address");
+         return;
+     }
+@@ -49,7 +54,7 @@
+         return;
+     }
+     if (size > 0xc0000000 - s->address) {
+-        error_setg(errp, "flexvm-shared-ram overlaps the PC device aperture");
++        error_setg(errp, "flexvm-shared-ram crosses the guest RAM aperture");
+         munmap(address, size);
+         return;
+     }

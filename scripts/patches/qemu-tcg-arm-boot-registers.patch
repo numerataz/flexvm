@@ -1,0 +1,120 @@
+--- a/hw/arm/virt.c
++++ b/hw/arm/virt.c
+@@ -831,6 +831,34 @@
+     qemu_irq_pulse(qdev_get_gpio_in(VIRT_MACHINE(machine)->gic, gsi));
+ }
+ 
++void qmp_x_flexvm_set_arm_boot_registers(uint32_t cpu_index, uint64_t pc,
++                                       uint64_t x0, uint32_t pstate,
++                                       Error **errp)
++{
++    Object *machine = OBJECT(qdev_get_machine());
++    CPUState *cs = qemu_get_cpu(cpu_index);
++    CPUARMState *env;
++
++    if (!tcg_enabled() || !object_dynamic_cast(machine, TYPE_VIRT_MACHINE) ||
++        !runstate_check(RUN_STATE_PRELAUNCH) || cpu_index >= 2 ||
++        !cs || !arm_feature(&ARM_CPU(cs)->env, ARM_FEATURE_AARCH64)) {
++        error_setg(errp, "FlexVM ARM boot registers require a prelaunch TCG vCPU");
++        return;
++    }
++
++    env = &ARM_CPU(cs)->env;
++    if (!is_a64(env) || arm_current_el(env) != 1 || pc % 4 ||
++        (pstate & ~(PSTATE_D | PSTATE_A | PSTATE_I | PSTATE_F)) !=
++        PSTATE_MODE_EL1h) {
++        error_setg(errp, "invalid FlexVM ARM EL1 boot registers");
++        return;
++    }
++    env->xregs[0] = x0;
++    env->pc = pc;
++    pstate_write(env, pstate);
++    arm_rebuild_hflags(env);
++}
++
+ static void create_v2m(VirtMachineState *vms)
+ {
+     int i;
+--- a/hw/char/debugcon.c
++++ b/hw/char/debugcon.c
+@@ -695,6 +695,7 @@
+     DeviceState parent_obj;
+     DebugconState lane;
+     DebugconState second_lane;
++    uint64_t size;
+ };
+ 
+ static void flexvm_mmio_close_lane(DebugconState *lane)
+@@ -720,7 +721,9 @@
+     Error *err = NULL;
+ 
+     if (!lane->mmio_base || lane->mmio_base % DEBUGCON_MMIO_SIZE ||
+-        lane->mmio_base > UINT64_MAX - DEBUGCON_MMIO_SIZE ||
++        !worker->size || worker->size % DEBUGCON_MMIO_SIZE ||
++        lane->mmio_base >= 0x80000000 ||
++        worker->size > 0x80000000 - lane->mmio_base ||
+         !qemu_get_cpu(0) || qemu_get_cpu(2) ||
+         !!cpu1 != qemu_chr_fe_backend_connected(&second->chr)) {
+         error_setg(errp, "flexvm-mmio-run needs a page address and one socket per vCPU");
+@@ -754,9 +757,9 @@
+     }
+ 
+     memory_region_init_io(&lane->mmio, OBJECT(dev), &debugcon_mmio_ops,
+-                          lane, "flexvm-mmio", DEBUGCON_MMIO_SIZE);
+-    memory_region_add_subregion(get_system_memory(), lane->mmio_base,
+-                                &lane->mmio);
++                          lane, "flexvm-mmio", worker->size);
++    memory_region_add_subregion_overlap(get_system_memory(), lane->mmio_base,
++                                        &lane->mmio, 1);
+ }
+ 
+ static void flexvm_mmio_run_unrealize(DeviceState *dev)
+@@ -775,6 +778,7 @@
+     DEFINE_PROP_CHR("chardev", FlexvmMmioRun, lane.chr),
+     DEFINE_PROP_CHR("parallel-chardev", FlexvmMmioRun, second_lane.chr),
+     DEFINE_PROP_UINT64("addr", FlexvmMmioRun, lane.mmio_base, 0),
++    DEFINE_PROP_UINT64("size", FlexvmMmioRun, size, DEBUGCON_MMIO_SIZE),
+ };
+ 
+ static void flexvm_mmio_run_class_init(ObjectClass *klass, const void *data)
+--- a/qapi/misc-arm.json
++++ b/qapi/misc-arm.json
+@@ -79,3 +79,25 @@
+ ##
+ { 'command': 'x-flexvm-pulse-arm-gsi',
+   'data': { 'gsi': 'uint32' }, 'features': [ 'unstable' ] }
++
++##
++# @x-flexvm-set-arm-boot-registers:
++#
++# Set the ARM TCG vCPU's initial kernel boot registers.
++#
++# @cpu-index: The stopped ARM vCPU index.
++#
++# @pc: The kernel entry address.
++#
++# @x0: The kernel's first argument, usually its device tree address.
++#
++# @pstate: The initial AArch64 EL1h state, including exception masks.
++#
++# Features:
++#
++# @unstable: Experimental FlexVM worker protocol.
++##
++{ 'command': 'x-flexvm-set-arm-boot-registers',
++  'data': { 'cpu-index': 'uint32', 'pc': 'uint64', 'x0': 'uint64',
++            'pstate': 'uint32' },
++  'features': [ 'unstable' ] }
+--- a/stubs/monitor-arm-flexvm.c
++++ b/stubs/monitor-arm-flexvm.c
+@@ -13,3 +13,10 @@
+ {
+     error_setg(errp, "FlexVM GSI pulses require an ARM virt machine");
+ }
++
++void qmp_x_flexvm_set_arm_boot_registers(uint32_t cpu_index, uint64_t pc,
++                                       uint64_t x0, uint32_t pstate,
++                                       Error **errp)
++{
++    error_setg(errp, "FlexVM ARM boot registers require an ARM virt machine");
++}

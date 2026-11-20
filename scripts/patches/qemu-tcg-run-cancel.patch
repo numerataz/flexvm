@@ -1,0 +1,48 @@
+--- a/hw/char/debugcon.c
++++ b/hw/char/debugcon.c
+@@ -49,6 +49,7 @@
+     bool run_active;
+     bool run_failed;
+     bool output_pending;
++    bool cancel_pending;
+     uint8_t output;
+     VMChangeStateEntry *run_state;
+ } DebugconState;
+@@ -79,6 +80,13 @@
+ {
+     DebugconState *s = opaque;
+
++    if (len == 1 && buf[0] == 'I') {
++        if (s->run_active && !s->run_failed && !s->output_pending) {
++            s->cancel_pending = true;
++            vm_stop(RUN_STATE_PAUSED);
++        }
++        return;
++    }
+     if (s->run_failed || s->run_active || len != 1 || buf[0] != 'R' ||
+         (!runstate_check(RUN_STATE_PRELAUNCH) &&
+          !runstate_check(RUN_STATE_PAUSED))) {
+@@ -108,12 +116,19 @@
+     }
+
+     s->run_active = false;
+-    if (!s->run_failed && s->output_pending && state == RUN_STATE_PAUSED &&
+-        qemu_chr_fe_write(&s->chr, &s->output, 1) != 1) {
+-        error_report("debugcon run control could not deliver port output");
+-        s->run_failed = true;
++    if (!s->run_failed && state == RUN_STATE_PAUSED &&
++        (s->output_pending || s->cancel_pending)) {
++        uint8_t reply[2] = {
++            s->output_pending ? 'O' : 'I',
++            s->output_pending ? s->output : 0,
++        };
++        if (qemu_chr_fe_write(&s->chr, reply, sizeof(reply)) != sizeof(reply)) {
++            error_report("debugcon run control could not deliver the stopped exit");
++            s->run_failed = true;
++        }
+     }
+     s->output_pending = false;
++    s->cancel_pending = false;
+ }
+
+ static void debugcon_ioport_write(void *opaque, hwaddr addr, uint64_t val,

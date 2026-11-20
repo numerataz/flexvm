@@ -159,7 +159,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/software-qemu
-          key: software-qemu-x86_64-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch') }}
+          key: software-qemu-x86_64-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch', 'scripts/compat/parent-kvm/slot-map.h') }}
       - name: Install fixed x86 software CPU engine
         if: matrix.arch == 'x86_64'
         run: |
@@ -297,22 +297,41 @@ jobs:
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends ${{ matrix.qemu }} strace build-essential flex bison bc libelf-dev libssl-dev dwarves xz-utils kmod pkg-config zlib1g-dev libzstd-dev
-      - name: Cache fixed x86 software CPU engine
-        if: matrix.arch == 'x86_64'
+      - name: Cache fixed software CPU engine
         id: software-qemu
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/software-qemu
-          key: software-qemu-x86_64-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch') }}
-      - name: Install fixed x86 software CPU engine
-        if: matrix.arch == 'x86_64'
+          key: software-qemu-${{ matrix.arch }}-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch', 'scripts/compat/parent-kvm/slot-map.h') }}
+      - name: Install fixed software CPU engine
         run: |
-          if [ ! -x "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" ]; then
+          arch=${{ matrix.arch }}
+          engine="$RUNNER_TEMP/software-qemu/bin/qemu-system-$arch"
+          if [ ! -x "$engine" ]; then
             sudo apt-get install -y -q --no-install-recommends ninja-build python3-venv libglib2.0-dev libpixman-1-dev libslirp-dev libseccomp-dev libfdt-dev
-            scripts/build-qemu.sh "$RUNNER_TEMP/software-qemu"
+            scripts/build-qemu.sh "$RUNNER_TEMP/software-qemu" "$arch"
           fi
-          sudo ln -sf "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" /usr/local/bin/qemu-system-x86_64
-          sudo qemu-system-x86_64 --version
+          if [ "$arch" = x86_64 ]; then
+            sudo ln -sf "$engine" /usr/local/bin/qemu-system-x86_64
+          fi
+          "$engine" --version
+      - name: ARM TCG worker shares guest RAM and forwards MMIO without KVM
+        if: matrix.arch == 'aarch64'
+        run: |
+          trace="$RUNNER_TEMP/arm-parent-shared-ram.strace"
+          program="$RUNNER_TEMP/arm-parent-tcg-vgic"
+          as scripts/compat/parent-kvm/arm-tcg-vgic.S -o "$program.o"
+          objcopy -O binary "$program.o" "$program.bin"
+          strace -f -e trace=file -o "$trace" python3 scripts/compat/arm-shared-ram.py --mmio-run --vgic-program "$program.bin" \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64"
+          if grep -F '"/dev/kvm"' "$trace"; then exit 1; fi
+      - name: ARM TCG worker resumes from a checkpoint backed by parent RAM
+        if: matrix.arch == 'aarch64'
+        run: |
+          trace="$RUNNER_TEMP/arm-parent-worker-checkpoint.strace"
+          strace -f -e trace=file -o "$trace" python3 scripts/compat/arm-worker-checkpoint.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64"
+          if grep -F '"/dev/kvm"' "$trace"; then exit 1; fi
       - name: Kernel artifact directory
         run: sudo install -d -o "$(id -u)" -g "$(id -g)" "$RUNNER_TEMP/software-state/artifacts"
       - name: Matching kernel and development bundles
@@ -322,6 +341,70 @@ jobs:
           key: module-artifacts-${{ matrix.arch }}-${{ hashFiles('scripts/build-kernel.sh', 'scripts/package-kernel-modules.sh', 'scripts/fetch.sh', 'scripts/versions.sh', 'scripts/checksums.sha256', 'kernel/config/*', 'kernel/features*.config', 'kernel/source.env', 'kernel/patches/*', 'scripts/apply-kernel-patches.sh') }}
       - name: Fetch matching kernel, runtime modules and SDK
         run: scripts/fetch.sh --kernel-sdk --state "$RUNNER_TEMP/software-state"
+      - name: ARM guest negotiates parent KVM VM control
+        if: matrix.arch == 'aarch64'
+        run: |
+          sdk=$(mktemp -d "$RUNNER_TEMP/arm-parent-kvm-sdk.XXXXXXXX")
+          trap 'rm -rf "$sdk"' EXIT
+          artifacts="$RUNNER_TEMP/software-state/artifacts"
+          tar --extract --gzip --no-same-owner --file="$artifacts/kernel-sdk.tar.gz" --directory="$sdk"
+          release=$(jq -er '.release' "$sdk/usr/lib/flexvm/kernel-modules.json")
+          bundle="$RUNNER_TEMP/arm-parent-kvm-bundle"
+          scripts/compat/parent-kvm/build.sh "$sdk/lib/modules/$release/build" "$bundle" --native
+          trace="$RUNNER_TEMP/arm-parent-frontend.strace"
+          strace -f -e trace=file -o "$trace" python3 scripts/compat/arm-parent-frontend.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64" --kernel "$artifacts/vmlinux" \
+            --bundle "$bundle" --output "$RUNNER_TEMP/arm-parent-frontend"
+          if grep -F '"/dev/kvm"' "$trace"; then exit 1; fi
+          trace="$RUNNER_TEMP/arm-parent-frontend-checkpoint.strace"
+          strace -f -e trace=file -o "$trace" python3 scripts/compat/arm-parent-frontend.py --checkpoint \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64" --kernel "$artifacts/vmlinux" \
+            --bundle "$bundle" --output "$RUNNER_TEMP/arm-parent-frontend-checkpoint"
+          if grep -F '"/dev/kvm"' "$trace"; then exit 1; fi
+          if sudo "$bundle/native-worker" --ipa-bits >/dev/null 2>&1; then
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% \
+              python3 scripts/compat/arm-parent-frontend.py --native \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64" --kernel "$artifacts/vmlinux" \
+              --bundle "$bundle" --output "$RUNNER_TEMP/arm-parent-frontend-native"
+          fi
+          root=$PWD
+          source scripts/versions.sh
+          stock="firecracker-$FC_VERSION-$ARCH"
+          url="https://github.com/firecracker-microvm/firecracker/releases/download/$FC_VERSION/$stock.tgz"
+          archive="$RUNNER_TEMP/$stock.tgz"
+          curl --fail --silent --show-error --location --retry 3 --output "$archive" "$url"
+          checksum=$(pinned "$url")
+          printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check --status
+          tar -xOzf "$archive" "release-$FC_VERSION-$ARCH/$stock" > "$RUNNER_TEMP/$stock"
+          run_arm_parent() {
+            local engine=$1
+            local cpus=$2
+            local output="$RUNNER_TEMP/arm-parent-firecracker-$engine-$cpus"
+            case "${3-}" in
+              --freeze) output="$output-freeze" ;;
+              --transfer) output="$output-transfer" ;;
+              --rollback) output="$output-rollback" ;;
+            esac
+            shift 2
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% \
+              strace -f -e trace=file -o "$output.strace" python3 scripts/compat/arm-parent-firecracker.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64" --kernel "$artifacts/vmlinux" \
+              --bundle "$bundle" --firecracker "$RUNNER_TEMP/$stock" --engine "$engine" --vcpus "$cpus" \
+              --output "$output" "$@" || { cat "$output/guest.log" >&2 || true; return 1; }
+            if [ "$engine" = tcg ] && sudo grep -F '"/dev/kvm"' "$output.strace"; then return 1; fi
+            cat "$output/report.json"
+          }
+          for cpus in 1 2; do
+            run_arm_parent tcg "$cpus"
+          done
+          run_arm_parent tcg 2 --freeze
+          run_arm_parent tcg 2 --transfer
+          run_arm_parent tcg 2 --rollback
+          if sudo "$bundle/native-worker" --ipa-bits >/dev/null 2>&1; then
+            for cpus in 1 2; do
+              run_arm_parent kvm "$cpus"
+            done
+          fi
       - name: Parent TCG worker through the guest KVM API
         if: matrix.arch == 'x86_64'
         run: |
@@ -332,17 +415,202 @@ jobs:
           release=$(jq -er '.release' "$sdk/usr/lib/flexvm/kernel-modules.json")
           sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
             --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
-            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-run"
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-run" --memory-quota
           cat "$RUNNER_TEMP/parent-kvm-run/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-scattered" --ram-pages 64
+          cat "$RUNNER_TEMP/parent-kvm-scattered/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-protected" --ram-pages 49152 --protected-entry
+          cat "$RUNNER_TEMP/parent-kvm-protected/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-split" --ram-pages 49152 --protected-entry --split-slot
+          cat "$RUNNER_TEMP/parent-kvm-split/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-cancel" --ram-pages 64 --protected-entry --split-slot --interrupt-run
+          cat "$RUNNER_TEMP/parent-kvm-cancel/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-smp" --ram-pages 64 --protected-entry --split-slot --two-vcpus --cpuid
+          cat "$RUNNER_TEMP/parent-kvm-smp/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-long" --ram-pages 64 --split-slot --long-mode --fpu
+          cat "$RUNNER_TEMP/parent-kvm-long/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-msrs" --ram-pages 64 --split-slot --long-mode --msrs
+          cat "$RUNNER_TEMP/parent-kvm-msrs/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-mmio" --ram-pages 64 --split-slot --long-mode --mmio-read --ioeventfd --complete-read
+          cat "$RUNNER_TEMP/parent-kvm-mmio/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-irqchip" --ram-pages 64 --split-slot --protected-entry --pit --tss --lapic --pio-boundary --complete-read
+          cat "$RUNNER_TEMP/parent-kvm-irqchip/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-irqchip-state" --ram-pages 64 --split-slot --protected-entry --irqchip-state --lapic
+          cat "$RUNNER_TEMP/parent-kvm-irqchip-state/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-pit-state" --ram-pages 64 --split-slot --protected-entry --pit-state --lapic
+          cat "$RUNNER_TEMP/parent-kvm-pit-state/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-debugregs" --ram-pages 64 --split-slot --protected-entry --debugregs
+          cat "$RUNNER_TEMP/parent-kvm-debugregs/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-mp-state" --ram-pages 64 --split-slot --protected-entry --mp-state --lapic
+          cat "$RUNNER_TEMP/parent-kvm-mp-state/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-xcrs" --ram-pages 64 --split-slot --protected-entry --xcrs
+          cat "$RUNNER_TEMP/parent-kvm-xcrs/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-xsave" --ram-pages 64 --split-slot --protected-entry --xsave
+          cat "$RUNNER_TEMP/parent-kvm-xsave/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-vcpu-events" --ram-pages 64 --split-slot --protected-entry --vcpu-events --lapic
+          cat "$RUNNER_TEMP/parent-kvm-vcpu-events/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-clock" --ram-pages 64 --split-slot --protected-entry --clock
+          cat "$RUNNER_TEMP/parent-kvm-clock/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-irqfd" --ram-pages 64 --split-slot --protected-entry --irqfd
+          cat "$RUNNER_TEMP/parent-kvm-irqfd/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-zero-slot" --ram-pages 32768 --pvh
+          cat "$RUNNER_TEMP/parent-kvm-zero-slot/report.json"
+          sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+            --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-single-page" --ram-pages 1
+          cat "$RUNNER_TEMP/parent-kvm-single-page/report.json"
           sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
             --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
             --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-reject-close" --reject-close
           cat "$RUNNER_TEMP/parent-kvm-reject-close/report.json"
+          # Use the published binary, independently of the FlexVM release artifacts.
+          root=$PWD
+          source scripts/versions.sh
+          stock="firecracker-$FC_VERSION-$ARCH"
+          url="https://github.com/firecracker-microvm/firecracker/releases/download/$FC_VERSION/$stock.tgz"
+          archive="$RUNNER_TEMP/$stock.tgz"
+          curl --fail --silent --show-error --location --retry 3 --output "$archive" "$url"
+          checksum=$(pinned "$url")
+          printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check --status
+          tar -xOzf "$archive" "release-$FC_VERSION-$ARCH/$stock" > "$RUNNER_TEMP/$stock"
+          run_parent_firecracker() {
+            local engine=$1
+            local cpus=${2:-1}
+            local memory=${3:-128}
+            local output="$RUNNER_TEMP/parent-kvm-firecracker-$engine-$cpus"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$output" --parent-engine "$engine" \
+              --firecracker "$RUNNER_TEMP/$stock" --firecracker-vcpus "$cpus" --firecracker-memory "$memory" || {
+              cat "$output/report.json" "$output/worker.log" "$output/outer.log" >&2 || true
+              return 1
+            }
+            cat "$output/report.json"
+          }
+          run_parent_firecracker tcg
+          run_parent_firecracker tcg 2 192
           if sudo python3 -c 'import fcntl, os; fd = os.open("/dev/kvm", os.O_RDWR); assert fcntl.ioctl(fd, 0xAE00) == 12; fcntl.ioctl(fd, 0xAE01, 0)' 2>/dev/null; then
             sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
               --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
-              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-worker" --parent-engine kvm --native-oracle
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-worker" --parent-engine kvm --native-oracle --ram-pages 64
             cat "$RUNNER_TEMP/parent-kvm-native-worker/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-protected" --parent-engine kvm --native-oracle --ram-pages 49152 --protected-entry --split-slot
+            cat "$RUNNER_TEMP/parent-kvm-native-protected/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-cancel" --parent-engine kvm --native-oracle --ram-pages 64 --protected-entry --split-slot --interrupt-run
+            cat "$RUNNER_TEMP/parent-kvm-native-cancel/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-smp" --parent-engine kvm --native-oracle --ram-pages 64 --protected-entry --split-slot --two-vcpus --cpuid
+            cat "$RUNNER_TEMP/parent-kvm-native-smp/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-long" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --long-mode --fpu
+            cat "$RUNNER_TEMP/parent-kvm-native-long/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-msrs" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --long-mode --msrs
+            cat "$RUNNER_TEMP/parent-kvm-native-msrs/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-mmio" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --long-mode --mmio-read --ioeventfd --complete-read
+            cat "$RUNNER_TEMP/parent-kvm-native-mmio/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-irqchip" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --protected-entry --pit --tss --lapic --pio-boundary --complete-read
+            cat "$RUNNER_TEMP/parent-kvm-native-irqchip/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-irqchip-state" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --protected-entry --irqchip-state --lapic
+            cat "$RUNNER_TEMP/parent-kvm-native-irqchip-state/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-pit-state" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --protected-entry --pit-state --lapic
+            cat "$RUNNER_TEMP/parent-kvm-native-pit-state/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-debugregs" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --protected-entry --debugregs
+            cat "$RUNNER_TEMP/parent-kvm-native-debugregs/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-mp-state" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --protected-entry --mp-state --lapic
+            cat "$RUNNER_TEMP/parent-kvm-native-mp-state/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-xcrs" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --protected-entry --xcrs
+            cat "$RUNNER_TEMP/parent-kvm-native-xcrs/report.json"
+            output="$RUNNER_TEMP/parent-kvm-native-xsave"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$output" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --protected-entry --xsave || {
+                status=$?
+                for log in native-kvm.log worker.log outer.log child.log; do
+                  if sudo test -f "$output/$log"; then
+                    sudo tail -c 8000 -- "$output/$log" || true
+                  fi
+                done
+                exit "$status"
+              }
+            cat "$output/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-vcpu-events" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --protected-entry --vcpu-events --lapic
+            cat "$RUNNER_TEMP/parent-kvm-native-vcpu-events/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-clock" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --protected-entry --clock
+            cat "$RUNNER_TEMP/parent-kvm-native-clock/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-irqfd" --parent-engine kvm --native-oracle --ram-pages 64 --split-slot --protected-entry --irqfd
+            cat "$RUNNER_TEMP/parent-kvm-native-irqfd/report.json"
+            sudo systemd-run --scope --collect -p MemoryMax=1G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/parent-kvm-run.py \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
+              --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-native-zero-slot" --parent-engine kvm --native-oracle --ram-pages 32768 --pvh
+            cat "$RUNNER_TEMP/parent-kvm-native-zero-slot/report.json"
+            run_parent_firecracker kvm 1 96
+            run_parent_firecracker kvm 2
           fi
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master, 2026-10-09
         with:
@@ -350,6 +618,61 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Build FlexVM
         run: cargo build --release -p flexvm
+      - name: Launch unchanged Firecracker through the public parent KVM command
+        if: matrix.arch == 'x86_64'
+        run: |
+          source scripts/versions.sh
+          run_public_parent() {
+            local engine=$1
+            local bundle=${2:-$engine}
+            local output="$RUNNER_TEMP/software-parent-kvm-$engine"
+            sudo systemd-run --scope --collect -p MemoryMax=1400M -p MemorySwapMax=0 -p CPUQuota=200% \
+              python3 scripts/compat/software-parent-kvm.py --bin target/release/flexvm \
+              --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" \
+              --firecracker "$RUNNER_TEMP/firecracker-$FC_VERSION-$ARCH" --engine "$engine" \
+              --bundle "$RUNNER_TEMP/parent-kvm-firecracker-$bundle-2/provider" --output "$output" || {
+              cat "$output/guest.log" >&2 || true
+              return 1
+            }
+            cat "$output/report.json"
+          }
+          run_public_parent tcg
+          if [ -x "$RUNNER_TEMP/parent-kvm-firecracker-kvm-2/provider/native-worker" ]; then
+            run_public_parent kvm
+            run_public_parent auto kvm
+          fi
+      - name: Launch unchanged ARM Firecracker through FlexVM software
+        if: matrix.arch == 'aarch64'
+        run: |
+          source scripts/versions.sh
+          bundle="$RUNNER_TEMP/arm-parent-kvm-bundle"
+          run_public_arm() {
+            local engine=$1
+            local selected_bundle=$2
+            local output="$RUNNER_TEMP/arm-parent-firecracker-public-$engine"
+            if [ "${3-}" = --pause ]; then output="$output-pause"; fi
+            shift 2
+            sudo systemd-run --scope --collect -p MemoryMax=1400M -p MemorySwapMax=0 -p CPUQuota=200% \
+              strace -f -e trace=file -o "$output.strace" python3 scripts/compat/arm-parent-firecracker.py \
+              --bin target/release/flexvm --engine "$engine" \
+              --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64" --bundle "$selected_bundle" \
+              --firecracker "$RUNNER_TEMP/firecracker-$FC_VERSION-$ARCH" --output "$output" "$@" || {
+              cat "$output/guest.log" >&2 || true
+              return 1
+            }
+            if [ "$engine" != kvm ] && sudo grep -F '"/dev/kvm"' "$output.strace"; then return 1; fi
+            cat "$output/report.json"
+          }
+          run_public_arm tcg "$bundle"
+          run_public_arm tcg "$bundle" --pause
+          software_bundle="$RUNNER_TEMP/arm-parent-software-bundle"
+          mkdir "$software_bundle"
+          cp "$bundle/flexvm-pvkvm.img" "$software_bundle/"
+          run_public_arm auto "$software_bundle"
+          if sudo "$bundle/native-worker" --ipa-bits >/dev/null 2>&1; then
+            run_public_arm kvm "$bundle"
+          fi
       - name: Guest compile, DKMS, ABI rejection and loaded module lifecycle
         run: |
           sudo systemd-run --scope --collect -p MemoryMax=4G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-modules.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-modules" --timeout 1800
@@ -386,7 +709,7 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ${{ runner.temp }}/software-qemu
-          key: software-qemu-x86_64-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch') }}
+          key: software-qemu-x86_64-ubuntu24-${{ hashFiles('scripts/build-qemu.sh', 'scripts/patches/qemu-*.patch', 'scripts/compat/parent-kvm/slot-map.h') }}
       - name: Install fixed x86 software CPU engine
         if: matrix.arch == 'x86_64'
         run: |
@@ -627,6 +950,7 @@ jobs:
           cargo test --locked --target x86_64-unknown-linux-musl -p vmm --lib acpi::x86_64::tests
           cargo test --locked --release --target x86_64-unknown-linux-musl -p vmm --lib configured_serial_survives_backing_update_and_restore
           cargo test --locked --release --target x86_64-unknown-linux-musl -p vmm --lib invalid_serial_is_rejected_before_opening_the_backing_file
+          cargo test --locked --release --target x86_64-unknown-linux-musl -p firecracker test_confined_block_load_bindings
           # Confinement fixtures create TAP devices: build as the runner, run as root.
           cargo test --locked --release --target x86_64-unknown-linux-musl -p vmm --lib --no-run --message-format=json > "$RUNNER_TEMP/firecracker-unit-tests.json"
           python3 - "$RUNNER_TEMP/firecracker-unit-tests.json" <<'PY'
@@ -636,6 +960,7 @@ jobs:
                       and item.get('target', {}).get('name') == 'vmm' and item.get('executable')]
           assert len(binaries) == 1, binaries
           subprocess.run(['sudo', binaries[0], 'persist::tests::test_check_', '--test-threads=1'], check=True)
+          subprocess.run(['sudo', binaries[0], 'devices::virtio::block::', '--test-threads=1'], check=True)
           PY
 
       - name: Save Firecracker
@@ -695,6 +1020,10 @@ jobs:
           for boot in first second; do
             sudo python3 scripts/compat/native-block-boot.py --firecracker "$STATE/artifacts/firecracker" --kernel "$STATE/artifacts/vmlinux" --serial fv0123456789abcdef01 --output "$RUNNER_TEMP/native-block-$boot"
           done
+      - name: Native confined block restore after backing transfer
+        if: env.KVM == 'true' && (matrix.shard == 'pr 1/4' || matrix.shard == 'heavy')
+        run: |
+          sudo python3 scripts/compat/native-block-restore.py --firecracker "$STATE/artifacts/firecracker" --kernel "$STATE/artifacts/vmlinux" --output "$RUNNER_TEMP/native-block-confined-restore"
 
       # The test image (scripts/test-image.py: the base root filesystem as an OCI layout), which
       # e2e.py pulls its templates from; it makes it when the cache has none. flexvm embeds flexvm-init.

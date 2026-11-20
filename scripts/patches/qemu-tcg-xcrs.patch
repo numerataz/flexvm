@@ -1,0 +1,154 @@
+--- a/qapi/misc-i386.json
++++ b/qapi/misc-i386.json
+@@ -871 +871,25 @@
+   'returns': 'FlexvmX86MpRecord', 'features': [ 'unstable' ] }
++
++##
++# @FlexvmX86Xcr0:
++#
++# @value: The vCPU's current XCR0 value.
++# @status: Zero on success or a negative Linux errno.
++##
++{ 'struct': 'FlexvmX86Xcr0', 'data': { 'value': 'uint64', 'status': 'int32' } }
++
++##
++# @x-flexvm-access-x86-xcr0:
++#
++# Read or install a stopped x86 vCPU's XCR0.
++#
++# @cpu-index: Index of the stopped vCPU.
++# @value: New XCR0 value, when writing.
++#
++# Features:
++#
++# @unstable: Experimental FlexVM worker protocol.
++##
++{ 'command': 'x-flexvm-access-x86-xcr0',
++  'data': { 'cpu-index': 'uint16', '*value': 'uint64' },
++  'returns': 'FlexvmX86Xcr0', 'features': [ 'unstable' ] }
+--- a/stubs/monitor-i386-flexvm.c
++++ b/stubs/monitor-i386-flexvm.c
+@@ -110 +110,9 @@
+ }
++
++FlexvmX86Xcr0 *qmp_x_flexvm_access_x86_xcr0(uint16_t cpu_index,
++                                           bool has_value, uint64_t value,
++                                           Error **errp)
++{
++    error_setg(errp, "FlexVM XCR0 requires an x86 worker");
++    return NULL;
++}
+--- a/target/i386/cpu.h
++++ b/target/i386/cpu.h
+@@ -2643,2 +2643,3 @@
+ void cpu_x86_update_dr7(CPUX86State *env, uint32_t new_dr7);
++bool x86_cpu_set_xcr0(CPUX86State *env, uint64_t mask);
+
+@@ -2896,3 +2897,3 @@
+     uint64_t reserved_bits = CR4_RESERVED_MASK;
+-    if (!env->features[FEAT_XSAVE]) {
++    if (!(env->features[FEAT_1_ECX] & CPUID_EXT_XSAVE)) {
+         reserved_bits |= CR4_OSXSAVE_MASK;
+--- a/target/i386/monitor.c
++++ b/target/i386/monitor.c
+@@ -1350 +1350,34 @@
+ }
++
++#ifdef CONFIG_TCG
++static void flexvm_set_xcr0(CPUState *cpu, run_on_cpu_data data)
++{
++    CPUX86State *env = &X86_CPU(cpu)->env;
++    FlexvmX86Xcr0 *state = data.host_ptr;
++
++    if (!x86_cpu_set_xcr0(env, state->value)) {
++        state->status = -EINVAL;
++    }
++}
++#endif
++
++FlexvmX86Xcr0 *qmp_x_flexvm_access_x86_xcr0(uint16_t cpu_index,
++                                           bool has_value, uint64_t value,
++                                           Error **errp)
++{
++    CPUX86State *env = flexvm_stopped_cpu(cpu_index, errp);
++    FlexvmX86Xcr0 *result;
++
++    if (!env) {
++        return NULL;
++    }
++    result = g_new0(FlexvmX86Xcr0, 1);
++#ifdef CONFIG_TCG
++    if (has_value) {
++        result->value = value;
++        run_on_cpu(CPU(env_archcpu(env)), flexvm_set_xcr0, RUN_ON_CPU_HOST_PTR(result));
++    }
++#endif
++    result->value = env->xcr0;
++    return result;
++}
+--- a/target/i386/tcg/fpu_helper.c
++++ b/target/i386/tcg/fpu_helper.c
+@@ -3195,33 +3195,19 @@
+
+-void helper_xsetbv(CPUX86State *env, uint32_t ecx, uint64_t mask)
++bool x86_cpu_set_xcr0(CPUX86State *env, uint64_t mask)
+ {
++    const uint64_t avx512 = XSTATE_OPMASK_MASK | XSTATE_ZMM_Hi256_MASK | XSTATE_Hi16_ZMM_MASK;
++    const uint64_t tile = XSTATE_XTILE_CFG_MASK | XSTATE_XTILE_DATA_MASK;
+     uint32_t dummy, ena_lo, ena_hi;
+-    uint64_t ena;
+-
+-    /* The OS must have enabled XSAVE.  */
+-    if (!(env->cr[4] & CR4_OSXSAVE_MASK)) {
+-        raise_exception_ra(env, EXCP06_ILLOP, GETPC());
+-    }
+-
+-    /* Only XCR0 is defined at present; the FPU may not be disabled.  */
+-    if (ecx != 0 || (mask & XSTATE_FP_MASK) == 0) {
+-        goto do_gpf;
+-    }
+-
+-    /* SSE can be disabled, but only if AVX is disabled too.  */
+-    if ((mask & (XSTATE_SSE_MASK | XSTATE_YMM_MASK)) == XSTATE_YMM_MASK) {
+-        goto do_gpf;
+-    }
++    uint64_t allowed;
+
+-    /* Disallow enabling unimplemented features.  */
++    /* Bit zero stays enabled even for a guest without the XSAVE feature. */
+     cpu_x86_cpuid(env, 0x0d, 0, &ena_lo, &dummy, &dummy, &ena_hi);
+-    ena = ((uint64_t)ena_hi << 32) | ena_lo;
+-    if (mask & ~ena) {
+-        goto do_gpf;
+-    }
+-
+-    /* Disallow enabling only half of MPX.  */
+-    if ((mask ^ (mask * (XSTATE_BNDCSR_MASK / XSTATE_BNDREGS_MASK)))
+-        & XSTATE_BNDCSR_MASK) {
+-        goto do_gpf;
++    allowed = ((uint64_t)(ena_hi & env->features[FEAT_XSAVE_XCR0_HI]) << 32) |
++              (ena_lo & env->features[FEAT_XSAVE_XCR0_LO]) | XSTATE_FP_MASK;
++    if (!(mask & XSTATE_FP_MASK) || (mask & ~allowed) ||
++        ((mask & XSTATE_YMM_MASK) && !(mask & XSTATE_SSE_MASK)) ||
++        (!!(mask & XSTATE_BNDREGS_MASK) != !!(mask & XSTATE_BNDCSR_MASK)) ||
++        ((mask & avx512) && ((mask & avx512) != avx512 || !(mask & XSTATE_YMM_MASK))) ||
++        ((mask & tile) && (mask & tile) != tile)) {
++        return false;
+     }
+@@ -3231,6 +3217,13 @@
+     cpu_sync_avx_hflag(env);
+-    return;
++    return true;
++}
+
+- do_gpf:
+-    raise_exception_ra(env, EXCP0D_GPF, GETPC());
++void helper_xsetbv(CPUX86State *env, uint32_t ecx, uint64_t mask)
++{
++    if (!(env->cr[4] & CR4_OSXSAVE_MASK)) {
++        raise_exception_ra(env, EXCP06_ILLOP, GETPC());
++    }
++    if (ecx != 0 || !x86_cpu_set_xcr0(env, mask)) {
++        raise_exception_ra(env, EXCP0D_GPF, GETPC());
++    }
+ }

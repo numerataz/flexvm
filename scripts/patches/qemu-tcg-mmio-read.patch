@@ -1,0 +1,181 @@
+--- a/hw/char/debugcon.c
++++ b/hw/char/debugcon.c
+@@ -29,6 +29,7 @@
+ #include "hw/core/cpu.h"
+ #include "qemu/bswap.h"
+ #include "qemu/error-report.h"
++#include "qemu/main-loop.h"
+ #include "qemu/module.h"
+ #include "chardev/char-fe.h"
+ #include "hw/isa/isa.h"
+@@ -59,6 +60,12 @@
+     uint64_t mmio_base;
+     uint8_t output[DEBUGCON_EXIT_MAX];
+     unsigned int output_length;
++    QemuCond read_completed;
++    unsigned int read_width;
++    unsigned int read_bytes;
++    bool receiving_read;
++    bool read_ready;
++    uint8_t read_data[8];
+     VMChangeStateEntry *run_state;
+ } DebugconState;
+
+@@ -81,6 +88,9 @@
+         if (s->run_active && runstate_is_running()) {
+             vm_stop(RUN_STATE_PAUSED);
+         }
++        if (s->read_width) {
++            qemu_cond_signal(&s->read_completed);
++        }
+     }
+ }
+
+@@ -88,14 +98,41 @@
+ {
+     DebugconState *s = opaque;
+
+-    if (len == 1 && buf[0] == 'I') {
++    if (len != 1) {
++        debugcon_run_failed(s);
++        return;
++    }
++    if (s->receiving_read) {
++        s->read_data[s->read_bytes++] = buf[0];
++        if (s->read_bytes == s->read_width) {
++            s->receiving_read = false;
++            s->run_active = true;
++            if (!vm_start_one_tcg_cpu(s->run_cpu)) {
++                debugcon_run_failed(s);
++                return;
++            }
++            s->read_ready = true;
++            qemu_cond_signal(&s->read_completed);
++        }
++        return;
++    }
++    if (buf[0] == 'D') {
++        if (!s->read_width || s->run_failed || s->run_active ||
++            !runstate_check(RUN_STATE_PAUSED)) {
++            debugcon_run_failed(s);
++            return;
++        }
++        s->receiving_read = true;
++        return;
++    }
++    if (buf[0] == 'I') {
+         if (s->run_active && !s->run_failed && !s->output_length) {
+             s->cancel_pending = true;
+             vm_stop(RUN_STATE_PAUSED);
+         }
+         return;
+     }
+-    if (s->run_failed || s->run_active || len != 1 ||
++    if (s->run_failed || s->run_active || s->read_width ||
+         buf[0] < 'R' || buf[0] > 'S' ||
+         (!runstate_check(RUN_STATE_PRELAUNCH) &&
+          !runstate_check(RUN_STATE_PAUSED))) {
+@@ -140,14 +177,14 @@
+
+         if (qemu_chr_fe_write(&s->chr, reply, bytes) != bytes) {
+             error_report("debugcon run control could not deliver the stopped exit");
+-            s->run_failed = true;
++            debugcon_run_failed(s);
+         }
+     }
+     s->output_length = 0;
+     s->cancel_pending = false;
+ }
+
+-static void debugcon_stop_at_exit(DebugconState *s, const uint8_t *reply,
++static bool debugcon_stop_at_exit(DebugconState *s, const uint8_t *reply,
+                                   unsigned int bytes)
+ {
+     if (s->run_active && !s->run_failed && !s->output_length &&
+@@ -158,6 +195,7 @@
+         s->run_failed = true;
+     }
+     vm_stop(RUN_STATE_PAUSED);
++    return !s->run_failed;
+ }
+
+ static void debugcon_ioport_write(void *opaque, hwaddr addr, uint64_t val,
+@@ -208,10 +246,42 @@
+     .endianness = DEVICE_LITTLE_ENDIAN,
+ };
+
+-static bool debugcon_mmio_accepts(void *opaque, hwaddr address, unsigned width,
+-                                   bool is_write, MemTxAttrs attrs)
++static MemTxResult debugcon_mmio_read(void *opaque, hwaddr address,
++                                      uint64_t *value, unsigned width,
++                                      MemTxAttrs attrs)
+ {
+-    return is_write;
++    DebugconState *s = opaque;
++    uint8_t reply[DEBUGCON_EXIT_MAX] = {'Q', width};
++    bool ready;
++
++    if (s->read_width || width > sizeof(s->read_data)) {
++        debugcon_run_failed(s);
++        return MEMTX_ERROR;
++    }
++    stq_le_p(reply + 2, s->mmio_base + address);
++    if (!debugcon_stop_at_exit(s, reply, sizeof(reply))) {
++        return MEMTX_ERROR;
++    }
++    s->read_width = width;
++    s->read_bytes = 0;
++    s->read_ready = false;
++    memset(s->read_data, 0, sizeof(s->read_data));
++
++    /*
++     * The read is blocked at the access until the parent supplies data.
++     * Publish the selected vCPU's stopped state before releasing the BQL
++     * so the main loop can finish pausing and deliver the exit.
++     */
++    cpu_pause(current_cpu);
++    while (!s->read_ready && !s->run_failed) {
++        qemu_cond_wait_bql(&s->read_completed);
++    }
++    ready = s->read_ready && !s->run_failed;
++    *value = ldq_le_p(s->read_data);
++    s->read_width = 0;
++    s->receiving_read = false;
++    qemu_cond_signal(&s->read_completed);
++    return ready ? MEMTX_OK : MEMTX_ERROR;
+ }
+
+ static void debugcon_mmio_write(void *opaque, hwaddr address, uint64_t value,
+@@ -226,10 +296,10 @@
+ }
+
+ static const MemoryRegionOps debugcon_mmio_ops = {
++    .read_with_attrs = debugcon_mmio_read,
+     .write = debugcon_mmio_write,
+     .valid.min_access_size = 1,
+     .valid.max_access_size = 8,
+-    .valid.accepts = debugcon_mmio_accepts,
+     .impl.min_access_size = 1,
+     .impl.max_access_size = 8,
+     .endianness = DEVICE_LITTLE_ENDIAN,
+@@ -279,6 +349,7 @@
+     memory_region_add_subregion(isa_address_space_io(d),
+                                 isa->iobase, &s->io);
+     if (s->mmio_base) {
++        qemu_cond_init(&s->read_completed);
+         memory_region_init_io(&s->mmio, OBJECT(dev), &debugcon_mmio_ops, s,
+                               "flexvm-mmio", DEBUGCON_MMIO_SIZE);
+         memory_region_add_subregion(get_system_memory(), s->mmio_base,
+@@ -292,7 +363,12 @@
+
+     if (s->run_state) {
+         if (s->mmio_base) {
++            debugcon_run_failed(s);
++            while (s->read_width) {
++                qemu_cond_wait_bql(&s->read_completed);
++            }
+             memory_region_del_subregion(get_system_memory(), &s->mmio);
++            qemu_cond_destroy(&s->read_completed);
+         }
+         qemu_chr_fe_set_handlers(&s->chr, NULL, NULL, NULL, NULL,
+                                  NULL, NULL, false);

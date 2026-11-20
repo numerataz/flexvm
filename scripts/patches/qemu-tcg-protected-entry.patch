@@ -1,0 +1,99 @@
+--- a/qapi/misc-i386.json
++++ b/qapi/misc-i386.json
+@@ -524,3 +524,20 @@
+ ##
+ { 'command': 'x-flexvm-query-x86-sregs',
+   'returns': 'FlexvmX86SpecialRegisters', 'features': [ 'unstable' ] }
++
++##
++# @x-flexvm-set-x86-protected-entry:
++#
++# Initialize the flat ring-zero protected-mode entry state of the
++# experimental FlexVM TCG worker before it runs.
++#
++# @gdt-base: The address of the guest descriptor table.
++# @gdt-limit: The table limit for three descriptors.
++#
++# Features:
++#
++# @unstable: Experimental FlexVM worker protocol.
++##
++{ 'command': 'x-flexvm-set-x86-protected-entry',
++  'data': { 'gdt-base': 'uint32', 'gdt-limit': 'uint16' },
++  'features': [ 'unstable' ] }
+--- a/target/i386/monitor.c
++++ b/target/i386/monitor.c
+@@ -691,3 +691,35 @@
+     result->apic_base = cpu_get_apic_base(x86->apic_state);
+     return result;
+ }
++
++void qmp_x_flexvm_set_x86_protected_entry(uint32_t gdt_base,
++                                         uint16_t gdt_limit, Error **errp)
++{
++    CPUState *cpu = first_cpu;
++    CPUX86State *env;
++    const uint32_t data_flags = DESC_G_MASK | DESC_B_MASK | DESC_P_MASK |
++                                DESC_S_MASK | DESC_W_MASK | DESC_A_MASK;
++
++    if (!cpu || CPU_NEXT(cpu) || !tcg_enabled() ||
++        (!runstate_check(RUN_STATE_PRELAUNCH) &&
++         !runstate_check(RUN_STATE_PAUSED))) {
++        error_setg(errp, "FlexVM requires one stopped x86 TCG vCPU");
++        return;
++    }
++    env = &X86_CPU(cpu)->env;
++    if ((env->cr[0] & (CR0_PE_MASK | CR0_PG_MASK)) || gdt_limit != 23) {
++        error_setg(errp, "FlexVM requires initial flat protected-mode state");
++        return;
++    }
++
++    env->gdt.base = gdt_base;
++    env->gdt.limit = gdt_limit;
++    cpu_x86_update_cr0(env, env->cr[0] | CR0_PE_MASK);
++    cpu_x86_load_seg_cache(env, R_CS, 8, 0, UINT32_MAX,
++                          data_flags | DESC_CS_MASK);
++    const X86Seg data_registers[] = { R_DS, R_ES, R_FS, R_GS, R_SS };
++    for (size_t i = 0; i < ARRAY_SIZE(data_registers); i++) {
++        cpu_x86_load_seg_cache(env, data_registers[i], 16, 0, UINT32_MAX,
++                              data_flags);
++    }
++}
+--- a/stubs/monitor-i386-flexvm.c
++++ b/stubs/monitor-i386-flexvm.c
+@@ -9,3 +9,9 @@
+     error_setg(errp, "FlexVM special registers require an x86 worker");
+     return NULL;
+ }
++
++void qmp_x_flexvm_set_x86_protected_entry(uint32_t gdt_base,
++                                         uint16_t gdt_limit, Error **errp)
++{
++    error_setg(errp, "FlexVM protected entry requires an x86 worker");
++}
+--- a/hw/misc/flexvm-shared-ram.c
++++ b/hw/misc/flexvm-shared-ram.c
+@@ -38,9 +38,9 @@
+     void *address;
+
+     if (qemu_real_host_page_size() != FLEXVM_SLOT_PAGE_SIZE ||
+-        s->address < FLEXVM_SLOT_PAGE_SIZE || s->address >= 0xa0000 ||
++        s->address < FLEXVM_SLOT_PAGE_SIZE || s->address >= 0xc0000000 ||
+         s->address % FLEXVM_SLOT_PAGE_SIZE) {
+-        error_setg(errp, "flexvm-shared-ram needs 4 KiB pages within PC low RAM");
++        error_setg(errp, "flexvm-shared-ram needs a page-aligned PC RAM address");
+         return;
+     }
+     address = flexvm_map_slot(s->ram_fd, s->layout_fd, &size);
+@@ -48,8 +48,9 @@
+         error_setg_errno(errp, errno, "cannot map flexvm-shared-ram");
+         return;
+     }
+-    if (size > 0xa0000 - s->address) {
+-        error_setg(errp, "flexvm-shared-ram crosses the PC low RAM limit");
++    uint64_t end = s->address + size;
++    if (end > 0xc0000000 || (s->address < 0x100000 && end > 0xa0000)) {
++        error_setg(errp, "flexvm-shared-ram overlaps the PC device aperture");
+         munmap(address, size);
+         return;
+     }

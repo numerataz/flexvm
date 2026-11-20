@@ -1,0 +1,315 @@
+--- a/system/ioport.c
++++ b/system/ioport.c
+@@ -28,2 +28,4 @@
+ #include "qemu/osdep.h"
++#include "qemu/main-loop.h"
++#include "system/cpus.h"
+ #include "system/ioport.h"
+@@ -60,2 +62,47 @@
+
++static IOPortInterceptor *port_interceptor;
++static void *port_interceptor_owner;
++
++bool cpu_register_ioport_interceptor(IOPortInterceptor *intercept, void *opaque)
++{
++    assert(bql_locked());
++    if (port_interceptor) {
++        return false;
++    }
++    port_interceptor_owner = opaque;
++    qatomic_set(&port_interceptor, intercept);
++    return true;
++}
++
++void cpu_unregister_ioport_interceptor(void *opaque)
++{
++    assert(bql_locked());
++    assert(port_interceptor && port_interceptor_owner == opaque);
++    qatomic_set(&port_interceptor, NULL);
++    port_interceptor_owner = NULL;
++}
++
++bool cpu_intercept_ioport(uint32_t port, unsigned int width, bool write,
++                                 uint32_t *value)
++{
++    bool handled = false;
++    bool already_locked;
++
++    if (!qatomic_read(&port_interceptor) || !qemu_in_vcpu_thread()) {
++        return false;
++    }
++    already_locked = bql_locked();
++    if (!already_locked) {
++        bql_lock();
++    }
++    if (port_interceptor) {
++        handled = port_interceptor(port_interceptor_owner, port, width,
++                                   write, value);
++    }
++    if (!already_locked) {
++        bql_unlock();
++    }
++    return handled;
++}
++
+ void cpu_outb(uint32_t addr, uint8_t val)
+--- a/include/system/ioport.h
++++ b/include/system/ioport.h
+@@ -43,2 +43,11 @@
+
++typedef bool IOPortInterceptor(void *opaque, uint32_t port, unsigned int width,
++                               bool write, uint32_t *value);
++
++bool cpu_register_ioport_interceptor(IOPortInterceptor *intercept, void *opaque);
++void cpu_unregister_ioport_interceptor(void *opaque);
++
++bool cpu_intercept_ioport(uint32_t port, unsigned int width, bool write,
++                          uint32_t *value);
++
+ void cpu_outb(uint32_t addr, uint8_t val);
+--- a/hw/char/debugcon.c
++++ b/hw/char/debugcon.c
+@@ -39,2 +39,3 @@
+ #include "system/address-spaces.h"
++#include "system/ioport.h"
+ #include "system/runstate.h"
+@@ -48,15 +49,5 @@
+
+-typedef struct DebugconState DebugconState;
+-
+-typedef struct DebugconPioRange {
+-    MemoryRegion region;
+-    DebugconState *debugcon;
+-    unsigned int first;
+-} DebugconPioRange;
+-
+-struct DebugconState {
++typedef struct DebugconState {
+     MemoryRegion io;
+     MemoryRegion mmio;
+-    DebugconPioRange pio[6];
+-    unsigned int pio_count;
+     unsigned int pio_waiters;
+@@ -69,2 +60,3 @@
+     bool keep_pit_ports;
++    bool keep_speaker_port;
+     bool run_active;
+@@ -85,3 +77,3 @@
+     VMChangeStateEntry *run_state;
+-};
++} DebugconState;
+
+@@ -361,82 +353,60 @@
+
+-static MemTxResult debugcon_pio_read(void *opaque, hwaddr address,
+-                                     uint64_t *value, unsigned width,
+-                                     MemTxAttrs attrs)
++static bool debugcon_pic_owns(uint32_t port, unsigned int width)
+ {
+-    DebugconPioRange *range = opaque;
+-    uint8_t reply[8] = {'V', width};
+-
+-    if (!debugcon_wait_for_pio_run(range->debugcon)) {
+-        return MEMTX_ERROR;
+-    }
+-    stw_le_p(reply + 2, range->first + address);
+-    stl_le_p(reply + 4, 1);
+-    return debugcon_complete_read(range->debugcon, reply, sizeof(reply),
+-                                  value, width);
++    return (port >= 0x20 && port + width <= 0x22) ||
++           (port >= 0xa0 && port + width <= 0xa2) ||
++           (port >= 0x4d0 && port + width <= 0x4d2);
+ }
+
+-static void debugcon_pio_write(void *opaque, hwaddr address, uint64_t value,
+-                                unsigned width)
++static bool debugcon_forward_pio(void *opaque, uint32_t port,
++                                 unsigned int width, bool write,
++                                 uint32_t *value)
+ {
+-    DebugconPioRange *range = opaque;
+-    uint8_t reply[12] = {'U', width};
++    DebugconState *s = opaque;
++    uint8_t reply[12] = {write ? 'U' : 'V', width};
++    uint64_t read_value;
+
+-    if (!debugcon_wait_for_pio_run(range->debugcon)) {
+-        return;
++    if (port >= MAX_IOPORTS) {
++        return false;
+     }
+-    stw_le_p(reply + 2, range->first + address);
+-    stl_le_p(reply + 4, 1);
+-    stl_le_p(reply + 8, value);
+-    debugcon_stop_at_exit(range->debugcon, reply, 8 + width);
+-}
+-
+-static const MemoryRegionOps debugcon_pio_ops = {
+-    .read_with_attrs = debugcon_pio_read,
+-    .write = debugcon_pio_write,
+-    .valid.min_access_size = 1,
+-    .valid.max_access_size = 4,
+-    .valid.unaligned = true,
+-    .impl.min_access_size = 1,
+-    .impl.max_access_size = 4,
+-    .impl.unaligned = true,
+-    .endianness = DEVICE_LITTLE_ENDIAN,
+-};
+-
+-static void debugcon_map_pio_range(ISADevice *dev, DebugconState *s,
+-                                   unsigned int first, unsigned int end)
+-{
+-    DebugconPioRange *range;
+-
+-    assert(s->pio_count < ARRAY_SIZE(s->pio));
+-    range = &s->pio[s->pio_count++];
+-    range->debugcon = s;
+-    range->first = first;
+-    memory_region_init_io(&range->region, OBJECT(dev), &debugcon_pio_ops,
+-                          range, "flexvm-pio", end - first);
+-    memory_region_add_subregion_overlap(isa_address_space_io(dev), first,
+-                                        &range->region, 10);
+-}
+-
+-static void debugcon_map_pio(ISADevice *dev, DebugconState *s)
+-{
+-    const struct {
+-        unsigned int first;
+-        unsigned int end;
+-        bool keep;
+-    } reserved[] = {
+-        { 0x20, 0x22, s->keep_pic_ports },
+-        { 0x40, 0x44, s->keep_pit_ports },
+-        { 0x61, 0x62, s->keep_pit_ports },
+-        { 0xa0, 0xa2, s->keep_pic_ports },
+-        { 0x4d0, 0x4d2, s->keep_pic_ports },
+-    };
+-    unsigned int first = 0;
+-
+-    for (size_t i = 0; i < ARRAY_SIZE(reserved); i++) {
+-        if (reserved[i].keep) {
+-            debugcon_map_pio_range(dev, s, first, reserved[i].first);
+-            first = reserved[i].end;
++    if (s->keep_pic_ports && debugcon_pic_owns(port, width)) {
++        if (width == 1) {
++            return false;
++        }
++        /* The in-kernel PIC ignores wide writes and returns zero on reads. */
++        if (!write) {
++            *value = 0;
++        }
++        return true;
++    }
++    if (s->keep_pit_ports && port >= 0x40 && port + width <= 0x44) {
++        if (width == 1) {
++            return false;
+         }
++        /* The in-kernel i8254 uses just the low byte of a wide access. */
++        if (write) {
++            cpu_outb(port, *value);
++        } else {
++            *value = cpu_inb(port);
++        }
++        return true;
++    }
++    if (s->keep_speaker_port && port == 0x61 && width == 1) {
++        return false;
++    }
++    if (!debugcon_wait_for_pio_run(s)) {
++        *value = UINT32_MAX;
++        return true;
+     }
+-    debugcon_map_pio_range(dev, s, first, 0x10000);
++    stw_le_p(reply + 2, port);
++    stl_le_p(reply + 4, 1);
++    if (write) {
++        stl_le_p(reply + 8, *value);
++        debugcon_stop_at_exit(s, reply, 8 + width);
++    } else if (debugcon_complete_read(s, reply, 8, &read_value, width) == MEMTX_OK) {
++        *value = read_value;
++    } else {
++        *value = UINT32_MAX;
++    }
++    return true;
+ }
+@@ -502,4 +472,12 @@
+     }
++    if (s->forward_pio &&
++        !cpu_register_ioport_interceptor(debugcon_forward_pio, s)) {
++        error_setg(errp, "already using a CPU port I/O interceptor");
++        return;
++    }
+     debugcon_realize_core(s, &err);
+     if (err != NULL) {
++        if (s->forward_pio) {
++            cpu_unregister_ioport_interceptor(s);
++        }
+         error_propagate(errp, err);
+@@ -507,5 +485,3 @@
+     }
+-    if (s->forward_pio) {
+-        debugcon_map_pio(d, s);
+-    } else {
++    if (!s->forward_pio) {
+         memory_region_init_io(&s->io, OBJECT(dev), &debugcon_ops, s,
+@@ -541,5 +517,4 @@
+         }
+-        for (unsigned int i = 0; i < s->pio_count; i++) {
+-            memory_region_del_subregion(isa_address_space_io(ISA_DEVICE(dev)),
+-                                        &s->pio[i].region);
++        if (s->forward_pio) {
++            cpu_unregister_ioport_interceptor(s);
+         }
+@@ -564,2 +539,4 @@
+                      false),
++    DEFINE_PROP_BOOL("keep-speaker-port", ISADebugconState, state.keep_speaker_port,
++                     false),
+ };
+--- a/target/i386/tcg/system/misc_helper.c
++++ b/target/i386/tcg/system/misc_helper.c
+@@ -25,2 +25,3 @@
+ #include "system/address-spaces.h"
++#include "system/ioport.h"
+ #include "system/memory.h"
+@@ -32,2 +33,5 @@
+ {
++    if (cpu_intercept_ioport(port, 1, true, &data)) {
++        return;
++    }
+     address_space_stb(&address_space_io, port, data,
+@@ -38,2 +42,7 @@
+ {
++    uint32_t data;
++
++    if (cpu_intercept_ioport(port, 1, false, &data)) {
++        return data;
++    }
+     return address_space_ldub(&address_space_io, port,
+@@ -44,2 +53,5 @@
+ {
++    if (cpu_intercept_ioport(port, 2, true, &data)) {
++        return;
++    }
+     address_space_stw(&address_space_io, port, data,
+@@ -50,2 +62,7 @@
+ {
++    uint32_t data;
++
++    if (cpu_intercept_ioport(port, 2, false, &data)) {
++        return data;
++    }
+     return address_space_lduw(&address_space_io, port,
+@@ -56,2 +73,5 @@
+ {
++    if (cpu_intercept_ioport(port, 4, true, &data)) {
++        return;
++    }
+     address_space_stl(&address_space_io, port, data,
+@@ -62,2 +82,7 @@
+ {
++    uint32_t data;
++
++    if (cpu_intercept_ioport(port, 4, false, &data)) {
++        return data;
++    }
+     return address_space_ldl(&address_space_io, port,

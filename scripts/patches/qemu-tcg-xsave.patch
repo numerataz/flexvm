@@ -1,0 +1,217 @@
+--- a/qapi/misc-i386.json
++++ b/qapi/misc-i386.json
+@@ -895 +895,25 @@
+   'returns': 'FlexvmX86Xcr0', 'features': [ 'unstable' ] }
++
++##
++# @FlexvmX86XsaveRecord:
++#
++# @record: Hex-encoded standard-format Linux KVM XSAVE record.
++# @status: Zero on success or a negative Linux errno.
++##
++{ 'struct': 'FlexvmX86XsaveRecord', 'data': { 'record': 'str', 'status': 'int32' } }
++
++##
++# @x-flexvm-access-x86-xsave:
++#
++# Read or restore the actual extended state of a stopped x86 vCPU.
++#
++# @cpu-index: Index of the stopped vCPU.
++# @record: New standard-format XSAVE record, when writing.
++#
++# Features:
++#
++# @unstable: Experimental FlexVM worker protocol.
++##
++{ 'command': 'x-flexvm-access-x86-xsave',
++  'data': { 'cpu-index': 'uint16', '*record': 'str' },
++  'returns': 'FlexvmX86XsaveRecord', 'features': [ 'unstable' ] }
+--- a/stubs/monitor-i386-flexvm.c
++++ b/stubs/monitor-i386-flexvm.c
+@@ -118 +118,9 @@
+ }
++
++FlexvmX86XsaveRecord *qmp_x_flexvm_access_x86_xsave(uint16_t cpu_index,
++                                                  const char *record,
++                                                  Error **errp)
++{
++    error_setg(errp, "FlexVM XSAVE requires an x86 worker");
++    return NULL;
++}
+--- a/target/i386/cpu.h
++++ b/target/i386/cpu.h
+@@ -2887,2 +2887,6 @@
+ uint32_t xsave_area_size(uint64_t mask, bool compacted);
++#ifndef CONFIG_USER_ONLY
++#define FLEXVM_XSAVE_SIZE 4096
++bool x86_cpu_flexvm_xsave(X86CPU *cpu, bool write, uint8_t image[FLEXVM_XSAVE_SIZE]);
++#endif
+ void x86_update_hflags(CPUX86State* env);
+--- a/target/i386/monitor.c
++++ b/target/i386/monitor.c
+@@ -1383 +1383,62 @@
+ }
++
++typedef struct FlexvmXsaveAccess {
++    bool write;
++    int status;
++    uint8_t image[FLEXVM_XSAVE_SIZE];
++} FlexvmXsaveAccess;
++
++static void flexvm_access_xsave(CPUState *cpu, run_on_cpu_data data)
++{
++    FlexvmXsaveAccess *access = data.host_ptr;
++
++    if (!x86_cpu_flexvm_xsave(X86_CPU(cpu), access->write, access->image)) {
++        access->status = -EINVAL;
++    }
++}
++
++FlexvmX86XsaveRecord *qmp_x_flexvm_access_x86_xsave(uint16_t cpu_index,
++                                                  const char *record,
++                                                  Error **errp)
++{
++    static const char hex[] = "0123456789abcdef";
++    CPUX86State *env = flexvm_stopped_cpu(cpu_index, errp);
++    g_autofree FlexvmXsaveAccess *access = NULL;
++    FlexvmX86XsaveRecord *result;
++
++    if (!env) {
++        return NULL;
++    }
++    access = g_new0(FlexvmXsaveAccess, 1);
++    access->write = record != NULL;
++    if (record) {
++        if (strlen(record) != 2 * sizeof(access->image)) {
++            error_setg(errp, "Invalid FlexVM XSAVE image size");
++            return NULL;
++        }
++        for (size_t i = 0; i < sizeof(access->image); i++) {
++            int high = g_ascii_xdigit_value(record[2 * i]);
++            int low = g_ascii_xdigit_value(record[2 * i + 1]);
++
++            if (high < 0 || low < 0) {
++                error_setg(errp, "Invalid hex in FlexVM XSAVE image");
++                return NULL;
++            }
++            access->image[i] = (high << 4) | low;
++        }
++    }
++    run_on_cpu(CPU(env_archcpu(env)), flexvm_access_xsave, RUN_ON_CPU_HOST_PTR(access));
++    result = g_new0(FlexvmX86XsaveRecord, 1);
++    result->status = access->status;
++    if (access->write) {
++        result->record = g_strdup("");
++    } else {
++        result->record = g_malloc(2 * sizeof(access->image) + 1);
++        for (size_t i = 0; i < sizeof(access->image); i++) {
++            result->record[2 * i] = hex[access->image[i] >> 4];
++            result->record[2 * i + 1] = hex[access->image[i] & 15];
++        }
++        result->record[2 * sizeof(access->image)] = '\0';
++    }
++    return result;
++}
+--- a/target/i386/xsave_helper.c
++++ b/target/i386/xsave_helper.c
+@@ -7,2 +7,5 @@
+ #include "cpu.h"
++#ifndef CONFIG_USER_ONLY
++#include "exec/cputlb.h"
++#endif
+
+@@ -279 +282,94 @@
+ }
++
++#ifndef CONFIG_USER_ONLY
++static uint64_t flexvm_xsave_mask(CPUX86State *env)
++{
++    uint32_t low, high, ignored;
++    uint64_t mask;
++
++    cpu_x86_cpuid(env, 0x0d, 0, &low, &ignored, &ignored, &high);
++    mask = (uint64_t)(high & env->features[FEAT_XSAVE_XCR0_HI]) << 32;
++    mask |= low & env->features[FEAT_XSAVE_XCR0_LO];
++    mask |= XSTATE_FP_MASK | XSTATE_SSE_MASK;
++    for (unsigned int i = 2; i < ARRAY_SIZE(x86_ext_save_areas); i++) {
++        const ExtSaveArea *area = &x86_ext_save_areas[i];
++
++        if (!area->offset || !area->size ||
++            area->offset + area->size > FLEXVM_XSAVE_SIZE) {
++            mask &= ~(1ULL << i);
++        }
++    }
++    return mask;
++}
++
++static bool flexvm_xsave_header_valid(const X86XSaveHeader *header, uint64_t supported)
++{
++    if (header->xstate_bv & ~supported || header->xcomp_bv || header->reserve0) {
++        return false;
++    }
++    for (size_t i = 0; i < sizeof(header->reserved); i++) {
++        if (header->reserved[i]) {
++            return false;
++        }
++    }
++    return true;
++}
++
++bool x86_cpu_flexvm_xsave(X86CPU *cpu, bool write, uint8_t image[FLEXVM_XSAVE_SIZE])
++{
++    CPUX86State *env = &cpu->env;
++    uint32_t size = MAX(FLEXVM_XSAVE_SIZE, xsave_area_size(UINT64_MAX, false));
++    g_autofree uint8_t *buffer = g_malloc0(size);
++    X86LegacyXSaveArea *legacy = (void *)buffer;
++    X86XSaveHeader *header = (void *)(buffer + sizeof(*legacy));
++    uint64_t supported = flexvm_xsave_mask(env);
++    uint64_t present;
++
++    if (write) {
++        memcpy(buffer, image, FLEXVM_XSAVE_SIZE);
++        if (!flexvm_xsave_header_valid(header, supported) ||
++            (legacy->mxcsr & 0xffff0000)) {
++            return false;
++        }
++        present = header->xstate_bv;
++        if (!(present & XSTATE_FP_MASK)) {
++            memset(legacy, 0, offsetof(X86LegacyXSaveArea, mxcsr));
++            memset(legacy->fpregs, 0, sizeof(legacy->fpregs));
++            legacy->fcw = 0x37f;
++        }
++        if (!(present & XSTATE_SSE_MASK)) {
++            memset(legacy->xmm_regs, 0, sizeof(legacy->xmm_regs));
++        }
++        if (!(present & (XSTATE_SSE_MASK | XSTATE_YMM_MASK))) {
++            legacy->mxcsr = 0x1f80;
++        }
++    } else {
++        x86_cpu_xsave_all_areas(cpu, buffer, size);
++        /* TCG tracks registers directly, including components currently disabled in XCR0. */
++        present = supported;
++        header->xstate_bv = present;
++    }
++
++    for (unsigned int i = 2; i < ARRAY_SIZE(x86_ext_save_areas); i++) {
++        const ExtSaveArea *area = &x86_ext_save_areas[i];
++
++        if (area->offset && area->size && !(present & (1ULL << i))) {
++            memset(buffer + area->offset, 0, area->size);
++        }
++    }
++    if (write) {
++        uint32_t old_pkru = env->pkru;
++
++        x86_cpu_xrstor_all_areas(cpu, buffer, size);
++        cpu_set_fpuc(env, env->fpuc);
++        cpu_set_mxcsr(env, env->mxcsr);
++        cpu_sync_bndcs_hflags(env);
++        if (old_pkru != env->pkru) {
++            tlb_flush(CPU(cpu));
++        }
++    } else {
++        memcpy(image, buffer, FLEXVM_XSAVE_SIZE);
++    }
++    return true;
++}
++#endif
