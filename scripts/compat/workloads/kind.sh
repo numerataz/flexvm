@@ -52,10 +52,31 @@ prepare)
     # earlier packaged engines call their native overlay driver overlay2.
     case $(docker info --format '{{.Driver}}') in overlay2|overlayfs) ;; *) exit 1 ;; esac
     docker pull "$node_image"
-    docker pull "$source_image"
-    docker tag "$source_image" "$image"
-    test "$(docker image inspect --format '{{.Id}}' "$source_image")" = "$(docker image inspect --format '{{.Id}}' "$image")"
-    docker image inspect "$node_image" "$source_image" > "$base/images.json"
+    if [ -e /nested-input/busybox.tar ] || [ -e /nested-input/busybox.json ]; then
+        python3 - "$source_image" <<'PYFIXTURE'
+from pathlib import Path
+import hashlib, json, platform, re, sys
+root = Path('/nested-input')
+metadata = json.loads((root / 'busybox.json').read_text())
+assert metadata['source'] == sys.argv[1], metadata
+assert metadata['architecture'] == {'x86_64': 'amd64', 'aarch64': 'arm64'}[platform.machine()], metadata
+assert metadata['tag'] == 'docker.io/flexvm/busybox:compat', metadata
+assert hashlib.sha256((root / 'busybox.tar').read_bytes()).hexdigest() == metadata['archive_sha256']
+assert re.fullmatch(r'sha256:[0-9a-f]{64}', metadata['config_digest'])
+print(metadata['config_digest'])
+PYFIXTURE
+
+        docker image load --input /nested-input/busybox.tar
+        docker image inspect "$image" > "$base/imported-image.json"
+        docker image save --output "$base/imported-image.tar" "$image"
+        python3 /nested-input/verify-fixture-import.py --archive "$base/imported-image.tar" --metadata /nested-input/busybox.json
+        rm "$base/imported-image.tar"
+    else
+        docker pull "$source_image"
+        docker tag "$source_image" "$image"
+        test "$(docker image inspect --format '{{.Id}}' "$source_image")" = "$(docker image inspect --format '{{.Id}}' "$image")"
+    fi
+    docker image inspect "$node_image" "$image" > "$base/images.json"
     cat > "$base/kind.yaml" <<'EOF'
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
@@ -181,7 +202,7 @@ PY
     test "$(k exec "$first" -- wget -qO- http://web.flexvm-compat.svc.cluster.local:8080)" = "$nonce"
     peer=$(k get pod "$second" -o jsonpath='{.status.podIP}')
     test "$(k exec "$first" -- wget -qO- "http://$peer:8080")" = "$nonce"
-    k exec "$first" -- wget -qO /dev/null http://example.com
+    k exec "$first" -- wget -qO /dev/null https://github.com/robots.txt
     test "$(curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:18089)" = "$nonce"
     printf 'KIND_PHASE_OK %s\n' "$phase"
     ;;

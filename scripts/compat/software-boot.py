@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import platform
 import signal
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -224,9 +225,14 @@ def checkpoint_run(cmd, isolated, out, timeout):
         evidence.update(status="passed", snapshot_bytes=snapshot.stat().st_size)
         return source + "\n" + target, evidence
     finally:
-        # The stream is test data; retain logs/reports, not hundreds of MiB of RAM.
-        snapshot.unlink(missing_ok=True)
-        runtime.cleanup()
+        # Main removes successful streams; failed streams remain available for replay.
+        evidence.setdefault("status", "incomplete")
+        try:
+            (out / "checkpoint-state.json").write_text(json.dumps(evidence, indent=2) + "\n")
+        except OSError as error:
+            print(f"checkpoint evidence: {error}")
+        finally:
+            runtime.cleanup()
 
 
 def main():
@@ -279,6 +285,7 @@ def main():
         raise Interrupted(number)
 
     previous = {number: signal.signal(number, interrupted) for number in (signal.SIGINT, signal.SIGTERM)}
+    cmd = None
     try:
         init = out / "init"
         run([args.cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static",
@@ -350,7 +357,7 @@ def main():
         if args.guest_tsc:
             expected.append("FLEXVM_SOFTWARE_GUEST_TSC_PASSED")
         if args.guest_kvm:
-            expected.append("PASS: 9 KVM ABI reference checks" if arch == "x86_64" else "FLEXVM_SOFTWARE_GUEST_KVM_PASSED")
+            expected.append("PASS: 11 KVM ABI reference checks" if arch == "x86_64" else "FLEXVM_SOFTWARE_GUEST_KVM_PASSED")
         if firecracker:
             expected += ["FLEXVM_SOFTWARE_INNER_BOOTED", "FLEXVM_SOFTWARE_INNER_COMPLETE",
                          "FLEXVM_SOFTWARE_GUEST_FIRECRACKER_PASSED"]
@@ -374,6 +381,31 @@ def main():
     finally:
         for number, handler in previous.items():
             signal.signal(number, handler)
+        snapshot = out / "checkpoint"
+        if args.checkpoint and snapshot.exists():
+            if report["status"] == "passed":
+                snapshot.unlink(missing_ok=True)
+            else:
+                try:
+                    shutil.copyfile(kernel, out / "replay-kernel")
+                    shutil.copyfile(out / "initramfs.cpio", out / "replay-initramfs.cpio")
+                    replay = list(cmd) if cmd else []
+                    for option, filename in [("-kernel", "replay-kernel"), ("-initrd", "replay-initramfs.cpio")]:
+                        if option in replay:
+                            replay[replay.index(option) + 1] = filename
+                    metadata = {"schema_version": 1, "arguments": replay,
+                                "incoming": "checkpoint", "release_input": "C\n",
+                                "kernel_sha256": digest(out / "replay-kernel"),
+                                "initramfs_sha256": digest(out / "replay-initramfs.cpio"),
+                                "checkpoint_sha256": digest(snapshot),
+                                "note": "Use a compatible QEMU build and firmware; wait for paused incoming state, continue via QMP, then send release_input."}
+                    engine = shutil.which(cmd[0]) if cmd else None
+                    if engine:
+                        metadata["qemu_sha256"] = digest(Path(engine))
+                    (out / "replay.json").write_text(json.dumps(metadata, indent=2) + "\n")
+                    report["failure_replay"] = "replay.json"
+                except Exception as error:
+                    report["failure_replay_error"] = f"{type(error).__name__}: {error}"
         report["elapsed_s"] = round(time.monotonic() - started, 3)
         report_path.write_text(json.dumps(report, indent=2) + "\n")
     print(f"{report['status'].upper()}: {report_path}")

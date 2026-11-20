@@ -453,7 +453,7 @@ fn read_all(src: &mut Source, len: u64) -> Result<Vec<u8>> {
 
 /// Allocates `need` bytes for new `file`, refused if that would leave less than `KEEP_FREE` on its
 /// filesystem. Under a host-wide lock: a concurrent load's check sees these blocks gone.
-fn reserve(file: &File, need: u64) -> Result<()> {
+pub(crate) fn reserve(file: &File, need: u64) -> Result<()> {
     let _admit = crate::host::lock_at(crate::host::host_locks()?, template::ROOM_LOCK, libc::LOCK_EX)?;
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     crate::util::check(unsafe { libc::fstatvfs(file.as_raw_fd(), &mut st) })?;

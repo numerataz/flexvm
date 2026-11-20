@@ -30,7 +30,7 @@ unusable (--no-kvm).
 """
 from contextlib import ExitStack, contextmanager, suppress
 
-import argparse, base64, fcntl, glob, ipaddress, json, multiprocessing, shlex, shutil, struct, os, re, signal, socket, subprocess, sys, tempfile, termios, threading, time, traceback, types
+import argparse, base64, fcntl, glob, ipaddress, json, multiprocessing, shlex, shutil, stat, struct, os, re, signal, socket, subprocess, sys, tempfile, termios, threading, time, traceback, types
 
 p = argparse.ArgumentParser(usage=__doc__)
 p.add_argument("--a", help="host A's listener (default: a free loopback port)")
@@ -49,6 +49,7 @@ p.add_argument("--state", default=os.environ.get("FLEXVM_STATE_DIR") or "/var/li
 p.add_argument("--ckpt-dir", help="where checkpoint scenarios write checkpoints (removed afterwards; default: this run's own, "
                "under /var/tmp)")
 p.add_argument("--no-skips", action="store_true", help="a skipped scenario counts as a failure")
+p.add_argument("--failure-dir", help="retain bounded console and process evidence before failed-scenario cleanup")
 p.add_argument("--template", default="small")
 p.add_argument("--image", default="public.ecr.aws/docker/library/busybox:1.36",
                help="container image of the app_log and bad_app_log scenarios' template (APP_TEMPLATE names a built one instead)")
@@ -625,6 +626,70 @@ def dump_logs(names, tail=6000):
             except Exception as e:
                 with suppress(Exception):
                     print(f"--- {n} on {h}: its logs could not be printed: {type(e).__name__}: {e}", flush=True)
+
+
+
+def save_failure_evidence(scenario, names):
+    """Best-effort capture while the owned VM work directories and processes exist."""
+    if not args.failure_dir:
+        return
+    try:
+        os.makedirs(args.failure_dir, exist_ok=True)
+        destination = tempfile.mkdtemp(prefix=scenario + "-", dir=args.failure_dir)
+        report = {"scenario": scenario, "hosts": {}, "logs": [], "errors": []}
+        limit = 64 << 20
+        remaining = 256 << 20
+        for label, host in (("a", A), ("b", B)):
+            try:
+                code, out, err = cli(host, "ps", "-a", "--json", timeout=5)
+                if code:
+                    raise RuntimeError(err or out)
+                entries = [entry for entry in json.loads(out) if entry["name"] in names]
+                details = report["hosts"][label] = {"entries": entries, "threads": {}}
+                for entry in entries:
+                    pid = entry.get("pid")
+                    if not pid or starttime_of(pid) != entry.get("start"):
+                        continue
+                    details["threads"][str(pid)] = threads_of(pid)
+                    fc = entry.get("firecracker")
+                    if fc:
+                        # A stale registry PID must not label an unrelated process as this VMM.
+                        with open(f"/proc/{fc}/stat") as f:
+                            fields = f.read().rsplit(")", 1)[1].split()
+                        if int(fields[1]) == pid:
+                            details["threads"][str(fc)] = threads_of(fc)
+            except Exception as error:
+                report["errors"].append(f"host {label} process capture: {type(error).__name__}: {error}")
+            # These directories belong to this isolated test host. Copy before kill
+            # removes its VMM consoles; existing HeldLogs retains VM log tails too.
+            for path in sorted(glob.glob(os.path.join(host.run, "**", "*.log"), recursive=True)):
+                try:
+                    if not remaining:
+                        report["errors"].append("log capture reached its 256 MiB budget")
+                        break
+                    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NONBLOCK), "rb") as source:
+                        metadata = os.fstat(source.fileno())
+                        if not stat.S_ISREG(metadata.st_mode):
+                            raise ValueError("log is not a regular file")
+                        size = metadata.st_size
+                        offset = max(0, size - min(limit, remaining))
+                        source.seek(offset)
+                        data = source.read(min(limit, remaining))
+                    remaining -= len(data)
+                    relative = os.path.relpath(path, host.run)
+                    target = os.path.join(destination, label, relative)
+                    os.makedirs(os.path.dirname(target), exist_ok=True)
+                    with open(target, "xb") as output:
+                        output.write(data)
+                    report["logs"].append({"host": label, "path": relative, "bytes": len(data),
+                                           "observed_bytes": size, "offset": offset, "truncated": size > len(data)})
+                except Exception as error:
+                    report["errors"].append(f"host {label} log {path}: {type(error).__name__}: {error}")
+        with open(os.path.join(destination, "report.json"), "x") as output:
+            json.dump(report, output, indent=2)
+        print(f"failure evidence before cleanup: {destination}", flush=True)
+    except Exception as error:
+        print(f"failure evidence capture: {type(error).__name__}: {error}", flush=True)
 
 
 def whole_log(host, name):
@@ -1678,7 +1743,10 @@ def exec_background():
     sessions = lambda: cli_json(A, "debug", n, "sessions").get("result") or {}
     # A client that reads its exit and then stays silent, its connection open, holds the relay and the
     # guest's handler for 2 s at most; its session stays, exited and unacknowledged, for a reattach.
-    before = sessions().get("unacknowledged", 0)
+    # Earlier exec relays acknowledge exits asynchronously. The only session
+    # this phase inherits is the deliberately stalled output stream.
+    quiet = wait_for(lambda: sessions() == {"live": 1, "unacknowledged": 0}, 10)
+    check("exec bg: only the deliberately stalled session remains before testing silent exits", quiet, sessions())
     with raw_exec(os.urandom(16).hex(), "echo hi") as s:
         f = s.makefile("rb")
         f.readline()
@@ -1692,7 +1760,7 @@ def exec_background():
         hung_up = s.recv(1) == b""
         took = time.time() - t
         check("exec bg: the relay lets go of a client silent after its exit", kind == 3 and hung_up and took < 4, (kind, hung_up, took))
-        check("exec bg: the session stays, unacknowledged", wait_for(lambda: sessions().get("unacknowledged") == before + 1, 3), sessions())
+        check("exec bg: the session stays, unacknowledged", wait_for(lambda: sessions().get("unacknowledged") == 1, 3), sessions())
         f.close()
     # Piped into a slow reader, the CLI acknowledges its exit only once it wrote all output out, after the
     # guest stopped waiting. Such exits do not count towards the 64 running sessions: with 70 at once,
@@ -1726,7 +1794,7 @@ def exec_background():
         for r in readers:
             r.start()
             time.sleep(0.02)
-        full = wait_for(lambda: sessions().get("unacknowledged", 0) >= before + 1 + 64, 15)
+        full = wait_for(lambda: sessions().get("unacknowledged", 0) >= 65, 15)
         check("exec bg: 64 and more slow readers' exits are unacknowledged at once", full and not drained, (sessions(), time.time() - start))
         t = time.time()
         r = sh(A, n, "echo hi")
@@ -1744,14 +1812,14 @@ def exec_background():
             os.unlink(release)
     bad = [d for d in drained if d[1] != (0, str(d[0]), "")]
     check("exec bg: 70 slow readers all get all their output and status", len(drained) == 70 and not bad, bad[:3])
-    check("exec bg: their acknowledgements release their sessions", wait_for(lambda: sessions().get("unacknowledged") == before + 1, 10), sessions())
+    check("exec bg: their acknowledgements release their sessions", wait_for(lambda: sessions().get("unacknowledged") == 1, 10), sessions())
     # #1030: output that fits the socket buffers, its exit right behind it, to a reader back after 5 s: its
     # acknowledgement is waited for once it has read the exit, and, too late for the guest by then, is passed
     # on as a CLOSE, so the session does not stay.
     drained.clear()
     slow_reader(150000, 5)
     check("exec bg: 150 KB to a reader back after 5 s all arrive", drained == [(150000, (0, "150000", ""))], drained)
-    released = wait_for(lambda: sessions().get("unacknowledged") == before + 1, 10)
+    released = wait_for(lambda: sessions().get("unacknowledged") == 1, 10)
     check("exec bg: its late acknowledgement still releases its session", released, sessions())
     # More output than the guest keeps for a session (4 MiB): the command waits for its reader, and the
     # reader, back after 15 s (well past Firecracker's 2 s vsock shutdown expiry), gets all of it.
@@ -13307,6 +13375,8 @@ try:
             traceback.print_exc()
             check(f"{s}: raised {type(e).__name__}", False, e)
         finally:
+            if failures != before:
+                save_failure_evidence(s, scenario_vms)
             disarm()
             for n in scenario_vms:
                 for h in (A, B):

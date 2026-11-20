@@ -517,6 +517,63 @@ def md5(host, vm):
     return must(host, vm, "md5sum /tmp/data").split()[0]
 
 
+def save_distro_failure(vm):
+    """Capture the failed distro before its finally block removes the VMs."""
+    try:
+        destination = tempfile.mkdtemp(prefix="distro-failure-", dir=args.log_dir)
+        report = {"vm": vm, "hosts": {}, "errors": []}
+        for host in (A, B):
+            details = report["hosts"][host.label] = {"threads": {}}
+            try:
+                result = host.cli("ps", "-a", "--json", timeout=5, check=False)
+                details["registry"] = {"status": result.returncode, "stdout": result.stdout, "stderr": result.stderr}
+                entry = next((item for item in json.loads(result.stdout) if item["name"] == vm), None)
+                details["entry"] = entry
+                if entry and entry.get("pid"):
+                    pid = entry["pid"]
+                    def identity(process):
+                        with open(f"/proc/{process}/stat") as source:
+                            fields = source.read().rsplit(")", 1)[1].split()
+                        return int(fields[1]), int(fields[19])
+                    if identity(pid)[1] == entry.get("start"):
+                        processes = [(pid, entry["start"])]
+                        child = entry.get("firecracker")
+                        if child:
+                            parent, start = identity(child)
+                            if parent == pid:
+                                processes.append((child, start))
+                        for process, start in processes:
+                            captured = {}
+                            for task in sorted(os.listdir(f"/proc/{process}/task"))[:256]:
+                                captured[task] = {}
+                                for name in ("comm", "status", "wchan", "stack"):
+                                    try:
+                                        with open(f"/proc/{process}/task/{task}/{name}") as source:
+                                            captured[task][name] = source.read(16384)
+                                    except OSError as error:
+                                        captured[task][name] = str(error)
+                            if identity(process)[1] == start:
+                                details["threads"][str(process)] = captured
+            except Exception as error:
+                report["errors"].append(f"{host.label} processes: {type(error).__name__}: {error}")
+            try:
+                host.save_logs(destination)
+            except Exception as error:
+                report["errors"].append(f"{host.label} logs: {type(error).__name__}: {error}")
+            try:
+                journal = host.exec(vm, "journalctl --no-pager -n 200 -u flexvm-runtime.service "
+                                    "-u flexvm-runtime-restart-probe.service; systemctl show "
+                                    "flexvm-runtime.service flexvm-runtime-restart-probe.service", timeout=3)
+                details["guest_journal"] = {"status": journal[0], "stdout": journal[1], "stderr": journal[2]}
+            except Exception as error:
+                report["errors"].append(f"{host.label} journal: {type(error).__name__}: {error}")
+        with open(os.path.join(destination, "report.json"), "x") as output:
+            json.dump(report, output, indent=2)
+        print(f"distro failure evidence before cleanup: {destination}", flush=True)
+    except Exception as error:
+        print(f"distro failure evidence: {type(error).__name__}: {error}", flush=True)
+
+
 def marker(host, vm):
     """Starts a guest process counting up in /tmp/count; returns (pid, start time)."""
     # Written to a temporary file and renamed, so a read never sees it empty or half written.
@@ -2559,8 +2616,9 @@ def openrc_test_image():
     if (output / "index.json").exists():
         return str(output)
     builder = "e2e-openrc-builder"
+    image = fixture["base_image"](ENV.get("FLEXVM_OPENRC_ALPINE_LAYOUT"))
     A.cli("pull", "--tag", "ci-openrc-builder", "--max", "1024", "--vcpus", "2",
-          "--cmd", '["/bin/sleep","1800"]', fixture["IMAGE"], timeout=300)
+          "--cmd", '["/bin/sleep","1800"]', image, timeout=300)
     dns = json.load(open(os.path.join(A.state_dir, "host.json"))).get("dns")
     try:
         A.configure(dns=ENV["FLEXVM_TEST_DNS"].split())
@@ -2815,8 +2873,14 @@ def distro_systemd():
         host = B
         observe("migration")
         old = execute("systemctl show --property=MainPID --value flexvm-runtime.service")[1].strip()
-        restart = "for i in $(seq 1 8); do systemctl restart flexvm-runtime.service || exit; done; touch /run/flexvm-restarts-done"
-        execute("systemd-run --unit=flexvm-runtime-restart-probe --collect --no-block /bin/sh -ec " + shlex.quote(restart), False)
+        restart = ("for i in $(seq 1 8); do echo FLEXVM_RESTART_BEGIN_$i; "
+                   "if systemctl restart flexvm-runtime.service; then echo FLEXVM_RESTART_END_$i; "
+                   "else result=$?; echo FLEXVM_RESTART_FAILED_${i}_STATUS_$result; "
+                   "systemctl status --no-pager flexvm-runtime.service; exit $result; fi; "
+                   "done; touch /run/flexvm-restarts-done; echo FLEXVM_RESTART_COMPLETE")
+        execute("systemd-run --unit=flexvm-runtime-restart-probe --collect --no-block "
+                "--property=StandardOutput=journal+console --property=StandardError=journal+console "
+                "/bin/sh -ec " + shlex.quote(restart), False)
         check("distro: repeated runtime restart restores exec", wait_for(lambda: execute("test -f /run/flexvm-restarts-done", False)[0] == 0, 30))
         check("distro: runtime provider replaced", execute("systemctl show --property=MainPID --value flexvm-runtime.service")[1].strip() not in ("", "0", old))
         observe("runtime restart")
@@ -2846,6 +2910,9 @@ def distro_systemd():
         host.cli("kill", "--signal", "TERM", vm)
         check("distro: guest shutdown records successful exit", wait_for(lambda: host.ps().get(vm, {}).get("state") == "exited", 30), host.ps().get(vm))
         check("distro: poweroff status is zero", host.ps()[vm].get("status") == 0, host.ps()[vm])
+    except BaseException:
+        save_distro_failure(vm)
+        raise
     finally:
         A.rm(vm, force=True, check=False)
         B.rm(vm, force=True, check=False)
@@ -2926,18 +2993,27 @@ def containerd():
 def compat_workload(workload, boot="app", memory_mib=2048):
     output = os.path.join(args.log_dir, workload + "-compat")
     previous_dns = [(host, json.load(open(os.path.join(host.state_dir, "host.json"))).get("dns")) for host in (A, B)]
+    image = TEST_IMAGE if boot != "app" else ENV.get(
+        "FLEXVM_COMPAT_APP_IMAGE",
+        "public.ecr.aws/docker/library/ubuntu@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8",
+    )
+    fixture_args = []
+    if workload in ("kind", "k3s") and ENV.get("FLEXVM_WORKLOAD_FIXTURE"):
+        for name in ("busybox.tar", "busybox.json"):
+            fixture_args.extend(["--seed", os.path.join(ENV["FLEXVM_WORKLOAD_FIXTURE"], name), "/nested-input/" + name])
+        fixture_args.extend(["--seed", os.path.join(ROOT, "scripts/compat/verify-fixture-import.py"), "/nested-input/verify-fixture-import.py"])
     try:
         for host, _ in previous_dns:
             host.configure(dns=ENV["FLEXVM_TEST_DNS"].split())
         subprocess.run([
             "python3", os.path.join(ROOT, "scripts/compat.py"), "--bin", BIN,
             "--state", A.state_dir, "--run", A.run_dir, "--boot", boot,
-            "--image", TEST_IMAGE if boot != "app" else "public.ecr.aws/docker/library/ubuntu@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8",
+            "--image", image,
             "--workload", os.path.join(ROOT, f"scripts/compat/workloads/{workload}.sh"),
             "--phases", "run,suspend,checkpoint,migration", "--migration-to", B.addr,
             "--to-state", B.state_dir, "--to-run", B.run_dir,
             "--vcpus", "2", "--memory-mib", str(memory_mib), "--require", "storage.fuse",
-            "--output", output,
+            "--output", output, *fixture_args,
         ], check=True, timeout=1500, env=ENV)
     finally:
         for host, dns in previous_dns:
@@ -3542,6 +3618,7 @@ def faults(template=None, scenarios=None):
     p = subprocess.Popen([sys.executable, os.path.join(ROOT, "scripts", "faults.py"), "--a", A.addr, "--b", B.addr,
                           "--a-state", A.state_dir, "--a-run", A.run_dir, "--b-state", B.state_dir, "--b-run", B.run_dir,
                           "--a-listen-log", A.log, "--b-listen-log", B.log,
+                          "--failure-dir", os.path.join(args.log_dir, "fault-failures"),
                           "--a-ips", f"{A.net}.2-{A.net}.60", "--b-ips", f"{B.net}.2-{B.net}.60",
                           *listeners, *(["--no-skips"] if args.no_skips else []), "--bin", BIN, "--template", template,
                           "--ckpt-dir", os.path.join(WORK, "faults-ckpt"), *image, *scenarios.split()], env=env, start_new_session=True)
