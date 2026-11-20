@@ -274,7 +274,7 @@ pub fn prepare(cache: &Path, init: Option<&Path>, o: &Options, modules: Option<&
     };
     // Bind injected modules and their kernel to the cached root filesystem.
     let key = json!({
-        "v": 6, "config": img.config_digest, "diff_ids": img.diff_ids,
+        "v": 7, "config": img.config_digest, "diff_ids": img.diff_ids,
         "init": sha256_hex(&init_bytes), "options": o,
         "kernel_modules": modules.map(KernelBundle::identity),
     });
@@ -1143,6 +1143,7 @@ fn inject(root: &mut Root, app: &App, init: &[u8]) -> Result<String> {
 fn inject_openrc(root: &mut Root) -> Result<()> {
     root.secure_dir("etc/init.d", 0o755)?;
     root.secure_dir("etc/runlevels/default", 0o755)?;
+    root.secure_dir("etc/runlevels/single", 0o755)?;
     root.write_file(
         "etc/init.d/flexvm-runtime",
         br#"#!/sbin/openrc-run
@@ -1177,21 +1178,29 @@ stop_post() {
 depend() {
     need localmount
     after cgroups
+    keyword -stop
 }
 "#,
         0o755,
     )?;
-    root.write_symlink("etc/runlevels/default/flexvm-runtime", "/etc/init.d/flexvm-runtime")
+    root.write_symlink("etc/runlevels/default/flexvm-runtime", "/etc/init.d/flexvm-runtime")?;
+    root.write_symlink("etc/runlevels/single/flexvm-runtime", "/etc/init.d/flexvm-runtime")
 }
 
 fn inject_systemd(root: &mut Root) -> Result<()> {
     root.secure_dir("etc/systemd/system", 0o755)?;
     root.secure_dir("etc/systemd/system/multi-user.target.wants", 0o755)?;
+    root.secure_dir("etc/systemd/system/rescue.target.wants", 0o755)?;
+    root.secure_dir("etc/systemd/system/emergency.target.wants", 0o755)?;
     root.write_file(
         "etc/systemd/system/flexvm-runtime.service",
         br#"[Unit]
 Description=FlexVM workload delegation
-After=local-fs.target
+DefaultDependencies=no
+After=local-fs.target sysinit.target basic.target
+Before=shutdown.target
+Conflicts=shutdown.target
+IgnoreOnIsolate=yes
 StartLimitIntervalSec=0
 
 [Service]
@@ -1203,11 +1212,13 @@ Restart=always
 RestartSec=250ms
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=multi-user.target rescue.target emergency.target
 "#,
         0o644,
     )?;
     root.write_symlink("etc/systemd/system/multi-user.target.wants/flexvm-runtime.service", "../flexvm-runtime.service")?;
+    root.write_symlink("etc/systemd/system/rescue.target.wants/flexvm-runtime.service", "../flexvm-runtime.service")?;
+    root.write_symlink("etc/systemd/system/emergency.target.wants/flexvm-runtime.service", "../flexvm-runtime.service")?;
     // The management agent already configures eth0 before init. Other links
     // remain available to the distro's normal network managers.
     root.secure_dir("etc/systemd/network", 0o755)?;
@@ -2603,7 +2614,7 @@ mod tests {
         let o = Options { image, ..Options::default() };
         let config_value: Value = serde_json::from_str(&config).unwrap();
         let key =
-            json!({"v": 6, "config": cd, "diff_ids": config_value["rootfs"]["diff_ids"], "init": sha256_hex(b"init"), "options": o, "kernel_modules": null});
+            json!({"v": 7, "config": cd, "diff_ids": config_value["rootfs"]["diff_ids"], "init": sha256_hex(b"init"), "options": o, "kernel_modules": null});
         let key = sha256_hex(key.to_string().as_bytes());
         let cached = d.join("rootfs").join(format!("{}.ext4", &key[7..]));
         cached_rootfs(&cached, build("cached"), sync_dir).unwrap();
@@ -2857,5 +2868,32 @@ mod tests {
         release.send(()).unwrap();
         assert_eq!(first.join().unwrap(), second.join().unwrap());
         assert_eq!(read(&cached), "first image");
+    }
+
+    #[test]
+    fn distro_runtime_units_survive_rescue_and_single_user_isolation() {
+        let sd = tmpdir("inject-systemd");
+        let mut root = unpack::Root::open(&sd, Limits::default()).unwrap();
+        inject_systemd(&mut root).unwrap();
+        let unit = read(sd.join("etc/systemd/system/flexvm-runtime.service"));
+        assert!(unit.contains("DefaultDependencies=no"), "{unit}");
+        assert!(unit.contains("After=local-fs.target sysinit.target basic.target"), "{unit}");
+        assert!(unit.contains("IgnoreOnIsolate=yes"), "{unit}");
+        assert!(unit.contains("Before=shutdown.target"), "{unit}");
+        assert!(unit.contains("Conflicts=shutdown.target"), "{unit}");
+        for target in ["multi-user.target.wants", "rescue.target.wants", "emergency.target.wants"] {
+            let link = sd.join("etc/systemd/system").join(target).join("flexvm-runtime.service");
+            assert_eq!(std::fs::read_link(&link).unwrap(), Path::new("../flexvm-runtime.service"));
+        }
+
+        let rc = tmpdir("inject-openrc");
+        let mut root = unpack::Root::open(&rc, Limits::default()).unwrap();
+        inject_openrc(&mut root).unwrap();
+        let script = read(rc.join("etc/init.d/flexvm-runtime"));
+        assert!(script.contains("keyword -stop"), "{script}");
+        for runlevel in ["default", "single"] {
+            let link = rc.join("etc/runlevels").join(runlevel).join("flexvm-runtime");
+            assert_eq!(std::fs::read_link(&link).unwrap(), Path::new("/etc/init.d/flexvm-runtime"));
+        }
     }
 }
