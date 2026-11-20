@@ -31,6 +31,15 @@ diagnostics() {
 }
 trap diagnostics 0
 case $step in
+diagnose)
+    # The host can request this after a timed-out verify connection is gone.
+    k --request-timeout=4s get pods -l app=web -o wide || true
+    k --request-timeout=4s describe pods -l app=web || true
+    timeout 6 docker exec fvkind-control-plane journalctl --no-pager -u kubelet -n 80 || true
+    timeout 6 docker exec fvkind-control-plane sh -c '
+        cat /sys/fs/cgroup/cpu.stat /sys/fs/cgroup/memory.events
+        crictl ps -a' || true
+    ;;
 prepare)
     export DEBIAN_FRONTEND=noninteractive
     mkdir -p "$base" /var/lib/docker /var/lib/containerd
@@ -202,7 +211,7 @@ PY
     test "$(k exec "$first" -- wget -qO- http://web.flexvm-compat.svc.cluster.local:8080)" = "$nonce"
     peer=$(k get pod "$second" -o jsonpath='{.status.podIP}')
     test "$(k exec "$first" -- wget -qO- "http://$peer:8080")" = "$nonce"
-    k exec "$first" -- wget -qO /dev/null http://example.com
+    k exec "$first" -- wget -qO /dev/null https://github.com/robots.txt
     test "$(curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:18089)" = "$nonce"
     printf 'KIND_PHASE_OK %s\n' "$phase"
     ;;
