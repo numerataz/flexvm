@@ -8,7 +8,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -566,6 +566,8 @@ pub struct Template {
     len: usize,
     data: Vec<u64>,
     verified: Mutex<BTreeMap<String, Stamp>>,
+    /// Cached result of `names_rootfs_by_path`: `vmstate` is immutable for a generation.
+    rootfs_by_path: OnceLock<bool>,
     /// The directory as opened, through `_handle`, whatever its path refers to now.
     fixed: PathBuf,
     _handle: File,
@@ -703,6 +705,7 @@ impl Template {
             len,
             data,
             verified: Mutex::default(),
+            rootfs_by_path: OnceLock::new(),
             fixed,
             _handle: handle,
             _use,
@@ -770,7 +773,11 @@ impl Template {
 
     /// Whether its snapshot names its root filesystem by its path (built by v0.1.0), which v0.1.0 needs.
     pub fn names_rootfs_by_path(&self) -> Result<bool> {
-        Ok(names_by_path(&std::fs::read(self.vmstate())?, &self.meta.rootfs))
+        if let Some(&yes) = self.rootfs_by_path.get() {
+            return Ok(yes);
+        }
+        let yes = names_by_path(&std::fs::read(self.vmstate())?, &self.meta.rootfs);
+        Ok(*self.rootfs_by_path.get_or_init(|| yes))
     }
 
     /// The only file a load of it may open as pmem: `ROOTFS`, or for one built by v0.1.0 its root

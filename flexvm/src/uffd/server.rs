@@ -145,6 +145,7 @@ fn serve(
     let mut stream = io::BufReader::with_capacity(12 * 16, stream);
     let mut req = [0u8; 12];
     let mut buf = Vec::new();
+    let mut write_timeout = None;
     while read_request(&mut stream, &mut req, &stop) && !stop() {
         if !admitted.0.busy() {
             return Ok(());
@@ -153,7 +154,7 @@ fn serve(
         let len = u32::from_le_bytes(req[8..].try_into().unwrap()) as usize;
         if len > MAX_FETCH {
             crate::log!("page server: refusing a {len}-byte read (at most {MAX_FETCH}); dropping the connection");
-            return send(conn, stream.get_mut(), &[1], within, &stop);
+            return send(conn, stream.get_mut(), &[1], within, &stop, &mut write_timeout);
         }
         // The status byte, then the pages: sent with one write. The buffer only grows (zeroed once): `read`
         // overwrites what is sent.
@@ -164,10 +165,10 @@ fn serve(
         let reply = &mut buf[..1 + len];
         reply[0] = 0;
         match read(offset, &mut reply[1..]) {
-            Ok(()) => send(conn, stream.get_mut(), reply, within, &stop)?,
+            Ok(()) => send(conn, stream.get_mut(), reply, within, &stop, &mut write_timeout)?,
             Err(e) => {
                 crate::log!("page server: {e}");
-                send(conn, stream.get_mut(), &[1], within, &stop)?;
+                send(conn, stream.get_mut(), &[1], within, &stop, &mut write_timeout)?;
             }
         }
         admitted.0.idle();
@@ -177,7 +178,7 @@ fn serve(
 
 /// Writes all of `reply` within `within`, however slowly the client drains it, asking `stop` between writes and at
 /// least every second.
-fn send(conn: &TcpStream, w: &mut impl Write, reply: &[u8], within: Duration, stop: &impl Fn() -> bool) -> io::Result<()> {
+fn send(conn: &TcpStream, w: &mut impl Write, reply: &[u8], within: Duration, stop: &impl Fn() -> bool, last_timeout: &mut Option<Duration>) -> io::Result<()> {
     let deadline = Instant::now() + within;
     let mut sent = 0;
     while sent < reply.len() {
@@ -186,7 +187,14 @@ fn send(conn: &TcpStream, w: &mut impl Write, reply: &[u8], within: Duration, st
         }
         let left = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero());
         let Some(left) = left else { return Err(io::Error::new(io::ErrorKind::TimedOut, format!("reply not sent within {within:?}"))) };
-        conn.set_write_timeout(Some(left.min(Duration::from_secs(1))))?;
+        let timeout = left.min(Duration::from_secs(1));
+        if last_timeout.is_none_or(|prev| {
+            prev != timeout
+                && (prev.abs_diff(timeout) >= Duration::from_millis(100) || (timeout < Duration::from_millis(100) && prev >= Duration::from_millis(100)))
+        }) {
+            conn.set_write_timeout(Some(timeout))?;
+            *last_timeout = Some(timeout);
+        }
         match w.write(&reply[sent..]) {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
             Ok(n) => sent += n,
@@ -239,10 +247,15 @@ impl Pager {
         let remote = libc::iovec { iov_base: addr as *mut _, iov_len: len };
         let pid = self.pid.load(Ordering::SeqCst) as libc::pid_t;
         if unsafe { libc::process_vm_readv(pid, local.as_ptr(), local.len() as _, &remote, 1, 0) } != len as isize {
-            return Err(io::Error::other(format!("process_vm_readv: {}", io::Error::last_os_error())));
+            let err = io::Error::last_os_error();
+            if self.exited() {
+                return Err(io::Error::other("firecracker exited"));
+            }
+            return Err(io::Error::other(format!("process_vm_readv: {err}")));
         }
-        // The pid was Firecracker's all along.
-        if self.exited() {
+        // Firecracker is reaped only after `stop`, so its pid cannot be reused while running; only check `exited` on
+        // success once stopped or if never named.
+        if (self.pidfd.get().is_none() || self.stop.load(Ordering::SeqCst)) && self.exited() {
             return Err(io::Error::other("firecracker exited"));
         }
         Ok(())
