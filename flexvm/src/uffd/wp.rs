@@ -90,7 +90,7 @@ impl Pager {
         // that unprotect woke the others but before the page table changed: wake it, which costs nothing like an
         // unprotect (which makes KVM drop its mappings of the range and flush the vCPUs' TLBs). Only an optimization:
         // a failure to read the pagemap leaves it to the unprotect.
-        if self.pagemap(page, 1).is_ok_and(|e| e[0] & PM_PRESENT != 0 && e[0] & PM_UFFD_WP == 0) {
+        if self.pagemap_one(page).is_ok_and(|e| e & PM_PRESENT != 0 && e & PM_UFFD_WP == 0) {
             return self.wake(page).map(|()| Served::Done(WP));
         }
         if let Some(cow) = cow.as_ref().filter(|c| c.state(page) == READING) {
@@ -141,7 +141,7 @@ impl Pager {
             // retry must not trim these pages as already unprotected. Marked after is safe: `freeze` takes the dirty
             // bits under the same lock (`wp`), so it sees both or neither.
             self.writeprotect(p, q - p, false)?;
-            (p..q).for_each(|d| self.pages().mark_dirty(d));
+            self.pages().mark_dirty_range(p, q);
             return Ok(Served::Done(WP));
         };
         // A writer claimed the faulting page itself (PENDING -> READING) after the check above, so it stayed protected,
@@ -236,6 +236,14 @@ impl Pager {
             return Err(io::Error::other("firecracker exited"));
         }
         Ok(self.pagemap.get_or_init(|| f))
+    }
+
+    /// The pagemap entry of `page` in Firecracker (`PM_*` bits), without allocating.
+    fn pagemap_one(&self, page: usize) -> io::Result<u64> {
+        let f = self.pagemap_file()?;
+        let mut raw = [0u8; 8];
+        std::os::unix::fs::FileExt::read_exact_at(f, &mut raw, self.addr(page)? / PAGE_SIZE as u64 * 8)?;
+        Ok(u64::from_le_bytes(raw))
     }
 
     /// The pagemap entries of `n` pages from `page` in Firecracker (`PM_*` bits).
@@ -395,9 +403,7 @@ impl Pager {
         // Hot pages stay unprotected unless their block did not change since the last checkpoint.
         let hot_unchanged = hot.as_ref().map_or(0, |h| h.unchanged.len());
         // Ascending.
-        let kept: Vec<usize> = hot.iter().flat_map(|h| h.held.pages().iter().copied().filter(|&p| h.keeps(p))).collect();
-        // Only populated ones: a page discarded since must be in a delta, as zero.
-        let unchanged = |p: usize| hot.as_ref().is_some_and(|h| h.unchanged(p)) && pages.get(p) == PRESENT;
+        let kept: Vec<usize> = hot.as_ref().map_or_else(Vec::new, |h| h.kept_pages());
         let start = Instant::now();
         let mut protected = 0;
         // Everything populated was protected at the last pause (or when tracking began); since then only dirty pages
@@ -407,8 +413,15 @@ impl Pager {
             // Range by range, not the whole region: a protect makes KVM drop its mappings of everything in the range
             // (see `WP_CHUNK`), so the guest would refault every page it uses there, clean ones too, after the resume.
             // That costs far more than the calls it spares (#281).
-            let dirty_here = dirty.pages(from, to).filter(|&p| pages.get(p) == PRESENT && kept.binary_search(&p).is_err());
-            match self.protect(protect_ranges(dirty_here, &kept), Some(&dirty)) {
+            let kept_start = kept.partition_point(|&p| p < from);
+            let mut k = kept_start;
+            let dirty_here = dirty.pages(from, to).filter(|&p| {
+                while kept.get(k).is_some_and(|&x| x < p) {
+                    k += 1;
+                }
+                pages.get(p) == PRESENT && kept.get(k) != Some(&p)
+            });
+            match self.protect(protect_ranges(dirty_here, &kept[kept_start..]), Some(&dirty)) {
                 Ok(n) => protected += n,
                 Err(e) => {
                     self.recycle_hot(hot);
@@ -421,12 +434,23 @@ impl Pager {
         let out = match incremental {
             false => runs.clone(),
             true => {
-                // Pages not dirty keep what the previous checkpoint has, and so do hot pages unchanged since.
+                // Pages not dirty keep what the previous checkpoint has, and so do hot pages unchanged since
+                // (only populated ones: a page discarded since must be in a delta, as zero).
                 let mut out: Runs = Vec::new();
-                for p in dirty.pages(0, pages.len()).filter(|&p| !unchanged(p)) {
-                    let r = runs.partition_point(|r| r.0 <= p as u64);
-                    let st = match r.checked_sub(1).map(|r| runs[r]) {
-                        Some((f, n, s)) if (p as u64) < f + n => s,
+                let unchanged_pages = hot.as_ref().map_or(&[][..], |h| h.unchanged.as_slice());
+                let (mut u, mut r) = (0, 0);
+                for p in dirty.pages(0, pages.len()) {
+                    while unchanged_pages.get(u).is_some_and(|&x| x < p) {
+                        u += 1;
+                    }
+                    if unchanged_pages.get(u) == Some(&p) && pages.get(p) == PRESENT {
+                        continue;
+                    }
+                    while runs.get(r).is_some_and(|&(f, n, _)| f + n <= p as u64) {
+                        r += 1;
+                    }
+                    let st = match runs.get(r) {
+                        Some(&(f, _, s)) if f <= p as u64 => s,
                         _ => BASE,
                     };
                     match out.last_mut() {
@@ -440,7 +464,11 @@ impl Pager {
         if cow {
             let mut bits = std::collections::BTreeMap::new();
             kept.iter().for_each(|&p| *bits.entry(p / 64).or_insert(0) |= 1u64 << (p % 64));
-            // Only copied pages stay unprotected and are marked dirty again below before resume. The sparse map
+            // Unprotected, so dirty from the pause on.
+            for (&word, &mask) in &bits {
+                pages.mark_dirty_word(word, mask);
+            }
+            // Only copied pages stay unprotected and are marked dirty again above before resume. The sparse map
             // merely excludes those pages from the fault-growth heuristic; it does not replace dirty tracking.
             *self.hot_kept.lock().unwrap() = bits;
             // Share the immutable snapshot instead of copying it during the pause. Frozen retains the same bits
@@ -454,11 +482,7 @@ impl Pager {
             hot.iter().for_each(|h| c.hold(h.held.clone()));
             Arc::new(c)
         });
-        // Unprotected, so dirty from the pause on.
-        let held = hot.as_ref().map(|h| {
-            kept.iter().for_each(|&p| pages.mark_dirty(p));
-            (kept.len(), h.held.clone())
-        });
+        let held = hot.as_ref().map(|h| (kept.len(), h.held.clone()));
         // Faults that wait for the writers are retried as soon as they save pages.
         if let (Some(c), Some(fd)) = (&cow, pages.wake.get().and_then(|fd| fd.try_clone().ok())) {
             c.set_waker(fd);

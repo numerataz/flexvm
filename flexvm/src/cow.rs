@@ -487,7 +487,10 @@ impl GuestPages for CowPages<'_> {
     fn read(&self, page: usize, buf: &mut [u8]) -> Result<()> {
         let cow = self.cow;
         cow.writing.store(true, Ordering::SeqCst);
-        std::thread::sleep((self.slow)());
+        let d = (self.slow)();
+        if !d.is_zero() {
+            std::thread::sleep(d);
+        }
         cow.check_active()?;
         self.check_abort_progress()?;
         let n = buf.len() / PAGE_SIZE;

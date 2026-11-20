@@ -289,6 +289,8 @@ pub struct Runtime {
     /// for `seed`.
     awaiting_seed: AtomicBool,
     prefetch: Mutex<PrefetchState>,
+    /// Mirror of `prefetch.learning` so the UFFD event loop checks it without locking `prefetch`.
+    learning: AtomicBool,
 }
 
 impl std::ops::Deref for Pager {
@@ -357,7 +359,13 @@ impl Pager {
 
     /// Starts the working-set prefetch once it is `due` and, while learning the load set, the snapshot is `loaded`.
     fn start_prefetch(self: &Arc<Self>, loaded: bool, due: bool) {
-        if self.prefetch.lock().unwrap().request(loaded, due) {
+        let start = {
+            let mut p = self.prefetch.lock().unwrap();
+            let start = p.request(loaded, due);
+            self.learning.store(p.learning(), Ordering::Release);
+            start
+        };
+        if start {
             self.prefetching.store(RUNNING, Ordering::SeqCst);
             let p = self.clone();
             thread::spawn(move || p.prefetch());
@@ -394,7 +402,9 @@ impl Pager {
     /// holding the working-set prefetch back until `loaded` so that it does not hide them. For loads off the critical
     /// path (a standby VM's). Call before the load.
     pub fn learn_load_set(&self) {
-        self.prefetch.lock().unwrap().learn();
+        let mut p = self.prefetch.lock().unwrap();
+        p.learn();
+        self.learning.store(p.learning(), Ordering::Release);
     }
 
     /// The snapshot load is done (or failed): stops learning and lets a held-back prefetch go.

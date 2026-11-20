@@ -210,8 +210,19 @@ impl Pages {
         }
     }
 
-    /// Installed writable: publish dirty before PRESENT, which lets quiesce_export finish and freeze take it.
-    fn mark_dirty_range(&self, mut first: usize, end: usize) {
+    /// Marks the pages in `mask` of dirty word `word` dirty, touching its chunk first.
+    pub(super) fn mark_dirty_word(&self, word: usize, mask: u64) {
+        if mask != 0 {
+            if let Some(w) = self.dirty.get(word) {
+                self.touch(word * 64);
+                w.fetch_or(mask, Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// Installed or unprotected writable: publish dirty before PRESENT, which lets quiesce_export finish and freeze take it.
+    pub(super) fn mark_dirty_range(&self, mut first: usize, end: usize) {
+        let end = end.min(self.len());
         while first < end {
             let word = end.min((first / 64 + 1) * 64);
             self.touch(first);
