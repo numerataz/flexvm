@@ -93,7 +93,7 @@
  static void debugcon_isa_realizefn(DeviceState *dev, Error **errp)
  {
      ISADevice *d = ISA_DEVICE(dev);
-@@ -673,9 +685,92 @@
+@@ -673,9 +685,124 @@
      .class_init    = debugcon_isa_class_initfn,
  };
  
@@ -106,26 +106,63 @@
 +struct FlexvmMmioRun {
 +    DeviceState parent_obj;
 +    DebugconState lane;
++    DebugconState second_lane;
 +};
++
++static void flexvm_mmio_close_lane(DebugconState *lane)
++{
++    debugcon_run_failed(lane);
++    while (lane->read_width || lane->pio_waiters ||
++           lane->completion_ack_pending || lane->parallel_ack_pending) {
++        qemu_cond_wait_bql(&lane->read_completed);
++    }
++    qemu_chr_fe_set_handlers(&lane->chr, NULL, NULL, NULL, NULL,
++                             NULL, NULL, false);
++    qemu_del_vm_change_state_handler(lane->run_state);
++    lane->run_state = NULL;
++    qemu_cond_destroy(&lane->read_completed);
++}
 +
 +static void flexvm_mmio_run_realize(DeviceState *dev, Error **errp)
 +{
-+    DebugconState *lane = &FLEXVM_MMIO_RUN(dev)->lane;
++    FlexvmMmioRun *worker = FLEXVM_MMIO_RUN(dev);
++    DebugconState *lane = &worker->lane;
++    DebugconState *second = &worker->second_lane;
++    CPUState *cpu1 = qemu_get_cpu(1);
 +    Error *err = NULL;
 +
 +    if (!lane->mmio_base || lane->mmio_base % DEBUGCON_MMIO_SIZE ||
 +        lane->mmio_base > UINT64_MAX - DEBUGCON_MMIO_SIZE ||
-+        !qemu_get_cpu(0) || qemu_get_cpu(1)) {
-+        error_setg(errp, "flexvm-mmio-run needs one vCPU and a page address");
++        !qemu_get_cpu(0) || qemu_get_cpu(2) ||
++        !!cpu1 != qemu_chr_fe_backend_connected(&second->chr)) {
++        error_setg(errp, "flexvm-mmio-run needs a page address and one socket per vCPU");
 +        return;
 +    }
 +    lane->run_control = true;
++    if (cpu1) {
++        lane->run_cpu = qemu_get_cpu(0);
++        lane->parallel = true;
++        lane->other_lane = second;
++        second->run_cpu = cpu1;
++        second->parallel = second->run_control = true;
++        second->mmio_base = lane->mmio_base;
++    }
 +    qemu_cond_init(&lane->read_completed);
 +    debugcon_realize_core(lane, &err);
 +    if (err) {
 +        qemu_cond_destroy(&lane->read_completed);
 +        error_propagate(errp, err);
 +        return;
++    }
++    if (cpu1) {
++        qemu_cond_init(&second->read_completed);
++        debugcon_realize_core(second, &err);
++        if (err) {
++            qemu_cond_destroy(&second->read_completed);
++            flexvm_mmio_close_lane(lane);
++            error_propagate(errp, err);
++            return;
++        }
 +    }
 +
 +    memory_region_init_io(&lane->mmio, OBJECT(dev), &debugcon_mmio_ops,
@@ -138,22 +175,17 @@
 +{
 +    DebugconState *lane = &FLEXVM_MMIO_RUN(dev)->lane;
 +
-+    debugcon_run_failed(lane);
-+    while (lane->read_width || lane->pio_waiters ||
-+           lane->completion_ack_pending) {
-+        qemu_cond_wait_bql(&lane->read_completed);
++    if (lane->other_lane) {
++        flexvm_mmio_close_lane(lane->other_lane);
 +    }
-+    qemu_chr_fe_set_handlers(&lane->chr, NULL, NULL, NULL, NULL,
-+                             NULL, NULL, false);
-+    qemu_del_vm_change_state_handler(lane->run_state);
-+    lane->run_state = NULL;
++    flexvm_mmio_close_lane(lane);
 +    memory_region_del_subregion(get_system_memory(), &lane->mmio);
 +    object_unparent(OBJECT(&lane->mmio));
-+    qemu_cond_destroy(&lane->read_completed);
 +}
 +
 +static const Property flexvm_mmio_run_properties[] = {
 +    DEFINE_PROP_CHR("chardev", FlexvmMmioRun, lane.chr),
++    DEFINE_PROP_CHR("parallel-chardev", FlexvmMmioRun, second_lane.chr),
 +    DEFINE_PROP_UINT64("addr", FlexvmMmioRun, lane.mmio_base, 0),
 +};
 +
