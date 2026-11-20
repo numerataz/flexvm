@@ -136,19 +136,8 @@ pub fn check_pinned(path: &Path, asset: &Asset) -> Result<()> {
 }
 
 fn check_pinned_with(path: &Path, asset: &Asset, pin: &str, run: Option<&Path>) -> Result<()> {
-    let stamp = || -> Result<Stamp> { Ok(Stamp::of(&std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?)) };
-    let before = stamp()?;
-    let cache = format!("{}.pinned.json", asset.name);
-    let cached = run.and_then(|d| std::fs::read(d.join(&cache)).ok()).and_then(|b| serde_json::from_slice::<(Stamp, String)>(&b).ok());
-    if cached.is_some_and(|(s, p)| s == before && p == pin) {
-        return Ok(());
-    }
-    check_existing(path, asset, Some(pin))?;
-    // Cached only if the file hashed was the one stat-ed.
-    if let Some(run) = run.filter(|_| stamp().is_ok_and(|after| after == before)) {
-        let _ = crate::util::write_file(run, &cache, &serde_json::to_vec(&(before, pin))?, false);
-    }
-    Ok(())
+    let got = cached_sha256(path, asset, run).map_err(|e| format!("{}: cannot check its sha256: {e}", path.display()))?;
+    check_content(path, asset, Some(pin), &got)
 }
 
 /// Where the sha256 (hex) of a file the scripts built or verified at `path` is recorded: the first word of a line.
@@ -386,9 +375,11 @@ mod tests {
         std::fs::write(dir.join("new"), b"new release").unwrap();
         std::fs::rename(dir.join("new"), &path).unwrap();
         check_pinned_with(&path, &FIRECRACKER, &pin, Some(&run)).unwrap();
-        assert!(run.join("firecracker.pinned.json").exists());
+        let cache = run.join("firecracker.sha256.json");
+        let stamp = Stamp::of(&std::fs::metadata(&cache).unwrap());
         check_pinned_with(&path, &FIRECRACKER, &pin, Some(&run)).unwrap();
-        // The cache names the pin it checked: another one checks again.
+        assert_eq!(Stamp::of(&std::fs::metadata(&cache).unwrap()), stamp, "cache hit does not rewrite");
+        // The cache holds the file's sha256: another pin fails against it.
         assert!(check_pinned_with(&path, &FIRECRACKER, &old, Some(&run)).is_err());
         // Replaced (a new inode): hashed again, and refused.
         std::fs::write(dir.join("new"), b"old release").unwrap();

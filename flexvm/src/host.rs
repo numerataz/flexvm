@@ -349,13 +349,211 @@ impl std::fmt::Display for Hop {
 }
 
 /// The reserve of a host that sets none: a sixteenth of its RAM, from 256 MiB to 4 GiB.
+/// Read live from `/proc/meminfo` so `virtio-mem` hotplug growth is reflected immediately.
 pub fn default_reserve() -> u64 {
-    static TOTAL: OnceLock<u64> = OnceLock::new();
-    reserve_for(*TOTAL.get_or_init(|| crate::util::proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20))
+    reserve_for(meminfo_mib("MemTotal").unwrap_or(0))
+}
+
+fn meminfo_mib(field: &str) -> Option<u64> {
+    crate::util::proc_kb("/proc/meminfo", field).map(|b| b >> 20)
 }
 
 fn reserve_for(total_mib: u64) -> u64 {
     (total_mib / 16).clamp(256, 4096)
+}
+
+/// True when this host is itself a guest backed by a `virtio-mem` device whose
+/// outer hypervisor can plug more RAM on demand when `MemAvailable` drops.
+fn has_virtio_mem() -> bool {
+    std::fs::read_dir("/sys/bus/virtio/drivers/virtio_mem")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| entry.file_name().to_str().is_some_and(|n| n.starts_with("virtio")))
+}
+
+fn cmdline_tmpfs_mib(cmdline: &str) -> Option<u64> {
+    cmdline.split_whitespace().find_map(|arg| arg.strip_prefix("flexvm.tmpfs_mib=")?.parse::<u64>().ok()).filter(|&n| n > 0)
+}
+
+fn effective_total_mib(mem_total_mib: Option<u64>, cmdline: Option<&str>, virtio_mem: bool) -> u64 {
+    let Some(total) = mem_total_mib else {
+        return u64::MAX;
+    };
+    if virtio_mem {
+        if let Some(ceiling) = cmdline.and_then(cmdline_tmpfs_mib) {
+            return total.max(ceiling);
+        }
+    }
+    total
+}
+
+/// Effective host RAM in MiB: `MemTotal`, or the outer elastic guest's `flexvm.tmpfs_mib`
+/// ceiling when running inside a `virtio-mem` guest. Returns `u64::MAX` if `MemTotal` is unreadable.
+fn host_total_mib() -> u64 {
+    let mem_total_mib = meminfo_mib("MemTotal");
+    let virtio_mem = has_virtio_mem();
+    let cmdline = virtio_mem.then(|| std::fs::read_to_string("/proc/cmdline").ok()).flatten();
+    effective_total_mib(mem_total_mib, cmdline.as_deref(), virtio_mem)
+}
+
+const VIRTIO_MEM_HEADROOM_MIB: u64 = 64;
+const VIRTIO_MEM_CHUNK_MIB: u64 = 256;
+const VIRTIO_MEM_MIN_PROBE_MIB: u64 = 16;
+const VIRTIO_MEM_COOLDOWN_MS: u64 = 30_000;
+
+fn parse_virtio_mem_cooldown(text: &str) -> Option<(u64, u64)> {
+    let mut parts = text.split_whitespace();
+    let until_ms = parts.next()?.parse::<u64>().ok()?;
+    let total_mib = parts.next()?.parse::<u64>().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((until_ms, total_mib))
+}
+
+fn virtio_mem_cooldown_active(cooldown: Option<(u64, u64)>, now_ms: u64, current_total_mib: u64) -> bool {
+    cooldown.is_some_and(|(until_ms, recorded_total_mib)| now_ms < until_ms && current_total_mib == recorded_total_mib)
+}
+
+fn read_virtio_mem_cooldown(file: &mut File) -> Option<(u64, u64)> {
+    use std::io::{Read, Seek};
+    file.seek(std::io::SeekFrom::Start(0)).ok()?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).ok()?;
+    parse_virtio_mem_cooldown(&buf)
+}
+
+fn write_virtio_mem_cooldown(file: &mut File, until_ms: u64, total_mib: u64) {
+    use std::io::{Seek, Write};
+    if file.set_len(0).is_ok() && file.seek(std::io::SeekFrom::Start(0)).is_ok() {
+        let _ = writeln!(file, "{until_ms} {total_mib}");
+    }
+}
+
+/// Next probe chunk size (MiB) to push `MemAvailable` down toward `VIRTIO_MEM_HEADROOM_MIB`
+/// without overshooting into OOM or hitting a fixed total cap.
+fn virtio_mem_probe_chunk_mib(avail_mib: u64) -> u64 {
+    let excess = avail_mib.saturating_sub(VIRTIO_MEM_HEADROOM_MIB);
+    if excess < VIRTIO_MEM_MIN_PROBE_MIB {
+        0
+    } else {
+        excess.min(VIRTIO_MEM_CHUNK_MIB)
+    }
+}
+
+/// Fallible anonymous page mapping that unmaps on drop, avoiding `vec!` OOM aborts.
+struct MmapGuard {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl MmapGuard {
+    fn new(len: usize) -> Option<Self> {
+        if len == 0 {
+            return None;
+        }
+        let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+        if ptr == libc::MAP_FAILED {
+            return None;
+        }
+        Some(Self { ptr: ptr.cast::<u8>(), len })
+    }
+
+    /// Touch one byte per 4 KiB page so the kernel commits anonymous pages and drives `MemAvailable` down.
+    fn touch_pages(&mut self) {
+        for off in (0..self.len).step_by(4096) {
+            // Volatile write prevents release-mode DSE from eliding the page faults.
+            unsafe { std::ptr::write_volatile(self.ptr.add(off), 1) };
+        }
+        std::hint::black_box(self.ptr);
+    }
+}
+
+impl Drop for MmapGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.ptr.cast::<libc::c_void>(), self.len);
+        }
+    }
+}
+
+/// Inside a `virtio-mem` guest, `MemAvailable` reflects only currently plugged RAM.
+/// Briefly create bounded memory pressure (keeping at least `VIRTIO_MEM_HEADROOM_MIB` free)
+/// so the outer hypervisor can admit and plug additional RAM against the physical host's reserve.
+fn request_virtio_mem_growth(run: &Path, need_mib: u64, deadline: Option<std::time::Instant>) {
+    if !has_virtio_mem() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let max_wait = now + std::time::Duration::from_secs(15);
+    let limit = deadline.map_or(max_wait, |d| d.min(max_wait));
+    // Serialize concurrent callers across threads and processes so parallel starts do not
+    // stack probes into OOM; a waiter that acquires the lock after growth immediately sees
+    // `MemAvailable >= need_mib` and returns without probing again.
+    let Ok(mut guard) = flock_by(&locks(run).join("virtio-mem-grow"), limit).map(Flock) else {
+        return;
+    };
+    if let Some(current_total_mib) = meminfo_mib("MemTotal") {
+        if virtio_mem_cooldown_active(read_virtio_mem_cooldown(&mut guard.0), boottime_ms(), current_total_mib) {
+            return;
+        }
+    }
+    for _ in 0..16 {
+        if std::time::Instant::now() >= limit {
+            break;
+        }
+        let Some(avail_mib) = meminfo_mib("MemAvailable") else { break };
+        let Some(total_mib) = meminfo_mib("MemTotal") else { break };
+        if avail_mib >= need_mib {
+            break;
+        }
+        let max_probe_mib = avail_mib.saturating_sub(VIRTIO_MEM_HEADROOM_MIB);
+        let mut probed_mib = 0u64;
+        let mut probes: Vec<MmapGuard> = Vec::new();
+        let mut grew = false;
+        loop {
+            if std::time::Instant::now() >= limit {
+                break;
+            }
+            let Some(now_total) = meminfo_mib("MemTotal") else { break };
+            if now_total > total_mib {
+                grew = true;
+                break;
+            }
+            let Some(now_avail) = meminfo_mib("MemAvailable") else { break };
+            let remaining_budget = max_probe_mib.saturating_sub(probed_mib);
+            let chunk_mib = virtio_mem_probe_chunk_mib(now_avail).min(remaining_budget);
+            if chunk_mib < VIRTIO_MEM_MIN_PROBE_MIB {
+                break;
+            }
+            let Some(len) = (chunk_mib as usize).checked_shl(20) else { break };
+            let Some(mut guard) = MmapGuard::new(len) else { break };
+            guard.touch_pages();
+            probes.push(guard);
+            probed_mib = probed_mib.saturating_add(chunk_mib);
+        }
+        if !grew && (!probes.is_empty() || avail_mib < VIRTIO_MEM_HEADROOM_MIB + VIRTIO_MEM_MIN_PROBE_MIB) {
+            let step_limit = limit.min(std::time::Instant::now() + std::time::Duration::from_secs(5));
+            while std::time::Instant::now() < step_limit {
+                if let Some(now_total) = meminfo_mib("MemTotal") {
+                    if now_total > total_mib {
+                        grew = true;
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        drop(probes);
+        if !grew {
+            let final_total_mib = meminfo_mib("MemTotal").unwrap_or(total_mib);
+            write_virtio_mem_cooldown(&mut guard.0, boottime_ms().saturating_add(VIRTIO_MEM_COOLDOWN_MS), final_total_mib);
+            break;
+        }
+        let _ = guard.0.set_len(0);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 /// The underlay addresses (one of each family, either may be missing) and announce device
@@ -562,6 +760,10 @@ impl Config {
 
     /// `here`: this host's own addresses and next hops (`here`).
     fn warnings_by(&self, local: impl Fn(IpAddr) -> Result<bool>, here: Result<Vec<(IpAddr, &str)>>) -> Vec<String> {
+        self.warnings_with_total(local, here, host_total_mib())
+    }
+
+    fn warnings_with_total(&self, local: impl Fn(IpAddr) -> Result<bool>, here: Result<Vec<(IpAddr, &str)>>, total: u64) -> Vec<String> {
         let mut w = Vec::new();
         // Never handed out (`claim_new_in`), so likely a range meant for elsewhere (#1078).
         match (self.range(), here) {
@@ -599,7 +801,6 @@ impl Config {
             w.push(format!("flexvm: the eviction mark {e} MiB is under the {} MiB reserve: eviction starts at the reserve", self.reserve()));
         }
         // Valid (a host.json copied from a larger host), but every start would be refused.
-        let total = crate::util::proc_kb("/proc/meminfo", "MemTotal").map_or(u64::MAX, |b| b >> 20);
         if let Some(r) = self.reserve_mib.filter(|&r| r > total) {
             w.push(format!("flexvm: warning: reserve_mib {r} is more than this host's {total} MiB of RAM: every start is refused"));
         }
@@ -1163,14 +1364,25 @@ impl Host {
                 r => r.map_err(|e| named(&path, e))?,
             }
         }
+        // Fast path: when `.synced`, `STATE/run.json`, `RUN/state.json` and `RUN/vms/.locks` are
+        // already in place and agree with `(state, run)`, skip the exclusive `STATE/.locks/open` flock.
+        let synced = id().ok().is_some_and(|id| std::fs::read_to_string(&marker).ok() == Some(id)) && dirs.iter().all(|(d, _)| state.join(d).is_dir());
+        reserved_run(state, run, Path::new(RUN_STATE), Path::new(DEFAULT_RUN))?;
+        let bound = verify_binding(state, "run", run)?;
+        let claimed = verify_binding(run, "state", state)?;
+        let vms_locks = locks(&run.join("vms")).is_dir();
         // Readers of an initialized state need no lock: they cannot change its binding
         // or repair it. Never flock the publicly readable directory itself.
-        let _held = match private_file(&locks(state).join("open")) {
-            Ok(f) => Some(Flock::new(f, libc::LOCK_EX).map_err(root)?),
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => None,
-            Err(e) => return Err(root(e).into()),
+        let _held = if synced && bound && claimed && vms_locks {
+            None
+        } else {
+            match private_file(&locks(state).join("open")) {
+                Ok(f) => Some(Flock::new(f, libc::LOCK_EX).map_err(root)?),
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => None,
+                Err(e) => return Err(root(e).into()),
+            }
         };
-        if id().ok().is_none_or(|id| std::fs::read_to_string(&marker).ok() != Some(id)) || dirs.iter().any(|(d, _)| !state.join(d).is_dir()) {
+        if !synced && (id().ok().is_none_or(|id| std::fs::read_to_string(&marker).ok() != Some(id)) || dirs.iter().any(|(d, _)| !state.join(d).is_dir())) {
             let _ = std::fs::remove_file(&marker);
             dirs.iter()
                 .try_for_each(|(d, mode)| host_dir(&state.join(d), *mode).and_then(|()| crate::util::create_dir_durably(&state.join(d), *mode)))
@@ -1178,7 +1390,9 @@ impl Host {
                 .map_err(root)?;
         }
         // Name locks (`vms`): made by root, so a non-root reader leaves it be.
-        let _ = private_dir(&locks(&run.join("vms")));
+        if !vms_locks {
+            let _ = private_dir(&locks(&run.join("vms")));
+        }
         match crate::template::note_shared(&crate::template::Paths::new(state), state) {
             Err(e) if !unwritable(&e) => Err(root(e))?,
             _ => {}
@@ -1189,16 +1403,17 @@ impl Host {
             _ => {}
         }
         let (state, run) = (state.to_path_buf(), run.to_path_buf());
-        let binding = state.join("run.json");
-        reserved_run(&state, &run, Path::new(RUN_STATE), Path::new(DEFAULT_RUN))?;
-        let bound = verify_binding(&state, "run", &run)?;
-        let claimed = claim_run(&state, &run)?;
-        // A user who cannot write the state root (a non-root `flexvm ps` of an unbound one) leaves it unbound,
-        // as does one who could not claim the run directory: it is not bound to a directory it may not own.
-        if !bound && claimed {
-            match crate::util::write_file(&state, "run.json", &serde_json::to_vec(&run)?, true) {
-                Err(e) if unwritable(&e) => {}
-                r => r.map_err(|e| format!("{}: {e}", binding.display()))?,
+        if !bound || !claimed {
+            let binding = state.join("run.json");
+            let bound = verify_binding(&state, "run", &run)?;
+            let claimed = claim_run(&state, &run)?;
+            // A user who cannot write the state root (a non-root `flexvm ps` of an unbound one) leaves it unbound,
+            // as does one who could not claim the run directory: it is not bound to a directory it may not own.
+            if !bound && claimed {
+                match crate::util::write_file(&state, "run.json", &serde_json::to_vec(&run)?, true) {
+                    Err(e) if unwritable(&e) => {}
+                    r => r.map_err(|e| format!("{}: {e}", binding.display()))?,
+                }
             }
         }
         let _ = RUN_DIR.set(run.clone());
@@ -1897,11 +2112,24 @@ impl Host {
         self.claim_new_in(l, &self.config_now(), holder, want)
     }
 
+    /// `claim_new` taking the host lock after snapshotting netlink state (`listen::HostNet`),
+    /// so `next_hops()` and `local_ips()` run outside `STATE/.locks/host`.
+    pub fn claim_new_unlocked(&self, holder: &str, want: Option<Ipv4Addr>) -> Result<AddrClaim> {
+        let net = crate::listen::HostNet::snapshot()?;
+        let l = self.lock()?;
+        self.claim_new_with_net(&l, &self.config_now(), holder, want, &net)
+    }
+
     /// `claim_new` from `cfg`'s range: a caller that decided by that range claims by it too.
     /// Never an address this host reaches its network or peers by (`listen::assignable`, #1078).
     pub fn claim_new_in(&self, l: &Locked, cfg: &Config, holder: &str, want: Option<Ipv4Addr>) -> Result<AddrClaim> {
         let assignable = crate::listen::assignable(&self.run, cfg)?;
         self.claim_new_by(l, cfg, holder, want, assignable)
+    }
+
+    /// `claim_new_in` reusing a `HostNet` snapshot captured before taking the host lock.
+    pub fn claim_new_with_net(&self, l: &Locked, cfg: &Config, holder: &str, want: Option<Ipv4Addr>, net: &crate::listen::HostNet) -> Result<AddrClaim> {
+        self.claim_new_by(l, cfg, holder, want, net.assignable(&self.run, cfg))
     }
 
     fn claim_new_by(&self, l: &Locked, cfg: &Config, holder: &str, want: Option<Ipv4Addr>, assignable: impl Fn(Ipv4Addr) -> Result<()>) -> Result<AddrClaim> {
@@ -2704,6 +2932,9 @@ impl Host {
             // A guard further out would keep the lock held through the wait.
             debug_assert_eq!(DEPTH.with(|d| d.get()), 0, "waiting for VM processes under the host lock");
             crate::hostmem::release_kept_admitting(self, deadline);
+            if floor == Floor::Reserve && !cfg!(test) && available().is_some_and(|a| a < need) {
+                request_virtio_mem_growth(&self.run, need, deadline);
+            }
             released = true;
         }
     }
@@ -12258,5 +12489,90 @@ pub(crate) mod tests {
         assert_eq!(helpers(), 1, "the waiting helper's lock was handed over, no new one started");
         assert!(probe(&open(), libc::LOCK_EX).is_err(), "the lock handed over is held");
         flock(&got, libc::LOCK_UN).unwrap();
+    }
+
+    #[test]
+    fn virtio_mem_probe_chunk_walks_past_2304_mib_without_overshoot() {
+        assert_eq!(virtio_mem_probe_chunk_mib(0), 0);
+        assert_eq!(virtio_mem_probe_chunk_mib(VIRTIO_MEM_HEADROOM_MIB), 0);
+        assert_eq!(virtio_mem_probe_chunk_mib(VIRTIO_MEM_HEADROOM_MIB + VIRTIO_MEM_MIN_PROBE_MIB - 1), 0);
+        assert_eq!(virtio_mem_probe_chunk_mib(VIRTIO_MEM_HEADROOM_MIB + VIRTIO_MEM_MIN_PROBE_MIB), VIRTIO_MEM_MIN_PROBE_MIB);
+        assert_eq!(virtio_mem_probe_chunk_mib(200), 200 - VIRTIO_MEM_HEADROOM_MIB);
+        // Above 2304 MiB (the former 2048 MiB probe dead zone), chunking walks all the way down to headroom.
+        let mut avail = 4096u64;
+        let mut chunks = 0usize;
+        while let chunk @ 1.. = virtio_mem_probe_chunk_mib(avail) {
+            assert!(chunk <= VIRTIO_MEM_CHUNK_MIB);
+            avail -= chunk;
+            chunks += 1;
+        }
+        assert!(chunks > 8);
+        assert_eq!(avail, VIRTIO_MEM_HEADROOM_MIB);
+    }
+
+    #[test]
+    fn mmap_guard_touches_pages_and_fails_cleanly_on_invalid_size() {
+        assert!(MmapGuard::new(0).is_none());
+        assert!(MmapGuard::new(usize::MAX).is_none());
+        let mut guard = MmapGuard::new(2 * 4096).expect("small anonymous mmap succeeds");
+        guard.touch_pages();
+        unsafe {
+            assert_eq!(*guard.ptr, 1);
+            assert_eq!(*guard.ptr.add(4096), 1);
+        }
+        drop(guard);
+    }
+
+    #[test]
+    fn virtio_mem_cooldown_roundtrip_and_invalidation() {
+        assert_eq!(parse_virtio_mem_cooldown(""), None);
+        assert_eq!(parse_virtio_mem_cooldown("1000"), None);
+        assert_eq!(parse_virtio_mem_cooldown("1000 2048 extra"), None);
+        assert_eq!(parse_virtio_mem_cooldown("bad 2048"), None);
+        assert_eq!(parse_virtio_mem_cooldown("10000 4096\n"), Some((10_000, 4096)));
+
+        let dir = crate::test_util::TempDir::new("virtio-mem-cooldown");
+        let mut f = private_file(&dir.join("virtio-mem-grow")).unwrap();
+        assert_eq!(read_virtio_mem_cooldown(&mut f), None);
+
+        write_virtio_mem_cooldown(&mut f, 50_000, 2048);
+        let state = read_virtio_mem_cooldown(&mut f);
+        assert_eq!(state, Some((50_000, 2048)));
+
+        // Active before deadline while MemTotal is unchanged.
+        assert!(virtio_mem_cooldown_active(state, 49_999, 2048));
+        // Expired at or after deadline.
+        assert!(!virtio_mem_cooldown_active(state, 50_000, 2048));
+        assert!(!virtio_mem_cooldown_active(state, 60_000, 2048));
+        // Invalidated if MemTotal changed (growth or unplug).
+        assert!(!virtio_mem_cooldown_active(state, 49_999, 3072));
+        assert!(!virtio_mem_cooldown_active(state, 49_999, 1024));
+        assert!(!virtio_mem_cooldown_active(None, 49_999, 2048));
+    }
+
+    #[test]
+    fn warnings_uses_virtio_mem_ceiling_for_reserve_mib() {
+        let cmdline = "console=ttyS0 quiet flexvm.tmpfs_mib=8192 flexvm.control=serial";
+        assert_eq!(cmdline_tmpfs_mib(cmdline), Some(8192));
+        assert_eq!(cmdline_tmpfs_mib("console=ttyS0 flexvm.tmpfs_mib=0"), None);
+        assert_eq!(cmdline_tmpfs_mib("console=ttyS0 quiet"), None);
+
+        assert_eq!(effective_total_mib(Some(1024), Some(cmdline), true), 8192);
+        assert_eq!(effective_total_mib(Some(16384), Some(cmdline), true), 16384);
+        assert_eq!(effective_total_mib(Some(1024), Some(cmdline), false), 1024);
+        assert_eq!(effective_total_mib(None, Some(cmdline), true), u64::MAX);
+
+        let mut cfg = Config { reserve_mib: Some(2048), ..Default::default() };
+        // Inside an elastic virtio-mem guest whose MemTotal is currently 1024 MiB but ceiling is 8192 MiB: no warning.
+        let w = cfg.warnings_with_total(|_| Ok(false), Ok(vec![]), effective_total_mib(Some(1024), Some(cmdline), true)).join("\n");
+        assert!(!w.contains("reserve_mib"), "{w}");
+        // Reserve above the elastic ceiling still warns.
+        cfg.reserve_mib = Some(16384);
+        let w = cfg.warnings_with_total(|_| Ok(false), Ok(vec![]), effective_total_mib(Some(1024), Some(cmdline), true)).join("\n");
+        assert!(w.contains("reserve_mib 16384 is more than this host's 8192 MiB of RAM"), "{w}");
+        // Without virtio-mem, MemTotal is used directly.
+        cfg.reserve_mib = Some(2048);
+        let w = cfg.warnings_with_total(|_| Ok(false), Ok(vec![]), effective_total_mib(Some(1024), Some(cmdline), false)).join("\n");
+        assert!(w.contains("reserve_mib 2048 is more than this host's 1024 MiB of RAM"), "{w}");
     }
 }

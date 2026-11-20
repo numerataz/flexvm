@@ -12,6 +12,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -26,6 +27,7 @@ pub const CGROUP: &str = "/sys/fs/cgroup/vm";
 const WORK: &str = "/sys/fs/cgroup/vm/work";
 const GIVE_UP: Duration = Duration::from_secs(3);
 const RETRY: Duration = Duration::from_millis(250);
+const VIRTIO_MEM_DRIVER: &str = "/sys/bus/virtio/drivers/virtio_mem";
 
 static WORK_PROCS: OnceLock<CString> = OnceLock::new();
 
@@ -33,9 +35,11 @@ static WORK_PROCS: OnceLock<CString> = OnceLock::new();
 pub fn start() {
     let _ = std::fs::write("/proc/sys/vm/overcommit_memory", "1");
     match setup() {
-        Ok((events, uev, high)) => {
+        Ok(watcher) => {
             let _ = WORK_PROCS.set(CString::new(format!("{WORK}/cgroup.procs")).unwrap());
-            thread::spawn(move || watch(events, uev, high));
+            if let Some((events, uev, high, mode)) = watcher {
+                thread::spawn(move || watch(events, uev, high, mode));
+            }
         }
         Err(e) => eprintln!("flexvm-init: memory cgroup setup failed: {e}"),
     }
@@ -61,14 +65,19 @@ pub fn enter(cmd: &mut Command, procs: CString, required: bool) {
 }
 
 /// Subscribes to uevents before reading MemTotal, so a plug in between still gets an event.
-fn setup() -> io::Result<(File, OwnedFd, High)> {
+fn setup() -> io::Result<Option<(File, OwnedFd, High, Mode)>> {
     std::fs::create_dir_all(CGROUP_ROOT)?;
     crate::mount("cgroup2", CGROUP_ROOT, "cgroup2", 0, "")?;
     enable_controllers(CGROUP_ROOT)?;
     std::fs::create_dir_all(WORK)?;
     crate::runtime::prepare()?;
     enable_controllers(CGROUP)?;
-    observe()
+    let mode = detect_mode(Path::new(VIRTIO_MEM_DRIVER), std::fs::read_to_string("/proc/cmdline").ok().as_deref());
+    if mode == Mode::Fixed {
+        return Ok(None);
+    }
+    let (events, uev, high) = observe()?;
+    Ok(Some((events, uev, high, mode)))
 }
 
 fn observe() -> io::Result<(File, OwnedFd, High)> {
@@ -105,12 +114,16 @@ pub(crate) fn prepare_distro() -> io::Result<()> {
 /// The broker has retained the initial cgroup namespace and mount view. Its
 /// pressure watcher stays outside /vm while the distro owns the tree inside it.
 pub(crate) fn start_distro() -> io::Result<()> {
+    let mode = detect_mode(Path::new(VIRTIO_MEM_DRIVER), std::fs::read_to_string("/proc/cmdline").ok().as_deref());
+    if mode == Mode::Fixed {
+        return Ok(());
+    }
     let (events, uev, high) = observe()?;
-    thread::Builder::new().name("memory-pressure".into()).spawn(move || watch(events, uev, high))?;
+    thread::Builder::new().name("memory-pressure".into()).spawn(move || watch(events, uev, high, mode))?;
     Ok(())
 }
 
-fn meminfo() -> Option<(u64, u64)> {
+pub(crate) fn meminfo() -> Option<(u64, u64)> {
     read_meminfo(File::open("/proc/meminfo").ok()?)
 }
 
@@ -239,7 +252,49 @@ fn memory_changed(fd: &OwnedFd) -> bool {
     }
 }
 
-fn watch(events: File, uev: OwnedFd, mut limit: High) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// No bound `virtio_mem` device: fixed-RAM VM that can never grow.
+    Fixed,
+    /// `virtio_mem` is present, but `AF_VSOCK` is unavailable (e.g. `flexvm.control=serial`):
+    /// wait passively for the host's `MEMINFO` poller to plug RAM without hammering vsock.
+    Passive,
+    /// `virtio_mem` and `AF_VSOCK` are available: ask the host on `MEM_PORT`.
+    Vsock,
+}
+
+fn has_virtio_mem(driver_dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(driver_dir) else { return false };
+    entries.flatten().any(|entry| {
+        entry.file_name().to_str().and_then(|name| name.strip_prefix("virtio")).is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
+fn serial_control(cmdline: &str) -> bool {
+    cmdline.split_whitespace().any(|arg| arg == "flexvm.control=serial")
+}
+
+fn detect_mode(virtio_mem_dir: &Path, cmdline: Option<&str>) -> Mode {
+    if !has_virtio_mem(virtio_mem_dir) {
+        return Mode::Fixed;
+    }
+    if cmdline.is_some_and(serial_control) {
+        return Mode::Passive;
+    }
+    Mode::Vsock
+}
+
+fn is_vsock_unavailable(err: &io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::EAFNOSUPPORT | libc::EPROTONOSUPPORT | libc::ENODEV | libc::ENXIO | libc::EHOSTUNREACH))
+}
+
+fn on_memory_changed(limit: &mut High, waiting: &mut Option<Instant>, total: Option<u64>) {
+    if limit.set_total(total) {
+        *waiting = None;
+    }
+}
+
+fn watch(events: File, uev: OwnedFd, mut limit: High, mut mode: Mode) {
     let mut seen = high_events(&events);
     let mut asked: Option<Instant> = None;
     let mut waiting: Option<Instant> = None;
@@ -257,16 +312,15 @@ fn watch(events: File, uev: OwnedFd, mut limit: High) {
             limit.relieve();
         }
         if fds[1].revents & libc::POLLIN != 0 && memory_changed(&uev) {
-            // Plugged or unplugged: move the mark. Memory arriving ends a wait.
-            limit.set_total(meminfo().map(|(total, _)| total));
-            waiting = None;
+            // Plugged or unplugged: move the mark. Only memory arriving ends a wait.
+            on_memory_changed(&mut limit, &mut waiting, meminfo().map(|(total, _)| total));
         }
         let now = Instant::now();
         let high = high_events(&events);
         if high != seen && asked.is_none_or(|t| now - t >= RETRY) {
             seen = high;
             asked = Some(now);
-            match ask() {
+            match ask(&mut mode) {
                 Reply::Full => {
                     limit.lift();
                     waiting = None;
@@ -292,7 +346,7 @@ fn check_wait(limit: &mut High, waiting: &mut Option<Instant>, total: Option<u64
     }
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 enum Reply {
     /// The host is plugging more (or could not be reached; retry).
     Asked,
@@ -305,23 +359,40 @@ enum Reply {
 
 /// Sends `MEM <available KiB> <total KiB>`; the host answers `grow`, `busy` (plug in flight), `ok`
 /// (also when refused) or `full` (at the ceiling).
-fn ask() -> Reply {
-    let Some((total, avail)) = meminfo() else { return Reply::Asked };
-    let reply = (|| -> io::Result<String> {
-        let mut s = File::from(crate::vsock_socket()?);
-        let addr = crate::vsock_addr(libc::VMADDR_CID_HOST, crate::proto::MEM_PORT);
-        crate::sock_timeout(s.as_raw_fd(), libc::SO_RCVTIMEO, Some(Duration::from_secs(2)));
-        os(unsafe { libc::connect(s.as_raw_fd(), (&addr as *const libc::sockaddr_vm).cast(), std::mem::size_of_val(&addr) as _) })?;
-        s.write_all(format!("MEM {avail} {total}\n").as_bytes())?;
-        let mut buf = [0u8; 64];
-        let n = s.read(&mut buf)?;
-        Ok(String::from_utf8_lossy(&buf[..n]).into_owned())
-    })();
-    match reply {
-        Ok(r) if r.starts_with("full") => Reply::Full,
-        Ok(r) if r.starts_with("ok") => Reply::Enough,
-        _ => Reply::Asked,
+fn ask(mode: &mut Mode) -> Reply {
+    if *mode == Mode::Vsock {
+        let Some((total, avail)) = meminfo() else { return Reply::Asked };
+        ask_with(mode, || ask_vsock(total, avail))
+    } else {
+        ask_with(mode, || unreachable!())
     }
+}
+
+fn ask_with(mode: &mut Mode, ask_vsock: impl FnOnce() -> io::Result<String>) -> Reply {
+    match *mode {
+        Mode::Fixed => Reply::Full,
+        Mode::Passive => Reply::Asked,
+        Mode::Vsock => match ask_vsock() {
+            Ok(r) if r.starts_with("full") => Reply::Full,
+            Ok(r) if r.starts_with("ok") => Reply::Enough,
+            Err(e) if is_vsock_unavailable(&e) => {
+                *mode = Mode::Passive;
+                Reply::Asked
+            }
+            _ => Reply::Asked,
+        },
+    }
+}
+
+fn ask_vsock(total: u64, avail: u64) -> io::Result<String> {
+    let mut s = File::from(crate::vsock_socket()?);
+    let addr = crate::vsock_addr(libc::VMADDR_CID_HOST, crate::proto::MEM_PORT);
+    crate::sock_timeout(s.as_raw_fd(), libc::SO_RCVTIMEO, Some(Duration::from_secs(2)));
+    os(unsafe { libc::connect(s.as_raw_fd(), (&addr as *const libc::sockaddr_vm).cast(), std::mem::size_of_val(&addr) as _) })?;
+    s.write_all(format!("MEM {avail} {total}\n").as_bytes())?;
+    let mut buf = [0u8; 64];
+    let n = s.read(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf[..n]).into_owned())
 }
 
 #[cfg(test)]
@@ -492,5 +563,130 @@ mod tests {
         resume.send(()).unwrap();
         settle(&high);
         assert_eq!(*installed.lock().unwrap(), Some(high_limit(8192 << 10)));
+    }
+
+    #[test]
+    fn detect_mode_distinguishes_fixed_passive_and_vsock() {
+        let base = std::env::temp_dir().join(format!("flexvm-mem-mode-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let missing = base.join("missing");
+        assert_eq!(detect_mode(&missing, None), Mode::Fixed);
+        assert_eq!(detect_mode(&missing, Some("flexvm.control=serial")), Mode::Fixed);
+
+        let driver = base.join("virtio_mem");
+        std::fs::create_dir_all(&driver).unwrap();
+        for name in ["bind", "unbind", "uevent", "module", "virtio", "virtio_foo"] {
+            File::create(driver.join(name)).unwrap();
+        }
+        assert!(!has_virtio_mem(&driver));
+        assert_eq!(detect_mode(&driver, None), Mode::Fixed);
+        assert_eq!(detect_mode(&driver, Some("flexvm.control=serial")), Mode::Fixed);
+
+        File::create(driver.join("virtio0")).unwrap();
+        assert!(has_virtio_mem(&driver));
+        assert_eq!(detect_mode(&driver, None), Mode::Vsock);
+        assert_eq!(detect_mode(&driver, Some("quiet flexvm.control=serial2")), Mode::Vsock);
+        assert_eq!(detect_mode(&driver, Some("quiet flexvm.control=serial console=ttyS0")), Mode::Passive);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn fixed_mode_reports_full_without_touching_vsock() {
+        let mut mode = Mode::Fixed;
+        let mut calls = 0;
+        let reply = ask_with(&mut mode, || {
+            calls += 1;
+            Ok("grow\n".to_string())
+        });
+        assert_eq!(reply, Reply::Full);
+        assert_eq!(mode, Mode::Fixed);
+        assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn passive_mode_and_unavailable_vsock_avoid_hammering_vsock() {
+        let mut mode = Mode::Passive;
+        let mut calls = 0;
+        for _ in 0..3 {
+            let reply = ask_with(&mut mode, || {
+                calls += 1;
+                Ok("grow\n".to_string())
+            });
+            assert_eq!(reply, Reply::Asked);
+        }
+        assert_eq!(mode, Mode::Passive);
+        assert_eq!(calls, 0);
+
+        for errno in [libc::EAFNOSUPPORT, libc::EPROTONOSUPPORT, libc::ENODEV, libc::ENXIO, libc::EHOSTUNREACH] {
+            let mut mode = Mode::Vsock;
+            let mut calls = 0;
+            let first = ask_with(&mut mode, || {
+                calls += 1;
+                Err(io::Error::from_raw_os_error(errno))
+            });
+            assert_eq!(first, Reply::Asked);
+            assert_eq!(mode, Mode::Passive);
+            assert_eq!(calls, 1);
+
+            let second = ask_with(&mut mode, || {
+                calls += 1;
+                Ok("grow\n".to_string())
+            });
+            assert_eq!(second, Reply::Asked);
+            assert_eq!(calls, 1);
+        }
+
+        // Transient errors keep vsock enabled for subsequent retries.
+        let mut mode = Mode::Vsock;
+        let mut calls = 0;
+        assert_eq!(
+            ask_with(&mut mode, || {
+                calls += 1;
+                Err(io::Error::from_raw_os_error(libc::EAGAIN))
+            }),
+            Reply::Asked
+        );
+        assert_eq!(mode, Mode::Vsock);
+        assert_eq!(
+            ask_with(&mut mode, || {
+                calls += 1;
+                Ok("ok\n".to_string())
+            }),
+            Reply::Enough
+        );
+        assert_eq!(
+            ask_with(&mut mode, || {
+                calls += 1;
+                Ok("full\n".to_string())
+            }),
+            Reply::Full
+        );
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn offline_uevent_moves_mark_without_clearing_active_wait() {
+        let (mut high, _writes, _resume, installed) = high(0);
+        let now = Instant::now();
+        let mut waiting = Some(now);
+
+        // Offline/unplug lowers MemTotal: mark moves down, but active wait for growth stays.
+        on_memory_changed(&mut high, &mut waiting, Some(2048 << 10));
+        settle(&high);
+        assert_eq!(*installed.lock().unwrap(), Some(high_limit(2048 << 10)));
+        assert_eq!(waiting, Some(now));
+
+        // Unchanged or missing MemTotal also keeps the active wait.
+        on_memory_changed(&mut high, &mut waiting, Some(2048 << 10));
+        assert_eq!(waiting, Some(now));
+        on_memory_changed(&mut high, &mut waiting, None);
+        assert_eq!(waiting, Some(now));
+
+        // Online/plug raises MemTotal: mark moves up and ends the wait.
+        on_memory_changed(&mut high, &mut waiting, Some(3072 << 10));
+        settle(&high);
+        assert_eq!(*installed.lock().unwrap(), Some(high_limit(3072 << 10)));
+        assert!(waiting.is_none());
     }
 }

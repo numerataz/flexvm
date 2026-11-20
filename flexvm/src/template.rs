@@ -8,7 +8,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -566,6 +566,8 @@ pub struct Template {
     len: usize,
     data: Vec<u64>,
     verified: Mutex<BTreeMap<String, Stamp>>,
+    /// Cached result of `names_rootfs_by_path`: `vmstate` is immutable for a generation.
+    rootfs_by_path: OnceLock<bool>,
     /// The directory as opened, through `_handle`, whatever its path refers to now.
     fixed: PathBuf,
     _handle: File,
@@ -703,6 +705,7 @@ impl Template {
             len,
             data,
             verified: Mutex::default(),
+            rootfs_by_path: OnceLock::new(),
             fixed,
             _handle: handle,
             _use,
@@ -770,7 +773,11 @@ impl Template {
 
     /// Whether its snapshot names its root filesystem by its path (built by v0.1.0), which v0.1.0 needs.
     pub fn names_rootfs_by_path(&self) -> Result<bool> {
-        Ok(names_by_path(&std::fs::read(self.vmstate())?, &self.meta.rootfs))
+        if let Some(&yes) = self.rootfs_by_path.get() {
+            return Ok(yes);
+        }
+        let yes = names_by_path(&std::fs::read(self.vmstate())?, &self.meta.rootfs);
+        Ok(*self.rootfs_by_path.get_or_init(|| yes))
     }
 
     /// The only file a load of it may open as pmem: `ROOTFS`, or for one built by v0.1.0 its root
@@ -2764,7 +2771,7 @@ pub(crate) mod tests {
             crate::vm::Resources { cpus: None, memory_mib: Some(m) }.check(&meta).map_err(|e| e.to_string())
         };
         let run = |m, mem_mib, max_mib| run_beside(&f.meta.rootfs, m, mem_mib, max_mib);
-        assert_eq!(run(2048, 256, 1024).unwrap_err(), "--memory 2048 MiB is more than the image's ceiling, 1024 MiB (pull it with --max for more)");
+        assert_eq!(run(2048, 256, 1024).unwrap_err(), "--memory 2048 MiB is more than the image's ceiling, 1024 MiB (pull it with --mem for more)");
         let full = 17280 + hotplug_room(0).unwrap();
         run(full, 17280, full).unwrap();
         assert_eq!(
@@ -2772,13 +2779,13 @@ pub(crate) mod tests {
             format!("--memory {} MiB is more than the image's ceiling, {full} MiB (the most Firecracker's hotplug window holds)", full + 1)
         );
         let short = full - SLOT_MIB;
-        assert!(run(full, 17280, short).unwrap_err().ends_with("(pull it with --max for more)"));
+        assert!(run(full, 17280, short).unwrap_err().ends_with("(pull it with --mem for more)"));
         // Beside a 20 GiB root filesystem, that is a full template.
         let big = f.dir.join("big-rootfs");
         File::create(&big).unwrap().set_len(20 << 30).unwrap();
         let full = 16640 + hotplug_room(20 << 30).unwrap();
         assert!(run_beside(&big, full + 1, 16640, full).unwrap_err().ends_with("(the most Firecracker's hotplug window holds)"));
-        assert!(run_beside(&big, full, 16640, full - SLOT_MIB).unwrap_err().ends_with("(pull it with --max for more)"));
+        assert!(run_beside(&big, full, 16640, full - SLOT_MIB).unwrap_err().ends_with("(pull it with --mem for more)"));
     }
 
     fn sent(f: &mut Fixture, rootfs_named: &str) -> (Arc<Template>, Vec<u8>) {

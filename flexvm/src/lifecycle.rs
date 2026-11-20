@@ -439,8 +439,9 @@ impl Proc {
         drop(held);
         self.set_resources(resources.or(ck.manifest.resources), &tpl.meta)?;
         self.bind_ports()?;
-        // Decided and claimed under one lock, by one reading of the range: a change
-        // between them cannot send a local address to `claim_new` as foreign.
+        // Snapshot netlink state outside the host lock, then decide and claim under one lock by one
+        // reading of the range: a change between them cannot send a local address to `claim_new` as foreign.
+        let net = crate::listen::HostNet::snapshot()?;
         let l = self.host.lock()?;
         let cfg = self.host.config_now();
         let claim = match want.filter(|&ip| !cfg.range().is_ok_and(|r| r.contains(ip))) {
@@ -449,7 +450,7 @@ impl Proc {
                 self.borrow(&name, ip)?
             }
             None => {
-                let claim = self.host.claim_new_in(&l, &cfg, &name, want);
+                let claim = self.host.claim_new_with_net(&l, &cfg, &name, want, &net);
                 drop(l);
                 claim.map_err(|e| format!("{e}; run --checkpoint with --ip auto (or another address)"))?
             }

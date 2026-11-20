@@ -395,6 +395,7 @@ pub struct Root {
     fd: OwnedFd,
     limits: Limits,
     pub entries: u64,
+    pub has_xattrs: bool,
     seen: u64,
     unpacked: u64,
     root_meta: Option<(tar::Header, Meta)>,
@@ -407,7 +408,7 @@ impl Root {
     }
 
     pub fn from_fd(fd: OwnedFd, limits: Limits) -> Root {
-        Root { fd, limits, entries: 0, seen: 0, unpacked: 0, root_meta: None }
+        Root { fd, limits, entries: 0, has_xattrs: false, seen: 0, unpacked: 0, root_meta: None }
     }
 
     /// Check before creating anything, including implicit parents. Deletions do not refund the
@@ -594,7 +595,7 @@ impl Root {
                 // No bigger than the file: most are small, and a 256 KiB buffer each would be an mmap.
                 let mut file = self.create(|| Ok(BufWriter::with_capacity((e.size() as usize).min(256 << 10), at.create()?)))?;
                 io::copy(e, &mut file).and_then(|_| file.flush()).map_err(|err| format!("write {rel:?}: {err}"))?;
-                Self::file_metadata(&at, &h, &m, rel, file.get_ref().as_raw_fd())?;
+                self.has_xattrs |= Self::file_metadata(&at, &h, &m, rel, file.get_ref().as_raw_fd())?;
                 return Ok(at);
             }
             T::Symlink => {
@@ -627,15 +628,15 @@ impl Root {
             }
             other => bail!("unsupported tar entry type {other:?} at {rel:?}"),
         }
-        Self::metadata(&at, &h, &m, rel, None)?;
+        self.has_xattrs |= Self::metadata(&at, &h, &m, rel, None)?;
         Ok(at)
     }
 
-    fn file_metadata(at: &At, h: &tar::Header, m: &Meta, rel: &Path, fd: RawFd) -> Result<()> {
+    fn file_metadata(at: &At, h: &tar::Header, m: &Meta, rel: &Path, fd: RawFd) -> Result<bool> {
         Self::metadata(at, h, m, rel, Some(fd))
     }
 
-    fn metadata(at: &At, h: &tar::Header, m: &Meta, rel: &Path, fd: Option<RawFd>) -> Result<()> {
+    fn metadata(at: &At, h: &tar::Header, m: &Meta, rel: &Path, fd: Option<RawFd>) -> Result<bool> {
         let (dfd, name) = (at.dir.as_raw_fd(), at.name.as_ptr());
         let kind = h.entry_type();
         let nofollow = libc::AT_SYMLINK_NOFOLLOW;
@@ -653,22 +654,27 @@ impl Root {
                 }
             }
         }
+        let mut wrote_xattr = false;
         if kind != tar::EntryType::Symlink {
             for (key, value) in &m.xattrs {
-                if let Err(e) = at.set_xattr(key, value, fd) {
-                    // Capabilities and ACLs decide who may run or read what; other xattrs are best-effort.
-                    if key == "security.capability" || key.starts_with("system.posix_acl_") {
-                        bail!("xattr {key} on {rel:?}: {e}");
+                match at.set_xattr(key, value, fd) {
+                    Ok(()) => wrote_xattr = true,
+                    Err(e) => {
+                        // Capabilities and ACLs decide who may run or read what; other xattrs are best-effort.
+                        if key == "security.capability" || key.starts_with("system.posix_acl_") {
+                            bail!("xattr {key} on {rel:?}: {e}");
+                        }
+                        crate::log!("image: xattr {key} on {rel:?}: {e}");
                     }
-                    crate::log!("image: xattr {key} on {rel:?}: {e}");
                 }
             }
         }
         let ts = [libc::timespec { tv_sec: h.mtime().unwrap_or(0) as i64, tv_nsec: 0 }; 2];
         match fd {
-            Some(fd) => check(unsafe { libc::futimens(fd, ts.as_ptr()) }, "futimens", rel),
-            None => check(unsafe { libc::utimensat(dfd, name, ts.as_ptr(), nofollow) }, "utimensat", rel),
+            Some(fd) => check(unsafe { libc::futimens(fd, ts.as_ptr()) }, "futimens", rel)?,
+            None => check(unsafe { libc::utimensat(dfd, name, ts.as_ptr(), nofollow) }, "utimensat", rel)?,
         }
+        Ok(wrote_xattr)
     }
 
     /// Module artifacts have their own bounded budget. Shared image directories
@@ -767,10 +773,10 @@ impl Root {
     }
 
     /// Child creation (including injected files) changes the root's mtime.
-    pub fn restore_root_metadata(&self) -> Result<()> {
+    pub fn restore_root_metadata(&mut self) -> Result<()> {
         if let Some((h, m)) = &self.root_meta {
             let at = At { dir: self.resolve(Path::new(""))?, name: c".".to_owned() };
-            Self::metadata(&at, h, m, Path::new("/"), None)?;
+            self.has_xattrs |= Self::metadata(&at, h, m, Path::new("/"), None)?;
         }
         Ok(())
     }

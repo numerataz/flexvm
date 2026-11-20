@@ -117,7 +117,12 @@ pub fn sweep_every() -> Duration {
     knob().map_or(Duration::from_secs(60), |_| Duration::from_secs(1))
 }
 /// Output still read after the shell exits, as for the app.
+/// How long after the shell exits its stdout/stderr pipes are still read before descendants keeping them open are
+/// handed off to the discarder. Shortened under `cfg(test)` so unit tests do not spend seconds waiting out the drain.
+#[cfg(not(test))]
 pub(crate) const DRAIN: Duration = Duration::from_secs(2);
+#[cfg(test)]
+pub(crate) const DRAIN: Duration = Duration::from_millis(250);
 
 type Session = Arc<(Mutex<Output>, Condvar)>;
 pub type Sessions = Arc<Mutex<Table>>;
@@ -1737,7 +1742,7 @@ mod tests {
         assert!(request(&sessions, &statuses, "CLOSE kept", b"").ends_with(b"closed"));
         reap(&statuses, kept_group);
         let ring = kept.0.lock().unwrap();
-        assert!(kept.1.wait_timeout_while(ring, DRAIN * 3, |r| r.exit.is_none()).unwrap().0.exit.is_some());
+        assert!(kept.1.wait_timeout_while(ring, Duration::from_secs(5), |r| r.exit.is_none()).unwrap().0.exit.is_some());
     }
 
     #[test]
@@ -1779,7 +1784,7 @@ mod tests {
         output.0.lock().unwrap().gone = None;
         output.1.notify_all();
         let ring = output.0.lock().unwrap();
-        let (ring, timeout) = output.1.wait_timeout_while(ring, DRAIN * 5, |r| r.exit.is_none()).unwrap();
+        let (ring, timeout) = output.1.wait_timeout_while(ring, Duration::from_secs(10), |r| r.exit.is_none()).unwrap();
         assert!(!timeout.timed_out(), "the pump never got its exit");
         assert_eq!((ring.exit, ring.end), (Some(3), 65536 + 5));
         drop(ring);
@@ -1948,7 +1953,7 @@ mod tests {
         assert!(libc::WIFEXITED(status));
         assert_eq!(libc::WEXITSTATUS(status), 7);
         let ring = output.0.lock().unwrap();
-        let (ring, timeout) = output.1.wait_timeout_while(ring, DRAIN * 3, |r| r.exit.is_none()).unwrap();
+        let (ring, timeout) = output.1.wait_timeout_while(ring, Duration::from_secs(5), |r| r.exit.is_none()).unwrap();
         assert!(!timeout.timed_out(), "exit never recorded");
         assert_eq!(ring.exit, Some(7));
         assert_eq!(ring.read_chunk(0), Some((FRAME_STDOUT, &b"/bin/sh done"[..])));
@@ -1964,7 +1969,7 @@ mod tests {
         assert!(libc::WIFEXITED(status));
         assert_eq!(libc::WEXITSTATUS(status), 0);
         let ring = output.0.lock().unwrap();
-        let (ring, _) = output.1.wait_timeout_while(ring, DRAIN * 3, |r| r.exit.is_none()).unwrap();
+        let (ring, _) = output.1.wait_timeout_while(ring, Duration::from_secs(5), |r| r.exit.is_none()).unwrap();
         // dash leaves LINENO unset in a sourced file; bash and ash give 1, the prefix sharing the line.
         assert!(matches!(ring.read_chunk(0), Some((FRAME_STDOUT, b"line=" | b"line=1"))), "{:?}", ring.read_chunk(0));
     }
@@ -1975,7 +1980,7 @@ mod tests {
         let (output, group) = start(&sessions, &statuses, "bg", b"echo hi; sleep 100 & exit 3");
         let status = reap(&statuses, group);
         let ring = output.0.lock().unwrap();
-        let (ring, timeout) = output.1.wait_timeout_while(ring, DRAIN * 3, |r| r.exit.is_none()).unwrap();
+        let (ring, timeout) = output.1.wait_timeout_while(ring, Duration::from_secs(5), |r| r.exit.is_none()).unwrap();
         assert!(!timeout.timed_out(), "exit never recorded");
         assert_eq!((ring.end, ring.exit, libc::WEXITSTATUS(status)), (3, Some(3), 3));
         drop(ring);
@@ -1996,7 +2001,7 @@ mod tests {
         // The background sleep went with it: the group empties.
         wait_group_gone(group, "the background process survived");
         let ring = output.0.lock().unwrap();
-        assert!(output.1.wait_timeout_while(ring, DRAIN * 3, |r| r.exit.is_none()).unwrap().0.exit.is_some());
+        assert!(output.1.wait_timeout_while(ring, Duration::from_secs(5), |r| r.exit.is_none()).unwrap().0.exit.is_some());
     }
 
     #[test]
@@ -2032,7 +2037,7 @@ mod tests {
         let (output, group) = start(&sessions, &statuses, "old", b"exit 0");
         reap(&statuses, group);
         let ring = output.0.lock().unwrap();
-        assert!(output.1.wait_timeout_while(ring, DRAIN * 3, |r| r.exit.is_none()).unwrap().0.exit.is_some());
+        assert!(output.1.wait_timeout_while(ring, Duration::from_secs(5), |r| r.exit.is_none()).unwrap().0.exit.is_some());
         // A new command, unreaped, in a group of its own, takes the finished shell's pid.
         let mut cmd = Command::new("/bin/sleep");
         cmd.arg("100").process_group(0);

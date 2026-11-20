@@ -6,6 +6,7 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::bail;
 use crate::util::{self, Result};
@@ -58,8 +59,21 @@ fn capacity(bytes: u64) -> Result<()> {
     Ok(())
 }
 
+fn hash_zeros(hash: &mut Sha256, mut count: u64, zeros: &[u8]) {
+    while count > 0 {
+        let chunk = count.min(zeros.len() as u64) as usize;
+        hash.update(&zeros[..chunk]);
+        count -= chunk as u64;
+    }
+}
+
 fn copy_sparse(source: &File, target: &File, size: u64) -> Result<()> {
+    copy_sparse_inner(source, target, size, None)
+}
+
+fn copy_sparse_inner(source: &File, target: &File, size: u64, mut hash: Option<&mut Sha256>) -> Result<()> {
     let mut buffer = vec![0; 1 << 20];
+    let zeros = if hash.is_some() { vec![0; 64 << 10] } else { Vec::new() };
     let mut offset = 0;
     let mut seek_holes = true;
     while offset < size {
@@ -68,7 +82,12 @@ fn copy_sparse(source: &File, target: &File, size: u64) -> Result<()> {
             if data < 0 {
                 let error = std::io::Error::last_os_error();
                 match error.raw_os_error() {
-                    Some(libc::ENXIO) => break,
+                    Some(libc::ENXIO) => {
+                        if let Some(h) = hash.as_deref_mut() {
+                            hash_zeros(h, size - offset, &zeros);
+                        }
+                        break;
+                    }
                     Some(libc::EINVAL | libc::EOPNOTSUPP | libc::ENOSYS) => {
                         seek_holes = false;
                         continue;
@@ -90,6 +109,9 @@ fn copy_sparse(source: &File, target: &File, size: u64) -> Result<()> {
             if data < offset as libc::off_t || data as u64 >= size || hole <= data {
                 bail!("invalid source volume extent");
             }
+            if let Some(h) = hash.as_deref_mut() {
+                hash_zeros(h, data as u64 - offset, &zeros);
+            }
             offset = data as u64;
             (hole as u64).min(size)
         } else {
@@ -98,6 +120,9 @@ fn copy_sparse(source: &File, target: &File, size: u64) -> Result<()> {
         while offset < end {
             let bytes = (end - offset).min(buffer.len() as u64) as usize;
             source.read_exact_at(&mut buffer[..bytes], offset)?;
+            if let Some(h) = hash.as_deref_mut() {
+                h.update(&buffer[..bytes]);
+            }
             // Also preserve sparsity when a filesystem reports holes as data.
             if buffer[..bytes].iter().any(|byte| *byte != 0) {
                 target.write_all_at(&buffer[..bytes], offset)?;
@@ -109,9 +134,19 @@ fn copy_sparse(source: &File, target: &File, size: u64) -> Result<()> {
 }
 
 pub(crate) fn copy_raw(source: &File, target: &File, size: u64) -> Result<()> {
+    copy_raw_inner(source, target, size, false).map(|_| ())
+}
+
+/// Copies `source` into `target`, returning the SHA-256 hex digest when the fallback streaming
+/// copy ran, or `None` when `FICLONE` succeeded without reading the data.
+pub(crate) fn copy_raw_hashed(source: &File, target: &File, size: u64) -> Result<Option<String>> {
+    copy_raw_inner(source, target, size, true)
+}
+
+fn copy_raw_inner(source: &File, target: &File, size: u64, compute_hash: bool) -> Result<Option<String>> {
     loop {
         if unsafe { libc::ioctl(target.as_raw_fd(), libc::FICLONE, source.as_raw_fd()) } == 0 {
-            return Ok(());
+            return Ok(None);
         }
         let error = std::io::Error::last_os_error();
         match error.raw_os_error() {
@@ -123,7 +158,14 @@ pub(crate) fn copy_raw(source: &File, target: &File, size: u64) -> Result<()> {
     // A failed optional clone must not leave data in holes of the fallback copy.
     target.set_len(0)?;
     target.set_len(size)?;
-    copy_sparse(source, target, size)
+    if compute_hash {
+        let mut hash = Sha256::new();
+        copy_sparse_inner(source, target, size, Some(&mut hash))?;
+        Ok(Some(format!("{:x}", hash.finalize())))
+    } else {
+        copy_sparse(source, target, size)?;
+        Ok(None)
+    }
 }
 
 fn make_directory(parent: &File, name: &std::ffi::CStr) -> Result<()> {
@@ -162,7 +204,7 @@ fn entries(dir: &File) -> Result<Vec<String>> {
 
 fn rename(parent: &File, from: &str, to: &str) -> Result<()> {
     let (from, to) = (util::cname(from), util::cname(to));
-    util::check(unsafe { libc::renameat2(parent.as_raw_fd(), from.as_ptr(), parent.as_raw_fd(), to.as_ptr(), libc::RENAME_NOREPLACE) })?;
+    util::check(util::rename_at(parent.as_raw_fd(), &from, parent.as_raw_fd(), &to, libc::RENAME_NOREPLACE))?;
     parent.sync_all()?;
     Ok(())
 }
@@ -194,11 +236,11 @@ impl Catalog {
         Ok(crate::host::Flock(lock))
     }
 
-    fn read(&self, id: &str) -> Result<(Info, File, File)> {
-        if !valid_id(id) {
-            bail!("invalid volume identifier");
+    fn read_dir(&self, id: &str, dir: File, disk_flags: i32) -> Result<(Info, File, File)> {
+        let stat = dir.metadata()?;
+        if stat.uid() != unsafe { libc::geteuid() } || stat.mode() & 0o077 != 0 {
+            bail!("volume directory is not private to its owner");
         }
-        let dir = directory(&self.directory, id)?;
         let mut bytes = Vec::new();
         member(&dir, "metadata.json", libc::O_RDONLY)?.take(4097).read_to_end(&mut bytes)?;
         if bytes.len() > 4096 {
@@ -209,7 +251,7 @@ impl Catalog {
             bail!("unsupported or inconsistent volume metadata");
         }
         capacity(metadata.capacity_bytes)?;
-        let disk = member(&dir, "disk.raw", libc::O_RDWR)?;
+        let disk = member(&dir, "disk.raw", disk_flags)?;
         let stat = disk.metadata()?;
         if stat.len() != metadata.capacity_bytes {
             bail!("volume backing size differs from its declared capacity");
@@ -217,11 +259,27 @@ impl Catalog {
         Ok((Info { metadata, allocated_bytes: stat.blocks().saturating_mul(512) }, dir, disk))
     }
 
+    fn read_with(&self, id: &str, disk_flags: i32) -> Result<(Info, File, File)> {
+        if !valid_id(id) {
+            bail!("invalid volume identifier");
+        }
+        let dir: File = util::open_dir_at(self.directory.as_raw_fd(), &util::cname(id))?.into();
+        self.read_dir(id, dir, disk_flags)
+    }
+
+    fn read(&self, id: &str) -> Result<(Info, File, File)> {
+        self.read_with(id, libc::O_RDWR)
+    }
+
+    fn read_info(&self, id: &str) -> Result<Info> {
+        self.read_with(id, libc::O_RDONLY).map(|(info, _, _)| info)
+    }
+
     fn volumes(&self) -> Result<Vec<Info>> {
         let mut volumes = Vec::new();
         for id in entries(&self.directory)? {
             if valid_id(&id) {
-                volumes.push(self.read(&id)?.0);
+                volumes.push(self.read_info(&id)?);
             } else if ![".creating-v1-", ".deleting-v1-"].iter().any(|prefix| id.strip_prefix(prefix).is_some_and(valid_id)) {
                 bail!("unrecognized volume catalog entry {id:?}");
             }
@@ -231,7 +289,14 @@ impl Catalog {
     }
 
     fn find(&self, name: &str) -> Result<Info> {
-        let mut matches = self.volumes()?.into_iter().filter(|v| v.metadata.id == name || v.metadata.name == name);
+        if valid_id(name) {
+            return match util::open_dir_at(self.directory.as_raw_fd(), &util::cname(name)) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!("volume {name:?} does not exist"),
+                Err(e) => Err(e.into()),
+                Ok(dir) => self.read_dir(name, dir.into(), libc::O_RDONLY).map(|(info, _, _)| info),
+            };
+        }
+        let mut matches = self.volumes()?.into_iter().filter(|v| v.metadata.name == name);
         let found = matches.next().ok_or_else(|| format!("volume {name:?} does not exist"))?;
         if matches.next().is_some() {
             bail!("ambiguous volume name");

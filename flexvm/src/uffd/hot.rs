@@ -95,10 +95,29 @@ pub struct Hot {
 
 impl Hot {
     /// Whether `page` stays unprotected: copied, in a block that changed.
+    #[cfg(test)]
     pub fn keeps(&self, page: usize) -> bool {
         self.held.pages.binary_search(&page).is_ok() && self.changed.binary_search(&(page / HOT_BLOCK)).is_ok()
     }
 
+    /// Copied pages that stay unprotected (in a block that changed), ascending.
+    pub fn kept_pages(&self) -> Vec<usize> {
+        let mut c = 0;
+        self.held
+            .pages
+            .iter()
+            .copied()
+            .filter(|&p| {
+                let b = p / HOT_BLOCK;
+                while self.changed.get(c).is_some_and(|&x| x < b) {
+                    c += 1;
+                }
+                self.changed.get(c) == Some(&b)
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     pub fn unchanged(&self, page: usize) -> bool {
         self.unchanged.binary_search(&page).is_ok()
     }
@@ -276,11 +295,18 @@ fn copy(
         // changed (it is saved again, which is never wrong).
         let mut same = Vec::new();
         let mut changed = None;
+        let mut prev_i = prev.as_ref().map_or(0, |h| h.pages.partition_point(|&q| q < hot[a]));
         for (i, &p) in hot.iter().enumerate().take(b).skip(a) {
             if changed == Some(p / HOT_BLOCK) {
                 continue;
             }
-            match prev.as_ref().and_then(|h| h.get(p)).is_some_and(|old| old == buf.page(i)) {
+            let same_page = prev.as_ref().is_some_and(|h| {
+                while h.pages.get(prev_i).is_some_and(|&q| q < p) {
+                    prev_i += 1;
+                }
+                h.pages.get(prev_i) == Some(&p) && h.buf.page(prev_i) == buf.page(i)
+            });
+            match same_page {
                 true => same.push(p),
                 false => changed = Some(p / HOT_BLOCK),
             }
@@ -302,7 +328,17 @@ fn copy(
     }
     let mut unchanged = unchanged.into_inner().unwrap();
     unchanged.sort_unstable();
-    let mut changed: Vec<usize> = hot.iter().filter(|p| unchanged.binary_search(p).is_err()).map(|p| p / HOT_BLOCK).collect();
+    let mut u = 0;
+    let mut changed: Vec<usize> = hot
+        .iter()
+        .filter(|&&p| {
+            while unchanged.get(u).is_some_and(|&x| x < p) {
+                u += 1;
+            }
+            unchanged.get(u) != Some(&p)
+        })
+        .map(|p| p / HOT_BLOCK)
+        .collect();
     changed.dedup();
     Ok(Hot { held: Arc::new(Held { pages: hot, buf }), unchanged, changed, prev })
 }

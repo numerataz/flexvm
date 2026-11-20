@@ -1491,7 +1491,17 @@ def model_cpuid(engine, qemu, output, control, cpu_count):
         native = native_query([output / NATIVE_WORKER, "--supported-cpuid"])
         if native.returncode:
             raise RuntimeError(f"native CPUID query failed: {native.stderr.decode(errors='replace')}")
-        entries = [entry for entry in unpack_cpuid(native.stdout) if not entry[2] & ~1]
+        # The outer VM runs under QEMU TCG (which reports AuthenticAMD) while native-worker runs on
+        # host KVM (often Intel). Clear KVM_FEATURE_PV_UNHALT (bit 7 of leaf 0x40000001) so the inner
+        # kernel does not execute VMMCALL in kvm_kick_cpu on an Intel KVM host, where kvm_fix_hypercall
+        # faults trying to patch read-only kernel .text.
+        entries = []
+        for entry in unpack_cpuid(native.stdout):
+            if entry[2] & ~1:
+                continue
+            if entry[0] == 0x40000001:
+                entry = (*entry[:3], entry[3] & ~(1 << 7), *entry[4:])
+            entries.append(entry)
     else:
         with model_monitor(qemu, output, control, cpu_count, "cpuid") as monitor:
             tcg_clock(monitor.ask, None)

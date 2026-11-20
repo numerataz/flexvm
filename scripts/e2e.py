@@ -212,7 +212,7 @@ class Host:
         while not owns_socket(self.proc.pid, listener_inode(self.port)):
             if self.proc.poll() is not None or time.time() > deadline:
                 raise AssertionError(f"host {self.label} did not come up; see {self.log}")
-            time.sleep(0.2)
+            time.sleep(0.02)
 
     def stop(self, timeout=60):
         """Destroys what VMs are left and stops the listener; raises if it died early."""
@@ -828,7 +828,7 @@ def image_volumes():
     with open(os.path.join(layout, "oci-layout"), "w") as f:
         json.dump({"imageLayoutVersion": "1.0.0"}, f)
     name, vm = args.template + "-volumes", "e2e-volumes"
-    flexvm("pull", layout, "--tag", name, "--vcpus", "2", "--max", "2048", timeout=600)
+    flexvm("pull", layout, "--tag", name, "--vcpus", "2", "--mem", "2048", timeout=600)
     A.run(vm, template=name)
     check("empty volume uses tmpfs", must(A, vm, "stat -f -c %T /empty-volume") == "tmpfs")
     capacity = must(A, vm, 'python3 -c \'import os; print([(p, os.statvfs(p).f_blocks, os.statvfs(p).f_bavail, os.statvfs(p).f_ffree) for p in ("/", "/dev/shm", "/empty-volume")])\'')
@@ -1119,7 +1119,7 @@ def migrate_other_build():
     """the target pulled another build under the same tag: the source's generation is sent and the target's tag stays"""
     vm, want = "e2e-other-build", template_id(A, args.template)
     with b_unpulled() as templates:
-        B.cli("pull", TEST_IMAGE, "--tag", args.template, "--vcpus", "2", "--max", TEMPLATE_MAX, timeout=600)
+        B.cli("pull", TEST_IMAGE, "--tag", args.template, "--vcpus", "2", "--mem", TEMPLATE_MAX, timeout=600)
         theirs = template_id(B, args.template)
         check("B: its own build, another content id", theirs and theirs != want, (theirs, want))
         A.run(vm)
@@ -1469,7 +1469,7 @@ def checkpoint_load_other_build():
     vm, want = "e2e-load-other", template_id(A, args.template)
     with b_unpulled() as templates:
         try:
-            B.cli("pull", TEST_IMAGE, "--tag", args.template, "--vcpus", "2", "--max", TEMPLATE_MAX, timeout=600)
+            B.cli("pull", TEST_IMAGE, "--tag", args.template, "--vcpus", "2", "--mem", TEMPLATE_MAX, timeout=600)
             theirs = template_id(B, args.template)
             check("B: its own build, another content id", theirs and theirs != want, (theirs, want))
             # An app that ends once told to, under --keep: the VM stays up after it, on B too.
@@ -2671,7 +2671,7 @@ def openrc_test_image():
         return str(output)
     builder = "e2e-openrc-builder"
     image = fixture["base_image"](ENV.get("FLEXVM_OPENRC_ALPINE_LAYOUT"))
-    A.cli("pull", "--tag", "ci-openrc-builder", "--max", "1024", "--vcpus", "2",
+    A.cli("pull", "--tag", "ci-openrc-builder", "--mem", "1024", "--vcpus", "2",
           "--cmd", '["/bin/sleep","1800"]', image, timeout=300)
     dns = json.load(open(os.path.join(A.state_dir, "host.json"))).get("dns")
     try:
@@ -2689,7 +2689,7 @@ def openrc_test_image():
 def distro_openrc_pressure():
     """Keep the OpenRC broker responsive when the host refuses workload RAM."""
     tag = "ci-openrc-pressure"
-    A.cli("pull", "--boot", "openrc", "--tag", tag, "--vcpus", "2", "--max", "2048", openrc_test_image(), timeout=600)
+    A.cli("pull", "--boot", "openrc", "--tag", tag, "--vcpus", "2", "--mem", "2048", openrc_test_image(), timeout=600)
     faults(template=tag, scenarios="mem_high")
 
 
@@ -2698,7 +2698,7 @@ def distro_openrc_pressure():
 def distro_openrc():
     """Real OpenRC PID 1 and supervised service state survive all native VM transitions."""
     vm, clone, tag, host = "e2e-openrc", "e2e-openrc-clone", "ci-openrc", A
-    A.cli("pull", "--boot", "openrc", "--tag", tag, "--vcpus", "2", "--max", "2048", openrc_test_image(), timeout=600)
+    A.cli("pull", "--boot", "openrc", "--tag", tag, "--vcpus", "2", "--mem", "2048", openrc_test_image(), timeout=600)
     A.run(vm, template=tag)
     saved, previous = None, None
     try:
@@ -2785,6 +2785,16 @@ def distro_openrc():
         execute("rc-service flexvm-openrc-restart stop")
         execute("rc-service flexvm-openrc-probe stop; rc-service flexvm-runtime status")
         check("OpenRC: stopping a service keeps OS alive", host.ps()[vm]["state"] == "running")
+        execute("openrc single")
+        execute("rc-service flexvm-runtime status")
+        execute("openrc default")
+        execute("rc-service flexvm-runtime status")
+        before_boot = execute("cat /proc/sys/kernel/random/boot_id")[1].strip()
+        before_pid = host.ps()[vm]["pid"]
+        execute("openrc-shutdown --reboot now", False)
+        check("OpenRC: guest reboot cold-boots a fresh VM", wait_for(lambda: host.ps().get(vm, {}).get("state") == "running" and host.ps()[vm]["pid"] != before_pid, 45), host.ps().get(vm))
+        check("OpenRC: exec reconnects with a new boot id after reboot", wait_for(lambda: (r := execute("cat /proc/sys/kernel/random/boot_id", False))[0] == 0 and r[1].strip() not in ("", before_boot), 45))
+        execute("rc-service flexvm-runtime status")
         host.cli("kill", "--signal", "TERM", vm)
         check("OpenRC: actual poweroff completes", wait_for(lambda: host.ps().get(vm, {}).get("state") == "exited", 30), host.ps().get(vm))
         check("OpenRC: poweroff status zero", host.ps()[vm].get("status") == 0, host.ps().get(vm))
@@ -2835,7 +2845,7 @@ def distro_bad_init():
     with open(os.path.join(layout, "oci-layout"), "w") as file:
         json.dump({"imageLayoutVersion": "1.0.0"}, file)
     started = time.monotonic()
-    result = A.cli("pull", "--boot", "systemd", "--tag", "ci-bad-systemd", "--vcpus", "2", "--max", "2048", layout, check=False, timeout=40)
+    result = A.cli("pull", "--boot", "systemd", "--tag", "ci-bad-systemd", "--vcpus", "2", "--mem", "2048", layout, check=False, timeout=40)
     check("distro: failed init is diagnosed", result.returncode != 0 and "distro init exec failed" in result.stderr, (result.stdout, result.stderr))
     check("distro: failed init does not wait out readiness", time.monotonic() - started < 30)
 
@@ -2845,7 +2855,7 @@ def distro_bad_init():
 def distro_pressure():
     """Keep real distro init responsive when the host refuses more workload RAM."""
     tag = "ci-systemd-pressure"
-    A.cli("pull", "--boot", "systemd", "--tag", tag, "--vcpus", "2", "--max", "2048", TEST_IMAGE, timeout=600)
+    A.cli("pull", "--boot", "systemd", "--tag", tag, "--vcpus", "2", "--mem", "2048", TEST_IMAGE, timeout=600)
     faults(template=tag, scenarios="mem_high")
 
 
@@ -2854,7 +2864,7 @@ def distro_pressure():
 def distro_systemd():
     """Real PID 1 and delegated services keep their identity across all VM lifecycle operations."""
     vm, clone, tag, host = "e2e-distro", "e2e-distro-clone", "ci-systemd", A
-    A.cli("pull", "--boot", "systemd", "--tag", tag, "--vcpus", "2", "--max", "2048", TEST_IMAGE, timeout=600)
+    A.cli("pull", "--boot", "systemd", "--tag", tag, "--vcpus", "2", "--mem", "2048", TEST_IMAGE, timeout=600)
     A.run(vm, template=tag)
     previous = None
     try:
@@ -2964,6 +2974,17 @@ def distro_systemd():
             host.configure(dns=dns)
         execute("systemctl stop flexvm-distro-probe.service; systemctl is-active --quiet flexvm-runtime.service")
         check("distro: stopping a unit keeps its VM running", host.ps()[vm]["state"] == "running")
+        execute("systemctl isolate --no-block rescue.target")
+        check("distro: rescue target keeps flexvm-runtime and exec alive", wait_for(lambda: execute("systemctl is-active --quiet rescue.target && systemctl is-active --quiet flexvm-runtime.service", False)[0] == 0, 30))
+        execute("systemctl isolate multi-user.target")
+        execute("systemctl is-system-running --wait")
+        before_boot = execute("cat /proc/sys/kernel/random/boot_id")[1].strip()
+        before_pid = host.ps()[vm]["pid"]
+        execute("systemctl reboot --no-block", False)
+        check("distro: guest reboot cold-boots a fresh VM", wait_for(lambda: host.ps().get(vm, {}).get("state") == "running" and host.ps()[vm]["pid"] != before_pid, 45), host.ps().get(vm))
+        check("distro: exec reconnects with a new boot id after reboot", wait_for(lambda: (r := execute("cat /proc/sys/kernel/random/boot_id", False))[0] == 0 and r[1].strip() not in ("", before_boot), 45))
+        execute("systemctl is-system-running --wait")
+        execute("systemctl is-active --quiet flexvm-runtime.service")
         host.cli("kill", "--signal", "TERM", vm)
         check("distro: guest shutdown records successful exit", wait_for(lambda: host.ps().get(vm, {}).get("state") == "exited", 30), host.ps().get(vm))
         check("distro: poweroff status is zero", host.ps()[vm].get("status") == 0, host.ps()[vm])
@@ -3293,7 +3314,7 @@ def image_template():
     t = time.time()
     cmd = ["sh", "-c", "mkdir -p /tmp/www && echo hello-from-image > /tmp/www/index.html && "
                        "echo app-started && exec httpd -f -p 8080 -h /tmp/www"]
-    opts = ["--vcpus", "2", "--max", "2048", "--cmd", json.dumps(cmd)]
+    opts = ["--vcpus", "2", "--mem", "2048", "--cmd", json.dumps(cmd)]
     layout = image_layout()
     if layout:
         # Cached (CI): the image as an OCI layout of the blobs an earlier pull fetched. No
@@ -3342,7 +3363,7 @@ def pull_gc():
 
     def pull(n):
         """Rebuilt (another --env); returns the ids it deleted."""
-        r = h.cli("pull", TEST_IMAGE, "--tag", name, "--vcpus", "2", "--max", "2048", "--env", f"GC={n}", timeout=600)
+        r = h.cli("pull", TEST_IMAGE, "--tag", name, "--vcpus", "2", "--mem", "2048", "--env", f"GC={n}", timeout=600)
         return [json.loads(line)["deleted"] for line in r.stdout.splitlines() if line.startswith("{")]
 
     def images():
@@ -3456,7 +3477,7 @@ def pull_standby():
     name = "e2e-sbpull"
 
     def pull(n, *extra):
-        r = h.cli("pull", TEST_IMAGE, "--tag", name, "--vcpus", "2", "--max", "2048", "--env", f"SB={n}", *extra, timeout=600)
+        r = h.cli("pull", TEST_IMAGE, "--tag", name, "--vcpus", "2", "--mem", "2048", "--env", f"SB={n}", *extra, timeout=600)
         return [json.loads(line)["deleted"] for line in r.stdout.splitlines() if line.startswith("{") and "deleted" in line]
 
     def current():
@@ -3773,7 +3794,7 @@ APP = args.template + "-applog"
 # 4 GiB more to grow into, evict_grower's grow past 3 GiB (with the default 4 GiB plugged, free until touched).
 TEMPLATE_MAX = "10240" if args.shard == "heavy" else "2048"
 APP_FAULTS = ("app_log", "bad_app_log", "app_abort")
-APP_OPTS = ["--vcpus", "2", "--max", "2048", "--cmd", json.dumps(
+APP_OPTS = ["--vcpus", "2", "--mem", "2048", "--cmd", json.dumps(
     ["sh", "-c", "head -c 8000000 /dev/zero | tr '\\0' x; echo; i=0; while :; do echo applog-$i; i=$((i+1)); sleep 0.05; done"])]
 B = Host("b", args.port_a + 1, args.port_a, args.net_b)
 
@@ -3901,7 +3922,7 @@ COST = {"incus": 180, "kind": 180, "k3s": 180, "lxc": 180, "nspawn": 180, "rootl
         "faults/shrink_stall": 45, "faults/pages_dead": 40, "faults/source_killed_basic": 35, "faults/kill_refused_checkpoint": 35,
         "faults/quiet_source": 32, "faults/kill_source": 32, "faults/checkpoint_crash": 30, "faults/suspend_disk_freed": 23,
         "faults/collapse_ckpt_fail": 12, "faults/evacuate": 25}
-BATCH_S = 20
+BATCH_S = 60
 SELFTEST_SKIP_NAME = "wildcard_listen"
 
 
@@ -3986,9 +4007,14 @@ def selected_work(selected, scenarios, kvm, split=None):
         i, n = map(int, split.split("/"))
         assert 1 <= i <= n, f"--split {split}: want I/N with 1 <= I <= N"
         parts = [[] for _ in range(n)]
-        for item in work:
+        # Keep GROW-template scenarios in one split so only one runner builds the GROW template.
+        grow = [item for item in work if GROW in item[1]]
+        rest = [item for item in work if GROW not in item[1]]
+        parts[0].extend(grow)
+        for item in rest:
             min(parts, key=lambda part: sum(value[2] for value in part)).append(item)
         work = parts[i - 1]
+        work.sort(key=lambda w: (-w[2], w[0]))
     return work
 
 
@@ -4064,11 +4090,13 @@ def main():
             if not ready:
                 return None
             # A batch's worker starts its hosts' listeners, or leaves them to faults.py: never both.
+            # Heavy scenarios each run in their own worker so each gets its own faults.py timeout.
             batch = [ready[0]]
-            for w in reversed([w for w in ready[1:] if own(w[0]) == own(ready[0][0])]):
-                if sum(b[2] for b in batch) + w[2] > BATCH_S:
-                    break
-                batch.append(w)
+            if args.shard != "heavy":
+                for w in reversed([w for w in ready[1:] if own(w[0]) == own(ready[0][0])]):
+                    if sum(b[2] for b in batch) + w[2] > BATCH_S:
+                        break
+                    batch.append(w)
             for w in batch:
                 work.remove(w)
             return [w[0] for w in batch]
@@ -4181,10 +4209,10 @@ def main():
         threading.Thread(target=make_test_image, daemon=True).start()
     else:
         test_image.set()
-    builders = [threading.Thread(target=build, args=(args.template, "--vcpus", "2", "--max", TEMPLATE_MAX))] if args.template in needed else []
+    builders = [threading.Thread(target=build, args=(args.template, "--vcpus", "2", "--mem", TEMPLATE_MAX))] if args.template in needed else []
     if GROW in needed:
         # A larger ceiling with little plugged at the start: VMs must grow.
-        builders.append(threading.Thread(target=build, args=(GROW, "--vcpus", "2", "--max", "6144", "--plug", "128")))
+        builders.append(threading.Thread(target=build, args=(GROW, "--vcpus", "2", "--mem", "6144", "--plug", "128")))
     if APP in needed:
         builders.append(threading.Thread(target=build, args=(APP, *APP_OPTS), kwargs={"image": True}))
     runners = [threading.Thread(target=lane, args=(i, *l), daemon=True) for i, l in enumerate(lanes())]
@@ -4242,6 +4270,8 @@ def main():
         for egress_case in ("podman", "namespace_sandboxes", "containerd"):
             assigned = [any(item[0] == egress_case for item in selected_work(list(CASES), scenarios, kvm, f"{i}/4")) for i in range(1, 5)]
             assert sum(assigned) == 1, f"{egress_case} egress must belong to exactly one split: {assigned}"
+        grow_splits = [any(GROW in item[1] for item in selected_work(list(CASES), scenarios, kvm, f"{i}/4")) for i in range(1, 5)]
+        assert sum(grow_splits) == 1, f"GROW scenarios must belong to exactly one split: {grow_splits}"
         # The second batch could not be spawned: exactly its cases and scenarios fail, the rest pass.
         bad = sorted(r[0] for r in failed)
         want = sorted(spawned[1][0] + [f"faults/{x}" for x in spawned[1][1]]) if len(spawned) > 1 else ["(no second batch)"]

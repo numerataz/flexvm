@@ -168,7 +168,7 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      verified first (--sha256: only the save whose SHA-256 save
                                      printed); its template by content id, unnamed, if not here
   flexvm migrate NAME HOST:PORT      live-migrate a VM to the host listening there
-  flexvm pull IMAGE[:TAG|@DIGEST] [--tag NAME] [--vcpus N] [--mem MIB] [--max MIB] [--plug MIB]
+  flexvm pull IMAGE[:TAG|@DIGEST] [--tag NAME] [--vcpus N] [--mem MIB] [--plug MIB]
               [--standby N] [--boot app|systemd] [--kernel-sdk | --kernel-modules FILE] ...
                                      pull an image and build its template (an archive or OCI layout
                                      directory needs --tag; see README); again: rebuilt if it changed;
@@ -583,7 +583,7 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("listen", 2, &[]),
     ("api", 2, &[]),
     ("info", 1, &[]),
-    ("pull", 2, &["tag", "vcpus", "mem", "max", "plug", "standby"]),
+    ("pull", 2, &["tag", "vcpus", "mem", "plug", "standby"]),
     ("images", 1, &["json", "quiet", "filter"]),
     ("tag", 3, &[]),
     ("image", 2, &["force", "force-shared"]),
@@ -2176,55 +2176,76 @@ fn only_standby(args: &Args) -> bool {
     args.flags.iter().all(|(f, _)| GLOBAL.contains(&f.as_str()) || matches!(f.as_str(), "standby" | "tag"))
 }
 
-/// `--max` is the host's memory unless given (at most what a peer takes, never below `--mem`:
-/// then there is no hotplug), and at most what fits Firecracker's hotplug window beside the root
-/// filesystem (`template::hotplug_room`, of `rootfs_bytes`, or the smallest before it is made).
-/// `--max` given past what a peer takes is refused, as is one below `--mem` or past the window, and
-/// `--mem` past what fits below Firecracker's 64-bit MMIO gap on `arch` (`template::boot_room`, far
-/// below what a peer takes).
+/// `--mem` is the memory ceiling (the host's memory unless given, at most what a peer takes and
+/// at most what fits Firecracker's hotplug window beside the root filesystem, `template::hotplug_room`,
+/// of `rootfs_bytes`, or the smallest before it is made). Boot memory is derived automatically from
+/// the ceiling (`template::base_mib(max).min(max)`) so guests always start small and grow elastically
+/// up to `--mem` (or host RAM).
 fn pull_size(args: &Args, ram_mib: u64, rootfs_bytes: Option<u64>, arch: compat::Arch) -> Result<template::Size> {
     let room = template::hotplug_room(rootfs_bytes.unwrap_or(0))?;
-    let mem_of = |max: u64| args.parse_or("mem", template::base_mib(max));
+    let mem_of = |max: u64| template::base_mib(max).min(max);
     let fits = |max: u64, mem: u64| max.saturating_sub(mem) / template::SLOT_MIB * template::SLOT_MIB <= room;
-    // The largest ceiling from `from` down that fits. --mem's default only shrinks with the ceiling,
-    // so none between the first past the room with this one's --mem and this one fits: each step
-    // skips them, and the next one's smaller --mem lets a little back in.
-    let largest = |from: u64| -> Result<u64> {
+    // The largest ceiling from `from` down that fits. Boot memory only shrinks with the ceiling,
+    // so none between the first past the room with this one's base and this one fits: each step
+    // skips them, and the next one's smaller base lets a little back in.
+    let largest = |from: u64| -> u64 {
         let mut max = from;
-        while !fits(max, mem_of(max)?) {
-            max = mem_of(max)? + room + template::SLOT_MIB - 1;
+        while !fits(max, mem_of(max)) {
+            max = mem_of(max) + room + template::SLOT_MIB - 1;
         }
-        Ok(max)
+        max
     };
-    let max = args.parse_or("max", largest(ram_mib.min(template::MAX_MEM_MIB))?)?;
-    let (mem, plug) = (mem_of(max)?, args.parse_or("plug", template::PLUG_MIB)?);
+    let max = args.parse_or("mem", largest(ram_mib.min(template::MAX_MEM_MIB)))?;
+    if max == 0 {
+        bail!("--mem must be at least 1 MiB");
+    }
+    if max > template::MAX_MEM_MIB {
+        bail!("--mem must be at most {} MiB", template::MAX_MEM_MIB);
+    }
+    let (mem, plug) = (mem_of(max), args.parse_or("plug", template::PLUG_MIB)?);
     if mem > template::boot_room(arch) {
         bail!(
-            "--mem {mem} MiB does not fit: Firecracker maps boot memory past its 64-bit MMIO gap where it places the hotplug region \
-             and the root filesystem, so on {arch} it is at most {} MiB",
+            "--mem {max} MiB does not fit: boot memory ({mem} MiB) exceeds what fits below Firecracker's 64-bit MMIO gap on {arch} (at most {} MiB)",
             template::boot_room(arch)
         );
     }
-    if max > template::MAX_MEM_MIB {
-        bail!("--max must be at most {} MiB", template::MAX_MEM_MIB);
-    }
-    if max < mem && args.has("max") {
-        bail!("--max must be at least --mem ({mem} MiB)");
-    }
     if !fits(max, mem) {
         bail!(
-            "--max {max} MiB does not fit: Firecracker holds the hotplug region and the root filesystem in a {} GiB window, \
-             so the hotplug region is at most {room} MiB (the largest --max that fits is {} MiB)",
+            "--mem {max} MiB does not fit: Firecracker holds the hotplug region and the root filesystem in a {} GiB window, \
+             so the hotplug region is at most {room} MiB (the largest --mem that fits is {} MiB)",
             template::WINDOW_MIB >> 10,
-            largest(template::MAX_MEM_MIB)?
+            largest(template::MAX_MEM_MIB)
         );
     }
-    Ok(template::Size { vcpus: template_vcpus(args)?, mem_mib: mem, max_mib: max.max(mem), plug_mib: plug })
+    Ok(template::Size { vcpus: template_vcpus(args)?, mem_mib: mem, max_mib: max, plug_mib: plug })
 }
 
-/// MemTotal in MiB.
+fn cmdline_tmpfs_mib(cmdline: &str) -> Option<u64> {
+    cmdline.split_whitespace().find_map(|arg| arg.strip_prefix("flexvm.tmpfs_mib=")?.parse::<u64>().ok()).filter(|&n| n > 0)
+}
+
+fn has_virtio_mem_in(driver_dir: &std::path::Path) -> bool {
+    std::fs::read_dir(driver_dir)
+        .ok()
+        .is_some_and(|entries| entries.flatten().any(|entry| entry.file_name().to_str().is_some_and(|name| name.starts_with("virtio"))))
+}
+
+fn effective_host_ram_mib(mem_total_mib: u64, cmdline: Option<&str>, has_virtio_mem: bool) -> u64 {
+    if has_virtio_mem {
+        if let Some(ceiling) = cmdline.and_then(cmdline_tmpfs_mib) {
+            return mem_total_mib.max(ceiling);
+        }
+    }
+    mem_total_mib
+}
+
+/// MemTotal in MiB, or the outer elastic guest's `flexvm.tmpfs_mib` ceiling when running
+/// inside a `virtio-mem` guest whose `MemTotal` only reflects currently plugged RAM.
 fn host_ram_mib() -> u64 {
-    proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20
+    let mem_total_mib = proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20;
+    let has_virtio_mem = has_virtio_mem_in(std::path::Path::new("/sys/bus/virtio/drivers/virtio_mem"));
+    let cmdline = has_virtio_mem.then(|| std::fs::read_to_string("/proc/cmdline").ok()).flatten();
+    effective_host_ram_mib(mem_total_mib, cmdline.as_deref(), has_virtio_mem)
 }
 
 /// `pull SRC`: the template named after the image (or `--tag`), built unless it is up to date;
@@ -2452,6 +2473,17 @@ fn kernel_bundle(args: &Args, kernel: &Path, reviewed: bool) -> Result<Option<im
     Ok(Some(bundle))
 }
 
+fn software_memory_limits(named: bool, cap_mib: Option<u32>, host_ram_mib: u64) -> Result<(u32, u32)> {
+    if named {
+        return qemu::Config::elastic_limits(cap_mib, host_ram_mib);
+    }
+    let mem_mib = cap_mib.unwrap_or(512);
+    if !(128..=1_048_576).contains(&mem_mib) {
+        bail!("software --mem must be 128..1048576 MiB");
+    }
+    Ok((mem_mib, mem_mib))
+}
+
 /// First software execution slice: reuse OCI preparation and the real agent,
 /// with engine processes owned by this foreground command. Named VMs also expose
 /// live management and local suspend/restore; migration remains separate work.
@@ -2503,12 +2535,15 @@ fn software(args: &Args, src: &str) -> Result<i32> {
     if installed {
         artifacts::ensure(&[(&kernel, &artifacts::KERNEL)])?;
     }
+    let cap_mib: Option<u32> = args.get("mem").map(|s| s.parse::<u32>().map_err(|_| format!("bad --mem {s:?}"))).transpose()?;
+    let (mem_mib, max_mib) = software_memory_limits(args.get("name").is_some(), cap_mib, host_ram_mib())?;
     let config = qemu::Config {
         control,
         kernel,
         qemu: args.get("qemu").map(String::from).unwrap_or_else(|| format!("qemu-system-{}", std::env::consts::ARCH)),
         vsock_backend: args.get("vsock-backend").unwrap_or("vhost-device-vsock").into(),
         mem_mib,
+        max_mib,
         vcpus: args.parse_or("vcpus", 1)?,
         boot_timeout: Duration::from_secs(args.parse_or("timeout", 90)?),
         parent_kvm,
@@ -2542,7 +2577,7 @@ fn software(args: &Args, src: &str) -> Result<i32> {
             Ok((host, lock))
         })
         .transpose()?;
-    let _reservation =
+    let reservation =
         named.as_ref().map(|(host, _)| software::Reservation::new(host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)).transpose()?;
     let disks = if args.has("disk") {
         let (host, _) = named.as_ref().ok_or("--disk requires a named software VM")?;
@@ -2556,8 +2591,8 @@ fn software(args: &Args, src: &str) -> Result<i32> {
         None => config.boot(&rootfs, processes.clone(), disks)?,
     };
     drop(_cache_lock);
-    if let Some((host, lock)) = named {
-        return software::run(host, lock, machine, processes, &config, &meta);
+    if let Some((_host, lock)) = named {
+        return software::run(lock, machine, processes, &config, &meta, reservation.unwrap());
     }
 
     if !meta.boot.is_app() {
@@ -3121,29 +3156,30 @@ mod exec_tests {
 
     #[test]
     fn pull_refuses_invalid_memory_before_kvm() {
-        for (max, mem, message) in [
-            ("255", "256", "--max must be at least --mem (256 MiB)"),
-            ("2097153", "256", "--max must be at most 2097152 MiB"),
-            ("18446744073709551615", "256", "--max must be at most 2097152 MiB"),
-            ("2097152", "256", window_refusal(2097152, 523264, 524543).as_str()),
-            ("524544", "256", window_refusal(524544, 523264, 524543).as_str()),
-            ("2097152", "2097152", boot_refusal(2097152, compat::Arch::HOST).as_str()),
-            ("300000", "262144", boot_refusal(262144, compat::Arch::HOST).as_str()),
+        for (mem, message) in [
+            ("0", "--mem must be at least 1 MiB"),
+            ("2097153", "--mem must be at most 2097152 MiB"),
+            ("18446744073709551615", "--mem must be at most 2097152 MiB"),
+            ("2097152", window_refusal(2097152, 523264, 541567).as_str()),
+            ("541568", window_refusal(541568, 523264, 541567).as_str()),
         ] {
-            let args = parse(&["pull", "busybox", "--max", max, "--mem", mem]);
+            let args = parse(&["pull", "busybox", "--mem", mem]);
             assert_eq!(real_main(&args).unwrap_err().to_string(), message);
         }
+        // --max is removed from pull.
+        assert_eq!(Args::parse(["pull", "busybox", "--max", "2048"].map(String::from)).err().unwrap().to_string(), "unknown option --max (see flexvm --help)");
         // The hotplug region is whole slots: what is past the last one is not hotplug.
-        for max in ["256", "523520", "524543"] {
-            let size = pull_size(&parse(&["pull", "busybox", "--max", max, "--mem", "256"]), host_ram_mib(), None, compat::Arch::HOST).unwrap();
-            assert_eq!(size.max_mib.to_string(), max);
+        for mem in ["128", "256", "523520", "541567"] {
+            let size = pull_size(&parse(&["pull", "busybox", "--mem", mem]), host_ram_mib(), None, compat::Arch::HOST).unwrap();
+            assert_eq!(size.max_mib.to_string(), mem);
+            assert!(size.mem_mib <= size.max_mib);
         }
     }
 
-    fn window_refusal(max: u64, room: u64, largest: u64) -> String {
+    fn window_refusal(mem: u64, room: u64, largest: u64) -> String {
         format!(
-            "--max {max} MiB does not fit: Firecracker holds the hotplug region and the root filesystem in a 512 GiB window, \
-             so the hotplug region is at most {room} MiB (the largest --max that fits is {largest} MiB)"
+            "--mem {mem} MiB does not fit: Firecracker holds the hotplug region and the root filesystem in a 512 GiB window, \
+             so the hotplug region is at most {room} MiB (the largest --mem that fits is {largest} MiB)"
         )
     }
 
@@ -3156,7 +3192,7 @@ mod exec_tests {
         // A root filesystem larger than the window is refused, hotplug or not.
         let err = template::hotplug_room((512 << 30) + 1).unwrap_err().to_string();
         assert_eq!(err, "the root filesystem, 524290 MiB, does not fit Firecracker's 512 GiB window for pmem devices");
-        let args = parse(&["pull", "busybox", "--max", "256", "--mem", "256"]);
+        let args = parse(&["pull", "busybox", "--mem", "256"]);
         assert_eq!(
             pull_size(&args, 16 << 10, Some(513 << 30), compat::Arch::HOST).unwrap_err().to_string(),
             "the root filesystem, 525312 MiB, does not fit Firecracker's 512 GiB window for pmem devices"
@@ -3164,7 +3200,7 @@ mod exec_tests {
     }
 
     #[test]
-    fn pull_max_defaults_to_what_fits_firecrackers_window() {
+    fn pull_mem_defaults_to_what_fits_firecrackers_window() {
         const GIB: u64 = 1024;
         let small = 64 << 20;
         let big = 20 << 30;
@@ -3173,7 +3209,7 @@ mod exec_tests {
             v.extend_from_slice(argv);
             pull_size(&parse(&v), ram, rootfs, compat::Arch::HOST).map(|s| (s.mem_mib, s.max_mib, s.hotplug_mib()))
         };
-        // (host RAM, root filesystem) -> (--mem, --max, hotplug region): up to 512 GiB the
+        // (host RAM, root filesystem) -> (boot mem, ceiling --mem, hotplug region): up to 512 GiB the
         // host's memory, unchanged (a template too big for the window never built).
         for (ram, rootfs, want) in [
             (16 * GIB, None, (768, 16384, 15360)),
@@ -3193,16 +3229,17 @@ mod exec_tests {
             assert_eq!(mem, template::base_mib(max));
             assert!(hotplug + rootfs.unwrap_or(0).div_ceil(1 << 20).max(2) <= template::WINDOW_MIB);
         }
-        // An explicit --max, whatever the host has: refused past the window (of this root
+        // An explicit --mem, whatever the host has: refused past the window (of this root
         // filesystem once it is made), at pull time and again before Firecracker starts.
         for ram in [16 * GIB, 512 * GIB, 743 * GIB, 2048 * GIB] {
-            assert_eq!(size(&["--max", "524288"], ram, None).unwrap(), (16640, 524288, 506880));
-            assert_eq!(size(&["--max", "540672"], ram, Some(small)).unwrap(), (17152, 540672, 523264));
-            assert_eq!(size(&["--max", "8192", "--mem", "512"], ram, Some(big)).unwrap(), (512, 8192, 7168));
+            assert_eq!(size(&["--mem", "524288"], ram, None).unwrap(), (16640, 524288, 506880));
+            assert_eq!(size(&["--mem", "540672"], ram, Some(small)).unwrap(), (17152, 540672, 523264));
+            assert_eq!(size(&["--mem", "8192"], ram, Some(big)).unwrap(), (512, 8192, 7168));
+            assert_eq!(size(&["--mem", "128"], ram, None).unwrap(), (128, 128, 0));
             // The largest that fits is exact: one MiB more is refused.
-            assert_eq!(size(&["--max", "541567"], ram, None).unwrap(), (17280, 541567, 523264));
-            assert_eq!(size(&["--max", "521471"], ram, Some(big)).unwrap(), (16640, 521471, 503808));
-            for (max, rootfs, room, largest) in [
+            assert_eq!(size(&["--mem", "541567"], ram, None).unwrap(), (17280, 541567, 523264));
+            assert_eq!(size(&["--mem", "521471"], ram, Some(big)).unwrap(), (16640, 521471, 503808));
+            for (mem, rootfs, room, largest) in [
                 (541568, None, 523264, 541567),
                 (521472, Some(big), 503808, 521471),
                 (600000, None, 523264, 541567),
@@ -3211,66 +3248,28 @@ mod exec_tests {
                 (2097152, None, 523264, 541567),
                 (524288, Some(big), 503808, 521471),
             ] {
-                let err = size(&["--max", &max.to_string()], ram, rootfs).unwrap_err().to_string();
-                assert_eq!(err, window_refusal(max, room, largest), "{ram} MiB of RAM, --max {max}");
+                let err = size(&["--mem", &mem.to_string()], ram, rootfs).unwrap_err().to_string();
+                assert_eq!(err, window_refusal(mem, room, largest), "{ram} MiB of RAM, --mem {mem}");
             }
-            let err = size(&["--max", "540672", "--mem", "16384"], ram, None).unwrap_err().to_string();
-            assert_eq!(err, window_refusal(540672, 523264, 16384 + 523264 + 1023));
         }
     }
 
-    fn boot_refusal(mem: u64, arch: compat::Arch) -> String {
-        format!(
-            "--mem {mem} MiB does not fit: Firecracker maps boot memory past its 64-bit MMIO gap where it places the hotplug region \
-             and the root filesystem, so on {arch} it is at most {} MiB",
-            template::boot_room(arch)
-        )
-    }
-
     #[test]
-    fn pull_max_defaults_to_the_host_and_never_below_mem() {
+    fn pull_mem_defaults_to_the_host_and_boot_fits_below_mmio_gap_on_both_arches() {
+        use compat::Arch::{Aarch64, X86_64};
         let size = pull_size(&parse(&["pull", "busybox"]), host_ram_mib(), None, compat::Arch::HOST).unwrap();
         assert!(size.max_mib <= template::MAX_MEM_MIB && size.mem_mib <= size.max_mib);
         assert!(size.hotplug_mib() <= template::hotplug_room(0).unwrap());
         assert!(size.mem_mib <= template::boot_room(compat::Arch::HOST));
-        let size = pull_size(&parse(&["pull", "busybox", "--mem", "32768"]), 16 << 10, None, compat::Arch::HOST).unwrap();
-        assert_eq!((size.mem_mib, size.max_mib), (32768, 32768), "--mem past the host's memory: no hotplug");
-        for ram in [16 << 10, 2 << 20] {
-            let err = pull_size(&parse(&["pull", "busybox", "--mem", "2097153"]), ram, None, compat::Arch::HOST).unwrap_err().to_string();
-            assert_eq!(err, boot_refusal(2097153, compat::Arch::HOST), "the boot room is the tighter limit");
-        }
-    }
-
-    #[test]
-    fn pull_mem_fits_below_firecrackers_64bit_mmio_gap_on_both_arches() {
-        use compat::Arch::{Aarch64, X86_64};
         // Boot memory up to MMIO64_MEM_START (256 GiB): from 0 less the 1 GiB gap below 4 GiB on
-        // x86_64, from 2 GiB on aarch64. Past it, Firecracker maps it from 512 GiB, over the window.
+        // x86_64, from 2 GiB on aarch64.
         assert_eq!((template::boot_room(X86_64), template::boot_room(Aarch64)), (255 << 10, 254 << 10));
-        let size = |arch, mem: u64, max: Option<u64>, ram: u64| {
-            let (mem, max) = (mem.to_string(), max.map(|m| m.to_string()));
-            let mut v = vec!["pull", "busybox", "--mem", &mem];
-            if let Some(max) = &max {
-                v.extend_from_slice(&["--max", max]);
-            }
-            pull_size(&parse(&v), ram, None, arch).map(|s| (s.mem_mib, s.max_mib)).map_err(|e| e.to_string())
-        };
-        for (arch, room) in [(X86_64, 261120), (Aarch64, 260096)] {
-            // The largest that fits is exact, with hotplug or none, whatever the host has.
-            for ram in [16 << 10, 512 << 10, 2 << 20] {
-                assert_eq!(size(arch, room, Some(room), ram).unwrap(), (room, room), "{arch}");
-                assert_eq!(size(arch, room, Some(room + 8192), ram).unwrap(), (room, room + 8192), "{arch}");
-                for mem in [room + 1, room + 128, 262144, 2 << 20] {
-                    assert_eq!(size(arch, mem, Some(mem), ram).unwrap_err(), boot_refusal(mem, arch), "{arch}, --mem {mem}");
-                    assert_eq!(size(arch, mem, None, ram).unwrap_err(), boot_refusal(mem, arch), "{arch}, --mem {mem}");
-                }
-            }
-            // The default --mem never comes near it: at most 17280 MiB, at the window's ceiling.
-            assert_eq!(pull_size(&parse(&["pull", "busybox"]), 4 << 20, None, arch).unwrap().mem_mib, 17280);
+        // The derived boot memory never comes near the 64-bit MMIO gap: at most 17280 MiB at the ceiling.
+        for arch in [X86_64, Aarch64] {
+            let s = pull_size(&parse(&["pull", "busybox"]), 4 << 20, None, arch).unwrap();
+            assert_eq!(s.mem_mib, 17280);
+            assert!(s.mem_mib <= template::boot_room(arch));
         }
-        // Between the two: an x86_64 size an aarch64 host refuses.
-        assert_eq!(size(X86_64, 260097, Some(260097), 16 << 10), Ok((260097, 260097)));
-        assert_eq!(size(Aarch64, 260097, Some(260097), 16 << 10), Err(boot_refusal(260097, Aarch64)));
     }
 
     #[test]
@@ -4538,10 +4537,10 @@ mod exec_tests {
 
     #[test]
     fn switches_repeated_values_and_internal_flags_parse() {
-        let args = parse(&["pull", "x", "--env", "A=1", "--json", "--env", "B=2", "--standby", "3", "--max", "456", "--max", "789"]);
+        let args = parse(&["pull", "x", "--env", "A=1", "--json", "--env", "B=2", "--standby", "3", "--mem", "456", "--mem", "789"]);
         assert!(args.has("json"));
         assert_eq!(args.all("env"), ["A=1", "B=2"]);
-        assert_eq!((args.get("standby"), args.parse_or::<u64>("max", 0).unwrap()), (Some("3"), 789));
+        assert_eq!((args.get("standby"), args.parse_or::<u64>("mem", 0).unwrap()), (Some("3"), 789));
         let args = parse(&["run", "--incoming", "--standby", "--paused"]);
         assert!(args.has("incoming") && args.has("standby") && args.has("paused"));
         assert!(args.rest.is_empty());
@@ -5151,6 +5150,42 @@ mod exec_tests {
         let input = frames(&[(guest::FRAME_MSG, b"unknown request \"SESSION\"")]);
         let e = exec_frames(&mut input.as_slice(), &session, &mut Vec::new(), &mut Vec::new(), &mut Instant::now(), None).err().unwrap();
         assert_eq!(e.to_string(), "unknown request \"SESSION\"; rebuild the rootfs and its templates");
+    }
+
+    #[test]
+    fn host_ram_mib_uses_tmpfs_mib_ceiling_inside_virtio_mem_guest() {
+        let cmdline = "console=ttyS0 quiet panic=1 root=/dev/vda ro init=/sbin/flexvm-init flexvm.tmpfs_mib=49152 flexvm.control=serial";
+        assert_eq!(cmdline_tmpfs_mib(cmdline), Some(49152));
+        assert_eq!(cmdline_tmpfs_mib("console=ttyS0 flexvm.tmpfs_mib=0"), None);
+        assert_eq!(cmdline_tmpfs_mib("console=ttyS0 flexvm.tmpfs_mib=nope"), None);
+        assert_eq!(cmdline_tmpfs_mib("console=ttyS0 quiet"), None);
+
+        assert_eq!(effective_host_ram_mib(384, Some(cmdline), true), 49152);
+        assert_eq!(effective_host_ram_mib(65536, Some(cmdline), true), 65536);
+        assert_eq!(effective_host_ram_mib(384, Some(cmdline), false), 384);
+        assert_eq!(effective_host_ram_mib(384, None, true), 384);
+
+        let root = crate::test_util::TempDir::new("virtio-mem-driver");
+        assert!(!has_virtio_mem_in(&root.join("missing")));
+        let driver = root.join("virtio_mem");
+        std::fs::create_dir(&driver).unwrap();
+        std::fs::write(driver.join("uevent"), "").unwrap();
+        assert!(!has_virtio_mem_in(&driver));
+        std::fs::write(driver.join("virtio2"), "").unwrap();
+        assert!(has_virtio_mem_in(&driver));
+    }
+
+    #[test]
+    fn unnamed_software_vms_use_fixed_ram_and_named_vms_use_elastic_limits() {
+        assert_eq!(software_memory_limits(false, None, 49152).unwrap(), (512, 512));
+        assert_eq!(software_memory_limits(false, Some(2048), 49152).unwrap(), (2048, 2048));
+        assert_eq!(software_memory_limits(false, Some(256), 0).unwrap(), (256, 256));
+        assert!(software_memory_limits(false, Some(64), 49152).is_err());
+        assert!(software_memory_limits(false, Some(2_000_000), 49152).is_err());
+
+        assert_eq!(software_memory_limits(true, None, 49152).unwrap(), (qemu::ELASTIC_BASE_MIB, 49152));
+        assert_eq!(software_memory_limits(true, Some(2048), 49152).unwrap(), (qemu::ELASTIC_BASE_MIB, 2048));
+        assert!(software_memory_limits(true, None, 0).is_err());
     }
 }
 

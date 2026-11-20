@@ -1153,7 +1153,7 @@ impl Injector {
         msg.msg_name = (&mut addr as *mut libc::sockaddr_ll).cast();
         msg.msg_namelen = std::mem::size_of_val(&addr) as u32;
         msg.msg_iov = iov.as_mut_ptr();
-        msg.msg_iovlen = iov.len();
+        msg.msg_iovlen = iov.len() as _;
         let len = (header.len() + packet.len()) as isize;
         // A tap queues only so many frames (its txqueuelen) for its guest to take: a hold's backlog
         // can be more, injected faster than a guest takes them. Refused, the frame waits for the

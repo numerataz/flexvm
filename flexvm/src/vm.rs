@@ -273,8 +273,11 @@ impl Vm {
         self.fc.lock().unwrap().as_ref().map_or_else(|| "no firecracker".into(), Firecracker::post_mortem)
     }
 
-    pub fn distro_powered_off(&self) -> bool {
-        self.template.meta.image.as_ref().is_some_and(|image| !image.boot.is_app()) && self.fc.lock().unwrap().as_ref().is_some_and(Firecracker::powered_off)
+    pub fn distro_shutdown(&self) -> Option<crate::fc::GuestShutdown> {
+        if self.template.meta.image.as_ref().is_none_or(|image| image.boot.is_app()) {
+            return None;
+        }
+        self.fc.lock().unwrap().as_ref().and_then(Firecracker::distro_shutdown)
     }
 
     pub fn firecracker_log(&self) -> String {
@@ -1155,7 +1158,7 @@ impl Resources {
                 let rootfs = std::fs::metadata(&meta.rootfs).map_or(0, |m| m.len());
                 let room = crate::template::hotplug_room(rootfs).unwrap_or(0);
                 let more = match meta.max_mib - meta.mem_mib + crate::template::SLOT_MIB <= room {
-                    true => "pull it with --max for more",
+                    true => "pull it with --mem for more",
                     false => "the most Firecracker's hotplug window holds",
                 };
                 bail!("--memory {m} MiB is more than the image's ceiling, {} MiB ({more})", meta.max_mib);

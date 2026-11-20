@@ -105,6 +105,8 @@ pub(super) fn bucket_floor(i: usize) -> u64 {
 /// A fault the event thread has yet to resolve.
 struct Pending {
     addr: u64,
+    /// `(page, mapping_index)` resolved once on read from `self.mappings()` (immutable after handshake).
+    loc: Option<(usize, usize)>,
     flags: u64,
     read: Instant,
     /// Its kind (`KINDS`), when known before it is resolved: it waited for another installer, or had its run fetched.
@@ -174,20 +176,23 @@ impl Pager {
                 }
                 let removing = pages.removing();
                 let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-                let learning = self.prefetch.lock().unwrap().learning();
+                let read_at = Instant::now();
+                let learning = self.learning.load(Ordering::Acquire);
                 let mut resolved = 0;
                 for msg in buf[..n.max(0) as usize].chunks_exact(32) {
                     let a = u64::from_ne_bytes(msg[8..16].try_into().unwrap());
                     let b = u64::from_ne_bytes(msg[16..24].try_into().unwrap());
                     match msg[0] {
                         UFFD_EVENT_PAGEFAULT => {
-                            if let Some((page, _)) = self.page_of(b).filter(|_| learning) {
+                            let loc = self.locate_page(b);
+                            if let Some((page, _)) = loc.filter(|_| learning) {
                                 self.base.note_load_fault(page as u64);
                             }
                             pending.push_back(Pending {
                                 addr: b,
+                                loc,
                                 flags: a,
-                                read: Instant::now(),
+                                read: read_at,
                                 kind: None,
                                 parked: false,
                                 tried: false,
@@ -206,10 +211,13 @@ impl Pager {
             // Start bounded template reads for the whole batch before the first UFFDIO_COPY can wait on disk.
             // No wp/events/prefetch lock is held here; retries do not issue the hint again, nor do faults in the run
             // just hinted (about 0.6 µs a call with the page cache warm).
+            let mappings = self.mappings();
             let mut hinted = 0..0;
             for p in pending.iter().filter(|p| !p.tried && p.flags & UFFD_PAGEFAULT_FLAG_WP == 0) {
-                if !self.page_of(p.addr).is_some_and(|(page, _)| hinted.contains(&page)) {
-                    hinted = self.readahead_template(p.addr);
+                if let Some((page, mi)) = p.loc {
+                    if !hinted.contains(&page) {
+                        hinted = self.readahead_template(page, &mappings[mi]);
+                    }
                 }
             }
             // Before the faults look at page states: an installer that settles a page after that sees it set, and wakes
@@ -219,8 +227,11 @@ impl Pager {
             // for a while: a dropped fault would block its vCPU forever.
             for _ in 0..pending.len() {
                 let mut p = pending.pop_front().unwrap();
-                let page = self.page_of(p.addr).map(|(page, _)| page);
-                let served = self.fault(p.addr, p.flags, p.kind.is_some(), !p.tried);
+                let page = p.loc.map(|(page, _)| page);
+                let served = match p.loc {
+                    Some((page, mi)) => self.fault(page, &mappings[mi], p.flags, p.kind.is_some(), !p.tried),
+                    None => Err(io::Error::other("fault outside guest memory")),
+                };
                 p.tried = true;
                 match served {
                     Ok(Served::Done(kind)) => {
@@ -270,9 +281,14 @@ impl Pager {
         }
     }
 
+    fn locate_page(&self, addr: u64) -> Option<(usize, usize)> {
+        let (mi, m) = self.mappings().iter().enumerate().find(|(_, m)| addr >= m.base_host_virt_addr && addr < m.base_host_virt_addr + m.size as u64)?;
+        Some((((addr - m.base_host_virt_addr + m.offset) as usize) / PAGE_SIZE, mi))
+    }
+
     fn page_of(&self, addr: u64) -> Option<(usize, &Mapping)> {
-        let m = self.mappings().iter().find(|m| addr >= m.base_host_virt_addr && addr < m.base_host_virt_addr + m.size as u64)?;
-        Some((((addr - m.base_host_virt_addr + m.offset) as usize) / PAGE_SIZE, m))
+        let (page, mi) = self.locate_page(addr)?;
+        Some((page, &self.mappings()[mi]))
     }
 
     /// Applies a REMOVE of `[start, end)`, a mapping at a time.
@@ -299,8 +315,7 @@ impl Pager {
     /// WILLNEED starts page-cache I/O without touching the mapping or changing guest page states. It can overlap
     /// reads for queued faults and nearby future faults; UFFDIO_COPY still waits if their data is not ready.
     /// Returns the pages hinted.
-    fn readahead_template(&self, addr: u64) -> std::ops::Range<usize> {
-        let Some((page, m)) = self.page_of(addr) else { return 0..0 };
+    fn readahead_template(&self, page: usize, m: &Mapping) -> std::ops::Range<usize> {
         let n = self.pages().base_run(page, FAULT_AROUND.min(m.span().1 - page), |p| self.base.has_data(p));
         self.base.willneed(page, n);
         page..page + n
@@ -315,10 +330,7 @@ impl Pager {
     }
 
     /// Serves a fault: REMOTE reads go to fetchers, while BASE copies can wait for template disk I/O.
-    fn fault(&self, addr: u64, flags: u64, waiting: bool, first: bool) -> io::Result<Served> {
-        let Some((page, m)) = self.page_of(addr) else {
-            return Err(io::Error::other("fault outside guest memory"));
-        };
+    fn fault(&self, page: usize, m: &Mapping, flags: u64, waiting: bool, first: bool) -> io::Result<Served> {
         // Runs stay within a 2 MiB chunk: Firecracker keeps unplugged virtio-mem slots PROT_NONE, which splits the
         // region into VMAs at slot boundaries, and a uffd copy across a VMA end fails (ENOENT).
         let chunk = (2 << 20) / PAGE_SIZE;

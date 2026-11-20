@@ -41,10 +41,10 @@ pub fn set_link_up(name: &str, up: bool) -> Result<()> {
     let fd = socket(libc::AF_INET, libc::SOCK_DGRAM, 0, "socket")?;
     let mut req = ifreq(name)?;
     let done = unsafe {
-        libc::ioctl(fd.as_raw_fd(), libc::SIOCGIFFLAGS, &mut req) >= 0 && {
+        libc::ioctl(fd.as_raw_fd(), libc::SIOCGIFFLAGS as _, &mut req) >= 0 && {
             let flags = &mut req.ifr_ifru.ifru_flags;
             *flags = if up { *flags | libc::IFF_UP as libc::c_short } else { *flags & !(libc::IFF_UP as libc::c_short) };
-            libc::ioctl(fd.as_raw_fd(), libc::SIOCSIFFLAGS, &req) >= 0
+            libc::ioctl(fd.as_raw_fd(), libc::SIOCSIFFLAGS as _, &req) >= 0
         }
     };
     crate::syscall_check!(!done, "set {name} {}", if up { "up" } else { "down" });
@@ -1243,11 +1243,11 @@ fn enable_proxy_arp(on: &mut ProxyArp, what: &str, dev: &str, index: Result<u32>
 /// Waited for `PROXY_LOCK_WAIT` at most: a holder stopped (SIGSTOP) holds up no sweep, route
 /// switch or kill for longer; each caller logs the failure, and a sweep or tick tries again.
 fn proxy_lock() -> Result<crate::host::Flock> {
+    let ns = std::fs::File::open("/proc/thread-self/ns/net").map_err(|e| format!("the network namespace: {e}"))?;
     let until = std::time::Instant::now() + PROXY_LOCK_WAIT;
     loop {
-        let ns = std::fs::File::open("/proc/thread-self/ns/net").map_err(|e| format!("the network namespace: {e}"))?;
-        match crate::host::Flock::new(ns, libc::LOCK_EX | libc::LOCK_NB) {
-            Ok(lock) => return Ok(lock),
+        match crate::host::flock(&ns, libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(()) => return Ok(crate::host::Flock(ns)),
             Err(e) if e.raw_os_error() != Some(libc::EWOULDBLOCK) => bail!("locking the network namespace's proxy entries: {e}"),
             Err(_) if std::time::Instant::now() >= until => {
                 bail!("the network namespace's proxy entries stayed locked for {} s; not changed", PROXY_LOCK_WAIT.as_secs())
@@ -1428,11 +1428,14 @@ fn dev_routes6(table: &str, prefix: Ipv6Prefix, not: &[&str]) -> std::collection
     const RTF_LOCAL: u32 = 0x8000_0000;
     let route = |l: &str| {
         // Destination, its length, source, its length, next hop, metric, references, use, flags, device.
-        let f: Vec<&str> = l.split_whitespace().collect();
-        let (dst, hop, flags) =
-            (u128::from_str_radix(f.first()?, 16).ok()?, u128::from_str_radix(f.get(4)?, 16).ok()?, u32::from_str_radix(f.get(8)?, 16).ok()?);
-        let (ip, dev) = (Ipv6Addr::from(dst), *f.get(9)?);
-        let on_dev = *f.get(1)? == "80" && hop == 0 && flags & RTF_UP != 0 && flags & (RTF_GATEWAY | RTF_REJECT | RTF_CACHE | RTF_LOCAL) == 0;
+        let mut f = l.split_whitespace();
+        let dst = u128::from_str_radix(f.next()?, 16).ok()?;
+        let plen = f.next()?;
+        let hop = u128::from_str_radix(f.nth(2)?, 16).ok()?;
+        let flags = u32::from_str_radix(f.nth(3)?, 16).ok()?;
+        let dev = f.next()?;
+        let ip = Ipv6Addr::from(dst);
+        let on_dev = plen == "80" && hop == 0 && flags & RTF_UP != 0 && flags & (RTF_GATEWAY | RTF_REJECT | RTF_CACHE | RTF_LOCAL) == 0;
         (on_dev && prefix.ipv4_of(ip).is_some() && dev != "lo" && !not.contains(&dev)).then_some(ip)
     };
     table.lines().filter_map(route).collect()

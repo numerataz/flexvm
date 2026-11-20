@@ -27,7 +27,7 @@ CI=$(ci_url)
 # --inputs: Firecracker's version, commit and patches, the build recipe, the kernel) bumps this in the same change;
 # see RELEASING in README.md. Tags use vMAJOR.MINOR.PATCH (artifacts-5 was the last artifacts-N; v0.1.0 was the first source release).
 # A release's assets never change.
-ARTIFACTS_TAG=${ARTIFACTS_TAG:-v0.5.6}
+ARTIFACTS_TAG=${ARTIFACTS_TAG:-v0.5.7}
 ARTIFACTS_URL=https://github.com/numerataz/flexvm/releases/download/$ARTIFACTS_TAG
 
 # A release asset's name for an architecture (default ARCH): firecracker, vmlinux or inputs.txt. x86_64's

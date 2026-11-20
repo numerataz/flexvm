@@ -120,7 +120,7 @@ class Suite:
     def start(self, probe):
         if not self.args.vm:
             self.source.call("pull", self.args.image, "--tag", self.image,
-                             "--boot", self.args.boot, "--vcpus", str(self.args.vcpus), "--max", str(self.args.memory_mib), timeout=600)
+                             "--boot", self.args.boot, "--vcpus", str(self.args.vcpus), "--mem", str(self.args.memory_mib), timeout=600)
             self.pulled = True
             self.started = True
             self.source.call("run", "-d", "--name", self.name,

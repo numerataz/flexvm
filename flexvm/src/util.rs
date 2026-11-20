@@ -1338,8 +1338,21 @@ fn default_stop_signals() -> io::Result<()> {
 /// the child is killed and reaped and its error returned (also when the child exited failing
 /// meanwhile, as a Ctrl-C to the process group does).
 pub fn run_until(cmd: &mut std::process::Command, stop: impl Fn() -> Result<()>) -> Result<std::process::Output> {
+    run_until_with_stdin(cmd, None, stop)
+}
+
+/// As `run_until`, feeding a small `input` buffer to the child's stdin before closing it.
+pub fn run_until_stdin(cmd: &mut std::process::Command, input: &[u8], stop: impl Fn() -> Result<()>) -> Result<std::process::Output> {
+    run_until_with_stdin(cmd, Some(input), stop)
+}
+
+fn run_until_with_stdin(cmd: &mut std::process::Command, input: Option<&[u8]>, stop: impl Fn() -> Result<()>) -> Result<std::process::Output> {
     use std::process::Stdio;
-    let mut child = unblock_signals_in(cmd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let stdin = if input.is_some() { Stdio::piped() } else { Stdio::null() };
+    let mut child = unblock_signals_in(cmd).stdin(stdin).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    if let (Some(bytes), Some(mut pipe)) = (input, child.stdin.take()) {
+        let _ = pipe.write_all(bytes);
+    }
     let drain = |r: Option<Box<dyn io::Read + Send>>| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
@@ -1380,11 +1393,17 @@ pub fn is_nonce(s: &str) -> bool {
     s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// Linux renameat2 is not exported by every libc, including musl. Both names
+/// stay valid C strings for the synchronous syscall; its result is 0 or -1.
+pub fn rename_at(from_dir: RawFd, from: &CStr, to_dir: RawFd, to: &CStr, flags: libc::c_uint) -> libc::c_int {
+    unsafe { libc::syscall(libc::SYS_renameat2, from_dir, from.as_ptr(), to_dir, to.as_ptr(), flags) as libc::c_int }
+}
+
 /// False if `path` exists.
 pub fn rename_noreplace(tmp: &Path, path: &Path) -> io::Result<bool> {
     use std::os::unix::ffi::OsStrExt;
     let (src, dest) = (std::ffi::CString::new(tmp.as_os_str().as_bytes())?, std::ffi::CString::new(path.as_os_str().as_bytes())?);
-    match eintr(|| unsafe { libc::renameat2(libc::AT_FDCWD, src.as_ptr(), libc::AT_FDCWD, dest.as_ptr(), libc::RENAME_NOREPLACE) }) {
+    match eintr(|| rename_at(libc::AT_FDCWD, &src, libc::AT_FDCWD, &dest, libc::RENAME_NOREPLACE)) {
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
         res => res.map(|_| true),
     }
