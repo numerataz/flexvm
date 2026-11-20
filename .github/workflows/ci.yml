@@ -87,15 +87,6 @@ jobs:
         run: |
           sudo apt-get install -y -q --no-install-recommends btrfs-progs
           sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/volume-clone.py --bin target/debug/flexvm --btrfs --output "$RUNNER_TEMP/volume-clone-btrfs"
-      - name: Upload storage CLI evidence
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: volume-clones-${{ matrix.arch }}
-          path: |
-            ${{ runner.temp }}/volume-clone-*/report.json
-            ${{ runner.temp }}/volume-clone-*/*.strace
-          if-no-files-found: warn
       # The semver artifacts release (vMAJOR.MINOR.PATCH; what `cargo build` users download) must be built
       # from this checkout's inputs (scripts/pin-artifacts.sh --inputs): a change to them bumps ARTIFACTS_TAG
       # in the same change, or fails here, PR or main. --check also validates the semver tag format.
@@ -241,9 +232,28 @@ jobs:
         run: |
           sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --image "$RUNNER_TEMP/software-systemd-image" --workload scripts/compat/workloads/user-sessions.sh --boot systemd --mem 2048 --timeout 900 --require storage.fuse --output "$RUNNER_TEMP/software-user-sessions"
           cat "$RUNNER_TEMP/software-user-sessions/report.json"
+      - name: Restore pinned Alpine base for OpenRC
+        id: openrc-alpine-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/openrc-alpine-oci
+          key: openrc-alpine-v1-${{ runner.arch }}-${{ hashFiles('scripts/compat/workload-fixture.py') }}
+      - name: Verify pinned Alpine base for OpenRC
+        run: |
+          if [[ ! -d "$RUNNER_TEMP/openrc-alpine-oci" ]] && ! command -v skopeo >/dev/null; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q --no-install-recommends skopeo
+          fi
+          python3 scripts/compat/workload-fixture.py --alpine --cache "$RUNNER_TEMP/openrc-alpine-oci"
+      - name: Save verified Alpine base for OpenRC
+        if: steps.openrc-alpine-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/openrc-alpine-oci
+          key: ${{ steps.openrc-alpine-cache.outputs.cache-primary-key }}
       - name: OpenRC PID 1 and fresh-owner restore without virtualization devices
         run: |
-          sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/openrc-image.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-openrc-image"
+          sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/openrc-image.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --alpine-layout "$RUNNER_TEMP/openrc-alpine-oci" --output "$RUNNER_TEMP/software-openrc-image"
           sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --image "$RUNNER_TEMP/software-openrc-image" --workload scripts/compat/workloads/distro-openrc.sh --boot openrc --mem 1536 --timeout 900 --require storage.fuse --output "$RUNNER_TEMP/software-openrc"
           cat "$RUNNER_TEMP/software-openrc/report.json"
       - name: Unchanged KVM clients inside software FlexVM
@@ -254,68 +264,6 @@ jobs:
         run: |
           sudo python3 scripts/compat/software-lifecycle.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --firecracker "$RUNNER_TEMP/software-state/artifacts/firecracker" --output "$RUNNER_TEMP/software-nested-lifecycle" --timeout 900
           cat "$RUNNER_TEMP/software-nested-lifecycle/report.json"
-      - name: Upload software execution evidence
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: software-execution-${{ matrix.arch }}
-          path: |
-            ${{ runner.temp }}/software-user-sessions/*.json
-            ${{ runner.temp }}/software-user-sessions/*.log
-            ${{ runner.temp }}/software-user-sessions/*.strace
-            ${{ runner.temp }}/software-openrc-image/fixture.json
-            ${{ runner.temp }}/software-openrc/*.json
-            ${{ runner.temp }}/software-openrc/*.log
-            ${{ runner.temp }}/software-openrc/*.strace
-            ${{ runner.temp }}/software-distro/*.json
-            ${{ runner.temp }}/software-distro/*.log
-            ${{ runner.temp }}/software-distro/*.strace
-            ${{ runner.temp }}/software-tsc/*.json
-            ${{ runner.temp }}/software-tsc/*.log
-            ${{ runner.temp }}/software-tsc/*.strace
-            ${{ runner.temp }}/software-boot/report.json
-            ${{ runner.temp }}/software-boot/guest.log
-            ${{ runner.temp }}/software-boot/files.strace
-            ${{ runner.temp }}/software-boot/restored.log
-            ${{ runner.temp }}/software-boot/restored.strace
-            ${{ runner.temp }}/software-boot/compile.log
-            ${{ runner.temp }}/software-boot/kvm-compile.log
-            ${{ runner.temp }}/software-boot/inner-compile.log
-            ${{ runner.temp }}/software-boot/checkpoint-state.json
-            ${{ runner.temp }}/software-boot/checkpoint
-            ${{ runner.temp }}/software-boot/replay.json
-            ${{ runner.temp }}/software-boot/replay-kernel
-            ${{ runner.temp }}/software-boot/replay-initramfs.cpio
-            ${{ runner.temp }}/software-agent/report.json
-            ${{ runner.temp }}/software-agent/guest.log
-            ${{ runner.temp }}/software-agent/files.strace
-            ${{ runner.temp }}/software-agent/cancel.log
-            ${{ runner.temp }}/software-agent/cancel-files.strace
-            ${{ runner.temp }}/software-agent/docker.log
-            ${{ runner.temp }}/software-agent/docker-files.strace
-            ${{ runner.temp }}/software-serial/*.json
-            ${{ runner.temp }}/software-serial/*.log
-            ${{ runner.temp }}/software-serial/*.strace
-            ${{ runner.temp }}/software-owner/*.json
-            ${{ runner.temp }}/software-owner/*.log
-            ${{ runner.temp }}/software-owner/*.strace
-            ${{ runner.temp }}/software-lifecycle/*.json
-            ${{ runner.temp }}/software-lifecycle/*.jsonl
-            ${{ runner.temp }}/software-lifecycle/*.log
-            ${{ runner.temp }}/software-lifecycle/*.strace
-            ${{ runner.temp }}/software-lifecycle/failure-state.tar.zst
-            ${{ runner.temp }}/software-nested-lifecycle/*.json
-            ${{ runner.temp }}/software-nested-lifecycle/*.jsonl
-            ${{ runner.temp }}/software-nested-lifecycle/*.log
-            ${{ runner.temp }}/software-nested-lifecycle/*.strace
-            ${{ runner.temp }}/software-nested-lifecycle/failure-state.tar.zst
-            ${{ runner.temp }}/software-kvm/*.json
-            ${{ runner.temp }}/software-kvm/*.log
-            ${{ runner.temp }}/software-kvm/*.strace
-          if-no-files-found: ignore
-
-  # Whether the aarch64 runner can run VMs: it decides what e2e-aarch64 runs (the KVM shards, or what
-  # needs no KVM). Never fails; it reports.
 
   software-modules:
     name: guest kernel modules without KVM (${{ matrix.arch }})
@@ -382,32 +330,22 @@ jobs:
         run: |
           sudo systemd-run --scope --collect -p MemoryMax=4G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-modules.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-modules" --timeout 1800
           cat "$RUNNER_TEMP/software-modules/report.json"
-      - name: Upload module acceptance evidence
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: software-modules-${{ matrix.arch }}
-          path: |
-            ${{ runner.temp }}/software-modules/*.json
-            ${{ runner.temp }}/software-modules/*.log
-            ${{ runner.temp }}/software-modules/*.strace
-            ${{ runner.temp }}/parent-kvm-run/*.json
-            ${{ runner.temp }}/parent-kvm-run/*.log
-            ${{ runner.temp }}/parent-kvm-run/*.strace
-          if-no-files-found: warn
 
+  # A pull request runs one workload of each kind, on x86_64: a container runtime under flexvm-init
+  # (podman), a rootless one under systemd (rootless-containerd), a container manager (nspawn) and
+  # Kubernetes (k3s). Every workload on both architectures (22 jobs, most of a run's runner time) runs
+  # on main, nightly, and on request for a branch: gh workflow run ci.yml --ref <branch>.
   software-workloads:
     name: guest workload without KVM (${{ matrix.arch }}, ${{ matrix.workload }})
-    runs-on: ${{ matrix.runner }}
+    runs-on: ${{ matrix.arch == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
     timeout-minutes: ${{ (matrix.workload == 'k3s' || matrix.workload == 'kind') && 80 || 45 }}
     strategy:
       fail-fast: false
       matrix:
-        arch: [x86_64, aarch64]
-        workload: [podman, namespace-sandboxes, containerd, rootless-docker, rootless-containerd, rootless-podman, nspawn, lxc, k3s, kind, incus]
-        include:
-          - { arch: x86_64, runner: ubuntu-24.04, qemu: qemu-system-x86 }
-          - { arch: aarch64, runner: ubuntu-24.04-arm, qemu: qemu-system-arm }
+        arch: ${{ fromJSON(github.event_name == 'pull_request' && '["x86_64"]' || '["x86_64", "aarch64"]') }}
+        workload: ${{ fromJSON(github.event_name == 'pull_request' && '["podman", "rootless-containerd", "nspawn", "k3s"]' || '["podman", "namespace-sandboxes", "containerd", "rootless-docker", "rootless-containerd", "rootless-podman", "nspawn", "lxc", "k3s", "kind", "incus"]') }}
+    env:
+      QEMU_PACKAGE: ${{ matrix.arch == 'aarch64' && 'qemu-system-arm' || 'qemu-system-x86' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -415,7 +353,7 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends ${{ matrix.qemu }} strace build-essential flex bison bc libelf-dev libssl-dev dwarves xz-utils kmod pkg-config zlib1g-dev libzstd-dev squashfs-tools
+          sudo apt-get install -y -q --no-install-recommends "$QEMU_PACKAGE" strace build-essential flex bison bc libelf-dev libssl-dev dwarves xz-utils kmod pkg-config zlib1g-dev libzstd-dev squashfs-tools
       - name: Cache fixed x86 software CPU engine
         if: matrix.arch == 'x86_64'
         id: software-qemu
@@ -471,9 +409,30 @@ jobs:
         with:
           path: ${{ runner.temp }}/workload-fixture-cache
           key: ${{ steps.workload-fixture-cache.outputs.cache-primary-key }}
+      - name: Restore pinned Ubuntu workload image
+        if: matrix.workload == 'podman' || matrix.workload == 'namespace-sandboxes' || matrix.workload == 'containerd'
+        id: ubuntu-workload-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ubuntu-workload-oci
+          key: ubuntu-workload-v1-${{ runner.arch }}-${{ hashFiles('scripts/compat/workload-fixture.py') }}
+      - name: Verify pinned Ubuntu workload image
+        if: matrix.workload == 'podman' || matrix.workload == 'namespace-sandboxes' || matrix.workload == 'containerd'
+        run: |
+          if [[ ! -d "$RUNNER_TEMP/ubuntu-workload-oci" ]] && ! command -v skopeo >/dev/null; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q --no-install-recommends skopeo
+          fi
+          python3 scripts/compat/workload-fixture.py --ubuntu --cache "$RUNNER_TEMP/ubuntu-workload-oci"
+      - name: Save verified Ubuntu workload image
+        if: (matrix.workload == 'podman' || matrix.workload == 'namespace-sandboxes' || matrix.workload == 'containerd') && steps.ubuntu-workload-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ubuntu-workload-oci
+          key: ${{ steps.ubuntu-workload-cache.outputs.cache-primary-key }}
       - name: Guest workload and fresh-owner software restoration
         run: |
-          workload_args=()
+          workload_args=(--image "$RUNNER_TEMP/ubuntu-workload-oci")
           memory_limit=6G
           cpu_quota=200%
           workload_timeout=1800
@@ -501,49 +460,13 @@ jobs:
           fi
           sudo systemd-run --scope --collect -p "MemoryMax=$memory_limit" -p MemorySwapMax=0 -p "CPUQuota=$cpu_quota" python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --workload "scripts/compat/workloads/${{ matrix.workload }}.sh" "${workload_args[@]}" --require storage.fuse --output "$RUNNER_TEMP/software-workload" --timeout "$workload_timeout"
           cat "$RUNNER_TEMP/software-workload/report.json"
-      - name: Upload software workload evidence
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: software-workload-${{ matrix.arch }}-${{ matrix.workload }}
-          path: |
-            ${{ runner.temp }}/software-distro-image/source.sha256
-            ${{ runner.temp }}/workload-fixture/*.json
-            ${{ runner.temp }}/software-workload/*.json
-            ${{ runner.temp }}/software-workload/*.log
-            ${{ runner.temp }}/software-workload/*.strace
-          if-no-files-found: warn
-
-  kvm-aarch64:
-    name: KVM probe (aarch64)
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 5
-    outputs:
-      kvm: ${{ steps.probe.outputs.kvm }}
-    steps:
-      - name: Probe KVM
-        id: probe
-        run: |
-          uname -r; nproc; free -m; getconf PAGESIZE
-          grep -m1 -E 'CPU part|Features' /proc/cpuinfo || true
-          grep -E 'HAVE_ARCH_USERFAULTFD_WP|USERFAULTFD' "/boot/config-$(uname -r)" || true
-          kvm=false
-          if [ -e /dev/kvm ]; then
-            # As scripts/e2e.py decides (kvm_unusable): KVM_GET_API_VERSION answers 12, and KVM_CREATE_VM works.
-            sudo chmod 0666 /dev/kvm
-            python3 -c 'import fcntl, os; fd = os.open("/dev/kvm", os.O_RDWR); v = fcntl.ioctl(fd, 0xAE00); vm = fcntl.ioctl(fd, 0xAE01, 0); print("KVM API", v, "vm fd", vm); assert v == 12' \
-              && kvm=true && echo "::notice::aarch64 runner has KVM: the aarch64 end-to-end shards run" \
-              || echo "::warning::aarch64 runner has /dev/kvm but KVM_CREATE_VM fails"
-          else
-            echo "::warning::aarch64 runner has no /dev/kvm: aarch64 end-to-end runs only what needs no KVM"
-          fi
-          echo "kvm=$kvm" >> "$GITHUB_OUTPUT"
 
   e2e:
     # Shards (scripts/e2e.py --shard): pr (the cases, and the main and recovery scenarios) in four
     # splits side by side, balanced by e2e.py's COST; the scheduled run takes heavy (GiB-scale
     # guests, long windows) one scenario at a time.
-    # The steps are e2e-aarch64's too: KVM (in env) says whether this job runs VMs.
+    # The steps are e2e-aarch64's too: KVM (in env) says whether this job runs VMs; e2e-aarch64 leaves
+    # it unset, and "Probe KVM" sets it.
     name: end-to-end (KVM, ${{ matrix.shard }})
     runs-on: ubuntu-24.04
     timeout-minutes: ${{ matrix.shard == 'heavy' && 150 || 45 }}
@@ -557,6 +480,27 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # Whether the runner can run VMs, where the job does not say (e2e-aarch64): it decides what the job
+      # runs (the pr shard on KVM, or what needs no KVM). Never fails; it reports. A step, not a job of
+      # its own that e2e-aarch64 needs: that job waited in the queue twice, once behind the probe.
+      - name: Probe KVM
+        if: env.KVM == ''
+        run: |
+          uname -r; nproc; free -m; getconf PAGESIZE
+          grep -m1 -E 'CPU part|Features' /proc/cpuinfo || true
+          grep -E 'HAVE_ARCH_USERFAULTFD_WP|USERFAULTFD' "/boot/config-$(uname -r)" || true
+          kvm=false
+          if [ -e /dev/kvm ]; then
+            # As scripts/e2e.py decides (kvm_unusable): KVM_GET_API_VERSION answers 12, and KVM_CREATE_VM works.
+            sudo chmod 0666 /dev/kvm
+            python3 -c 'import fcntl, os; fd = os.open("/dev/kvm", os.O_RDWR); v = fcntl.ioctl(fd, 0xAE00); vm = fcntl.ioctl(fd, 0xAE01, 0); print("KVM API", v, "vm fd", vm); assert v == 12' \
+              && kvm=true && echo "::warning::this runner has KVM: the pr shard runs here unsplit, and heavy never; split e2e-aarch64 as e2e is" \
+              || echo "::warning::this runner has /dev/kvm but KVM_CREATE_VM fails"
+          else
+            echo "::notice::this runner has no /dev/kvm: end-to-end runs only what needs no KVM"
+          fi
+          echo "KVM=$kvm" >> "$GITHUB_ENV"
 
       - name: Enable KVM
         if: env.KVM == 'true'
@@ -717,17 +661,6 @@ jobs:
           for boot in first second; do
             sudo python3 scripts/compat/native-block-boot.py --firecracker "$STATE/artifacts/firecracker" --kernel "$STATE/artifacts/vmlinux" --serial fv0123456789abcdef01 --output "$RUNNER_TEMP/native-block-$boot"
           done
-      - name: Upload native block evidence
-        if: always() && env.KVM == 'true' && (matrix.shard == 'pr 1/4' || matrix.shard == 'heavy')
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: native-block-cold-boot-${{ runner.arch }}
-          path: |
-            ${{ runner.temp }}/native-block-*/report.json
-            ${{ runner.temp }}/native-block-*/console.log
-            ${{ runner.temp }}/native-block-*/compile.log
-            ${{ runner.temp }}/native-block-*/io.strace.*
-          if-no-files-found: error
 
       # The test image (scripts/test-image.py: the base root filesystem as an OCI layout), which
       # e2e.py pulls its templates from; it makes it when the cache has none. flexvm embeds flexvm-init.
@@ -804,6 +737,43 @@ jobs:
         with:
           path: ${{ runner.temp }}/workload-fixture-cache
           key: ${{ steps.workload-fixture-cache.outputs.cache-primary-key }}
+      - name: Restore pinned Ubuntu workload image
+        if: env.KVM == 'true'
+        id: ubuntu-workload-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ubuntu-workload-oci
+          key: ubuntu-workload-v1-${{ runner.arch }}-${{ hashFiles('scripts/compat/workload-fixture.py') }}
+      - name: Verify pinned Ubuntu workload image
+        if: env.KVM == 'true'
+        run: |
+          if [[ ! -d "$RUNNER_TEMP/ubuntu-workload-oci" ]] && ! command -v skopeo >/dev/null; then
+            sudo apt-get update -q
+            sudo apt-get install -y -q --no-install-recommends skopeo
+          fi
+          python3 scripts/compat/workload-fixture.py --ubuntu --cache "$RUNNER_TEMP/ubuntu-workload-oci"
+      - name: Save verified Ubuntu workload image
+        if: (env.KVM == 'true') && steps.ubuntu-workload-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/ubuntu-workload-oci
+          key: ${{ steps.ubuntu-workload-cache.outputs.cache-primary-key }}
+      - name: Restore pinned Alpine base for OpenRC
+        if: env.KVM == 'true'
+        id: openrc-alpine-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/openrc-alpine-oci
+          key: openrc-alpine-v1-${{ runner.arch }}-${{ hashFiles('scripts/compat/workload-fixture.py') }}
+      - name: Verify pinned Alpine base for OpenRC
+        if: env.KVM == 'true'
+        run: python3 scripts/compat/workload-fixture.py --alpine --cache "$RUNNER_TEMP/openrc-alpine-oci"
+      - name: Save verified Alpine base for OpenRC
+        if: env.KVM == 'true' && steps.openrc-alpine-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/openrc-alpine-oci
+          key: ${{ steps.openrc-alpine-cache.outputs.cache-primary-key }}
       - name: End-to-end tests
         env:
           SHARD: ${{ matrix.shard }}
@@ -812,7 +782,7 @@ jobs:
           set -- $SHARD
           jobs=4; if [ "$1" = heavy ]; then jobs=1; fi
           kvm=--require-kvm; if [ "$KVM" != true ]; then kvm=--no-kvm; fi
-          sudo env FLEXVM_WORKLOAD_FIXTURE="$RUNNER_TEMP/workload-fixture" python3 -u scripts/e2e.py --shard "$1" ${2:+--split "$2"} --jobs "$jobs" --no-skips "$kvm" --image "$E2E_IMAGE" --image-cache "$RUNNER_TEMP/image-cache" --test-image "/var/lib/flexvm-test-image" --log-dir "$RUNNER_TEMP/e2e-logs"
+          sudo env FLEXVM_WORKLOAD_FIXTURE="$RUNNER_TEMP/workload-fixture" FLEXVM_COMPAT_APP_IMAGE="$RUNNER_TEMP/ubuntu-workload-oci" FLEXVM_OPENRC_ALPINE_LAYOUT="$RUNNER_TEMP/openrc-alpine-oci" python3 -u scripts/e2e.py --shard "$1" ${2:+--split "$2"} --jobs "$jobs" --no-skips "$kvm" --image "$E2E_IMAGE" --image-cache "$RUNNER_TEMP/image-cache" --test-image "/var/lib/flexvm-test-image" --log-dir "$RUNNER_TEMP/e2e-logs"
       - name: Test image made
         id: test-image-made
         if: always() && steps.test-image-cache.outputs.cache-hit != 'true'
@@ -848,37 +818,17 @@ jobs:
           sudo dmesg | tail -200 > "$RUNNER_TEMP/e2e-logs/dmesg.txt" || true
           # The background release build's output, also when "Build flexvm" never ran.
           cp "$RUNNER_TEMP/build.log" "$RUNNER_TEMP/e2e-logs/build.log" || true
-      - name: Upload compatibility reports
-        if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: compatibility-${{ runner.arch }}-${{ strategy.job-index }}
-          path: |
-            ${{ runner.temp }}/e2e-logs/**/*-compat/report.json
-            ${{ runner.temp }}/workload-fixture/*.json
-          if-no-files-found: ignore
 
-      - name: Upload logs
-        if: failure() || cancelled()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: e2e-logs-${{ runner.arch }}-${{ strategy.job-index }}
-          path: ${{ runner.temp }}/e2e-logs
-          if-no-files-found: ignore
-
-  # e2e's steps on the aarch64 runner. With KVM (kvm-aarch64 decides) it runs e2e's shards; without (GitHub's
-  # arm runners have none) everything else, in one job: the release build, the patched Firecracker for
-  # aarch64-unknown-linux-musl (cached as e2e's is), the aarch64 artifacts fetched and checked against their
-  # pins, the test image, and what needs no KVM (e2e.py --no-kvm).
+  # e2e's steps on the aarch64 runner, in one job. "Probe KVM" decides what it runs: with KVM, the pr shard
+  # unsplit; without (GitHub's arm runners have none) everything else: the release build, the patched
+  # Firecracker for aarch64-unknown-linux-musl (cached as e2e's is), the aarch64 artifacts fetched and
+  # checked against their pins, the test image, and what needs no KVM (e2e.py --no-kvm).
   e2e-aarch64:
-    name: end-to-end (${{ needs.kvm-aarch64.outputs.kvm == 'true' && 'KVM' || 'no KVM' }}, aarch64, ${{ matrix.shard }})
-    needs: kvm-aarch64
+    name: end-to-end (aarch64, ${{ matrix.shard }})
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: ${{ matrix.shard == 'heavy' && 150 || 45 }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        shard: ${{ fromJSON(needs.kvm-aarch64.outputs.kvm != 'true' && '["pr"]' || (github.event_name == 'schedule' || inputs.heavy) && '["heavy"]' || '["pr 1/4", "pr 2/4", "pr 3/4", "pr 4/4"]') }}
-    env:
-      KVM: ${{ needs.kvm-aarch64.outputs.kvm }}
+        shard: [pr]
     steps: *e2e-steps
