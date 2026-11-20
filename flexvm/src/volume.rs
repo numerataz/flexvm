@@ -162,7 +162,7 @@ fn entries(dir: &File) -> Result<Vec<String>> {
 
 fn rename(parent: &File, from: &str, to: &str) -> Result<()> {
     let (from, to) = (util::cname(from), util::cname(to));
-    util::check(unsafe { libc::renameat2(parent.as_raw_fd(), from.as_ptr(), parent.as_raw_fd(), to.as_ptr(), libc::RENAME_NOREPLACE) })?;
+    util::check(util::rename_at(parent.as_raw_fd(), &from, parent.as_raw_fd(), &to, libc::RENAME_NOREPLACE))?;
     parent.sync_all()?;
     Ok(())
 }

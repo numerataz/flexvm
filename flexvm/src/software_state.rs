@@ -952,7 +952,7 @@ impl Staging {
         }
         if previous.is_some() {
             let (from, to) = (util::cpath(&self.path)?, util::cpath(&target)?);
-            if unsafe { libc::renameat2(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), libc::RENAME_EXCHANGE) } < 0 {
+            if util::rename_at(libc::AT_FDCWD, &from, libc::AT_FDCWD, &to, libc::RENAME_EXCHANGE) < 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
         } else if !util::rename_noreplace(&self.path, &target)? {
@@ -1360,7 +1360,7 @@ mod tests {
         fs::write(canonical.join("live-input"), b"must remain linked").unwrap();
         let stale = private_directory(&stage).unwrap();
         let (from, to) = (util::cpath(&stage).unwrap(), util::cpath(&canonical).unwrap());
-        assert_eq!(unsafe { libc::renameat2(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), libc::RENAME_EXCHANGE) }, 0);
+        assert_eq!(util::rename_at(libc::AT_FDCWD, &from, libc::AT_FDCWD, &to, libc::RENAME_EXCHANGE), 0);
         // The sweeper's fd pins the newly published bundle, but its old path
         // names the consumed inputs. Locking that fd cannot authorize deletion.
         sweep_entry(&stale, &stage, true).unwrap();

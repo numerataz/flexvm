@@ -46,6 +46,13 @@ int main(void) {
         }
         puts("FLEXVM_SOFTWARE_GUEST_TSC_PASSED");
     }
+    if (access("/kvm-clock", F_OK) == 0) {
+        char *const argv[] = {"/kvm-clock", NULL};
+        if (execute(argv[0], argv) < 0) {
+            puts("FLEXVM_SOFTWARE_GUEST_CLOCK_FAILED");
+            for (;;) pause();
+        }
+    }
     if (access("/firecracker", F_OK) == 0) {
         char *const argv[] = {"/firecracker", "--no-api", "--config-file", "/firecracker.json", NULL};
         if (mount("proc", "/proc", "proc", 0, NULL) < 0 ||

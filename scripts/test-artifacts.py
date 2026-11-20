@@ -180,7 +180,12 @@ class Pins(unittest.TestCase):
         target.write_text('\tkvm_xen_init_vcpu(vcpu);\n\tkvm_vcpu_mtrr_init(vcpu);\n'
                           '\tvcpu_load(vcpu);\n'
                           '\tkvm_set_tsc_khz(vcpu, vcpu->kvm->arch.default_tsc_khz);\n'
-                          '\tkvm_vcpu_reset(vcpu, false);\n\tkvm_init_mmu(vcpu);\n')
+                          '\tkvm_vcpu_reset(vcpu, false);\n\tkvm_init_mmu(vcpu);\n'
+                          '\n\t\t\t\t   &hv_clock.tsc_to_system_mul);\n'
+                          '\t\tdata->clock = __pvclock_read_cycles(&hv_clock, data->host_tsc);\n'
+                          '\t} else {\n'
+                          '\t\tdata->clock = get_kvmclock_base_ns() + ka->kvmclock_offset;\n'
+                          '\t}\n\n\tput_cpu();\n')
         applied = self.run_script('apply-kernel-patches.sh', str(source))
         self.assertEqual(applied.returncode, 0, applied.stderr + applied.stdout)
         reused = self.run_script('apply-kernel-patches.sh', str(source))

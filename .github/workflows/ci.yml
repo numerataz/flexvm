@@ -192,7 +192,7 @@ jobs:
           cat "$RUNNER_TEMP/software-boot/report.json"
       - name: TSC initialization without hardware scaling
         if: matrix.arch == 'x86_64'
-        run: sudo python3 scripts/compat/software-boot.py --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-tsc" --guest-kvm --guest-tsc
+        run: sudo python3 scripts/compat/software-boot.py --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-tsc" --guest-kvm --guest-tsc --guest-clock
       - name: Save software kernel
         if: success() && steps.software-kernel.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -484,7 +484,10 @@ jobs:
       fail-fast: false
       matrix:
         arch: ${{ fromJSON(github.event_name == 'pull_request' && '["x86_64"]' || '["x86_64", "aarch64"]') }}
-        workload: ${{ fromJSON(github.event_name == 'pull_request' && '["podman", "rootless-containerd", "nspawn", "k3s"]' || '["podman", "namespace-sandboxes", "containerd", "rootless-docker", "rootless-containerd", "rootless-podman", "nspawn", "lxc", "k3s", "kind", "incus"]') }}
+        workload: ${{ fromJSON(github.event_name == 'pull_request' && '["podman", "rootless-containerd", "nspawn", "k3s", "nested-flexvm"]' || '["podman", "namespace-sandboxes", "containerd", "rootless-docker", "rootless-containerd", "rootless-podman", "nspawn", "lxc", "k3s", "kind", "incus", "nested-flexvm"]') }}
+        include:
+          - arch: aarch64
+            workload: nested-flexvm
     env:
       QEMU_PACKAGE: ${{ matrix.arch == 'aarch64' && 'qemu-system-arm' || 'qemu-system-x86' }}
     steps:
@@ -527,10 +530,28 @@ jobs:
       - name: Build FlexVM
         run: cargo build --release -p flexvm
       - name: Prepare the systemd image for distro workloads
-        if: startsWith(matrix.workload, 'rootless-') || matrix.workload == 'nspawn' || matrix.workload == 'lxc' || matrix.workload == 'k3s' || matrix.workload == 'kind' || matrix.workload == 'incus'
+        if: startsWith(matrix.workload, 'rootless-') || matrix.workload == 'nspawn' || matrix.workload == 'lxc' || matrix.workload == 'k3s' || matrix.workload == 'kind' || matrix.workload == 'incus' || matrix.workload == 'nested-flexvm'
         run: |
           scripts/fetch.sh --state "$RUNNER_TEMP/software-state"
           sudo python3 scripts/test-image.py --state "$RUNNER_TEMP/software-state" "$RUNNER_TEMP/software-distro-image"
+      - name: Prepare the portable nested FlexVM CLI and child image
+        if: matrix.workload == 'nested-flexvm'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends musl-tools libseccomp-dev
+          rustup target add "${{ matrix.arch }}-unknown-linux-musl"
+          cargo build --locked --release -p flexvm --target "${{ matrix.arch }}-unknown-linux-musl"
+          python3 scripts/compat/nested-flexvm-inputs.py --output "$RUNNER_TEMP/nested-inputs"
+          root=$PWD
+          source scripts/versions.sh
+          asset_url="$ARTIFACTS_URL/$(asset firecracker)"
+          if pinned "$asset_url" >/dev/null; then
+            sudo install -D -m 755 "$RUNNER_TEMP/software-state/artifacts/firecracker" "$RUNNER_TEMP/nested-state/artifacts/firecracker"
+          else
+            [[ $? == 2 ]] || exit 1
+            scripts/build-firecracker.sh --state "$RUNNER_TEMP/nested-state"
+          fi
+          sha256sum "$RUNNER_TEMP/nested-state/artifacts/firecracker"
       - name: Restore immutable workload fixture
         if: matrix.workload == 'kind' || matrix.workload == 'k3s' || matrix.workload == 'rootless-containerd'
         id: workload-fixture-cache
@@ -577,7 +598,7 @@ jobs:
           memory_limit=6G
           cpu_quota=200%
           workload_timeout=1800
-          if [[ "${{ matrix.workload }}" == rootless-* || "${{ matrix.workload }}" == nspawn || "${{ matrix.workload }}" == lxc || "${{ matrix.workload }}" == k3s || "${{ matrix.workload }}" == kind || "${{ matrix.workload }}" == incus ]]; then
+          if [[ "${{ matrix.workload }}" == rootless-* || "${{ matrix.workload }}" == nspawn || "${{ matrix.workload }}" == lxc || "${{ matrix.workload }}" == k3s || "${{ matrix.workload }}" == kind || "${{ matrix.workload }}" == incus || "${{ matrix.workload }}" == nested-flexvm ]]; then
             workload_args=(--boot systemd --image "$RUNNER_TEMP/software-distro-image")
           fi
           if [[ "${{ matrix.workload }}" == k3s || "${{ matrix.workload }}" == kind ]]; then
@@ -592,6 +613,15 @@ jobs:
           fi
           if [[ "${{ matrix.workload }}" == incus ]]; then
             workload_args+=(--mem 3072 --poweroff-timeout 180)
+          fi
+          if [[ "${{ matrix.workload }}" == nested-flexvm ]]; then
+            workload_args+=(--mem 2048 --vcpus 1 --require virtualization.kvm)
+            workload_args+=(--seed "target/${{ matrix.arch }}-unknown-linux-musl/release/flexvm" /nested-input/flexvm)
+            workload_args+=(--seed "$RUNNER_TEMP/nested-state/artifacts/firecracker" /nested-input/firecracker)
+            for artifact in vmlinux kernel-modules.tar.gz; do
+              workload_args+=(--seed "$RUNNER_TEMP/software-state/artifacts/$artifact" "/nested-input/$artifact")
+            done
+            workload_args+=(--seed "$RUNNER_TEMP/nested-inputs/child.tar" /nested-input/child.tar)
           fi
           if [[ "${{ matrix.workload }}" == kind || "${{ matrix.workload }}" == k3s || "${{ matrix.workload }}" == rootless-containerd ]]; then
             for name in busybox.tar busybox.json; do

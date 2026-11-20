@@ -567,7 +567,7 @@ fn probe_features() -> io::Result<u64> {
     // struct uffdio_api: api, features (in: requested, out: available), ioctls (out).
     let mut api = [UFFD_API, 0u64, 0];
     // SAFETY: `api` is a struct uffdio_api the kernel reads and writes.
-    if unsafe { libc::ioctl(std::os::fd::AsRawFd::as_raw_fd(&fd), UFFDIO_API, api.as_mut_ptr()) } < 0 {
+    if unsafe { libc::ioctl(std::os::fd::AsRawFd::as_raw_fd(&fd), UFFDIO_API as _, api.as_mut_ptr()) } < 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(api[1])
@@ -1317,7 +1317,7 @@ mod tests {
         }
         let fd = unsafe { OwnedFd::from_raw_fd(fd as libc::c_int) };
         let mut api = [UFFD_API, 0u64, 0];
-        assert_eq!(unsafe { libc::ioctl(fd.as_raw_fd(), UFFDIO_API, api.as_mut_ptr()) }, 0, "{}", io::Error::last_os_error());
+        assert_eq!(unsafe { libc::ioctl(fd.as_raw_fd(), UFFDIO_API as _, api.as_mut_ptr()) }, 0, "{}", io::Error::last_os_error());
         // In host pages.
         let len = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
         let prot = libc::PROT_READ | libc::PROT_WRITE;

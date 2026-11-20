@@ -41,10 +41,10 @@ pub fn set_link_up(name: &str, up: bool) -> Result<()> {
     let fd = socket(libc::AF_INET, libc::SOCK_DGRAM, 0, "socket")?;
     let mut req = ifreq(name)?;
     let done = unsafe {
-        libc::ioctl(fd.as_raw_fd(), libc::SIOCGIFFLAGS, &mut req) >= 0 && {
+        libc::ioctl(fd.as_raw_fd(), libc::SIOCGIFFLAGS as _, &mut req) >= 0 && {
             let flags = &mut req.ifr_ifru.ifru_flags;
             *flags = if up { *flags | libc::IFF_UP as libc::c_short } else { *flags & !(libc::IFF_UP as libc::c_short) };
-            libc::ioctl(fd.as_raw_fd(), libc::SIOCSIFFLAGS, &req) >= 0
+            libc::ioctl(fd.as_raw_fd(), libc::SIOCSIFFLAGS as _, &req) >= 0
         }
     };
     crate::syscall_check!(!done, "set {name} {}", if up { "up" } else { "down" });

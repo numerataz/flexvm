@@ -289,10 +289,10 @@ mod kvm {
     fn reg_list(vcpu: &OwnedFd) -> Result<BTreeSet<u64>> {
         // struct kvm_reg_list { __u64 n; __u64 reg[]; }: KVM reports the size it needs with E2BIG.
         let mut buf = vec![0u64; 1];
-        let result = unsafe { libc::ioctl(vcpu.as_raw_fd(), KVM_GET_REG_LIST, buf.as_mut_ptr()) };
+        let result = unsafe { libc::ioctl(vcpu.as_raw_fd(), KVM_GET_REG_LIST as _, buf.as_mut_ptr()) };
         crate::syscall_check!(result < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::E2BIG), "KVM_GET_REG_LIST");
         buf.resize(1 + buf[0] as usize, 0);
-        crate::syscall_check!(unsafe { libc::ioctl(vcpu.as_raw_fd(), KVM_GET_REG_LIST, buf.as_mut_ptr()) } < 0, "KVM_GET_REG_LIST");
+        crate::syscall_check!(unsafe { libc::ioctl(vcpu.as_raw_fd(), KVM_GET_REG_LIST as _, buf.as_mut_ptr()) } < 0, "KVM_GET_REG_LIST");
         let n = (buf[0] as usize).min(buf.len() - 1);
         Ok(buf[1..1 + n].iter().copied().collect())
     }
@@ -301,7 +301,7 @@ mod kvm {
     fn can_create(vm: &OwnedFd, kind: u32) -> bool {
         // struct kvm_create_device { __u32 type; __u32 fd; __u32 flags; }
         let mut device = [kind, 0, KVM_CREATE_DEVICE_TEST];
-        unsafe { libc::ioctl(vm.as_raw_fd(), KVM_CREATE_DEVICE, device.as_mut_ptr()) == 0 }
+        unsafe { libc::ioctl(vm.as_raw_fd(), KVM_CREATE_DEVICE as _, device.as_mut_ptr()) == 0 }
     }
 
     fn cntfrq() -> u64 {
@@ -320,7 +320,7 @@ mod kvm {
             ids.insert(id, value);
         }
         let attr = DeviceAttr { flags: 0, group: KVM_ARM_VCPU_PVTIME_CTRL, attr: KVM_ARM_VCPU_PVTIME_IPA, addr: 0 };
-        let pvtime = unsafe { libc::ioctl(vcpu.as_raw_fd(), KVM_HAS_DEVICE_ATTR, &attr) } == 0;
+        let pvtime = unsafe { libc::ioctl(vcpu.as_raw_fd(), KVM_HAS_DEVICE_ATTR as _, &attr) } == 0;
         let gic = gic_version(can_create(&vm, KVM_DEV_TYPE_ARM_VGIC_V3), can_create(&vm, KVM_DEV_TYPE_ARM_VGIC_ITS), can_create(&vm, KVM_DEV_TYPE_ARM_VGIC_V2));
         std::thread::spawn(move || drop((vcpu, vm)));
         // Vector lengths are readable only on a vCPU with SVE, which a VM's others must share.

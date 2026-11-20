@@ -56,7 +56,7 @@ def initramfs(init, kvm=None, files=None):
         for name, minor in (("null", 3), ("zero", 5), ("urandom", 9)):
             add("dev/" + name, 0o020600, major=1, minor=minor)
         for name, data in files.items():
-            add(name, 0o100755 if name in ("firecracker", "kvm-tsc") else 0o100600, data)
+            add(name, 0o100755 if name in ("firecracker", "kvm-tsc", "kvm-clock") else 0o100600, data)
     add("TRAILER!!!", 0)
     return archive
 
@@ -242,6 +242,7 @@ def main():
     parser.add_argument("--cc", default="cc")
     parser.add_argument("--guest-kvm", action="store_true", help="require ARM KVM execution inside software-emulated EL2")
     parser.add_argument("--guest-firecracker", type=Path, help="also boot an inner Linux VM with this unchanged ARM Firecracker binary (requires --guest-kvm)")
+    parser.add_argument("--guest-clock", action="store_true", help="require correlated x86 fallback KVM realtime clock data")
     parser.add_argument("--guest-tsc", action="store_true", help="require x86 TSC initialization without hardware scaling")
     parser.add_argument("--checkpoint", action="store_true", help="cold-restore the outer software VM while the inner guest is running (requires --guest-firecracker)")
     parser.add_argument("--timeout", type=int, default=90)
@@ -257,6 +258,8 @@ def main():
         parser.error("--checkpoint requires --guest-firecracker")
     if args.guest_tsc and (arch != "x86_64" or not args.guest_kvm):
         parser.error("--guest-tsc requires x86_64 and --guest-kvm")
+    if args.guest_clock and (arch != "x86_64" or not args.guest_kvm):
+        parser.error("--guest-clock requires x86_64 and --guest-kvm")
     if args.timeout < 1:
         parser.error("timeout must be positive")
     kernel = args.kernel.resolve(strict=True)
@@ -317,6 +320,11 @@ def main():
             run([args.cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static",
                  str(ROOT / "kvm-tsc.c"), "-o", str(test)], 60, out / "tsc-compile.log")
             files["kvm-tsc"] = test.read_bytes()
+        if args.guest_clock:
+            test = out / "kvm-clock"
+            run([args.cc, "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static",
+                 str(ROOT / "kvm-clock.c"), "-o", str(test)], 60, out / "clock-compile.log")
+            files["kvm-clock"] = test.read_bytes()
         archive.write_bytes(initramfs(init.read_bytes(), nested, files))
         blocked = out / "unusable-kvm"
         blocked.touch(mode=0o600)
@@ -350,12 +358,16 @@ def main():
         else:
             run(isolated(cmd, traces[0]), args.timeout, out / "guest.log")
             log = (out / "guest.log").read_text(errors="replace")
+        if args.guest_clock:
+            report["fallback_clock_realtime"] = True
         if args.guest_tsc:
             report["tsc_initialization"] = True
         expected = ["FLEXVM_SOFTWARE_GUEST_BOOTED", "FLEXVM_SOFTWARE_GUEST_COMPLETE"]
         expected += [f"FLEXVM_SOFTWARE_GUEST_TICK {i}" for i in range(3)]
         if args.guest_tsc:
             expected.append("FLEXVM_SOFTWARE_GUEST_TSC_PASSED")
+        if args.guest_clock:
+            expected.append("FLEXVM_SOFTWARE_GUEST_CLOCK_PASSED")
         if args.guest_kvm:
             expected.append("PASS: 11 KVM ABI reference checks" if arch == "x86_64" else "FLEXVM_SOFTWARE_GUEST_KVM_PASSED")
         if firecracker:
