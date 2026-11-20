@@ -1427,6 +1427,7 @@ static long device_capability(unsigned long capability)
 	case KVM_CAP_XCRS:
 	case KVM_CAP_XSAVE:
 	case KVM_CAP_VCPU_EVENTS:
+	case KVM_CAP_EXT_CPUID:
 		return 1;
 	case KVM_CAP_NR_MEMSLOTS:
 		return PVKVM_MAX_SLOTS;

@@ -1,9 +1,8 @@
 # Managed raw volume catalog
 
 The catalog creates retained sparse raw storage independently of VM lifetime.
-VM attachment, filesystem formatting, disk checkpoints and automatic disk
-migration are still being implemented in #1329. These commands manage unattached
-storage; creating a volume does not yet add a disk to a VM.
+Named software VMs can attach a volume as a writable virtio-blk data disk.
+Automatic cross-host disk transfer is tracked in #1329.
 
 ```sh
 flexvm volume create database --size 1073741824
@@ -35,10 +34,9 @@ Catalog operation locks are explicitly released when an operation ends, even
 if an unrelated child has inherited its descriptor before exec. Raw disk writer
 leases remain separate and survive until their inherited descriptors close.
 
-This lock is one prerequisite for future VM attachment. Durable migration
-ownership, checkpoint references and the engine's inherited-descriptor lifecycle
-must also be integrated before attached disks can use this catalog. The full
-storage design is in PR #1436; catalog implementation is tracked in #1437.
+A named QEMU software VM opens its volumes through the catalog and passes the
+writer descriptors to its emulator. Cloning, deleting and opening the same
+volume for another VM require that writer lease to be free.
 
 ## Independent clones
 
@@ -64,3 +62,21 @@ checkpoints, sealed generation retention and automatic migration remain part of
 mount namespace with host KVM/vsock masked and file/ioctl traces retained.
 CI runs extent copying and forced unsupported-operation fallback on both
 architectures, plus a temporary Btrfs reflink check on x86_64.
+
+
+## Attach a disk to a software VM
+
+```sh
+flexvm volume create database --size 1073741824
+flexvm software --name db --kernel /path/to/vmlinux --disk database IMAGE
+```
+
+Use additional `--disk` flags to attach more data disks in order. A new
+volume is a raw block device that the guest can format and mount. Its data
+persists independently of the guest's RAM and VM lifetime.
+
+When a named VM stops, FlexVM drains QEMU's block I/O and records a sealed
+copy of each managed disk with the RAM and device state. Local start acquires
+the original disk's writer lease and verifies its bytes against that checkpoint
+before running the guest. Changing the catalog volume while the VM is stopped
+causes restore to fail rather than combine saved RAM with newer disk contents.
