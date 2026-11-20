@@ -5,12 +5,14 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 import errno
 import fcntl
+import json
 import mmap
 import os
 from pathlib import Path
 import platform
 import runpy
 import select
+import shutil
 import socket
 import struct
 import tempfile
@@ -307,25 +309,19 @@ def serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, bi
             os.close(exited)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("qemu", "kernel", "initrd", "worker"):
-        parser.add_argument("--" + name, type=Path, required=True)
-    parser.add_argument("--mem", type=int, default=256)
-    parser.add_argument("--child-mem", type=int, default=128)
-    args = parser.parse_args()
-    if platform.machine() != "aarch64":
-        parser.error("the native ARM parent requires an aarch64 Linux host")
-    if not 128 <= args.mem <= 3072 or not 1 <= args.child_mem <= min(args.mem, 256):
-        parser.error("invalid outer or child RAM size")
-    worker = args.worker.resolve(strict=True)
+def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=None, frontend=None):
     probe = PARENT["native_query"]([worker, "--ipa-bits"])
     if probe.returncode:
         raise RuntimeError(probe.stderr.decode(errors="replace"))
     ipa_bits = int(probe.stdout)
 
     with ExitStack() as resources:
-        runtime = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix="flexvm-arm-kvm-")))
+        if control is None:
+            runtime = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix="flexvm-arm-kvm-")))
+        else:
+            runtime = control
+            runtime.mkdir(mode=0o700)
+            resources.callback(shutil.rmtree, runtime)
         doorbell = runtime / "doorbell"
         server = resources.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
         server.bind(str(doorbell))
@@ -338,11 +334,11 @@ def main():
         struct.pack_into("<II", mailbox, 0, 0x4d564b46, 36)
         struct.pack_into("<I", mailbox, PARENT["FEATURES_AT"], 3)
         struct.pack_into("<I", mailbox, ARM_IPA_BITS_AT, ipa_bits)
-        max_pages = args.child_mem * MIB // PARENT["PAGE_SIZE"]
+        max_pages = child_mib * MIB // PARENT["PAGE_SIZE"]
         struct.pack_into("<I", mailbox, PARENT["RAM_LIMIT_AT"], max_pages)
         memory = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         resources.callback(os.close, memory)
-        outer_bytes = args.mem * MIB
+        outer_bytes = memory_mib * MIB
         os.ftruncate(memory, outer_bytes)
         fcntl.fcntl(memory, fcntl.F_ADD_SEALS, fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
         def eventfd():
@@ -353,19 +349,44 @@ def main():
         requests, cancellations, replies = (eventfd() for _ in range(3))
         irq_fds = tuple(eventfd() for _ in range(ARM_GSI_COUNT))
         command = [
-            args.qemu.resolve(strict=True), "-machine", "virt,gic-version=3,memory-backend=outer-ram",
-            "-accel", "tcg,thread=multi", "-cpu", "cortex-a72", "-m", str(args.mem), "-smp", "1",
-            "-display", "none", "-monitor", "none", "-serial", "none", "-nodefaults", "-nic", "none", "-no-reboot",
-            "-object", f"memory-backend-file,id=outer-ram,mem-path=/proc/self/fd/{memory},share=on,size={args.mem}M",
-            "-chardev", "stdio,id=console,signal=off", "-device", "virtio-serial-device,id=serial",
-            "-device", "virtconsole,chardev=console,bus=serial.0", "-kernel", args.kernel.resolve(strict=True),
-            "-initrd", args.initrd.resolve(strict=True), "-append", "console=hvc0 quiet panic=1 rdinit=/init",
-            "-chardev", f"socket,id=doorbell,path={doorbell}", "-device", f"ivshmem-doorbell,chardev=doorbell,vectors={2 + len(irq_fds)}",
+            *command,
+            "-object", f"memory-backend-file,id=outer-ram,mem-path=/proc/self/fd/{memory},share=on,size={memory_mib}M",
+            "-chardev", f"socket,id=doorbell,path={doorbell}",
+            "-device", f"ivshmem-doorbell,chardev=doorbell,vectors={2 + len(irq_fds)}",
         ]
-        outer = SPAWN(command, pass_fds=(memory,))
+        if frontend is not None:
+            block = json.dumps({"driver": "raw", "node-name": "parent-kvm-module", "read-only": True,
+                                "file": {"driver": "file", "filename": str(frontend)}})
+            # The root disk uses virtio-mmio and must remain /dev/vda.
+            command.extend(["-blockdev", block, "-device", "virtio-blk-pci,drive=parent-kvm-module,serial=flexvm-pvkvm"])
+        outer = SPAWN(command, pass_fds=(memory, *inherited))
+        for fd in inherited:
+            os.close(fd)
         resources.callback(PARENT["stop_process"], outer)
         resources.enter_context(PARENT["doorbell_peer"](server, mailbox_fd, requests, cancellations, irq_fds, replies))
         return serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, worker, memory, outer_bytes, max_pages)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    for name in ("qemu", "kernel", "initrd", "worker"):
+        parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--mem", type=int, default=256)
+    parser.add_argument("--child-mem", type=int, default=128)
+    args = parser.parse_args()
+    if platform.machine() != "aarch64":
+        parser.error("the native ARM parent requires an aarch64 Linux host")
+    if not 128 <= args.mem <= 3072 or not 1 <= args.child_mem <= min(args.mem, 256):
+        parser.error("invalid outer or child RAM size")
+    command = [
+        args.qemu.resolve(strict=True), "-machine", "virt,gic-version=3,memory-backend=outer-ram",
+        "-accel", "tcg,thread=multi", "-cpu", "cortex-a72", "-m", str(args.mem), "-smp", "1",
+        "-display", "none", "-monitor", "none", "-serial", "none", "-nodefaults", "-nic", "none", "-no-reboot",
+        "-chardev", "stdio,id=console,signal=off", "-device", "virtio-serial-device,id=serial",
+        "-device", "virtconsole,chardev=console,bus=serial.0", "-kernel", args.kernel.resolve(strict=True),
+        "-initrd", args.initrd.resolve(strict=True), "-append", "console=hvc0 quiet panic=1 rdinit=/init",
+    ]
+    return launch_arm(command, args.worker.resolve(strict=True), args.mem, args.child_mem)
 
 
 if __name__ == "__main__":

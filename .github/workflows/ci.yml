@@ -594,6 +594,23 @@ jobs:
             run_public_parent kvm
             run_public_parent auto kvm
           fi
+      - name: Launch unchanged ARM Firecracker through FlexVM software
+        if: matrix.arch == 'aarch64'
+        run: |
+          bundle="$RUNNER_TEMP/arm-parent-kvm-bundle"
+          if sudo "$bundle/native-worker" --ipa-bits >/dev/null 2>&1; then
+            source scripts/versions.sh
+            output="$RUNNER_TEMP/arm-parent-firecracker-public"
+            sudo systemd-run --scope --collect -p MemoryMax=1400M -p MemorySwapMax=0 -p CPUQuota=200% \
+              python3 scripts/compat/arm-parent-firecracker.py --bin target/release/flexvm \
+              --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" \
+              --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64" --bundle "$bundle" \
+              --firecracker "$RUNNER_TEMP/firecracker-$FC_VERSION-$ARCH" --output "$output" || {
+              cat "$output/guest.log" >&2 || true
+              exit 1
+            }
+            cat "$output/report.json"
+          fi
       - name: Guest compile, DKMS, ABI rejection and loaded module lifecycle
         run: |
           sudo systemd-run --scope --collect -p MemoryMax=4G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-modules.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-modules" --timeout 1800

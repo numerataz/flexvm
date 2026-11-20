@@ -2338,8 +2338,11 @@ def serve_outer(argv):
     parser.add_argument("--control", type=Path)
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
-    if platform.machine() != "x86_64":
-        parser.error("the parent KVM service requires x86_64")
+    arch = platform.machine()
+    if arch not in ("x86_64", "aarch64"):
+        parser.error("the parent KVM service requires x86_64 or aarch64")
+    if arch == "aarch64" and args.engine == "tcg":
+        parser.error("the ARM parent currently requires a native KVM worker")
     if not 128 <= args.outer_memory <= 1_048_576 or not 1 <= args.child_memory <= min(256, args.outer_memory):
         parser.error("invalid outer or nested VM memory limit")
     if not args.command or args.command[0] != "--" or len(args.command) < 2:
@@ -2366,6 +2369,11 @@ def serve_outer(argv):
     if not destination.samefile(bundle):
         parser.error("service directory already refers to another provider bundle")
     engine = args.engine
+    if arch == "aarch64":
+        launch_arm = runpy.run_path(str(ROOT / "arm-parent-run.py"))["launch_arm"]
+        result = launch_arm(command, destination / "native-worker", args.outer_memory, args.child_memory,
+                            inherited=args.inherit, control=args.control, frontend=destination / "flexvm-pvkvm.img")
+        return 128 - result if result < 0 else result
     if engine != "tcg":
         worker = bundle / "native-worker"
         try:
