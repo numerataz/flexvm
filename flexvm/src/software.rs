@@ -3,7 +3,7 @@ use std::io::{BufReader, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -807,15 +807,7 @@ pub fn restore(host: Host, vm_name: &str, notify: Option<std::fs::File>) -> Resu
         let metadata = software_state::metadata(&path)?;
         let processes = Arc::new(qemu::Processes::default());
         setup_signals(processes.clone());
-        let config = qemu::Config {
-            control: qemu::Control::Serial,
-            kernel: PathBuf::new(),
-            qemu: String::new(),
-            vsock_backend: String::new(),
-            mem_mib: metadata.memory_mib,
-            vcpus: metadata.vcpus,
-            boot_timeout: Duration::from_secs(120),
-        };
+        let config = restore_config(&metadata);
         let _reservation = Reservation::new(&host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)?;
         let verified = software_state::open(&path, config.profiles()?)?;
         let manifest = verified.manifest.clone();
@@ -830,6 +822,33 @@ pub fn restore(host: Host, vm_name: &str, notify: Option<std::fs::File>) -> Resu
         let _ = file.send(&json!({"ok":false,"error":error.to_string()}));
     }
     result
+}
+
+fn restore_config(manifest: &software_state::Manifest) -> qemu::Config {
+    qemu::Config {
+        control: qemu::Control::Serial,
+        kernel: PathBuf::new(),
+        qemu: String::new(),
+        vsock_backend: String::new(),
+        mem_mib: manifest.memory_mib,
+        vcpus: manifest.vcpus,
+        boot_timeout: Duration::from_secs(120),
+    }
+}
+
+pub fn activate(host: Host, vm: &str, offer: &Path, trusted_engine: &Path) -> Result<i32> {
+    let name = host.take_name(vm, false)?;
+    let activation = software_state::transfer::bundle::activate::Activation::prepare(&name, offer)?;
+    let manifest = activation.manifest().clone();
+    let config = restore_config(&manifest);
+    let processes = Arc::new(qemu::Processes::default());
+    setup_signals(processes.clone());
+    let _reservation = Reservation::new(&host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)?;
+    let verified = activation.verify_inputs(&config.profiles()?, trusted_engine)?;
+    let machine = config.restore(verified, processes.clone())?;
+    let (generation, consumed) = activation.grant(processes.engine_ident()?)?;
+    let meta = manifest.image.clone();
+    serve(host, name, machine, processes, &config, &meta, Some(Resume { manifest, generation, consumed, notify: None }))
 }
 
 pub fn setup_signals(processes: Arc<qemu::Processes>) {

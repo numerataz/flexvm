@@ -846,7 +846,7 @@ mod tests {
             }
         }
         let guest = Mem(guest_mem(n));
-        let pages = CowPages { guest: &guest, cow: &cow, slow: || Duration::ZERO };
+        let pages = CowPages::new(&guest, &cow, || Duration::ZERO);
         // Not pages 1 and 3: the writer saved them before (the claims above stand for it).
         for (a, b) in [(0, 1), (2, 3), (4, 24)] {
             let mut buf = vec![0u8; (b - a) * PAGE_SIZE];
@@ -880,7 +880,7 @@ mod tests {
         let guest = Mem(guest_mem(n));
         for round in 0..4 {
             let cow = Cow::new(n, &vec![(0, n as u64, crate::uffd::REMOTE)]);
-            let pages = CowPages { guest: &guest, cow: &cow, slow: || Duration::ZERO };
+            let pages = CowPages::new(&guest, &cow, || Duration::ZERO);
             let out = Mutex::new(vec![0u8; n * PAGE_SIZE]);
             let rescued = AtomicUsize::new(0);
             // Save one unit before rescuing, then wait for a rescue before reading on: both paths must run.
@@ -938,7 +938,7 @@ mod tests {
             }
         }
         let guest = Mem(&mem);
-        let pages = CowPages { guest: &guest, cow: &cow, slow: || Duration::ZERO };
+        let pages = CowPages::new(&guest, &cow, || Duration::ZERO);
         crate::checkpoint::GuestPages::read(&pages, 0, &mut vec![0u8; PAGE_SIZE]).unwrap();
         room.set(3);
         assert!(!cow.over_budget());

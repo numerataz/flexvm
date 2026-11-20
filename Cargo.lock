@@ -156,6 +156,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "ring",
  "ruzstd",
  "serde",
  "serde_json",
@@ -165,6 +166,7 @@ dependencies = [
  "tokio-util",
  "ureq",
  "yamux",
+ "zeroize",
 ]
 
 [[package]]
