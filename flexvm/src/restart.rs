@@ -55,6 +55,13 @@ pub fn on_exit(rec: &mut Exited, ran: Duration) -> bool {
     }
 }
 
+/// A distro guest requested a clean reboot (`LINUX_REBOOT_CMD_RESTART`). Cold-boots the VM again
+/// after a short cool-down if it rebooted immediately.
+pub fn on_guest_reboot(rec: &mut Exited, ran: Duration) {
+    let delay = if ran >= crate::app::RAN_LONG { crate::app::FIRST_BACKOFF } else { Duration::from_secs(1) };
+    rec.restart_due = Some(now_ms() + delay.as_millis() as u64);
+}
+
 /// Leaves `restart-due NAME` behind, detached (it outlives the VM process that schedules it), its output to the
 /// VM's log.
 pub fn schedule(host: &Host, name: &str) -> Result<()> {
@@ -101,7 +108,10 @@ pub fn due(host: &Host, name: &str, start: impl Fn(&str) -> Result<()>) -> Resul
         if host.alive(name) {
             return Ok(());
         }
-        crate::info!("vm {name}: restarting ({})", rec.spec.restart.as_ref().map(|r| format!("{r}, restart {}", r.count)).unwrap_or_default());
+        crate::info!(
+            "vm {name}: restarting ({})",
+            rec.spec.restart.as_ref().map(|r| format!("{r}, restart {}", r.count)).unwrap_or_else(|| "guest reboot".into())
+        );
         match start(name) {
             Ok(()) => return Ok(()),
             Err(e) => {
@@ -225,6 +235,18 @@ mod tests {
         assert!(!on_exit(&mut rec(0, "on-failure"), Duration::ZERO), "a success");
         assert!(on_exit(&mut rec(0, "always"), Duration::ZERO));
         assert!(!on_exit(&mut rec(3, "no"), Duration::ZERO));
+    }
+
+    #[test]
+    fn guest_reboot_schedules_cold_restart_without_restart_policy() {
+        let mut r = rec(0, "no");
+        on_guest_reboot(&mut r, crate::app::RAN_LONG);
+        let due = r.restart_due.unwrap();
+        assert!(due >= now_ms() && due <= now_ms() + 200, "{due}");
+        let mut fast = rec(0, "no");
+        on_guest_reboot(&mut fast, Duration::from_millis(50));
+        let due = fast.restart_due.unwrap();
+        assert!(due >= now_ms() + 800 && due <= now_ms() + 1200, "{due}");
     }
 
     #[test]
