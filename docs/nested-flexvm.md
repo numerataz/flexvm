@@ -41,3 +41,47 @@ This acceptance does not prove accelerated nested-state migration, cross-host
 hierarchy migration, shared scheduling or parent-enforced child budgets. It does
 not close #1327 or #1358. The explicit one-vCPU outer profile also does not resolve
 the separate intermittent two-vCPU x86 software failure in #1401.
+
+## Docker inside nested FlexVM
+
+`scripts/compat/workloads/nested-flexvm-docker.sh` runs stock `docker:27-dind`
+inside a nested FlexVM child launched by the static musl `flexvm` CLI inside a
+software-backed outer guest (no host `/dev/kvm` or `/dev/vhost-vsock`).
+
+Prepare a local OCI archive of `docker:27-dind` for the target architecture
+(under 256 MiB, fitting the `/nested-input/` seed budget) and run
+`software-workload.py` with the patched TCG QEMU (`scripts/build-qemu.sh`) and
+3072 MiB outer memory:
+
+```sh
+skopeo copy --override-os linux --override-arch amd64 \
+  docker://docker.io/library/docker:27-dind \
+  oci-archive:/var/tmp/docker-dind.tar:docker:27-dind
+
+sudo env PATH="/path/to/patched-qemu/bin:$PATH" \
+  python3 scripts/compat/software-workload.py \
+  --bin target/release/flexvm \
+  --kernel /path/to/artifacts/vmlinux \
+  --boot systemd \
+  --image /path/to/software-distro-image \
+  --workload scripts/compat/workloads/nested-flexvm-docker.sh \
+  --mem 3072 --vcpus 1 --timeout 2400 --poweroff-timeout 120 \
+  --require virtualization.kvm \
+  --seed target/x86_64-unknown-linux-musl/release/flexvm /nested-input/flexvm \
+  --seed /path/to/artifacts/firecracker /nested-input/firecracker \
+  --seed /path/to/artifacts/vmlinux /nested-input/vmlinux \
+  --seed /path/to/artifacts/kernel-modules.tar.gz /nested-input/kernel-modules.tar.gz \
+  --seed /var/tmp/docker-dind.tar /nested-input/docker-dind.tar \
+  --output /tmp/nested-flexvm-docker-report
+```
+
+Inside the outer guest, the workload configures IPv4 forwarding, NAT, and DNS for
+the inner VM's TAP, pulls `/nested-input/docker-dind.tar` (`--mem 1024 --max 1024
+--plug 0 --vcpus 1`), and verifies Docker 27.5.1 with native `overlay2` on tmpfs,
+cgroup v2 limits (`memory.max`, `cpu.max`, `pids.max`), named volumes, bind
+mounts, uncached BuildKit image builds, custom bridge DNS, published ports, and
+live container continuity (unchanged PID, random RAM cookie, advancing counter,
+and HTTP/volume data) across inner `pause`/`unpause`, inner `stop`/`start`,
+outer `pause`/`unpause`, outer `stop`/`start` in a fresh emulator, restore
+without the runtime service, and clean OS poweroff. Host traces verify zero
+`/dev/kvm`, `/dev/vhost-vsock`, or host module-loading accesses.
