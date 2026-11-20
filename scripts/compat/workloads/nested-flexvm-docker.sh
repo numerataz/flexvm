@@ -19,50 +19,58 @@ traffic_control() {
 }
 
 check_live_container() {
-    test "$(docker info --format '{{.Driver}}')" = overlay2
-    test "$(docker info --format '{{.CgroupVersion}}')" = 2
-    test "$(docker inspect --format '{{.State.Running}} {{.State.Pid}}' nested-srv)" = "true $(cat "$base/srv-pid")"
+    expected_pid=$(cat "$base/srv-pid")
     cookie=$(awk '{print $1}' "$base/probe")
-    dexec docker exec nested-srv sh -ec '
-        expected=$1
-        set -- $(cat /tmp/probe)
-        test "$1" = "$expected"
-        before=$2
-        i=0
-        while [ "$i" -lt 50 ]; do
-            i=$((i + 1))
+    dexec sh -ec '
+        expected_pid=$1 cookie=$2 nonce=$3
+        test "$(docker info --format "{{.Driver}} {{.CgroupVersion}}")" = "overlay2 2"
+        test "$(docker inspect --format "{{.State.Running}} {{.State.Pid}}" nested-srv)" = "true $expected_pid"
+        probe=$(docker exec nested-srv sh -ec '\''
+            expected=$1
             set -- $(cat /tmp/probe)
             test "$1" = "$expected"
-            if [ "$2" -gt "$before" ]; then printf "%s %s\n" "$1" "$2"; exit 0; fi
-            sleep .2
-        done
-        echo "nested docker container counter did not advance" >&2
-        exit 1' sh "$cookie" > "$base/probe-now"
-    test "$(docker run --rm --network nested-net flexvm-nested-base:local wget -qO- http://nested-srv:8080/marker)" = "$nonce"
-    test "$(dexec wget -qO- http://127.0.0.1:18080/marker)" = "$nonce"
-    test "$(docker run --rm -v nested-data:/data flexvm-nested-base:local cat /data/marker)" = "$nonce"
+            before=$2
+            i=0
+            while [ "$i" -lt 50 ]; do
+                i=$((i + 1))
+                set -- $(cat /tmp/probe)
+                test "$1" = "$expected"
+                if [ "$2" -gt "$before" ]; then printf "%s %s\n" "$1" "$2"; exit 0; fi
+                sleep .2
+            done
+            echo "nested docker container counter did not advance" >&2
+            exit 1'\'' sh "$cookie")
+        test "$(wget -qO- http://127.0.0.1:18080/marker)" = "$nonce"
+        docker run --rm --network nested-net -v nested-data:/data -e "NONCE=$nonce" \
+            flexvm-nested-base:local sh -ec '\''
+                test "$(wget -qO- http://nested-srv:8080/marker)" = "$NONCE"
+                test "$(cat /data/marker)" = "$NONCE"'\''
+        printf "%s\n" "$probe"
+    ' sh "$expected_pid" "$cookie" "$nonce" > "$base/probe-now"
 }
 
 case $step in
 prepare)
     if ! (command -v mkfs.ext4 >/dev/null && command -v debugfs >/dev/null &&
           command -v python3 >/dev/null && command -v tc >/dev/null &&
-          command -v unshare >/dev/null && command -v iptables >/dev/null); then
+          command -v unshare >/dev/null); then
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
-        apt-get install -y -qq --no-install-recommends e2fsprogs python3 iproute2 util-linux iptables
+        apt-get install -y -qq --no-install-recommends e2fsprogs python3 iproute2 util-linux
     fi
     traffic_control
     test -c /dev/kvm
     test -c /dev/net/tun
-    # Provide outbound forwarding/NAT and DNS for the nested FlexVM's TAP.
+    # Enable forwarding (and NAT when iptables is present) plus DNS for the inner TAP.
     sysctl -w net.ipv4.ip_forward=1
-    iptables -t nat -C POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null ||
-        iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-    iptables -C FORWARD -i eth0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null ||
-        iptables -A FORWARD -i eth0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
-    iptables -C FORWARD -o eth0 -j ACCEPT 2>/dev/null ||
-        iptables -A FORWARD -o eth0 -j ACCEPT
+    if command -v iptables >/dev/null; then
+        iptables -t nat -C POSTROUTING -o eth0 -j MASQUERADE 2>/dev/null ||
+            iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+        iptables -C FORWARD -i eth0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT 2>/dev/null ||
+            iptables -A FORWARD -i eth0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+        iptables -C FORWARD -o eth0 -j ACCEPT 2>/dev/null ||
+            iptables -A FORWARD -o eth0 -j ACCEPT
+    fi
     mkdir -p "$base/state/artifacts"
     python3 - "$base/state/host.json" <<'PY'
 import json, pathlib, sys
@@ -80,8 +88,10 @@ PY
         cp "/nested-input/$artifact" "$base/state/artifacts/$artifact"
         sha256sum "$base/state/artifacts/$artifact" > "$base/state/artifacts/$artifact.sha256"
     done
-    cli pull /nested-input/docker-dind.tar --tag nested-docker --mem 1024 --max 1024 --plug 0 --vcpus 1
-    cli run -d --name docker-vm nested-docker
+    # Let the inner VM use elastic memory up to the outer guest's RAM (no --plug 0).
+    cli pull /nested-input/docker-dind.tar --tag nested-docker --vcpus 1
+    # Local Unix socket access via `flexvm exec` does not need 4096-bit TLS cert generation.
+    cli run -d --name docker-vm -e DOCKER_TLS_CERTDIR= nested-docker
     ready=false
     for _ in $(seq 1 180); do
         if docker info >/dev/null 2>&1; then ready=true; break; fi

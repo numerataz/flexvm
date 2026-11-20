@@ -50,8 +50,10 @@ software-backed outer guest (no host `/dev/kvm` or `/dev/vhost-vsock`).
 
 Prepare a local OCI archive of `docker:27-dind` for the target architecture
 (under 256 MiB, fitting the `/nested-input/` seed budget) and run
-`software-workload.py` with the patched TCG QEMU (`scripts/build-qemu.sh`) and
-3072 MiB outer memory:
+`software-workload.py` with the patched TCG QEMU (`scripts/build-qemu.sh`). Both
+the outer software VM and inner Firecracker VM use elastic `virtio-mem` memory
+(booting small at 384 MiB base and growing/shrinking dynamically; `--mem` is an
+optional maximum cap, defaulting to host RAM):
 
 ```sh
 skopeo copy --override-os linux --override-arch amd64 \
@@ -65,7 +67,7 @@ sudo env PATH="/path/to/patched-qemu/bin:$PATH" \
   --boot systemd \
   --image /path/to/software-distro-image \
   --workload scripts/compat/workloads/nested-flexvm-docker.sh \
-  --mem 3072 --vcpus 1 --timeout 2400 --poweroff-timeout 120 \
+  --mem 4096 --vcpus 1 --timeout 2400 --poweroff-timeout 120 \
   --require virtualization.kvm \
   --seed target/x86_64-unknown-linux-musl/release/flexvm /nested-input/flexvm \
   --seed /path/to/artifacts/firecracker /nested-input/firecracker \
@@ -75,13 +77,14 @@ sudo env PATH="/path/to/patched-qemu/bin:$PATH" \
   --output /tmp/nested-flexvm-docker-report
 ```
 
-Inside the outer guest, the workload configures IPv4 forwarding, NAT, and DNS for
-the inner VM's TAP, pulls `/nested-input/docker-dind.tar` (`--mem 1024 --max 1024
---plug 0 --vcpus 1`), and verifies Docker 27.5.1 with native `overlay2` on tmpfs,
-cgroup v2 limits (`memory.max`, `cpu.max`, `pids.max`), named volumes, bind
-mounts, uncached BuildKit image builds, custom bridge DNS, published ports, and
-live container continuity (unchanged PID, random RAM cookie, advancing counter,
-and HTTP/volume data) across inner `pause`/`unpause`, inner `stop`/`start`,
-outer `pause`/`unpause`, outer `stop`/`start` in a fresh emulator, restore
-without the runtime service, and clean OS poweroff. Host traces verify zero
-`/dev/kvm`, `/dev/vhost-vsock`, or host module-loading accesses.
+Inside the outer guest, the workload configures IPv4 forwarding (and NAT when
+`iptables` is present) plus DNS for the inner VM's TAP, pulls
+`/nested-input/docker-dind.tar` with default elastic memory (`--vcpus 1`, no
+`--plug 0`), and verifies Docker 27.5.1 with native `overlay2` on tmpfs, cgroup
+v2 limits (`memory.max`, `cpu.max`, `pids.max`), named volumes, bind mounts,
+uncached BuildKit image builds, custom bridge DNS, published ports, and live
+container continuity (unchanged PID, random RAM cookie, advancing counter, and
+HTTP/volume data) across inner `pause`/`unpause`, inner `stop`/`start`, outer
+`pause`/`unpause`, outer `stop`/`start` in a fresh emulator, restore without the
+runtime service, and clean OS poweroff. Host traces verify zero `/dev/kvm`,
+`/dev/vhost-vsock`, or host module-loading accesses.

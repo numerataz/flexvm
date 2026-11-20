@@ -110,7 +110,7 @@ pub(crate) fn start_distro() -> io::Result<()> {
     Ok(())
 }
 
-fn meminfo() -> Option<(u64, u64)> {
+pub(crate) fn meminfo() -> Option<(u64, u64)> {
     read_meminfo(File::open("/proc/meminfo").ok()?)
 }
 

@@ -358,6 +358,64 @@ fn reserve_for(total_mib: u64) -> u64 {
     (total_mib / 16).clamp(256, 4096)
 }
 
+/// True when this host is itself a guest backed by a `virtio-mem` device whose
+/// outer hypervisor can plug more RAM on demand when `MemAvailable` drops.
+fn has_virtio_mem() -> bool {
+    std::fs::read_dir("/sys/bus/virtio/drivers/virtio_mem")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .any(|entry| entry.file_name().to_str().is_some_and(|n| n.starts_with("virtio")))
+}
+
+/// Inside a `virtio-mem` guest, `MemAvailable` reflects only currently plugged RAM.
+/// Briefly create bounded memory pressure (keeping at least 48 MiB free) so the outer
+/// hypervisor can admit and plug additional RAM against the physical host's reserve.
+fn request_virtio_mem_growth(need_mib: u64, deadline: Option<std::time::Instant>) {
+    if !has_virtio_mem() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let max_wait = now + std::time::Duration::from_secs(15);
+    let limit = deadline.map_or(max_wait, |d| d.min(max_wait));
+    for _ in 0..6 {
+        if std::time::Instant::now() >= limit {
+            break;
+        }
+        let Some(avail_mib) = crate::util::proc_kb("/proc/meminfo", "MemAvailable").map(|b| b >> 20) else { break };
+        let Some(total_mib) = crate::util::proc_kb("/proc/meminfo", "MemTotal").map(|b| b >> 20) else { break };
+        if avail_mib >= need_mib {
+            break;
+        }
+        let probe_mib = avail_mib.saturating_sub(48).min(2048) as usize;
+        if probe_mib < 16 {
+            break;
+        }
+        let mut probe = vec![0u8; probe_mib << 20];
+        for off in (0..probe.len()).step_by(4096) {
+            // Volatile write prevents release-mode DSE from eliding the page faults.
+            unsafe { std::ptr::write_volatile(probe.as_mut_ptr().add(off), 1) };
+        }
+        std::hint::black_box(&probe);
+        let step_limit = limit.min(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        let mut grew = false;
+        while std::time::Instant::now() < step_limit {
+            if let Some(now_total) = crate::util::proc_kb("/proc/meminfo", "MemTotal").map(|b| b >> 20) {
+                if now_total > total_mib {
+                    grew = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        drop(probe);
+        if !grew {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// The underlay addresses (one of each family, either may be missing) and announce device
 /// derived toward the peers.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -2704,6 +2762,9 @@ impl Host {
             // A guard further out would keep the lock held through the wait.
             debug_assert_eq!(DEPTH.with(|d| d.get()), 0, "waiting for VM processes under the host lock");
             crate::hostmem::release_kept_admitting(self, deadline);
+            if floor == Floor::Reserve && !cfg!(test) && available().is_some_and(|a| a < need) {
+                request_virtio_mem_growth(need, deadline);
+            }
             released = true;
         }
     }

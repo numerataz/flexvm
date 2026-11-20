@@ -2478,12 +2478,15 @@ fn software(args: &Args, src: &str) -> Result<i32> {
     if installed {
         artifacts::ensure(&[(&kernel, &artifacts::KERNEL)])?;
     }
+    let cap_mib: Option<u32> = args.get("mem").map(|s| s.parse::<u32>().map_err(|_| format!("bad --mem {s:?}"))).transpose()?;
+    let (mem_mib, max_mib) = qemu::Config::elastic_limits(cap_mib, host_ram_mib())?;
     let config = qemu::Config {
         control,
         kernel,
         qemu: args.get("qemu").map(String::from).unwrap_or_else(|| format!("qemu-system-{}", std::env::consts::ARCH)),
         vsock_backend: args.get("vsock-backend").unwrap_or("vhost-device-vsock").into(),
-        mem_mib: args.parse_or("mem", 512)?,
+        mem_mib,
+        max_mib,
         vcpus: args.parse_or("vcpus", 1)?,
         boot_timeout: Duration::from_secs(args.parse_or("timeout", 90)?),
     };
@@ -2516,7 +2519,7 @@ fn software(args: &Args, src: &str) -> Result<i32> {
             Ok((host, lock))
         })
         .transpose()?;
-    let _reservation =
+    let reservation =
         named.as_ref().map(|(host, _)| software::Reservation::new(host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)).transpose()?;
     let disks = if args.has("disk") {
         let (host, _) = named.as_ref().ok_or("--disk requires a named software VM")?;
@@ -2531,7 +2534,7 @@ fn software(args: &Args, src: &str) -> Result<i32> {
     };
     drop(_cache_lock);
     if let Some((host, lock)) = named {
-        return software::run(host, lock, machine, processes, &config, &meta);
+        return software::run(host, lock, machine, processes, &config, &meta, reservation.unwrap());
     }
 
     if !meta.boot.is_app() {

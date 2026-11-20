@@ -93,6 +93,10 @@ impl Disk {
     }
 }
 
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Manifest {
@@ -102,6 +106,10 @@ pub struct Manifest {
     pub snapshot_id: String,
     pub identity_generation: u64,
     pub memory_mib: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_memory_mib: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub plugged_mib: u64,
     pub vcpus: u32,
     pub paused: bool,
     pub terminal: bool,
@@ -1096,6 +1104,8 @@ mod tests {
             snapshot_id: "abcdef0123456789abcdef0123456789".into(),
             identity_generation: 1,
             memory_mib: 512,
+            max_memory_mib: None,
+            plugged_mib: 0,
             vcpus: 1,
             paused: false,
             terminal: true,

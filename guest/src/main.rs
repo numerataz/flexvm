@@ -705,7 +705,7 @@ fn accept_request(stream: File, statuses: &Statuses, sessions: &session::Session
         }
         return;
     }
-    let permit = match admission.filter(|_| !matches!(verb, "PING" | "FORKS" | "SESSIONS" | "APPSTATUS" | "LOGS" | "FENCE")) {
+    let permit = match admission.filter(|_| !matches!(verb, "PING" | "FORKS" | "SESSIONS" | "APPSTATUS" | "LOGS" | "FENCE" | "MEMINFO")) {
         Some(gate) => match gate.enter() {
             Ok(permit) => Some(permit),
             Err(e) => return drop(fail(&stream, e)),
@@ -714,7 +714,7 @@ fn accept_request(stream: File, statuses: &Statuses, sessions: &session::Session
     };
     // START is on every start's critical path, where a new thread costs ms: quick requests are answered inline.
     // Non-blocking session control verbs (FENCE, SESSIONS, CLOSE, RELEASE) also run inline without a thread (#1338).
-    if ["PING", "START ", "START6 ", "CLOCK ", "FORKS", "HOSTNAME ", "FENCE", "SESSIONS", "CLOSE ", "RELEASE "].iter().any(|v| line.starts_with(v)) {
+    if ["PING", "START ", "START6 ", "CLOCK ", "FORKS", "HOSTNAME ", "FENCE", "SESSIONS", "CLOSE ", "RELEASE ", "MEMINFO"].iter().any(|v| line.starts_with(v)) {
         let _ = handle(&stream, &line, statuses, sessions);
         return;
     }
@@ -869,6 +869,7 @@ fn handle(out: &File, line: &str, statuses: &Statuses, sessions: &session::Sessi
     let (verb, arg) = line.split_once(' ').unwrap_or((line, ""));
     let reply = match verb {
         "PING" => Ok("pong".to_string()),
+        "MEMINFO" => mem::meminfo().map(|(total, avail)| format!("ok {avail} {total}")).ok_or_else(|| "cannot read /proc/meminfo".into()),
         // Acked only once the clock is set, so "ok" means it is.
         "START" | "START6" => match parse_start(verb == "START6", arg) {
             Some(s) => net::configure(s.ip, s.ip6, &s.dns).map_err(|e| e.to_string()).and_then(|()| set_clock(s.now)).map(|_| "ok".into()),

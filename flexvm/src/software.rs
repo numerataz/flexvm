@@ -21,30 +21,84 @@ const DETACHED: u8 = 1;
 const EXITED: u8 = 2;
 const OUTPUT_FAILED: u8 = 3;
 
-/// Conservatively hold the entire fixed-RAM grant for this initial owner path.
-/// Unlike an ordinary start grant it must not expire while RAM is still promised.
+/// Hold the admitted RAM grant for a software VM's lifetime, growing as
+/// elastic virtio-mem steps are admitted against the host reserve.
 pub struct Reservation {
     host: Host,
     grant: u64,
-    hold: Option<crate::host::Hold>,
+    holds: Vec<crate::host::Hold>,
 }
 
 impl Reservation {
     pub fn new(host: &Host, mib: u32, deadline: Instant, processes: &qemu::Processes) -> Result<Self> {
         let (grant, hold) = host.grant_start(u64::from(mib), crate::host::Floor::Reserve, true, Some(deadline))?;
-        let reservation = Self { host: host.clone(), grant, hold };
-        if let Some(hold) = &reservation.hold {
+        let mut holds = Vec::new();
+        if let Some(hold) = hold {
             processes.inherit_lease(hold.inherit()?);
+            holds.push(hold);
         }
-        Ok(reservation)
+        Ok(Self { host: host.clone(), grant, holds })
+    }
+
+    pub fn grow(&mut self, add_mib: u64, deadline: Instant, processes: &qemu::Processes) -> Result<()> {
+        let (grant, hold) = self.host.grant_start(add_mib, crate::host::Floor::Reserve, true, Some(deadline))?;
+        self.grant = self.grant.saturating_add(grant);
+        if let Some(hold) = hold {
+            processes.inherit_lease(hold.inherit()?);
+            self.holds.push(hold);
+        }
+        Ok(())
+    }
+
+    pub fn shrink(&mut self, refund_mib: u64) {
+        let actual = refund_mib.min(self.grant);
+        if actual == 0 {
+            return;
+        }
+        self.grant -= actual;
+        self.host.refund_by(actual, Some(Instant::now() + Duration::from_secs(2)));
     }
 }
 
 impl Drop for Reservation {
     fn drop(&mut self) {
-        drop(self.hold.take());
+        self.holds.clear();
         self.host.refund_by(self.grant, Some(Instant::now() + Duration::from_secs(2)));
     }
+}
+
+const SHRINK_COOLDOWN: Duration = Duration::from_secs(5);
+
+/// Decide whether a software VM should plug another 2 MiB-aligned virtio-mem step.
+pub(crate) fn elastic_step(avail_mib: u64, total_mib: u64, base_mib: u32, plugged_mib: u64, max_mib: u32) -> Option<u64> {
+    let cap = u64::from(max_mib);
+    let current = u64::from(base_mib).saturating_add(plugged_mib);
+    if current >= cap {
+        return None;
+    }
+    let threshold = (total_mib / 4).clamp(64, 256);
+    if avail_mib >= threshold {
+        return None;
+    }
+    let step = ((current / 2).clamp(128, 1024) / 2) * 2;
+    let add = step.min(cap - current);
+    (add >= 2).then_some(add)
+}
+
+/// Decide whether a software VM has enough excess free memory to unplug 2 MiB-aligned virtio-mem blocks.
+pub(crate) fn elastic_shrink_step(avail_mib: u64, total_mib: u64, plugged_mib: u64) -> Option<u64> {
+    if plugged_mib < 2 {
+        return None;
+    }
+    let high_water = (total_mib / 2).max(256);
+    if avail_mib <= high_water {
+        return None;
+    }
+    let keep_free = (total_mib / 3).clamp(128, 512);
+    let reclaim = (avail_mib.saturating_sub(keep_free) / 2) * 2;
+    let sub = reclaim.min((plugged_mib / 2) * 2);
+    let min_step = plugged_mib.min(64);
+    (sub >= min_step && sub >= 2).then_some(sub)
 }
 
 /// Own flags for pipes/ttys; changing the inherited open-file description would
@@ -143,6 +197,10 @@ struct Owner {
     host_id: String,
     image: image::ImageMeta,
     memory_mib: u32,
+    max_memory_mib: u32,
+    plugged_mib: AtomicU64,
+    last_grow: Mutex<Option<Instant>>,
+    reservation: Mutex<Reservation>,
     vcpus: u32,
     consumed: Option<software_state::Consumed>,
     pending: Mutex<Option<(PathBuf, String)>>,
@@ -156,6 +214,72 @@ impl Owner {
         self.changed.notify_all();
         let entry = self.entry.lock().unwrap().clone();
         self.name.publish(&entry)
+    }
+
+    fn adjust_memory(&self) {
+        let Ok(_op) = self.op.try_read() else { return };
+        if self.ended.load(Ordering::SeqCst) || self.entry.lock().unwrap().state != "running" {
+            return;
+        }
+        let Ok((avail_kib, total_kib)) = self.machine.meminfo(Instant::now() + Duration::from_secs(2)) else { return };
+        let (avail_mib, total_mib) = (avail_kib >> 10, total_kib >> 10);
+        let plugged = self.plugged_mib.load(Ordering::SeqCst);
+        if let Some(add) = elastic_step(avail_mib, total_mib, self.memory_mib, plugged, self.max_memory_mib) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            if let Err(error) = self.reservation.lock().unwrap().grow(add, deadline, &self.processes) {
+                crate::log!("software VM {}: elastic memory +{add} MiB refused: {error}", self.name.name);
+                return;
+            }
+            let next = plugged + add;
+            if let Err(error) = self.machine.set_virtio_mem(next << 20, deadline) {
+                self.reservation.lock().unwrap().shrink(add);
+                crate::log!("software VM {}: virtio-mem resize to {} MiB failed: {error}", self.name.name, u64::from(self.memory_mib) + next);
+                return;
+            }
+            *self.last_grow.lock().unwrap() = Some(Instant::now());
+            self.update_plugged(next);
+            crate::info!("software VM {}: grew memory +{add} MiB (plugged {next} MiB, ceiling {} MiB)", self.name.name, self.max_memory_mib);
+            return;
+        }
+        if self.last_grow.lock().unwrap().is_some_and(|t| t.elapsed() < SHRINK_COOLDOWN) {
+            return;
+        }
+        if let Some(sub) = elastic_shrink_step(avail_mib, total_mib, plugged) {
+            let target = plugged - sub;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            if let Err(error) = self.machine.set_virtio_mem(target << 20, deadline) {
+                crate::log!("software VM {}: virtio-mem shrink to {} MiB failed: {error}", self.name.name, u64::from(self.memory_mib) + target);
+                return;
+            }
+            let mut actual = plugged;
+            for _ in 0..5 {
+                std::thread::sleep(Duration::from_millis(200));
+                if let Ok(bytes) = self.machine.virtio_mem_size(Instant::now() + Duration::from_secs(2)) {
+                    actual = (bytes >> 20).min(plugged);
+                    if actual <= target {
+                        break;
+                    }
+                }
+            }
+            if actual < plugged {
+                let freed = plugged - actual;
+                self.reservation.lock().unwrap().shrink(freed);
+                self.update_plugged(actual);
+                crate::info!("software VM {}: shrunk memory -{freed} MiB (plugged {actual} MiB)", self.name.name);
+            }
+        }
+    }
+
+    fn update_plugged(&self, next: u64) {
+        self.plugged_mib.store(next, Ordering::SeqCst);
+        let entry = {
+            let mut entry = self.entry.lock().unwrap();
+            if let Backend::QemuTcg { ram_mib, .. } = &mut entry.backend {
+                *ram_mib = self.memory_mib.saturating_add(next as u32);
+            }
+            entry.clone()
+        };
+        let _ = self.name.publish(&entry);
     }
 
     fn switch(&self, paused: bool) -> Result<Value> {
@@ -372,6 +496,8 @@ impl Owner {
                 snapshot_id: snapshot_id.clone(),
                 identity_generation: entry.gen,
                 memory_mib: self.memory_mib,
+                max_memory_mib: (self.max_memory_mib > self.memory_mib).then_some(self.max_memory_mib),
+                plugged_mib: self.plugged_mib.load(Ordering::SeqCst),
                 vcpus: self.vcpus,
                 paused: was_paused,
                 terminal: true,
@@ -575,22 +701,37 @@ struct Resume {
     notify: Option<Startup>,
 }
 
-pub fn run(host: Host, name: NameLock, machine: qemu::Machine, processes: Arc<qemu::Processes>, config: &qemu::Config, meta: &image::ImageMeta) -> Result<i32> {
-    serve(host, name, machine, processes, config, meta, None)
-}
-
-fn serve(
-    host: Host,
+pub fn run(
+    _host: Host,
     name: NameLock,
     machine: qemu::Machine,
     processes: Arc<qemu::Processes>,
     config: &qemu::Config,
     meta: &image::ImageMeta,
+    reservation: Reservation,
+) -> Result<i32> {
+    serve(name, machine, processes, config, meta, reservation, None)
+}
+
+fn serve(
+    name: NameLock,
+    machine: qemu::Machine,
+    processes: Arc<qemu::Processes>,
+    config: &qemu::Config,
+    meta: &image::ImageMeta,
+    reservation: Reservation,
     resumed: Option<Resume>,
 ) -> Result<i32> {
+    let host = reservation.host.clone();
     let machine = Arc::new(machine);
     let epoch = u64::from_str_radix(&util::random_hex(8)?, 16)?;
     let deadline = Instant::now() + if meta.boot.is_app() { guest::TIMEOUT } else { config.boot_timeout };
+    let max_memory_mib = config.effective_max_mib();
+    let initial_plugged = match (&resumed, max_memory_mib > config.mem_mib) {
+        (Some(r), true) => machine.virtio_mem_size(deadline).map(|b| b >> 20).unwrap_or(r.manifest.plugged_mib),
+        (Some(r), false) => r.manifest.plugged_mib,
+        (None, _) => 0,
+    };
     let (generation, identity_generation, vm_id, main_id, main_reader, offset, claim, consumed, notify) = match resumed {
         Some(resumed) => {
             // STARTED was synchronized before this first guest instruction.
@@ -653,14 +794,14 @@ fn serve(
             image: meta.source.clone(),
             digest: meta.digest.clone(),
             argv: meta.argv.clone(),
-            ram_mib: config.mem_mib,
+            ram_mib: config.mem_mib.saturating_add(initial_plugged as u32),
         },
         name: name.name.clone(),
         ident: Ident::me(),
         ip: Some(machine.ip()),
         gen: identity_generation,
         vcpus: config.vcpus,
-        max_mib: u64::from(config.mem_mib),
+        max_mib: u64::from(max_memory_mib),
         state: "running".into(),
         cmd: meta.boot.is_app(),
         ..Default::default()
@@ -695,6 +836,10 @@ fn serve(
         host_id: local_host_id,
         image: meta.clone(),
         memory_mib: config.mem_mib,
+        max_memory_mib,
+        plugged_mib: AtomicU64::new(initial_plugged),
+        last_grow: Mutex::new(None),
+        reservation: Mutex::new(reservation),
         vcpus: config.vcpus,
         consumed,
         pending: Mutex::new(None),
@@ -722,6 +867,20 @@ fn serve(
             }
         }
     })?;
+    let mem_watcher = if max_memory_mib > config.mem_mib {
+        let weak = Arc::downgrade(&owner);
+        Some(std::thread::Builder::new().name("software-mem".into()).spawn(move || {
+            while let Some(owner) = weak.upgrade() {
+                if owner.ended.load(Ordering::SeqCst) {
+                    break;
+                }
+                owner.adjust_memory();
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        })?)
+    } else {
+        None
+    };
     let serving = owner.clone();
     let server = std::thread::Builder::new().name("software-owner".into()).spawn(move || {
         while !serving.ended.load(Ordering::SeqCst) {
@@ -772,6 +931,9 @@ fn serve(
         owner.processes.stop();
     }
     let _ = signals.join();
+    if let Some(watcher) = mem_watcher {
+        let _ = watcher.join();
+    }
     let _ = server.join();
     if owner.suspended.load(Ordering::SeqCst) && crate::template::interrupted_signal().is_none() {
         let deadline = Instant::now() + guest::TIMEOUT;
@@ -810,7 +972,8 @@ pub fn restore(host: Host, vm_name: &str, notify: Option<std::fs::File>) -> Resu
         let processes = Arc::new(qemu::Processes::default());
         setup_signals(processes.clone());
         let config = restore_config(&metadata);
-        let _reservation = Reservation::new(&host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)?;
+        let admitted_mib = config.mem_mib.saturating_add(metadata.plugged_mib as u32);
+        let reservation = Reservation::new(&host, admitted_mib, Instant::now() + config.boot_timeout, &processes)?;
         let profiles = config.profiles_for_disk_ids(metadata.disks.iter().map(|disk| disk.volume_id.as_str()))?;
         let verified = software_state::open(&path, profiles)?;
         let disks = verified.manifest.open_disks(&host.state)?;
@@ -820,7 +983,7 @@ pub fn restore(host: Host, vm_name: &str, notify: Option<std::fs::File>) -> Resu
         let machine = config.restore(verified, processes.clone(), disks)?;
         let consumed = prepared.grant(processes.engine_ident()?)?;
         let meta = manifest.image.clone();
-        serve(host, name, machine, processes, &config, &meta, Some(Resume { manifest, generation, consumed, notify }))
+        serve(name, machine, processes, &config, &meta, reservation, Some(Resume { manifest, generation, consumed, notify }))
     })();
     if let (Err(error), Some(file)) = (&result, failure_notify) {
         let _ = file.send(&json!({"ok":false,"error":error.to_string()}));
@@ -835,6 +998,7 @@ fn restore_config(manifest: &software_state::Manifest) -> qemu::Config {
         qemu: String::new(),
         vsock_backend: String::new(),
         mem_mib: manifest.memory_mib,
+        max_mib: manifest.max_memory_mib.unwrap_or(manifest.memory_mib),
         vcpus: manifest.vcpus,
         boot_timeout: Duration::from_secs(120),
     }
@@ -847,12 +1011,13 @@ pub fn activate(host: Host, vm: &str, offer: &Path, trusted_engine: &Path) -> Re
     let config = restore_config(&manifest);
     let processes = Arc::new(qemu::Processes::default());
     setup_signals(processes.clone());
-    let _reservation = Reservation::new(&host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)?;
+    let admitted_mib = config.mem_mib.saturating_add(manifest.plugged_mib as u32);
+    let reservation = Reservation::new(&host, admitted_mib, Instant::now() + config.boot_timeout, &processes)?;
     let verified = activation.verify_inputs(&config.profiles()?, trusted_engine)?;
     let machine = config.restore(verified, processes.clone(), Vec::new())?;
     let (generation, consumed) = activation.grant(processes.engine_ident()?)?;
     let meta = manifest.image.clone();
-    serve(host, name, machine, processes, &config, &meta, Some(Resume { manifest, generation, consumed, notify: None }))
+    serve(name, machine, processes, &config, &meta, reservation, Some(Resume { manifest, generation, consumed, notify: None }))
 }
 
 pub fn setup_signals(processes: Arc<qemu::Processes>) {
@@ -907,5 +1072,36 @@ pub fn stop(host: &Host, name: &str, expected: &Ident) -> Result<()> {
     match result {
         Err(error) => Err(error),
         Ok(_) => Err("software VM did not publish a verified retirement".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn elastic_step_grows_under_pressure_and_respects_ceiling() {
+        // Plenty of free RAM: no growth.
+        assert_eq!(elastic_step(300, 512, 512, 0, 2048), None);
+        // Under 25% of 512 MiB (threshold 128 MiB): grows by 256 MiB (half of 512).
+        assert_eq!(elastic_step(80, 512, 512, 0, 2048), Some(256));
+        // Near ceiling: clamped to remaining room (even 2 MiB multiple).
+        assert_eq!(elastic_step(32, 1900, 512, 1400, 2048), Some(136));
+        // At ceiling: no growth.
+        assert_eq!(elastic_step(16, 2048, 512, 1536, 2048), None);
+        // Fixed RAM (max == base): never grows.
+        assert_eq!(elastic_step(16, 512, 512, 0, 512), None);
+    }
+
+    #[test]
+    fn elastic_shrink_unplugs_excess_and_avoids_thrashing() {
+        // Nothing plugged: nothing to shrink.
+        assert_eq!(elastic_shrink_step(400, 512, 0), None);
+        // Below 50% available: do not shrink.
+        assert_eq!(elastic_shrink_step(400, 1024, 512), None);
+        // 800 MiB free out of 1024 MiB (keep 341 MiB -> reclaim 458 MiB, 2 MiB aligned).
+        assert_eq!(elastic_shrink_step(800, 1024, 512), Some(458));
+        // Clamped to plugged_mib.
+        assert_eq!(elastic_shrink_step(900, 1024, 128), Some(128));
     }
 }
