@@ -302,7 +302,12 @@ impl Config {
     pub fn elastic_limits(cap_mib: Option<u32>, host_ram_mib: u64) -> Result<(u32, u32)> {
         let cap = match cap_mib {
             Some(n) => n,
-            None => (host_ram_mib & !1).clamp(128, 1_048_576) as u32,
+            None => {
+                if host_ram_mib == 0 {
+                    bail!("cannot determine host memory for software VM; pass --mem");
+                }
+                (host_ram_mib & !1).clamp(128, 1_048_576) as u32
+            }
         };
         if !(128..=1_048_576).contains(&cap) {
             bail!("software --mem must be 128..1048576 MiB");
@@ -331,14 +336,14 @@ impl Config {
             bail!("software --mem must be 128..1048576 MiB");
         }
         if self.max_mib != 0 && self.max_mib < self.mem_mib {
-            bail!("software --max ({}) must be at least --mem ({})", self.max_mib, self.mem_mib);
+            bail!("software max memory ({}) must be at least --mem ({})", self.max_mib, self.mem_mib);
         }
         let max_mib = self.effective_max_mib();
         if max_mib > 1_048_576 {
-            bail!("software --max must be at most 1048576 MiB");
+            bail!("software max memory must be at most 1048576 MiB");
         }
         if max_mib > self.mem_mib && !(max_mib - self.mem_mib).is_multiple_of(2) {
-            bail!("software elastic hotplug size (--max - --mem) must be a multiple of 2 MiB");
+            bail!("software elastic hotplug size (max memory - --mem) must be a multiple of 2 MiB");
         }
         if !(1..=256).contains(&self.vcpus) {
             bail!("software --vcpus must be 1..256");
@@ -1597,9 +1602,11 @@ mod tests {
         assert!(append.contains("memhp_default_state=online"), "{append}");
 
         config.max_mib = 256;
-        assert!(config.validate_limits().is_err(), "--max < --mem must be refused");
+        let err = config.validate_limits().unwrap_err().to_string();
+        assert!(err.contains("software max memory"), "{err}");
         config.max_mib = 513;
-        assert!(config.validate_limits().is_err(), "odd hotplug size must be refused");
+        let err = config.validate_limits().unwrap_err().to_string();
+        assert!(err.contains("max memory"), "{err}");
     }
 
     #[test]
@@ -1640,5 +1647,8 @@ mod tests {
         assert_eq!(Config::elastic_limits(Some(256), 49152).unwrap(), (256, 256));
         assert_eq!(Config::elastic_limits(Some(513), 49152).unwrap(), (383, 513));
         assert!(Config::elastic_limits(Some(64), 49152).is_err());
+        let err = Config::elastic_limits(None, 0).unwrap_err().to_string();
+        assert!(err.contains("cannot determine host memory"), "{err}");
+        assert_eq!(Config::elastic_limits(Some(512), 0).unwrap(), (ELASTIC_BASE_MIB, 512));
     }
 }

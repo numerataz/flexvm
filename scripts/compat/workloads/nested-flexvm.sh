@@ -30,7 +30,7 @@ prepare)
         cp "/nested-input/$artifact" "$base/state/artifacts/$artifact"
         sha256sum "$base/state/artifacts/$artifact" > "$base/state/artifacts/$artifact.sha256"
     done
-    cli pull /nested-input/child.tar --tag nested-child --mem 128 --max 128 --plug 0 --vcpus 1
+    cli pull /nested-input/child.tar --tag nested-child --mem 128 --plug 0 --vcpus 1
     cli run -d --name child nested-child
     for attempt in $(seq 1 100); do
         if cli exec child /state-probe status > "$base/initial"; then break; fi

@@ -50,23 +50,27 @@ import hashlib, os, pathlib, sys, time
 base = pathlib.Path(sys.argv[1])
 target_mib = int(sys.argv[2])
 chunks = []
-h = hashlib.sha256()
 for i in range(target_mib):
     # Touch every page with deterministic non-zero bytes so the kernel commits RAM.
     b = bytearray(1 << 20)
     tag = f"{i:08x}".encode()
     for off in range(0, 1 << 20, 4096):
         b[off:off+8] = tag
-    h.update(bytes(b[:64]))
     chunks.append(b)
     if i % 32 == 31:
         time.sleep(0.15)
-digest = h.hexdigest()
+
+def chunks_digest():
+    h = hashlib.sha256()
+    for b in chunks:
+        h.update(bytes(b[:64]))
+    return h.hexdigest()
+
+digest = chunks_digest()
 (base / "ready").write_text(f"{os.getpid()} {digest}\n")
 while True:
-    # Re-verify a sample page every second to ensure RAM stays intact.
-    assert chunks[0][:8] == b"00000000"
-    assert chunks[-1][:8] == f"{target_mib - 1:08x}".encode()
+    # Re-verify all chunks' digest every second to ensure RAM stays intact.
+    assert chunks_digest() == digest
     time.sleep(1)
 PY
     python3 "$base/holder.py" "$base" 420 >/dev/null 2>"$base/holder.err" &
@@ -87,11 +91,16 @@ PY
 verify)
     holder_pid=$(cat "$base/holder-pid")
     kill -0 "$holder_pid"
+    test -s "$base/ready"
+    test ! -s "$base/holder.err"
+    set -- $(cat "$base/ready")
+    test "$1" = "$holder_pid"
+    test -n "${2:-}"
     grown=$(cat "$base/grown-mib")
     now=$(mem_total_mib)
     # Restored VM must retain the plugged virtio-mem capacity.
     test "$now" -ge $((grown - 16))
-    printf 'ELASTIC_PHASE_OK %s initial=%s now=%s pid=%s\n' "$phase" "$(cat "$base/initial-mib")" "$now" "$holder_pid"
+    printf 'ELASTIC_PHASE_OK %s initial=%s now=%s pid=%s digest=%s\n' "$phase" "$(cat "$base/initial-mib")" "$now" "$holder_pid" "$2"
     ;;
 *) exit 2 ;;
 esac

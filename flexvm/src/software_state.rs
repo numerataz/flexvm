@@ -162,6 +162,15 @@ impl Manifest {
         {
             bail!("software state has invalid ownership, session or barrier identity");
         }
+        let max_mib = self.max_memory_mib.unwrap_or(self.memory_mib);
+        if max_mib < self.memory_mib
+            || max_mib > 1_048_576
+            || (max_mib > self.memory_mib && !(max_mib - self.memory_mib).is_multiple_of(2))
+            || self.plugged_mib > u64::from(max_mib - self.memory_mib)
+            || (self.plugged_mib > 0 && !self.plugged_mib.is_multiple_of(2))
+        {
+            bail!("software state has invalid elastic memory bounds");
+        }
         if [&self.engine, &self.kernel, &self.rootfs, &self.state]
             .into_iter()
             .chain(self.firmware.values())
@@ -834,12 +843,12 @@ pub fn describe(path: &Path, name: &str) -> Result<serde_json::Value> {
             image: manifest.image.source,
             digest: manifest.image.digest,
             argv: manifest.image.argv,
-            ram_mib: manifest.memory_mib,
+            ram_mib: manifest.memory_mib.saturating_add(u32::try_from(manifest.plugged_mib).unwrap_or(u32::MAX)),
         },
         ip: crate::qemu::Network::from_profile(&manifest.profile).map(crate::qemu::Network::ip),
         gen: manifest.identity_generation,
         vcpus: manifest.vcpus,
-        max_mib: u64::from(manifest.memory_mib),
+        max_mib: u64::from(manifest.max_memory_mib.unwrap_or(manifest.memory_mib)),
         cmd: true,
         state: if grant.is_some() { "quarantined" } else { "suspended" }.into(),
         ..Default::default()
@@ -1567,5 +1576,70 @@ mod tests {
         assert_eq!(fs::read(path.join("manifest.json")).unwrap(), before);
         assert!(open(&path, &profile).is_ok());
         assert!(fs::read_dir(&*root).unwrap().all(|entry| !entry.unwrap().file_name().to_string_lossy().starts_with(".software-stage-")));
+    }
+
+    #[test]
+    fn manifest_validate_checks_elastic_memory_bounds() {
+        let valid_artifact = Artifact { bytes: 64, sha256: "a".repeat(64) };
+        let base = || {
+            let mut m = manifest(Profile { architecture: std::env::consts::ARCH.into(), arguments: Vec::new() });
+            m.engine = valid_artifact.clone();
+            m.kernel = valid_artifact.clone();
+            m.rootfs = valid_artifact.clone();
+            m.state = valid_artifact.clone();
+            m
+        };
+
+        for (max_memory_mib, plugged_mib) in
+            [(None, 0), (Some(512), 0), (Some(1024), 0), (Some(1024), 256), (Some(1024), 512), (Some(1_048_576), 1_048_576 - 512)]
+        {
+            let mut m = base();
+            m.max_memory_mib = max_memory_mib;
+            m.plugged_mib = plugged_mib;
+            m.validate().unwrap_or_else(|e| panic!("expected valid ({max_memory_mib:?}, {plugged_mib}): {e}"));
+        }
+
+        for (label, max_memory_mib, plugged_mib) in [
+            ("max < memory", Some(256), 0),
+            ("max > 1_048_576", Some(1_048_578), 0),
+            ("odd hotplug size", Some(515), 0),
+            ("plugged without max", None, 2),
+            ("plugged > max - mem", Some(1024), 514),
+            ("odd plugged_mib", Some(1024), 3),
+            ("plugged_mib >= 2^32", Some(1024), 1u64 << 32),
+        ] {
+            let mut m = base();
+            m.max_memory_mib = max_memory_mib;
+            m.plugged_mib = plugged_mib;
+            assert!(m.validate().is_err(), "expected rejection for {label}");
+        }
+    }
+
+    #[test]
+    fn describe_reports_elastic_plugged_and_max_memory() {
+        let root = TempDir::new("software-describe-elastic");
+        let (plain_path, _profile) = checkpoint(&root);
+        let plain = describe(&plain_path, "plain-vm").unwrap();
+        assert_eq!(plain["backend"]["ram_mib"], json!(512));
+        assert_eq!(plain["max_mib"], json!(512));
+
+        let inputs = Inputs {
+            engine: source(&root, "elastic-engine", b"engine"),
+            kernel: source(&root, "elastic-kernel", b"kernel"),
+            rootfs: source(&root, "elastic-rootfs", b"rootfs"),
+            firmware: firmware_names().iter().map(|name| (name.to_string(), source(&root, &format!("elastic-{name}"), name.as_bytes()))).collect(),
+        };
+        let profile = Profile { architecture: std::env::consts::ARCH.into(), arguments: vec!["native-profile".into()] };
+        let mut m = manifest(profile);
+        m.max_memory_mib = Some(2048);
+        m.plugged_mib = 256;
+        let mut staging = Staging::new(&root).unwrap();
+        staging.state.write_all(b"saved-state").unwrap();
+        let elastic_path = root.join("elastic-checkpoint");
+        staging.commit(&elastic_path, &inputs, m).unwrap().retire().unwrap();
+
+        let elastic = describe(&elastic_path, "elastic-vm").unwrap();
+        assert_eq!(elastic["backend"]["ram_mib"], json!(768));
+        assert_eq!(elastic["max_mib"], json!(2048));
     }
 }

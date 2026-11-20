@@ -349,9 +349,13 @@ impl std::fmt::Display for Hop {
 }
 
 /// The reserve of a host that sets none: a sixteenth of its RAM, from 256 MiB to 4 GiB.
+/// Read live from `/proc/meminfo` so `virtio-mem` hotplug growth is reflected immediately.
 pub fn default_reserve() -> u64 {
-    static TOTAL: OnceLock<u64> = OnceLock::new();
-    reserve_for(*TOTAL.get_or_init(|| crate::util::proc_kb("/proc/meminfo", "MemTotal").unwrap_or(0) >> 20))
+    reserve_for(meminfo_mib("MemTotal").unwrap_or(0))
+}
+
+fn meminfo_mib(field: &str) -> Option<u64> {
+    crate::util::proc_kb("/proc/meminfo", field).map(|b| b >> 20)
 }
 
 fn reserve_for(total_mib: u64) -> u64 {
@@ -368,47 +372,120 @@ fn has_virtio_mem() -> bool {
         .any(|entry| entry.file_name().to_str().is_some_and(|n| n.starts_with("virtio")))
 }
 
+const VIRTIO_MEM_HEADROOM_MIB: u64 = 64;
+const VIRTIO_MEM_CHUNK_MIB: u64 = 256;
+const VIRTIO_MEM_MIN_PROBE_MIB: u64 = 16;
+
+/// Next probe chunk size (MiB) to push `MemAvailable` down toward `VIRTIO_MEM_HEADROOM_MIB`
+/// without overshooting into OOM or hitting a fixed total cap.
+fn virtio_mem_probe_chunk_mib(avail_mib: u64) -> u64 {
+    let excess = avail_mib.saturating_sub(VIRTIO_MEM_HEADROOM_MIB);
+    if excess < VIRTIO_MEM_MIN_PROBE_MIB {
+        0
+    } else {
+        excess.min(VIRTIO_MEM_CHUNK_MIB)
+    }
+}
+
+/// Fallible anonymous page mapping that unmaps on drop, avoiding `vec!` OOM aborts.
+struct MmapGuard {
+    ptr: *mut u8,
+    len: usize,
+}
+
+impl MmapGuard {
+    fn new(len: usize) -> Option<Self> {
+        if len == 0 {
+            return None;
+        }
+        let ptr = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+        if ptr == libc::MAP_FAILED {
+            return None;
+        }
+        Some(Self { ptr: ptr.cast::<u8>(), len })
+    }
+
+    /// Touch one byte per 4 KiB page so the kernel commits anonymous pages and drives `MemAvailable` down.
+    fn touch_pages(&mut self) {
+        for off in (0..self.len).step_by(4096) {
+            // Volatile write prevents release-mode DSE from eliding the page faults.
+            unsafe { std::ptr::write_volatile(self.ptr.add(off), 1) };
+        }
+        std::hint::black_box(self.ptr);
+    }
+}
+
+impl Drop for MmapGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.ptr.cast::<libc::c_void>(), self.len);
+        }
+    }
+}
+
 /// Inside a `virtio-mem` guest, `MemAvailable` reflects only currently plugged RAM.
-/// Briefly create bounded memory pressure (keeping at least 48 MiB free) so the outer
-/// hypervisor can admit and plug additional RAM against the physical host's reserve.
-fn request_virtio_mem_growth(need_mib: u64, deadline: Option<std::time::Instant>) {
+/// Briefly create bounded memory pressure (keeping at least `VIRTIO_MEM_HEADROOM_MIB` free)
+/// so the outer hypervisor can admit and plug additional RAM against the physical host's reserve.
+fn request_virtio_mem_growth(run: &Path, need_mib: u64, deadline: Option<std::time::Instant>) {
     if !has_virtio_mem() {
         return;
     }
     let now = std::time::Instant::now();
     let max_wait = now + std::time::Duration::from_secs(15);
     let limit = deadline.map_or(max_wait, |d| d.min(max_wait));
-    for _ in 0..6 {
+    // Serialize concurrent callers across threads and processes so parallel starts do not
+    // stack probes into OOM; a waiter that acquires the lock after growth immediately sees
+    // `MemAvailable >= need_mib` and returns without probing again.
+    let Ok(_guard) = flock_by(&locks(run).join("virtio-mem-grow"), limit).map(Flock) else {
+        return;
+    };
+    for _ in 0..16 {
         if std::time::Instant::now() >= limit {
             break;
         }
-        let Some(avail_mib) = crate::util::proc_kb("/proc/meminfo", "MemAvailable").map(|b| b >> 20) else { break };
-        let Some(total_mib) = crate::util::proc_kb("/proc/meminfo", "MemTotal").map(|b| b >> 20) else { break };
+        let Some(avail_mib) = meminfo_mib("MemAvailable") else { break };
+        let Some(total_mib) = meminfo_mib("MemTotal") else { break };
         if avail_mib >= need_mib {
             break;
         }
-        let probe_mib = avail_mib.saturating_sub(48).min(2048) as usize;
-        if probe_mib < 16 {
-            break;
-        }
-        let mut probe = vec![0u8; probe_mib << 20];
-        for off in (0..probe.len()).step_by(4096) {
-            // Volatile write prevents release-mode DSE from eliding the page faults.
-            unsafe { std::ptr::write_volatile(probe.as_mut_ptr().add(off), 1) };
-        }
-        std::hint::black_box(&probe);
-        let step_limit = limit.min(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        let max_probe_mib = avail_mib.saturating_sub(VIRTIO_MEM_HEADROOM_MIB);
+        let mut probed_mib = 0u64;
+        let mut probes: Vec<MmapGuard> = Vec::new();
         let mut grew = false;
-        while std::time::Instant::now() < step_limit {
-            if let Some(now_total) = crate::util::proc_kb("/proc/meminfo", "MemTotal").map(|b| b >> 20) {
-                if now_total > total_mib {
-                    grew = true;
-                    break;
-                }
+        loop {
+            if std::time::Instant::now() >= limit {
+                break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            let Some(now_total) = meminfo_mib("MemTotal") else { break };
+            if now_total > total_mib {
+                grew = true;
+                break;
+            }
+            let Some(now_avail) = meminfo_mib("MemAvailable") else { break };
+            let remaining_budget = max_probe_mib.saturating_sub(probed_mib);
+            let chunk_mib = virtio_mem_probe_chunk_mib(now_avail).min(remaining_budget);
+            if chunk_mib < VIRTIO_MEM_MIN_PROBE_MIB {
+                break;
+            }
+            let Some(len) = (chunk_mib as usize).checked_shl(20) else { break };
+            let Some(mut guard) = MmapGuard::new(len) else { break };
+            guard.touch_pages();
+            probes.push(guard);
+            probed_mib = probed_mib.saturating_add(chunk_mib);
         }
-        drop(probe);
+        if !grew && (!probes.is_empty() || avail_mib < VIRTIO_MEM_HEADROOM_MIB + VIRTIO_MEM_MIN_PROBE_MIB) {
+            let step_limit = limit.min(std::time::Instant::now() + std::time::Duration::from_secs(5));
+            while std::time::Instant::now() < step_limit {
+                if let Some(now_total) = meminfo_mib("MemTotal") {
+                    if now_total > total_mib {
+                        grew = true;
+                        break;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        drop(probes);
         if !grew {
             break;
         }
@@ -2763,7 +2840,7 @@ impl Host {
             debug_assert_eq!(DEPTH.with(|d| d.get()), 0, "waiting for VM processes under the host lock");
             crate::hostmem::release_kept_admitting(self, deadline);
             if floor == Floor::Reserve && !cfg!(test) && available().is_some_and(|a| a < need) {
-                request_virtio_mem_growth(need, deadline);
+                request_virtio_mem_growth(&self.run, need, deadline);
             }
             released = true;
         }
@@ -12293,5 +12370,37 @@ pub(crate) mod tests {
         assert_eq!(helpers(), 1, "the waiting helper's lock was handed over, no new one started");
         assert!(probe(&open(), libc::LOCK_EX).is_err(), "the lock handed over is held");
         flock(&got, libc::LOCK_UN).unwrap();
+    }
+
+    #[test]
+    fn virtio_mem_probe_chunk_walks_past_2304_mib_without_overshoot() {
+        assert_eq!(virtio_mem_probe_chunk_mib(0), 0);
+        assert_eq!(virtio_mem_probe_chunk_mib(VIRTIO_MEM_HEADROOM_MIB), 0);
+        assert_eq!(virtio_mem_probe_chunk_mib(VIRTIO_MEM_HEADROOM_MIB + VIRTIO_MEM_MIN_PROBE_MIB - 1), 0);
+        assert_eq!(virtio_mem_probe_chunk_mib(VIRTIO_MEM_HEADROOM_MIB + VIRTIO_MEM_MIN_PROBE_MIB), VIRTIO_MEM_MIN_PROBE_MIB);
+        assert_eq!(virtio_mem_probe_chunk_mib(200), 200 - VIRTIO_MEM_HEADROOM_MIB);
+        // Above 2304 MiB (the former 2048 MiB probe dead zone), chunking walks all the way down to headroom.
+        let mut avail = 4096u64;
+        let mut chunks = 0usize;
+        while let chunk @ 1.. = virtio_mem_probe_chunk_mib(avail) {
+            assert!(chunk <= VIRTIO_MEM_CHUNK_MIB);
+            avail -= chunk;
+            chunks += 1;
+        }
+        assert!(chunks > 8);
+        assert_eq!(avail, VIRTIO_MEM_HEADROOM_MIB);
+    }
+
+    #[test]
+    fn mmap_guard_touches_pages_and_fails_cleanly_on_invalid_size() {
+        assert!(MmapGuard::new(0).is_none());
+        assert!(MmapGuard::new(usize::MAX).is_none());
+        let mut guard = MmapGuard::new(2 * 4096).expect("small anonymous mmap succeeds");
+        guard.touch_pages();
+        unsafe {
+            assert_eq!(*guard.ptr, 1);
+            assert_eq!(*guard.ptr.add(4096), 1);
+        }
+        drop(guard);
     }
 }

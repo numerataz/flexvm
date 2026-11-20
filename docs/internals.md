@@ -103,16 +103,16 @@ not wait on the host:
   requested resource is not available", #1292). So the default ceiling is host
   RAM down to the largest that fits (about 528 GiB with a small root
   filesystem: 511 GiB of hotplug plus the 17 GiB boot memory that ceiling
-  defaults to). A larger `--max` is refused as `pull` starts (against the
+  defaults to). A larger `--mem` is refused as `pull` starts (against the
   smallest root filesystem) and again once the root filesystem is made, before
   Firecracker starts; a received template with more hotplug is refused.
   Boot memory is mapped up to the 64-bit MMIO gap at 256 GiB and the rest
   past it, from 512 GiB, over the window, which Firecracker's allocator does
-  not account for (#1305). So `--mem` is at most what fits below the gap
+  not account for (#1305). So boot memory is at most what fits below the gap
   (`template::boot_room`): 255 GiB on x86_64 (from 0, less the 1 GiB 32-bit
   MMIO gap) and 254 GiB on aarch64 (from 2 GiB). A larger one is refused as
-  `pull` starts, by `build`, and in a received template. The default `--mem`
-  is at most 17 GiB.
+  `pull` starts, by `build`, and in a received template. The derived boot
+  memory is at most 17 GiB.
 - **Shrinking** is free page reporting (freed pages go back within seconds,
   plugged or not), plus unplugging memory above the template's plug once a
   guest has had more than three times its headroom free for 10 s. A shrink

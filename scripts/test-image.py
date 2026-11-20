@@ -6,7 +6,7 @@ told what to run, and the same squashfs always makes the same image (one uncompr
 with fixed times and numeric owners, and no creation date), so flexvm's image cache keeps it.
 
     sudo scripts/test-image.py /var/lib/flexvm-test-image
-    sudo flexvm pull /var/lib/flexvm-test-image --tag small --vcpus 2 --max 2048
+    sudo flexvm pull /var/lib/flexvm-test-image --tag small --vcpus 2 --mem 2048
 
 scripts/e2e.py makes and pulls it for its templates. A directory that already holds the image
 of the same squashfs is left as it is. OUT must be missing, empty, or an existing
