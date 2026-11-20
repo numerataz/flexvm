@@ -1,0 +1,56 @@
+--- a/hw/misc/flexvm-shared-ram.c
++++ b/hw/misc/flexvm-shared-ram.c
+@@ -18,6 +18,7 @@
+     DeviceState parent_obj;
+     MemoryRegion slot;
+     Error *migration_blocker;
++    bool external_ram_state;
+     uint64_t address;
+     int32_t ram_fd;
+     int32_t layout_fd;
+@@ -59,13 +60,21 @@
+         return;
+     }
+ 
+-    error_setg(&s->migration_blocker,
+-               "flexvm-shared-ram is backed by another worker's live RAM");
+-    if (migrate_add_blocker(&s->migration_blocker, errp) < 0) {
+-        munmap(address, size);
+-        return;
++    if (!s->external_ram_state) {
++        error_setg(&s->migration_blocker,
++                   "flexvm-shared-ram is backed by another worker's live RAM");
++        if (migrate_add_blocker(&s->migration_blocker, errp) < 0) {
++            munmap(address, size);
++            return;
++        }
+     }
+ 
++    /*
++     * The pointer-backed slot is outside QEMU's RAM migration list.
++     * With external-ram-state the owner supplies the same slot contents
++     * at the destination before loading this worker's CPU/device state.
++     */
++
+     memory_region_init_ram_ptr_owned(&s->slot, OBJECT(dev), "flexvm.shared-ram",
+                                      size, address, flexvm_slot_unmap);
+     /* The KVM slot owns the bytes even in the legacy PC ROM window. */
+@@ -82,13 +91,17 @@
+ 
+     memory_region_del_subregion(get_system_memory(), &s->slot);
+     object_unparent(OBJECT(&s->slot));
+-    migrate_del_blocker(&s->migration_blocker);
++    if (s->migration_blocker) {
++        migrate_del_blocker(&s->migration_blocker);
++    }
+ }
+ 
+ static const Property flexvm_shared_ram_properties[] = {
+     DEFINE_PROP_UINT64("addr", FlexvmSharedRam, address, 0x1000),
+     DEFINE_PROP_INT32("ram-fd", FlexvmSharedRam, ram_fd, -1),
+     DEFINE_PROP_INT32("layout-fd", FlexvmSharedRam, layout_fd, -1),
++    DEFINE_PROP_BOOL("external-ram-state", FlexvmSharedRam, external_ram_state,
++                     false),
+ };
+ 
+ static void flexvm_shared_ram_class_init(ObjectClass *klass, const void *data)
