@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run a parent worker against a pinned KVM memory slot in shared outer RAM."""
 import argparse
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 import ctypes
 from dataclasses import dataclass
 import errno
@@ -42,7 +42,7 @@ EFER_LONG_MODE_ACTIVE = 1 << 10
 EFER_LONG_MODE_ENABLE = 1 << 8
 (OPEN_VM, CLOSE_VM, OPEN_CPU, CLOSE_CPU, RUN, GET_REGS, SET_REGS, GET_SREGS,
  GET_FPU, SET_FPU, GET_MSRS, SET_MSRS, GET_SUPPORTED_CPUID, CREATE_IRQCHIP, SET_IRQ_LINE,
- CREATE_PIT, SET_TSS_ADDR) = range(1, 18)
+ CREATE_PIT, SET_TSS_ADDR, GET_LAPIC, SET_LAPIC) = range(1, 20)
 FPU_VALID_AT = 48
 FPU_AT = 768
 FPU_SIZE = 416
@@ -72,6 +72,9 @@ IRQ_AT = 0x84200
 IRQ_RECORD = struct.Struct("<II")
 PIT_FLAGS_AT = 0x84208
 TSS_AT = 0x8420c
+LAPIC_AT = 0x85000
+LAPIC_VALID_AT = 56
+LAPIC_SIZE = 1024
 FIRECRACKER_TSS_GPA = 0xfffbd000
 KVM_PIT_SPEAKER_DUMMY = 1
 GSI_COUNT = 24
@@ -454,6 +457,12 @@ class TcgChild:
     def set_floating_point(self, cpu, record):
         self.special_command("x-flexvm-set-x86-fpu", {"cpu-index": cpu, "record": record.hex()})
 
+    def lapic(self, cpu):
+        return parse_lapic(self.special_command("x-flexvm-query-x86-lapic", {"cpu-index": cpu}))
+
+    def set_lapic(self, cpu, record):
+        self.special_command("x-flexvm-set-x86-lapic", {"cpu-index": cpu, "record": record.hex()})
+
     def access_msrs(self, cpu, entries, write):
         result = self.special_command("x-flexvm-access-x86-msrs", {
             "cpu-index": cpu, "write": write,
@@ -559,6 +568,18 @@ class KvmChild:
         if self.channel.connection.recv(2) != b"W":
             raise RuntimeError("native parent worker did not acknowledge the floating-point write")
 
+    def lapic(self, cpu):
+        self.channel.connection.sendall(bytes((ord("A"), cpu)))
+        record = self.channel.connection.recv(LAPIC_SIZE + 1)
+        if len(record) != LAPIC_SIZE:
+            raise RuntimeError("native parent worker returned an invalid LAPIC image")
+        return record
+
+    def set_lapic(self, cpu, record):
+        self.channel.connection.sendall(bytes((ord("B"), cpu)) + record)
+        if self.channel.connection.recv(2) != b"B":
+            raise RuntimeError("native parent worker did not acknowledge the LAPIC write")
+
     def access_msrs(self, cpu, entries, write):
         payload = pack_msr_batch(entries)
         self.channel.connection.sendall(bytes((ord("N" if write else "M"), cpu)) + payload)
@@ -649,6 +670,26 @@ def read_tcg_cpuid(monitor):
     return sorted(entries)
 
 
+@contextmanager
+def model_monitor(qemu, output, control, cpu_count, name):
+    path = control / f"{name}.sock"
+    with (output / f"{name}-model.log").open("ab") as log:
+        process = subprocess.Popen([
+            qemu, *QEMU_OPTIONS, "-machine", "pc,accel=tcg", "-cpu", TCG_CHILD_CPU,
+            "-m", "16", "-smp", str(cpu_count), "-serial", "none", "-S",
+            "-qmp", f"unix:{path},server=on,wait=off",
+        ], stdout=log, stderr=log)
+    try:
+        monitor = HELPERS["QMP"](path, process, time.monotonic() + 3)
+        try:
+            yield monitor
+        finally:
+            monitor.close()
+    finally:
+        stop_process(process)
+        path.unlink(missing_ok=True)
+
+
 def model_cpuid(engine, qemu, output, control, cpu_count):
     if engine == "kvm":
         native = subprocess.run([output / "native-worker", "--supported-cpuid"], capture_output=True, timeout=3)
@@ -656,24 +697,28 @@ def model_cpuid(engine, qemu, output, control, cpu_count):
             raise RuntimeError(f"native CPUID query failed: {native.stderr.decode(errors='replace')}")
         entries = [entry for entry in unpack_cpuid(native.stdout) if not entry[2] & ~1]
     else:
-        path = control / "cpuid.sock"
-        with (output / "cpuid-model.log").open("wb") as log:
-            process = subprocess.Popen([
-                qemu, *QEMU_OPTIONS, "-machine", "pc,accel=tcg", "-cpu", TCG_CHILD_CPU,
-                "-m", "16", "-smp", str(cpu_count), "-serial", "none", "-S",
-                "-qmp", f"unix:{path},server=on,wait=off",
-            ], stdout=log, stderr=log)
-        try:
-            monitor = HELPERS["QMP"](path, process, time.monotonic() + 3)
-            try:
-                entries = read_tcg_cpuid(monitor)
-            finally:
-                monitor.close()
-        finally:
-            stop_process(process)
+        with model_monitor(qemu, output, control, cpu_count, "cpuid") as monitor:
+            entries = read_tcg_cpuid(monitor)
     if not 0 < len(entries) <= CPUID_MAX:
         raise RuntimeError("CPUID model returned an empty or oversized profile")
     return entries
+
+
+def parse_lapic(value):
+    record = bytes.fromhex(value["record"])
+    if len(record) != LAPIC_SIZE:
+        raise RuntimeError("TCG parent worker returned an invalid LAPIC image")
+    return record
+
+
+def reset_lapic(engine, qemu, output, control, cpu_count, cpu):
+    if engine == "kvm":
+        native = subprocess.run([output / "native-worker", "--reset-lapic", str(cpu)], capture_output=True, timeout=3)
+        if native.returncode or len(native.stdout) != LAPIC_SIZE:
+            raise RuntimeError(f"native reset LAPIC query failed: {native.stderr.decode(errors='replace')}")
+        return native.stdout
+    with model_monitor(qemu, output, control, cpu_count, "lapic") as monitor:
+        return parse_lapic(monitor.ask("x-flexvm-query-x86-lapic", {"cpu-index": cpu}))
 
 
 def read_slot_table(mailbox, ram_pages, outer_bytes, protected_entry, split_slot, zero_slot):
@@ -756,7 +801,7 @@ def verify_slot_spans(pid, slots):
 
 def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry,
              split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs, cpuid, mmio, mmio_read,
-             ioeventfd, irqchip, pit, irqfd, zero_slot, tss):
+             ioeventfd, irqchip, pit, irqfd, zero_slot, tss, lapic):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
@@ -770,6 +815,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
             expected.append(CREATE_PIT)
         expected.append(SET_IRQ_LINE)
     expected.extend([OPEN_CPU] * cpu_count)
+    if lapic:
+        expected.append(GET_LAPIC)
     expected_counters = []
     expected_mmio = MMIO_WRITES if mmio else ()
     if ioeventfd:
@@ -794,6 +841,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         expected.extend((GET_FPU, SET_FPU))
     if msrs:
         expected.extend((GET_MSRS, SET_MSRS))
+    if lapic:
+        expected.extend((GET_LAPIC, SET_LAPIC, GET_LAPIC))
     if irqchip:
         expected.append(SET_IRQ_LINE)
     expected.extend((SET_REGS, GET_REGS, *((RUN, GET_REGS) * expected_interruptions), RUN, GET_REGS))
@@ -801,6 +850,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         expected.append(GET_FPU)
     if msrs:
         expected.append(GET_MSRS)
+    if lapic:
+        expected.append(GET_LAPIC)
     if irqchip:
         expected.append(SET_IRQ_LINE)
     expected_counters.extend((*([0x3579] * (1 + expected_interruptions)), 0x2468))
@@ -845,7 +896,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 23)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 24)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
         os.ftruncate(outer_ram, outer_ram_size)
@@ -902,7 +953,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
             if pending != complete + 1 or len(observed) >= len(expected) or opcode != expected[len(observed)]:
                 raise RuntimeError(f"unexpected doorbell request {pending}, command {opcode}")
             cpu, = struct.unpack_from("<I", mapping, 44)
-            cpu_commands = (CLOSE_CPU, RUN, GET_REGS, GET_SREGS, SET_REGS, GET_FPU, SET_FPU, GET_MSRS, SET_MSRS)
+            cpu_commands = (CLOSE_CPU, RUN, GET_REGS, GET_SREGS, SET_REGS, GET_FPU, SET_FPU, GET_MSRS, SET_MSRS,
+                            GET_LAPIC, SET_LAPIC)
             if opcode in cpu_commands and cpu not in open_cpus:
                 raise RuntimeError(f"command {opcode} requested unopened vCPU {cpu}")
             status = 0
@@ -939,6 +991,16 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 if length or cpu >= cpu_count or cpu in open_cpus:
                     raise RuntimeError(f"invalid request to create vCPU {cpu}")
                 open_cpus.add(cpu)
+            elif opcode == GET_LAPIC:
+                if length or not irqchip_created:
+                    raise RuntimeError("LAPIC read requires an irqchip")
+                record = (reset_lapic(parent_engine, qemu, output, control, cpu_count, cpu)
+                          if child is None else child.lapic(cpu))
+                mapping[LAPIC_AT:LAPIC_AT + LAPIC_SIZE] = record
+            elif opcode == SET_LAPIC:
+                if length or not irqchip_created or cpu not in started_cpus:
+                    raise RuntimeError("LAPIC write requires a stopped, initialized vCPU")
+                child.set_lapic(cpu, mapping[LAPIC_AT:LAPIC_AT + LAPIC_SIZE])
             elif opcode == RUN:
                 if child is None:
                     if length != slot_size or len(open_cpus) != cpu_count:
@@ -972,6 +1034,11 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                         raise RuntimeError("unexpected staged boot MSR state")
                     if initial_msrs and child.access_msrs(cpu, initial_msrs, True) != initial_msrs:
                         raise RuntimeError("worker rejected staged boot MSR state")
+                    lapic_valid, = struct.unpack_from("<I", mapping, LAPIC_VALID_AT)
+                    if lapic_valid != int(lapic):
+                        raise RuntimeError("unexpected staged LAPIC image")
+                    if lapic_valid:
+                        child.set_lapic(cpu, mapping[LAPIC_AT:LAPIC_AT + LAPIC_SIZE])
                     started_cpus.add(cpu)
                 size, reserved, value = COMPLETION_RECORD.unpack_from(mapping, COMPLETION_AT)
                 completion = b""
@@ -1060,6 +1127,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 or irqfd and "PASS KVM_IRQFD woke an active run and honored deassignment and pending signals" not in guest
                 or zero_slot and "PASS zero-based RAM shared every tested page across the legacy PC region" not in guest
                 or tss and "PASS child ran with Firecracker's three-page TSS reservation" not in guest
+                or lapic and "PASS VMM and guest updated the parent LAPIC" not in guest
                 or "PASS /dev/kvm returned two port I/O exits" not in guest
                 or "PASS parent KVM guest shutdown" not in guest):
             raise RuntimeError(f"parent execution proof failed; commands={observed}, see outer.log")
@@ -1098,6 +1166,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         "tcg_irqfd_pulses": pulses,
         "zero_based_ram": zero_slot,
         "tss_gpa": tss_gpa,
+        "lapic": lapic,
         "register_counters": counters,
         "interrupted_runs": len(child.channel.interruptions),
         "interrupted_run_ms": child.channel.interruptions,
@@ -1142,12 +1211,13 @@ def main():
     parser.add_argument("--irqfd", action="store_true", help="wake an active run through KVM_IRQFD")
     parser.add_argument("--zero-slot", action="store_true", help="share RAM at GPA zero across the PC legacy region")
     parser.add_argument("--tss", action="store_true", help="reserve Firecracker's x86 TSS address")
+    parser.add_argument("--lapic", action="store_true", help="get and set parent-owned xAPIC state")
     parser.add_argument("--reject-close", action="store_true", help="verify page retention when the parent refuses close")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.mmio_read or args.ioeventfd:
         args.mmio_write = True
-    if args.pit or args.irqfd or args.tss:
+    if args.pit or args.irqfd or args.tss or args.lapic:
         args.irqchip = True
     if args.pit and args.irqfd:
         parser.error("--pit and --irqfd use separate fixtures")
@@ -1187,7 +1257,7 @@ def main():
                                   args.protected_entry, args.split_slot, args.interrupt_run,
                                   2 if args.two_vcpus else 1, args.long_mode, args.fpu, args.msrs, args.cpuid,
                                   args.mmio_write, args.mmio_read, args.ioeventfd, args.irqchip, args.pit,
-                                  args.irqfd, args.zero_slot, args.tss)))
+                                  args.irqfd, args.zero_slot, args.tss, args.lapic)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -1243,6 +1313,8 @@ def main():
                 oracle.append("zero-slot")
             if args.tss:
                 oracle.append("tss")
+            if args.lapic:
+                oracle.append("lapic")
             HELPERS["run"](oracle, 14 if args.interrupt_run else 8, output / "native-kvm.log")
             report["same_client_passed_native_kvm"] = True
             report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
@@ -1280,6 +1352,8 @@ def main():
             files["zero-slot"] = b""
         if args.tss:
             files["tss"] = b""
+        if args.lapic:
+            files["lapic"] = b""
         image = HELPERS["initramfs"](init.read_bytes(), files=files)
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
@@ -1316,6 +1390,7 @@ def main():
                             *(["--irqfd"] if args.irqfd else []),
                             *(["--zero-slot"] if args.zero_slot else []),
                             *(["--tss"] if args.tss else []),
+                            *(["--lapic"] if args.lapic else []),
                             *(["--reject-close"] if args.reject_close else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}
@@ -1326,7 +1401,7 @@ def main():
             worker_path = f'execve("{output / "native-worker"}",'
             workers = {line.split()[0] for line in lines if worker_path in line and line.endswith(" = 0")}
             kvm_users = {line.split()[0] for line in lines if '"/dev/kvm"' in line}
-            if len(workers) != 1 + int(args.cpuid) or kvm_users != workers:
+            if len(workers) != 1 + int(args.cpuid) + int(args.lapic) or kvm_users != workers:
                 raise RuntimeError("only the native parent worker may use host KVM")
         report.update(json.loads(worker.read_text()), status="passed", host_device_access=bool(devices),
                       host_devices=sorted(devices))

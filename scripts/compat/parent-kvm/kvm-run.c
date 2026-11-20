@@ -32,6 +32,7 @@
 #define MMIO_DEASSIGNED_OFFSET 0xb80
 #define PIC_ENTRY_OFFSET 0xc00
 #define PIC_HANDLER_OFFSET 0xd00
+#define LAPIC_RESUME_OFFSET 0xd80
 #define PIT_ENTRY_OFFSET 0xe00
 #define IRQFD_ENTRY_OFFSET 0xe00
 #define ZERO_SLOT_ENTRY_OFFSET 0xe00
@@ -39,6 +40,13 @@
 #define PIC_IDTR_OFFSET 0x540
 #define PIC_GSI 3
 #define FIRECRACKER_TSS_GPA 0xfffbd000UL
+#define LAPIC_SVR 0xf0
+#define LAPIC_ICR 0x300
+#define LAPIC_LINT0 0x350
+#define LAPIC_LINT1 0x360
+#define LAPIC_LINT0_EXTINT 0x700
+#define LAPIC_LINT1_NMI 0x400
+#define LAPIC_LVT_MASKED 0x10000
 #define PIC_VECTOR (32 + PIC_GSI)
 #define MMIO_BASE 0xd0000000ULL
 #define MMIO_FIRST_VALUE 0x5a443322U
@@ -494,7 +502,7 @@ static void set_pic_line(int vm, unsigned int level)
     check(ioctl(vm, KVM_IRQ_LINE, &irq) == 0, "set the parent IRQ line");
 }
 
-static void prepare_pic(int vm, unsigned char *ram, uint32_t gpa, bool pit)
+static void prepare_pic(int vm, unsigned char *ram, uint32_t gpa, bool pit, bool lapic)
 {
     check(ioctl(vm, KVM_CREATE_IRQCHIP, 0) == 0, "create the x86 irqchip");
     check(ioctl(vm, KVM_CREATE_IRQCHIP, 0) == -1 && errno == EEXIST, "reject duplicate irqchip creation");
@@ -517,9 +525,11 @@ static void prepare_pic(int vm, unsigned char *ram, uint32_t gpa, bool pit)
         memcpy(ram + PIC_IDT_OFFSET + 32 * 8, gate, sizeof(gate));
     memcpy(ram + PIC_IDTR_OFFSET, &limit, sizeof(limit));
     memcpy(ram + PIC_IDTR_OFFSET + sizeof(limit), &idt, sizeof(idt));
-    const unsigned char pic_setup[] = {
+    const unsigned char apic_setup[] = {
         0xc7, 0x05, 0xf0, 0x00, 0xe0, 0xfe, 0xff, 0x01, 0, 0, /* enable LAPIC with spurious vector 255 */
         0xc7, 0x05, 0x50, 0x03, 0xe0, 0xfe, 0x00, 0x07, 0, 0, /* route PIC through LINT0 ExtINT */
+    };
+    const unsigned char pic_setup[] = {
         0xb0, 0x11, 0xe6, 0x20, 0xe6, 0xa0, /* start initialization of both PICs */
         0xb0, 0x20, 0xe6, 0x21,             /* PIC master vector base 32 */
         0xb0, 0x28, 0xe6, 0xa1,             /* PIC slave vector base 40 */
@@ -537,9 +547,56 @@ static void prepare_pic(int vm, unsigned char *ram, uint32_t gpa, bool pit)
         0xb0, 0x20, 0xe6, 0x20,     /* send end of interrupt to the master PIC */
         0x58, 0xcf,                 /* pop eax; iret */
     };
-    memcpy(ram + PIC_ENTRY_OFFSET, pic_setup, sizeof(pic_setup));
+    int entry = PIC_ENTRY_OFFSET;
+    if (!lapic) {
+        memcpy(ram + entry, apic_setup, sizeof(apic_setup));
+        entry += sizeof(apic_setup);
+    }
+    memcpy(ram + entry, pic_setup, sizeof(pic_setup));
     memcpy(ram + PIC_HANDLER_OFFSET, pic_handler, sizeof(pic_handler));
-    install_jump(ram, PIC_ENTRY_OFFSET + sizeof(pic_setup), 0x10);
+    install_jump(ram, entry + sizeof(pic_setup), 0x10);
+}
+
+static uint32_t lapic_reg(const struct kvm_lapic_state *lapic, unsigned int offset)
+{
+    uint32_t value;
+
+    memcpy(&value, lapic->regs + offset, sizeof(value));
+    return value;
+}
+
+static void set_lapic_reg(struct kvm_lapic_state *lapic, unsigned int offset, uint32_t value)
+{
+    memcpy(lapic->regs + offset, &value, sizeof(value));
+}
+
+static void configure_lapic(int cpu)
+{
+    struct kvm_lapic_state lapic;
+
+    check(ioctl(cpu, KVM_GET_LAPIC, &lapic) == 0 && lapic_reg(&lapic, 0x30) != 0,
+          "read the reset LAPIC and its version");
+    set_lapic_reg(&lapic, LAPIC_SVR, 0x1ff);
+    set_lapic_reg(&lapic, LAPIC_LINT0, LAPIC_LINT0_EXTINT);
+    set_lapic_reg(&lapic, LAPIC_LINT1, LAPIC_LINT1_NMI);
+    check(ioctl(cpu, KVM_SET_LAPIC, &lapic) == 0, "install Firecracker-style LINT delivery modes");
+    check(ioctl(cpu, KVM_GET_LAPIC, &lapic) == 0 && lapic_reg(&lapic, LAPIC_LINT0) == LAPIC_LINT0_EXTINT &&
+          lapic_reg(&lapic, LAPIC_LINT1) == LAPIC_LINT1_NMI, "read back the staged LINT state");
+}
+
+static void reconfigure_lapic(int cpu)
+{
+    struct kvm_lapic_state lapic;
+
+    check(ioctl(cpu, KVM_GET_LAPIC, &lapic) == 0 && lapic_reg(&lapic, LAPIC_LINT0) == LAPIC_LINT0_EXTINT &&
+          lapic_reg(&lapic, LAPIC_LINT1) == LAPIC_LINT1_NMI, "read LINT state in the stopped worker");
+    set_lapic_reg(&lapic, LAPIC_LINT1, LAPIC_LINT1_NMI | LAPIC_LVT_MASKED);
+    set_lapic_reg(&lapic, LAPIC_ICR, 0x40028); /* self IPI vector 40 if executed as an ICR write */
+    check(ioctl(cpu, KVM_SET_LAPIC, &lapic) == 0, "update the stopped worker's LAPIC");
+    check(ioctl(cpu, KVM_GET_LAPIC, &lapic) == 0 &&
+          lapic_reg(&lapic, LAPIC_LINT1) == (LAPIC_LINT1_NMI | LAPIC_LVT_MASKED) &&
+          (lapic_reg(&lapic, LAPIC_ICR) & 0xc00ff) == 0x40028 &&
+          !(lapic_reg(&lapic, 0x210) & (1U << 8)), "restore LAPIC state without sending an IPI");
 }
 
 static void test_pit(int cpu, struct kvm_run *run, int size, unsigned char *ram, unsigned char *data,
@@ -724,6 +781,7 @@ int main(int argc, char **argv)
     bool zero_slot = false;
     bool tss = false;
     bool provider_tss = false;
+    bool lapic = false;
     check(argc == 2 || protected_mode, "specify RAM pages and optional protected or split mode");
     for (int i = 3; i < argc; i++) {
         if (!interrupt_run && !strcmp(argv[i], "interrupt"))
@@ -755,7 +813,9 @@ int main(int argc, char **argv)
         else if (!tss && (!strcmp(argv[i], "tss") || !strcmp(argv[i], "provider-tss"))) {
             tss = true;
             provider_tss = !strcmp(argv[i], "provider-tss");
-        } else
+        } else if (!lapic && !strcmp(argv[i], "lapic"))
+            lapic = true;
+        else
             check(false, "invalid execution option");
     }
     char *end;
@@ -778,6 +838,7 @@ int main(int argc, char **argv)
     check(!zero_slot || (count >= 258 && protected_mode && !split_slot && !long_mode &&
           !irqchip && !cpuid && !two_vcpus), "test one zero-based slot across the PC legacy region");
     check(!tss || irqchip, "program the TSS before creating the x86 irqchip");
+    check(!lapic || irqchip, "get and set the local APIC with an irqchip");
     size_t pages = count;
     size_t ram_bytes = pages * 4096;
     uint64_t gpa = PVKVM_GUEST_START;
@@ -996,6 +1057,15 @@ int main(int argc, char **argv)
             const unsigned char enable_irq[] = {0xfb, 0x90, 0xfa}; /* sti; nop; cli */
             memcpy(ram + resume, enable_irq, sizeof(enable_irq));
             resume += sizeof(enable_irq);
+            if (lapic) {
+                const unsigned char unmask_lint1[] = {
+                    0xc7, 0x05, 0x60, 0x03, 0xe0, 0xfe, 0x00, 0x04, 0, 0, /* set LAPIC LINT1 to NMI */
+                };
+                install_jump(ram, resume, LAPIC_RESUME_OFFSET);
+                resume = LAPIC_RESUME_OFFSET;
+                memcpy(ram + resume, unmask_lint1, sizeof(unmask_lint1));
+                resume += sizeof(unmask_lint1);
+            }
         } else if (fpu) {
             const uint16_t control = 0x77f;
             const uint32_t mxcsr = 0x3f80;
@@ -1048,7 +1118,7 @@ int main(int argc, char **argv)
         memcpy(data + 0x100, gdtr, sizeof(gdtr));
     }
     if (irqchip)
-        prepare_pic(vm, ram, gpa, pit);
+        prepare_pic(vm, ram, gpa, pit, lapic);
     if (zero_slot)
         prepare_zero_slot(ram, zero_slot_offsets, sizeof(zero_slot_offsets) / sizeof(zero_slot_offsets[0]));
     int cpu = ioctl(vm, KVM_CREATE_VCPU, 0);
@@ -1114,6 +1184,8 @@ int main(int argc, char **argv)
         check(ioctl(other_cpu, KVM_SET_REGS, &other_regs) == 0, "set second vCPU registers");
         select_segments(other_cpu, true, false, gpa);
     }
+    if (lapic)
+        configure_lapic(cpu);
     struct ioevent_test notifications;
     if (ioeventfd)
         notifications = install_ioeventfds(vm);
@@ -1189,6 +1261,8 @@ int main(int argc, char **argv)
     if (irqchip) {
         check(sregs.idt.base == gpa + PIC_IDT_OFFSET && sregs.idt.limit == (PIC_VECTOR + 1) * 8 - 1,
               "read the live interrupt descriptor table");
+        if (lapic)
+            reconfigure_lapic(cpu);
         check(!data[0xf8], "wait for a real IRQ before running the guest handler");
         set_pic_line(vm, 1);
     }
@@ -1220,6 +1294,12 @@ int main(int argc, char **argv)
         check_resumed_msrs(cpu, data);
     if (irqchip) {
         check(data[0xf8] == 1, "deliver exactly one real PIC interrupt to the child");
+        if (lapic) {
+            struct kvm_lapic_state state;
+            check(ioctl(cpu, KVM_GET_LAPIC, &state) == 0 && lapic_reg(&state, LAPIC_LINT1) == LAPIC_LINT1_NMI,
+                  "observe the guest's LINT1 MMIO update in KVM_GET_LAPIC");
+            puts("PASS VMM and guest updated the parent LAPIC");
+        }
         set_pic_line(vm, 0);
         puts("PASS child PIC delivered and acknowledged the parent IRQ");
         if (pit)
