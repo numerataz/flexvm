@@ -1163,14 +1163,25 @@ impl Host {
                 r => r.map_err(|e| named(&path, e))?,
             }
         }
+        // Fast path: when `.synced`, `STATE/run.json`, `RUN/state.json` and `RUN/vms/.locks` are
+        // already in place and agree with `(state, run)`, skip the exclusive `STATE/.locks/open` flock.
+        let synced = id().ok().is_some_and(|id| std::fs::read_to_string(&marker).ok() == Some(id)) && dirs.iter().all(|(d, _)| state.join(d).is_dir());
+        reserved_run(state, run, Path::new(RUN_STATE), Path::new(DEFAULT_RUN))?;
+        let bound = verify_binding(state, "run", run)?;
+        let claimed = verify_binding(run, "state", state)?;
+        let vms_locks = locks(&run.join("vms")).is_dir();
         // Readers of an initialized state need no lock: they cannot change its binding
         // or repair it. Never flock the publicly readable directory itself.
-        let _held = match private_file(&locks(state).join("open")) {
-            Ok(f) => Some(Flock::new(f, libc::LOCK_EX).map_err(root)?),
-            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => None,
-            Err(e) => return Err(root(e).into()),
+        let _held = if synced && bound && claimed && vms_locks {
+            None
+        } else {
+            match private_file(&locks(state).join("open")) {
+                Ok(f) => Some(Flock::new(f, libc::LOCK_EX).map_err(root)?),
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => None,
+                Err(e) => return Err(root(e).into()),
+            }
         };
-        if id().ok().is_none_or(|id| std::fs::read_to_string(&marker).ok() != Some(id)) || dirs.iter().any(|(d, _)| !state.join(d).is_dir()) {
+        if !synced && (id().ok().is_none_or(|id| std::fs::read_to_string(&marker).ok() != Some(id)) || dirs.iter().any(|(d, _)| !state.join(d).is_dir())) {
             let _ = std::fs::remove_file(&marker);
             dirs.iter()
                 .try_for_each(|(d, mode)| host_dir(&state.join(d), *mode).and_then(|()| crate::util::create_dir_durably(&state.join(d), *mode)))
@@ -1178,7 +1189,9 @@ impl Host {
                 .map_err(root)?;
         }
         // Name locks (`vms`): made by root, so a non-root reader leaves it be.
-        let _ = private_dir(&locks(&run.join("vms")));
+        if !vms_locks {
+            let _ = private_dir(&locks(&run.join("vms")));
+        }
         match crate::template::note_shared(&crate::template::Paths::new(state), state) {
             Err(e) if !unwritable(&e) => Err(root(e))?,
             _ => {}
@@ -1189,16 +1202,17 @@ impl Host {
             _ => {}
         }
         let (state, run) = (state.to_path_buf(), run.to_path_buf());
-        let binding = state.join("run.json");
-        reserved_run(&state, &run, Path::new(RUN_STATE), Path::new(DEFAULT_RUN))?;
-        let bound = verify_binding(&state, "run", &run)?;
-        let claimed = claim_run(&state, &run)?;
-        // A user who cannot write the state root (a non-root `flexvm ps` of an unbound one) leaves it unbound,
-        // as does one who could not claim the run directory: it is not bound to a directory it may not own.
-        if !bound && claimed {
-            match crate::util::write_file(&state, "run.json", &serde_json::to_vec(&run)?, true) {
-                Err(e) if unwritable(&e) => {}
-                r => r.map_err(|e| format!("{}: {e}", binding.display()))?,
+        if !bound || !claimed {
+            let binding = state.join("run.json");
+            let bound = verify_binding(&state, "run", &run)?;
+            let claimed = claim_run(&state, &run)?;
+            // A user who cannot write the state root (a non-root `flexvm ps` of an unbound one) leaves it unbound,
+            // as does one who could not claim the run directory: it is not bound to a directory it may not own.
+            if !bound && claimed {
+                match crate::util::write_file(&state, "run.json", &serde_json::to_vec(&run)?, true) {
+                    Err(e) if unwritable(&e) => {}
+                    r => r.map_err(|e| format!("{}: {e}", binding.display()))?,
+                }
             }
         }
         let _ = RUN_DIR.set(run.clone());
@@ -1897,11 +1911,24 @@ impl Host {
         self.claim_new_in(l, &self.config_now(), holder, want)
     }
 
+    /// `claim_new` taking the host lock after snapshotting netlink state (`listen::HostNet`),
+    /// so `next_hops()` and `local_ips()` run outside `STATE/.locks/host`.
+    pub fn claim_new_unlocked(&self, holder: &str, want: Option<Ipv4Addr>) -> Result<AddrClaim> {
+        let net = crate::listen::HostNet::snapshot()?;
+        let l = self.lock()?;
+        self.claim_new_with_net(&l, &self.config_now(), holder, want, &net)
+    }
+
     /// `claim_new` from `cfg`'s range: a caller that decided by that range claims by it too.
     /// Never an address this host reaches its network or peers by (`listen::assignable`, #1078).
     pub fn claim_new_in(&self, l: &Locked, cfg: &Config, holder: &str, want: Option<Ipv4Addr>) -> Result<AddrClaim> {
         let assignable = crate::listen::assignable(&self.run, cfg)?;
         self.claim_new_by(l, cfg, holder, want, assignable)
+    }
+
+    /// `claim_new_in` reusing a `HostNet` snapshot captured before taking the host lock.
+    pub fn claim_new_with_net(&self, l: &Locked, cfg: &Config, holder: &str, want: Option<Ipv4Addr>, net: &crate::listen::HostNet) -> Result<AddrClaim> {
+        self.claim_new_by(l, cfg, holder, want, net.assignable(&self.run, cfg))
     }
 
     fn claim_new_by(&self, l: &Locked, cfg: &Config, holder: &str, want: Option<Ipv4Addr>, assignable: impl Fn(Ipv4Addr) -> Result<()>) -> Result<AddrClaim> {

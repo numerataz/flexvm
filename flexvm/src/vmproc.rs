@@ -10,7 +10,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -718,7 +718,21 @@ pub enum Start {
     },
 }
 
-pub type Op<'a> = MutexGuard<'a, ()>;
+#[derive(Debug, Default)]
+struct OpLock {
+    held: Mutex<bool>,
+    free: Condvar,
+}
+
+#[derive(Debug)]
+pub struct Op<'a>(&'a OpLock);
+
+impl Drop for Op<'_> {
+    fn drop(&mut self) {
+        *self.0.held.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        self.0.free.notify_one();
+    }
+}
 
 /// How the VM left, which decides what becomes of its address and of an
 /// arrival still pulling: Gone lets its source go, Died lets the source run
@@ -750,7 +764,7 @@ pub struct Proc {
 pub struct Runtime {
     vm: OnceLock<Arc<Vm>>,
     forwards: Mutex<Option<crate::ports::Forwarder>>,
-    op: Mutex<()>,
+    op: OpLock,
     holder: OnceLock<Option<Arc<Holder>>>,
     /// The migration this VM arrived by, until all its pages are in.
     pub arrived: Mutex<Option<MigRecord>>,
@@ -1362,30 +1376,39 @@ impl Proc {
     }
 
     pub fn op(&self) -> Op<'_> {
-        self.op.lock().unwrap_or_else(|e| e.into_inner())
+        let mut held = self.op.held.lock().unwrap_or_else(|e| e.into_inner());
+        while *held {
+            held = self.op.free.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+        *held = true;
+        Op(&self.op)
     }
 
     /// Without waiting: None if another operation holds it.
     pub fn op_now(&self) -> Option<Op<'_>> {
-        match self.op.try_lock() {
-            Ok(g) => Some(g),
-            Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
-            Err(_) => None,
+        let mut held = self.op.held.lock().unwrap_or_else(|e| e.into_inner());
+        if *held {
+            return None;
         }
+        *held = true;
+        Some(Op(&self.op))
     }
 
     pub fn op_within(&self) -> Result<Op<'_>> {
-        let (deadline, mut nap) = (Instant::now() + OP_WAIT, Duration::from_millis(1));
-        loop {
-            match self.op_now() {
-                Some(g) => return Ok(g),
-                None if Instant::now() < deadline => {
-                    thread::sleep(nap);
-                    nap = (nap * 2).min(Duration::from_millis(50));
-                }
-                None => bail!("vm {} is busy", self.name()),
+        let deadline = Instant::now() + OP_WAIT;
+        let mut held = self.op.held.lock().unwrap_or_else(|e| e.into_inner());
+        while *held {
+            let Some(left) = deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
+                bail!("vm {} is busy", self.name());
+            };
+            let (g, res) = self.op.free.wait_timeout(held, left).unwrap_or_else(|e| e.into_inner());
+            held = g;
+            if *held && res.timed_out() {
+                bail!("vm {} is busy", self.name());
             }
         }
+        *held = true;
+        Ok(Op(&self.op))
     }
 
     /// Whether the address is held.
@@ -1864,7 +1887,7 @@ impl Proc {
         // Before the claim: a refused start mints no generation (nor withdraws one).
         self.admit_start(tpl.working_set_mib(), None, crate::host::Floor::Reserve, None)?;
         self.bind_ports()?;
-        let claim = self.host.claim_new(&self.host.lock()?, name, want)?;
+        let claim = self.host.claim_new_unlocked(name, want)?;
         let ip = self.set_addr(claim);
         self.serve_ports(ip)?;
         t.mark("claim_ip");
@@ -1963,7 +1986,7 @@ impl Proc {
             return Ok(());
         }
         // Before any request can checkpoint: the room it copies within is the host's, refreshed, or none (#674).
-        self.ready_room(false);
+        self.ready_room(&self.host.config_now(), false);
         let p = self.arc().ok_or("vm process gone")?;
         let sock = self.host.sock(&self.name())?;
         let _ = std::fs::remove_file(&sock);
@@ -2496,7 +2519,7 @@ impl Proc {
     }
 
     fn controller(self: Arc<Self>) {
-        let (mut published, mut growth, mut stopping) = (false, Growth::default(), None::<Stopping>);
+        let (mut published, mut growth, mut stopping, mut last_announce_dev) = (false, Growth::default(), None::<Stopping>, None::<String>);
         loop {
             thread::sleep(Duration::from_secs(1));
             // Standby VMs signalled last tick had that sleep: other processes may stop them now, however long this tick blocks.
@@ -2508,7 +2531,7 @@ impl Proc {
             if !vm.firecracker_alive() || vm.pager.failed().is_some() {
                 self.died();
             }
-            if let Ok(_op) = self.op.try_lock() {
+            if let Some(_op) = self.op_now() {
                 if vm.release_pending() && matches!(vm.state(), State::Running | State::Paused) {
                     match vm.release_reports(Duration::from_millis(500)) {
                         Ok(()) => crate::info!("vm {}: released free page reports", vm.name),
@@ -2536,13 +2559,17 @@ impl Proc {
                 avail = host_available_mib();
             }
             let short = relief_needs_memory(&cfg, avail, self.host.run.join("evict.active").exists()) || vm.starving();
-            self.ready_room(short);
-            relieve(&self.host, avail, vm.starving(), &mut stopping);
-            // A derived announce device follows the routes (one that changed gets proxy ARP, and the
-            // VM's proxy entry: one a removal took while it was served here comes back).
-            if let Some(dev) = self.host.config_now().announce_dev() {
-                let _ = crate::net::proxy_arp(&dev);
-                self.proxy_ndp(&dev);
+            self.ready_room(&cfg, short);
+            relieve_in(&self.host, &cfg, avail, vm.starving(), &mut stopping);
+            // A derived announce device follows the routes: apply proxy ARP / NDP on first tick and whenever it changes.
+            if let Some(dev) = cfg.announce_dev() {
+                if last_announce_dev.as_deref() != Some(dev.as_str()) {
+                    let _ = crate::net::proxy_arp(&dev);
+                    self.proxy_ndp(&dev);
+                    last_announce_dev = Some(dev);
+                }
+            } else {
+                last_announce_dev = None;
             }
         }
     }
@@ -2551,7 +2578,7 @@ impl Proc {
     /// after the pause was never populated, so the copy never reads it.
     fn resize(&self, hint: Option<u64>) -> Result<Resized> {
         let vm = self.vm();
-        if let Ok(_op) = self.op.try_lock() {
+        if let Some(_op) = self.op_now() {
             return resize(vm, &self.host, hint, false);
         }
         match *vm.cow_copy.lock().unwrap() {
@@ -2564,9 +2591,9 @@ impl Proc {
     /// and while the host is `short` releases what is kept for the next checkpoint (`Pager::host_memory`).
     /// None yet (bound before a resume or restore has its VM): its room stays closed (`cow::Room::closed`) until
     /// the controller's first tick.
-    fn ready_room(&self, short: bool) {
+    fn ready_room(&self, cfg: &crate::host::Config, short: bool) {
         let Some(vm) = self.vm.get() else { return };
-        let reserve = self.host.config_now().reserve();
+        let reserve = cfg.reserve();
         vm.pager.mem_room().attach(&self.host);
         vm.pager.host_memory(room_sample(reserve, host_available_mib, || self.host.promised()), short);
     }
@@ -3601,12 +3628,16 @@ static EVICTING: AtomicBool = AtomicBool::new(false);
 /// `evict_marks` (`RUN/evict.active` while it lasts). A starved VM is moved
 /// whenever it asks, pressure or not. Nothing is done when MemAvailable
 /// cannot be read (`avail` None): that is no pressure.
+#[cfg(test)]
 fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut Option<Stopping>) {
+    relieve_in(host, &host.config_now(), avail, starved_here, stopping);
+}
+
+fn relieve_in(host: &Host, cfg: &crate::host::Config, avail: Option<u64>, starved_here: bool, stopping: &mut Option<Stopping>) {
     let Some(avail) = avail else {
         *stopping = None;
         return;
     };
-    let cfg = host.config_now();
     let (reserve, at, until) = cfg.evict_marks();
     // Standby VMs go under the reserve whatever eviction is doing (a slow migration holds its lock).
     if avail >= reserve {
@@ -3621,7 +3652,7 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut O
     }
     let Ok(lock) = crate::host::private_file(&crate::host::locks(&host.state).join("evict")) else { return };
     let Ok(lock) = crate::host::Flock::new(lock, libc::LOCK_EX | libc::LOCK_NB) else { return };
-    let pressure = eviction_pressure(&cfg, avail, evicting);
+    let pressure = eviction_pressure(cfg, avail, evicting);
     if pressure && !evicting {
         let _ = crate::host::write_record(&active, b"");
         crate::info!(
@@ -3652,7 +3683,7 @@ fn relieve(host: &Host, avail: Option<u64>, starved_here: bool, stopping: &mut O
     }
     let _ = crate::host::write_record(&last, b"");
     EVICTING.store(true, Ordering::SeqCst);
-    let host = host.clone();
+    let (host, cfg) = (host.clone(), cfg.clone());
     thread::spawn(move || {
         let _lock = lock;
         // Arrivals by eviction are refused while it runs (`Floor::EvictMark`).
