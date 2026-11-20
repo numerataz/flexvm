@@ -123,6 +123,10 @@ Add `--lapic` to read the reset xAPIC image, stage LINT0 and LINT1 before
 the first run, and update the stopped controller. The guest receives a PIC
 interrupt through the installed state, then changes LINT1 through MMIO.
 The test checks that restoring ICR contents does not send an interrupt.
+Use `--clock --protected-entry` to restore a clock before creating the
+child worker and again while it is stopped. The guest registers a real
+pvclock page using its KVM MSR and samples RDTSC. The VMM verifies that the
+time derived from the page follows both restored clock values.
 Use `--vcpu-events --protected-entry` to restore a masked pending NMI,
 deliver an exception with its error code and an interrupt, then restore
 SMM flags and a nonzero startup vector from the VMM.

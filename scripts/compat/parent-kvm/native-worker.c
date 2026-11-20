@@ -149,6 +149,19 @@ static void query_unstarted_pit(unsigned int flags, bool restore)
     close(kvm);
 }
 
+static void reset_clock(void)
+{
+    int kvm = host_kvm();
+    int vm = ioctl(kvm, KVM_CREATE_VM, 0);
+    struct kvm_clock_data clock = {0};
+
+    check(vm >= 0, "create a host reset clock VM");
+    check(ioctl(vm, KVM_GET_CLOCK, &clock) == 0, "read the host VM clock");
+    check(write(STDOUT_FILENO, &clock, sizeof(clock)) == sizeof(clock), "write the clock record");
+    close(vm);
+    close(kvm);
+}
+
 static struct pending_read reply_run(int control, struct kvm_run *run, int mapping_bytes)
 {
     if (run->exit_reason == KVM_EXIT_MMIO) {
@@ -213,6 +226,10 @@ int main(int argc, char **argv)
     }
     if (argc == 3 && !strcmp(argv[1], "--reset-xsave")) {
         reset_state(number(argv[2], PVKVM_MAX_CPUS - 1), false, KVM_GET_XSAVE, NULL, 0);
+        return 0;
+    }
+    if (argc == 2 && !strcmp(argv[1], "--reset-clock")) {
+        reset_clock();
         return 0;
     }
     if (argc == 4 && !strcmp(argv[1], "--reset-events")) {
@@ -300,6 +317,7 @@ int main(int argc, char **argv)
                    sizeof(struct kvm_xcrs) == PVKVM_XCRS_BYTES &&
                    sizeof(struct kvm_xsave) == PVKVM_XSAVE_BYTES && sizeof(cpuid) >= PVKVM_XSAVE_BYTES &&
                    sizeof(struct kvm_vcpu_events) == PVKVM_VCPU_EVENTS_BYTES &&
+                   sizeof(struct kvm_clock_data) == PVKVM_CLOCK_BYTES &&
                    sizeof(lapic) == PVKVM_LAPIC_BYTES && sizeof(cpuid) >= sizeof(lapic) &&
                    sizeof(cpuid) >= PVKVM_PIO_BYTES + sizeof(uint32_t) &&
                    sizeof(cpuid) >= sizeof(segments) && sizeof(cpuid) >= sizeof(msrs),
@@ -448,6 +466,22 @@ int main(int argc, char **argv)
             memcpy(image, &reply.status, sizeof(reply.status));
             memcpy(image + sizeof(reply.status), &reply.events, sizeof(reply.events));
             check(write(control, image, sizeof(image)) == sizeof(image), "return the host vCPU event result");
+            continue;
+        }
+        if ((received == 2 && request[0] == 'c') ||
+            (received == 2 + sizeof(struct kvm_clock_data) && request[0] == 'd')) {
+            struct kvm_clock_data clock = {0};
+            int32_t status = 0;
+            unsigned char image[sizeof(status) + sizeof(clock)];
+            bool write_clock = request[0] == 'd';
+
+            if (write_clock)
+                memcpy(&clock, request + 2, sizeof(clock));
+            if (ioctl(vm, write_clock ? KVM_SET_CLOCK : KVM_GET_CLOCK, &clock) < 0)
+                status = -errno;
+            memcpy(image, &status, sizeof(status));
+            memcpy(image + sizeof(status), &clock, sizeof(clock));
+            check(write(control, image, sizeof(image)) == sizeof(image), "return the host VM clock result");
             continue;
         }
         if (received == 2 + sizeof(struct kvm_irq_level) && request[0] == 'L') {

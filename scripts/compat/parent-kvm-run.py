@@ -44,7 +44,8 @@ EFER_LONG_MODE_ENABLE = 1 << 8
  GET_FPU, SET_FPU, GET_MSRS, SET_MSRS, GET_SUPPORTED_CPUID, CREATE_IRQCHIP, SET_IRQ_LINE,
  CREATE_PIT, SET_TSS_ADDR, GET_LAPIC, SET_LAPIC, COMPLETE_READ, GET_IRQCHIP, SET_IRQCHIP,
  GET_PIT, SET_PIT, GET_DEBUGREGS, SET_DEBUGREGS, GET_MP_STATE, SET_MP_STATE,
- GET_XCRS, SET_XCRS, GET_XSAVE, SET_XSAVE, GET_VCPU_EVENTS, SET_VCPU_EVENTS) = range(1, 35)
+ GET_XCRS, SET_XCRS, GET_XSAVE, SET_XSAVE, GET_VCPU_EVENTS, SET_VCPU_EVENTS,
+ GET_CLOCK, SET_CLOCK) = range(1, 37)
 FPU_VALID_AT = 48
 FPU_AT = 768
 FPU_SIZE = 416
@@ -96,6 +97,9 @@ EVENT_NMI_PENDING = 1
 EVENT_SIPI_VECTOR = 2
 EVENT_SHADOW = 4
 EVENT_SMM = 8
+CLOCK_AT = 0x89100
+CLOCK_DATA = struct.Struct("<QI4xQQ16x")
+CLOCK_REALTIME = 4
 PIO_WRITES = ((0x3f8, 1, b"L"), (0x2f8, 2, b"\xcd\xab"),
               (0xcf8, 4, b"\x00\x00\x00\x80"), (0x3f8, 1, b"vmio"))
 PIO_READS = ((0x3fd, 1, b"\x60"), (0x2f8, 2, b"\x67\x45"),
@@ -515,6 +519,7 @@ class TcgChild:
                 description = self.debugger.exchange("qXfer:features:read:target.xml:0,fff")
                 if b'<xi:include href="i386-64bit.xml"/>' not in description:
                     raise RuntimeError("unexpected QEMU register layout")
+                self.clock()
                 for cpu in range(cpu_count):
                     self.debugger.select_cpu(cpu)
                     self.debugger.write(18, 4, 0)  # Real-mode code segment with zero base.
@@ -653,6 +658,9 @@ class TcgChild:
             args["record"] = record.hex()
         state = self.special_command("x-flexvm-access-x86-vcpu-events", args)
         return parse_vcpu_events(state)
+
+    def clock(self, record=None):
+        return 0, tcg_clock(self.special_command, record)
 
     def pulse_irq(self, gsi):
         self.special_command("x-flexvm-pulse-x86-gsi", {"gsi": gsi})
@@ -869,6 +877,13 @@ class KvmChild:
             raise RuntimeError("native parent worker returned an invalid vCPU event result")
         return IOCTL_RESULT.unpack_from(result)[0], result[IOCTL_RESULT.size:]
 
+    def clock(self, record=None):
+        self.channel.connection.sendall(b"c\0" if record is None else b"d\0" + record)
+        result = self.channel.connection.recv(IOCTL_RESULT.size + CLOCK_DATA.size + 1)
+        if len(result) != IOCTL_RESULT.size + CLOCK_DATA.size:
+            raise RuntimeError("native parent worker returned an invalid VM clock")
+        return IOCTL_RESULT.unpack_from(result)[0], result[IOCTL_RESULT.size:]
+
     def close(self):
         if self.channel is not None:
             self.channel.close()
@@ -965,6 +980,7 @@ def model_cpuid(engine, qemu, output, control, cpu_count):
         entries = [entry for entry in unpack_cpuid(native.stdout) if not entry[2] & ~1]
     else:
         with model_monitor(qemu, output, control, cpu_count, "cpuid") as monitor:
+            tcg_clock(monitor.ask, None)
             entries = read_tcg_cpuid(monitor)
     if not 0 < len(entries) <= CPUID_MAX:
         raise RuntimeError("CPUID model returned an empty or oversized profile")
@@ -1144,6 +1160,40 @@ def staged_smm_active(record):
     return bool(flags & EVENT_SMM and (record[24] or record[25]))
 
 
+def tcg_clock(command, record):
+    args = {}
+    if record is not None:
+        value, flags, realtime, _ = CLOCK_DATA.unpack(record)
+        args["clock"] = value
+        if flags & CLOCK_REALTIME:
+            args["realtime"] = realtime
+    result = command("x-flexvm-access-x86-clock", args)
+    return CLOCK_DATA.pack(result["clock"], CLOCK_REALTIME, result["realtime"], 0)
+
+
+def reset_clock(engine, qemu, output, control):
+    if engine == "kvm":
+        native = subprocess.run([output / "native-worker", "--reset-clock"], capture_output=True, timeout=3)
+        if native.returncode or len(native.stdout) != CLOCK_DATA.size:
+            raise RuntimeError(f"native VM clock query failed: {native.stderr.decode(errors='replace')}")
+        return native.stdout
+    with model_monitor(qemu, output, control, 1, "clock") as monitor:
+        return tcg_clock(monitor.ask, None)
+
+
+def capture_clock(record, restore=False):
+    value, flags, realtime, _ = CLOCK_DATA.unpack(record)
+    if restore and flags & CLOCK_REALTIME:
+        value += max(0, time.time_ns() - realtime)
+    return (value, time.monotonic_ns())
+
+
+def staged_clock_record(anchor, restore=False):
+    value, captured = anchor
+    value = (value + time.monotonic_ns() - captured) & ((1 << 64) - 1)
+    return CLOCK_DATA.pack(value, 0 if restore else CLOCK_REALTIME, time.time_ns(), 0)
+
+
 def read_slot_table(mailbox, ram_pages, outer_bytes, protected_entry, split_slot, zero_slot):
     first_gpa = PROTECTED_GPA if protected_entry else PAGE_SIZE
     if zero_slot:
@@ -1225,12 +1275,14 @@ def verify_slot_spans(pid, slots):
 def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry,
              split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs, cpuid, mmio, mmio_read,
              ioeventfd, irqchip, pit, irqfd, zero_slot, tss, lapic, pio, complete_read, pio_boundary, pvh,
-             irqchip_state, pit_state, debugregs, mp_state, xcrs, xsave, vcpu_events):
+             irqchip_state, pit_state, debugregs, mp_state, xcrs, xsave, vcpu_events, clock):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
     expected_interruptions = TEST_INTERRUPTS if interrupt_run else 0
     expected = [OPEN_VM]
+    if clock:
+        expected.extend((GET_CLOCK, SET_CLOCK, GET_CLOCK))
     if tss:
         expected.append(SET_TSS_ADDR)
     if irqchip:
@@ -1343,6 +1395,10 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         expected_io.extend(((0, 0x8a), (0, 0x8a)))
     if vcpu_events:
         expected.extend((SET_VCPU_EVENTS, GET_VCPU_EVENTS, SET_VCPU_EVENTS, SET_MP_STATE, GET_MP_STATE, GET_SREGS))
+    if clock:
+        expected.extend((SET_REGS, RUN, GET_REGS, GET_CLOCK, SET_CLOCK, RUN, GET_REGS, GET_CLOCK))
+        expected_counters.extend((0x7a51,) * 2)
+        expected_io.extend(((0, 0x8c),) * 2)
     expected.extend((CLOSE_CPU, CLOSE_VM))
     if reject_close:
         expected = expected[:-1]
@@ -1366,6 +1422,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
     staged_xsave = {}
     staged_vcpu_events = {}
     baseline_vcpu_events = {}
+    staged_clock = None
     tss_gpa = None
     irq_levels = []
     expected_irq_levels = IRQ_LEVELS + ([(6, 1), (6, 0)] if irqchip_state else []) if irqchip else []
@@ -1391,7 +1448,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 34)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 35)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
         os.ftruncate(outer_ram, outer_ram_size)
@@ -1475,6 +1532,25 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 if length or not irqchip_created or pit_flags is not None or flags & ~KVM_PIT_SPEAKER_DUMMY:
                     raise RuntimeError("invalid PIT creation request")
                 pit_flags = flags
+            elif opcode in (GET_CLOCK, SET_CLOCK):
+                if length:
+                    raise RuntimeError("unexpected memory argument for VM clock")
+                end = CLOCK_AT + CLOCK_DATA.size
+                if opcode == SET_CLOCK:
+                    record = mapping[CLOCK_AT:end]
+                    if child is None:
+                        staged_clock = capture_clock(record, restore=True)
+                    else:
+                        status, _ = child.clock(record)
+                else:
+                    if child is None:
+                        if staged_clock is None:
+                            staged_clock = capture_clock(reset_clock(parent_engine, qemu, output, control))
+                        record = staged_clock_record(staged_clock)
+                    else:
+                        status, record = child.clock()
+                    if not status:
+                        mapping[CLOCK_AT:end] = record
             elif opcode in (GET_PIT, SET_PIT):
                 if length or pit_flags is None:
                     raise RuntimeError("PIT state requires an initialized timer")
@@ -1663,6 +1739,10 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                                         cpu_count, mmio, irqchip_created, pit_flags, irq_fds, tss_gpa)
                     cleanup.callback(child.close)
                     extents = verify_slot_spans(child.process.pid, slots)
+                    if staged_clock is not None:
+                        status, _ = child.clock(staged_clock_record(staged_clock, restore=True))
+                        if status:
+                            raise RuntimeError(f"parent worker rejected staged VM clock with error {status}")
                     for id, image in staged_irqchips.items():
                         child.set_irqchip(id, image)
                     if staged_pit is not None:
@@ -1830,6 +1910,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 or xcrs and "PASS guest XGETBV and XSETBV used the actual parent XCR0" not in guest
                 or xsave and "PASS XSAVE installed and read actual x87, MXCSR and AVX state" not in guest
                 or vcpu_events and "PASS real x86 exception, NMI, IRQ and nonzero startup vector" not in guest
+                or clock and "PASS staged and restored VM clock reached the actual guest pvclock page" not in guest
                 or irqfd and "PASS KVM_IRQFD woke an active run and honored deassignment and pending signals" not in guest
                 or zero_slot and "PASS zero-based RAM shared every tested page across the legacy PC region" not in guest
                 or tss and "PASS child ran with Firecracker's three-page TSS reservation" not in guest
@@ -1883,6 +1964,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         "xcrs": xcrs,
         "xsave": xsave,
         "vcpu_events": vcpu_events,
+        "clock": clock,
         "irqfd": irqfd,
         "tcg_irqfd_pulses": pulses,
         "zero_based_ram": zero_slot,
@@ -1940,6 +2022,7 @@ def main():
     parser.add_argument("--xcrs", action="store_true", help="verify real XGETBV and XSETBV with VMM-restored XCR0")
     parser.add_argument("--xsave", action="store_true", help="verify real x87, MXCSR and AVX state restore")
     parser.add_argument("--vcpu-events", action="store_true", help="restore real x86 exception, IRQ and NMI state")
+    parser.add_argument("--clock", action="store_true", help="restore the VM clock and verify its guest pvclock page")
     parser.add_argument("--irqfd", action="store_true", help="wake an active run through KVM_IRQFD")
     parser.add_argument("--zero-slot", action="store_true", help="share RAM at GPA zero across the PC legacy region")
     parser.add_argument("--tss", action="store_true", help="reserve Firecracker's x86 TSS address")
@@ -1962,7 +2045,7 @@ def main():
             parser.error("--pvh needs at least 8192 pages for the kernel entry point")
     if args.pit_state:
         args.pit = True
-    if args.xcrs or args.xsave:
+    if args.xcrs or args.xsave or args.clock:
         args.cpuid = True
     if args.pit or args.irqfd or args.tss or args.lapic or args.irqchip_state or args.mp_state or args.vcpu_events:
         args.irqchip = True
@@ -2014,6 +2097,9 @@ def main():
     if args.xsave and (not args.protected_entry or args.two_vcpus or args.zero_slot or args.long_mode or
                        args.mmio_write or args.irqchip or args.xcrs):
         parser.error("--xsave requires a separate single-vCPU protected-mode fixture")
+    if args.clock and (not args.protected_entry or args.two_vcpus or args.zero_slot or args.long_mode or
+                       args.mmio_write or args.irqchip or args.xcrs or args.xsave):
+        parser.error("--clock requires a separate single-vCPU protected-mode fixture")
     qemu, kernel = (path.resolve(strict=True) for path in (args.qemu, args.kernel))
     output = args.output.resolve()
     if os.geteuid() != 0 or platform.machine() != "x86_64":
@@ -2025,7 +2111,7 @@ def main():
                                   args.mmio_write, args.mmio_read, args.ioeventfd, args.irqchip, args.pit,
                                   args.irqfd, args.zero_slot, args.tss, args.lapic, args.pio, args.complete_read,
                                   args.pio_boundary, args.pvh, args.irqchip_state, args.pit_state, args.debugregs,
-                                  args.mp_state, args.xcrs, args.xsave, args.vcpu_events)))
+                                  args.mp_state, args.xcrs, args.xsave, args.vcpu_events, args.clock)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -2105,6 +2191,8 @@ def main():
                 oracle.append("xsave")
             if args.vcpu_events:
                 oracle.append("vcpu-events")
+            if args.clock:
+                oracle.append("clock")
             HELPERS["run"](oracle, 14 if args.interrupt_run else 8, output / "native-kvm.log")
             report["same_client_passed_native_kvm"] = True
             report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
@@ -2166,6 +2254,8 @@ def main():
             files["xsave"] = b""
         if args.vcpu_events:
             files["vcpu-events"] = b""
+        if args.clock:
+            files["clock"] = b""
         image = HELPERS["initramfs"](init.read_bytes(), files=files)
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
@@ -2214,6 +2304,7 @@ def main():
                             *(["--xcrs"] if args.xcrs else []),
                             *(["--xsave"] if args.xsave else []),
                             *(["--vcpu-events"] if args.vcpu_events else []),
+                            *(["--clock"] if args.clock else []),
                             *(["--reject-close"] if args.reject_close else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}
@@ -2226,7 +2317,7 @@ def main():
             kvm_users = {line.split()[0] for line in lines if '"/dev/kvm"' in line}
             reset_queries = 2 if args.two_vcpus else 1
             model_queries = sum((args.cpuid, args.lapic, args.irqchip_state, args.debugregs, args.xcrs, args.xsave))
-            model_queries += int(args.vcpu_events)
+            model_queries += int(args.vcpu_events) + int(args.clock)
             model_queries += 2 * int(args.pit_state) + 3 * int(args.mp_state)
             if len(workers) != 1 + model_queries + reset_queries or kvm_users != workers:
                 raise RuntimeError("only the native parent worker may use host KVM")

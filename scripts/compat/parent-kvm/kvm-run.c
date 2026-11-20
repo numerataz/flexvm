@@ -75,6 +75,10 @@
 #define EVENTS_IRQ_OFFSET 0xa40
 #define EVENTS_IRQ_VECTOR 34
 #define EVENTS_ERROR_CODE 0x4320
+#define CLOCK_ENTRY_OFFSET 0xe00
+#define CLOCK_PAGE_OFFSET 0x340
+#define CLOCK_TSC_OFFSET 0x360
+#define CLOCK_SECOND_NS 1000000000ULL
 #define MMIO_BASE 0xd0000000ULL
 #define MMIO_FIRST_VALUE 0x5a443322U
 #define MMIO_SECOND_VALUE 0xaabbccddeeff0011ULL
@@ -884,6 +888,120 @@ static struct kvm_xsave read_xsave(int cpu)
     return state;
 }
 
+struct x86_pvclock_page {
+    uint32_t version;
+    uint32_t pad;
+    uint64_t tsc_timestamp;
+    uint64_t system_time;
+    uint32_t mul;
+    int8_t shift;
+    uint8_t flags;
+    uint8_t reserved[2];
+};
+
+static struct kvm_clock_data read_vm_clock(int vm)
+{
+    struct kvm_clock_data clock;
+
+    check(ioctl(vm, KVM_GET_CLOCK, &clock) == 0, "read the actual guest clock");
+    return clock;
+}
+
+static void stage_vm_clock(int kvm, int vm)
+{
+    int capabilities = ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_ADJUST_CLOCK);
+    check(capabilities > 0 && (capabilities & KVM_CLOCK_REALTIME),
+          "check the clock restoration capability");
+    struct kvm_clock_data clock = read_vm_clock(vm);
+
+    if (!(clock.flags & KVM_CLOCK_REALTIME)) {
+        struct timespec now;
+
+        check(clock_gettime(CLOCK_REALTIME, &now) == 0, "sample real time on a host without a stable KVM clock");
+        clock.realtime = now.tv_sec * CLOCK_SECOND_NS + now.tv_nsec;
+    }
+    check(clock.realtime > CLOCK_SECOND_NS, "obtain a real-time sample for clock restore");
+    struct kvm_clock_data invalid = {.flags = 1U << 31};
+
+    check(ioctl(vm, KVM_SET_CLOCK, &invalid) == -1 && errno == EINVAL, "reject unknown clock flags");
+    clock = (struct kvm_clock_data) {
+        .clock = 7 * CLOCK_SECOND_NS, .flags = KVM_CLOCK_REALTIME,
+        .realtime = clock.realtime - 50000000,
+    };
+    check(ioctl(vm, KVM_SET_CLOCK, &clock) == 0, "stage a VM clock with an elapsed host interval");
+    struct kvm_clock_data staged = read_vm_clock(vm);
+
+    check(staged.clock >= clock.clock + 50000000, "account for the elapsed real-time interval");
+}
+
+static uint64_t read_guest_pvclock(const unsigned char *data, size_t tsc_offset)
+{
+    struct x86_pvclock_page clock;
+    uint64_t tsc;
+    __uint128_t delta;
+
+    memcpy(&clock, data + CLOCK_PAGE_OFFSET, sizeof(clock));
+    memcpy(&tsc, data + tsc_offset, sizeof(tsc));
+    check(clock.version && !(clock.version & 1) && clock.mul && clock.shift >= -31 && clock.shift <= 31,
+          "read a coherent guest pvclock page");
+    delta = tsc >= clock.tsc_timestamp ? tsc - clock.tsc_timestamp : 0;
+    if (clock.shift >= 0)
+        delta <<= clock.shift;
+    else
+        delta >>= -clock.shift;
+    return clock.system_time + ((delta * clock.mul) >> 32);
+}
+
+static void check_pvclock(int vm, const unsigned char *data, size_t tsc_offset, uint64_t minimum)
+{
+    uint64_t observed = read_guest_pvclock(data, tsc_offset);
+    struct kvm_clock_data current = read_vm_clock(vm);
+
+    check(observed >= minimum && observed <= current.clock + CLOCK_SECOND_NS / 4 &&
+          current.clock <= observed + 2 * CLOCK_SECOND_NS, "guest pvclock agrees with the actual VM clock");
+}
+
+static void test_vm_clock(int vm, int cpu, struct kvm_run *run, int size, unsigned char *ram,
+                          const unsigned char *data, uint64_t gpa, uint64_t data_address)
+{
+    const unsigned char setup[] = {
+        0xb9, 0x01, 0x4d, 0x56, 0x4b,        /* mov ecx, MSR_KVM_SYSTEM_TIME_NEW */
+        0x8d, 0x87, 0x41, 0x03, 0, 0,       /* lea eax, [edi+0x341] */
+        0x31, 0xd2, 0x0f, 0x30,              /* xor edx, edx; wrmsr */
+        0x8d, 0xb7, 0x60, 0x03, 0, 0,       /* lea esi, [edi+0x360] */
+    };
+    const unsigned char checkpoint[] = {
+        0x0f, 0x31, 0x89, 0x06, 0x89, 0x56, 4, /* rdtsc and save the architectural result */
+        0xb9, 0x51, 0x7a, 0, 0,
+        0xb0, 0x8c, 0xe6, 0x30,
+    };
+    const unsigned char next[] = {0x83, 0xc6, 8}; /* add esi, 8 */
+    unsigned char *entry = ram + CLOCK_ENTRY_OFFSET;
+    const struct kvm_regs regs = {
+        .rsp = gpa + 0xf00, .rdi = data_address,
+        .rip = gpa + CLOCK_ENTRY_OFFSET, .rflags = 2,
+    };
+
+    memcpy(entry, setup, sizeof(setup));
+    memcpy(entry + sizeof(setup), checkpoint, sizeof(checkpoint));
+    memcpy(entry + sizeof(setup) + sizeof(checkpoint), next, sizeof(next));
+    memcpy(entry + sizeof(setup) + sizeof(checkpoint) + sizeof(next), checkpoint, sizeof(checkpoint));
+    entry[sizeof(setup) + 2 * sizeof(checkpoint) + sizeof(next)] = 0xf4;
+    check(ioctl(cpu, KVM_SET_REGS, &regs) == 0, "enter the guest clock test");
+    timed_run(cpu);
+    check_output(run, size, 0x8c);
+    check_registers(cpu, 0x8c, 0x7a51, gpa + CLOCK_ENTRY_OFFSET);
+    check_pvclock(vm, data, CLOCK_TSC_OFFSET, 7 * CLOCK_SECOND_NS);
+
+    const struct kvm_clock_data restored = {.clock = 30 * CLOCK_SECOND_NS};
+    check(ioctl(vm, KVM_SET_CLOCK, &restored) == 0, "restore the live clock for an existing guest page");
+    timed_run(cpu);
+    check_output(run, size, 0x8c);
+    check_registers(cpu, 0x8c, 0x7a51, gpa + CLOCK_ENTRY_OFFSET);
+    check_pvclock(vm, data, CLOCK_TSC_OFFSET + 8, restored.clock);
+    puts("PASS staged and restored VM clock reached the actual guest pvclock page");
+}
+
 static void write_xsave_pattern(int cpu, uint16_t control, uint32_t mxcsr,
                                unsigned char xmm_low, unsigned char ymm_high)
 {
@@ -1651,6 +1769,7 @@ int main(int argc, char **argv)
     bool xcrs = false;
     bool xsave = false;
     bool vcpu_events = false;
+    bool clock = false;
     bool irqfd = false;
     bool zero_slot = false;
     bool tss = false;
@@ -1697,6 +1816,8 @@ int main(int argc, char **argv)
             xsave = true;
         else if (!vcpu_events && !strcmp(argv[i], "vcpu-events"))
             vcpu_events = true;
+        else if (!clock && !strcmp(argv[i], "clock"))
+            clock = true;
         else if (!irqfd && !strcmp(argv[i], "irqfd"))
             irqfd = true;
         else if (!zero_slot && !strcmp(argv[i], "zero-slot"))
@@ -1744,6 +1865,8 @@ int main(int argc, char **argv)
           "use a single protected vCPU with CPUID and AVX support");
     check(!vcpu_events || (irqchip && !pit && !irqfd && !irqchip_state && !mp_state),
           "use a separate PIC fixture for vCPU events");
+    check(!clock || (protected_mode && cpuid && !two_vcpus && !irqchip && !xcrs && !xsave && !mmio),
+          "use a separate single-vCPU clock fixture with CPUID support");
     check(!debugregs || (protected_mode && !two_vcpus && !zero_slot && !long_mode &&
                          !mmio && !irqchip && !cpuid), "use the single-vCPU protected debug fixture");
     check(!irqfd || (irqchip && !pit), "test IRQFD in a separate PIC vCPU run");
@@ -1788,6 +1911,8 @@ int main(int argc, char **argv)
     check(vm >= 0 && (fcntl(vm, F_GETFD) & FD_CLOEXEC), "VM file descriptor");
     check(ioctl(vm, KVM_CHECK_EXTENSION, KVM_CAP_USER_MEMORY) == 1,
           "query the VM's memory capability");
+    if (clock)
+        stage_vm_clock(kvm, vm);
     if (tss) {
         check(ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_SET_TSS_ADDR) == 1, "query TSS address support");
         check(ioctl(vm, KVM_SET_TSS_ADDR, 0xffffe000UL) == -1 && errno == EINVAL,
@@ -2135,7 +2260,7 @@ int main(int argc, char **argv)
     struct ioevent_test notifications;
     if (ioeventfd)
         notifications = install_ioeventfds(vm);
-    else if (!irqchip)
+    else if (!irqchip && !clock)
         close(vm);
     run->immediate_exit = 1;
     check(ioctl(cpu, KVM_RUN, 0) == -1 && errno == EINTR, "immediate exit");
@@ -2294,6 +2419,10 @@ int main(int argc, char **argv)
         test_xcrs(cpu, run, size, ram, data, gpa, data_address);
     if (xsave)
         test_xsave(cpu, run, size, ram, data, gpa, data_address);
+    if (clock) {
+        test_vm_clock(vm, cpu, run, size, ram, data, gpa, data_address);
+        close(vm);
+    }
     munmap(run, size);
     close(cpu);
     munmap(ram, ram_bytes);
