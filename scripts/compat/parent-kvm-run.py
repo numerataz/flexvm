@@ -15,7 +15,6 @@ import platform
 import re
 import runpy
 import select
-import shutil
 import signal
 import socket
 import struct
@@ -26,6 +25,8 @@ import time
 
 ROOT = Path(__file__).resolve().parent
 SOURCES = ROOT / "parent-kvm"
+PROVIDER_DIR = "provider"
+NATIVE_WORKER = Path(PROVIDER_DIR) / "native-worker"
 HELPERS = runpy.run_path(str(ROOT / "software-boot.py"))
 DEVICES = ("/dev/kvm", "/dev/vhost-vsock", "/dev/vhost-net")
 MIB = 1 << 20
@@ -837,7 +838,7 @@ class KvmChild:
                 control = worker.fileno()
                 pit_request = 0 if pit_flags is None else pit_flags + 1
                 tss_request = 0xffffffff if tss_gpa is None else tss_gpa
-                command = [output / "native-worker", str(control), str(outer_ram), str(cpu_count),
+                command = [output / NATIVE_WORKER, str(control), str(outer_ram), str(cpu_count),
                            str(int(irqchip)), str(pit_request), str(tss_request), *map(str, irq_fds)]
                 if fds:
                     command.extend(["--run-sockets", *map(str, fds)])
@@ -1125,7 +1126,7 @@ def model_monitor(qemu, output, control, cpu_count, name):
 
 def model_cpuid(engine, qemu, output, control, cpu_count):
     if engine == "kvm":
-        native = subprocess.run([output / "native-worker", "--supported-cpuid"], capture_output=True, timeout=3)
+        native = subprocess.run([output / NATIVE_WORKER, "--supported-cpuid"], capture_output=True, timeout=3)
         if native.returncode:
             raise RuntimeError(f"native CPUID query failed: {native.stderr.decode(errors='replace')}")
         entries = [entry for entry in unpack_cpuid(native.stdout) if not entry[2] & ~1]
@@ -1147,7 +1148,7 @@ def parse_lapic(value):
 
 def reset_lapic(engine, qemu, output, control, cpu_count, cpu):
     if engine == "kvm":
-        native = subprocess.run([output / "native-worker", "--reset-lapic", str(cpu)], capture_output=True, timeout=3)
+        native = subprocess.run([output / NATIVE_WORKER, "--reset-lapic", str(cpu)], capture_output=True, timeout=3)
         if native.returncode or len(native.stdout) != LAPIC_SIZE:
             raise RuntimeError(f"native reset LAPIC query failed: {native.stderr.decode(errors='replace')}")
         return native.stdout
@@ -1157,7 +1158,7 @@ def reset_lapic(engine, qemu, output, control, cpu_count, cpu):
 
 def reset_sregs(engine, qemu, output, control, cpu_count, cpu, irqchip):
     if engine == "kvm":
-        native = subprocess.run([output / "native-worker", "--reset-sregs", str(cpu), str(int(irqchip))],
+        native = subprocess.run([output / NATIVE_WORKER, "--reset-sregs", str(cpu), str(int(irqchip))],
                                 capture_output=True, timeout=3)
         if native.returncode or len(native.stdout) != SPECIAL_REGISTERS_SIZE:
             raise RuntimeError(f"native reset SREGS query failed: {native.stderr.decode(errors='replace')}")
@@ -1176,7 +1177,7 @@ def pack_irqchip(chip_id, snapshot):
 def reset_irqchips(engine, qemu, output, control, cpu_count):
     count = len(IRQCHIP_PAYLOAD_SIZES)
     if engine == "kvm":
-        native = subprocess.run([output / "native-worker", "--reset-irqchips"], capture_output=True, timeout=3)
+        native = subprocess.run([output / NATIVE_WORKER, "--reset-irqchips"], capture_output=True, timeout=3)
         if native.returncode or len(native.stdout) != count * IRQCHIP_SIZE:
             raise RuntimeError(f"native reset irqchip query failed: {native.stderr.decode(errors='replace')}")
         return [native.stdout[id * IRQCHIP_SIZE:(id + 1) * IRQCHIP_SIZE] for id in range(count)]
@@ -1195,7 +1196,7 @@ def parse_pit_state(snapshot):
 def unstarted_pit_state(engine, qemu, output, control, flags, staged):
     if engine == "kvm":
         option = "--reset-pit" if staged is None else "--staged-pit"
-        native = subprocess.run([output / "native-worker", option, str(flags)], input=staged,
+        native = subprocess.run([output / NATIVE_WORKER, option, str(flags)], input=staged,
                                 capture_output=True, timeout=3)
         if native.returncode or len(native.stdout) != PIT_STATE_SIZE:
             raise RuntimeError(f"native unstarted PIT query failed: {native.stderr.decode(errors='replace')}")
@@ -1211,7 +1212,7 @@ def pack_debugregs(state):
 
 def reset_debugregs(engine, qemu, output, control, cpu_count, cpu):
     if engine == "kvm":
-        native = subprocess.run([output / "native-worker", "--reset-debugregs", str(cpu)],
+        native = subprocess.run([output / NATIVE_WORKER, "--reset-debugregs", str(cpu)],
                                 capture_output=True, timeout=3)
         if native.returncode or len(native.stdout) != DEBUGREGS.size:
             raise RuntimeError(f"native debug register query failed: {native.stderr.decode(errors='replace')}")
@@ -1222,7 +1223,7 @@ def reset_debugregs(engine, qemu, output, control, cpu_count, cpu):
 
 def unstarted_mp_state(engine, qemu, output, control, cpu_count, cpu, irqchip, staged):
     if engine == "kvm":
-        command = [output / "native-worker", "--reset-mp", str(cpu), str(int(irqchip)), *map(str, staged)]
+        command = [output / NATIVE_WORKER, "--reset-mp", str(cpu), str(int(irqchip)), *map(str, staged)]
         native = subprocess.run(command, capture_output=True, timeout=3)
         if native.returncode or len(native.stdout) != MP_STATE.size:
             raise RuntimeError(f"native MP state query failed: {native.stderr.decode(errors='replace')}")
@@ -1242,7 +1243,7 @@ def pack_xcrs(xcr0):
 
 def reset_xcrs(engine, qemu, output, control, cpu_count, cpu):
     if engine == "kvm":
-        native = subprocess.run([output / "native-worker", "--reset-xcrs", str(cpu)],
+        native = subprocess.run([output / NATIVE_WORKER, "--reset-xcrs", str(cpu)],
                                 capture_output=True, timeout=3)
         if native.returncode or len(native.stdout) != XCRS.size:
             raise RuntimeError(f"native XCR query failed: {native.stderr.decode(errors='replace')}")
@@ -1260,7 +1261,7 @@ def parse_xsave(state):
 
 def reset_xsave(engine, qemu, output, control, cpu_count, cpu):
     if engine == "kvm":
-        native = subprocess.run([output / "native-worker", "--reset-xsave", str(cpu)],
+        native = subprocess.run([output / NATIVE_WORKER, "--reset-xsave", str(cpu)],
                                 capture_output=True, timeout=3)
         if native.returncode or len(native.stdout) != XSAVE_SIZE:
             raise RuntimeError(f"native XSAVE query failed: {native.stderr.decode(errors='replace')}")
@@ -1278,7 +1279,7 @@ def parse_vcpu_events(state):
 
 def reset_vcpu_events(engine, qemu, output, control, cpu_count, cpu, irqchip):
     if engine == "kvm":
-        native = subprocess.run([output / "native-worker", "--reset-events", str(cpu), str(int(irqchip))],
+        native = subprocess.run([output / NATIVE_WORKER, "--reset-events", str(cpu), str(int(irqchip))],
                                 capture_output=True, timeout=3)
         if native.returncode or len(native.stdout) != VCPU_EVENTS_SIZE:
             raise RuntimeError(f"native event query failed: {native.stderr.decode(errors='replace')}")
@@ -1324,7 +1325,7 @@ def tcg_clock(command, record):
 
 def reset_clock(engine, qemu, output, control):
     if engine == "kvm":
-        native = subprocess.run([output / "native-worker", "--reset-clock"], capture_output=True, timeout=3)
+        native = subprocess.run([output / NATIVE_WORKER, "--reset-clock"], capture_output=True, timeout=3)
         if native.returncode or len(native.stdout) != CLOCK_DATA.size:
             raise RuntimeError(f"native VM clock query failed: {native.stderr.decode(errors='replace')}")
         return native.stdout
@@ -2374,20 +2375,17 @@ def main():
         parser.error("use an output directory without an existing report")
     report = {"qemu_sha256": HELPERS["digest"](qemu), "kernel_sha256": HELPERS["digest"](kernel)}
     try:
-        module = output / "module"
-        module.mkdir()
-        for filename in ("Makefile", "mailbox.h", "flexvm-pvkvm.c"):
-            shutil.copyfile(SOURCES / filename, module / filename)
-        HELPERS["run"](["make", "-j2", "-C", args.kernel_build.resolve(strict=True), f"M={module}", "modules"],
+        provider = output / PROVIDER_DIR
+        HELPERS["run"](["bash", SOURCES / "build.sh", args.kernel_build.resolve(strict=True), provider,
+                        *(["--native"] if args.parent_engine == "kvm" else [])],
                        120, output / "module-build.log")
+        module = provider / "flexvm-pvkvm.ko"
         client, init = output / "client", output / "init"
-        programs = [("kvm-run.c", client), ("init.c", init)]
-        if args.parent_engine == "kvm":
-            programs.append(("native-worker.c", output / "native-worker"))
-        for source, binary in programs:
-            HELPERS["run"](["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static", "-pthread", SOURCES / source, "-o", binary],
-                           20, output / f"{source}.log")
-        report.update(client_sha256=HELPERS["digest"](client), module_sha256=HELPERS["digest"](module / "flexvm-pvkvm.ko"))
+        for source, binary in (("kvm-run.c", client), ("init.c", init)):
+            HELPERS["run"](["cc", "-std=c11", "-O2", "-Wall", "-Wextra", "-Werror", "-static", "-pthread",
+                            SOURCES / source, "-o", binary], 20, output / f"{source}.log")
+        report.update(client_sha256=HELPERS["digest"](client), module_sha256=HELPERS["digest"](module),
+                      module_kernel_release=(provider / "kernel.release").read_text().strip())
         if args.native_oracle:
             oracle = [client, str(args.ram_pages)]
             if args.protected_entry:
@@ -2450,7 +2448,7 @@ def main():
             report["same_client_passed_native_kvm"] = True
             report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
         files = {
-            "kvm-run": client.read_bytes(), "flexvm-pvkvm.ko": (module / "flexvm-pvkvm.ko").read_bytes(),
+            "kvm-run": client.read_bytes(), "flexvm-pvkvm.ko": module.read_bytes(),
             "ram-pages": str(args.ram_pages).encode("ascii"),
         }
         if args.memory_quota:
@@ -2597,7 +2595,7 @@ def main():
         if devices != expected:
             raise RuntimeError(f"unexpected virtualization device access: {sorted(devices)}")
         if args.parent_engine == "kvm":
-            worker_path = f'execve("{output / "native-worker"}",'
+            worker_path = f'execve("{output / NATIVE_WORKER}",'
             workers = {line.split()[0] for line in lines if worker_path in line and line.endswith(" = 0")}
             kvm_users = {line.split()[0] for line in lines if '"/dev/kvm"' in line}
             reset_queries = 2 if args.two_vcpus else 1
