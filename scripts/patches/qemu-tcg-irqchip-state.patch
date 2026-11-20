@@ -1,0 +1,225 @@
+--- a/qapi/misc-i386.json
++++ b/qapi/misc-i386.json
+@@ -772 +772,25 @@
+   'features': [ 'unstable' ] }
++
++##
++# @FlexvmX86IrqchipRecord:
++#
++# @record: Hex-encoded Linux KVM PIC or IOAPIC state.
++##
++{ 'struct': 'FlexvmX86IrqchipRecord', 'data': { 'record': 'str' } }
++
++##
++# @x-flexvm-access-x86-irqchip:
++#
++# Read or install an interrupt controller image for a stopped x86 VM.
++#
++# @chip-id: Master PIC, slave PIC, or IOAPIC, numbered 0 through 2.
++# @record: New hex-encoded controller state, when writing.
++#
++# Features:
++#
++# @unstable: Experimental FlexVM worker protocol.
++##
++{ 'command': 'x-flexvm-access-x86-irqchip',
++  'data': { 'chip-id': 'uint8', '*record': 'str' },
++  'returns': 'FlexvmX86IrqchipRecord',
++  'features': [ 'unstable' ] }
+--- a/target/i386/monitor.c
++++ b/target/i386/monitor.c
+@@ -37,2 +37,3 @@
+ #include "hw/i386/pc.h"
++#include "hw/intc/flexvm-irqchip.h"
+ #include "hw/irq.h"
+@@ -1117 +1118,53 @@
+ }
++
++FlexvmX86IrqchipRecord *qmp_x_flexvm_access_x86_irqchip(uint8_t chip_id,
++                                                     const char *record,
++                                                     Error **errp)
++{
++    static const char hex[] = "0123456789abcdef";
++    uint8_t bytes[FLEXVM_IOAPIC_IMAGE_SIZE] = { 0 };
++    size_t length = chip_id == 2 ? FLEXVM_IOAPIC_IMAGE_SIZE : FLEXVM_PIC_IMAGE_SIZE;
++    FlexvmX86IrqchipRecord *result;
++    bool ok;
++
++    if (!flexvm_stopped_cpu(0, errp)) {
++        return NULL;
++    }
++    if (chip_id > 2 || !object_dynamic_cast(OBJECT(qdev_get_machine()), TYPE_PC_MACHINE)) {
++        error_setg(errp, "FlexVM requires a valid x86 PC interrupt controller");
++        return NULL;
++    }
++    if (record) {
++        if (strlen(record) != 2 * length) {
++            error_setg(errp, "Invalid FlexVM interrupt controller image size");
++            return NULL;
++        }
++        for (size_t i = 0; i < length; i++) {
++            int hi = g_ascii_xdigit_value(record[2 * i]);
++            int lo = g_ascii_xdigit_value(record[2 * i + 1]);
++
++            if (hi < 0 || lo < 0) {
++                error_setg(errp, "Invalid hex in FlexVM interrupt controller image");
++                return NULL;
++            }
++            bytes[i] = (hi << 4) | lo;
++        }
++    }
++    if (chip_id == 2) {
++        ok = flexvm_ioapic_state(record != NULL, bytes);
++    } else {
++        ok = flexvm_pic_state(chip_id == 0, record != NULL, bytes);
++    }
++    if (!ok) {
++        error_setg(errp, "FlexVM interrupt controller state is unavailable");
++        return NULL;
++    }
++    result = g_new0(FlexvmX86IrqchipRecord, 1);
++    result->record = g_malloc(2 * length + 1);
++    for (size_t i = 0; i < length; i++) {
++        result->record[2 * i] = hex[bytes[i] >> 4];
++        result->record[2 * i + 1] = hex[bytes[i] & 15];
++    }
++    result->record[2 * length] = '\0';
++    return result;
++}
+--- a/stubs/monitor-i386-flexvm.c
++++ b/stubs/monitor-i386-flexvm.c
+@@ -80 +80,9 @@
+ }
++
++FlexvmX86IrqchipRecord *qmp_x_flexvm_access_x86_irqchip(uint8_t chip_id,
++                                                     const char *record,
++                                                     Error **errp)
++{
++    error_setg(errp, "FlexVM interrupt controller state requires an x86 worker");
++    return NULL;
++}
+--- a/hw/intc/i8259.c
++++ b/hw/intc/i8259.c
+@@ -25,2 +25,3 @@
+ #include "qemu/osdep.h"
++#include "hw/intc/flexvm-irqchip.h"
+ #include "hw/intc/i8259.h"
+@@ -115,2 +116,48 @@
+ }
++
++bool flexvm_pic_state(bool master, bool write, uint8_t record[FLEXVM_PIC_IMAGE_SIZE])
++{
++    PICCommonState *s = master ? isa_pic : slave_pic;
++
++    if (!s) {
++        return false;
++    }
++    if (write) {
++        s->last_irr = record[0];
++        s->irr = record[1];
++        s->imr = record[2];
++        s->isr = record[3];
++        s->priority_add = record[4];
++        s->irq_base = record[5];
++        s->read_reg_select = record[6];
++        s->poll = record[7];
++        s->special_mask = record[8];
++        s->init_state = record[9];
++        s->auto_eoi = record[10];
++        s->rotate_on_auto_eoi = record[11];
++        s->special_fully_nested_mode = record[12];
++        s->init4 = record[13];
++        s->elcr = record[14];
++        s->elcr_mask = record[15];
++        pic_update_irq(s);
++    } else {
++        record[0] = s->last_irr;
++        record[1] = s->irr;
++        record[2] = s->imr;
++        record[3] = s->isr;
++        record[4] = s->priority_add;
++        record[5] = s->irq_base;
++        record[6] = s->read_reg_select;
++        record[7] = s->poll;
++        record[8] = s->special_mask;
++        record[9] = s->init_state;
++        record[10] = s->auto_eoi;
++        record[11] = s->rotate_on_auto_eoi;
++        record[12] = s->special_fully_nested_mode;
++        record[13] = s->init4;
++        record[14] = s->elcr;
++        record[15] = s->elcr_mask;
++    }
++    return true;
++}
+
+--- a/hw/intc/ioapic.c
++++ b/hw/intc/ioapic.c
+@@ -23,2 +23,4 @@
+ #include "qemu/osdep.h"
++#include "qemu/bswap.h"
++#include "hw/intc/flexvm-irqchip.h"
+ #include "qapi/error.h"
+@@ -148,2 +150,47 @@
+ }
++
++bool flexvm_ioapic_state(bool write, uint8_t record[FLEXVM_IOAPIC_IMAGE_SIZE])
++{
++    IOAPICCommonState *s = ioapics[0];
++    uint64_t address;
++
++    if (!s) {
++        return false;
++    }
++    address = s->busdev.mmio[0].addr;
++    if (write) {
++        uint32_t masked = 0;
++
++        if (ldq_le_p(record) != address || ldl_le_p(record + 8) > UINT8_MAX ||
++            ldl_le_p(record + 12) > UINT8_MAX ||
++            ldl_le_p(record + 16) >= (1U << IOAPIC_NUM_PINS) ||
++            ldl_le_p(record + 20)) {
++            return false;
++        }
++        s->ioregsel = ldl_le_p(record + 8);
++        s->id = ldl_le_p(record + 12);
++        s->irr = ldl_le_p(record + 16);
++        for (unsigned int i = 0; i < IOAPIC_NUM_PINS; i++) {
++            s->ioredtbl[i] = ldq_le_p(record + 24 + i * 8);
++            if (s->ioredtbl[i] & IOAPIC_LVT_MASKED) {
++                masked |= 1U << i;
++            }
++        }
++        /* A masked request remains pending when the image is installed. */
++        masked &= s->irr;
++        s->irr &= ~masked;
++        ioapic_service(s);
++        s->irr |= masked;
++    } else {
++        stq_le_p(record, address);
++        stl_le_p(record + 8, s->ioregsel);
++        stl_le_p(record + 12, s->id);
++        stl_le_p(record + 16, s->irr);
++        stl_le_p(record + 20, 0);
++        for (unsigned int i = 0; i < IOAPIC_NUM_PINS; i++) {
++            stq_le_p(record + 24 + i * 8, s->ioredtbl[i]);
++        }
++    }
++    return true;
++}
+
+--- /dev/null
++++ b/include/hw/intc/flexvm-irqchip.h
+@@ -0,0 +1,12 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#ifndef HW_INTC_FLEXVM_IRQCHIP_H
++#define HW_INTC_FLEXVM_IRQCHIP_H
++
++#define FLEXVM_PIC_IMAGE_SIZE 16
++#define FLEXVM_IOAPIC_IMAGE_SIZE 216
++
++bool flexvm_pic_state(bool master, bool write,
++                      uint8_t record[FLEXVM_PIC_IMAGE_SIZE]);
++bool flexvm_ioapic_state(bool write, uint8_t record[FLEXVM_IOAPIC_IMAGE_SIZE]);
++
++#endif

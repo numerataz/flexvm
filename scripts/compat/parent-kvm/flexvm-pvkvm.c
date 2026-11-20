@@ -1147,6 +1147,7 @@ static long device_capability(unsigned long capability)
 	case KVM_CAP_PIT2:
 	case KVM_CAP_IRQFD:
 	case KVM_CAP_SET_TSS_ADDR:
+	case KVM_CAP_IRQCHIP:
 		return 1;
 	case KVM_CAP_NR_MEMSLOTS:
 		return PVKVM_MAX_SLOTS;
@@ -1352,6 +1353,47 @@ static long create_irqchip(struct pvvm *vm, unsigned long arg)
 	return result;
 }
 
+static long access_irqchip(struct pvvm *vm, bool write, struct kvm_irqchip __user *user)
+{
+	struct pvkvm *p = vm->provider;
+	struct kvm_irqchip *chip;
+	int result;
+
+	chip = memdup_user(user, sizeof(*chip));
+	if (IS_ERR(chip))
+		return PTR_ERR(chip);
+	if (chip->chip_id >= KVM_NR_IRQCHIPS) {
+		result = -EINVAL;
+		goto free_chip;
+	}
+	if (write && chip->chip_id == KVM_IRQCHIP_IOAPIC &&
+	    (chip->chip.ioapic.base_address != PVKVM_IOAPIC_GPA ||
+	     chip->chip.ioapic.ioregsel > U8_MAX || chip->chip.ioapic.id > U8_MAX ||
+	     chip->chip.ioapic.irr >= BIT(PVKVM_GSI_COUNT) || chip->chip.ioapic.pad)) {
+		result = -EINVAL;
+		goto free_chip;
+	}
+	result = mutex_lock_interruptible(&p->lock);
+	if (result)
+		goto free_chip;
+	if (!vm->irqchip_created) {
+		result = -ENXIO;
+	} else if (p->dead) {
+		result = -ENODEV;
+	} else {
+		memcpy_toio(p->mailbox + PVKVM_IRQCHIP_AT, chip, sizeof(*chip));
+		result = request(p, write ? PVKVM_SET_IRQCHIP : PVKVM_GET_IRQCHIP, NULL, NULL);
+		if (!result && !write)
+			memcpy_fromio(chip, p->mailbox + PVKVM_IRQCHIP_AT, sizeof(*chip));
+	}
+	mutex_unlock(&p->lock);
+	if (!result && !write && copy_to_user(user, chip, sizeof(*chip)))
+		result = -EFAULT;
+free_chip:
+	kfree(chip);
+	return result;
+}
+
 static long set_irq_line(struct pvvm *vm, struct kvm_irq_level __user *user)
 {
 	struct pvkvm *p = vm->provider;
@@ -1477,6 +1519,8 @@ static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return vm_ioeventfd(vm, (void __user *)arg);
 	if (cmd == KVM_CREATE_IRQCHIP)
 		return create_irqchip(vm, arg);
+	if (cmd == KVM_GET_IRQCHIP || cmd == KVM_SET_IRQCHIP)
+		return access_irqchip(vm, cmd == KVM_SET_IRQCHIP, (void __user *)arg);
 	if (cmd == KVM_IRQ_LINE)
 		return set_irq_line(vm, (void __user *)arg);
 	if (cmd == KVM_IRQFD)
@@ -1678,8 +1722,10 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	BUILD_BUG_ON(sizeof(struct kvm_lapic_state) != PVKVM_LAPIC_BYTES);
 	BUILD_BUG_ON(PVKVM_LAPIC_VALID_AT + sizeof(u32) > PVKVM_REGISTERS_AT);
 	BUILD_BUG_ON(PVKVM_LAPIC_AT + PVKVM_LAPIC_BYTES > PVKVM_PIO_DATA_AT);
+	BUILD_BUG_ON(PVKVM_PIO_DATA_AT + PVKVM_PIO_BYTES > PVKVM_IRQCHIP_AT);
+	BUILD_BUG_ON(sizeof(struct kvm_irqchip) != PVKVM_IRQCHIP_BYTES);
 	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
-	    pci_resource_len(dev, 2) < PVKVM_PIO_DATA_AT + PVKVM_PIO_BYTES)
+	    pci_resource_len(dev, 2) < PVKVM_IRQCHIP_AT + PVKVM_IRQCHIP_BYTES)
 		return -ENODEV;
 	result = pcim_enable_device(dev);
 	if (result)

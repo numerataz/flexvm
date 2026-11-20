@@ -53,6 +53,10 @@
 #define LAPIC_LINT1_NMI 0x400
 #define LAPIC_LVT_MASKED 0x10000
 #define PIC_VECTOR (32 + PIC_GSI)
+#define IOAPIC_GSI 6
+#define IOAPIC_VECTOR (32 + IOAPIC_GSI)
+#define IOAPIC_HANDLER_OFFSET 0xd40
+#define IOAPIC_ENTRY_OFFSET 0xe00
 #define MMIO_BASE 0xd0000000ULL
 #define MMIO_FIRST_VALUE 0x5a443322U
 #define MMIO_SECOND_VALUE 0xaabbccddeeff0011ULL
@@ -654,26 +658,51 @@ static void test_port_boundary(int cpu, struct kvm_run *run, size_t bytes)
     test_port_access(cpu, run, bytes, 0xffff, 4, false, "\xde\xc0\xef\xbe", 4);
 }
 
-static void set_pic_line(int vm, unsigned int level)
+static void set_irq_line(int vm, unsigned int gsi, unsigned int level)
 {
-    const struct kvm_irq_level irq = {.irq = PIC_GSI, .level = level};
+    const struct kvm_irq_level irq = {.irq = gsi, .level = level};
     check(ioctl(vm, KVM_IRQ_LINE, &irq) == 0, "set the parent IRQ line");
 }
 
-static void prepare_pic(int vm, unsigned char *ram, uint32_t gpa, bool pit, bool lapic)
+static struct kvm_irqchip read_irqchip(int vm, unsigned int id)
+{
+    struct kvm_irqchip chip = {.chip_id = id};
+
+    check(ioctl(vm, KVM_GET_IRQCHIP, &chip) == 0 && chip.chip_id == id, "read a real x86 interrupt controller");
+    return chip;
+}
+
+static void configure_irqchip_state(int vm)
+{
+    check(ioctl(vm, KVM_CHECK_EXTENSION, KVM_CAP_IRQCHIP) == 1, "advertise the x86 irqchip capability");
+    struct kvm_irqchip master = read_irqchip(vm, KVM_IRQCHIP_PIC_MASTER);
+    struct kvm_irqchip slave = read_irqchip(vm, KVM_IRQCHIP_PIC_SLAVE);
+    struct kvm_irqchip ioapic = read_irqchip(vm, KVM_IRQCHIP_IOAPIC);
+
+    check(master.chip.pic.elcr_mask == 0xf8 && slave.chip.pic.elcr_mask == 0xde,
+          "read both reset PIC edge/level masks");
+    check(ioapic.chip.ioapic.base_address == PVKVM_IOAPIC_GPA &&
+          (ioapic.chip.ioapic.redirtbl[IOAPIC_GSI].bits & 0x10000), "read the masked IOAPIC reset route");
+    ioapic.chip.ioapic.redirtbl[IOAPIC_GSI].bits = IOAPIC_VECTOR;
+    check(ioctl(vm, KVM_SET_IRQCHIP, &ioapic) == 0, "stage the IOAPIC route before first execution");
+}
+
+static void prepare_pic(int vm, unsigned char *ram, uint32_t gpa, bool pit, bool lapic, bool irqchip_state)
 {
     check(ioctl(vm, KVM_CREATE_IRQCHIP, 0) == 0, "create the x86 irqchip");
     check(ioctl(vm, KVM_CREATE_IRQCHIP, 0) == -1 && errno == EEXIST, "reject duplicate irqchip creation");
+    if (irqchip_state)
+        configure_irqchip_state(vm);
     if (pit) {
         struct kvm_pit_config config = {.flags = KVM_PIT_SPEAKER_DUMMY};
         check(ioctl(vm, KVM_CHECK_EXTENSION, KVM_CAP_PIT2) > 0, "check PIT support");
         check(ioctl(vm, KVM_CREATE_PIT2, &config) == 0, "create the x86 PIT");
         check(ioctl(vm, KVM_CREATE_PIT, 0) == -1 && errno == EEXIST, "reject duplicate PIT creation");
     }
-    set_pic_line(vm, 0);
+    set_irq_line(vm, PIC_GSI, 0);
 
     const uint32_t idt = gpa + PIC_IDT_OFFSET;
-    const uint16_t limit = (PIC_VECTOR + 1) * 8 - 1;
+    const uint16_t limit = ((irqchip_state ? IOAPIC_VECTOR : PIC_VECTOR) + 1) * 8 - 1;
     const uint32_t handler = gpa + PIC_HANDLER_OFFSET;
     const uint32_t gate[] = {
         (handler & 0xffff) | (8 << 16), (handler & 0xffff0000) | 0x8e00,
@@ -681,6 +710,17 @@ static void prepare_pic(int vm, unsigned char *ram, uint32_t gpa, bool pit, bool
     memcpy(ram + PIC_IDT_OFFSET + PIC_VECTOR * 8, gate, sizeof(gate));
     if (pit)
         memcpy(ram + PIC_IDT_OFFSET + 32 * 8, gate, sizeof(gate));
+    if (irqchip_state) {
+        const uint32_t handler_gpa = gpa + IOAPIC_HANDLER_OFFSET;
+        const uint32_t gate[] = {(handler_gpa & 0xffff) | (8 << 16), (handler_gpa & 0xffff0000) | 0x8e00};
+        const unsigned char handler[] = {
+            0xfe, 0x87, 0xfa, 0, 0, 0,                  /* inc byte [edi+0xfa] */
+            0xc7, 0x05, 0xb0, 0x00, 0xe0, 0xfe, 0, 0, 0, 0, /* LAPIC EOI */
+            0xcf,                                      /* iret */
+        };
+        memcpy(ram + PIC_IDT_OFFSET + IOAPIC_VECTOR * 8, gate, sizeof(gate));
+        memcpy(ram + IOAPIC_HANDLER_OFFSET, handler, sizeof(handler));
+    }
     memcpy(ram + PIC_IDTR_OFFSET, &limit, sizeof(limit));
     memcpy(ram + PIC_IDTR_OFFSET + sizeof(limit), &idt, sizeof(idt));
     const unsigned char apic_setup[] = {
@@ -713,6 +753,45 @@ static void prepare_pic(int vm, unsigned char *ram, uint32_t gpa, bool pit, bool
     memcpy(ram + entry, pic_setup, sizeof(pic_setup));
     memcpy(ram + PIC_HANDLER_OFFSET, pic_handler, sizeof(pic_handler));
     install_jump(ram, entry + sizeof(pic_setup), 0x10);
+}
+
+static void check_live_irqchip_state(int vm)
+{
+    struct kvm_irqchip master = read_irqchip(vm, KVM_IRQCHIP_PIC_MASTER);
+    struct kvm_irqchip slave = read_irqchip(vm, KVM_IRQCHIP_PIC_SLAVE);
+    struct kvm_irqchip ioapic = read_irqchip(vm, KVM_IRQCHIP_IOAPIC);
+    const uint8_t mask = master.chip.pic.imr;
+
+    check(mask == 0xf7 && master.chip.pic.irq_base == 32 &&
+          slave.chip.pic.imr == 0xff && slave.chip.pic.irq_base == 40, "read PIC state after guest programming");
+    check(ioapic.chip.ioapic.redirtbl[IOAPIC_GSI].bits == IOAPIC_VECTOR, "read the installed live IOAPIC route");
+    master.chip.pic.imr = 0xff;
+    check(ioctl(vm, KVM_SET_IRQCHIP, &master) == 0, "write the stopped PIC mask");
+    master = read_irqchip(vm, KVM_IRQCHIP_PIC_MASTER);
+    check(master.chip.pic.imr == 0xff, "read back the stopped PIC mask");
+    master.chip.pic.imr = mask;
+    check(ioctl(vm, KVM_SET_IRQCHIP, &master) == 0, "restore the original PIC mask");
+}
+
+static void test_ioapic(int vm, int cpu, struct kvm_run *run, int size, unsigned char *ram, unsigned char *data,
+                        uint64_t gpa, uint64_t data_address)
+{
+    const unsigned char program[] = {0xfb, 0x90, 0xfa, 0xb0, 0x7c, 0xe6, 0x30, 0xf4};
+    const struct kvm_regs regs = {
+        .rcx = 0x6543, .rsp = gpa + 0xf00, .rdi = data_address,
+        .rip = gpa + IOAPIC_ENTRY_OFFSET, .rflags = 2,
+    };
+
+    memcpy(ram + IOAPIC_ENTRY_OFFSET, program, sizeof(program));
+    check(data[0xfa] == 0, "wait for the IOAPIC edge before running its handler");
+    set_irq_line(vm, IOAPIC_GSI, 1);
+    check(ioctl(cpu, KVM_SET_REGS, &regs) == 0, "enter the configured IOAPIC interrupt window");
+    timed_run(cpu);
+    check_output(run, size, 0x7c);
+    check_registers(cpu, 0x7c, 0x6543, gpa + IOAPIC_ENTRY_OFFSET);
+    check(data[0xfa] == 1 && data[0xf8] == 1, "receive exactly one IOAPIC interrupt on its own vector");
+    set_irq_line(vm, IOAPIC_GSI, 0);
+    puts("PASS VMM-configured IOAPIC routed a real interrupt to the guest");
 }
 
 static uint32_t lapic_reg(const struct kvm_lapic_state *lapic, unsigned int offset)
@@ -944,6 +1023,7 @@ int main(int argc, char **argv)
     bool complete_read = false;
     bool pio_boundary = false;
     bool pvh = false;
+    bool irqchip_state = false;
     check(argc == 2 || protected_mode, "specify RAM pages and optional protected or split mode");
     for (int i = 3; i < argc; i++) {
         if (!interrupt_run && !strcmp(argv[i], "interrupt"))
@@ -985,6 +1065,8 @@ int main(int argc, char **argv)
             pio_boundary = true;
         else if (!pvh && !strcmp(argv[i], "pvh"))
             pvh = true;
+        else if (!irqchip_state && !strcmp(argv[i], "irqchip-state"))
+            irqchip_state = true;
         else
             check(false, "invalid execution option");
     }
@@ -1014,6 +1096,7 @@ int main(int argc, char **argv)
     check(!complete_read || pio || mmio_read, "exercise completion-only entry with a pending read");
     check(!pio_boundary || (pio && irqchip), "test port boundary behavior with the PIC enabled");
     check(!pvh || (zero_slot && count >= 8192), "use a zero-based slot containing the x86 PVH entry");
+    check(!irqchip_state || (irqchip && !pit && !irqfd), "test PIC and IOAPIC state in their own interrupt fixture");
     size_t pages = count;
     size_t ram_bytes = pages * 4096;
     uint64_t gpa = PVKVM_GUEST_START;
@@ -1293,7 +1376,7 @@ int main(int argc, char **argv)
         memcpy(data + 0x100, gdtr, sizeof(gdtr));
     }
     if (irqchip)
-        prepare_pic(vm, ram, gpa, pit, lapic);
+        prepare_pic(vm, ram, gpa, pit, lapic, irqchip_state);
     if (zero_slot)
         prepare_zero_slot(ram, zero_slot_offsets, sizeof(zero_slot_offsets) / sizeof(zero_slot_offsets[0]));
     if (pvh) {
@@ -1467,12 +1550,15 @@ int main(int argc, char **argv)
     if (msrs)
         update_msrs(cpu, ram);
     if (irqchip) {
-        check(sregs.idt.base == gpa + PIC_IDT_OFFSET && sregs.idt.limit == (PIC_VECTOR + 1) * 8 - 1,
+        check(sregs.idt.base == gpa + PIC_IDT_OFFSET &&
+              sregs.idt.limit == ((irqchip_state ? IOAPIC_VECTOR : PIC_VECTOR) + 1) * 8 - 1,
               "read the live interrupt descriptor table");
         if (lapic)
             reconfigure_lapic(cpu);
+        if (irqchip_state)
+            check_live_irqchip_state(vm);
         check(!data[0xf8], "wait for a real IRQ before running the guest handler");
-        set_pic_line(vm, 1);
+        set_irq_line(vm, PIC_GSI, 1);
     }
     data[0x81] = 0x52;
     const struct kvm_regs update = {
@@ -1508,12 +1594,14 @@ int main(int argc, char **argv)
                   "observe the guest's LINT1 MMIO update in KVM_GET_LAPIC");
             puts("PASS VMM and guest updated the parent LAPIC");
         }
-        set_pic_line(vm, 0);
+        set_irq_line(vm, PIC_GSI, 0);
         puts("PASS child PIC delivered and acknowledged the parent IRQ");
         if (pit)
             test_pit(cpu, run, size, ram, data, gpa, data_address);
         if (irqfd)
             test_irqfd(vm, cpu, run, size, ram, data, gpa, data_address);
+        if (irqchip_state)
+            test_ioapic(vm, cpu, run, size, ram, data, gpa, data_address);
         close(vm);
     }
     if (tss)

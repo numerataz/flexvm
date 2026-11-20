@@ -40,7 +40,7 @@ int main(void)
     pid_t child = fork();
     check(child >= 0, "fork the KVM client");
     if (child == 0) {
-        char *arguments[23] = {"kvm-run", pages};
+        char *arguments[24] = {"kvm-run", pages};
         unsigned int next = 2;
         if (access("/split-slot", F_OK) == 0)
             arguments[next++] = "split";
@@ -84,6 +84,8 @@ int main(void)
             arguments[next++] = "pio-boundary";
         if (access("/pvh", F_OK) == 0)
             arguments[next++] = "pvh";
+        if (access("/irqchip-state", F_OK) == 0)
+            arguments[next++] = "irqchip-state";
         execv("/kvm-run", arguments);
         _exit(127);
     }
