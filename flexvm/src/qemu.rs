@@ -1276,10 +1276,10 @@ impl Machine {
                 Err(error) => return Err(error.into()),
             }
         }
-        if status.success() && crate::fc::kernel_powered_off(&String::from_utf8_lossy(&console)) {
+        if status.success() && crate::fc::kernel_shutdown(&String::from_utf8_lossy(&console)).is_some() {
             return Ok(Some(0));
         }
-        bail!("software distro engine exited without a completed guest power-off: {status}; {}", self.diagnostics())
+        bail!("software distro engine exited without a completed guest power-off or reboot: {status}; {}", self.diagnostics())
     }
 
     pub fn exec(&self, argv: Vec<String>, out: impl FnMut(u8, &[u8]) -> Result<()>) -> Result<i32> {
@@ -1659,6 +1659,18 @@ mod tests {
         assert_eq!(machine.distro_exit().unwrap(), None, "a live console cannot terminate or complete a VM");
         machine.processes.alive().unwrap();
         fs::write(gate, b"exit").unwrap();
+        while machine.distro_exit().unwrap().is_none() {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(machine.distro_exit().unwrap(), Some(0));
+    }
+
+    #[test]
+    fn distro_reboot_requires_actual_engine_exit_and_drained_console() {
+        let machine = machine();
+        machine.processes.spawn(Command::new("sh").args(["-c", "printf '[    1.0] reboot: Restarting system\n'"]), &machine.logs.join("qemu.log")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
         while machine.distro_exit().unwrap().is_none() {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(5));
