@@ -3,7 +3,7 @@
 #define FLEXVM_PVKVM_MAILBOX_H
 
 #define PVKVM_MAGIC        0x4d564b46
-#define PVKVM_VERSION      32
+#define PVKVM_VERSION      36
 #define PVKVM_MAGIC_AT     0
 #define PVKVM_VERSION_AT   4
 #define PVKVM_REQUEST_AT   8
@@ -17,6 +17,9 @@
 #define PVKVM_FPU_VALID_AT   48
 #define PVKVM_CPUID_VALID_AT 52
 #define PVKVM_LAPIC_VALID_AT 56
+#define PVKVM_FEATURES_AT    60
+#define PVKVM_FEATURE_PARALLEL_RUN 1
+#define PVKVM_FEATURE_ARM 2
 #define PVKVM_SLOT_TABLE_AT  640
 #define PVKVM_SLOT_RECORD_SIZE 16
 #define PVKVM_FPU_AT         768
@@ -44,8 +47,43 @@
 #define PVKVM_MP_STATE_AT     0x87480
 #define PVKVM_XCRS_AT         0x87500
 #define PVKVM_XCRS_BYTES      392
+#define PVKVM_XSAVE_AT        0x88000
+#define PVKVM_XSAVE_BYTES     4096
+#define PVKVM_VCPU_EVENTS_AT  0x89000
+#define PVKVM_VCPU_EVENTS_BYTES 64
+#define PVKVM_CLOCK_AT        0x89100
+#define PVKVM_CLOCK_BYTES     48
+#define PVKVM_RAM_LIMIT_AT    0x89130
+#define PVKVM_ARM_IPA_BITS_AT 0x89138
+#define PVKVM_ARM_VM_TYPE_AT  0x89140
+#define PVKVM_ARM_INIT_AT     0x89300
+#define PVKVM_ARM_REG_AT      0x89400
+#define PVKVM_ARM_EVENT_AT    0x89520
+#define PVKVM_ARM_DEVICE_AT   0x89600
+#define PVKVM_ARM_GSI_AT      0x89620
+#define PVKVM_ARM_MP_STATE_AT 0x89624
+#define PVKVM_ARM_REGS_AT     0x96000
+#define PVKVM_ARM_REG_BYTES   256
+#define PVKVM_ARM_MAX_REGS    4096
+#define PVKVM_ARM_RAM_BASE    0x40000000ULL
+
+#define PVKVM_LANES_AT        0x90000
+#define PVKVM_LANE_STRIDE     0x2000
+#define PVKVM_LANE_REQUEST    0
+#define PVKVM_LANE_REPLY      4
+#define PVKVM_LANE_COMMAND    8
+#define PVKVM_LANE_STATUS     12
+#define PVKVM_LANE_CANCEL     16
+#define PVKVM_LANE_EXIT       32
+#define PVKVM_LANE_COMPLETE   64
+#define PVKVM_LANE_ARM_EVENT  128
+#define PVKVM_LANE_PIO        0x1000
 #define PVKVM_IOAPIC_GPA     0xfec00000ULL
+#ifdef CONFIG_ARM64
+#define PVKVM_GSI_COUNT      FLEXVM_ARM_GSI_COUNT
+#else
 #define PVKVM_GSI_COUNT      24
+#endif
 #define PVKVM_REGISTERS_AT   64
 #define PVKVM_INITIAL_SREGISTERS_AT 256
 #define PVKVM_GUEST_PAGE_SIZE 4096
@@ -58,11 +96,11 @@
 #define PVKVM_IO_PORT      0x30
 #define PVKVM_IVPOSITION_AT 8
 #define PVKVM_DOORBELL_AT   12
-#define PVKVM_GUEST_POSITION 1
 #define PVKVM_HOST_VECTOR    0
 #define PVKVM_CANCEL_VECTOR  1
 #define PVKVM_IRQFD_VECTOR   2
 
+#if defined(__x86_64__)
 struct pvkvm_msr_batch {
 	__u32 count;
 	__u32 reserved;
@@ -73,6 +111,28 @@ struct pvkvm_cpuid_table {
 	__u32 count;
 	__u32 reserved;
 	struct kvm_cpuid_entry2 entries[PVKVM_CPUID_MAX];
+};
+
+#endif
+
+struct pvkvm_arm_register {
+	__u64 id;
+	__u8 data[PVKVM_ARM_REG_BYTES];
+};
+
+struct pvkvm_arm_device {
+	__u32 type;
+	__u32 flags;
+	__u32 group;
+	__u32 reserved;
+	__u64 attribute;
+	__u64 value;
+};
+
+struct pvkvm_arm_event {
+	__u32 type;
+	__u32 count;
+	__u64 data[16];
 };
 
 struct pvkvm_run_exit {
@@ -121,6 +181,26 @@ enum pvkvm_command {
 	PVKVM_SET_MP_STATE,
 	PVKVM_GET_XCRS,
 	PVKVM_SET_XCRS,
+	PVKVM_GET_XSAVE,
+	PVKVM_SET_XSAVE,
+	PVKVM_GET_VCPU_EVENTS,
+	PVKVM_SET_VCPU_EVENTS,
+	PVKVM_GET_CLOCK,
+	PVKVM_SET_CLOCK,
+	PVKVM_PREPARE_RUN,
+	PVKVM_ARM_PREFERRED_TARGET,
+	PVKVM_ARM_INIT_VCPU,
+	PVKVM_ARM_GET_REG_LIST,
+	PVKVM_ARM_GET_ONE_REG,
+	PVKVM_ARM_SET_ONE_REG,
+	PVKVM_ARM_CREATE_DEVICE,
+	PVKVM_ARM_CLOSE_DEVICE,
+	PVKVM_ARM_GET_DEVICE_ATTR,
+	PVKVM_ARM_SET_DEVICE_ATTR,
+	PVKVM_ARM_HAS_DEVICE_ATTR,
+	PVKVM_ARM_BIND_IRQFD,
+	PVKVM_ARM_GET_MP_STATE,
+	PVKVM_ARM_SET_MP_STATE,
 };
 
 #endif

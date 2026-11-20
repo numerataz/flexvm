@@ -1,0 +1,220 @@
+--- a/hw/char/meson.build
++++ b/hw/char/meson.build
+@@ -6,7 +6,8 @@
+ system_ss.add(when: 'CONFIG_IMX', if_true: files('imx_serial.c'))
+ system_ss.add(when: 'CONFIG_IP_OCTAL_232', if_true: files('ipoctal232.c'))
+ system_ss.add(when: 'CONFIG_ISA_BUS', if_true: files('parallel-isa.c'))
+-system_ss.add(when: 'CONFIG_ISA_DEBUG', if_true: files('debugcon.c'))
++specific_ss.add(when: 'CONFIG_ISA_DEBUG', if_true: files('debugcon.c'))
++specific_ss.add(when: 'CONFIG_ARM_VIRT', if_true: files('debugcon.c'))
+ system_ss.add(when: 'CONFIG_NRF51_SOC', if_true: files('nrf51_uart.c'))
+ system_ss.add(when: 'CONFIG_PARALLEL', if_true: files('parallel.c'))
+ system_ss.add(when: 'CONFIG_PL011_C', if_true: files('pl011.c'))
+--- a/hw/char/debugcon.c
++++ b/hw/char/debugcon.c
+@@ -25,6 +25,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include CONFIG_DEVICES
+ #include "qapi/error.h"
+ #include "hw/core/cpu.h"
+ #include "qemu/bswap.h"
+@@ -40,10 +41,8 @@
+ #include "system/ioport.h"
+ #include "system/runstate.h"
+ 
+-#define TYPE_ISA_DEBUGCON_DEVICE "isa-debugcon"
+ #define DEBUGCON_MMIO_SIZE 4096
+ #define DEBUGCON_EXIT_MAX 18
+-OBJECT_DECLARE_SIMPLE_TYPE(ISADebugconState, ISA_DEBUGCON_DEVICE)
+ 
+ //#define DEBUG_DEBUGCON
+ 
+@@ -80,6 +79,10 @@
+     VMChangeStateEntry *run_state;
+ } DebugconState;
+ 
++#ifdef CONFIG_ISA_DEBUG
++#define TYPE_ISA_DEBUGCON_DEVICE "isa-debugcon"
++OBJECT_DECLARE_SIMPLE_TYPE(ISADebugconState, ISA_DEBUGCON_DEVICE)
++
+ struct ISADebugconState {
+     ISADevice parent_obj;
+ 
+@@ -88,6 +91,8 @@
+     DebugconState second_lane;
+ };
+ 
++#endif
++
+ static int debugcon_can_run(void *opaque)
+ {
+     return 1;
+@@ -277,6 +282,7 @@
+     return true;
+ }
+ 
++#ifdef CONFIG_ISA_DEBUG
+ static void debugcon_ioport_write(void *opaque, hwaddr addr, uint64_t val,
+                                   unsigned width)
+ {
+@@ -325,6 +331,8 @@
+     .endianness = DEVICE_LITTLE_ENDIAN,
+ };
+ 
++#endif
++
+ static DebugconState *debugcon_current_lane(DebugconState *s)
+ {
+     if (!s->parallel || current_cpu == s->run_cpu) {
+@@ -417,6 +425,7 @@
+     return !s->run_failed;
+ }
+ 
++#ifdef CONFIG_ISA_DEBUG
+ static bool debugcon_pic_owns(uint32_t port, unsigned int width)
+ {
+     return (port >= 0x20 && port + width <= 0x22) ||
+@@ -478,6 +487,8 @@
+     return true;
+ }
+ 
++#endif
++
+ static void debugcon_mmio_write(void *opaque, hwaddr address, uint64_t value,
+                                  unsigned width)
+ {
+@@ -524,6 +535,7 @@
+     }
+ }
+ 
++#ifdef CONFIG_ISA_DEBUG
+ static void debugcon_isa_realizefn(DeviceState *dev, Error **errp)
+ {
+     ISADevice *d = ISA_DEVICE(dev);
+@@ -673,9 +685,124 @@
+     .class_init    = debugcon_isa_class_initfn,
+ };
+ 
++#endif
++
++#ifdef CONFIG_ARM_VIRT
++#define TYPE_FLEXVM_MMIO_RUN "flexvm-mmio-run"
++OBJECT_DECLARE_SIMPLE_TYPE(FlexvmMmioRun, FLEXVM_MMIO_RUN)
++
++struct FlexvmMmioRun {
++    DeviceState parent_obj;
++    DebugconState lane;
++    DebugconState second_lane;
++};
++
++static void flexvm_mmio_close_lane(DebugconState *lane)
++{
++    debugcon_run_failed(lane);
++    while (lane->read_width || lane->pio_waiters ||
++           lane->completion_ack_pending || lane->parallel_ack_pending) {
++        qemu_cond_wait_bql(&lane->read_completed);
++    }
++    qemu_chr_fe_set_handlers(&lane->chr, NULL, NULL, NULL, NULL,
++                             NULL, NULL, false);
++    qemu_del_vm_change_state_handler(lane->run_state);
++    lane->run_state = NULL;
++    qemu_cond_destroy(&lane->read_completed);
++}
++
++static void flexvm_mmio_run_realize(DeviceState *dev, Error **errp)
++{
++    FlexvmMmioRun *worker = FLEXVM_MMIO_RUN(dev);
++    DebugconState *lane = &worker->lane;
++    DebugconState *second = &worker->second_lane;
++    CPUState *cpu1 = qemu_get_cpu(1);
++    Error *err = NULL;
++
++    if (!lane->mmio_base || lane->mmio_base % DEBUGCON_MMIO_SIZE ||
++        lane->mmio_base > UINT64_MAX - DEBUGCON_MMIO_SIZE ||
++        !qemu_get_cpu(0) || qemu_get_cpu(2) ||
++        !!cpu1 != qemu_chr_fe_backend_connected(&second->chr)) {
++        error_setg(errp, "flexvm-mmio-run needs a page address and one socket per vCPU");
++        return;
++    }
++    lane->run_control = true;
++    if (cpu1) {
++        lane->run_cpu = qemu_get_cpu(0);
++        lane->parallel = true;
++        lane->other_lane = second;
++        second->run_cpu = cpu1;
++        second->parallel = second->run_control = true;
++        second->mmio_base = lane->mmio_base;
++    }
++    qemu_cond_init(&lane->read_completed);
++    debugcon_realize_core(lane, &err);
++    if (err) {
++        qemu_cond_destroy(&lane->read_completed);
++        error_propagate(errp, err);
++        return;
++    }
++    if (cpu1) {
++        qemu_cond_init(&second->read_completed);
++        debugcon_realize_core(second, &err);
++        if (err) {
++            qemu_cond_destroy(&second->read_completed);
++            flexvm_mmio_close_lane(lane);
++            error_propagate(errp, err);
++            return;
++        }
++    }
++
++    memory_region_init_io(&lane->mmio, OBJECT(dev), &debugcon_mmio_ops,
++                          lane, "flexvm-mmio", DEBUGCON_MMIO_SIZE);
++    memory_region_add_subregion(get_system_memory(), lane->mmio_base,
++                                &lane->mmio);
++}
++
++static void flexvm_mmio_run_unrealize(DeviceState *dev)
++{
++    DebugconState *lane = &FLEXVM_MMIO_RUN(dev)->lane;
++
++    if (lane->other_lane) {
++        flexvm_mmio_close_lane(lane->other_lane);
++    }
++    flexvm_mmio_close_lane(lane);
++    memory_region_del_subregion(get_system_memory(), &lane->mmio);
++    object_unparent(OBJECT(&lane->mmio));
++}
++
++static const Property flexvm_mmio_run_properties[] = {
++    DEFINE_PROP_CHR("chardev", FlexvmMmioRun, lane.chr),
++    DEFINE_PROP_CHR("parallel-chardev", FlexvmMmioRun, second_lane.chr),
++    DEFINE_PROP_UINT64("addr", FlexvmMmioRun, lane.mmio_base, 0),
++};
++
++static void flexvm_mmio_run_class_init(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++
++    dc->realize = flexvm_mmio_run_realize;
++    dc->unrealize = flexvm_mmio_run_unrealize;
++    dc->hotpluggable = false;
++    device_class_set_props(dc, flexvm_mmio_run_properties);
++}
++
++static const TypeInfo flexvm_mmio_run_info = {
++    .name = TYPE_FLEXVM_MMIO_RUN,
++    .parent = TYPE_DEVICE,
++    .instance_size = sizeof(FlexvmMmioRun),
++    .class_init = flexvm_mmio_run_class_init,
++};
++#endif
++
+ static void debugcon_register_types(void)
+ {
++#ifdef CONFIG_ISA_DEBUG
+     type_register_static(&debugcon_isa_info);
++#endif
++#ifdef CONFIG_ARM_VIRT
++    type_register_static(&flexvm_mmio_run_info);
++#endif
+ }
+ 
+ type_init(debugcon_register_types)

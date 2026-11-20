@@ -1,0 +1,197 @@
+--- a/hw/char/debugcon.c
++++ b/hw/char/debugcon.c
+@@ -28,6 +28,9 @@
+ #include CONFIG_DEVICES
+ #include "qapi/error.h"
+ #include "hw/core/cpu.h"
++#if defined(TARGET_I386) && defined(CONFIG_TCG)
++#include "cpu.h"
++#endif
+ #include "migration/blocker.h"
+ #include "qapi/qapi-commands-misc.h"
+ #include "qemu/bswap.h"
+@@ -147,6 +150,9 @@
+         return;
+     }
+     s->checkpoint_frozen = frozen;
++#if defined(TARGET_I386) && defined(CONFIG_TCG)
++    x86_flexvm_freeze_clock(frozen);
++#endif
+ }
+
+ #ifdef CONFIG_ISA_DEBUG
+--- a/hw/intc/apic.c
++++ b/hw/intc/apic.c
+@@ -806,6 +806,10 @@
+         uint64_t tsc = now + env->tsc_offset;
+         uint64_t delta = deadline > tsc ? deadline - tsc : 0;
+
++        if (x86_flexvm_clock_frozen()) {
++            timer_del(s->flexvm_deadline_timer);
++            return;
++        }
+         if (deadline) {
+             timer_mod_ns(s->flexvm_deadline_timer,
+                          now + MIN(delta, INT64_MAX - now));
+--- a/qapi/misc-i386.json
++++ b/qapi/misc-i386.json
+@@ -948,8 +948,13 @@
+ #
+ # @clock: Current guest clock in nanoseconds.
+ # @realtime: Current host wall-clock sample in nanoseconds.
+-##
+-{ 'struct': 'FlexvmX86Clock', 'data': { 'clock': 'uint64', 'realtime': 'uint64' } }
++#
++# @frozen: Whether the worker clock is held at a checkpoint boundary.
++#
++# @wall-clock: Whether a guest wall-clock page is registered.
++##
++{ 'struct': 'FlexvmX86Clock', 'data': { 'clock': 'uint64', 'realtime': 'uint64',
++                                      'frozen': 'bool', 'wall-clock': 'bool' } }
+
+ ##
+ # @x-flexvm-access-x86-clock:
+--- a/target/i386/cpu.h
++++ b/target/i386/cpu.h
+@@ -2663,6 +2663,9 @@
+ bool x86_flexvm_clock_enabled(void);
+ void x86_flexvm_hypercall(CPUX86State *env);
+ void x86_flexvm_enable_clock(void);
++bool x86_flexvm_clock_frozen(void);
++bool x86_flexvm_clock_has_wall(void);
++void x86_flexvm_freeze_clock(bool frozen);
+ uint64_t x86_flexvm_tsc_base(CPUX86State *env);
+ uint64_t x86_flexvm_get_clock(void);
+ void x86_flexvm_update_clock(uint64_t clock, uint64_t realtime, bool compensate_realtime);
+--- a/target/i386/monitor.c
++++ b/target/i386/monitor.c
+@@ -1618,6 +1618,8 @@
+     result = g_new(FlexvmX86Clock, 1);
+     result->clock = x86_flexvm_get_clock();
+     result->realtime = qemu_clock_get_ns(QEMU_CLOCK_HOST);
++    result->frozen = x86_flexvm_clock_frozen();
++    result->wall_clock = x86_flexvm_clock_has_wall();
+     return result;
+ #else
+     error_setg(errp, "FlexVM clock requires a TCG worker");
+--- a/target/i386/tcg/system/flexvm-clock.c
++++ b/target/i386/tcg/system/flexvm-clock.c
+@@ -15,9 +15,26 @@
+
+ static bool clock_enabled;
+ static uint64_t clock_offset;
++static bool clock_frozen;
++static uint64_t clock_frozen_at;
+ static bool wall_clock_set;
+ static uint64_t wall_clock_gpa;
+
++static uint64_t flexvm_clock_base(void)
++{
++    return clock_frozen ? clock_frozen_at : qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++}
++
++bool x86_flexvm_clock_frozen(void)
++{
++    return clock_frozen;
++}
++
++bool x86_flexvm_clock_has_wall(void)
++{
++    return wall_clock_set;
++}
++
+ bool x86_flexvm_clock_enabled(void)
+ {
+     return clock_enabled;
+@@ -25,7 +42,7 @@
+
+ uint64_t x86_flexvm_tsc_base(CPUX86State *env)
+ {
+-    return clock_enabled ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : cpu_get_tsc(env);
++    return clock_enabled ? flexvm_clock_base() : cpu_get_tsc(env);
+ }
+
+ /* Publish Linux's pvclock records only to ordinary writable guest RAM. */
+@@ -75,7 +92,7 @@
+ static bool publish_system_time(CPUX86State *env)
+ {
+     uint8_t record[28] = {0};
+-    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    uint64_t now = flexvm_clock_base();
+
+     if (!(env->flexvm_system_time & KVM_MSR_ENABLED)) {
+         return true;
+@@ -91,7 +108,7 @@
+ static bool publish_wall_clock(CPUX86State *env)
+ {
+     uint8_t record[8];
+-    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + clock_offset;
++    uint64_t now = x86_flexvm_get_clock();
+     uint64_t real = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+     uint64_t base = real >= now ? real - now : 0;
+
+@@ -103,7 +120,7 @@
+ void x86_flexvm_update_clock(uint64_t clock, uint64_t realtime, bool compensate_realtime)
+ {
+     CPUState *cpu;
+-    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    uint64_t now = flexvm_clock_base();
+     uint64_t real = qemu_clock_get_ns(QEMU_CLOCK_HOST);
+
+     if (compensate_realtime && real > realtime) {
+@@ -120,14 +137,54 @@
+
+ uint64_t x86_flexvm_get_clock(void)
+ {
+-    return qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + clock_offset;
++    return flexvm_clock_base() + clock_offset;
+ }
+
+ void x86_flexvm_enable_clock(void)
+ {
+     if (!clock_enabled) {
+         clock_enabled = true;
+-        clock_offset = -qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++        clock_offset = -flexvm_clock_base();
++    }
++}
++
++/*
++ * Called only under the run-control fence and BQL, after the vCPUs and
++ * their pending I/O have stopped. Preserve their nanosecond TSC and
++ * monotonic clock across the hold, including on another host.
++ */
++void x86_flexvm_freeze_clock(bool frozen)
++{
++    CPUState *cpu;
++    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    uint64_t adjustment = 0;
++
++    assert(bql_locked());
++    if (clock_frozen == frozen) {
++        return;
++    }
++    if (frozen) {
++        clock_frozen_at = now;
++    } else {
++        adjustment = clock_frozen_at - now;
++    }
++    clock_frozen = frozen;
++    if (!clock_enabled) {
++        return;
++    }
++
++    clock_offset += adjustment;
++    CPU_FOREACH(cpu) {
++        X86CPU *x86 = X86_CPU(cpu);
++
++        if (!frozen) {
++            x86->env.tsc_offset += adjustment;
++            publish_system_time(&x86->env);
++        }
++        apic_flexvm_reschedule_deadline(x86->apic_state);
++    }
++    if (!frozen && wall_clock_set && first_cpu) {
++        publish_wall_clock(&X86_CPU(first_cpu)->env);
+     }
+ }
