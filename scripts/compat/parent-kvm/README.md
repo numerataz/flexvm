@@ -54,6 +54,10 @@ Use `--protected-entry --ram-pages 49152` to map a 192 MiB slot and verify
 child writes to the first, middle, and last pages.
 Add `--split-slot` to divide the RAM between slots 0 and 5 at guest
 physical addresses 16 MiB and 512 MiB.
+Add `--interrupt-run` in protected mode to interrupt a running vCPU three
+times with a signal. Each return is acknowledged after the worker stops.
+The client checks that shared-memory writes cease on every stop and resume
+on subsequent runs, then releases the loop and receives an I/O exit.
 The worker uses one host mapping per consecutive extent. Highly fragmented
 slots can reach the host's mapping limit. A failed mapping releases the
 partially mapped worker span.

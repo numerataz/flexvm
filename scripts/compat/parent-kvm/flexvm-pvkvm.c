@@ -149,14 +149,34 @@ static int request(struct pvkvm *provider, enum pvkvm_command command,
 	wmb();
 	writel(seq, m + PVKVM_REQUEST_AT);
 	writel(PVKVM_HOST_VECTOR, provider->doorbell + PVKVM_DOORBELL_AT);
-	if (command == PVKVM_RUN || command == PVKVM_GET_REGS || command == PVKVM_GET_SREGS)
+	if (command == PVKVM_RUN) {
+		waited = wait_event_interruptible(provider->replied,
+				atomic_read(&provider->interrupt_count) != interrupts &&
+				readl(m + PVKVM_REPLY_AT) == seq);
+		if (!waited)
+			waited = 1;
+	} else if (command == PVKVM_GET_REGS || command == PVKVM_GET_SREGS) {
 		waited = wait_event_interruptible_timeout(provider->replied,
 				atomic_read(&provider->interrupt_count) != interrupts &&
 				readl(m + PVKVM_REPLY_AT) == seq, 5 * HZ);
-	else
+	} else {
 		waited = wait_event_timeout(provider->replied,
 				atomic_read(&provider->interrupt_count) != interrupts &&
 				readl(m + PVKVM_REPLY_AT) == seq, 5 * HZ);
+	}
+	if (command == PVKVM_RUN && waited < 0) {
+		/* A signal must stop the exact pending run before returning to
+		 * userspace. A concurrently completed I/O exit can still win.
+		 */
+		if (readl(m + PVKVM_REPLY_AT) != seq) {
+			writel(seq, m + PVKVM_CANCEL_AT);
+			wmb();
+			writel(PVKVM_CANCEL_VECTOR, provider->doorbell + PVKVM_DOORBELL_AT);
+		}
+		waited = wait_event_timeout(provider->replied,
+				atomic_read(&provider->interrupt_count) != interrupts &&
+				readl(m + PVKVM_REPLY_AT) == seq, 5 * HZ);
+	}
 	if (waited <= 0) {
 		/* The parent can still finish the request. A fresh provider
 		 * must use a fresh mailbox.
@@ -299,7 +319,7 @@ static int run_cpu(struct pvcpu *cpu)
 		memcpy_toio(p->mailbox + PVKVM_INITIAL_SREGISTERS_AT, &cpu->sregs, sizeof(cpu->sregs));
 	}
 	result = request(p, PVKVM_RUN, cpu->ran ? NULL : vm, &cpu->page->data);
-	if (!result)
+	if (!result || result == -EINTR)
 		cpu->ran = true;
 unlock:
 	mutex_unlock(&p->lock);

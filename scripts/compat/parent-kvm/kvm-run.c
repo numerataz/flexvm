@@ -2,6 +2,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/kvm.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -16,6 +18,7 @@
 #define PROTECTED_SLOT_GPA 0x1000000
 #define SPLIT_SLOT_GPA 0x20000000
 #define GDT_OFFSET 0x200
+#define TEST_INTERRUPTS 3
 
 static void check(bool valid, const char *why)
 {
@@ -74,11 +77,73 @@ static void select_segments(int cpu, bool protected_mode, uint64_t gpa)
     check(ioctl(cpu, KVM_SET_SREGS, &sregs) == 0, "select the child execution mode");
 }
 
+struct interrupt_test {
+    uint32_t *counter;
+    uint32_t baseline;
+    pthread_t runner;
+    bool long_run;
+};
+
+static void signal_handler(int signo)
+{
+    (void)signo;
+}
+
+static void *signal_running_vcpu(void *opaque)
+{
+    struct interrupt_test *test = opaque;
+    const struct timespec retry = {.tv_nsec = 1000000};
+    for (unsigned int attempt = 0; attempt < 2000 &&
+         __atomic_load_n(test->counter, __ATOMIC_RELAXED) == test->baseline; attempt++)
+        nanosleep(&retry, NULL);
+    check(__atomic_load_n(test->counter, __ATOMIC_RELAXED) != test->baseline,
+          "observe child instructions before sending the signal");
+    if (test->long_run) {
+        const struct timespec hold = {.tv_sec = 5, .tv_nsec = 500000000};
+        check(nanosleep(&hold, NULL) == 0, "allow a sustained active KVM_RUN before sending the signal");
+    }
+    check(pthread_kill(test->runner, SIGUSR1) == 0, "signal the running KVM ioctl thread");
+    return NULL;
+}
+
+static void interrupt_child(int cpu, uint32_t *counter, uint64_t gpa, bool long_run)
+{
+    struct interrupt_test test = {.counter = counter, .runner = pthread_self(),
+                                  .long_run = long_run,
+                                  .baseline = __atomic_load_n(counter, __ATOMIC_RELAXED)};
+    pthread_t sender;
+    check(pthread_create(&sender, NULL, signal_running_vcpu, &test) == 0, "start the signal sender");
+    check(ioctl(cpu, KVM_RUN, 0) == -1 && errno == EINTR, "interrupt an actively running child");
+    check(pthread_join(sender, NULL) == 0, "join the signal sender");
+
+    struct kvm_regs paused;
+    check(ioctl(cpu, KVM_GET_REGS, &paused) == 0 && paused.rip >= gpa + 0x60 && paused.rip < gpa + 0x71,
+          "read the stopped child's actual loop position");
+    uint32_t before = __atomic_load_n(counter, __ATOMIC_RELAXED);
+    const struct timespec settle = {.tv_nsec = 25000000};
+    check(nanosleep(&settle, NULL) == 0, "observe the paused child");
+    check(before != test.baseline && __atomic_load_n(counter, __ATOMIC_RELAXED) == before,
+          "confirmed stop prevents further shared-memory writes");
+}
+
+static void interrupt_and_resume(int cpu, unsigned char *data, uint64_t gpa)
+{
+    struct sigaction action = {.sa_handler = signal_handler};
+    check(sigemptyset(&action.sa_mask) == 0 && sigaction(SIGUSR1, &action, NULL) == 0,
+          "install signal handler for running KVM ioctl");
+    uint32_t *counter = (uint32_t *)(data + 0x84);
+    for (int attempt = 0; attempt < TEST_INTERRUPTS; attempt++)
+        interrupt_child(cpu, counter, gpa, attempt == 0);
+    data[0x83] = 1;
+}
+
 int main(int argc, char **argv)
 {
-    bool split_slot = argc == 3 && !strcmp(argv[2], "split");
-    bool protected_mode = split_slot || (argc == 3 && !strcmp(argv[2], "protected"));
-    check(argc == 2 || protected_mode, "specify the RAM page count and optional protected or split mode");
+    bool split_slot = argc >= 3 && !strcmp(argv[2], "split");
+    bool protected_mode = split_slot || (argc >= 3 && !strcmp(argv[2], "protected"));
+    bool interrupt_run = argc == 4 && !strcmp(argv[3], "interrupt");
+    check(argc == 2 || (protected_mode && (argc == 3 || interrupt_run)),
+          "specify RAM pages and optional protected or split mode with interruption");
     char *end;
     errno = 0;
     long count = strtol(argv[1], &end, 10);
@@ -177,6 +242,12 @@ int main(int argc, char **argv)
         0xb9, 0x68, 0x24, 0, 0,          /* mov ecx, 0x2468 */
         0xe6, 0x30, 0xf4,                /* out 0x30, al; hlt */
     };
+    const unsigned char flat_interruptible[] = {
+        0xff, 0x87, 0x84, 0, 0, 0,       /* inc dword [edi+0x84] */
+        0x80, 0xbf, 0x83, 0, 0, 0, 0,    /* cmp byte [edi+0x83], 0 */
+        0x74, 0xf1,                     /* je to the increment */
+        0xeb, 0xcf,                     /* jmp to the resumed code at 0x40 */
+    };
     unsigned char *data = ram + ram_bytes - 4096;
     unsigned char *middle = ram + (pages / 2) * 4096;
     const unsigned char gdtr[] = {0x2f, 0x00, 0x80, 0x34, 0x12, 0x00};
@@ -184,6 +255,8 @@ int main(int argc, char **argv)
     if (protected_mode) {
         memcpy(ram + 0x10, flat_code, sizeof(flat_code));
         memcpy(ram + 0x40, flat_resumed, sizeof(flat_resumed));
+        if (interrupt_run)
+            memcpy(ram + 0x60, flat_interruptible, sizeof(flat_interruptible));
         memcpy(ram + GDT_OFFSET, gdt, sizeof(gdt));
     } else {
         memcpy(ram + 0x10, code, sizeof(code));
@@ -233,15 +306,19 @@ int main(int argc, char **argv)
     data[0x81] = 0x52;
     const struct kvm_regs update = {
         .rbx = 0xf5, .rcx = 0x3579, .rsp = 0x1f00, .rbp = 0x12345678,
-        .rdi = protected_mode ? last_page : 0, .rip = gpa + 0x40, .rflags = 2,
+        .rdi = protected_mode ? last_page : 0, .rip = gpa + (interrupt_run ? 0x60 : 0x40), .rflags = 2,
     };
     check(ioctl(cpu, KVM_SET_REGS, &update) == 0, "set stopped registers before re-entry");
     check(ioctl(cpu, KVM_GET_REGS, &readback) == 0 && !memcmp(&readback, &update, sizeof(readback)),
           "read back updated registers");
+    if (interrupt_run)
+        interrupt_and_resume(cpu, data, gpa);
     unsigned long long second = timed_run(cpu);
     check_output(run, size, 0xa7);
     check_registers(cpu, 0xa7, 0x2468, gpa);
     check(data[0x82] == 0x52, "child saw the client's write during re-entry");
+    if (interrupt_run)
+        puts("PASS stopped and resumed the same running child");
     munmap(run, size);
     close(cpu);
     munmap(ram, ram_bytes);

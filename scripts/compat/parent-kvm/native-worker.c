@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <linux/kvm.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -14,6 +15,21 @@
 #include <unistd.h>
 #include "mailbox.h"
 #include "slot-map.h"
+
+static struct kvm_run *run_page;
+static volatile sig_atomic_t active_run;
+static volatile sig_atomic_t cancelled_run;
+
+static void interrupt_run(int signal, siginfo_t *info, void *context)
+{
+    (void)signal;
+    (void)context;
+    if (info->si_code != SI_QUEUE || info->si_value.sival_int <= 0)
+        return;
+    cancelled_run = info->si_value.sival_int;
+    if (cancelled_run == active_run)
+        __atomic_store_n(&run_page->immediate_exit, 1, __ATOMIC_RELAXED);
+}
 
 static void check(bool condition, const char *why)
 {
@@ -65,6 +81,10 @@ int main(int argc, char **argv)
     check(cpu >= 0, "create host vCPU");
     struct kvm_run *run = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, cpu, 0);
     check(run != MAP_FAILED, "map host kvm_run");
+    run_page = run;
+    struct sigaction action = {.sa_sigaction = interrupt_run, .sa_flags = SA_SIGINFO | SA_RESTART};
+    check(sigemptyset(&action.sa_mask) == 0 && sigaction(SIGRTMIN, &action, NULL) == 0,
+          "install the native run interrupt handler");
     struct kvm_sregs segments;
     check(ioctl(cpu, KVM_GET_SREGS, &segments) == 0, "read reset segments");
     segments.cs.base = 0;
@@ -110,13 +130,32 @@ int main(int argc, char **argv)
                   "return host special registers to the parent");
             continue;
         }
-        check(received == 1 && request[0] == 'R', "invalid run request");
-        check(ioctl(cpu, KVM_RUN, 0) == 0, "run host vCPU");
+        uint32_t sequence;
+        check(received == 1 + sizeof(sequence) && request[0] == 'R', "invalid run request");
+        memcpy(&sequence, request + 1, sizeof(sequence));
+        check(sequence > 0 && sequence <= INT_MAX, "invalid run sequence");
+        __atomic_store_n(&run->immediate_exit, 0, __ATOMIC_RELAXED);
+        /* The signal handler may publish an interrupt as soon as this
+         * sequence becomes active. Finish clearing the old value first.
+         */
+        __atomic_signal_fence(__ATOMIC_SEQ_CST);
+        active_run = (sig_atomic_t)sequence;
+        if (cancelled_run == active_run)
+            __atomic_store_n(&run->immediate_exit, 1, __ATOMIC_RELAXED);
+        int result = ioctl(cpu, KVM_RUN, 0);
+        active_run = 0;
+        if (result < 0 && errno == EINTR && cancelled_run == (sig_atomic_t)sequence) {
+            static const unsigned char interrupted[] = {'I', 0};
+            check(write(control, interrupted, sizeof(interrupted)) == sizeof(interrupted),
+                  "acknowledge the stopped host vCPU");
+            continue;
+        }
+        check(result == 0, "run host vCPU");
         check(run->exit_reason == KVM_EXIT_IO && run->io.direction == KVM_EXIT_IO_OUT &&
               run->io.port == 0x30 && run->io.count == 1 && run->io.size == 1 &&
               run->io.data_offset < (unsigned long)bytes, "unexpected host vCPU exit");
-        unsigned char value = ((unsigned char *)run)[run->io.data_offset];
-        check(write(control, &value, 1) == 1, "reply to the parent");
+        unsigned char output[] = {'O', ((unsigned char *)run)[run->io.data_offset]};
+        check(write(control, output, sizeof(output)) == sizeof(output), "reply to the parent");
     }
     return 0;
 }

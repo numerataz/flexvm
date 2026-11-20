@@ -3,7 +3,7 @@
 #define FLEXVM_PVKVM_MAILBOX_H
 
 #define PVKVM_MAGIC        0x4d564b46
-#define PVKVM_VERSION      11
+#define PVKVM_VERSION      12
 #define PVKVM_MAGIC_AT     0
 #define PVKVM_VERSION_AT   4
 #define PVKVM_REQUEST_AT   8
@@ -13,6 +13,7 @@
 #define PVKVM_DATA_SIZE_AT 24
 #define PVKVM_IO_VALUE_AT  28
 #define PVKVM_SLOT_COUNT_AT  32
+#define PVKVM_CANCEL_AT      40
 #define PVKVM_SLOT_TABLE_AT  640
 #define PVKVM_SLOT_RECORD_SIZE 16
 #define PVKVM_RAM_ADDRESS_AT 1024
@@ -31,6 +32,7 @@
 #define PVKVM_DOORBELL_AT   12
 #define PVKVM_GUEST_POSITION 1
 #define PVKVM_HOST_VECTOR    0
+#define PVKVM_CANCEL_VECTOR  1
 
 enum pvkvm_command {
 	PVKVM_CREATE_VM = 1,

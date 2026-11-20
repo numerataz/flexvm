@@ -45,7 +45,8 @@ int main(void)
             mode = "split";
         else if (access("/protected-entry", F_OK) == 0)
             mode = "protected";
-        execl("/kvm-run", "kvm-run", pages, mode, NULL);
+        const char *interrupt = access("/interrupt-run", F_OK) == 0 ? "interrupt" : NULL;
+        execl("/kvm-run", "kvm-run", pages, mode, interrupt, NULL);
         _exit(127);
     }
     int status;
