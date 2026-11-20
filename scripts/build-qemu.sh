@@ -6,7 +6,7 @@ umask 022
 prefix=${1:?usage: build-qemu.sh INSTALL_PREFIX [x86_64|aarch64]}
 arch=${2:-x86_64}
 case "$arch" in
-  x86_64) pkgversion=flexvm-tcg-nested-40 ;;
+  x86_64) pkgversion=flexvm-tcg-nested-41 ;;
   aarch64) pkgversion=flexvm-tcg-arm-11 ;;
   *) echo "unsupported QEMU target: $arch" >&2; exit 2 ;;
 esac
@@ -68,6 +68,7 @@ patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-worker-external-ram-checkpoin
 patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-worker-checkpoint-run-fence.patch"
 patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-arm-incoming-gic.patch"
 patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-resume-captured-worker.patch"
+patch --batch -p1 < "$scripts_dir/patches/qemu-tcg-x86-checkpoint-clock.patch"
 cp "$scripts_dir/compat/parent-kvm/slot-map.h" include/hw/misc/flexvm-slot-map.h
 ./configure --prefix="$prefix" --target-list="$arch-softmmu" --with-pkgversion="$pkgversion" \
   --disable-docs --disable-tools --disable-guest-agent --disable-werror \

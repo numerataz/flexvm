@@ -82,8 +82,8 @@ def exercise(args):
             time.sleep(.1)
         raise TimeoutError('workload did not publish its initial observation')
 
-    def nested_observation():
-        values = [int(v) for v in cli('exec', 'state-test', '/state-probe', 'status-full').split()]
+    def nested_observation(control=cli, vm='state-test'):
+        values = [int(v) for v in control('exec', vm, '/state-probe', 'status-full').split()]
         if len(values) != 12:
             raise RuntimeError(f'invalid nested observation: {values}')
         return values
@@ -99,12 +99,12 @@ def exercise(args):
             time.sleep(.1)
         raise RuntimeError(f'inner guest did not enter {mode} mode with forward progress')
 
-    def nested_restored(before, identity):
-        initial = nested_observation()
+    def nested_restored(before, identity, observe=nested_observation):
+        initial = observe()
         until = min(deadline, time.monotonic() + 5)
         while time.monotonic() < until:
             time.sleep(.15)
-            seen = nested_observation()
+            seen = observe()
             if initial[:8] != identity[:8] or seen[:8] != identity[:8] or seen[10] != before[10]:
                 raise RuntimeError(f'inner process/RAM/mode continuity lost: {before} -> {seen}')
             if seen[10] == 0 and (initial[11] != before[11] or seen[11] != before[11]):
@@ -160,6 +160,7 @@ def exercise(args):
         cli('rm', '-f', 'state-test', pending=True)
         owner, entry = launch(*boot, workload_log='transfer-workload.log')
         before = observation()
+        nested_before = nested_mode('spin') if args.firecracker else None
         cli('stop', 'state-test')
         if owner.wait(timeout=10) != 0:
             raise RuntimeError('transfer source owner did not retire')
@@ -205,6 +206,7 @@ def exercise(args):
         after = advancing_observation()
         if after[:3] != before[:3] or after[3] < before[3]:
             raise RuntimeError('transfer recovery lost the source workload identity')
+        nested_source = nested_restored(nested_before, nested_before) if nested_before else None
         cli('stop', 'state-test')
         checkpoint = args.state / 'state' / 'suspended' / 'state-test' / 'manifest.json'
         if json.loads(checkpoint.read_text())['owner_generation'] <= aborted_generation:
@@ -351,6 +353,17 @@ def exercise(args):
             require_refused('start', 'state-test', error='source cannot restart')
             if live() is not None:
                 raise RuntimeError('the committed transfer source is running')
+            if nested_source:
+                def observe_target():
+                    return nested_observation(target_cli, remote)
+
+                nested_after = nested_restored(nested_source, nested_before, observe_target)
+                target_cli('exec', remote, '/state-probe', 'mode', 'quit')
+                if activated.wait(timeout=30) != 23:
+                    raise RuntimeError('transferred inner guest did not shut down cleanly')
+                denied_activation('already granted execution', vm='duplicate')
+                evidence['nested_transfer'] = {'before': nested_source, 'after': nested_after, 'graceful_shutdown': 'passed'}
+                return
             target_cli('pause', remote)
             target_cli('unpause', remote)
             target_cli('stop', remote)
@@ -359,6 +372,15 @@ def exercise(args):
             restored = json.loads((destination_state / 'suspended' / remote / 'manifest.json').read_text())
             if restored['host_id'] != target_id or restored['owner_generation'] <= json.loads(offer.read_text())['generation']:
                 raise RuntimeError('destination checkpoint lacked its local host identity or newer generation')
+            activated_offer = json.loads(offer.read_text())
+            imported = destination_state / 'software-incoming' / f"{activated_offer['vm_id']}-{activated_offer['transfer_id']}"
+            if not imported.is_dir():
+                raise RuntimeError('destination import disappeared before collection')
+            target_cli('debug', 'gc')
+            if imported.exists():
+                raise RuntimeError('collection retained a cleanly retired import')
+            denied_activation('already granted execution', vm='duplicate')
+            evidence['retired_import_collection'] = 'passed'
             target_cli('start', remote)
             activated_state = destination_progress(activated_state)
             target_cli('stop', remote)
@@ -393,7 +415,7 @@ def exercise(args):
                 subprocess.run([*destination_base, 'rm', '-f', name], capture_output=True, timeout=20)
             subprocess.run([*intermediary_base, 'rm', '-f', 'third-host'], capture_output=True, timeout=20)
             cli('rm', '-f', 'returned-test', 'returned-via-third', pending=True)
-        cli('rm', '-f', 'state-test')
+            cli('rm', '-f', 'state-test', pending=True)
 
     evidence = {'cycles': []}
     try:
@@ -547,10 +569,9 @@ def exercise(args):
             if lines.count('NESTED_INNER_BOOT') != 1 or lines.count('NESTED_INNER_READY') != 1:
                 raise RuntimeError('nested Firecracker guest booted repeatedly or never completed startup')
             evidence['nested_firecracker'] = {'boots': 1, 'identity': nested_identity[:8], 'cpu_and_timer_restore': 'passed'}
-        else:
-            transfer_retirement()
-            evidence['source_transfer_retirement'] = 'passed'
-            evidence['destination_transfer_activation'] = 'passed'
+        transfer_retirement()
+        evidence['source_transfer_retirement'] = 'passed'
+        evidence['destination_transfer_activation'] = 'passed'
         evidence.update(status='passed', boots=1, delivered_ticks=len(ticks))
         (args.output / 'owner.json').write_text(json.dumps(evidence, indent=2) + '\n')
     except Exception:

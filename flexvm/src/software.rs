@@ -391,6 +391,7 @@ impl Owner {
                 state: blank,
                 firmware: std::collections::BTreeMap::new(),
                 parent: None,
+                disks: Vec::new(),
                 main: match &self.main_id {
                     Some(id) => software_state::Main::App(software_state::Session {
                         id: id.clone(),
@@ -409,6 +410,7 @@ impl Owner {
             let published = self.machine.checkpoint(staging, &checkpoint, manifest, previous, Instant::now() + Duration::from_secs(600))?;
             self.machine.retire(&published)?;
             if let Some(consumed) = &self.consumed {
+                consumed.complete_import();
                 consumed.release_replaced_inputs();
             }
             self.suspended.store(true, Ordering::SeqCst);
@@ -577,7 +579,7 @@ struct Resume {
 
 pub fn run(host: Host, name: NameLock, machine: qemu::Machine, processes: Arc<qemu::Processes>, config: &qemu::Config, meta: &image::ImageMeta) -> Result<i32> {
     if config.parent_kvm.is_some() && !machine.has_parent_fence() {
-        bail!("named parent KVM VMs require an ARM TCG worker with hierarchy pause support");
+        bail!("named parent KVM VMs require a worker with hierarchy pause support");
     }
     serve(host, name, machine, processes, config, meta, None)
 }
@@ -817,11 +819,13 @@ pub fn restore(host: Host, vm_name: &str, notify: Option<std::fs::File>) -> Resu
         setup_signals(processes.clone());
         let config = restore_config(&metadata);
         let _reservation = Reservation::new(&host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)?;
-        let verified = software_state::open(&path, config.profiles()?)?;
+        let profiles = config.profiles_for_disk_ids(metadata.disks.iter().map(|disk| disk.volume_id.as_str()))?;
+        let verified = software_state::open(&path, profiles)?;
+        let disks = verified.manifest.open_disks(&host.state)?;
         let manifest = verified.manifest.clone();
         let prepared = verified.prepare(&name, &software_state::host_id(&host.state)?)?;
         let generation = prepared.generation;
-        let machine = config.restore(verified, processes.clone())?;
+        let machine = config.restore(verified, processes.clone(), disks)?;
         let consumed = prepared.grant(processes.engine_ident()?)?;
         let meta = manifest.image.clone();
         serve(host, name, machine, processes, &config, &meta, Some(Resume { manifest, generation, consumed, notify }))
@@ -858,7 +862,7 @@ pub fn activate(host: Host, vm: &str, offer: &Path, trusted_engine: &Path) -> Re
     setup_signals(processes.clone());
     let _reservation = Reservation::new(&host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)?;
     let verified = activation.verify_inputs(&config.profiles()?, trusted_engine)?;
-    let machine = config.restore(verified, processes.clone())?;
+    let machine = config.restore(verified, processes.clone(), Vec::new())?;
     let (generation, consumed) = activation.grant(processes.engine_ident()?)?;
     let meta = manifest.image.clone();
     serve(host, name, machine, processes, &config, &meta, Some(Resume { manifest, generation, consumed, notify: None }))

@@ -49,9 +49,10 @@ alternates between a sustained CPU loop and timer sleeps. Observations retain th
 outer supervisor and VMM PID/start time, inner process identity, separate RAM
 canaries, an inner counter and monotonic time. The test repeats normal
 pause/unpause, fresh-owner stop/start, rollback and publication-owner-death
-recovery, and checks that the inner guest boots once. This extends the earlier
-input-gated raw-emulator experiment; cross-host and accelerated nested migration
-still have separate acceptance gates.
+recovery, and checks that the inner guest boots once. It also transfers a
+checkpoint with the inner CPU loop active, checks that both levels retain
+their process and memory identity, and requires fresh inner timer and CPU
+progress before an orderly shutdown.
 
 ## Execution and state identity
 
@@ -253,6 +254,13 @@ paused, and records its one-time execution grant in the host journal before
 resuming. A retry before the grant uses the same destination name and a newer
 generation. The grant survives removal of the VM or its imported artifacts.
 After activation, ordinary destination `stop` and `start` use local checkpoints.
+
+The destination can reclaim an import after a clean shutdown or after
+retirement publishes its replacement local checkpoint. `flexvm debug gc`
+collects those imports and obsolete destination bundles once their
+readers and engines have exited. The durable activation decision remains.
+If the owner failed without a clean retirement, the import is retained
+for recovery.
 
 To return to the previous host, repeat the same commands with source and
 destination reversed. The returning offer must advance the generation and

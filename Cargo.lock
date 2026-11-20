@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "flexvm"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -171,7 +171,7 @@ dependencies = [
 
 [[package]]
 name = "flexvm-init"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "bytes",
  "futures-util",

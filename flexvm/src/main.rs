@@ -105,14 +105,16 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      verify a prepared checkpoint bundle from stdin
   flexvm software-transfer activate OFFER VM --qemu FILE
                                      run one committed checkpoint with a matching local emulator
-  flexvm software --kernel FILE [OPTIONS] IMAGE [CMD...]
+  flexvm software [--kernel FILE] [OPTIONS] IMAGE [CMD...]
                                      --kernel-sdk: matching native module build inputs;
                                      --kernel-modules FILE: custom runtime or SDK bundle
                                      experimental foreground QEMU TCG execution without host KVM;
+                                     defaults to the installed, verified kernel and runtime modules;
                                      --qemu PATH, --vsock-backend PATH, --mem MIB, --vcpus N,
                                      --parent-kvm-bundle DIR enables a parent-owned /dev/kvm (x86_64, aarch64)
                                      --parent-kvm-engine auto|tcg|kvm, --parent-kvm-mem MIB (max 256)
                                      --timeout SECS (boot only); image env/workdir/user options apply
+                                     --disk VOLUME attaches a managed data disk (repeatable, requires --name)
   flexvm ps [-a] [-q] [--json] [-f, --filter KEY=VALUE]... [--format FORMAT]
                                      list running VMs (-a: stopped ones too; -q: names only);
                                      --filter name=PART|status=STATE|image=IMAGE|ip=IP (a key again:
@@ -529,7 +531,7 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     (
         "software",
         2,
-        &["name", "kernel", "qemu", "control", "vsock-backend", "mem", "vcpus", "timeout", "parent-kvm-bundle", "parent-kvm-engine", "parent-kvm-mem"],
+        &["name", "kernel", "qemu", "control", "vsock-backend", "mem", "vcpus", "timeout", "disk", "parent-kvm-bundle", "parent-kvm-engine", "parent-kvm-mem"],
     ),
     (
         "run",
@@ -2412,14 +2414,14 @@ fn kernel_bundle(args: &Args, kernel: &Path, reviewed: bool) -> Result<Option<im
     if let Some(custom) = args.get("kernel-modules") {
         let bundle = image::KernelBundle::open(kernel, Path::new(custom), None)?;
         if reviewed {
-            artifacts::KERNEL.check_digest(&bundle.kernel.artifact.sha256)?;
+            artifacts::KERNEL.check_opened(kernel, &bundle.kernel.artifact.sha256)?;
         }
         return Ok(Some(bundle));
     }
     let development = args.has("kernel-sdk");
     let asset = if development { &artifacts::KERNEL_SDK } else { &artifacts::MODULES };
-    let kernel = kernel.canonicalize()?;
-    let adjacent = kernel.with_file_name(asset.name);
+    let canonical_kernel = kernel.canonicalize()?;
+    let adjacent = canonical_kernel.with_file_name(asset.name);
     let state_kernel = paths(args)?.kernel;
     let state_artifacts = state_kernel.parent().ok_or("kernel has no artifact directory")?;
     let authenticated = reviewed || !adjacent.exists() || state_artifacts.canonicalize().is_ok_and(|directory| adjacent.parent() == Some(directory.as_path()));
@@ -2433,12 +2435,12 @@ fn kernel_bundle(args: &Args, kernel: &Path, reviewed: bool) -> Result<Option<im
     if authenticated {
         artifacts::ensure(&[(&selected, asset)])?;
     }
-    let bundle = image::KernelBundle::open(&kernel, &selected, Some(development))?;
+    let bundle = image::KernelBundle::open(&canonical_kernel, &selected, Some(development))?;
     if authenticated {
-        asset.check_digest(&bundle.identity().bundle_sha256)?;
+        asset.check_opened(&selected, &bundle.identity().bundle_sha256)?;
     }
     if reviewed {
-        artifacts::KERNEL.check_digest(&bundle.kernel.artifact.sha256)?;
+        artifacts::KERNEL.check_opened(kernel, &bundle.kernel.artifact.sha256)?;
     }
     Ok(Some(bundle))
 }
@@ -2447,11 +2449,11 @@ fn kernel_bundle(args: &Args, kernel: &Path, reviewed: bool) -> Result<Option<im
 /// with engine processes owned by this foreground command. Named VMs also expose
 /// live management and local suspend/restore; migration remains separate work.
 fn software(args: &Args, src: &str) -> Result<i32> {
+    if args.has("disk") && !args.has("name") {
+        bail!("--disk requires a named software VM");
+    }
     let mem_mib = args.parse_or("mem", 512)?;
     let parent_kvm = if let Some(bundle) = args.get("parent-kvm-bundle") {
-        if args.get("name").is_some() && !cfg!(target_arch = "aarch64") {
-            bail!("named parent KVM VMs require an ARM TCG worker with hierarchy pause support");
-        }
         Some(qemu::ParentKvm {
             bundle: std::fs::canonicalize(bundle).map_err(|error| format!("parent KVM bundle {bundle:?}: {error}"))?,
             engine: args.get("parent-kvm-engine").unwrap_or("auto").into(),
@@ -2486,9 +2488,17 @@ fn software(args: &Args, src: &str) -> Result<i32> {
     if args.get("name").is_some() && control != qemu::Control::Serial {
         bail!("named software VMs require --control serial");
     }
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("software image preparation currently requires root");
+    }
+    let kernel = args.get("kernel").map_or_else(|| paths(args).map(|paths| paths.kernel), |kernel| Ok(PathBuf::from(kernel)))?;
+    let installed = !args.has("kernel");
+    if installed {
+        artifacts::ensure(&[(&kernel, &artifacts::KERNEL)])?;
+    }
     let config = qemu::Config {
         control,
-        kernel: PathBuf::from(args.get("kernel").ok_or("software needs --kernel FILE (with virtio PCI on x86_64)")?),
+        kernel,
         qemu: args.get("qemu").map(String::from).unwrap_or_else(|| format!("qemu-system-{}", std::env::consts::ARCH)),
         vsock_backend: args.get("vsock-backend").unwrap_or("vhost-device-vsock").into(),
         mem_mib,
@@ -2497,9 +2507,6 @@ fn software(args: &Args, src: &str) -> Result<i32> {
         parent_kvm,
     };
     config.validate()?;
-    if unsafe { libc::geteuid() } != 0 {
-        bail!("software image preparation currently requires root");
-    }
     let processes = std::sync::Arc::new(qemu::Processes::default());
     let stopping = processes.clone();
     let signals: &[i32] = if args.get("name").is_some() { &[libc::SIGINT, libc::SIGQUIT, libc::SIGHUP] } else { &[libc::SIGINT, libc::SIGTERM, libc::SIGHUP] };
@@ -2515,7 +2522,7 @@ fn software(args: &Args, src: &str) -> Result<i32> {
         opts.cmd = Some(args.rest.clone());
     }
     let init = args.get("init").map(PathBuf::from);
-    let modules = kernel_bundle(args, &config.kernel, false)?;
+    let modules = kernel_bundle(args, &config.kernel, installed)?;
     let (rootfs, meta, _reserved, _cache_lock) = image::prepare(&state(args)?.join("images"), init.as_deref(), &opts, modules.as_ref())?;
     if meta.argv.is_empty() {
         bail!("software execution needs an image command or CMD");
@@ -2530,9 +2537,16 @@ fn software(args: &Args, src: &str) -> Result<i32> {
         .transpose()?;
     let _reservation =
         named.as_ref().map(|(host, _)| software::Reservation::new(host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)).transpose()?;
+    let disks = if args.has("disk") {
+        let (host, _) = named.as_ref().ok_or("--disk requires a named software VM")?;
+        let catalog = volume::Catalog::open(&host.state)?;
+        args.all("disk").iter().map(|name| catalog.writer(name)).collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
     let machine = match modules {
-        Some(bundle) => config.boot_with_kernel(&rootfs, processes.clone(), bundle.kernel)?,
-        None => config.boot(&rootfs, processes.clone())?,
+        Some(bundle) => config.boot_with_kernel(&rootfs, processes.clone(), bundle.kernel, disks)?,
+        None => config.boot(&rootfs, processes.clone(), disks)?,
     };
     drop(_cache_lock);
     if let Some((host, lock)) = named {

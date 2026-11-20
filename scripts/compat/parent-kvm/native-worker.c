@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include "mailbox.h"
 #include "slot-map.h"
+#include "native-x86-state.h"
 
 static _Thread_local struct kvm_run *run_page;
 static _Thread_local volatile sig_atomic_t active_run;
@@ -283,6 +284,29 @@ static void *serve_cpu_lane(void *opaque)
     return NULL;
 }
 
+static int set_irqfds(int vm, const int *descriptors, bool attach)
+{
+    for (unsigned int gsi = 0; gsi < PVKVM_GSI_COUNT; gsi++) {
+        struct kvm_irqfd irq = {
+            .fd = descriptors[gsi], .gsi = gsi,
+            .flags = attach ? 0 : KVM_IRQFD_FLAG_DEASSIGN,
+        };
+        if (ioctl(vm, KVM_IRQFD, &irq) == 0)
+            continue;
+        int error = errno;
+        // Restore the original ownership if the transition stops partway.
+        irq.flags ^= KVM_IRQFD_FLAG_DEASSIGN;
+        while (gsi > 0) {
+            gsi--;
+            irq.fd = descriptors[gsi];
+            irq.gsi = gsi;
+            check(ioctl(vm, KVM_IRQFD, &irq) == 0, "rollback incomplete native IRQFD transition");
+        }
+        return -error;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && !strcmp(argv[1], "--supported-cpuid")) {
@@ -359,12 +383,15 @@ int main(int argc, char **argv)
     check(vm >= 0, "create host VM");
     if (tss != UINT32_MAX)
         check(ioctl(vm, KVM_SET_TSS_ADDR, tss) == 0, "reserve the host VM TSS address");
+    int irq_fds[PVKVM_GSI_COUNT];
+    bool irqfds_attached = irqchip;
     if (irqchip) {
         check(ioctl(vm, KVM_CREATE_IRQCHIP, 0) == 0, "create the host irqchip");
-        for (unsigned int gsi = 0; gsi < PVKVM_GSI_COUNT; gsi++) {
-            struct kvm_irqfd irq = {.fd = number(argv[7 + gsi], INT_MAX), .gsi = gsi};
-            check(ioctl(vm, KVM_IRQFD, &irq) == 0, "connect a host irqfd doorbell");
-        }
+        for (unsigned int gsi = 0; gsi < PVKVM_GSI_COUNT; gsi++)
+            irq_fds[gsi] = number(argv[7 + gsi], INT_MAX);
+        int status = set_irqfds(vm, irq_fds, true);
+        errno = -status;
+        check(!status, "connect host IRQFD doorbells");
     }
     if (pit_request) {
         struct kvm_pit_config pit = {.flags = pit_request - 1};
@@ -432,10 +459,49 @@ int main(int argc, char **argv)
 
     check(write(control, "R", 1) == 1, "announce worker readiness");
     unsigned char request[2 + sizeof(cpuid)];
-    ssize_t received;
-    while ((received = recv(control, request, sizeof(request), MSG_TRUNC)) != 0) {
-        if (received < 0 && errno == EINTR) continue;
-        check(received >= 2 && request[1] < cpu_count, "invalid vCPU selector");
+    for (;;) {
+        union {
+            struct cmsghdr header;
+            unsigned char bytes[CMSG_SPACE(sizeof(int))];
+        } ancillary;
+        struct iovec data = {.iov_base = request, .iov_len = sizeof(request)};
+        struct msghdr message = {
+            .msg_iov = &data, .msg_iovlen = 1,
+            .msg_control = ancillary.bytes, .msg_controllen = sizeof(ancillary.bytes),
+        };
+        ssize_t received = recvmsg(control, &message, MSG_TRUNC | MSG_CMSG_CLOEXEC);
+        if (received < 0 && errno == EINTR)
+            continue;
+        if (received == 0)
+            break;
+        check(received >= 2 && received <= (ssize_t)sizeof(request) && request[1] < cpu_count &&
+              !(message.msg_flags & (MSG_CTRUNC | MSG_TRUNC)), "invalid native worker request");
+        struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+        if (received == 2 && (request[0] == 'a' || request[0] == 'b')) {
+            int fd;
+            check(parallel && request[1] == 0 && header && header->cmsg_level == SOL_SOCKET &&
+                  header->cmsg_type == SCM_RIGHTS && header->cmsg_len == CMSG_LEN(sizeof(fd)) &&
+                  !CMSG_NXTHDR(&message, header), "invalid native checkpoint request");
+            memcpy(&fd, CMSG_DATA(header), sizeof(fd));
+            int32_t status = irqfds_attached ? -EBUSY :
+                native_x86_state_file(fd, kvm, vm, cpus, cpu_count, irqchip, pit_request, request[0] == 'a');
+            close(fd);
+            check(write(control, &status, sizeof(status)) == sizeof(status), "reply to native checkpoint request");
+            continue;
+        }
+        check(!header, "unexpected native worker descriptor");
+        if (received == 3 && request[0] == 'i') {
+            check(parallel && request[1] == 0 && request[2] <= 1, "invalid native IRQFD transition");
+            bool attach = request[2];
+            int32_t status = 0;
+            if (irqchip && attach != irqfds_attached) {
+                status = set_irqfds(vm, irq_fds, attach);
+                if (!status)
+                    irqfds_attached = attach;
+            }
+            check(write(control, &status, sizeof(status)) == sizeof(status), "reply to native IRQFD transition");
+            continue;
+        }
         unsigned int id = request[1];
         int cpu = cpus[id];
         if (received == 2 + sizeof(registers) && request[0] == 'S') {

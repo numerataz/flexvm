@@ -34,15 +34,22 @@ static uint64_t core_id(size_t offset) {
     return KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | (offset / sizeof(uint32_t));
 }
 
+static struct kvm_one_reg core_register(size_t offset, uint64_t *value) {
+    return (struct kvm_one_reg){
+        .id = core_id(offset),
+        .addr = (uintptr_t)value,
+    };
+}
+
 static uint64_t get_core(int cpu, size_t offset) {
     uint64_t value;
-    struct kvm_one_reg reg = {.id = core_id(offset), .addr = (uintptr_t)&value};
+    struct kvm_one_reg reg = core_register(offset, &value);
     REQUIRE(ioctl(cpu, KVM_GET_ONE_REG, &reg) == 0);
     return value;
 }
 
 static void set_core(int cpu, size_t offset, uint64_t value) {
-    struct kvm_one_reg reg = {.id = core_id(offset), .addr = (uintptr_t)&value};
+    struct kvm_one_reg reg = core_register(offset, &value);
     REQUIRE(ioctl(cpu, KVM_SET_ONE_REG, &reg) == 0);
 }
 
@@ -122,6 +129,18 @@ int main(void) {
     REQUIRE(run_size >= (int)sizeof(struct kvm_run));
     struct kvm_run *state = mmap(NULL, (size_t)run_size, PROT_READ | PROT_WRITE, MAP_SHARED, cpu, 0);
     REQUIRE(state != MAP_FAILED);
+    REQUIRE(ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_IMMEDIATE_EXIT) > 0);
+    state->immediate_exit = 1;
+    alarm(15);
+    int cancelled = ioctl(cpu, KVM_RUN, 0);
+    int cancel_errno = errno;
+    alarm(0);
+    REQUIRE(cancelled == -1 && cancel_errno == EINTR);
+    uint64_t pc = 0;
+    struct kvm_one_reg pc_register = core_register(offsetof(struct kvm_regs, regs.pc), &pc);
+    REQUIRE(ioctl(cpu, KVM_GET_ONE_REG, &pc_register) == 0 && pc == 0x40000000);
+    state->immediate_exit = 0;
+    puts("PASS: ARM KVM run-page cancellation before guest execution");
     run(cpu);
     REQUIRE(state->exit_reason == KVM_EXIT_MMIO);
     REQUIRE(state->mmio.is_write == 1 && state->mmio.len == 4 && state->mmio.phys_addr == 0x10000000);

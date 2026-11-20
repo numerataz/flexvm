@@ -125,9 +125,11 @@ static int run_cpu(struct arm_cpu *cpu, const struct flexvm_arm_request *request
         __atomic_store_n(&run->immediate_exit, 1, __ATOMIC_RELAXED);
     int status = ioctl_result(ioctl(cpu->fd, KVM_RUN, 0));
     active_sequence = 0;
+    /* KVM completes the previous userspace read before an interrupted run. */
+    if (!status || status == -EINTR || status == -EAGAIN)
+        cpu->pending_read = 0;
     if (status)
         return status;
-    cpu->pending_read = 0;
     if (run->exit_reason == KVM_EXIT_MMIO) {
         if (!run->mmio.len || run->mmio.len > sizeof(run->mmio.data))
             return -EIO;

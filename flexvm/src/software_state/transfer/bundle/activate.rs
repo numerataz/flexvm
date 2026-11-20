@@ -25,6 +25,8 @@ struct Decision {
     grant: Option<Grant>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     return_fence: Option<Offer>,
+    #[serde(default)]
+    finished: bool,
 }
 
 pub(crate) struct Activation<'a> {
@@ -39,24 +41,71 @@ fn decision_name(vm_id: &str) -> String {
     format!(".software-activation-v1-{vm_id}")
 }
 
-pub(in crate::software_state::transfer) fn preceding_grant(state: &File, manifest: &Manifest) -> Result<Option<Offer>> {
-    let key = decision_name(&manifest.vm_id.to_ascii_lowercase());
-    if !present(state, &key)? {
-        return Ok(None);
+fn read_decision(state: &File, vm_id: &str) -> Result<Option<Decision>> {
+    let key = decision_name(vm_id);
+    if present(state, &key)? {
+        Ok(Some(record(state, &key)?))
+    } else {
+        Ok(None)
     }
-    let decision = record::<Decision>(state, &key)?;
-    Ok(decision.grant.filter(|grant| grant.generation <= manifest.owner_generation).map(|_| decision.offer))
+}
+
+pub(in crate::software_state::transfer) fn preceding_grant(state: &File, manifest: &Manifest) -> Result<Option<Offer>> {
+    let decision = read_decision(state, &manifest.vm_id.to_ascii_lowercase())?;
+    Ok(decision.filter(|d| d.grant.as_ref().is_some_and(|grant| grant.generation <= manifest.owner_generation)).map(|d| d.offer))
+}
+
+fn decision_for_offer(state: &File, offer: &Offer) -> Result<Option<Decision>> {
+    Ok(read_decision(state, &offer.vm_id)?.filter(|decision| decision.offer == *offer))
+}
+
+pub(in crate::software_state::transfer) fn finished(state: &File, offer: &Offer) -> Result<bool> {
+    Ok(decision_for_offer(state, offer)?.is_some_and(|decision| decision.finished))
+}
+
+pub(super) fn reclaimable(state: &File, offer: &Offer, obsolete: bool) -> Result<bool> {
+    let decision = decision_for_offer(state, offer)?;
+    if !obsolete && !decision.as_ref().is_some_and(|d| d.finished) {
+        return Ok(false);
+    }
+    match decision.and_then(|decision| decision.grant) {
+        Some(grant) => Ok(PidFd::open(&grant.engine)?.is_none()),
+        None => Ok(true),
+    }
 }
 
 /// Use only under the host transfer lock. A new outbound fence always
 /// supersedes an older inbound grant.
 pub(in crate::software_state::transfer) fn return_grant_generation(state: &File, outgoing: &Offer) -> Result<Option<u64>> {
-    let key = decision_name(&outgoing.vm_id);
-    if !present(state, &key)? {
-        return Ok(None);
+    let decision = read_decision(state, &outgoing.vm_id)?;
+    Ok(decision.filter(|decision| decision.return_fence.as_ref() == Some(outgoing)).and_then(|decision| decision.grant).map(|grant| grant.generation))
+}
+
+pub(in crate::software_state) struct Import {
+    state: File,
+    offer: Offer,
+}
+
+impl Import {
+    pub(in crate::software_state) fn finish(&self, grant: &Grant) -> Result<()> {
+        if grant.owner != Ident::me() || PidFd::open(&grant.engine)?.is_some() {
+            bail!("software import is still in use");
+        }
+        let _transfer = parent_lock(&self.state, libc::LOCK_EX)?;
+        let Some(mut decision) = decision_for_offer(&self.state, &self.offer)? else {
+            bail!("software import grant is no longer selected");
+        };
+        if decision.grant.as_ref() != Some(grant) {
+            bail!("software import grant changed before retirement");
+        }
+        if decision.finished {
+            self.state.sync_all()?;
+        } else {
+            decision.finished = true;
+            write_record(&self.state, &decision_name(&self.offer.vm_id), &serde_json::to_vec(&decision)?, true)?;
+        }
+        Ok(())
     }
-    let decision = record::<Decision>(state, &key)?;
-    Ok(decision.grant.filter(|_| decision.return_fence.as_ref() == Some(outgoing)).map(|grant| grant.generation))
 }
 
 impl<'a> Activation<'a> {
@@ -69,7 +118,7 @@ impl<'a> Activation<'a> {
         let _transfer = parent_lock(&state, libc::LOCK_EX)?;
         let return_fence = committed_return_fence(&state, &offer)?;
         let key = decision_name(&offer.vm_id);
-        let previous = if present(&state, &key)? { Some(record::<Decision>(&state, &key)?) } else { None };
+        let previous = read_decision(&state, &offer.vm_id)?;
         let mut floor = offer.generation;
         if let Some(previous) = &previous {
             if previous.offer == offer {
@@ -94,7 +143,7 @@ impl<'a> Activation<'a> {
         let header = Header { offer: offer.clone(), manifest: read_manifest(&directory)? };
         header.check(&offer)?;
         let generation = floor.checked_add(1).ok_or("software activation generation exhausted")?;
-        let decision = Decision { offer, name: name.name.clone(), generation, grant: None, return_fence };
+        let decision = Decision { offer, name: name.name.clone(), generation, grant: None, return_fence, finished: false };
         write_record(&state, &key, &serde_json::to_vec(&decision)?, previous.is_some())?;
         Ok(Self { state, directory, header, decision, _name: name })
     }
@@ -139,7 +188,8 @@ impl<'a> Activation<'a> {
         };
         self.decision.grant = Some(grant.clone());
         write_record(&self.state, &key, &serde_json::to_vec(&self.decision)?, true)?;
-        Ok((generation, Consumed { directory: self.directory, grant, manifest: self.header.manifest, replaced: Mutex::new(Vec::new()) }))
+        let import = Import { state: self.state, offer: self.decision.offer };
+        Ok((generation, Consumed { directory: self.directory, grant, manifest: self.header.manifest, replaced: Mutex::new(Vec::new()), import: Some(import) }))
     }
 }
 
@@ -183,5 +233,38 @@ mod tests {
         // The once-only grant survives the bundle itself and another requested name.
         std::fs::remove_dir_all(host.state.join(INCOMING).join(bundle_name(&offer))).unwrap();
         assert!(Activation::prepare_offer(&different, offer).err().unwrap().to_string().contains("already granted"));
+    }
+
+    #[test]
+    fn collection_preserves_ambiguous_activations_and_reclaims_clean_retirements() {
+        for clean in [false, true] {
+            let source = TempDir::new("bundle-retire-source");
+            let target = TempDir::new("bundle-retire-target");
+            let host = Host::open(&target.join("state"), &target.join("run")).unwrap();
+            let (offer, bytes) = super::super::tests::wire(&source, &host.state);
+            let key = Ed25519KeyPair::from_seed_unchecked(&[5; 32]).unwrap();
+            transition(&host.state, offer.clone(), Action::Prepare(STANDARD.encode(key.public_key()), Vec::new())).unwrap();
+            let sig = STANDARD.encode(key.sign(&offer.signing_message(RECEIPT_DOMAIN).unwrap()));
+            transition(&host.state, offer.clone(), Action::Commit(sig)).unwrap();
+            super::super::receive(&host.state, &offer, &mut bytes.as_slice(), 1 << 20).unwrap();
+            let name = host.take_name("activated", false).unwrap();
+            let activation = Activation::prepare_offer(&name, offer.clone()).unwrap();
+            let mut engine = crate::test_util::ChildGuard(std::process::Command::new("sleep").arg("60").spawn().unwrap());
+            let (_, consumed) = activation.grant(Ident::of(engine.id()).unwrap()).unwrap();
+            let import = consumed.import.as_ref().unwrap();
+            assert!(import.finish(&consumed.grant).unwrap_err().to_string().contains("still in use"));
+            engine.kill().unwrap();
+            engine.wait().unwrap();
+            if clean {
+                import.finish(&consumed.grant).unwrap();
+                import.finish(&consumed.grant).unwrap();
+            }
+            drop(consumed);
+            crate::software_state::sweep(&host.state).unwrap();
+            let path = host.state.join(INCOMING).join(bundle_name(&offer));
+            assert_eq!(path.exists(), !clean);
+            assert!(Activation::prepare_offer(&name, offer.clone()).err().unwrap().to_string().contains("already granted"));
+            assert_eq!(super::super::receive(&host.state, &offer, &mut bytes.as_slice(), 1 << 20).is_ok(), !clean);
+        }
     }
 }

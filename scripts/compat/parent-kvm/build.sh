@@ -55,9 +55,7 @@ cp -- "$source_dir"/{Makefile,mailbox.h,flexvm-pvkvm.c,arm-frontend.h,arm-vgic.h
 env -u KVM -u LOCALVERSION make -j2 -C "$kernel_build" "ARCH=$kernel_arch" "CROSS_COMPILE=$cross" "M=$work/module" modules
 install -m 0644 -- "$work/module/flexvm-pvkvm.ko" "$publish/bundle/"
 printf '%s\n' "$release" > "$publish/bundle/kernel.release"
-if [[ $target == aarch64 ]]; then
-  printf '1\n' > "$publish/bundle/checkpoint.version"
-fi
+printf '1\n' > "$publish/bundle/checkpoint.version"
 python3 - "$publish/bundle" <<'PYMODULE'
 from pathlib import Path
 import struct
