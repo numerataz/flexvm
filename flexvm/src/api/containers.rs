@@ -1197,4 +1197,18 @@ mod tests {
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), json!({"StatusCode": 42, "Error": null}));
     }
+
+    #[test]
+    fn ancestor_filter_requires_non_empty_digest_prefix() {
+        let (_d, api) = fixture();
+        let mut d = Detail::read(&api, &vm("web", "running"));
+        d.image = "nginx:latest".into();
+        d.image_id = "sha256:abcdef012345".into();
+        for value in ["", "sha256:", "sha256:sha256:", "ffff", "sha256:ffff"] {
+            assert!(!matches(&d, "ancestor", value).unwrap(), "expected no match for {value:?}");
+        }
+        for value in ["abcd", "sha256:abcd", "sha256:abcdef012345"] {
+            assert!(matches(&d, "ancestor", value).unwrap(), "expected match for {value:?}");
+        }
+    }
 }

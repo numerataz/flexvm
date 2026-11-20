@@ -1984,4 +1984,29 @@ mod tests {
         assert!(err.contains("cannot determine host memory"), "{err}");
         assert_eq!(Config::elastic_limits(Some(512), 0).unwrap(), (ELASTIC_BASE_MIB, 512));
     }
+
+    #[test]
+    fn parent_kvm_command_pins_native_worker_with_host_fd_path() {
+        let key = PathBuf::from(format!("parent-kvm-pin-{}", util::random_hex(16).unwrap()));
+        let root = SocketRoot::unique(&key).unwrap();
+        fs::create_dir(root.dir.join("logs")).unwrap();
+        let src_bundle = root.dir.join("src-bundle");
+        fs::create_dir(&src_bundle).unwrap();
+        for name in ["native-worker", "frontend", "worker", "broker", "state"] {
+            fs::write(src_bundle.join(name), name.as_bytes()).unwrap();
+        }
+        let parent_inputs = software_state::ParentInputs {
+            frontend: software_state::Input::open(&src_bundle.join("frontend")).unwrap(),
+            worker: software_state::Input::open(&src_bundle.join("worker")).unwrap(),
+            broker: software_state::Input::open(&src_bundle.join("broker")).unwrap(),
+        };
+        let state = software_state::Input::open(&src_bundle.join("state")).unwrap();
+        let incoming = Incoming { state: &state.file, version: &Value::Null, parent: Some(&parent_inputs) };
+        let provider = ParentKvm { bundle: src_bundle, engine: "kvm".into(), child_mem_mib: 64 };
+        let (_cmd, _frontend, native_worker) =
+            provider.command(Command::new("qemu-system-x86_64"), &[state.file.as_raw_fd()], Some(&incoming), &root, 128, &root.dir.join("qmp.sock")).unwrap();
+        let worker = native_worker.expect("kvm restore pins native-worker");
+        let link = fs::read_link(root.dir.join("logs/parent-kvm/bundle/native-worker")).unwrap();
+        assert_eq!(link, crate::host::fd_path(worker.file.as_raw_fd()));
+    }
 }

@@ -398,6 +398,14 @@ mod tests {
         assert_eq!(select_hot([1, 2, 3, 4].into_iter(), &[1, 2, 3, 4], |p| p >= 3, 2), [3, 4]);
     }
 
+    #[test]
+    fn select_hot_deduplicates_only_kept_prev_pages() {
+        // When `prev.len() > cap`, pages past `cap` were not kept in step 1 and must remain
+        // eligible in step 2 if space remains, while kept pages in `prev[..cap]` are not duplicated.
+        assert_eq!(select_hot([10, 30, 40].into_iter(), &[10, 20, 30], |p| p != 20, 2), [10, 30]);
+        assert_eq!(select_hot([30, 40].into_iter(), &[10, 20, 30, 40], |p| p >= 30, 2), [30, 40]);
+    }
+
     /// A guest of `n` pages, each filled with its own byte.
     fn guest(n: usize) -> Vec<u8> {
         (0..n * PAGE_SIZE).map(|i| (i / PAGE_SIZE) as u8).collect()
