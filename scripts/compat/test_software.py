@@ -8,6 +8,7 @@ import platform
 import runpy
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -48,6 +49,47 @@ platform.machine = lambda: os.environ['TEST_ARCH']
 with patch('os.geteuid', return_value=0):
     runpy.run_path(script, run_name='__main__')
 '''
+
+
+class ParentRunLanes(unittest.TestCase):
+    def test_parallel_stream_acks_do_not_wait_for_a_second_byte(self):
+        protocol = runpy.run_path(str(ROOT / "parent-kvm-run.py"))
+        mailbox = bytearray(protocol["MAILBOX_SIZE"])
+        stride = protocol["LANE_STRIDE"]
+        base = protocol["LANES_AT"]
+        cpus = {0, 1}
+        replies = os.eventfd(0)
+        self.addCleanup(os.close, replies)
+        sockets, peers = zip(*(socket.socketpair() for _ in cpus), strict=True)
+        for connection in (*sockets, *peers):
+            self.addCleanup(connection.close)
+            connection.settimeout(.5)
+        for peer in peers:
+            peer.sendall(b"R")
+        lanes = protocol["RunLanes"]([protocol["RunChannel"](sock) for sock in sockets])
+
+        for cpu in cpus:
+            struct.pack_into("<III", mailbox, base + cpu * stride, 1, 0, protocol["RUN"])
+        lanes.service(mailbox, (), cpus, cpus, replies)
+        for cpu, peer in enumerate(peers):
+            self.assertEqual(peer.recv(1), bytes((ord("R") + cpu,)))
+            peer.sendall(struct.pack("<cBHI", b"V", 1, 0x65 + cpu, 1))
+        lanes.service(mailbox, sockets, cpus, cpus, replies)
+        self.assertEqual(os.eventfd_read(replies), 2)
+
+        for cpu in cpus:
+            offset = base + cpu * stride
+            struct.pack_into("<III", mailbox, offset, 2, 1, protocol["COMPLETE_READ"])
+            struct.pack_into("<I", mailbox, offset + protocol["LANE_COMPLETION"], 1)
+            mailbox[offset + protocol["LANE_PIO"]] = 0x30 + cpu
+        lanes.service(mailbox, (), cpus, cpus, replies)
+        for cpu, peer in enumerate(peers):
+            self.assertEqual(peer.recv(2), bytes((ord("E"), 0x30 + cpu)))
+            peer.sendall(b"E")
+        lanes.service(mailbox, sockets, cpus, cpus, replies)
+        self.assertEqual(os.eventfd_read(replies), 2)
+        self.assertFalse(lanes.live)
+        self.assertEqual(lanes.max_in_flight, 2)
 
 
 class SoftwareCheck(unittest.TestCase):
