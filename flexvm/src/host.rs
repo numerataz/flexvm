@@ -11090,7 +11090,7 @@ pub(crate) mod tests {
                 unsafe {
                     std::os::unix::process::CommandExt::pre_exec(&mut cmd, move || {
                         libc::write(fd, b"f".as_ptr().cast(), 1);
-                        std::thread::sleep(Duration::from_secs(1));
+                        std::thread::sleep(Duration::from_millis(150));
                         Ok(())
                     })
                 };

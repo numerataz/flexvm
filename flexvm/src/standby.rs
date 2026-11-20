@@ -1365,7 +1365,10 @@ const CHECK_EVERY: Duration = Duration::from_millis(100);
 /// What a refill grants a standby at least (`grant_mib`).
 const MIN_GRANT_MIB: u64 = 256;
 /// How long a refill holds relief off for each standby it starts: its grant, then its lock file.
+#[cfg(not(test))]
 const LOCKED_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const LOCKED_TIMEOUT: Duration = Duration::from_millis(150);
 /// Restore, reseed and settle, bounded independently of publishing the lock.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const LATE: Duration = Duration::from_millis(250);

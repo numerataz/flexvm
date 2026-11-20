@@ -194,7 +194,16 @@ pub fn tail(data: &[u8], n: usize) -> &[u8] {
 }
 
 /// How often `logs -f` looks for more.
+#[cfg(not(test))]
 const FOLLOW_EVERY: Duration = Duration::from_millis(200);
+#[cfg(test)]
+const FOLLOW_EVERY: Duration = Duration::from_millis(10);
+
+/// How long `logs -f` waits after a VM is gone before ending (allowing a restart's brief gap).
+#[cfg(not(test))]
+const FOLLOW_GRACE: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const FOLLOW_GRACE: Duration = Duration::from_millis(100);
 
 /// `logs [-f] [--tail N] NAME`: `log.1` (the log before its last rotation), then `log`, of the
 /// name's logs' lifetime (`Host::open_logs`). Following, it reads on across rotations (it finishes
@@ -348,7 +357,7 @@ fn logs_to(host: &Host, name: &str, follow: bool, lines: Option<usize>, out: &mu
         match (running || host.is_suspended(name), gone_since) {
             (true, _) => gone_since = None,
             (false, None) => gone_since = Some(Instant::now()),
-            (false, Some(t)) if t.elapsed() > Duration::from_secs(1) => return Ok(()),
+            (false, Some(t)) if t.elapsed() > FOLLOW_GRACE => return Ok(()),
             (false, Some(_)) => {}
         }
     }
@@ -1138,7 +1147,7 @@ mod tests {
                 std::fs::write(dir.join(".owner"), serde_json::to_vec(&host::LogsOwner { id: owner.clone(), handoff, to: vec![], by: vec![] }).unwrap())
                     .unwrap();
                 let (_got, rx) = follow(&host, "job");
-                let ended = rx.recv_timeout(Duration::from_secs(3)).is_ok();
+                let ended = rx.recv_timeout(FOLLOW_GRACE * 3).is_ok();
                 assert_eq!(ended, ends && !handoff, "{owner:?} {handoff}");
                 // Ended now in any case (and the next case starts on a fresh directory).
                 host.retire_logs("job").unwrap();
