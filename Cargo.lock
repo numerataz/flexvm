@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "flexvm"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -156,6 +156,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "ring",
  "ruzstd",
  "serde",
  "serde_json",
@@ -165,11 +166,12 @@ dependencies = [
  "tokio-util",
  "ureq",
  "yamux",
+ "zeroize",
 ]
 
 [[package]]
 name = "flexvm-init"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "bytes",
  "futures-util",

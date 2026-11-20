@@ -137,7 +137,9 @@ sudo flexvm pull --kernel-sdk my-compiler-image:latest
 ```
 
 `--kernel-modules FILE` selects a custom runtime or development bundle instead.
-With `software --kernel PATH`, adjacent `kernel-modules.tar.gz` is used
+`flexvm software IMAGE` uses the installed FlexVM kernel and runtime modules
+from the state directory, fetching the pinned artifacts when needed. With
+`software --kernel PATH`, adjacent `kernel-modules.tar.gz` is used
 when present; `--kernel-sdk` selects adjacent `kernel-sdk.tar.gz`. Fetch the
 published development inputs separately with `scripts/fetch.sh --kernel-sdk`.
 Bundle admission checks the kernel digest, architecture, configuration, symbol

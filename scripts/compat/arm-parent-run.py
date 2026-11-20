@@ -283,7 +283,7 @@ def serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, cr
                    gate=None, capture=None, rollback=None, worker=None):
     vm_open = worker is not None
     cpus = set(worker.cpus) if worker else set()
-    registered = worker is not None
+    registered = worker is not None and bool(worker.slots)
     exited = os.pidfd_open(outer.pid)
     try:
         while True:
@@ -384,8 +384,6 @@ IDLE_WORKER_STATE = b"FLEXVM ARM no nested worker\n"
 
 def capture_state(outer, qmp, irq_fds, worker, fds):
     outer_fd, child_fd, metadata = state_fds(fds, writing=True)
-    if worker is not None and worker.proc is None:
-        raise RuntimeError("ARM checkpoint cannot capture a worker that is still starting")
     if any(os.fstat(fd).st_size for fd in fds):
         raise RuntimeError("ARM checkpoint output files must be empty")
     monitor = PARENT["HELPERS"]["QMP"](qmp, outer, time.monotonic() + 30)

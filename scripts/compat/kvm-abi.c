@@ -218,6 +218,18 @@ int main(int argc, char **argv) {
     struct machine a = create(kvm, cpuid, 0x41);
     advertised_feature_control(kvm, a.cpu);
     struct machine b = create(kvm, cpuid, 0x61);
+    REQUIRE(ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_IMMEDIATE_EXIT) > 0);
+    a.run->immediate_exit = 1;
+    alarm(10);
+    int cancelled = ioctl(a.cpu, KVM_RUN, 0);
+    int cancel_errno = errno;
+    alarm(0);
+    REQUIRE(cancelled == -1 && cancel_errno == EINTR);
+    struct kvm_regs stopped;
+    REQUIRE(ioctl(a.cpu, KVM_GET_REGS, &stopped) == 0 && stopped.rip == CODE_ADDR);
+    REQUIRE(a.ram[DATA_ADDR] == 0x41);
+    a.run->immediate_exit = 0;
+    pass("vCPU run-page cancellation before guest execution");
     output(&a, 0x41);
     // The stopped vCPU must see a caller write immediately when it resumes.
     a.ram[DATA_ADDR] = 0x50;
