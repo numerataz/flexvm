@@ -589,6 +589,7 @@ impl Owner {
     }
 
     fn suspend(&self) -> Result<Value> {
+        self.machine.checkpoint_supported()?;
         if !self.reset_capable {
             bail!("software suspend requires a current serial guest agent");
         }
@@ -657,6 +658,7 @@ impl Owner {
                 rootfs: blank.clone(),
                 state: blank,
                 firmware: std::collections::BTreeMap::new(),
+                parent: None,
                 disks: Vec::new(),
                 main: match &self.main_id {
                     Some(id) => software_state::Main::App(software_state::Session {
@@ -851,6 +853,9 @@ pub fn run(
     meta: &image::ImageMeta,
     reservation: Reservation,
 ) -> Result<i32> {
+    if config.parent_kvm.is_some() && !machine.has_parent_fence() {
+        bail!("named parent KVM VMs require a worker with hierarchy pause support");
+    }
     serve(name, machine, processes, config, meta, reservation, None)
 }
 
@@ -866,13 +871,16 @@ fn serve(
     let host = reservation.host.clone();
     let machine = Arc::new(machine);
     let epoch = u64::from_str_radix(&util::random_hex(8)?, 16)?;
-    let deadline = Instant::now() + if meta.boot.is_app() { guest::TIMEOUT } else { config.boot_timeout };
+    // A restored VM must reconnect its guest transport after device load.
+    // Allow the same startup budget as a cold boot for that handoff.
+    let timeout = if resumed.is_some() || !meta.boot.is_app() { config.boot_timeout } else { guest::TIMEOUT };
+    let deadline = Instant::now() + timeout;
     let max_memory_mib = config.effective_max_mib();
     // QEMU has finished booting (or loading restored RAM via migrate-incoming),
     // so resident pages are already reflected in MemAvailable; release the boot
     // hold so it does not double-count resident guest RAM for the VM's lifetime.
     reservation.settle_boot();
-    let initial_plugged = match (&resumed, max_memory_mib > config.mem_mib) {
+    let initial_plugged = match (&resumed, max_memory_mib > config.mem_mib && config.parent_kvm.is_none()) {
         (Some(r), true) => {
             let actual = machine.virtio_mem_size(deadline).map(|b| b >> 20).unwrap_or(r.manifest.plugged_mib);
             if actual > r.manifest.plugged_mib {
@@ -1020,7 +1028,7 @@ fn serve(
             }
         }
     })?;
-    let mem_watcher = if max_memory_mib > config.mem_mib {
+    let mem_watcher = if max_memory_mib > config.mem_mib && config.parent_kvm.is_none() {
         let weak = Arc::downgrade(&owner);
         Some(std::thread::Builder::new().name("software-mem".into()).spawn(move || {
             while let Some(owner) = weak.upgrade() {
@@ -1125,16 +1133,30 @@ fn admitted_memory_mib(base_mib: u32, plugged_mib: u64) -> Result<u32> {
     base_mib.checked_add(plugged).ok_or_else(|| format!("software VM memory {base_mib} + {plugged} MiB overflows u32").into())
 }
 
-pub fn restore(host: Host, vm_name: &str, notify: Option<std::fs::File>) -> Result<i32> {
+pub fn restore(host: Host, vm_name: &str, bundle: Option<&Path>, notify: Option<std::fs::File>) -> Result<i32> {
     let notify = notify.map(|file| Startup(Arc::new(Mutex::new(Some(file)))));
     let failure_notify = notify.clone();
     let result = (|| {
         let name = host.take_name(vm_name, true)?;
         let path = host.suspended(vm_name)?;
         let metadata = software_state::metadata(&path)?;
+        let native = metadata.parent.as_ref().is_some_and(|parent| parent.native);
+        let bundle = if native {
+            bundle
+                .filter(|path| !path.as_os_str().is_empty())
+                .ok_or("restoring native parent KVM state requires a local --parent-kvm-bundle DIR")?
+                .canonicalize()?
+        } else {
+            PathBuf::new()
+        };
         let processes = Arc::new(qemu::Processes::default());
         setup_signals(processes.clone());
-        let config = restore_config(&metadata);
+        let mut config = restore_config(&metadata);
+        config.parent_kvm = metadata.parent.as_ref().map(|parent| qemu::ParentKvm {
+            bundle,
+            engine: if parent.native { "kvm" } else { "tcg" }.into(),
+            child_mem_mib: parent.child_memory_mib,
+        });
         let admitted_mib = admitted_memory_mib(config.mem_mib, metadata.plugged_mib)?;
         let reservation = Reservation::new(&host, admitted_mib, Instant::now() + config.boot_timeout, &processes)?;
         let profiles = config.profiles_for_disk_ids(metadata.disks.iter().map(|disk| disk.volume_id.as_str()))?;
@@ -1164,6 +1186,7 @@ fn restore_config(manifest: &software_state::Manifest) -> qemu::Config {
         max_mib: manifest.max_memory_mib.unwrap_or(manifest.memory_mib),
         vcpus: manifest.vcpus,
         boot_timeout: Duration::from_secs(120),
+        parent_kvm: None,
     }
 }
 
@@ -1283,18 +1306,10 @@ mod tests {
         let base = crate::test_util::TempDir::new("software-reservation");
         let host = Host::open(&base.join("state"), &base.join("run")).unwrap();
         let holds_dir = crate::host::locks(&host.run).join("holds");
-        let hold_count = || {
-            std::fs::read_dir(&holds_dir)
-                .map(|entries| entries.flatten().count())
-                .unwrap_or(0)
-        };
+        let hold_count = || std::fs::read_dir(&holds_dir).map(|entries| entries.flatten().count()).unwrap_or(0);
         let grant_ids = || -> Vec<u64> {
             let Ok(bytes) = std::fs::read(host.grants()) else { return Vec::new() };
-            serde_json::from_slice::<Vec<(u64, u64, u64)>>(&bytes)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(_, _, id)| id)
-                .collect()
+            serde_json::from_slice::<Vec<(u64, u64, u64)>>(&bytes).unwrap_or_default().into_iter().map(|(_, _, id)| id).collect()
         };
 
         let processes = qemu::Processes::default();

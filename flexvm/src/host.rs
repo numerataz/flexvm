@@ -4534,6 +4534,13 @@ impl PidFd {
                 Liveness::Unknown => bail!("cannot tell whether process {pid} is still the one meant"),
             },
             Err(e) if e.raw_os_error() == Some(libc::ESRCH) => Ok(None),
+            // If the PID now names a non-leader thread, the error varies
+            // by kernel. Only treat it as gone after checking the identity.
+            Err(e) if pid > 0 && matches!(e.raw_os_error(), Some(libc::EINVAL | libc::ENOENT)) => match id.liveness_at(pid) {
+                Liveness::Gone => Ok(None),
+                Liveness::Unknown => bail!("cannot tell whether process {pid} is still the one meant: {e}"),
+                Liveness::Alive => bail!("pidfd_open {pid}: {e}"),
+            },
             Err(e) => bail!("pidfd_open {pid}: {e}"),
         }
     }
@@ -6686,6 +6693,25 @@ pub(crate) mod tests {
         assert_eq!(liveness_with_time(&id, "boot", |_| Ok(stat("S", 43)), || true), Liveness::Gone);
         assert_eq!(liveness_with_time(&id, "boot", |_| Ok(stat("S", 42)), || false), Liveness::Alive);
         assert_eq!(liveness_with_time(&id, "boot", |_| Ok(stat("Z", 43)), || false), Liveness::Gone);
+    }
+
+    #[test]
+    fn a_recycled_pid_assigned_to_a_thread_is_proven_gone() {
+        let (ready, identity) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::spawn(move || {
+            let tid = unsafe { libc::gettid() } as u32;
+            ready.send(Ident::of(tid).unwrap()).unwrap();
+            let _ = wait.recv();
+        });
+        let mut old = identity.recv_timeout(WAIT).unwrap();
+        let current = PidFd::open(&old);
+        old.start ^= 1;
+        let previous = PidFd::open(&old);
+        drop(release);
+        thread.join().unwrap();
+        assert!(current.is_err());
+        assert!(previous.unwrap().is_none());
     }
 
     #[test]
@@ -12509,8 +12535,7 @@ pub(crate) mod tests {
         assert_eq!(effective_total_mib(Some(1024), Some(cmdline), false), 1024);
         assert_eq!(effective_total_mib(None, Some(cmdline), true), u64::MAX);
 
-        let mut cfg = Config::default();
-        cfg.reserve_mib = Some(2048);
+        let mut cfg = Config { reserve_mib: Some(2048), ..Default::default() };
         // Inside an elastic virtio-mem guest whose MemTotal is currently 1024 MiB but ceiling is 8192 MiB: no warning.
         let w = cfg.warnings_with_total(|_| Ok(false), Ok(vec![]), effective_total_mib(Some(1024), Some(cmdline), true)).join("\n");
         assert!(!w.contains("reserve_mib"), "{w}");

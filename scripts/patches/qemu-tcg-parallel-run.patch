@@ -1,0 +1,244 @@
+--- a/system/cpus.c
++++ b/system/cpus.c
+@@ -811,3 +811,5 @@
+ {
+-    if (!tcg_enabled() || vm_prepare_start(false) || !runstate_is_running()) {
++    if (!tcg_enabled() ||
++        (!runstate_is_running() && vm_prepare_start(false)) ||
++        !runstate_is_running()) {
+         return false;
+--- a/target/i386/monitor.c
++++ b/target/i386/monitor.c
+@@ -787,3 +787,4 @@
+         (!runstate_check(RUN_STATE_PRELAUNCH) &&
+-         !runstate_check(RUN_STATE_PAUSED))) {
++         !runstate_check(RUN_STATE_PAUSED) &&
++         !(runstate_is_running() && cpu->stopped))) {
+         error_setg(errp, "FlexVM requires a stopped x86 TCG vCPU");
+--- a/hw/char/debugcon.c
++++ b/hw/char/debugcon.c
+@@ -64,2 +64,5 @@
+     bool cancel_pending;
++    bool parallel;
++    bool parallel_ack_pending;
++    struct DebugconState *other_lane;
+     CPUState *run_cpu;
+@@ -84,2 +87,3 @@
+     DebugconState state;
++    DebugconState second_lane;
+ };
+@@ -96,3 +100,7 @@
+         if (s->run_active && runstate_is_running()) {
+-            vm_stop(RUN_STATE_PAUSED);
++            if (s->parallel) {
++                cpu_pause(s->run_cpu);
++            } else {
++                vm_stop(RUN_STATE_PAUSED);
++            }
+         }
+@@ -114,2 +122,26 @@
+     qemu_cond_broadcast(&s->read_completed);
++}
++
++static void debugcon_run_state(void *opaque, bool running, RunState state);
++
++static void debugcon_ack_stop(CPUState *cpu, run_on_cpu_data data)
++{
++    DebugconState *s = data.host_ptr;
++
++    assert(bql_locked());
++    /* A read or REP I/O may already have reported this exit inline. */
++    if (s->output_length || s->cancel_pending) {
++        debugcon_run_state(s, false, RUN_STATE_PAUSED);
++    }
++    s->parallel_ack_pending = false;
++    qemu_cond_broadcast(&s->read_completed);
++}
++
++static void debugcon_stop_lane(DebugconState *s)
++{
++    cpu_pause(s->run_cpu);
++    if (!s->parallel_ack_pending) {
++        s->parallel_ack_pending = true;
++        async_run_on_cpu(s->run_cpu, debugcon_ack_stop, RUN_ON_CPU_HOST_PTR(s));
++    }
+ }
+@@ -152,3 +184,4 @@
+         if (!s->read_width || s->run_failed || s->run_active ||
+-            !runstate_check(RUN_STATE_PAUSED)) {
++            !(s->parallel ? s->run_cpu->stopped :
++                            runstate_check(RUN_STATE_PAUSED))) {
+             debugcon_run_failed(s);
+@@ -163,3 +196,7 @@
+             s->cancel_pending = true;
+-            vm_stop(RUN_STATE_PAUSED);
++            if (s->parallel) {
++                debugcon_stop_lane(s);
++            } else {
++                vm_stop(RUN_STATE_PAUSED);
++            }
+         }
+@@ -170,12 +207,15 @@
+         (!runstate_check(RUN_STATE_PRELAUNCH) &&
+-         !runstate_check(RUN_STATE_PAUSED))) {
+-        debugcon_run_failed(s);
+-        return;
+-    }
+-
+-    s->run_cpu = qemu_get_cpu(buf[0] - 'R');
+-    if (!s->run_cpu) {
+-        debugcon_run_failed(s);
+-        return;
+-    }
++         !runstate_check(RUN_STATE_PAUSED) &&
++         !(s->parallel && runstate_is_running() && s->run_cpu->stopped))) {
++        debugcon_run_failed(s);
++        return;
++    }
++
++    CPUState *selected = qemu_get_cpu(buf[0] - 'R');
++
++    if (!selected || (s->parallel && selected != s->run_cpu)) {
++        debugcon_run_failed(s);
++        return;
++    }
++    s->run_cpu = selected;
+     s->run_active = true;
+@@ -231,3 +271,7 @@
+     s->output_length = bytes;
+-    vm_stop(RUN_STATE_PAUSED);
++    if (s->parallel) {
++        debugcon_stop_lane(s);
++    } else {
++        vm_stop(RUN_STATE_PAUSED);
++    }
+     return true;
+@@ -283,2 +327,13 @@
+
++static DebugconState *debugcon_current_lane(DebugconState *s)
++{
++    if (!s->parallel || current_cpu == s->run_cpu) {
++        return s;
++    }
++    if (s->other_lane && current_cpu == s->other_lane->run_cpu) {
++        return s->other_lane;
++    }
++    return NULL;
++}
++
+ static MemTxResult debugcon_complete_read(DebugconState *s,
+@@ -308,2 +363,6 @@
+     cpu_pause(current_cpu);
++    if (s->parallel) {
++        /* The read has stopped before the vCPU can leave this callback. */
++        debugcon_run_state(s, false, RUN_STATE_PAUSED);
++    }
+     while (!s->read_ready && !s->run_failed) {
+@@ -323,5 +382,8 @@
+ {
+-    DebugconState *s = opaque;
++    DebugconState *s = debugcon_current_lane(opaque);
+     uint8_t reply[DEBUGCON_EXIT_MAX] = {'Q', width};
+
++    if (!s) {
++        return MEMTX_ERROR;
++    }
+     stq_le_p(reply + 2, s->mmio_base + address);
+@@ -344,2 +406,6 @@
+     cpu_pause(cpu);
++    if (s->parallel) {
++        /* A later iteration proves the previous REP I/O finished. */
++        debugcon_run_state(s, false, RUN_STATE_PAUSED);
++    }
+     while (!s->run_failed &&
+@@ -396,3 +462,4 @@
+     }
+-    if (!debugcon_wait_for_pio_run(s)) {
++    s = debugcon_current_lane(s);
++    if (!s || !debugcon_wait_for_pio_run(s)) {
+         *value = UINT32_MAX;
+@@ -416,5 +483,8 @@
+ {
+-    DebugconState *s = opaque;
++    DebugconState *s = debugcon_current_lane(opaque);
+     uint8_t reply[DEBUGCON_EXIT_MAX] = {'M', width};
+
++    if (!s || !debugcon_wait_for_pio_run(s)) {
++        return;
++    }
+     stq_le_p(reply + 2, s->mmio_base + address);
+@@ -463,2 +533,18 @@
+
++    DebugconState *second = &isa->second_lane;
++
++    if (qemu_chr_fe_backend_connected(&second->chr)) {
++        if (!s->run_control || !s->forward_pio ||
++            !qemu_get_cpu(0) || !qemu_get_cpu(1) || qemu_get_cpu(2)) {
++            error_setg(errp, "parallel debugcon requires two run-control vCPUs and PIO forwarding");
++            return;
++        }
++        s->run_cpu = qemu_get_cpu(0);
++        s->parallel = true;
++        s->other_lane = second;
++        second->run_cpu = qemu_get_cpu(1);
++        second->parallel = second->run_control = true;
++        second->mmio_base = s->mmio_base;
++    }
++
+     if (s->mmio_base && (!s->run_control ||
+@@ -494,2 +580,17 @@
+     }
++    if (s->other_lane) {
++        qemu_cond_init(&second->read_completed);
++        debugcon_realize_core(second, &err);
++        if (err) {
++            qemu_cond_destroy(&second->read_completed);
++            qemu_cond_destroy(&s->read_completed);
++            qemu_chr_fe_set_handlers(&s->chr, NULL, NULL, NULL, NULL,
++                                     NULL, NULL, false);
++            qemu_del_vm_change_state_handler(s->run_state);
++            s->run_state = NULL;
++            cpu_unregister_ioport_interceptor(s);
++            error_propagate(errp, err);
++            return;
++        }
++    }
+     if (s->mmio_base) {
+@@ -505,3 +606,15 @@
+     DebugconState *s = &ISA_DEBUGCON_DEVICE(dev)->state;
+-
++    DebugconState *second = s->other_lane;
++
++    if (second && second->run_state) {
++        debugcon_run_failed(second);
++        while (second->read_width || second->pio_waiters ||
++               second->completion_ack_pending || second->parallel_ack_pending) {
++            qemu_cond_wait_bql(&second->read_completed);
++        }
++        qemu_chr_fe_set_handlers(&second->chr, NULL, NULL, NULL, NULL,
++                                 NULL, NULL, false);
++        qemu_del_vm_change_state_handler(second->run_state);
++        qemu_cond_destroy(&second->read_completed);
++    }
+     if (s->run_state) {
+@@ -509,3 +622,4 @@
+             debugcon_run_failed(s);
+-            while (s->read_width || s->pio_waiters || s->completion_ack_pending) {
++            while (s->read_width || s->pio_waiters ||
++                   s->completion_ack_pending || s->parallel_ack_pending) {
+                 qemu_cond_wait_bql(&s->read_completed);
+@@ -530,2 +644,3 @@
+     DEFINE_PROP_CHR("chardev",  ISADebugconState, state.chr),
++    DEFINE_PROP_CHR("parallel-chardev", ISADebugconState, second_lane.chr),
+     DEFINE_PROP_UINT32("readback", ISADebugconState, state.readback, 0xe9),
+--- a/target/i386/helper.c
++++ b/target/i386/helper.c
+@@ -610,2 +610,8 @@
+            offsetof(CPUX86State, start_init_save));
++#ifdef CONFIG_TCG
++    if (x86_flexvm_clock_enabled()) {
++        /* INIT leaves the timestamp counter unchanged. */
++        env->tsc_offset = save->tsc_offset;
++    }
++#endif
+     g_free(save);

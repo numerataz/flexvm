@@ -1,0 +1,445 @@
+--- a/qapi/misc-i386.json
++++ b/qapi/misc-i386.json
+@@ -944 +944,25 @@
+   'returns': 'FlexvmX86VcpuEvents', 'features': [ 'unstable' ] }
++
++##
++# @FlexvmX86Clock:
++#
++# @clock: Current guest clock in nanoseconds.
++# @realtime: Current host wall-clock sample in nanoseconds.
++##
++{ 'struct': 'FlexvmX86Clock', 'data': { 'clock': 'uint64', 'realtime': 'uint64' } }
++
++##
++# @x-flexvm-access-x86-clock:
++#
++# Initialize or update the clock exposed to a parent-owned x86 worker.
++#
++# @clock: Restored guest clock timestamp, when setting it.
++# @realtime: Host wall-clock sample to account for on restore.
++#
++# Features:
++#
++# @unstable: Experimental FlexVM worker protocol.
++##
++{ 'command': 'x-flexvm-access-x86-clock',
++  'data': { '*clock': 'uint64', '*realtime': 'uint64' },
++  'returns': 'FlexvmX86Clock', 'features': [ 'unstable' ] }
+--- a/stubs/monitor-i386-flexvm.c
++++ b/stubs/monitor-i386-flexvm.c
+@@ -135 +135,9 @@
+ }
++
++FlexvmX86Clock *qmp_x_flexvm_access_x86_clock(bool has_clock, uint64_t clock,
++                                             bool has_realtime, uint64_t realtime,
++                                             Error **errp)
++{
++    error_setg(errp, "FlexVM clock requires an x86 worker");
++    return NULL;
++}
+--- a/target/i386/cpu.c
++++ b/target/i386/cpu.c
+@@ -7905,2 +7905,7 @@
+         *ecx = env->features[FEAT_1_ECX];
++#if defined(CONFIG_TCG) && !defined(CONFIG_USER_ONLY)
++        if (x86_flexvm_clock_enabled()) {
++            *ecx |= CPUID_EXT_HYPERVISOR;
++        }
++#endif
+         if ((*ecx & CPUID_EXT_XSAVE) && (env->cr[4] & CR4_OSXSAVE_MASK)) {
+@@ -8313,2 +8318,11 @@
+     case 0x40000000:
++#if defined(CONFIG_TCG) && !defined(CONFIG_USER_ONLY)
++        if (x86_flexvm_clock_enabled()) {
++            *eax = 0x40000001;
++            *ebx = 0x4b4d564b;
++            *ecx = 0x564b4d56;
++            *edx = 0x4d;
++            break;
++        }
++#endif
+         /*
+@@ -8332,2 +8346,7 @@
+         *eax = 0;
++#if defined(CONFIG_TCG) && !defined(CONFIG_USER_ONLY)
++        if (x86_flexvm_clock_enabled()) {
++            *eax = (1U << KVM_FEATURE_CLOCKSOURCE) | (1U << KVM_FEATURE_CLOCKSOURCE2);
++        }
++#endif
+         *ebx = 0;
+--- a/target/i386/cpu.h
++++ b/target/i386/cpu.h
+@@ -2052,2 +2052,3 @@
+     uint64_t tsc_offset;
++    uint64_t flexvm_system_time;
+     uint64_t intercept;
+@@ -2660,2 +2661,12 @@
+ uint64_t cpu_get_tsc(CPUX86State *env);
++#ifndef CONFIG_USER_ONLY
++bool x86_flexvm_clock_enabled(void);
++void x86_flexvm_hypercall(CPUX86State *env);
++void x86_flexvm_enable_clock(void);
++uint64_t x86_flexvm_tsc_base(CPUX86State *env);
++uint64_t x86_flexvm_get_clock(void);
++void x86_flexvm_update_clock(uint64_t clock, uint64_t realtime, bool compensate_realtime);
++bool x86_flexvm_write_clock_msr(CPUX86State *env, uint32_t id, uint64_t value);
++bool x86_flexvm_read_clock_msr(CPUX86State *env, uint32_t id, uint64_t *value);
++#endif
+
+--- a/target/i386/monitor.c
++++ b/target/i386/monitor.c
+@@ -35,2 +35,3 @@
+ #include "qapi/util.h"
++#include "qemu/timer.h"
+ #include "hw/audio/pcspk.h"
+@@ -875,2 +876,8 @@
+ {
++#ifdef CONFIG_TCG
++    if (set ? x86_flexvm_write_clock_msr(env, index, *value) :
++              x86_flexvm_read_clock_msr(env, index, value)) {
++        return true;
++    }
++#endif
+ #define ACCESS_MSR(index, field) \
+@@ -1589 +1596,25 @@
+ }
++
++FlexvmX86Clock *qmp_x_flexvm_access_x86_clock(bool has_clock, uint64_t clock,
++                                             bool has_realtime, uint64_t realtime,
++                                             Error **errp)
++{
++#ifdef CONFIG_TCG
++    FlexvmX86Clock *result;
++
++    if (!flexvm_stopped_cpu(0, errp)) {
++        return NULL;
++    }
++    x86_flexvm_enable_clock();
++    if (has_clock) {
++        x86_flexvm_update_clock(clock, realtime, has_realtime);
++    }
++    result = g_new(FlexvmX86Clock, 1);
++    result->clock = x86_flexvm_get_clock();
++    result->realtime = qemu_clock_get_ns(QEMU_CLOCK_HOST);
++    return result;
++#else
++    error_setg(errp, "FlexVM clock requires a TCG worker");
++    return NULL;
++#endif
++}
+--- a/target/i386/tcg/misc_helper.c
++++ b/target/i386/tcg/misc_helper.c
+@@ -72,3 +72,7 @@
+
++#ifdef CONFIG_USER_ONLY
+     val = cpu_get_tsc(env) + env->tsc_offset;
++#else
++    val = x86_flexvm_tsc_base(env) + env->tsc_offset;
++#endif
+     env->regs[R_EAX] = (uint32_t)(val);
+--- /dev/null
++++ b/target/i386/tcg/system/flexvm-clock.c
+@@ -0,0 +1,249 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#include "qemu/osdep.h"
++#include "qemu/atomic.h"
++#include "qemu/bswap.h"
++#include "qemu/main-loop.h"
++#include "qemu/rcu.h"
++#include "qemu/timer.h"
++#include "cpu.h"
++#include "exec/target_page.h"
++#include "hw/core/cpu.h"
++#include "standard-headers/asm-x86/kvm_para.h"
++#include "standard-headers/linux/kvm_para.h"
++#include "system/memory.h"
++
++static bool clock_enabled;
++static uint64_t clock_offset;
++static bool wall_clock_set;
++static uint64_t wall_clock_gpa;
++
++bool x86_flexvm_clock_enabled(void)
++{
++    return clock_enabled;
++}
++
++uint64_t x86_flexvm_tsc_base(CPUX86State *env)
++{
++    return clock_enabled ? qemu_clock_get_ns(QEMU_CLOCK_REALTIME) : cpu_get_tsc(env);
++}
++
++/* Publish Linux's pvclock records only to ordinary writable guest RAM. */
++static bool publish_pvclock(CPUState *cpu, uint64_t gpa, uint8_t *body,
++                             size_t size, bool system_time)
++{
++    uint8_t version[4];
++    hwaddr offset;
++    hwaddr length = sizeof(version) + size;
++    AddressSpace *as = cpu->as;
++    uint32_t odd;
++    MemoryRegion *region;
++    const MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
++
++    if (gpa & 3 || length > TARGET_PAGE_SIZE - (gpa & (TARGET_PAGE_SIZE - 1))) {
++        return false;
++    }
++    RCU_READ_LOCK_GUARD();
++    region = address_space_translate(as, gpa, &offset, &length, true, attrs);
++    if (!memory_region_is_ram(region) || memory_region_is_rom(region) ||
++        memory_region_is_romd(region) || length < sizeof(version) + size ||
++        address_space_read(as, gpa, attrs, version, sizeof(version)) != MEMTX_OK) {
++        return false;
++    }
++    if (system_time) {
++        uint8_t flags;
++
++        if (address_space_read(as, gpa + 29, attrs, &flags, sizeof(flags)) != MEMTX_OK) {
++            return false;
++        }
++        body[25] |= flags & 2; /* Preserve PVCLOCK_GUEST_STOPPED. */
++    }
++    odd = (ldl_le_p(version) + 1) | 1;
++    stl_le_p(version, odd);
++    if (address_space_write(as, gpa, attrs, version, sizeof(version)) != MEMTX_OK) {
++        return false;
++    }
++    smp_wmb();
++    if (address_space_write(as, gpa + sizeof(version), attrs, body, size) != MEMTX_OK) {
++        return false;
++    }
++    smp_wmb();
++    stl_le_p(version, odd + 1);
++    return address_space_write(as, gpa, attrs, version, sizeof(version)) == MEMTX_OK;
++}
++
++static bool publish_system_time(CPUX86State *env)
++{
++    uint8_t record[28] = {0};
++    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++
++    if (!(env->flexvm_system_time & KVM_MSR_ENABLED)) {
++        return true;
++    }
++    stq_le_p(record + 4, now + env->tsc_offset);
++    stq_le_p(record + 12, now + clock_offset);
++    stl_le_p(record + 20, 0x80000000U);
++    record[24] = 1; /* (TSC delta << 1) * 2^-1 converts 1 GHz TSC to ns. */
++    return publish_pvclock(env_cpu(env), env->flexvm_system_time & ~1ULL,
++                           record, sizeof(record), true);
++}
++
++static bool publish_wall_clock(CPUX86State *env)
++{
++    uint8_t record[8];
++    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + clock_offset;
++    uint64_t real = qemu_clock_get_ns(QEMU_CLOCK_HOST);
++    uint64_t base = real >= now ? real - now : 0;
++
++    stl_le_p(record, base / NANOSECONDS_PER_SECOND);
++    stl_le_p(record + 4, base % NANOSECONDS_PER_SECOND);
++    return publish_pvclock(env_cpu(env), wall_clock_gpa, record, sizeof(record), false);
++}
++
++void x86_flexvm_update_clock(uint64_t clock, uint64_t realtime, bool compensate_realtime)
++{
++    CPUState *cpu;
++    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    uint64_t real = qemu_clock_get_ns(QEMU_CLOCK_HOST);
++
++    if (compensate_realtime && real > realtime) {
++        clock += real - realtime;
++    }
++    clock_offset = clock - now;
++    CPU_FOREACH(cpu) {
++        publish_system_time(&X86_CPU(cpu)->env);
++    }
++    if (wall_clock_set && first_cpu) {
++        publish_wall_clock(&X86_CPU(first_cpu)->env);
++    }
++}
++
++uint64_t x86_flexvm_get_clock(void)
++{
++    return qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + clock_offset;
++}
++
++void x86_flexvm_enable_clock(void)
++{
++    if (!clock_enabled) {
++        clock_enabled = true;
++        clock_offset = -qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++    }
++}
++
++static int clock_pairing(CPUX86State *env, uint64_t gpa, uint64_t clock_type)
++{
++    uint8_t record[64] = {0}; /* struct kvm_clock_pairing */
++    const MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
++    AddressSpace *as = env_cpu(env)->as;
++    hwaddr offset;
++    hwaddr length = sizeof(record);
++    MemoryRegion *region;
++    uint64_t before, real, after;
++
++    if (clock_type != KVM_CLOCK_PAIRING_WALLCLOCK) {
++        return -KVM_EOPNOTSUPP;
++    }
++    RCU_READ_LOCK_GUARD();
++    region = address_space_translate(as, gpa, &offset, &length, true, attrs);
++    if (!memory_region_is_ram(region) || memory_region_is_rom(region) ||
++        memory_region_is_romd(region) || length < sizeof(record)) {
++        return -KVM_EFAULT;
++    }
++
++    before = x86_flexvm_tsc_base(env);
++    real = qemu_clock_get_ns(QEMU_CLOCK_HOST);
++    after = x86_flexvm_tsc_base(env);
++    stq_le_p(record, real / NANOSECONDS_PER_SECOND);
++    stq_le_p(record + 8, real % NANOSECONDS_PER_SECOND);
++    stq_le_p(record + 16, before + (after - before) / 2 + env->tsc_offset);
++    return address_space_write(as, gpa, attrs, record, sizeof(record)) == MEMTX_OK
++           ? 0 : -KVM_EFAULT;
++}
++
++void x86_flexvm_hypercall(CPUX86State *env)
++{
++    bool long_mode = env->hflags & HF_CS64_MASK;
++    uint64_t nr = long_mode ? env->regs[R_EAX] : (uint32_t)env->regs[R_EAX];
++    int result = -KVM_ENOSYS;
++
++    if (env->hflags & HF_CPL_MASK) {
++        result = -KVM_EPERM;
++    } else if (nr == KVM_HC_VAPIC_POLL_IRQ) {
++        result = 0;
++    } else if (nr == KVM_HC_CLOCK_PAIRING) {
++        uint64_t gpa = long_mode ? env->regs[R_EBX] : (uint32_t)env->regs[R_EBX];
++        uint64_t type = long_mode ? env->regs[R_ECX] : (uint32_t)env->regs[R_ECX];
++
++        result = clock_pairing(env, gpa, type);
++    }
++
++    env->regs[R_EAX] = long_mode ? (uint64_t)result : (uint32_t)result;
++}
++
++static bool write_pvclock_msr(CPUX86State *env, uint32_t id, uint64_t value)
++{
++    switch (id) {
++    case MSR_IA32_TSC:
++        env->tsc_offset = value - x86_flexvm_tsc_base(env);
++        publish_system_time(env);
++        return true;
++    case MSR_KVM_SYSTEM_TIME:
++    case MSR_KVM_SYSTEM_TIME_NEW:
++        env->flexvm_system_time = value;
++        if (!publish_system_time(env)) {
++            env->flexvm_system_time &= ~1ULL;
++        }
++        return true;
++    case MSR_KVM_WALL_CLOCK:
++    case MSR_KVM_WALL_CLOCK_NEW:
++        qatomic_set(&wall_clock_gpa, value);
++        wall_clock_set = publish_wall_clock(env);
++        return true;
++    default:
++        return false;
++    }
++}
++
++bool x86_flexvm_write_clock_msr(CPUX86State *env, uint32_t id, uint64_t value)
++{
++    bool result;
++    bool took_bql;
++
++    if (!clock_enabled ||
++        (id != MSR_IA32_TSC &&
++         id != MSR_KVM_SYSTEM_TIME && id != MSR_KVM_SYSTEM_TIME_NEW &&
++         id != MSR_KVM_WALL_CLOCK && id != MSR_KVM_WALL_CLOCK_NEW)) {
++        return false;
++    }
++    took_bql = !bql_locked();
++    if (took_bql) {
++        bql_lock();
++    }
++    result = write_pvclock_msr(env, id, value);
++    if (took_bql) {
++        bql_unlock();
++    }
++    return result;
++}
++
++bool x86_flexvm_read_clock_msr(CPUX86State *env, uint32_t id, uint64_t *value)
++{
++    if (!clock_enabled) {
++        return false;
++    }
++    switch (id) {
++    case MSR_IA32_TSC:
++        *value = x86_flexvm_tsc_base(env) + env->tsc_offset;
++        return true;
++    case MSR_KVM_SYSTEM_TIME:
++    case MSR_KVM_SYSTEM_TIME_NEW:
++        *value = env->flexvm_system_time;
++        return true;
++    case MSR_KVM_WALL_CLOCK:
++    case MSR_KVM_WALL_CLOCK_NEW:
++        *value = qatomic_read(&wall_clock_gpa);
++        return true;
++    default:
++        return false;
++    }
++}
+--- a/target/i386/tcg/system/meson.build
++++ b/target/i386/tcg/system/meson.build
+@@ -7,2 +7,3 @@
+   'fpu_helper.c',
++  'flexvm-clock.c',
+   'svm_helper.c',
+--- a/target/i386/tcg/system/misc_helper.c
++++ b/target/i386/tcg/system/misc_helper.c
+@@ -140,2 +140,5 @@
+         ((uint64_t)((uint32_t)env->regs[R_EDX]) << 32);
++    if (x86_flexvm_write_clock_msr(env, env->regs[R_ECX], val)) {
++        return;
++    }
+
+@@ -335,2 +338,8 @@
+
++    if (x86_flexvm_read_clock_msr(env, env->regs[R_ECX], &val)) {
++        env->regs[R_EAX] = (uint32_t)val;
++        env->regs[R_EDX] = val >> 32;
++        return;
++    }
++
+     switch ((uint32_t)env->regs[R_ECX]) {
+--- a/target/i386/tcg/translate.c
++++ b/target/i386/tcg/translate.c
+@@ -3260,4 +3260,16 @@
++#ifndef CONFIG_USER_ONLY
++        case 0xc1: /* VMCALL */
++            if (!x86_flexvm_clock_enabled()) {
++                goto illegal_op;
++            }
++            /* The parent KVM clock supports both hypercall encodings. */
++            /* fall through */
++#endif
+         case 0xd9: /* VMMCALL */
++#ifndef CONFIG_USER_ONLY
++            if (!SVME(s) && !x86_flexvm_clock_enabled()) {
++#else
+             if (!SVME(s)) {
++#endif
+                 goto illegal_op;
+             }
+--- a/target/i386/tcg/system/svm_helper.c
++++ b/target/i386/tcg/system/svm_helper.c
+@@ -472,4 +472,8 @@
+ {
+     cpu_svm_check_intercept_param(env, SVM_EXIT_VMMCALL, 0, GETPC());
++    if (x86_flexvm_clock_enabled()) {
++        x86_flexvm_hypercall(env);
++        return;
++    }
+     raise_exception(env, EXCP06_ILLOP);
+ }

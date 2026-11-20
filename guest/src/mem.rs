@@ -266,11 +266,7 @@ enum Mode {
 fn has_virtio_mem(driver_dir: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(driver_dir) else { return false };
     entries.flatten().any(|entry| {
-        entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.strip_prefix("virtio"))
-            .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+        entry.file_name().to_str().and_then(|name| name.strip_prefix("virtio")).is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
     })
 }
 

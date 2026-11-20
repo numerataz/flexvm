@@ -1,0 +1,177 @@
+--- a/include/hw/i386/apic_internal.h
++++ b/include/hw/i386/apic_internal.h
+@@ -182,2 +182,3 @@
+     QEMUTimer *timer;
++    QEMUTimer *flexvm_deadline_timer;
+     int64_t timer_expiry;
+@@ -207,2 +208,5 @@
+ bool apic_next_timer(APICCommonState *s, int64_t current_time);
++uint64_t apic_flexvm_get_tsc_deadline(APICCommonState *s);
++void apic_flexvm_set_tsc_deadline(APICCommonState *s, uint64_t deadline);
++void apic_flexvm_reschedule_deadline(APICCommonState *s);
+ void apic_enable_tpr_access_reporting(APICCommonState *s, bool enable);
+--- a/hw/intc/apic_common.c
++++ b/hw/intc/apic_common.c
+@@ -213,2 +213,6 @@
+     s->timer_expiry = -1;
++    if (s->flexvm_deadline_timer) {
++        timer_del(s->flexvm_deadline_timer);
++        qatomic_set(&s->cpu->env.tsc_deadline, 0);
++    }
+
+--- a/hw/intc/apic.c
++++ b/hw/intc/apic.c
+@@ -19,2 +19,3 @@
+ #include "qemu/osdep.h"
++#include "qemu/main-loop.h"
+ #include "qemu/bswap.h"
+@@ -772,4 +773,87 @@
+
++static bool apic_tsc_deadline_mode(uint32_t lvt)
++{
++    uint32_t modes = APIC_LVT_TIMER_PERIODIC | APIC_LVT_TIMER_TSCDEADLINE;
++
++    return (lvt & modes) == APIC_LVT_TIMER_TSCDEADLINE;
++}
++
++static bool apic_uses_flexvm_deadline(APICCommonState *s)
++{
++    return s && x86_flexvm_clock_enabled() &&
++           (s->apicbase & MSR_IA32_APICBASE_ENABLE) &&
++           apic_tsc_deadline_mode(s->lvt[APIC_LVT_TIMER]);
++}
++
++static void apic_flexvm_deadline_expired(void *opaque)
++{
++    APICCommonState *s = opaque;
++
++    assert(bql_locked());
++    qatomic_set(&s->cpu->env.tsc_deadline, 0);
++    if (apic_uses_flexvm_deadline(s)) {
++        apic_local_deliver(s, APIC_LVT_TIMER);
++    }
++}
++
++void apic_flexvm_reschedule_deadline(APICCommonState *s)
++{
++    assert(bql_locked());
++    if (s && s->flexvm_deadline_timer) {
++        CPUX86State *env = &s->cpu->env;
++        uint64_t deadline = qatomic_read(&env->tsc_deadline);
++        uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
++        uint64_t tsc = now + env->tsc_offset;
++        uint64_t delta = deadline > tsc ? deadline - tsc : 0;
++
++        if (deadline) {
++            timer_mod_ns(s->flexvm_deadline_timer,
++                         now + MIN(delta, INT64_MAX - now));
++        } else {
++            timer_del(s->flexvm_deadline_timer);
++        }
++    }
++}
++
++uint64_t apic_flexvm_get_tsc_deadline(APICCommonState *s)
++{
++    assert(bql_locked());
++    return apic_uses_flexvm_deadline(s) ?
++           qatomic_read(&s->cpu->env.tsc_deadline) : 0;
++}
++
++void apic_flexvm_set_tsc_deadline(APICCommonState *s, uint64_t deadline)
++{
++    assert(bql_locked());
++    if (!apic_uses_flexvm_deadline(s)) {
++        return;
++    }
++    if (!s->flexvm_deadline_timer) {
++        s->flexvm_deadline_timer = timer_new_ns(QEMU_CLOCK_REALTIME,
++                                               apic_flexvm_deadline_expired, s);
++    }
++    qatomic_set(&s->cpu->env.tsc_deadline, deadline);
++    apic_flexvm_reschedule_deadline(s);
++}
++
++static void apic_flexvm_deadline_mode_changed(APICCommonState *s,
++                                             uint32_t old_lvt)
++{
++    if (x86_flexvm_clock_enabled() &&
++        apic_tsc_deadline_mode(old_lvt) != apic_tsc_deadline_mode(s->lvt[APIC_LVT_TIMER])) {
++        s->initial_count = 0;
++        qatomic_set(&s->cpu->env.tsc_deadline, 0);
++        if (s->flexvm_deadline_timer) {
++            timer_del(s->flexvm_deadline_timer);
++        }
++    }
++}
++
+ static void apic_timer_update(APICCommonState *s, int64_t current_time)
+ {
++    if (apic_uses_flexvm_deadline(s)) {
++        timer_del(s->timer);
++        s->timer_expiry = -1;
++        return;
++    }
+     if (apic_next_timer(s, current_time)) {
+@@ -906,2 +990,3 @@
+     uint32_t current;
++    uint32_t old_lvt = s->lvt[APIC_LVT_TIMER];
+     unsigned int divide;
+@@ -925,3 +1010,4 @@
+     }
+-    s->initial_count = ldl_le_p(record + 0x380);
++    apic_flexvm_deadline_mode_changed(s, old_lvt);
++    s->initial_count = apic_uses_flexvm_deadline(s) ? 0 : ldl_le_p(record + 0x380);
+     current = MIN(s->initial_count, ldl_le_p(record + 0x390));
+@@ -1073,4 +1159,6 @@
+             int n = index - 0x32;
++            uint32_t old_lvt = s->lvt[n];
+             s->lvt[n] = val;
+             if (n == APIC_LVT_TIMER) {
++                apic_flexvm_deadline_mode_changed(s, old_lvt);
+                 apic_timer_update(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+@@ -1082,2 +1170,5 @@
+     case 0x38:
++        if (apic_uses_flexvm_deadline(s)) {
++            break;
++        }
+         s->initial_count = val;
+@@ -1227,2 +1318,5 @@
+     timer_free(s->timer);
++    if (s->flexvm_deadline_timer) {
++        timer_free(s->flexvm_deadline_timer);
++    }
+     local_apics[s->initial_apic_id] = NULL;
+--- a/target/i386/tcg/system/flexvm-clock.c
++++ b/target/i386/tcg/system/flexvm-clock.c
+@@ -10,2 +10,3 @@
+ #include "hw/core/cpu.h"
++#include "hw/i386/apic_internal.h"
+ #include "standard-headers/asm-x86/kvm_para.h"
+@@ -188,2 +189,6 @@
+         publish_system_time(env);
++        apic_flexvm_reschedule_deadline(X86_CPU(env_cpu(env))->apic_state);
++        return true;
++    case MSR_IA32_TSCDEADLINE:
++        apic_flexvm_set_tsc_deadline(X86_CPU(env_cpu(env))->apic_state, value);
+         return true;
+@@ -212,3 +217,3 @@
+     if (!clock_enabled ||
+-        (id != MSR_IA32_TSC &&
++        (id != MSR_IA32_TSC && id != MSR_IA32_TSCDEADLINE &&
+          id != MSR_KVM_SYSTEM_TIME && id != MSR_KVM_SYSTEM_TIME_NEW &&
+@@ -237,2 +242,14 @@
+         return true;
++    case MSR_IA32_TSCDEADLINE: {
++        bool took_bql = !bql_locked();
++
++        if (took_bql) {
++            bql_lock();
++        }
++        *value = apic_flexvm_get_tsc_deadline(X86_CPU(env_cpu(env))->apic_state);
++        if (took_bql) {
++            bql_unlock();
++        }
++        return true;
++    }
+     case MSR_KVM_SYSTEM_TIME:

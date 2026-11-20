@@ -1,0 +1,229 @@
+--- a/hw/char/debugcon.c
++++ b/hw/char/debugcon.c
+@@ -28,6 +28,8 @@
+ #include CONFIG_DEVICES
+ #include "qapi/error.h"
+ #include "hw/core/cpu.h"
++#include "migration/blocker.h"
++#include "qapi/qapi-commands-misc.h"
+ #include "qemu/bswap.h"
+ #include "qemu/error-report.h"
+ #include "qemu/main-loop.h"
+@@ -63,6 +65,9 @@
+     bool cancel_pending;
+     bool parallel;
+     bool parallel_ack_pending;
++    bool checkpoint_control;
++    bool checkpoint_frozen;
++    Error *checkpoint_blocker;
+     struct DebugconState *other_lane;
+     CPUState *run_cpu;
+     uint64_t mmio_base;
+@@ -79,6 +84,71 @@
+     VMChangeStateEntry *run_state;
+ } DebugconState;
+ 
++static DebugconState *checkpoint_lane;
++
++static bool debugcon_lane_idle(const DebugconState *s)
++{
++    return !s->run_active && !s->read_width && !s->pio_waiters &&
++           !s->completion_ack_pending && !s->parallel_ack_pending &&
++           !s->cancel_pending && !s->output_length && !s->run_failed;
++}
++
++static bool debugcon_fence_checkpoint(DebugconState *s, Error **errp)
++{
++    error_setg(&s->checkpoint_blocker, "FlexVM worker run control is unfenced");
++    return migrate_add_blocker(&s->checkpoint_blocker, errp) == 0;
++}
++
++static bool debugcon_register_checkpoint(DebugconState *s, Error **errp)
++{
++    if (!s->checkpoint_control) {
++        return true;
++    }
++    if (checkpoint_lane || !s->run_control) {
++        error_setg(errp, "FlexVM checkpoint requires one run-control device");
++        return false;
++    }
++    if (!debugcon_fence_checkpoint(s, errp)) {
++        return false;
++    }
++    checkpoint_lane = s;
++    return true;
++}
++
++static void debugcon_unregister_checkpoint(DebugconState *s)
++{
++    if (s == checkpoint_lane) {
++        if (s->checkpoint_blocker) {
++            migrate_del_blocker(&s->checkpoint_blocker);
++        }
++        checkpoint_lane = NULL;
++    }
++}
++
++void qmp_x_flexvm_freeze_run_control(bool frozen, Error **errp)
++{
++    DebugconState *s = checkpoint_lane;
++
++    if (!s) {
++        error_setg(errp, "FlexVM checkpoint run control is unavailable");
++        return;
++    }
++    if (s->checkpoint_frozen == frozen) {
++        return;
++    }
++    if (frozen) {
++        if (!debugcon_lane_idle(s) ||
++            (s->other_lane && !debugcon_lane_idle(s->other_lane))) {
++            error_setg(errp, "FlexVM worker still has pending execution or I/O");
++            return;
++        }
++        migrate_del_blocker(&s->checkpoint_blocker);
++    } else if (!debugcon_fence_checkpoint(s, errp)) {
++        return;
++    }
++    s->checkpoint_frozen = frozen;
++}
++
+ #ifdef CONFIG_ISA_DEBUG
+ #define TYPE_ISA_DEBUGCON_DEVICE "isa-debugcon"
+ OBJECT_DECLARE_SIMPLE_TYPE(ISADebugconState, ISA_DEBUGCON_DEVICE)
+@@ -155,6 +225,10 @@
+ {
+     DebugconState *s = opaque;
+ 
++    if (checkpoint_lane && checkpoint_lane->checkpoint_frozen &&
++        (s == checkpoint_lane || s == checkpoint_lane->other_lane)) {
++        return;
++    }
+     if (len != 1 || s->completion_ack_pending) {
+         debugcon_run_failed(s);
+         return;
+@@ -568,13 +642,18 @@
+         error_setg(errp, "debugcon PIO forwarding requires run control");
+         return;
+     }
++    if (!debugcon_register_checkpoint(s, errp)) {
++        return;
++    }
+     if (s->forward_pio &&
+         !cpu_register_ioport_interceptor(debugcon_forward_pio, s)) {
++        debugcon_unregister_checkpoint(s);
+         error_setg(errp, "already using a CPU port I/O interceptor");
+         return;
+     }
+     debugcon_realize_core(s, &err);
+     if (err != NULL) {
++        debugcon_unregister_checkpoint(s);
+         if (s->forward_pio) {
+             cpu_unregister_ioport_interceptor(s);
+         }
+@@ -594,6 +673,7 @@
+         qemu_cond_init(&second->read_completed);
+         debugcon_realize_core(second, &err);
+         if (err) {
++            debugcon_unregister_checkpoint(s);
+             qemu_cond_destroy(&second->read_completed);
+             qemu_cond_destroy(&s->read_completed);
+             qemu_chr_fe_set_handlers(&s->chr, NULL, NULL, NULL, NULL,
+@@ -620,6 +700,7 @@
+     DebugconState *s = &ISA_DEBUGCON_DEVICE(dev)->state;
+     DebugconState *second = s->other_lane;
+ 
++    debugcon_unregister_checkpoint(s);
+     if (second && second->run_state) {
+         debugcon_run_failed(second);
+         while (second->read_width || second->pio_waiters ||
+@@ -660,6 +741,8 @@
+     DEFINE_PROP_UINT32("readback", ISADebugconState, state.readback, 0xe9),
+     DEFINE_PROP_BOOL("stop-on-write", ISADebugconState, state.stop_on_write, false),
+     DEFINE_PROP_BOOL("run-control", ISADebugconState, state.run_control, false),
++    DEFINE_PROP_BOOL("checkpoint-control", ISADebugconState,
++                     state.checkpoint_control, false),
+     DEFINE_PROP_UINT64("mmio-base", ISADebugconState, state.mmio_base, 0),
+     DEFINE_PROP_BOOL("forward-pio", ISADebugconState, state.forward_pio, false),
+     DEFINE_PROP_BOOL("keep-pic-ports", ISADebugconState, state.keep_pic_ports,
+@@ -740,9 +823,13 @@
+         second->parallel = second->run_control = true;
+         second->mmio_base = lane->mmio_base;
+     }
++    if (!debugcon_register_checkpoint(lane, errp)) {
++        return;
++    }
+     qemu_cond_init(&lane->read_completed);
+     debugcon_realize_core(lane, &err);
+     if (err) {
++        debugcon_unregister_checkpoint(lane);
+         qemu_cond_destroy(&lane->read_completed);
+         error_propagate(errp, err);
+         return;
+@@ -751,6 +838,7 @@
+         qemu_cond_init(&second->read_completed);
+         debugcon_realize_core(second, &err);
+         if (err) {
++            debugcon_unregister_checkpoint(lane);
+             qemu_cond_destroy(&second->read_completed);
+             flexvm_mmio_close_lane(lane);
+             error_propagate(errp, err);
+@@ -770,6 +858,7 @@
+ {
+     DebugconState *lane = &FLEXVM_MMIO_RUN(dev)->lane;
+ 
++    debugcon_unregister_checkpoint(lane);
+     if (lane->other_lane) {
+         flexvm_mmio_close_lane(lane->other_lane);
+     }
+@@ -783,6 +872,8 @@
+     DEFINE_PROP_CHR("parallel-chardev", FlexvmMmioRun, second_lane.chr),
+     DEFINE_PROP_UINT64("addr", FlexvmMmioRun, lane.mmio_base, 0),
+     DEFINE_PROP_UINT64("size", FlexvmMmioRun, size, DEBUGCON_MMIO_SIZE),
++    DEFINE_PROP_BOOL("checkpoint-control", FlexvmMmioRun,
++                     lane.checkpoint_control, false),
+ };
+ 
+ static void flexvm_mmio_run_class_init(ObjectClass *klass, const void *data)
+--- a/qapi/misc.json
++++ b/qapi/misc.json
+@@ -599,3 +599,17 @@
+ { 'event': 'VFU_CLIENT_HANGUP',
+   'data': { 'vfu-id': 'str', 'vfu-qom-path': 'str',
+             'dev-id': 'str', 'dev-qom-path': 'str' } }
++
++##
++# @x-flexvm-freeze-run-control:
++#
++# Freeze a quiescent FlexVM worker's run-control lanes for migration.
++#
++# @frozen: Whether to fence new vCPU runs.
++#
++# Features:
++#
++# @unstable: Experimental FlexVM worker protocol.
++##
++{ 'command': 'x-flexvm-freeze-run-control', 'data': { 'frozen': 'bool' },
++  'features': [ 'unstable' ] }
+--- a/stubs/meson.build
++++ b/stubs/meson.build
+@@ -77,6 +77,7 @@
+   stub_ss.add(files('win32-kbd-hook.c'))
+   stub_ss.add(files('xen-hw-stub.c'))
+   stub_ss.add(files('monitor-arm-gic.c', 'monitor-arm-flexvm.c'))
++  stub_ss.add(files('monitor-flexvm-run.c'))
+   stub_ss.add(files('monitor-i386-rtc.c'))
+   stub_ss.add(files('monitor-i386-sev.c'))
+   stub_ss.add(files('monitor-i386-sgx.c'))
+--- /dev/null
++++ b/stubs/monitor-flexvm-run.c
+@@ -0,0 +1,9 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qapi/qapi-commands-misc.h"
++
++void qmp_x_flexvm_freeze_run_control(bool frozen, Error **errp)
++{
++    error_setg(errp, "FlexVM checkpoint run control is unavailable");
++}

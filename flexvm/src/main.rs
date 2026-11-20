@@ -111,6 +111,8 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      experimental foreground QEMU TCG execution without host KVM;
                                      defaults to the installed, verified kernel and runtime modules;
                                      --qemu PATH, --vsock-backend PATH, --mem MIB, --vcpus N,
+                                     --parent-kvm-bundle DIR enables a parent-owned /dev/kvm (x86_64, aarch64)
+                                     --parent-kvm-engine auto|tcg|kvm, --parent-kvm-mem MIB (max 256)
                                      --timeout SECS (boot only); image env/workdir/user options apply
                                      --disk VOLUME attaches a managed data disk (repeatable, requires --name)
   flexvm ps [-a] [-q] [--json] [-f, --filter KEY=VALUE]... [--format FORMAT]
@@ -133,9 +135,10 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
   flexvm stop NAME...                suspend a VM to disk, freeing its memory (as SIGTERM to its process)
   flexvm start [-a] NAME...          resume a stopped VM in the background (-a: in the foreground); an
                                      exited one runs again from its image (its writes were in its memory)
+                                     native parent KVM checkpoints need --parent-kvm-bundle DIR
   flexvm pause NAME...               pause a VM's vCPUs, keeping its memory (as SIGTSTP; Ctrl-Z works too)
   flexvm unpause NAME...             resume a paused VM
-  flexvm restart NAME...             stop, then start a VM (a stopped one is started, an exited one rerun)
+  flexvm restart NAME...             stop, then start a VM (same restore options as start)
   flexvm rename OLD NEW              rename a running, stopped or exited VM (not while it checkpoints or migrates)
   flexvm kill NAME...                destroy a running VM (Ctrl-C or Ctrl-\\ in the foreground)
   flexvm kill -s SIGNAL NAME...      send SIGNAL (TERM, HUP, 9, ...) to the VM's app instead
@@ -526,7 +529,11 @@ const NAMES: usize = usize::MAX;
 
 /// Each command's words (itself included) at most, and its flags besides `GLOBAL`.
 const COMMANDS: &[(&str, usize, &[&str])] = &[
-    ("software", 2, &["name", "kernel", "qemu", "control", "vsock-backend", "mem", "vcpus", "timeout", "disk"]),
+    (
+        "software",
+        2,
+        &["name", "kernel", "qemu", "control", "vsock-backend", "mem", "vcpus", "timeout", "disk", "parent-kvm-bundle", "parent-kvm-engine", "parent-kvm-mem"],
+    ),
     (
         "run",
         2,
@@ -560,10 +567,10 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("logs", 2, &["follow", "tail"]),
     ("inspect", NAMES, &[]),
     ("wait", NAMES, &[]),
-    ("restart", NAMES, &[]),
+    ("restart", NAMES, &["parent-kvm-bundle"]),
     ("rename", 3, &[]),
     ("stop", NAMES, &[]),
-    ("start", NAMES, &["attach"]),
+    ("start", NAMES, &["attach", "parent-kvm-bundle"]),
     ("pause", NAMES, &[]),
     ("unpause", NAMES, &[]),
     ("kill", NAMES, &["signal"]),
@@ -913,7 +920,7 @@ fn real_main(args: &Args) -> Result<()> {
                 }
             }
             if software_state::identifies(&host.suspended(name)?) {
-                util::exit(software::restore(host, name, notify_fd())?);
+                util::exit(software::restore(host, name, args.get("parent-kvm-bundle").map(Path::new), notify_fd())?);
             }
             let start = rerun(&host, name)?.unwrap_or(Start::Resume { name: name.into() });
             vmproc::main(host, paths(args)?, start, notify_fd())
@@ -1545,7 +1552,13 @@ fn start(host: &Host, args: &Args, name: &str) -> Result<()> {
     if !host.alive(name) && !host.suspended(name)?.exists() && !host.has_record(name, "exited") {
         return Err(no_vm(host, name));
     }
-    match spawn_detached(host, name, &child_args(args, &["start", "--attach", "--", name]), &log_file(host, name)?, false) {
+    let mut words = vec!["start", "--attach"];
+    let bundle = args.get("parent-kvm-bundle").map(Path::new).map(Path::canonicalize).transpose()?;
+    if let Some(bundle) = &bundle {
+        words.extend(["--parent-kvm-bundle", bundle.to_str().ok_or("native parent KVM bundle path is not UTF-8")?]);
+    }
+    words.extend(["--", name]);
+    match spawn_detached(host, name, &child_args(args, &words), &log_file(host, name)?, false) {
         Ok(v) => print(v),
         Err(e) if host::name_taken(&e) || host.alive(name) => match started_meanwhile(host, name, Instant::now() + Duration::from_secs(60))? {
             true => output(format_args!("{name}\n")),
@@ -2478,6 +2491,19 @@ fn software(args: &Args, src: &str) -> Result<i32> {
     if args.has("disk") && !args.has("name") {
         bail!("--disk requires a named software VM");
     }
+    let mem_mib = args.parse_or("mem", 512)?;
+    let parent_kvm = if let Some(bundle) = args.get("parent-kvm-bundle") {
+        Some(qemu::ParentKvm {
+            bundle: std::fs::canonicalize(bundle).map_err(|error| format!("parent KVM bundle {bundle:?}: {error}"))?,
+            engine: args.get("parent-kvm-engine").unwrap_or("auto").into(),
+            child_mem_mib: args.parse_or("parent-kvm-mem", mem_mib.min(256))?,
+        })
+    } else {
+        if args.has("parent-kvm-engine") || args.has("parent-kvm-mem") {
+            bail!("--parent-kvm-engine and --parent-kvm-mem require --parent-kvm-bundle");
+        }
+        None
+    };
     if args.get("name").is_some() {
         // A shell's background SIGINT/SIGQUIT disposition must not disable the
         // normal management kill operation on a named VM.
@@ -2487,11 +2513,10 @@ fn software(args: &Args, src: &str) -> Result<i32> {
         }
         util::block_signals(&[libc::SIGTSTP, libc::SIGCONT, libc::SIGTERM]);
     }
-    let control = match args.get("control").unwrap_or(if args.get("name").is_some() || args.get("boot").is_some_and(|boot| boot != "app") {
-        "serial"
-    } else {
-        "vsock"
-    }) {
+    let control = match args
+        .get("control")
+        .unwrap_or(if parent_kvm.is_some() || args.get("name").is_some() || args.get("boot").is_some_and(|boot| boot != "app") { "serial" } else { "vsock" })
+    {
         "vsock" => qemu::Control::Vsock,
         "serial" => qemu::Control::Serial,
         other => bail!("unsupported software control transport {other:?}: use vsock or serial"),
@@ -2521,6 +2546,7 @@ fn software(args: &Args, src: &str) -> Result<i32> {
         max_mib,
         vcpus: args.parse_or("vcpus", 1)?,
         boot_timeout: Duration::from_secs(args.parse_or("timeout", 90)?),
+        parent_kvm,
     };
     config.validate()?;
     let processes = std::sync::Arc::new(qemu::Processes::default());
@@ -2579,7 +2605,7 @@ fn software(args: &Args, src: &str) -> Result<i32> {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
-    machine.exec(meta.argv, |kind, bytes| {
+    let result = machine.exec(meta.argv, |kind, bytes| {
         if kind == guest::FRAME_STDERR {
             let mut out = std::io::stderr().lock();
             out.write_all(bytes)?;
@@ -2590,6 +2616,14 @@ fn software(args: &Args, src: &str) -> Result<i32> {
             out.flush()?;
         }
         Ok(())
+    });
+    result.map_err(|error| {
+        if config.parent_kvm.is_some() {
+            processes.stop();
+            format!("{error}\n{}", machine.diagnostics()).into()
+        } else {
+            error
+        }
     })
 }
 

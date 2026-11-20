@@ -24,6 +24,7 @@ mod distro;
 mod input;
 mod mem;
 mod net;
+mod parent_kvm;
 #[allow(dead_code)]
 mod proto;
 mod runtime;
@@ -227,7 +228,9 @@ fn setup_root(distro: bool) -> io::Result<()> {
     }
     // Use the template's memory ceiling, not its small boot RAM. size=0 is unlimited but
     // statfs reports zero capacity/free blocks, which makes package managers refuse downloads.
-    let tmpfs = tmpfs_options(&std::fs::read_to_string("/proc/cmdline")?)?;
+    let cmdline = std::fs::read_to_string("/proc/cmdline")?;
+    let tmpfs = tmpfs_options(&cmdline)?;
+    parent_kvm::load_if_requested(&cmdline)?;
     mount("tmpfs", "/run", "tmpfs", 0, &format!("mode=755,{tmpfs}"))?;
     for d in ["/run/ovl/upper", "/run/ovl/work", "/run/root"] {
         std::fs::create_dir_all(d)?;
