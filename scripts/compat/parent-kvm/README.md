@@ -84,7 +84,10 @@ Add `--mmio-write` in a separate long-mode run to return MMIO writes from
 a device page. The client writes through a virtual alias and checks each
 physical address, width and byte sequence. A shared-memory marker shows that
 the worker stopped at each exit and continued from the same instruction stream.
-MMIO read completion remains part of #1501.
+Use `--mmio-read` to exercise both writes and reads. The single vCPU stops
+at each read. On the next ordinary `KVM_RUN`, it completes the access with
+the bytes written by the client into the mapped `kvm_run` page. Completion
+with a pending signal and parallel vCPU entry remain part of #1501.
 The worker uses one host mapping per consecutive extent. Highly fragmented
 slots can reach the host's mapping limit. A failed mapping releases the
 partially mapped worker span.
