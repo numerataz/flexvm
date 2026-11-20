@@ -579,7 +579,7 @@ struct Resume {
 
 pub fn run(host: Host, name: NameLock, machine: qemu::Machine, processes: Arc<qemu::Processes>, config: &qemu::Config, meta: &image::ImageMeta) -> Result<i32> {
     if config.parent_kvm.is_some() && !machine.has_parent_fence() {
-        bail!("named parent KVM VMs require an ARM TCG worker with hierarchy pause support");
+        bail!("named parent KVM VMs require a TCG worker with hierarchy pause support");
     }
     serve(host, name, machine, processes, config, meta, None)
 }

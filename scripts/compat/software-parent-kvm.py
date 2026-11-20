@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import runpy
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parent
 HELPERS = runpy.run_path(str(ROOT / "software-boot.py"))
@@ -17,7 +18,10 @@ def main():
     for name in ("bin", "kernel", "firecracker", "qemu", "bundle", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--engine", choices=("auto", "tcg", "kvm"), default="tcg")
+    parser.add_argument("--pause", action="store_true", help="pause and resume the first nested VM through the public command")
     args = parser.parse_args()
+    if args.pause and args.engine != "tcg":
+        parser.error("--pause requires the TCG parent provider")
     binary, kernel, firecracker, qemu, bundle = (
         path.resolve(strict=True) for path in (args.bin, args.kernel, args.firecracker, args.qemu, args.bundle)
     )
@@ -60,13 +64,19 @@ def main():
     with tempfile.TemporaryDirectory(prefix="flexvm-software-parent-", dir="/var/lib") as state:
         mask = Path(state) / "mask"
         mask.touch(mode=0o600)
-        HELPERS["run"]([
+        command = [
             "unshare", "--mount", "--propagation", "private", "sh", "-ec", setup, "sh", mask, args.engine,
             "strace", "-f", "-e", "trace=file", "-o", trace,
             binary, "software", "--kernel", kernel, "--qemu", qemu, "--state", state, "--verbose",
             "--parent-kvm-bundle", bundle, "--parent-kvm-engine", args.engine, "--parent-kvm-mem", "128",
-            "--mem", "512", archive,
-        ], 180, log)
+            "--mem", "512",
+        ]
+        during = None
+        if args.pause:
+            name = "parent-kvm-pause"
+            command.extend(["--name", name])
+            during = lambda proc, deadline: pause_nested(proc, deadline, binary, state, name, output, log)
+        HELPERS["run"]([*command, archive], 180, log, during=during)
     transcript = log.read_text(errors="replace")
     for marker in ("FLEXVM_SOFTWARE_INNER_CPU 0", "FLEXVM_SOFTWARE_INNER_CPU 1", "FLEXVM_SOFTWARE_INNER_COMPLETE",
                    "PASS Firecracker network echo"):
@@ -91,8 +101,25 @@ def main():
             raise RuntimeError("only the expected native worker processes may access host KVM")
     report = {"status": "passed", "engine": "tcg" if args.engine == "auto" else args.engine, "selection": args.engine,
               "nested_vcpus": 2, "nested_starts": 2, "firecracker_sha256": HELPERS["digest"](firecracker),
-              "host_virtualization_devices": sorted(devices)}
+              "host_virtualization_devices": sorted(devices), "paused_hierarchy": args.pause}
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+
+
+def pause_nested(proc, deadline, binary, state, name, output, log):
+    marker = "FLEXVM_SOFTWARE_INNER_TICK 0"
+    while marker not in log.read_text(errors="replace"):
+        if proc.poll() is not None or time.monotonic() >= deadline:
+            raise RuntimeError("the nested x86 guest did not reach its pause window")
+        time.sleep(.01)
+    HELPERS["run"]([binary, "pause", "--state", state, name], 15, output / "pause.log")
+    paused = log.read_text(errors="replace").split(marker, 1)[-1]
+    if "software: parent KVM vCPUs quiesced" not in paused:
+        raise RuntimeError("the x86 parent did not fence its nested run lanes")
+    ticks = log.read_text(errors="replace").count("FLEXVM_SOFTWARE_INNER_TICK")
+    time.sleep(5)
+    if proc.poll() is not None or log.read_text(errors="replace").count("FLEXVM_SOFTWARE_INNER_TICK") != ticks:
+        raise RuntimeError("the nested x86 guest advanced while the hierarchy was paused")
+    HELPERS["run"]([binary, "unpause", "--state", state, name], 15, output / "unpause.log")
 
 
 if __name__ == "__main__":

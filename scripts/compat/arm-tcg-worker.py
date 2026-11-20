@@ -364,6 +364,12 @@ class TcgArm:
             for cpu in profile["lanes"]:
                 self.add_lane(cpu)
 
+    def checkpoint_ready(self):
+        return not self.read_width and all(lane.live is None for lane in self.lanes.values())
+
+    def can_capture(self):
+        return self.proc is not None
+
     def freeze_run_control(self, frozen):
         if self.qmp and self.proc.poll() is None:
             self.ask("x-flexvm-freeze-run-control", {"frozen": frozen})

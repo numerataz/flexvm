@@ -337,6 +337,7 @@ class OuterLaunch:
     memory_mib: int
     emulator_fd: int | None
     control: Path | None
+    checkpoint: bool = False
 
 
 def spawn_owned(command, **kwargs):
@@ -524,6 +525,80 @@ class RegisterChannel:
         self.socket.close()
 
 
+class CheckpointGate:
+    def __init__(self, listener):
+        self.listener = listener
+        self.client = None
+        self.phase = "running"
+        self.captured_interrupts = {}
+
+    def descriptor(self):
+        return self.client if self.client is not None else self.listener
+
+    def service(self, ready, worker, capture=None, rollback=None):
+        if self.descriptor() not in ready:
+            return False
+        if self.client is None:
+            self.client, _ = self.listener.accept()
+            return False
+        request, fds, flags, _ = socket.recv_fds(self.client, 16, 3, socket.MSG_CMSG_CLOEXEC)
+        with ExitStack() as descriptors:
+            for fd in fds:
+                descriptors.callback(os.close, fd)
+                os.set_inheritable(fd, False)
+            if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
+                raise RuntimeError("truncated checkpoint request")
+            return self.handle(request, fds, worker, capture, rollback)
+
+    def handle(self, request, fds, worker, capture, rollback):
+        if not request:
+            self.close()
+            if self.phase != "running":
+                # The requester may have committed a captured VM elsewhere.
+                # Unwind the broker and both owned emulators on disconnect.
+                raise RuntimeError("checkpoint owner disconnected")
+        elif request == b"freeze" and not fds and self.phase == "running":
+            self.phase = "freezing"
+        elif request == b"ready" and not fds and self.phase == "frozen":
+            self.client.sendall(b"ok")
+        elif request == b"check-save" and not fds and self.phase == "frozen" and capture is not None:
+            self.client.sendall(b"ok" if worker is None or worker.can_capture() else b"nested worker is still starting")
+        elif request == b"thaw" and not fds and self.phase == "frozen":
+            if worker:
+                worker.freeze_run_control(False)
+            self.phase = "running"
+            self.client.sendall(b"ok")
+        elif request == b"save" and len(fds) == 3 and self.phase == "frozen" and capture is not None:
+            self.captured_interrupts = capture(worker, fds)
+            self.phase = "captured"
+            self.client.sendall(b"ok")
+        elif request == b"rollback" and not fds and self.phase == "captured" and rollback is not None:
+            rollback(worker, self.captured_interrupts)
+            self.captured_interrupts = {}
+            self.phase = "running"
+            self.client.sendall(b"ok")
+        elif request == b"retire" and not fds and self.phase == "captured":
+            return True
+        else:
+            self.client.sendall(b"invalid checkpoint command")
+        return False
+
+    def finish_freeze(self, worker):
+        if self.phase != "freezing":
+            return
+        if worker:
+            if not worker.checkpoint_ready():
+                return
+            worker.freeze_run_control(True)
+        self.phase = "frozen"
+        self.client.sendall(b"ok")
+
+    def close(self):
+        if self.client is not None:
+            self.client.close()
+            self.client = None
+
+
 def transfer_state(monitor, descriptor, *, incoming=False):
     monitor.send_fd(descriptor)
     try:
@@ -677,6 +752,9 @@ class TcgChild:
 
     def special_command(self, operation, arguments=None):
         return self.monitor().ask(operation, arguments)
+
+    def checkpoint_ready(self):
+        return self.lanes.checkpoint_ready()
 
     def freeze_run_control(self, frozen):
         self.special_command("x-flexvm-freeze-run-control", {"frozen": frozen})
@@ -1505,7 +1583,7 @@ def check_fixture_slots(slots, ram_pages, protected_entry, split_slot, zero_slot
 
 
 def start_child(engine, qemu, output, control, outer_ram, slots, cpu_count, mmio_base, irqchip, pit_flags, irq_fds, tss_gpa,
-                fixture_checks, parallel):
+                fixture_checks, parallel, *, checkpoint=False):
     if not irqchip:
         irq_fds = ()
     if tss_gpa is not None and any(slot.gpa < tss_gpa + 3 * PAGE_SIZE and
@@ -1525,7 +1603,7 @@ def start_child(engine, qemu, output, control, outer_ram, slots, cpu_count, mmio
         if engine == "kvm":
             return KvmChild(output, outer_ram, layouts, slots, cpu_count, irqchip, pit_flags, irq_fds, tss_gpa, parallel)
         return TcgChild(qemu, output, control, outer_ram, layouts, slots, cpu_count, mmio_base,
-                        pit_flags, irq_fds, fixture_checks, parallel)
+                        pit_flags, irq_fds, fixture_checks, parallel, checkpoint=checkpoint)
 
 
 def verify_slot_spans(pid, slots):
@@ -1726,6 +1804,7 @@ def exercise(
     active_vm = False
     slot_size = ram_pages * PAGE_SIZE
     parallel = launch is not None or firecracker and cpu_count > 1
+    checkpoint = launch is not None and launch.checkpoint
     outer_mib = launch.memory_mib if launch else max(384 if firecracker else 192, (slot_size + MIB - 1) // MIB + 128)
     outer_ram_size = outer_mib * MIB
     with ExitStack() as cleanup:
@@ -1735,6 +1814,13 @@ def exercise(
             cleanup.callback(shutil.rmtree, control)
         else:
             control = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix="flexvm-kvm-")))
+        gate = None
+        if checkpoint:
+            listener = cleanup.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET))
+            listener.bind(str(control / "checkpoint"))
+            listener.listen(1)
+            gate = CheckpointGate(listener)
+            cleanup.callback(gate.close)
         server = cleanup.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
         server.bind(str(control / "doorbell"))
         server.listen(1)
@@ -1792,13 +1878,16 @@ def exercise(
         exited = os.pidfd_open(outer.pid)
         cleanup.callback(os.close, exited)
         deadline = time.monotonic() + 60
+        request_wakeup = False
         while True:
             descriptors = [exited, requests, cancellations]
             lanes = child.lanes if parallel and child is not None and child.process is not None else None
-            if child is not None and child.process is not None:
+            if child is not None and child.process is not None and (not gate or gate.phase in ("running", "freezing")):
                 descriptors.extend(child.channel.gsi_by_fd)
             if lanes:
                 descriptors.extend(lanes.descriptors())
+            if gate:
+                descriptors.append(gate.descriptor())
             timeout = None if launch else max(0, deadline - time.monotonic())
             readable, _, _ = select.select(descriptors, [], [], timeout)
             if exited in readable:
@@ -1808,14 +1897,27 @@ def exercise(
                     raise TimeoutError("parallel guest did not shut down")
                 if requests in readable:
                     os.eventfd_read(requests)
+                    request_wakeup = True
                 if cancellations in readable:
                     os.eventfd_read(cancellations)
+                if gate and gate.service(readable, child):
+                    break
+                held = gate is not None and gate.phase != "running"
                 if lanes:
-                    child.channel.dispatch_irqs(readable, running=bool(lanes.live))
+                    if not gate or gate.phase in ("running", "freezing"):
+                        child.channel.dispatch_irqs(readable, running=bool(lanes.live))
                     if parent_engine == "kvm" or len(started_cpus) == len(lanes.connections):
-                        lanes.service(mapping, readable, open_cpus, started_cpus, replies)
+                        lanes.service(mapping, readable, open_cpus, started_cpus, replies, hold=held)
+                if held:
+                    gate.finish_freeze(child)
+                    continue
+                # Keep the doorbell credit across a pause, without inspecting
+                # requests on unrelated lane or interrupt wakeups.
+                if not request_wakeup:
+                    continue
+                request_wakeup = False
                 request_seq, reply_seq = struct.unpack_from("<II", mapping, 8)
-                if requests not in readable or request_seq == reply_seq:
+                if request_seq == reply_seq:
                     continue
             if not parallel and cancellations in readable and requests not in readable:
                 # The ordinary I/O exit can win a race with the cancel doorbell.
@@ -1825,10 +1927,11 @@ def exercise(
                 if cancelled > complete:
                     raise RuntimeError("cancellation has no live run")
                 continue
-            if child is not None and child.channel.dispatch_irqs(readable) and requests not in readable:
-                continue
-            if requests not in readable:
-                raise TimeoutError("outer guest did not shut down")
+            if not parallel:
+                if child is not None and child.channel.dispatch_irqs(readable) and requests not in readable:
+                    continue
+                if requests not in readable:
+                    raise TimeoutError("outer guest did not shut down")
             if not parallel and os.eventfd_read(requests) != 1:
                 raise RuntimeError("multiple outstanding doorbell requests")
             pending, complete, opcode, _, length = struct.unpack_from("<IIIII", mapping, 8)
@@ -2097,7 +2200,7 @@ def exercise(
                     mmio_base = FIRECRACKER_NET_MMIO_BASE if not fixture_checks else MMIO_BASE if mmio else None
                     child = start_child(parent_engine, qemu, output, control, outer_ram, slots,
                                         worker_cpus, mmio_base, irqchip_created, pit_flags, irq_fds, tss_gpa,
-                                        fixture_checks, parallel)
+                                        fixture_checks, parallel, checkpoint=checkpoint)
                     if launch:
                         child.channel.irq_pulses = deque(maxlen=128)
                         child.lanes.read_pio = deque(maxlen=128)
@@ -2448,10 +2551,11 @@ def serve_outer(argv):
     if not destination.samefile(bundle):
         parser.error("service directory already refers to another provider bundle")
     engine = args.engine
+    checkpoint_bundle = destination / "checkpoint.version"
+    checkpoint = (args.control is not None and args.outer_qmp is not None and
+                  checkpoint_bundle.is_file() and checkpoint_bundle.read_bytes() == b"1\n")
     if arch == "aarch64":
         launch_arm = runpy.run_path(str(ROOT / "arm-parent-run.py"))["launch_arm"]
-        checkpoint_bundle = destination / "checkpoint.version"
-        checkpoint = args.outer_qmp is not None and checkpoint_bundle.is_file() and checkpoint_bundle.read_bytes() == b"1\n"
         result = launch_arm(command, destination / "native-worker", args.outer_memory, args.child_memory,
                             inherited=args.inherit, control=args.control, frontend=destination / "flexvm-pvkvm.img",
                             engine=engine, tcg_qemu=qemu, emulator_fd=args.emulator_fd,
@@ -2466,10 +2570,15 @@ def serve_outer(argv):
         if not available and engine == "kvm":
             parser.error("native parent execution requires an available KVM worker")
         engine = "kvm" if available else "tcg"
+    if checkpoint and engine == "tcg":
+        options = native_query([qemu, "-device", "isa-debugcon,help"])
+        checkpoint = b"checkpoint-control" in options.stdout + options.stderr
+    else:
+        checkpoint = False
     result = exercise(
         qemu, None, output, parent_engine=engine, ram_pages=args.child_memory * MIB // PAGE_SIZE,
         protected_entry=True, pvh=True, cpu_count=2,
-        launch=OuterLaunch(tuple(command), tuple(args.inherit), args.outer_memory, args.emulator_fd, args.control),
+        launch=OuterLaunch(tuple(command), tuple(args.inherit), args.outer_memory, args.emulator_fd, args.control, checkpoint),
     )
     return 128 - result if result < 0 else result
 

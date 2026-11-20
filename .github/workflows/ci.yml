@@ -639,17 +639,21 @@ jobs:
             local engine=$1
             local bundle=${2:-$engine}
             local output="$RUNNER_TEMP/software-parent-kvm-$engine"
+            if [ -n "${3-}" ]; then output="$output-${3#--}"; fi
+            shift
+            if [ "$#" -gt 0 ]; then shift; fi
             sudo systemd-run --scope --collect -p MemoryMax=1400M -p MemorySwapMax=0 -p CPUQuota=200% \
               python3 scripts/compat/software-parent-kvm.py --bin target/release/flexvm \
               --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" \
               --firecracker "$RUNNER_TEMP/firecracker-$FC_VERSION-$ARCH" --engine "$engine" \
-              --bundle "$RUNNER_TEMP/parent-kvm-firecracker-$bundle-2/provider" --output "$output" || {
+              --bundle "$RUNNER_TEMP/parent-kvm-firecracker-$bundle-2/provider" --output "$output" "$@" || {
               cat "$output/guest.log" >&2 || true
               return 1
             }
             cat "$output/report.json"
           }
           run_public_parent tcg
+          run_public_parent tcg tcg --pause
           if [ -x "$RUNNER_TEMP/parent-kvm-firecracker-kvm-2/provider/native-worker" ]; then
             run_public_parent kvm
             run_public_parent auto kvm
