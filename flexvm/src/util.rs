@@ -11,6 +11,32 @@ use std::time::{Duration, Instant};
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Semantic error category for in-process callers (such as the Docker API) that map errors to status codes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorKind {
+    NotFound,
+    Conflict,
+    BadRequest,
+}
+
+#[derive(Debug)]
+pub struct CodedError {
+    pub kind: ErrorKind,
+    pub message: String,
+}
+
+impl std::fmt::Display for CodedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CodedError {}
+
+pub fn coded(kind: ErrorKind, message: impl Into<String>) -> Error {
+    Box::new(CodedError { kind, message: message.into() })
+}
+
 #[macro_export]
 macro_rules! bail {
     ($($arg:tt)*) => { return Err(format!($($arg)*).into()) };

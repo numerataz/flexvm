@@ -16,8 +16,15 @@ pub struct Record {
     pub name: String,
     /// Seconds since the epoch.
     pub created: u64,
-    /// `run -d --name NAME` takes these next: flags, then IMAGE, then CMD.
-    pub run: Vec<String>,
+    /// What `run` needs beyond the generation: env, entrypoint, ports, ip, flags, restart policy.
+    #[serde(default)]
+    pub spec: crate::app::RunSpec,
+    /// CPU and memory limits for `run`.
+    #[serde(default)]
+    pub resources: crate::vm::Resources,
+    /// Shell command for non-image templates (which have no app entrypoint to replace).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cmd: Option<String>,
     /// The image as given, and its template.
     pub image: String,
     pub template: String,
@@ -180,7 +187,7 @@ fn free_port(ip: Option<std::net::IpAddr>, udp: bool) -> Result<u16, Error> {
 }
 
 /// `-p` mappings from `PortBindings` (and `PublishAllPorts`: each exposed port to a free one).
-fn ports(host_config: &Value, exposed: &[String]) -> Result<Vec<String>, Error> {
+fn ports(host_config: &Value, exposed: &[String]) -> Result<Vec<crate::ports::Port>, Error> {
     let mut out = Vec::new();
     let mut bindings: Vec<(String, Value)> =
         host_config["PortBindings"].as_object().map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default();
@@ -193,42 +200,45 @@ fn ports(host_config: &Value, exposed: &[String]) -> Result<Vec<String>, Error> 
     }
     for (port, binds) in bindings {
         let (vm, proto) = port.split_once('/').unwrap_or((&port, "tcp"));
-        if !matches!(proto, "tcp" | "udp") {
-            return Err(Error::unsupported(format!("port {port} ({proto}: flexvm forwards tcp and udp)")));
-        }
-        let vm: u16 = vm.parse().map_err(|_| Error::unsupported(format!("port {port} (a range or a bad port)")))?;
+        let protocol = match proto {
+            "tcp" => crate::ports::Protocol::Tcp,
+            "udp" => crate::ports::Protocol::Udp,
+            _ => return Err(Error::unsupported(format!("port {port} ({proto}: flexvm forwards tcp and udp)"))),
+        };
+        let vm_port = vm.parse::<u16>().ok().filter(|&p| p > 0).ok_or_else(|| Error::unsupported(format!("port {port} (a range or a bad port)")))?;
         let binds = binds.as_array().cloned().unwrap_or_default();
         for b in if binds.is_empty() { vec![json!({})] } else { binds } {
             let ip = b["HostIp"].as_str().filter(|i| !i.is_empty());
             let ip: Option<std::net::IpAddr> =
                 ip.map(|i| i.trim_matches(['[', ']']).parse().map_err(|_| Error::bad(format!("bad HostIp {i:?}")))).transpose()?;
-            let host = match b["HostPort"].as_str().filter(|p| !p.is_empty() && *p != "0") {
-                Some(h) => h.parse::<u16>().map_err(|_| Error::unsupported(format!("host port {h:?} (a range or a bad port)")))?,
-                None => free_port(ip, proto == "udp")?,
+            let host_port = match b["HostPort"].as_str().filter(|p| !p.is_empty() && *p != "0") {
+                Some(h) => h.parse::<u16>().ok().filter(|&p| p > 0).ok_or_else(|| Error::unsupported(format!("host port {h:?} (a range or a bad port)")))?,
+                None => free_port(ip, protocol == crate::ports::Protocol::Udp)?,
             };
-            let bind = match ip {
-                Some(std::net::IpAddr::V6(v6)) => format!("[{v6}]:"),
-                Some(v4) => format!("{v4}:"),
-                None => String::new(),
-            };
-            out.push(format!("{bind}{host}:{vm}/{proto}"));
+            out.push(crate::ports::Port { ip, host_port, vm_port, protocol });
         }
     }
     Ok(out)
 }
 
-/// `HostConfig.RestartPolicy` as `run --restart`'s value (None: `no`).
-fn restart(policy: &Value) -> Result<Option<String>, Error> {
+/// `HostConfig.RestartPolicy` as `app::Restart` (None: `no`).
+fn restart(policy: &Value) -> Result<Option<crate::app::Restart>, Error> {
     let max = policy["MaximumRetryCount"].as_u64().unwrap_or(0);
     let name = policy["Name"].as_str().unwrap_or("");
-    let value = match name {
+    let kind = match name {
         "" | "no" => None,
-        "always" | "unless-stopped" | "on-failure" => Some(name.to_string()),
+        "always" => Some(crate::app::Policy::Always),
+        "unless-stopped" => Some(crate::app::Policy::UnlessStopped),
+        "on-failure" => Some(crate::app::Policy::OnFailure),
         p => return Err(Error::bad(format!("invalid restart policy {p:?}"))),
     };
-    match (value, max) {
-        (v, 0) => Ok(v),
-        (Some(v), n) if v == "on-failure" => Ok(Some(format!("on-failure:{n}"))),
+    match (kind, max) {
+        (None, 0) => Ok(None),
+        (Some(policy), 0) => Ok(Some(crate::app::Restart { policy, max: 0, count: 0, delay_ms: 0 })),
+        (Some(policy @ crate::app::Policy::OnFailure), n) => {
+            let max = u32::try_from(n).map_err(|_| Error::bad(format!("invalid restart policy: maximum retry count {n} is too large")))?;
+            Ok(Some(crate::app::Restart { policy, max, count: 0, delay_ms: 0 }))
+        }
         _ => Err(Error::bad(format!("invalid restart policy: maximum retry count can only be used with 'on-failure' ({name:?})"))),
     }
 }
@@ -316,7 +326,7 @@ fn refuse_unsupported(config: &Value, host_config: &Value, name: &str) -> Result
 /// its image (`template`, pulled: else docker's "No such image", which docker's CLI answers with a pull).
 /// `IPAMConfig.IPv6Address`: the IPv4 address whose VM has it, which agrees with `IPv4Address` if
 /// that is given. Refused unless it is in `vm_ipv6_prefix`: no other IPv6 address is a VM's.
-fn ipv4_of(cfg: &crate::host::Config, v6: &str, ipv4: Option<&str>) -> Result<String, Error> {
+fn ipv4_of(cfg: &crate::host::Config, v6: &str, ipv4: Option<&str>) -> Result<std::net::Ipv4Addr, Error> {
     let addr: std::net::Ipv6Addr = v6.parse().map_err(|_| Error::bad(format!("bad IPv6Address {v6:?}")))?;
     let Some(prefix) = cfg.vm_ipv6_prefix else {
         return Err(Error::unsupported(format!("IPv6Address {v6} without vm_ipv6_prefix in host.json")));
@@ -327,7 +337,7 @@ fn ipv4_of(cfg: &crate::host::Config, v6: &str, ipv4: Option<&str>) -> Result<St
     match ipv4.map(|v4| (v4, v4.parse::<std::net::Ipv4Addr>())) {
         Some((_, Ok(v4))) if v4 != ip => Err(Error::bad(format!("IPv6Address {v6} is not IPv4Address {v4}'s, {}", prefix.vm(v4)))),
         Some((given, Err(_))) => Err(Error::bad(format!("IPv6Address {v6} with IPv4Address {given:?}, which is not an IPv4 address"))),
-        _ => Ok(ip.to_string()),
+        _ => Ok(ip),
     }
 }
 
@@ -367,8 +377,8 @@ pub fn translate(api: &Api, name: &str, body: &Value) -> Result<Record, Error> {
             return Err(Error::unsupported(format!("{flag} for the app ({key} {v:?}): give it to flexvm pull")));
         }
     }
-    let mut run = Vec::new();
-    let mut cmd_words = Vec::new();
+    let mut spec = crate::app::RunSpec::default();
+    let mut cmd = None;
     // Docker's Entrypoint and Cmd: given (an empty Entrypoint clears the image's), else the image's; a new
     // entrypoint drops the image's command.
     if config["Entrypoint"].is_array() || config["Cmd"].is_array() {
@@ -377,47 +387,37 @@ pub fn translate(api: &Api, name: &str, body: &Value) -> Result<Record, Error> {
         match (app.as_slice() == argv, app.is_empty(), meta.is_some()) {
             (true, _, _) => {}
             (false, true, _) => return Err(Error::unsupported("an empty command over an image's app: a VM's app is its image's or a command")),
-            (false, false, true) => run.extend(["--entrypoint".to_string(), serde_json::to_string(&app).unwrap_or_default()]),
+            (false, false, true) => spec.entrypoint = Some(app),
             // A template of no image's has no app to replace: the VM follows the command, run by a shell.
-            (false, false, false) => cmd_words = vec![super::containers::shell_words(&app)],
+            (false, false, false) => cmd = Some(super::containers::shell_words(&app)),
         }
     }
     for kv in config["Env"].as_array().into_iter().flatten().filter_map(Value::as_str) {
         // A bare `K`: docker's CLI sends none (unset here, it leaves it out); this server's own would be the wrong one.
         if kv.contains('=') {
-            run.extend(["-e".to_string(), kv.to_string()]);
+            spec.env.push(kv.to_string());
         }
     }
-    if config["OpenStdin"] == true {
-        run.push("--interactive".into());
-    }
-    if config["Tty"] == true {
-        run.push("--tty".into());
-    }
-    if host_config["AutoRemove"] == true {
-        run.push("--rm".into());
-    }
-    if let Some(r) = restart(&host_config["RestartPolicy"])? {
-        run.extend(["--restart".to_string(), r]);
-    }
-    if let Some(m) = host_config["Memory"].as_u64().filter(|&m| m > 0) {
-        run.extend(["--memory".to_string(), m.to_string()]);
-    }
+    spec.stdin = config["OpenStdin"] == true;
+    spec.tty = config["Tty"] == true;
+    spec.rm = host_config["AutoRemove"] == true;
+    spec.restart = restart(&host_config["RestartPolicy"])?;
+    let memory_mib = match host_config["Memory"].as_u64().filter(|&m| m > 0) {
+        Some(m) if m < (1 << 20) => return Err(Error::bad(format!("Memory {m} is less than 1 MiB"))),
+        Some(m) => Some(m >> 20),
+        None => None,
+    };
     let cpus = match (host_config["NanoCpus"].as_u64().filter(|&n| n > 0), host_config["CpuQuota"].as_i64().filter(|&q| q > 0)) {
         (Some(n), _) => Some(n as f64 / 1e9),
         (None, Some(q)) => Some(q as f64 / host_config["CpuPeriod"].as_i64().filter(|&p| p > 0).unwrap_or(100_000) as f64),
         _ => None,
     };
-    if let Some(c) = cpus {
-        run.extend(["--cpus".to_string(), c.to_string()]);
-    }
+    let resources = crate::vm::Resources { cpus, memory_mib };
     let mut exposed: Vec<String> = config["ExposedPorts"].as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
     exposed.extend(image_config.as_deref().and_then(|c| c["ExposedPorts"].as_object()).map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default());
     exposed.sort();
     exposed.dedup();
-    for p in ports(&host_config, &exposed)? {
-        run.extend(["--publish".to_string(), p]);
-    }
+    spec.ports = ports(&host_config, &exposed)?;
     let endpoints = body["NetworkingConfig"]["EndpointsConfig"].as_object().cloned().unwrap_or_default();
     for (net, e) in &endpoints {
         if !matches!(net.as_str(), "bridge" | "flexvm" | "default") {
@@ -425,21 +425,16 @@ pub fn translate(api: &Api, name: &str, body: &Value) -> Result<Record, Error> {
         }
         let ipv4 = e["IPAMConfig"]["IPv4Address"].as_str().filter(|i| !i.is_empty());
         // A VM's IPv6 address is derived from its IPv4 one (`Config::vm_ipv6`): one asked for names that.
-        let ipv6 = match e["IPAMConfig"]["IPv6Address"].as_str().filter(|i| !i.is_empty()) {
+        let ip = match e["IPAMConfig"]["IPv6Address"].as_str().filter(|i| !i.is_empty()) {
             Some(v6) => Some(ipv4_of(&api.host.config_now(), v6, ipv4)?),
-            None => None,
+            None => ipv4.map(|v4| v4.parse().map_err(|_| Error::bad(format!("bad IPv4Address {v4:?}")))).transpose()?,
         };
-        if let Some(ip) = ipv6.or(ipv4.map(String::from)) {
-            run.extend(["--ip".to_string(), ip]);
+        if let Some(ip) = ip {
+            spec.ip = Some(ip);
         }
     }
-    run.push(generation.clone());
-    if !cmd_words.is_empty() {
-        run.push("--".into());
-        run.extend(cmd_words);
-    }
     let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-    Ok(Record { name: name.to_string(), created, run, image, template, generation, config, host_config, ..Record::default() })
+    Ok(Record { name: name.to_string(), created, spec, resources, cmd, image, template, generation, config, host_config, ..Record::default() })
 }
 
 #[cfg(test)]
@@ -543,8 +538,7 @@ pub(super) mod tests {
         for image in ["image", "aaaa1111", "aaaa", "sha256:aaaa1111", "sha256:aaaa"] {
             let r = translate(&api, "web", &json!({"Image": image})).unwrap();
             assert_eq!(r.generation, "aaaa1111");
-            assert_eq!(r.run.last().unwrap(), "aaaa1111");
-            assert_eq!(crate::template::name_of(r.run.last().unwrap()).unwrap(), "aaaa1111");
+            assert_eq!(crate::template::name_of(&r.generation).unwrap(), "aaaa1111");
         }
         image(&api, "aaaa2222", json!({"Cmd": ["other"]}));
         for image in ["aaaa", "sha256:aaaa"] {
@@ -566,8 +560,8 @@ pub(super) mod tests {
         std::fs::remove_file(api.paths.templates.join("image")).unwrap();
         std::os::unix::fs::symlink(".gen/bbbb2222", api.paths.templates.join("image")).unwrap();
         let r = load(&api, "web").unwrap();
-        assert_eq!(r.run.last().unwrap(), "aaaa1111");
-        assert_eq!(crate::template::Template::resolve(&api.paths, r.run.last().unwrap()).unwrap(), api.paths.templates.join(".gen/aaaa1111"));
+        assert_eq!(r.generation, "aaaa1111");
+        assert_eq!(crate::template::Template::resolve(&api.paths, &r.generation).unwrap(), api.paths.templates.join(".gen/aaaa1111"));
         assert!(api.host.template_users().contains("aaaa1111"));
         assert!(crate::host::recorded_template_users(&api.host.state, "shared").contains("aaaa1111"));
         assert!(crate::template::prune(&api.paths, Some("aaaa1111"), &|| api.host.template_users(), false).unwrap().is_empty());
@@ -598,8 +592,8 @@ pub(super) mod tests {
             let d = super::super::containers::Detail::read(&api, &json!({"name": "web", "state": "created", "docker": r}));
             assert_eq!(d.entrypoint.iter().chain(&d.cmd).map(String::as_str).collect::<Vec<_>>(), expected);
             assert_eq!(d.env, ["B=image", "A=container", "C=new"]);
-            if let Some(words) = r.run.windows(2).find(|w| w[0] == "--entrypoint") {
-                assert_eq!(serde_json::from_str::<Vec<String>>(&words[1]).unwrap(), expected);
+            if let Some(ep) = &r.spec.entrypoint {
+                assert_eq!(ep, &expected);
             } else {
                 assert_eq!(expected, ["/bin/sh", "-c", "", "default"]);
             }
@@ -623,7 +617,7 @@ pub(super) mod tests {
             assert_eq!(e.status, hyper::StatusCode::NOT_IMPLEMENTED);
             assert!(e.message.contains("Entrypoint and Cmd are unavailable"));
             let r = translate(&api, "web", &json!({"Image": "image", "Entrypoint": [], "Cmd": ["echo"]})).unwrap();
-            assert_eq!(&r.run[..2], ["--entrypoint", r#"["echo"]"#]);
+            assert_eq!(r.spec.entrypoint, Some(vec!["echo".into()]));
             assert!(translate(&api, "web", &json!({"Image": "image"})).is_ok());
         }
     }
@@ -632,14 +626,14 @@ pub(super) mod tests {
     fn port_bindings_become_publish_flags() {
         let hc = json!({"PortBindings": {"80/tcp": [{"HostIp": "", "HostPort": "8080"}], "53/udp": [{"HostIp": "127.0.0.1", "HostPort": "5353"}],
             "443/tcp": [{"HostIp": "::1", "HostPort": "8443"}]}});
-        let mut got = ports(&hc, &[]).unwrap();
+        let mut got: Vec<String> = ports(&hc, &[]).unwrap().into_iter().map(|p| p.to_string()).collect();
         got.sort();
         assert_eq!(got, ["127.0.0.1:5353:53/udp", "8080:80/tcp", "[::1]:8443:443/tcp"]);
         // Any host port: a free one now.
         let any = ports(&json!({"PortBindings": {"80/tcp": [{"HostPort": ""}]}}), &[]).unwrap();
-        assert!(any[0].ends_with(":80/tcp") && !any[0].starts_with("0:"), "{any:?}");
+        assert!(any[0].vm_port == 80 && any[0].host_port != 0 && any[0].protocol == crate::ports::Protocol::Tcp, "{any:?}");
         let all = ports(&json!({"PublishAllPorts": true}), &["9000/tcp".into()]).unwrap();
-        assert!(all.len() == 1 && all[0].ends_with(":9000/tcp"), "{all:?}");
+        assert!(all.len() == 1 && all[0].vm_port == 9000 && all[0].host_port != 0, "{all:?}");
         assert_eq!(ports(&json!({"PortBindings": {"80/sctp": null}}), &[]).unwrap_err().status, hyper::StatusCode::NOT_IMPLEMENTED);
         assert!(ports(&json!({"PortBindings": {"80/tcp": [{"HostPort": "8000-8010"}]}}), &[]).is_err());
     }
@@ -669,7 +663,7 @@ pub(super) mod tests {
 
     #[test]
     fn restart_policies_become_run_restart() {
-        let r = |p: Value| restart(&p);
+        let r = |p: Value| restart(&p).map(|o| o.map(|r| r.to_string()));
         assert_eq!(r(json!(null)).unwrap(), None);
         assert_eq!(r(json!({"Name": "no"})).unwrap(), None);
         assert_eq!(r(json!({"Name": "always"})).unwrap().as_deref(), Some("always"));
@@ -688,7 +682,7 @@ pub(super) mod tests {
                 ipam["IPv4Address"] = json!(v4);
             }
             let body = json!({"Image": "image", "NetworkingConfig": {"EndpointsConfig": {"bridge": {"IPAMConfig": ipam}}}});
-            translate(&api, "web", &body).map(|r| r.run.iter().position(|a| a == "--ip").map(|i| r.run[i + 1].clone()))
+            translate(&api, "web", &body).map(|r| r.spec.ip.map(|ip| ip.to_string()))
         };
         // No prefix: no IPv6 address is a VM's.
         assert_eq!(ipam(None, "fd00:7::a09:7").unwrap_err().status, hyper::StatusCode::NOT_IMPLEMENTED);
