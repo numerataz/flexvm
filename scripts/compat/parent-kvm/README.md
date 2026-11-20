@@ -8,9 +8,12 @@ client opens `/dev/kvm`, creates a VM and vCPU, maps `kvm_run`, and gets a port
 I/O exit. A second `KVM_RUN` resumes the same child. The child reads a byte
 the client changed while it was paused and reports it on the next I/O exit.
 
-The module supports one VM, one vCPU and one copied 4 KiB RAM region. The
-worker supports byte output to one port with a fixed entry point. Full register
-state, live memory mappings, interrupts, and checkpointing
+The module supports one VM, one vCPU and one pinned 4 KiB RAM page. The
+child maps that page directly from the outer VM's memory file. The parent
+stops the child before acknowledging release of the page. If it cannot
+confirm the release, the page stays pinned until the outer VM exits.
+The worker supports byte output to one port with a fixed entry point.
+Full register state, memory invalidation, interrupts, and checkpointing
 remain part of [issue #1501](https://github.com/numerataz/flexvm/issues/1501).
 
 Run the fixture on x86 with the QEMU build from `scripts/build-qemu.sh` and
