@@ -25,10 +25,10 @@ SOURCES = ROOT / "parent-kvm"
 HELPERS = runpy.run_path(str(ROOT / "software-boot.py"))
 DEVICES = ("/dev/kvm", "/dev/vhost-vsock", "/dev/vhost-net")
 MIB = 1 << 20
-MAILBOX_SIZE = 64 << 10
+MAILBOX_SIZE = 1 << 20
 PAGE_SIZE = 4096
-MAX_SLOT_PAGES = 128
-OUTER_RAM_SIZE = 192 * MIB
+MAX_REAL_MODE_PAGES = 128
+MAX_SLOT_PAGES = 65536
 PROTECTED_GPA = 16 * MIB
 IO_VALUES = (0x42, 0xa7)
 OPEN_VM, CLOSE_VM, OPEN_CPU, CLOSE_CPU, RUN, GET_REGS, SET_REGS, GET_SREGS = range(1, 9)
@@ -365,6 +365,9 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
     counters = []
     special = None
     child = None
+    slot_size = ram_pages * PAGE_SIZE
+    outer_mib = max(192, (slot_size + MIB - 1) // MIB + 128)
+    outer_ram_size = outer_mib * MIB
     with ExitStack() as cleanup:
         control = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix="flexvm-kvm-")))
         server = cleanup.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
@@ -375,10 +378,10 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 9)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 10)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
-        os.ftruncate(outer_ram, OUTER_RAM_SIZE)
+        os.ftruncate(outer_ram, outer_ram_size)
         fcntl.fcntl(outer_ram, fcntl.F_ADD_SEALS, fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
         requests = os.eventfd(0, os.EFD_CLOEXEC | os.EFD_NONBLOCK)
         cleanup.callback(os.close, requests)
@@ -386,8 +389,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         cleanup.callback(os.close, replies)
         command = [
             qemu, *QEMU_OPTIONS, "-machine", "q35,accel=tcg,memory-backend=outer-ram",
-            "-cpu", "max,vmx=off,svm=off", "-m", "192",
-            "-object", f"memory-backend-file,id=outer-ram,mem-path=/proc/self/fd/{outer_ram},share=on,size=192M",
+            "-cpu", "max,vmx=off,svm=off", "-m", str(outer_mib),
+            "-object", f"memory-backend-file,id=outer-ram,mem-path=/proc/self/fd/{outer_ram},share=on,size={outer_mib}M",
             "-serial", "stdio", "-kernel", kernel, "-initrd", output / "initramfs",
             "-append", "console=ttyS0 loglevel=5 panic=1 rdinit=/init",
             "-chardev", f"socket,id=doorbell,path={control / 'doorbell'}",
@@ -418,9 +421,9 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                     if gpa != (PROTECTED_GPA if protected_entry else PAGE_SIZE):
                         raise RuntimeError("unexpected guest physical address for the slot")
                     offsets = struct.unpack_from(f"<{ram_pages}Q", mapping, 1024)
-                    if length != ram_pages * PAGE_SIZE or len(set(offsets)) != ram_pages:
+                    if length != slot_size or len(set(offsets)) != ram_pages:
                         raise RuntimeError("unexpected physical page list for the registered slot")
-                    if any(offset % PAGE_SIZE or not MIB <= offset <= OUTER_RAM_SIZE - PAGE_SIZE for offset in offsets):
+                    if any(offset % PAGE_SIZE or not MIB <= offset <= outer_ram_size - PAGE_SIZE for offset in offsets):
                         raise RuntimeError("registered pages are outside the outer VM RAM")
                     state = read_protected_entry(mapping, gpa, length) if protected_entry else None
                     child = start_child(parent_engine, qemu, output, control, outer_ram, offsets, gpa)
@@ -473,6 +476,10 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
             raise RuntimeError("unexpected guest RAM pin disposition")
         if reject_close and (child.process is None or child.process.poll() is not None):
             raise RuntimeError("rejected close did not retain the child until enclosing cleanup")
+    if ram_pages <= MAX_REAL_MODE_PAGES:
+        layout_summary = {"outer_page_offsets": child.offsets}
+    else:
+        layout_summary = {"sample_outer_page_offsets": (child.offsets[0], child.offsets[ram_pages // 2], child.offsets[-1])}
     return {
         "guest_path": "/dev/kvm", "guest_vmx": False, "guest_svm": False,
         "boot_mode": "protected" if protected_entry else "real", "slot_gpa": gpa,
@@ -480,7 +487,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         "io_values": child.channel.exits, "child_memory_write_visible": True, "same_child_worker": True,
         "register_counters": counters,
         "special_registers": special,
-        "page_alias": True, "mapped_page_bytes": ram_pages * PAGE_SIZE, "outer_page_offsets": child.offsets,
+        "page_alias": True, "mapped_page_bytes": slot_size, "mapped_page_count": ram_pages,
+        "outer_memory_bytes": outer_ram_size, **layout_summary,
         "mapped_extents": extents,
         "worker_stopped_before_close_reply": not reject_close, "page_retained_on_rejected_close": retained,
         "client_run_ns": client_timings(guest), "worker_run_ms": child.channel.timings, "worker_control": "direct socket",
@@ -509,6 +517,8 @@ def main():
     args = parser.parse_args()
     if not 1 <= args.ram_pages <= MAX_SLOT_PAGES:
         parser.error(f"--ram-pages must be between 1 and {MAX_SLOT_PAGES}")
+    if args.ram_pages > MAX_REAL_MODE_PAGES and not args.protected_entry:
+        parser.error(f"--protected-entry is required above {MAX_REAL_MODE_PAGES} pages")
     qemu, kernel = (path.resolve(strict=True) for path in (args.qemu, args.kernel))
     output = args.output.resolve()
     if os.geteuid() != 0 or platform.machine() != "x86_64":

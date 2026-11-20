@@ -16,6 +16,7 @@
 #include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/sched/mm.h>
+#include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 #include <linux/wait.h>
@@ -43,7 +44,7 @@ struct pvvm {
 	struct kref refs;
 	struct pvkvm *provider;
 	struct mm_struct *owner;
-	struct page *slot[PVKVM_MAX_PAGES];
+	struct page **slot;
 	u64 gpa;
 	unsigned int pages;
 	bool slot_exposed;
@@ -179,6 +180,7 @@ static void vm_free(struct kref *ref)
 		else
 			pr_warn("flexvm-pvkvm: retaining registered RAM until the enclosing VM exits\n");
 	}
+	kvfree(vm->slot);
 	kref_put(&p->refs, provider_free);
 	mmdrop(vm->owner);
 	kfree(vm);
@@ -441,7 +443,7 @@ static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	struct pvvm *vm = file->private_data;
 	struct pvkvm *p = vm->provider;
 	struct kvm_userspace_memory_region memory;
-	struct page *slot[PVKVM_MAX_PAGES];
+	struct page **slot;
 	unsigned int pages;
 	long pinned;
 	int result;
@@ -464,22 +466,28 @@ static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	    !PAGE_ALIGNED(memory.userspace_addr))
 		return -EINVAL;
 	pages = memory.memory_size / PAGE_SIZE;
+	slot = kvmalloc_array(pages, sizeof(*slot), GFP_KERNEL);
+	if (!slot)
+		return -ENOMEM;
 	pinned = pin_user_pages_fast(memory.userspace_addr, pages, FOLL_WRITE | FOLL_LONGTERM, slot);
 	if (pinned != pages) {
 		if (pinned > 0)
 			unpin_user_pages(slot, pinned);
+		kvfree(slot);
 		return pinned < 0 ? pinned : -EFAULT;
 	}
 	mutex_lock(&p->lock);
 	result = p->dead ? -ENODEV : vm->pages ? -EEXIST : 0;
 	if (!result) {
-		memcpy(vm->slot, slot, pages * sizeof(slot[0]));
+		vm->slot = slot;
 		vm->gpa = memory.guest_phys_addr;
 		vm->pages = pages;
 	}
 	mutex_unlock(&p->lock);
-	if (result)
+	if (result) {
 		unpin_user_pages(slot, pages);
+		kvfree(slot);
+	}
 	return result;
 }
 
@@ -578,7 +586,7 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	int result;
 
 	BUILD_BUG_ON(sizeof(struct run_page) > PAGE_SIZE);
-	BUILD_BUG_ON(PAGE_SIZE != PVKVM_MEMORY_LEN);
+	BUILD_BUG_ON(PAGE_SIZE != PVKVM_GUEST_PAGE_SIZE);
 	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
 	    pci_resource_len(dev, 2) < PVKVM_RAM_ADDRESS_AT + PVKVM_MAX_PAGES * sizeof(u64))
 		return -ENODEV;

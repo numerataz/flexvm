@@ -32,7 +32,7 @@ int main(void)
     check(chmod("/kvm-run", 0700) == 0, "make the client executable");
     int fixture = open("/ram-pages", O_RDONLY | O_CLOEXEC);
     check(fixture >= 0, "open fixture configuration");
-    char pages[5];
+    char pages[8];
     ssize_t page_bytes = read(fixture, pages, sizeof(pages));
     check(page_bytes > 0 && page_bytes < (ssize_t)sizeof(pages), "read fixture page count");
     pages[page_bytes] = '\0';
