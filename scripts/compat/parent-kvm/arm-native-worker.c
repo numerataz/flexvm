@@ -26,6 +26,11 @@ struct arm_vm {
     int fd;
     size_t run_bytes;
     struct arm_cpu cpus[FLEXVM_ARM_MAX_CPUS];
+    struct {
+        uint64_t address;
+        size_t bytes;
+    } slots[FLEXVM_ARM_MAX_SLOTS];
+    size_t ram_bytes;
 };
 
 static void check(int condition, const char *message)
@@ -140,35 +145,126 @@ static int request_cpu(struct arm_cpu *cpu, const struct flexvm_arm_request *req
     }
 }
 
+static int register_ram(struct arm_vm *vm, const struct flexvm_arm_request *request, int ram, int layout)
+{
+    uint64_t address = request->ram.address;
+    unsigned int slot = request->ram.slot;
+    if (slot >= FLEXVM_ARM_MAX_SLOTS || request->ram.reserved || address < FLEXVM_ARM_RAM_BASE ||
+        address >= FLEXVM_ARM_RAM_LIMIT || address % FLEXVM_SLOT_PAGE_SIZE)
+        return -EINVAL;
+    if (vm->slots[slot].bytes)
+        return -EEXIST;
+    size_t bytes;
+    void *mapping = flexvm_map_slot(ram, layout, &bytes);
+    if (mapping == MAP_FAILED)
+        return -errno;
+    int status = -EINVAL;
+    if (bytes > FLEXVM_ARM_RAM_LIMIT - address)
+        goto unmap;
+    if (bytes > (size_t)FLEXVM_SLOT_MAX_PAGES * FLEXVM_SLOT_PAGE_SIZE - vm->ram_bytes) {
+        status = -ENOSPC;
+        goto unmap;
+    }
+    for (unsigned int existing = 0; existing < FLEXVM_ARM_MAX_SLOTS; existing++) {
+        uint64_t other = vm->slots[existing].address;
+        size_t length = vm->slots[existing].bytes;
+        if (length && address < other + length && other < address + bytes)
+            goto unmap;
+    }
+    struct kvm_userspace_memory_region region = {
+        .slot = slot, .guest_phys_addr = address, .memory_size = bytes, .userspace_addr = (uintptr_t)mapping,
+    };
+    status = ioctl_result(ioctl(vm->fd, KVM_SET_USER_MEMORY_REGION, &region));
+    if (status)
+        goto unmap;
+    vm->slots[slot].address = address;
+    vm->slots[slot].bytes = bytes;
+    vm->ram_bytes += bytes;
+    return 0;
+
+unmap:
+    munmap(mapping, bytes);
+    return status;
+}
+
+struct worker_packet {
+    struct flexvm_arm_request request;
+    int descriptors[2];
+    unsigned int count;
+    int well_formed;
+};
+
+static ssize_t receive_packet(int control, struct worker_packet *packet)
+{
+    struct iovec payload = {.iov_base = &packet->request, .iov_len = sizeof(packet->request)};
+    union {
+        struct cmsghdr align;
+        unsigned char bytes[CMSG_SPACE(sizeof(packet->descriptors))];
+    } ancillary;
+    struct msghdr message = {
+        .msg_iov = &payload, .msg_iovlen = 1, .msg_control = ancillary.bytes, .msg_controllen = sizeof(ancillary.bytes),
+    };
+    ssize_t received = recvmsg(control, &message, MSG_TRUNC | MSG_CMSG_CLOEXEC);
+    if (received <= 0)
+        return received;
+    packet->well_formed = received == sizeof(packet->request) && !(message.msg_flags & MSG_CTRUNC);
+    for (struct cmsghdr *header = CMSG_FIRSTHDR(&message); header; header = CMSG_NXTHDR(&message, header)) {
+        if (header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS) {
+            packet->well_formed = 0;
+            continue;
+        }
+        size_t count = (header->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+        for (size_t index = 0; index < count; index++) {
+            int descriptor;
+            memcpy(&descriptor, CMSG_DATA(header) + index * sizeof(int), sizeof(descriptor));
+            if (packet->count < sizeof(packet->descriptors) / sizeof(packet->descriptors[0]))
+                packet->descriptors[packet->count++] = descriptor;
+            else {
+                packet->well_formed = 0;
+                close(descriptor);
+            }
+        }
+    }
+    return received;
+}
+
 static void serve(struct arm_vm *vm, int control)
 {
     struct kvm_reg_list *list = calloc(1, sizeof(*list) + FLEXVM_ARM_MAX_REGS * sizeof(list->reg[0]));
     check(list != NULL, "allocate ARM KVM register list");
     for (;;) {
-        struct flexvm_arm_request request;
-        ssize_t got = recv(control, &request, sizeof(request), MSG_TRUNC);
+        struct worker_packet packet = {0};
+        ssize_t got = receive_packet(control, &packet);
         if (!got)
             break;
         if (got < 0 && errno == EINTR)
             continue;
         check(got >= 0, "read ARM KVM worker request");
 
+        const struct flexvm_arm_request *request = &packet.request;
         struct flexvm_arm_reply reply = {0};
-        if (got != (ssize_t)sizeof(request)) {
+        unsigned int descriptors_needed = request->command == FLEXVM_ARM_REGISTER_RAM ? 2 : 0;
+        if (!packet.well_formed || packet.count != descriptors_needed) {
             reply.status = -EPROTO;
-        } else if (request.command == FLEXVM_ARM_PREFERRED_TARGET) {
+        } else if (request->command == FLEXVM_ARM_REGISTER_RAM) {
+            reply.status = register_ram(vm, request, packet.descriptors[0], packet.descriptors[1]);
+        } else if (request->command == FLEXVM_ARM_PREFERRED_TARGET) {
             reply.status = ioctl_result(ioctl(vm->fd, KVM_ARM_PREFERRED_TARGET, &reply.init));
-        } else if (request.cpu >= FLEXVM_ARM_MAX_CPUS) {
+        } else if (request->cpu >= FLEXVM_ARM_MAX_CPUS) {
             reply.status = -EINVAL;
-        } else if (request.command == FLEXVM_ARM_CREATE_VCPU) {
-            reply.status = create_cpu(vm, request.cpu);
+        } else if (request->command == FLEXVM_ARM_CREATE_VCPU) {
+            reply.status = create_cpu(vm, request->cpu);
+        } else if (request->command == FLEXVM_ARM_RUN && !vm->ram_bytes) {
+            reply.status = -ENOEXEC;
         } else {
-            reply.status = request_cpu(&vm->cpus[request.cpu], &request, &reply, list);
+            reply.status = request_cpu(&vm->cpus[request->cpu], request, &reply, list);
         }
+        for (unsigned int index = 0; index < packet.count; index++)
+            close(packet.descriptors[index]);
 
         size_t registers = 0;
-        if (!reply.status && request.command == FLEXVM_ARM_GET_REG_LIST) {
-            check(list->n <= request.count, "received an invalid KVM register list");
+        if (!reply.status && request->command == FLEXVM_ARM_GET_REG_LIST) {
+            check(list->n <= request->count, "received an invalid KVM register list");
             registers = list->n * sizeof(list->reg[0]);
         }
         struct iovec iov[] = {{&reply, sizeof(reply)}, {list->reg, registers}};
@@ -180,20 +276,13 @@ static void serve(struct arm_vm *vm, int control)
 
 int main(int argc, char **argv)
 {
-    check(argc == 6, "expected ARM worker control FD, RAM FD, layout FD, GPA and VM type");
+    check(argc == 3, "expected ARM worker control FD and VM type");
     int control = number(argv[1], INT_MAX);
     int socket_type;
     socklen_t socket_type_size = sizeof(socket_type);
     check(getsockopt(control, SOL_SOCKET, SO_TYPE, &socket_type, &socket_type_size) == 0 &&
           socket_type == SOCK_SEQPACKET, "expected ARM worker packet socket");
-    int ram = number(argv[2], INT_MAX);
-    int layout = number(argv[3], INT_MAX);
-    uint64_t gpa = number(argv[4], FLEXVM_ARM_RAM_LIMIT - 1);
-    unsigned long type = number(argv[5], KVM_VM_TYPE_ARM_IPA_SIZE_MASK);
-    check(gpa >= FLEXVM_ARM_RAM_BASE && gpa % FLEXVM_SLOT_PAGE_SIZE == 0, "invalid ARM RAM slot address");
-    size_t bytes;
-    void *mapping = flexvm_map_slot(ram, layout, &bytes);
-    check(mapping != MAP_FAILED && bytes <= FLEXVM_ARM_RAM_LIMIT - gpa, "map the ARM RAM slot");
+    unsigned long type = number(argv[2], KVM_VM_TYPE_ARM_IPA_SIZE_MASK);
     int kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     check(kvm >= 0 && ioctl(kvm, KVM_GET_API_VERSION, 0) == KVM_API_VERSION, "open ARM KVM");
     int run_bytes = ioctl(kvm, KVM_GET_VCPU_MMAP_SIZE, 0);
@@ -201,10 +290,6 @@ int main(int argc, char **argv)
     struct arm_vm vm = {.fd = ioctl(kvm, KVM_CREATE_VM, type), .run_bytes = run_bytes,
                         .cpus = {{.fd = -1}, {.fd = -1}}};
     check(vm.fd >= 0, "create the ARM KVM VM");
-    struct kvm_userspace_memory_region region = {
-        .guest_phys_addr = gpa, .memory_size = bytes, .userspace_addr = (uintptr_t)mapping,
-    };
-    check(ioctl(vm.fd, KVM_SET_USER_MEMORY_REGION, &region) == 0, "register the shared ARM RAM slot");
     serve(&vm, control);
     return 0;
 }

@@ -34,6 +34,29 @@ static struct flexvm_arm_reply exchange(int control, struct flexvm_arm_request r
     return result->reply;
 }
 
+static int register_slot(int control, unsigned int slot, uint64_t address, int ram, int layout)
+{
+    struct flexvm_arm_request request = {.command = FLEXVM_ARM_REGISTER_RAM, .ram = {.address = address, .slot = slot}};
+    struct iovec payload = {.iov_base = &request, .iov_len = sizeof(request)};
+    int descriptors[] = {ram, layout};
+    union {
+        struct cmsghdr align;
+        unsigned char bytes[CMSG_SPACE(sizeof(descriptors))];
+    } ancillary = {0};
+    struct msghdr message = {
+        .msg_iov = &payload, .msg_iovlen = 1, .msg_control = ancillary.bytes, .msg_controllen = sizeof(ancillary.bytes),
+    };
+    struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+    header->cmsg_level = SOL_SOCKET;
+    header->cmsg_type = SCM_RIGHTS;
+    header->cmsg_len = CMSG_LEN(sizeof(descriptors));
+    memcpy(CMSG_DATA(header), descriptors, sizeof(descriptors));
+    ASSERT(sendmsg(control, &message, MSG_NOSIGNAL) == sizeof(request));
+    struct flexvm_arm_reply reply;
+    ASSERT(recv(control, &reply, sizeof(reply), MSG_TRUNC) == sizeof(reply));
+    return reply.status;
+}
+
 static uint64_t core_id(size_t offset)
 {
     return KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | (offset / sizeof(uint32_t));
@@ -60,12 +83,15 @@ int main(int argc, char *argv[])
     ASSERT(argc == 2);
     alarm(20);
     const unsigned int seals = F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL;
-    int ram = memfd_create("arm-native-ram", MFD_ALLOW_SEALING);
-    int layout = memfd_create("arm-native-layout", MFD_ALLOW_SEALING);
-    ASSERT(ram >= 0 && layout >= 0 && ftruncate(ram, 4 * PAGE) == 0);
+    int ram = memfd_create("arm-native-ram", MFD_ALLOW_SEALING | MFD_CLOEXEC);
+    ASSERT(ram >= 0 && ftruncate(ram, 4 * PAGE) == 0 && fcntl(ram, F_ADD_SEALS, seals) == 0);
     const uint64_t offsets[] = {3 * PAGE, PAGE};
-    ASSERT(write(layout, offsets, sizeof(offsets)) == sizeof(offsets));
-    ASSERT(fcntl(ram, F_ADD_SEALS, seals) == 0 && fcntl(layout, F_ADD_SEALS, seals | F_SEAL_WRITE) == 0);
+    int layouts[2];
+    for (unsigned int index = 0; index < 2; index++) {
+        layouts[index] = memfd_create("arm-native-layout", MFD_ALLOW_SEALING | MFD_CLOEXEC);
+        ASSERT(layouts[index] >= 0 && write(layouts[index], &offsets[index], sizeof(offsets[index])) == sizeof(offsets[index]));
+        ASSERT(fcntl(layouts[index], F_ADD_SEALS, seals | F_SEAL_WRITE) == 0);
+    }
     const uint32_t code[] = {
         0xb9400001, // ldr w1, [x0] from the VMM's MMIO address
         0xb9000401, // str w1, [x0, #4] back through MMIO
@@ -86,13 +112,10 @@ int main(int argc, char *argv[])
     ASSERT(worker >= 0);
     if (!worker) {
         close(link[0]);
-        char peer_arg[24], ram_arg[24], layout_arg[24], gpa_arg[24], ipa_arg[24];
+        char peer_arg[24], ipa_arg[24];
         snprintf(peer_arg, sizeof(peer_arg), "%d", link[1]);
-        snprintf(ram_arg, sizeof(ram_arg), "%d", ram);
-        snprintf(layout_arg, sizeof(layout_arg), "%d", layout);
-        snprintf(gpa_arg, sizeof(gpa_arg), "%llu", (unsigned long long)FLEXVM_ARM_RAM_BASE);
         snprintf(ipa_arg, sizeof(ipa_arg), "%d", ipa_bits > 48 ? 48 : ipa_bits);
-        execl(argv[1], argv[1], peer_arg, ram_arg, layout_arg, gpa_arg, ipa_arg, NULL);
+        execl(argv[1], argv[1], peer_arg, ipa_arg, NULL);
         _exit(127);
     }
     close(link[1]);
@@ -127,11 +150,24 @@ int main(int argc, char *argv[])
                             register_namespace | KVM_REG_SIZE_U128 | offsetof(struct kvm_regs, fp_regs.vregs[0]) / sizeof(uint32_t),
                             vector, sizeof(vector));
 
+    struct flexvm_arm_request run = {.command = FLEXVM_ARM_RUN};
+    ASSERT(exchange(link[0], run, &result).status == -ENOEXEC);
+    struct flexvm_arm_request missing_fds = {.command = FLEXVM_ARM_REGISTER_RAM};
+    ASSERT(exchange(link[0], missing_fds, &result).status == -EPROTO);
+    int unsealed = memfd_create("unsealed-arm-layout", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    ASSERT(unsealed >= 0 && write(unsealed, &offsets[0], sizeof(offsets[0])) == sizeof(offsets[0]));
+    ASSERT(register_slot(link[0], 0, FLEXVM_ARM_RAM_BASE, ram, unsealed) == -EINVAL);
+    ASSERT(close(unsealed) == 0);
+    ASSERT(register_slot(link[0], 0, FLEXVM_ARM_RAM_BASE, ram, layouts[0]) == 0);
+    ASSERT(register_slot(link[0], 0, FLEXVM_ARM_RAM_BASE + 3 * PAGE, ram, layouts[1]) == -EEXIST);
+    ASSERT(register_slot(link[0], 1, FLEXVM_ARM_RAM_BASE, ram, layouts[1]) == -EINVAL);
+    ASSERT(register_slot(link[0], 1, FLEXVM_ARM_RAM_BASE + 3 * PAGE, ram, layouts[1]) == 0);
+    ASSERT(close(layouts[0]) == 0 && close(layouts[1]) == 0);
+
     set_core(link[0], &result, offsetof(struct kvm_regs, regs.pc), FLEXVM_ARM_RAM_BASE);
     set_core(link[0], &result, offsetof(struct kvm_regs, regs.pstate), 0x3c5);
     set_core(link[0], &result, offsetof(struct kvm_regs, regs.regs[0]), 0x10000000);
-    set_core(link[0], &result, offsetof(struct kvm_regs, regs.regs[2]), FLEXVM_ARM_RAM_BASE + PAGE);
-    struct flexvm_arm_request run = {.command = FLEXVM_ARM_RUN};
+    set_core(link[0], &result, offsetof(struct kvm_regs, regs.regs[2]), FLEXVM_ARM_RAM_BASE + 3 * PAGE);
     reply = exchange(link[0], run, &result);
     ASSERT(!reply.status && reply.exit_reason == KVM_EXIT_MMIO && reply.mmio.address == 0x10000000 &&
            reply.mmio.length == 4 && !reply.mmio.is_write);
