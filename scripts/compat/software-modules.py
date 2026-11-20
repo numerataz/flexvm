@@ -76,6 +76,13 @@ exec /state-probe
     return '\n'.join(commands)
 
 
+def flip_first_byte(path):
+    with path.open("r+b") as stream:
+        byte = stream.read(1)
+        stream.seek(0)
+        stream.write(bytes([byte[0] ^ 1]))
+
+
 def engine_gone(identity, deadline):
     try:
         descriptor = os.pidfd_open(identity['pid'])
@@ -160,10 +167,7 @@ def exercise(args):
         # Bundle/kernel mismatch must fail before preparing an image or starting an engine.
         mismatch = args.output / 'mismatched-kernel'
         shutil.copyfile(args.kernel, mismatch)
-        with mismatch.open('r+b') as stream:
-            first = stream.read(1)
-            stream.seek(0)
-            stream.write(bytes([first[0] ^ 1]))
+        flip_first_byte(mismatch)
         refused = cli('software', '--name', 'module-refused', '--control', 'serial', '--kernel', str(mismatch),
                       '--kernel-modules', str(args.sdk), COMPILER, check=False)
         if refused.returncode == 0 or 'does not match the selected kernel' not in refused.stderr:
@@ -171,14 +175,28 @@ def exercise(args):
         if any(item['name'] == 'module-refused' for item in json.loads(cli('ps', '--json'))):
             raise RuntimeError('mismatched kernel published a VM')
         evidence['mismatch_admission'] = 'passed'
-        # A normal app gets the small runtime bundle without the development SDK.
+        # Place fetched artifacts in the isolated deployment state. Verify that
+        # corrupt installed contents fail even when release pins are present.
+        artifacts = args.state / 'state' / 'artifacts'
+        artifacts.mkdir(parents=True, exist_ok=True)
+        for source in (args.kernel, args.kernel.with_name('kernel-modules.tar.gz')):
+            installed = artifacts / ('vmlinux' if source == args.kernel else source.name)
+            shutil.copyfile(source, installed)
+            installed.with_name(installed.name + '.sha256').write_text(HELPERS['digest'](source) + '\n')
+            flip_first_byte(installed)
+            refused = cli('software', '--name', 'installed-refused', '--qemu', '/bin/false', COMPILER, check=False)
+            if refused.returncode == 0 or str(installed) not in refused.stderr or 'sha256' not in refused.stderr:
+                raise RuntimeError(f'invalid installed {installed.name} advanced past artifact verification: {refused.stderr}')
+            flip_first_byte(installed)
+        # A regular named app gets the small runtime bundle without the SDK.
         runtime = r'''release=$(uname -r)
 test -f /usr/lib/flexvm/kernel-modules.json
 test ! -e /lib/modules/$release/build
 grep '"development": false' /usr/lib/flexvm/kernel-modules.json
 echo FLEXVM_RUNTIME_MODULES_WITHOUT_SDK_PASSED'''
-        cli('software', '--control', 'serial', '--kernel', str(args.kernel), '--mem', '256',
+        cli('software', '--name', 'installed-kernel', '--mem', '256',
             '--entrypoint', '[]', BUSYBOX, '/bin/sh', '-ec', runtime)
+        evidence['installed_kernel_corruption_refused'] = 'passed'
         evidence['runtime_without_sdk'] = 'passed'
         selection = ['--kernel-sdk'] if args.sdk == args.kernel.with_name('kernel-sdk.tar.gz') else ['--kernel-modules', str(args.sdk)]
         with (args.output / 'guest.log').open('w') as output, (args.output / 'owner.log').open('w') as error:

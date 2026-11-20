@@ -902,17 +902,6 @@ impl Proc {
             self.publish();
             t.mark("resume");
             growth = Some(CopyGrowth::start(vm));
-            if fault("ckpt_abort") {
-                let (pager, c) = (vm.pager.clone(), frozen.cow.clone().unwrap());
-                let half = c.left() / 2;
-                thread::spawn(move || {
-                    let start = Instant::now();
-                    while c.left() > half && c.active() && start.elapsed() < Duration::from_secs(10) {
-                        thread::sleep(Duration::from_millis(1));
-                    }
-                    pager.abort_copy();
-                });
-            }
         }
         while cow && fault("ckpt_copy_wait") {
             cancelled().inspect_err(|_| vm.pager.unfreeze(&frozen))?;
@@ -927,7 +916,13 @@ impl Proc {
                 0
             })
         };
-        let cow_pages = frozen.cow.as_deref().map(|c| crate::cow::CowPages { guest: vm.pager.as_ref(), cow: c, slow });
+        let cow_pages = frozen.cow.as_deref().map(|copy| {
+            let mut pages = crate::cow::CowPages::new(vm.pager.as_ref(), copy, slow);
+            if fault("ckpt_abort") {
+                pages.abort_halfway();
+            }
+            pages
+        });
         let src: &dyn crate::checkpoint::GuestPages = match &cow_pages {
             Some(c) => c,
             None => vm.pager.as_ref(),
@@ -946,6 +941,9 @@ impl Proc {
         let committed = staging.commit(vm, src, &frozen.runs, parent, plugged.unwrap_or(0), t, || {
             cancelled()?;
             before_publish()?;
+            if let Some(pages) = &cow_pages {
+                pages.abort_if_armed()?;
+            }
             if fault("ckpt_fail_write") {
                 bail!("injected fault: writing the checkpoint failed");
             }
