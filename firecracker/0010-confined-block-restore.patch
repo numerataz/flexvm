@@ -1,0 +1,893 @@
+diff --git a/src/firecracker/src/api_server/request/snapshot.rs b/src/firecracker/src/api_server/request/snapshot.rs
+index fd4c3fdde..5ae5cba37 100644
+--- a/src/firecracker/src/api_server/request/snapshot.rs
++++ b/src/firecracker/src/api_server/request/snapshot.rs
+@@ -124,6 +124,7 @@ fn parse_put_snapshot_load(body: &Body) -> Result<ParsedRequest, RequestError> {
+         huge_pages: snapshot_config.huge_pages,
+         device_reference_path: snapshot_config.device_reference_path,
+         confined_pmem: snapshot_config.confined_pmem,
++        confined_blocks: snapshot_config.confined_blocks,
+     };
+ 
+     // Construct the `ParsedRequest` object.
+@@ -146,6 +147,41 @@ mod tests {
+     use super::*;
+     use crate::api_server::parsed_request::tests::{depr_action_from_req, vmm_action_from_request};
+ 
++    #[test]
++    fn test_confined_block_load_bindings() {
++        let mut body = serde_json::json!({
++            "snapshot_path": "checkpoint",
++            "mem_backend": {"backend_path": "memory", "backend_type": "File"},
++            "device_reference_path": "trusted-reference",
++            "confined_blocks": [{
++                "drive_id": "data", "serial": "fv-data", "path_on_host": "disk-0",
++                "capacity_bytes": 4096, "is_read_only": false, "is_root_device": false
++            }]
++        });
++        let parsed = parse_put_snapshot(&Body::new(body.to_string()), Some("load")).unwrap();
++        let VmmAction::LoadSnapshot(params) = vmm_action_from_request(parsed) else {
++            panic!("expected snapshot load");
++        };
++        assert_eq!(params.confined_blocks.len(), 1);
++        assert_eq!(
++            params.confined_blocks[0].path_on_host,
++            std::path::PathBuf::from("disk-0")
++        );
++        assert_eq!(params.confined_blocks[0].capacity_bytes, 4096);
++        // A misspelled binding must not silently drop a caller's constraint.
++        body["confined_blocks"][0]["capacity_byte"] = serde_json::json!(4096);
++        assert!(parse_put_snapshot(&Body::new(body.to_string()), Some("load")).is_err());
++        body["confined_blocks"][0]
++            .as_object_mut()
++            .unwrap()
++            .remove("capacity_byte");
++        body["confined_blocks"][0]
++            .as_object_mut()
++            .unwrap()
++            .remove("is_read_only");
++        assert!(parse_put_snapshot(&Body::new(body.to_string()), Some("load")).is_err());
++    }
++
+     #[test]
+     fn test_parse_put_snapshot() {
+         use std::path::PathBuf;
+@@ -229,6 +265,7 @@ mod tests {
+             huge_pages: SnapshotLoadHugePageConfig::Hugetlbfs2M,
+             device_reference_path: None,
+             confined_pmem: Some(PathBuf::from("rootfs")),
++            confined_blocks: Vec::new(),
+         };
+         assert!(matches!(
+             vmm_action_from_request(
+@@ -274,6 +311,7 @@ mod tests {
+             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
+             device_reference_path: None,
+             confined_pmem: None,
++            confined_blocks: Vec::new(),
+         };
+         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
+         assert!(
+@@ -310,6 +348,7 @@ mod tests {
+             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
+             device_reference_path: None,
+             confined_pmem: None,
++            confined_blocks: Vec::new(),
+         };
+         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
+         assert!(
+@@ -354,6 +393,7 @@ mod tests {
+             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
+             device_reference_path: None,
+             confined_pmem: None,
++            confined_blocks: Vec::new(),
+         };
+         let mut parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
+         assert!(
+@@ -386,6 +426,7 @@ mod tests {
+             huge_pages: SnapshotLoadHugePageConfig::Snapshot,
+             device_reference_path: None,
+             confined_pmem: None,
++            confined_blocks: Vec::new(),
+         };
+         let parsed_request = parse_put_snapshot(&Body::new(body), Some("load")).unwrap();
+         assert_eq!(
+diff --git a/src/firecracker/swagger/firecracker.yaml b/src/firecracker/swagger/firecracker.yaml
+index 8d08513a4..a7dc3de97 100644
+--- a/src/firecracker/swagger/firecracker.yaml
++++ b/src/firecracker/swagger/firecracker.yaml
+@@ -1733,6 +1733,35 @@ definitions:
+         description:
+           The new path for the backing Unix Domain Socket.
+ 
++  ConfinedBlock:
++    type: object
++    additionalProperties: false
++    required: [drive_id, serial, path_on_host, capacity_bytes, is_read_only, is_root_device]
++    properties:
++      drive_id:
++        type: string
++        minLength: 1
++        maxLength: 64
++        pattern: '^[A-Za-z0-9._-]+$'
++      serial:
++        type: string
++        minLength: 1
++        maxLength: 20
++        pattern: '^[A-Za-z0-9._-]+$'
++      path_on_host:
++        type: string
++        pattern: '^disk-[0-9]{1,20}$'
++        description: Caller-owned single-component alias in the VMM working directory.
++      capacity_bytes:
++        type: integer
++        minimum: 512
++        maximum: 8796093022208
++        multipleOf: 512
++      is_read_only:
++        type: boolean
++      is_root_device:
++        type: boolean
++
+   SnapshotLoadParams:
+     type: object
+     description:
+@@ -1768,6 +1797,18 @@ definitions:
+         type: boolean
+         description:
+           When set to true, the vm is also resumed if the snapshot load is successful.
++      confined_blocks:
++        type: array
++        default: []
++        items:
++          $ref: "#/definitions/ConfinedBlock"
++        description:
++          Explicit ordered raw block bindings for confined restore. Requires a
++          locally trusted device reference or prepared template. Saved devices
++          must match its identity, exact alias, capacity, layout and Writeback
++          policy; each backing must be a regular file of the selected capacity.
++          An empty list retains the confined restore block rejection. Callers
++          own alias confinement, exclusive writer leases and source retirement.
+       network_overrides:
+         type: array
+         description: Network host device names to override
+diff --git a/src/vmm/src/devices/virtio/block/virtio/device.rs b/src/vmm/src/devices/virtio/block/virtio/device.rs
+index 3f0714a45..810682e93 100644
+--- a/src/vmm/src/devices/virtio/block/virtio/device.rs
++++ b/src/vmm/src/devices/virtio/block/virtio/device.rs
+@@ -12,7 +12,7 @@ use std::io::{Seek, SeekFrom};
+ use std::ops::Deref;
+ use std::os::fd::AsRawFd;
+ use std::os::linux::fs::MetadataExt;
+-use std::os::unix::fs::FileTypeExt;
++use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+ use std::path::PathBuf;
+ use std::sync::Arc;
+ 
+@@ -63,16 +63,32 @@ pub struct DiskProperties {
+     pub file_engine: FileEngine,
+     pub nsectors: u64,
+     pub image_id: [u8; VIRTIO_BLK_ID_BYTES as usize],
++    confined_capacity: Option<u64>,
+ }
+ 
+ impl DiskProperties {
+     // Helper function that opens the file with the proper access permissions
+-    fn open_file(disk_image_path: &str, is_disk_read_only: bool) -> Result<File, VirtioBlockError> {
+-        OpenOptions::new()
+-            .read(true)
+-            .write(!is_disk_read_only)
+-            .open(PathBuf::from(&disk_image_path))
+-            .map_err(|x| VirtioBlockError::BackingFile(x, disk_image_path.to_string()))
++    fn open_file(
++        disk_image_path: &str,
++        is_disk_read_only: bool,
++        confined_capacity: Option<u64>,
++    ) -> Result<File, VirtioBlockError> {
++        let mut options = OpenOptions::new();
++        options.read(true).write(!is_disk_read_only);
++        if confined_capacity.is_some() {
++            // A caller-selected malformed FIFO must fail rather than block the API thread.
++            options.custom_flags(libc::O_NONBLOCK);
++        }
++        let file = options
++            .open(PathBuf::from(disk_image_path))
++            .map_err(|error| VirtioBlockError::BackingFile(error, disk_image_path.to_string()))?;
++        if let Some(capacity) = confined_capacity {
++            let metadata = file.metadata().map_err(VirtioBlockError::GetFileMetadata)?;
++            if !metadata.is_file() || metadata.len() != capacity {
++                return Err(VirtioBlockError::ConfinedBacking);
++            }
++        }
++        Ok(file)
+     }
+ 
+     // Helper function that gets the size of the file
+@@ -99,8 +115,10 @@ impl DiskProperties {
+         disk_image_path: String,
+         is_disk_read_only: bool,
+         file_engine_type: FileEngineType,
++        confined_capacity: Option<u64>,
+     ) -> Result<Self, VirtioBlockError> {
+-        let mut disk_image = Self::open_file(&disk_image_path, is_disk_read_only)?;
++        let mut disk_image =
++            Self::open_file(&disk_image_path, is_disk_read_only, confined_capacity)?;
+         let disk_size = Self::file_size(&disk_image_path, &mut disk_image)?;
+         let image_id = Self::build_disk_image_id(&disk_image);
+ 
+@@ -110,6 +128,7 @@ impl DiskProperties {
+                 .map_err(VirtioBlockError::FileEngine)?,
+             nsectors: disk_size >> SECTOR_SHIFT,
+             image_id,
++            confined_capacity,
+         })
+     }
+ 
+@@ -119,7 +138,8 @@ impl DiskProperties {
+         disk_image_path: String,
+         is_disk_read_only: bool,
+     ) -> Result<(), VirtioBlockError> {
+-        let mut disk_image = Self::open_file(&disk_image_path, is_disk_read_only)?;
++        let mut disk_image =
++            Self::open_file(&disk_image_path, is_disk_read_only, self.confined_capacity)?;
+         let disk_size = Self::file_size(&disk_image_path, &mut disk_image)?;
+ 
+         self.image_id = Self::build_disk_image_id(&disk_image);
+@@ -462,6 +482,7 @@ impl VirtioBlock {
+             config.path_on_host,
+             config.is_read_only,
+             config.file_engine_type,
++            None,
+         )?;
+         if let Some(id) = serial_id {
+             disk_properties.image_id = id;
+@@ -1022,16 +1043,20 @@ mod tests {
+         f.as_file().set_len(size).unwrap();
+ 
+         for engine in [FileEngineType::Sync, FileEngineType::Async] {
+-            let disk_properties =
+-                DiskProperties::new(String::from(f.as_path().to_str().unwrap()), true, engine)
+-                    .unwrap();
++            let disk_properties = DiskProperties::new(
++                String::from(f.as_path().to_str().unwrap()),
++                true,
++                engine,
++                None,
++            )
++            .unwrap();
+ 
+             assert_eq!(size, u64::from(SECTOR_SIZE) * num_sectors);
+             assert_eq!(disk_properties.nsectors, num_sectors);
+             // Testing `backing_file.virtio_block_disk_image_id()` implies
+             // duplicating that logic in tests, so skipping it.
+ 
+-            let res = DiskProperties::new("invalid-disk-path".to_string(), true, engine);
++            let res = DiskProperties::new("invalid-disk-path".to_string(), true, engine, None);
+             assert!(
+                 matches!(res, Err(VirtioBlockError::BackingFile(_, _))),
+                 "{:?}",
+diff --git a/src/vmm/src/devices/virtio/block/virtio/mod.rs b/src/vmm/src/devices/virtio/block/virtio/mod.rs
+index 06ff2fd32..f440710a7 100644
+--- a/src/vmm/src/devices/virtio/block/virtio/mod.rs
++++ b/src/vmm/src/devices/virtio/block/virtio/mod.rs
+@@ -52,6 +52,8 @@ pub enum VirtioBlockError {
+     InvalidDataLength,
+     /// Disk serial must contain 1 to 20 ASCII letters, digits, dots, underscores or hyphens.
+     InvalidSerial,
++    /// Confined backing must be a regular file of the declared capacity.
++    ConfinedBacking,
+     /// The requested operation would cause a seek beyond disk end.
+     InvalidOffset,
+     /// Discard is not supported with the async IO engine.
+diff --git a/src/vmm/src/devices/virtio/block/virtio/persist.rs b/src/vmm/src/devices/virtio/block/virtio/persist.rs
+index c6c81e4cb..d8ec7d6a4 100644
+--- a/src/vmm/src/devices/virtio/block/virtio/persist.rs
++++ b/src/vmm/src/devices/virtio/block/virtio/persist.rs
+@@ -14,7 +14,7 @@ use crate::devices::virtio::block::virtio::device::FileEngineType;
+ use crate::devices::virtio::block::virtio::device::VirtioBlkTopology;
+ use crate::devices::virtio::block::virtio::metrics::BlockMetricsPerDevice;
+ use crate::devices::virtio::device::{DeviceState, VirtioDeviceType};
+-use crate::devices::virtio::generated::virtio_blk::VIRTIO_BLK_F_RO;
++use crate::devices::virtio::generated::virtio_blk::{VIRTIO_BLK_F_FLUSH, VIRTIO_BLK_F_RO};
+ use crate::devices::virtio::persist::VirtioDeviceState;
+ use crate::rate_limiter::RateLimiter;
+ use crate::rate_limiter::persist::RateLimiterState;
+@@ -56,6 +56,11 @@ pub struct VirtioBlockState {
+     id: String,
+     #[serde(default)]
+     serial: Option<String>,
++    #[serde(default)]
++    capacity_sectors: u64,
++    // Set only after caller bindings and trusted reference validation; never serialized.
++    #[serde(skip)]
++    confined_capacity: Option<u64>,
+     partuuid: Option<String>,
+     cache_type: CacheType,
+     root_device: bool,
+@@ -68,6 +73,42 @@ pub struct VirtioBlockState {
+     discard_sector_alignment: u32,
+ }
+ 
++impl VirtioBlockState {
++    pub(crate) fn check_confined(
++        &self,
++        reference: &Self,
++        binding: &crate::vmm_config::snapshot::ConfinedBlock,
++    ) -> bool {
++        let read_only = self.virtio_state.avail_features & (1u64 << VIRTIO_BLK_F_RO) != 0;
++        self.id == binding.drive_id
++            && reference.id == binding.drive_id
++            && self.serial.as_deref() == Some(binding.serial.as_str())
++            && self.serial == reference.serial
++            && binding.path_on_host.to_str() == Some(self.disk_path.as_str())
++            && self.disk_path == reference.disk_path
++            && self.capacity_sectors == binding.capacity_bytes / u64::from(SECTOR_SIZE)
++            && self.capacity_sectors == reference.capacity_sectors
++            && self.root_device == binding.is_root_device
++            && self.root_device == reference.root_device
++            && read_only == binding.is_read_only
++            && self.cache_type == CacheType::Writeback
++            && self.cache_type == reference.cache_type
++            && self.partuuid == reference.partuuid
++            && self.file_engine_type == reference.file_engine_type
++            && self.blk_size == reference.blk_size
++            && self.topology == reference.topology
++            && self.discard_sector_alignment == reference.discard_sector_alignment
++            && self.virtio_state.device_type == VirtioDeviceType::Block
++            && self.virtio_state.avail_features & (1u64 << VIRTIO_BLK_F_FLUSH) != 0
++            && self.virtio_state.acked_features & !self.virtio_state.avail_features == 0
++            && self.virtio_state.avail_features == reference.virtio_state.avail_features
++    }
++
++    pub(crate) fn confine_capacity(&mut self, capacity_bytes: u64) {
++        self.confined_capacity = Some(capacity_bytes);
++    }
++}
++
+ impl Persist<'_> for VirtioBlock {
+     type State = VirtioBlockState;
+     type ConstructorArgs = BlockConstructorArgs;
+@@ -78,6 +119,8 @@ impl Persist<'_> for VirtioBlock {
+         VirtioBlockState {
+             id: self.id.clone(),
+             serial: self.serial.clone(),
++            capacity_sectors: self.disk.nsectors,
++            confined_capacity: None,
+             partuuid: self.partuuid.clone(),
+             cache_type: self.cache_type,
+             root_device: self.root_device,
+@@ -108,6 +151,7 @@ impl Persist<'_> for VirtioBlock {
+             state.disk_path.clone(),
+             is_read_only,
+             state.file_engine_type.into(),
++            state.confined_capacity,
+         )?;
+         if let Some(id) = serial_id {
+             disk_properties.image_id = id;
+@@ -215,6 +259,91 @@ mod tests {
+         assert_eq!(FileEngineTypeState::default(), FileEngineTypeState::Sync);
+     }
+ 
++    #[test]
++    fn confined_block_requires_matching_saved_identity_geometry_and_policy() {
++        use crate::vmm_config::snapshot::ConfinedBlock;
++        let file = TempFile::new().unwrap();
++        file.as_file().set_len(4096).unwrap();
++        let config = crate::vmm_config::drive::BlockDeviceConfig {
++            drive_id: "data".into(),
++            serial: Some("fv-0123456789abcdef".into()),
++            cache_type: CacheType::Writeback,
++            path_on_host: Some(file.as_path().to_str().unwrap().into()),
++            ..Default::default()
++        };
++        let block = VirtioBlock::new(VirtioBlockConfig::try_from(&config).unwrap()).unwrap();
++        let mut reference = block.save();
++        reference.disk_path = "disk-0".into();
++        let binding = ConfinedBlock {
++            drive_id: "data".into(),
++            serial: "fv-0123456789abcdef".into(),
++            path_on_host: "disk-0".into(),
++            capacity_bytes: 4096,
++            is_read_only: false,
++            is_root_device: false,
++        };
++        assert!(binding.validate());
++        assert!(reference.check_confined(&reference, &binding));
++        for (field, value) in [
++            ("id", serde_json::json!("other")),
++            ("serial", serde_json::json!("other")),
++            ("disk_path", serde_json::json!("/etc/shadow")),
++            ("capacity_sectors", serde_json::json!(9)),
++            ("root_device", serde_json::json!(true)),
++            ("partuuid", serde_json::json!("forged")),
++            ("cache_type", serde_json::json!("Unsafe")),
++            ("file_engine_type", serde_json::json!("Async")),
++            ("blk_size", serde_json::json!(4096)),
++            ("discard_sector_alignment", serde_json::json!(7)),
++        ] {
++            let mut json = serde_json::to_value(&reference).unwrap();
++            json[field] = value;
++            let forged: VirtioBlockState = serde_json::from_value(json).unwrap();
++            assert!(!forged.check_confined(&reference, &binding), "{field}");
++        }
++        let mut forged = reference.clone();
++        forged.virtio_state.acked_features = u64::MAX;
++        assert!(!forged.check_confined(&reference, &binding));
++        forged = reference.clone();
++        forged.virtio_state.device_type = VirtioDeviceType::Net;
++        assert!(!forged.check_confined(&reference, &binding));
++        for path in [
++            "../disk-0",
++            "./disk-0",
++            "/etc/shadow",
++            "disk-0/",
++            "disk-0\0",
++            "api.sock",
++        ] {
++            let mut forged = binding.clone();
++            forged.path_on_host = path.into();
++            assert!(!forged.validate(), "{path:?}");
++        }
++    }
++
++    #[test]
++    fn confined_capacity_is_local_only_and_checked_before_io_setup() {
++        let file = TempFile::new().unwrap();
++        file.as_file().set_len(4096).unwrap();
++        let config = crate::vmm_config::drive::BlockDeviceConfig {
++            path_on_host: Some(file.as_path().to_str().unwrap().into()),
++            ..Default::default()
++        };
++        let block = VirtioBlock::new(VirtioBlockConfig::try_from(&config).unwrap()).unwrap();
++        let mut state = block.save();
++        state.confine_capacity(4096);
++        let bytes = bitcode::serialize(&state).unwrap();
++        let decoded: VirtioBlockState = bitcode::deserialize(&bytes).unwrap();
++        assert_eq!(decoded.capacity_sectors, 8);
++        assert_eq!(decoded.confined_capacity, None);
++        VirtioBlock::restore(BlockConstructorArgs { mem: default_mem() }, &state).unwrap();
++        file.as_file().set_len(8192).unwrap();
++        assert!(matches!(
++            VirtioBlock::restore(BlockConstructorArgs { mem: default_mem() }, &state),
++            Err(VirtioBlockError::ConfinedBacking)
++        ));
++    }
++
+     #[test]
+     fn configured_serial_survives_backing_update_and_restore() {
+         let first = TempFile::new().unwrap();
+diff --git a/src/vmm/src/persist.rs b/src/vmm/src/persist.rs
+index 717dee69f..5328314f1 100644
+--- a/src/vmm/src/persist.rs
++++ b/src/vmm/src/persist.rs
+@@ -406,6 +406,9 @@ pub fn prepare_from_snapshot(
+     }
+     let mut state = snapshot_state_from_file(&params.snapshot_path)?;
+     check_confined_pmem(&state, params.confined_pmem.as_deref())?;
++    if !params.confined_blocks.is_empty() {
++        check_confined_blocks(&state, &state, &params.confined_blocks)?;
++    }
+     snapshot_state_sanity_check(&state)?;
+     if let (Some(vsock_override), VirtioDevicesState::Mmio(mmio_state)) = (
+         &params.vsock_override,
+@@ -561,8 +564,61 @@ fn device_set(state: &MicrovmState) -> Option<Vec<String>> {
+     Some(set)
+ }
+ 
++/// Caller bindings and a locally trusted reference must agree before any backing file opens.
++fn check_confined_blocks(
++    reference: &MicrovmState,
++    state: &MicrovmState,
++    bindings: &[crate::vmm_config::snapshot::ConfinedBlock],
++) -> Result<(), RestoreFromSnapshotError> {
++    use crate::devices::virtio::block::persist::BlockState;
++    let refuse = |why: &str| RestoreFromSnapshotError::Devices(why.into());
++    let (VirtioDevicesState::Mmio(want), VirtioDevicesState::Mmio(have)) = (
++        &reference.device_states.virtio_state,
++        &state.device_states.virtio_state,
++    ) else {
++        return Err(refuse("confined blocks require MMIO transport"));
++    };
++    if bindings.len() != want.block_devices.len() || bindings.len() != have.block_devices.len() {
++        return Err(refuse("confined block slots differ in number"));
++    }
++    let (mut ids, mut paths, mut serials) = (
++        std::collections::BTreeSet::new(),
++        std::collections::BTreeSet::new(),
++        std::collections::BTreeSet::new(),
++    );
++    for ((binding, reference), state) in bindings
++        .iter()
++        .zip(&want.block_devices)
++        .zip(&have.block_devices)
++    {
++        if !binding.validate()
++            || !ids.insert(&binding.drive_id)
++            || !paths.insert(&binding.path_on_host)
++            || !serials.insert(&binding.serial)
++        {
++            return Err(refuse("invalid or duplicate confined block binding"));
++        }
++        if reference.device_id != binding.drive_id || state.device_id != binding.drive_id {
++            return Err(refuse("confined block slots differ in identity or order"));
++        }
++        let (BlockState::Virtio(reference), BlockState::Virtio(state)) =
++            (&reference.device_state, &state.device_state)
++        else {
++            return Err(refuse(
++                "vhost-user blocks cannot be restored with file bindings",
++            ));
++        };
++        if !state.check_confined(reference, binding) {
++            return Err(refuse(
++                "confined block identity, path, geometry or policy differs",
++            ));
++        }
++    }
++    Ok(())
++}
++
+ /// flexvm: refuses a load of `state` unless its devices are exactly those of `reference` (what
+-/// flexvm prepared), none is a block device, and every tap and the vsock socket come from the
++/// flexvm prepared), blocks have explicit caller bindings, and every tap and the vsock socket come from the
+ /// load's overrides, so no host resource a restore opens is named by `state`. Runs before
+ /// anything is opened for the load.
+ fn check_devices(
+@@ -577,8 +633,15 @@ fn check_devices(
+     let VirtioDevicesState::Mmio(mmio) = &state.device_states.virtio_state else {
+         unreachable!("device_set checked the transport");
+     };
+-    if let Some(d) = mmio.block_devices.first() {
+-        return refuse(format!("block device {:?} is never restored", d.device_id));
++    if params.confined_blocks.is_empty() {
++        if let Some(d) = mmio.block_devices.first() {
++            return refuse(format!(
++                "block device {:?} is never restored without caller bindings",
++                d.device_id
++            ));
++        }
++    } else {
++        check_confined_blocks(reference, state, &params.confined_blocks)?;
+     }
+     if let Some(d) = have.iter().find(|d| !want.contains(d)) {
+         return refuse(format!("{d} was not prepared"));
+@@ -724,8 +787,22 @@ pub fn restore_from_snapshot(
+         (None, Some(path)) => {
+             check_devices(&snapshot_state_from_file(path)?, &microvm_state, params)?
+         }
++        (None, None) if !params.confined_blocks.is_empty() => {
++            return Err(RestoreFromSnapshotError::Devices(
++                "confined blocks require a trusted device reference".into(),
++            ));
++        }
+         (None, None) => {}
+     }
++    if let VirtioDevicesState::Mmio(mmio) = &mut microvm_state.device_states.virtio_state {
++        for (binding, device) in params.confined_blocks.iter().zip(&mut mmio.block_devices) {
++            if let crate::devices::virtio::block::persist::BlockState::Virtio(state) =
++                &mut device.device_state
++            {
++                state.confine_capacity(binding.capacity_bytes);
++            }
++        }
++    }
+ 
+     let track_dirty_pages = params.track_dirty_pages;
+ 
+@@ -891,7 +968,9 @@ fn unmap_premapped(uffd: &Uffd, addr: *mut u8, len: usize) -> Result<(), GuestMe
+     for tries in 0..=PREMAPPED_TRIES {
+         // SAFETY: the range is one mapping of ours and `resident` has a byte for each of its pages.
+         if unsafe { libc::mincore(addr.cast(), len, resident.as_mut_ptr()) } != 0 {
+-            return Err(GuestMemoryFromUffdError::Premapped(io::Error::last_os_error()));
++            return Err(GuestMemoryFromUffdError::Premapped(
++                io::Error::last_os_error(),
++            ));
+         }
+         let Some(first) = resident.iter().position(|&r| r & 1 != 0) else {
+             return Ok(());
+@@ -909,14 +988,16 @@ fn unmap_premapped(uffd: &Uffd, addr: *mut u8, len: usize) -> Result<(), GuestMe
+             .map_err(GuestMemoryFromUffdError::Register)?;
+         // SAFETY: nothing of the guest's is in this memory yet: it is only being set up.
+         if unsafe { libc::madvise(addr.cast(), len, libc::MADV_DONTNEED) } != 0 {
+-            return Err(GuestMemoryFromUffdError::Premapped(io::Error::last_os_error()));
++            return Err(GuestMemoryFromUffdError::Premapped(
++                io::Error::last_os_error(),
++            ));
+         }
+         uffd.register(addr.cast(), len)
+             .map_err(GuestMemoryFromUffdError::Register)?;
+     }
+-    Err(GuestMemoryFromUffdError::Premapped(io::Error::other(format!(
+-        "still mapped after dropping it {PREMAPPED_TRIES} times"
+-    ))))
++    Err(GuestMemoryFromUffdError::Premapped(io::Error::other(
++        format!("still mapped after dropping it {PREMAPPED_TRIES} times"),
++    )))
+ }
+ 
+ fn guest_memory_from_uffd(
+@@ -1064,14 +1145,18 @@ mod tests {
+         let resident = || {
+             let mut v = vec![0u8; 64];
+             // SAFETY: `v` has a byte for each page of the mapping.
+-            assert_eq!(unsafe { libc::mincore(addr.cast(), len, v.as_mut_ptr()) }, 0);
++            assert_eq!(
++                unsafe { libc::mincore(addr.cast(), len, v.as_mut_ptr()) },
++                0
++            );
+             v.iter().filter(|&&r| r & 1 != 0).count()
+         };
+         // As a scanner reads it: through /proc/self/mem, which maps the zero page.
+         let mem = File::open("/proc/self/mem").unwrap();
+         let mut b = [0u8; 1];
+         for i in [0, 5, 63] {
+-            mem.read_exact_at(&mut b, (addr as usize + i * page) as u64).unwrap();
++            mem.read_exact_at(&mut b, (addr as usize + i * page) as u64)
++                .unwrap();
+         }
+         assert_eq!(resident(), 3);
+         // Unprivileged processes may only handle faults from user space.
+@@ -1265,13 +1350,139 @@ mod tests {
+             config.path_on_host = path.into();
+             config.read_only = read_only;
+             state.device_states.virtio_state = VirtioDevicesState::Mmio(mmio.clone());
+-            assert_eq!(check_confined_pmem(&state, rootfs).is_ok(), allowed, "{path:?}");
++            assert_eq!(
++                check_confined_pmem(&state, rootfs).is_ok(),
++                allowed,
++                "{path:?}"
++            );
+             // Unset, as for local v0.1.0 generations: their paths load as before.
+             check_confined_pmem(&state, None).unwrap();
+         }
+     }
+ 
+     // flexvm: a load's devices must be exactly the prepared ones, never naming host resources.
++    #[test]
++    fn test_check_confined_blocks() {
++        use crate::device_manager::mmio::MMIODeviceInfo;
++        use crate::device_manager::persist::{DeviceStates, VirtioDeviceState};
++        use crate::devices::virtio::block::persist::BlockState;
++        use crate::devices::virtio::block::virtio::VirtioBlock;
++        use crate::devices::virtio::block::virtio::device::VirtioBlockConfig;
++        use crate::vmm_config::drive::BlockDeviceConfig;
++        use crate::vmm_config::snapshot::{
++            ConfinedBlock, MemBackendConfig, SnapshotLoadHugePageConfig,
++        };
++        let file = vmm_sys_util::tempfile::TempFile::new().unwrap();
++        file.as_file().set_len(4096).unwrap();
++        let config = BlockDeviceConfig {
++            drive_id: "data".into(),
++            serial: Some("fv-data-serial".into()),
++            cache_type: CacheType::Writeback,
++            path_on_host: Some(file.as_path().to_str().unwrap().into()),
++            ..Default::default()
++        };
++        let block = VirtioBlock::new(VirtioBlockConfig::try_from(&config).unwrap()).unwrap();
++        let mut state_json = serde_json::to_value(block.save()).unwrap();
++        state_json["disk_path"] = serde_json::json!("disk-0");
++        let record = VirtioDeviceState {
++            device_id: "data".into(),
++            device_state: BlockState::Virtio(serde_json::from_value(state_json).unwrap()),
++            transport_state: serde_json::from_value(
++                serde_json::json!({"features_select":0, "acked_features_select":0,
++                "queue_select":0, "device_status":0, "config_generation":0, "interrupt_status":0}),
++            )
++            .unwrap(),
++            device_info: MMIODeviceInfo {
++                addr: 0xd0000000,
++                len: 4096,
++                gsi: Some(5),
++            },
++        };
++        let mut reference = MicrovmState::default();
++        reference.device_states.virtio_state = VirtioDevicesState::Mmio(DeviceStates {
++            block_devices: vec![record],
++            ..Default::default()
++        });
++        let binding = ConfinedBlock {
++            drive_id: "data".into(),
++            serial: "fv-data-serial".into(),
++            path_on_host: "disk-0".into(),
++            capacity_bytes: 4096,
++            is_read_only: false,
++            is_root_device: false,
++        };
++        let mut params = LoadSnapshotParams {
++            snapshot_path: "checkpoint".into(),
++            mem_backend: MemBackendConfig {
++                backend_path: "memory".into(),
++                backend_type: MemBackendType::File,
++            },
++            track_dirty_pages: false,
++            resume_vm: false,
++            network_overrides: Vec::new(),
++            vsock_override: None,
++            clock_realtime: false,
++            huge_pages: SnapshotLoadHugePageConfig::Snapshot,
++            device_reference_path: Some("trusted-reference".into()),
++            confined_pmem: None,
++            confined_blocks: Vec::new(),
++        };
++        // Default confinement still refuses every block, even one matching the reference.
++        assert!(check_devices(&reference, &reference, &params).is_err());
++        params.confined_blocks = vec![binding.clone()];
++        check_devices(&reference, &reference, &params).unwrap();
++        for path in ["/etc/shadow", "../disk-0", "./disk-0", "disk-0/"] {
++            let mut forged = MicrovmState {
++                device_states: reference.device_states.clone(),
++                ..Default::default()
++            };
++            let VirtioDevicesState::Mmio(mmio) = &mut forged.device_states.virtio_state else {
++                unreachable!()
++            };
++            let mut json = serde_json::to_value(&mmio.block_devices[0].device_state).unwrap();
++            json["Virtio"]["disk_path"] = serde_json::json!(path);
++            mmio.block_devices[0].device_state = serde_json::from_value(json).unwrap();
++            assert!(
++                check_devices(&reference, &forged, &params).is_err(),
++                "{path}"
++            );
++            // A malformed reference cannot broaden the caller's exact alias either.
++            assert!(
++                check_devices(&forged, &forged, &params).is_err(),
++                "reference {path}"
++            );
++        }
++        let mut forged = MicrovmState {
++            device_states: reference.device_states.clone(),
++            ..Default::default()
++        };
++        let VirtioDevicesState::Mmio(mmio) = &mut forged.device_states.virtio_state else {
++            unreachable!()
++        };
++        mmio.block_devices[0].device_info.addr += 4096;
++        assert!(check_devices(&reference, &forged, &params).is_err());
++        let mut missing = MicrovmState {
++            device_states: reference.device_states.clone(),
++            ..Default::default()
++        };
++        let VirtioDevicesState::Mmio(mmio) = &mut missing.device_states.virtio_state else {
++            unreachable!()
++        };
++        mmio.block_devices.clear();
++        assert!(check_devices(&reference, &missing, &params).is_err());
++        let mut extra = MicrovmState {
++            device_states: reference.device_states.clone(),
++            ..Default::default()
++        };
++        let VirtioDevicesState::Mmio(mmio) = &mut extra.device_states.virtio_state else {
++            unreachable!()
++        };
++        mmio.block_devices.push(mmio.block_devices[0].clone());
++        assert!(check_devices(&reference, &extra, &params).is_err());
++        params.confined_blocks.push(binding);
++        assert!(check_devices(&extra, &extra, &params).is_err());
++    }
++
+     #[test]
+     fn test_check_devices() {
+         let vmm = default_vmm_with_devices();
+@@ -1313,6 +1524,7 @@ mod tests {
+             huge_pages: Default::default(),
+             device_reference_path: None,
+             confined_pmem: None,
++            confined_blocks: Vec::new(),
+         };
+         let good = params(&[("netif", "tap-flexvm")], true);
+         let refused =
+diff --git a/src/vmm/src/rpc_interface.rs b/src/vmm/src/rpc_interface.rs
+index d22abce3e..aba2a6a95 100644
+--- a/src/vmm/src/rpc_interface.rs
++++ b/src/vmm/src/rpc_interface.rs
+@@ -1381,6 +1381,7 @@ mod tests {
+                 huge_pages: SnapshotLoadHugePageConfig::Snapshot,
+                 device_reference_path: None,
+                 confined_pmem: None,
++                confined_blocks: Vec::new(),
+             },
+         )));
+         check_unsupported(runtime_request(VmmAction::SetEntropyDevice(
+diff --git a/src/vmm/src/vmm_config/snapshot.rs b/src/vmm/src/vmm_config/snapshot.rs
+index 3c846597f..04b4ed1ee 100644
+--- a/src/vmm/src/vmm_config/snapshot.rs
++++ b/src/vmm/src/vmm_config/snapshot.rs
+@@ -102,6 +102,51 @@ impl SnapshotLoadHugePageConfig {
+     }
+ }
+ 
++/// A caller-selected raw block slot. Snapshot data never selects its backing file.
++#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
++#[serde(deny_unknown_fields)]
++pub struct ConfinedBlock {
++    /// Stable slot identifier, matching both trusted reference and saved device.
++    pub drive_id: String,
++    /// Explicit guest-visible serial (1–20 ASCII bytes).
++    pub serial: String,
++    /// Caller-owned single-component alias, disk-N, in the VMM working directory.
++    pub path_on_host: PathBuf,
++    /// Fixed sector-aligned logical capacity of the selected raw regular file.
++    pub capacity_bytes: u64,
++    /// Whether the backing file may be opened for writes.
++    pub is_read_only: bool,
++    /// Whether this slot is the boot root device.
++    pub is_root_device: bool,
++}
++
++impl ConfinedBlock {
++    pub(crate) fn validate(&self) -> bool {
++        let Some(path) = self.path_on_host.to_str() else {
++            return false;
++        };
++        let alias = path.strip_prefix("disk-").is_some_and(|slot| {
++            !slot.is_empty() && slot.len() <= 20 && slot.bytes().all(|b| b.is_ascii_digit())
++        });
++        alias
++            && !self.drive_id.is_empty()
++            && self.drive_id.len() <= 64
++            && self
++                .drive_id
++                .bytes()
++                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
++            && !self.serial.is_empty()
++            && self.serial.len() <= 20
++            && self
++                .serial
++                .bytes()
++                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
++            && self.capacity_bytes > 0
++            && self.capacity_bytes <= (8 << 40)
++            && self.capacity_bytes.is_multiple_of(512)
++    }
++}
++
+ /// Stores the configuration that will be used for loading a snapshot.
+ #[derive(Debug, PartialEq, Eq)]
+ pub struct LoadSnapshotParams {
+@@ -132,6 +177,8 @@ pub struct LoadSnapshotParams {
+     /// flexvm: when set, the only path a pmem device may name, read only: the vmstate (and the
+     /// device reference) may come from a peer, so neither names any other host file.
+     pub confined_pmem: Option<PathBuf>,
++    /// Explicit raw block slots; empty retains the confined restore block rejection.
++    pub confined_blocks: Vec<ConfinedBlock>,
+ }
+ 
+ /// Stores the configuration for loading a snapshot that is provided by the user.
+@@ -176,6 +223,9 @@ pub struct LoadSnapshotConfig {
+     /// flexvm: see `LoadSnapshotParams::confined_pmem`.
+     #[serde(default)]
+     pub confined_pmem: Option<PathBuf>,
++    /// Explicit raw block slots; empty retains the confined restore block rejection.
++    #[serde(default)]
++    pub confined_blocks: Vec<ConfinedBlock>,
+ }
+ 
+ /// Stores the configuration used for managing snapshot memory.
+diff --git a/src/vmm/tests/integration_tests.rs b/src/vmm/tests/integration_tests.rs
+index 55dd47ef1..8982e1757 100644
+--- a/src/vmm/tests/integration_tests.rs
++++ b/src/vmm/tests/integration_tests.rs
+@@ -321,6 +321,7 @@ fn verify_load_snapshot(
+             huge_pages,
+             device_reference_path: None,
+             confined_pmem: None,
++            confined_blocks: Vec::new(),
+         }))
+         .unwrap();
+ 
+@@ -395,6 +396,7 @@ fn test_load_snapshot_rejects_hugetlbfs_with_file_backend() {
+             huge_pages: SnapshotLoadHugePageConfig::Hugetlbfs2M,
+             device_reference_path: None,
+             confined_pmem: None,
++            confined_blocks: Vec::new(),
+         }))
+         .unwrap_err();
+ 
+@@ -470,6 +472,7 @@ fn verify_load_snap_disallowed_after_boot_resources(res: VmmAction, res_name: &s
+         huge_pages: SnapshotLoadHugePageConfig::Snapshot,
+         device_reference_path: None,
+         confined_pmem: None,
++        confined_blocks: Vec::new(),
+     });
+     let err = preboot_api_controller.handle_preboot_request(req);
+     assert!(

@@ -1518,7 +1518,7 @@ def exercise(
     if xcrs:
         expected.extend((GET_XCRS, SET_XCRS, GET_XCRS))
     if xsave:
-        expected.extend((GET_XSAVE, SET_XSAVE, GET_XSAVE, SET_XSAVE))
+        expected.extend((SET_XCRS, GET_XSAVE, SET_XSAVE, GET_XSAVE, SET_XSAVE))
     if vcpu_events:
         expected.extend((GET_VCPU_EVENTS, SET_VCPU_EVENTS, SET_VCPU_EVENTS, GET_VCPU_EVENTS))
     if lapic:
@@ -2781,6 +2781,7 @@ def main():
                       host_devices=sorted(devices))
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as error:
         report.update(status="failed", error=str(error))
+        print(error, file=sys.stderr)
     report_path.write_text(json.dumps(report, indent=2) + "\n")
     print(f"{report['status'].upper()}: {report_path}")
     return int(report["status"] != "passed")

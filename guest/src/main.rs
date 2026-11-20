@@ -598,7 +598,7 @@ fn serve_serial(statuses: Statuses, sessions: session::Sessions) -> io::Result<(
     // One dispatcher preserves quick-request ordering, just like the vsock
     // accept loop. Session bodies/attachments still run concurrently.
     thread::Builder::new().name("serial-requests".into()).spawn(move || {
-        for stream in requests {
+        for stream in requests.into_iter().filter_map(control::IncomingRequest::wait_for_payload) {
             accept_request(File::from(OwnedFd::from(stream)), &statuses, &sessions, Some(&admission));
         }
     })?;
@@ -1317,6 +1317,18 @@ mod tests {
 
     #[test]
     fn bodies_end_by_their_deadline_and_readers_are_capped() {
+        const CHILD: &str = "FLEXVM_TEST_BODY_READER_LIMIT";
+        if std::env::var_os(CHILD).is_none() {
+            // The limit is process-wide, and other request tests can hold
+            // reader slots while this fixture fills the entire pool.
+            let status = crate::test_util::status(
+                Command::new(std::env::current_exe().unwrap()).args(["--exact", "tests::bodies_end_by_their_deadline_and_readers_are_capped"]).env(CHILD, "1"),
+            )
+            .unwrap();
+            assert!(status.success(), "body reader limit helper: {status}");
+            return;
+        }
+
         let at = Instant::now() + Duration::from_secs(5);
         assert_eq!(read_body(&mut &b"echo hi"[..], -1, 7, at).unwrap(), b"echo hi");
         assert_eq!(read_body(&mut &b"echo"[..], -1, 7, at).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
