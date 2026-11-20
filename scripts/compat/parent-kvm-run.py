@@ -222,8 +222,11 @@ def stop_process(process):
 
 
 class RunChannel:
-    def __init__(self, connection):
+    def __init__(self, connection, irq_fds=(), pulse_irq=None):
         self.connection = connection
+        self.gsi_by_fd = {fd: gsi for gsi, fd in enumerate(irq_fds)}
+        self.pulse_irq = pulse_irq
+        self.irq_pulses = []
         self.exits = []
         self.interruptions = []
         self.timings = []
@@ -249,24 +252,36 @@ class RunChannel:
                 expected = MMIO_WIRE.size
         return bytes(data)
 
+    def dispatch_irqs(self, ready, running=False):
+        pending = self.gsi_by_fd.keys() & set(ready)
+        for fd in sorted(pending):
+            os.eventfd_read(fd)
+            gsi = self.gsi_by_fd[fd]
+            self.pulse_irq(gsi)
+            self.irq_pulses.append((gsi, running))
+        return bool(pending)
+
     def run(self, request, cancellation, interrupt):
         started = time.monotonic()
         if select.select([self.connection], [], [], 0)[0]:
             raise RuntimeError("child replied before its next run request")
+        if self.gsi_by_fd:
+            self.dispatch_irqs(select.select(self.gsi_by_fd, [], [], 0)[0])
         self.connection.sendall(request)
         interrupted = False
         while True:
             timeout = max(0, cancellation.deadline - time.monotonic())
-            ready, _, _ = select.select([self.connection, cancellation.descriptor], [], [], timeout)
+            ready, _, _ = select.select([self.connection, cancellation.descriptor, *self.gsi_by_fd], [], [], timeout)
             if self.connection in ready:
                 if cancellation.descriptor in ready:
                     cancellation.applies()
                 break
-            if cancellation.descriptor not in ready:
+            if not ready:
                 raise TimeoutError("parent worker did not stop after KVM_RUN")
-            if cancellation.applies() and not interrupted:
+            if cancellation.descriptor in ready and cancellation.applies() and not interrupted:
                 interrupt()
                 interrupted = True
+            self.dispatch_irqs(ready, running=True)
         output = self.read_exit()
         if output == b"I\0" and interrupted:
             self.interruptions.append(round((time.monotonic() - started) * 1000, 3))
@@ -343,7 +358,7 @@ class RegisterChannel:
 
 
 class TcgChild:
-    def __init__(self, qemu, output, socket_path, outer_ram, layouts, slots, cpu_count, mmio, pit_flags):
+    def __init__(self, qemu, output, socket_path, outer_ram, layouts, slots, cpu_count, mmio, pit_flags, irq_fds):
         self.process = None
         self.channel = None
         self.debugger = None
@@ -376,7 +391,7 @@ class TcgChild:
                                     f"ram-fd={outer_ram},layout-fd={layout},addr={slot.gpa}"])
                 self.process = subprocess.Popen(command, pass_fds=(outer_ram, *layouts), stdout=log, stderr=log)
                 connection, _ = listener.accept()
-                self.channel = RunChannel(connection)
+                self.channel = RunChannel(connection, irq_fds, self.pulse_irq)
                 self.debugger = RegisterChannel(debugger_path)
                 description = self.debugger.exchange("qXfer:features:read:target.xml:0,fff")
                 if b'<xi:include href="i386-64bit.xml"/>' not in description:
@@ -449,6 +464,9 @@ class TcgChild:
     def set_irq(self, gsi, level):
         self.special_command("x-flexvm-set-x86-gsi", {"gsi": gsi, "level": bool(level)})
 
+    def pulse_irq(self, gsi):
+        self.special_command("x-flexvm-pulse-x86-gsi", {"gsi": gsi})
+
     def close(self):
         try:
             if self.special_monitor is not None:
@@ -466,7 +484,7 @@ class TcgChild:
 
 
 class KvmChild:
-    def __init__(self, output, outer_ram, layouts, slots, cpu_count, irqchip, pit_flags):
+    def __init__(self, output, outer_ram, layouts, slots, cpu_count, irqchip, pit_flags, irq_fds):
         self.process = None
         self.channel = None
         self.sigqueue = ctypes.CDLL(None, use_errno=True).sigqueue
@@ -478,10 +496,11 @@ class KvmChild:
                 control = worker.fileno()
                 pit_request = 0 if pit_flags is None else pit_flags + 1
                 command = [output / "native-worker", str(control), str(outer_ram), str(cpu_count),
-                           str(int(irqchip)), str(pit_request)]
+                           str(int(irqchip)), str(pit_request), *map(str, irq_fds)]
                 for slot, layout in zip(slots, layouts, strict=True):
                     command.extend(map(str, (layout, slot.gpa, slot.identifier)))
-                self.process = subprocess.Popen(command, pass_fds=(control, outer_ram, *layouts), stdout=log, stderr=log)
+                self.process = subprocess.Popen(command, pass_fds=(control, outer_ram, *irq_fds, *layouts),
+                                                stdout=log, stderr=log)
             self.channel = RunChannel(connection)
         except BaseException:
             connection.close()
@@ -572,14 +591,14 @@ class KvmChild:
         return None
 
 
-def doorbell_peer(server, memory, requests, cancellations, replies, unused_vector):
+def doorbell_peer(server, memory, requests, cancellations, irq_fds, replies):
     peer, _ = server.accept()
     try:
         peer.settimeout(3)
         # ivshmem protocol 0. The parent is peer 0 and the outer guest is peer 1.
         peer.sendall(struct.pack("<qq", 0, 1))
         for value, descriptor in ((-1, memory), (0, requests), (0, cancellations),
-                                  (1, replies), (1, unused_vector)):
+                                  *((0, fd) for fd in irq_fds), (1, replies)):
             if socket.send_fds(peer, [struct.pack("<q", value)], [descriptor]) != 8:
                 raise RuntimeError("short ivshmem setup message")
         return peer
@@ -680,7 +699,9 @@ def read_slot_table(mailbox, ram_pages, outer_bytes, protected_entry, split_slot
     return slots
 
 
-def start_child(engine, qemu, output, control, outer_ram, slots, cpu_count, mmio, irqchip, pit_flags):
+def start_child(engine, qemu, output, control, outer_ram, slots, cpu_count, mmio, irqchip, pit_flags, irq_fds):
+    if not irqchip:
+        irq_fds = ()
     with ExitStack() as manifests:
         layouts = []
         for slot in slots:
@@ -693,8 +714,9 @@ def start_child(engine, qemu, output, control, outer_ram, slots, cpu_count, mmio
                         fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SEAL)
             layouts.append(manifest)
         if engine == "kvm":
-            return KvmChild(output, outer_ram, layouts, slots, cpu_count, irqchip, pit_flags)
-        return TcgChild(qemu, output, control / "child.sock", outer_ram, layouts, slots, cpu_count, mmio, pit_flags)
+            return KvmChild(output, outer_ram, layouts, slots, cpu_count, irqchip, pit_flags, irq_fds)
+        return TcgChild(qemu, output, control / "child.sock", outer_ram, layouts, slots, cpu_count, mmio,
+                        pit_flags, irq_fds)
 
 
 def verify_slot_spans(pid, slots):
@@ -724,7 +746,8 @@ def verify_slot_spans(pid, slots):
 
 
 def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry,
-             split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs, cpuid, mmio, mmio_read, ioeventfd, irqchip, pit):
+             split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs, cpuid, mmio, mmio_read,
+             ioeventfd, irqchip, pit, irqfd):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
@@ -775,6 +798,10 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         expected.extend((SET_REGS, RUN, GET_REGS))
         expected_counters.append(0x4321)
         expected_io.append((0, 0x5c))
+    if irqfd:
+        expected.extend((SET_REGS, RUN, GET_REGS) * 2)
+        expected_counters.extend((0x5432, 0x5432))
+        expected_io.extend(((0, 0x6c), (0, 0x6c)))
     expected.extend((CLOSE_CPU, CLOSE_VM))
     if reject_close:
         expected = expected[:-1]
@@ -806,7 +833,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 21)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 22)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
         os.ftruncate(outer_ram, outer_ram_size)
@@ -817,8 +844,11 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         cleanup.callback(os.close, cancellations)
         replies = os.eventfd(0, os.EFD_CLOEXEC | os.EFD_NONBLOCK)
         cleanup.callback(os.close, replies)
-        unused_vector = os.eventfd(0, os.EFD_CLOEXEC | os.EFD_NONBLOCK)
-        cleanup.callback(os.close, unused_vector)
+        irq_fds = []
+        for _ in range(GSI_COUNT):
+            fd = os.eventfd(0, os.EFD_CLOEXEC | os.EFD_NONBLOCK)
+            cleanup.callback(os.close, fd)
+            irq_fds.append(fd)
         command = [
             qemu, *QEMU_OPTIONS, "-machine", "q35,accel=tcg,memory-backend=outer-ram",
             "-cpu", "max,vmx=off,svm=off", "-m", str(outer_mib), "-smp", "1",
@@ -826,17 +856,20 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
             "-serial", "stdio", "-kernel", kernel, "-initrd", output / "initramfs",
             "-append", "console=ttyS0 loglevel=5 panic=1 rdinit=/init",
             "-chardev", f"socket,id=doorbell,path={control / 'doorbell'}",
-            "-device", "ivshmem-doorbell,chardev=doorbell,vectors=2",
+            "-device", f"ivshmem-doorbell,chardev=doorbell,vectors={2 + len(irq_fds)}",
         ]
         with (output / "outer.log").open("wb") as log:
             outer = subprocess.Popen(command, pass_fds=(outer_ram,), stdout=log, stderr=log)
         cleanup.callback(stop_process, outer)
-        cleanup.enter_context(doorbell_peer(server, memory, requests, cancellations, replies, unused_vector))
+        cleanup.enter_context(doorbell_peer(server, memory, requests, cancellations, irq_fds, replies))
         exited = os.pidfd_open(outer.pid)
         cleanup.callback(os.close, exited)
         deadline = time.monotonic() + 60
         while True:
-            readable, _, _ = select.select([exited, requests, cancellations], [], [], max(0, deadline - time.monotonic()))
+            descriptors = [exited, requests, cancellations]
+            if child is not None and child.process is not None:
+                descriptors.extend(child.channel.gsi_by_fd)
+            readable, _, _ = select.select(descriptors, [], [], max(0, deadline - time.monotonic()))
             if exited in readable:
                 break
             if cancellations in readable and requests not in readable:
@@ -846,6 +879,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 cancelled, = struct.unpack_from("<I", mapping, 40)
                 if cancelled > complete:
                     raise RuntimeError("cancellation has no live run")
+                continue
+            if child is not None and child.channel.dispatch_irqs(readable) and requests not in readable:
                 continue
             if requests not in readable:
                 raise TimeoutError("outer guest did not shut down")
@@ -893,7 +928,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                         raise RuntimeError("unexpected total size of registered RAM")
                     slots = read_slot_table(mapping, ram_pages, outer_ram_size, protected_entry, split_slot)
                     child = start_child(parent_engine, qemu, output, control, outer_ram, slots,
-                                        cpu_count, mmio, irqchip_created, pit_flags)
+                                        cpu_count, mmio, irqchip_created, pit_flags, irq_fds)
                     cleanup.callback(child.close)
                     extents = verify_slot_spans(child.process.pid, slots)
                     for line, level in staged_irq_levels:
@@ -1005,9 +1040,16 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 or ioeventfd and "PASS KVM_IOEVENTFD signaled matched MMIO and PIO writes" not in guest
                 or irqchip and "PASS child PIC delivered and acknowledged the parent IRQ" not in guest
                 or pit and "PASS PIT woke the halted vCPU" not in guest
+                or irqfd and "PASS KVM_IRQFD woke an active run and honored deassignment and pending signals" not in guest
                 or "PASS /dev/kvm returned two port I/O exits" not in guest
                 or "PASS parent KVM guest shutdown" not in guest):
             raise RuntimeError(f"parent execution proof failed; commands={observed}, see outer.log")
+        pulses = child.channel.irq_pulses
+        if irqfd and parent_engine == "tcg":
+            if len(pulses) != 2 or pulses[0] != (3, True) or pulses[1][0] != 3:
+                raise RuntimeError(f"unexpected TCG interrupt doorbells: {pulses}")
+        elif pulses:
+            raise RuntimeError(f"unexpected TCG interrupt doorbells: {pulses}")
         retained = "retaining registered RAM until the enclosing VM exits" in guest
         if retained != reject_close:
             raise RuntimeError("unexpected guest RAM pin disposition")
@@ -1033,6 +1075,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         "ioeventfd": ioeventfd,
         "irq_levels": irq_levels,
         "pit_flags": pit_flags,
+        "irqfd": irqfd,
+        "tcg_irqfd_pulses": pulses,
         "register_counters": counters,
         "interrupted_runs": len(child.channel.interruptions),
         "interrupted_run_ms": child.channel.interruptions,
@@ -1074,13 +1118,16 @@ def main():
     parser.add_argument("--ioeventfd", action="store_true", help="signal guest eventfds for MMIO and port writes")
     parser.add_argument("--irqchip", action="store_true", help="deliver a real PIC interrupt on a stopped worker")
     parser.add_argument("--pit", action="store_true", help="program a PIT interrupt that wakes a halted worker")
+    parser.add_argument("--irqfd", action="store_true", help="wake an active run through KVM_IRQFD")
     parser.add_argument("--reject-close", action="store_true", help="verify page retention when the parent refuses close")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if args.mmio_read or args.ioeventfd:
         args.mmio_write = True
-    if args.pit:
+    if args.pit or args.irqfd:
         args.irqchip = True
+    if args.pit and args.irqfd:
+        parser.error("--pit and --irqfd use separate fixtures")
     if args.fpu and not args.long_mode:
         parser.error("--fpu requires long mode")
     if args.msrs and (not args.long_mode or args.fpu):
@@ -1113,7 +1160,7 @@ def main():
         print(json.dumps(exercise(qemu, kernel, output, args.reject_close, args.parent_engine, args.ram_pages,
                                   args.protected_entry, args.split_slot, args.interrupt_run,
                                   2 if args.two_vcpus else 1, args.long_mode, args.fpu, args.msrs, args.cpuid,
-                                  args.mmio_write, args.mmio_read, args.ioeventfd, args.irqchip, args.pit)))
+                                  args.mmio_write, args.mmio_read, args.ioeventfd, args.irqchip, args.pit, args.irqfd)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -1163,6 +1210,8 @@ def main():
                 oracle.append("irqchip")
             if args.pit:
                 oracle.append("pit")
+            if args.irqfd:
+                oracle.append("irqfd")
             HELPERS["run"](oracle, 14 if args.interrupt_run else 8, output / "native-kvm.log")
             report["same_client_passed_native_kvm"] = True
             report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
@@ -1194,6 +1243,8 @@ def main():
             files["irqchip"] = b""
         if args.pit:
             files["pit"] = b""
+        if args.irqfd:
+            files["irqfd"] = b""
         image = HELPERS["initramfs"](init.read_bytes(), files=files)
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
@@ -1227,6 +1278,7 @@ def main():
                             *(["--ioeventfd"] if args.ioeventfd else []),
                             *(["--irqchip"] if args.irqchip else []),
                             *(["--pit"] if args.pit else []),
+                            *(["--irqfd"] if args.irqfd else []),
                             *(["--reject-close"] if args.reject_close else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}

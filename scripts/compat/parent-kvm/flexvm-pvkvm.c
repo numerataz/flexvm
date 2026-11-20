@@ -6,6 +6,7 @@
 #include <linux/anon_inodes.h>
 #include <linux/atomic.h>
 #include <linux/eventfd.h>
+#include <linux/file.h>
 #include <linux/fs.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
@@ -17,11 +18,13 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pci.h>
+#include <linux/poll.h>
 #include <linux/sched/mm.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 #include <linux/wait.h>
+#include <linux/workqueue.h>
 #include <asm/msr-index.h>
 #include <asm/processor-flags.h>
 #include "mailbox.h"
@@ -36,6 +39,8 @@ struct pvkvm {
 	struct miscdevice misc;
 	void __iomem *mailbox;
 	void __iomem *doorbell;
+	spinlock_t irqfd_doorbell_lock;
+	bool irqfd_doorbell_live;
 	wait_queue_head_t replied;
 	atomic_t interrupt_count;
 	int irq;
@@ -59,6 +64,17 @@ struct pv_ioeventfd {
 	bool datamatch;
 };
 
+struct pv_irqfd {
+	struct list_head node;
+	struct pvvm *vm;
+	struct eventfd_ctx *eventfd;
+	wait_queue_head_t *head;
+	wait_queue_entry_t wait;
+	poll_table poll;
+	u32 gsi;
+	bool closed;
+};
+
 struct pvvm {
 	struct kref refs;
 	struct pvkvm *provider;
@@ -66,6 +82,9 @@ struct pvvm {
 	struct pvslot slots[PVKVM_MAX_SLOTS];
 	struct mutex ioevent_lock;
 	struct list_head ioevents;
+	struct mutex irqfd_lock;
+	struct list_head irqfds;
+	struct work_struct irqfd_reap;
 	unsigned int total_pages;
 	bool slots_exposed;
 	bool topology_frozen;
@@ -282,6 +301,67 @@ static void release_ioeventfd(struct pv_ioeventfd *entry)
 	kfree(entry);
 }
 
+static void signal_irqfd(struct pv_irqfd *entry)
+{
+	struct pvkvm *p = entry->vm->provider;
+	unsigned long flags;
+	u64 count;
+
+	lockdep_assert_held(&entry->head->lock);
+	eventfd_ctx_do_read(entry->eventfd, &count);
+	if (!count || READ_ONCE(entry->closed))
+		return;
+	spin_lock_irqsave(&p->irqfd_doorbell_lock, flags);
+	if (p->irqfd_doorbell_live)
+		writel(PVKVM_IRQFD_VECTOR + entry->gsi, p->doorbell + PVKVM_DOORBELL_AT);
+	spin_unlock_irqrestore(&p->irqfd_doorbell_lock, flags);
+}
+
+static int wake_irqfd(wait_queue_entry_t *wait, unsigned int mode, int sync, void *key)
+{
+	struct pv_irqfd *entry = container_of(wait, struct pv_irqfd, wait);
+	__poll_t events = key_to_poll(key);
+
+	if (events & EPOLLIN)
+		signal_irqfd(entry);
+	if (events & EPOLLHUP) {
+		WRITE_ONCE(entry->closed, true);
+		schedule_work(&entry->vm->irqfd_reap);
+	}
+	return !!(events & EPOLLIN);
+}
+
+static void queue_irqfd(struct file *file, wait_queue_head_t *head, poll_table *poll)
+{
+	struct pv_irqfd *entry = container_of(poll, struct pv_irqfd, poll);
+
+	entry->head = head;
+	add_wait_queue_priority(head, &entry->wait);
+}
+
+static void release_irqfd(struct pv_irqfd *entry)
+{
+	u64 count;
+
+	list_del(&entry->node);
+	eventfd_ctx_remove_wait_queue(entry->eventfd, &entry->wait, &count);
+	eventfd_ctx_put(entry->eventfd);
+	kfree(entry);
+}
+
+static void reap_irqfds(struct work_struct *work)
+{
+	struct pvvm *vm = container_of(work, struct pvvm, irqfd_reap);
+	struct pv_irqfd *entry, *next;
+
+	mutex_lock(&vm->irqfd_lock);
+	list_for_each_entry_safe(entry, next, &vm->irqfds, node) {
+		if (READ_ONCE(entry->closed))
+			release_irqfd(entry);
+	}
+	mutex_unlock(&vm->irqfd_lock);
+}
+
 static void vm_free(struct kref *ref)
 {
 	struct pvvm *vm = container_of(ref, struct pvvm, refs);
@@ -289,7 +369,13 @@ static void vm_free(struct kref *ref)
 	bool closed;
 	unsigned int id;
 	struct pv_ioeventfd *entry, *next;
+	struct pv_irqfd *irqfd, *next_irqfd;
 
+	mutex_lock(&vm->irqfd_lock);
+	list_for_each_entry_safe(irqfd, next_irqfd, &vm->irqfds, node)
+		release_irqfd(irqfd);
+	mutex_unlock(&vm->irqfd_lock);
+	cancel_work_sync(&vm->irqfd_reap);
 	mutex_lock(&p->lock);
 	closed = close_object(p, PVKVM_CLOSE_VM);
 	p->vm_open = false;
@@ -933,6 +1019,7 @@ static long device_capability(unsigned long capability)
 	case KVM_CAP_IOEVENTFD_ANY_LENGTH:
 	case KVM_CAP_PIT:
 	case KVM_CAP_PIT2:
+	case KVM_CAP_IRQFD:
 		return 1;
 	case KVM_CAP_NR_MEMSLOTS:
 		return PVKVM_MAX_SLOTS;
@@ -1042,6 +1129,73 @@ out:
 	return result;
 }
 
+static long configure_irqfd(struct pvvm *vm, struct kvm_irqfd __user *user)
+{
+	struct kvm_irqfd argument;
+	struct pv_irqfd *entry, *next, *new = NULL;
+	struct eventfd_ctx *eventfd;
+	struct file *file;
+	bool remove;
+	int result = 0;
+
+	if (copy_from_user(&argument, user, sizeof(argument)))
+		return -EFAULT;
+	if (argument.flags & ~KVM_IRQFD_FLAG_DEASSIGN || argument.gsi >= PVKVM_GSI_COUNT)
+		return -EINVAL;
+	remove = argument.flags & KVM_IRQFD_FLAG_DEASSIGN;
+	if (!remove && !READ_ONCE(vm->irqchip_created))
+		return -EAGAIN;
+	file = eventfd_fget(argument.fd);
+	if (IS_ERR(file))
+		return PTR_ERR(file);
+	eventfd = eventfd_ctx_fileget(file);
+	if (IS_ERR(eventfd)) {
+		result = PTR_ERR(eventfd);
+		goto put_file;
+	}
+	if (!remove) {
+		new = kzalloc(sizeof(*new), GFP_KERNEL);
+		if (!new) {
+			result = -ENOMEM;
+			goto put_event;
+		}
+		new->vm = vm;
+		new->eventfd = eventfd;
+		new->gsi = argument.gsi;
+		init_waitqueue_func_entry(&new->wait, wake_irqfd);
+		init_poll_funcptr(&new->poll, queue_irqfd);
+	}
+	mutex_lock(&vm->irqfd_lock);
+	list_for_each_entry_safe(entry, next, &vm->irqfds, node) {
+		if (entry->eventfd != eventfd)
+			continue;
+		if (!remove)
+			result = -EBUSY;
+		else if (entry->gsi == argument.gsi)
+			release_irqfd(entry);
+		break;
+	}
+	if (new && !result) {
+		unsigned long flags;
+
+		list_add_tail(&new->node, &vm->irqfds);
+		vfs_poll(file, &new->poll);
+		/* Claim pending data under the same lock as the wake callback. */
+		spin_lock_irqsave(&new->head->lock, flags);
+		signal_irqfd(new);
+		spin_unlock_irqrestore(&new->head->lock, flags);
+		mutex_unlock(&vm->irqfd_lock);
+		goto put_file;
+	}
+	mutex_unlock(&vm->irqfd_lock);
+	kfree(new);
+put_event:
+	eventfd_ctx_put(eventfd);
+put_file:
+	fput(file);
+	return result;
+}
+
 static long create_irqchip(struct pvvm *vm, unsigned long arg)
 {
 	struct pvkvm *p = vm->provider;
@@ -1059,7 +1213,7 @@ static long create_irqchip(struct pvvm *vm, unsigned long arg)
 	else {
 		result = request(p, PVKVM_CREATE_IRQCHIP, NULL, NULL);
 		if (!result)
-			vm->irqchip_created = true;
+			WRITE_ONCE(vm->irqchip_created, true);
 	}
 	mutex_unlock(&p->lock);
 	return result;
@@ -1143,6 +1297,8 @@ static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return create_irqchip(vm, arg);
 	if (cmd == KVM_IRQ_LINE)
 		return set_irq_line(vm, (void __user *)arg);
+	if (cmd == KVM_IRQFD)
+		return configure_irqfd(vm, (void __user *)arg);
 	if (cmd == KVM_CREATE_PIT)
 		return create_pit(vm, NULL);
 	if (cmd == KVM_CREATE_PIT2)
@@ -1201,6 +1357,9 @@ static int new_vm(struct pvkvm *p, unsigned long type)
 	vm->owner = current->mm;
 	mutex_init(&vm->ioevent_lock);
 	INIT_LIST_HEAD(&vm->ioevents);
+	mutex_init(&vm->irqfd_lock);
+	INIT_LIST_HEAD(&vm->irqfds);
+	INIT_WORK(&vm->irqfd_reap, reap_irqfds);
 	mmgrab(vm->owner);
 	kref_init(&vm->refs);
 	mutex_lock(&p->lock);
@@ -1351,6 +1510,8 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	atomic_set(&p->interrupt_count, 0);
 	p->doorbell = pcim_iomap_table(dev)[0];
 	p->mailbox = pcim_iomap_table(dev)[2];
+	spin_lock_init(&p->irqfd_doorbell_lock);
+	p->irqfd_doorbell_live = true;
 	if (readl(p->doorbell + PVKVM_IVPOSITION_AT) != PVKVM_GUEST_POSITION ||
 	    readl(p->mailbox + PVKVM_MAGIC_AT) != PVKVM_MAGIC ||
 	    readl(p->mailbox + PVKVM_VERSION_AT) != PVKVM_VERSION ||
@@ -1387,8 +1548,12 @@ free_provider:
 static void pvkvm_remove(struct pci_dev *dev)
 {
 	struct pvkvm *p = pci_get_drvdata(dev);
+	unsigned long flags;
 
 	misc_deregister(&p->misc);
+	spin_lock_irqsave(&p->irqfd_doorbell_lock, flags);
+	p->irqfd_doorbell_live = false;
+	spin_unlock_irqrestore(&p->irqfd_doorbell_lock, flags);
 	mutex_lock(&p->lock);
 	p->dead = true;
 	p->mailbox = NULL;

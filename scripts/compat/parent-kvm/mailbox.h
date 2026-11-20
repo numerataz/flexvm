@@ -3,7 +3,7 @@
 #define FLEXVM_PVKVM_MAILBOX_H
 
 #define PVKVM_MAGIC        0x4d564b46
-#define PVKVM_VERSION      21
+#define PVKVM_VERSION      22
 #define PVKVM_MAGIC_AT     0
 #define PVKVM_VERSION_AT   4
 #define PVKVM_REQUEST_AT   8
@@ -47,6 +47,7 @@
 #define PVKVM_GUEST_POSITION 1
 #define PVKVM_HOST_VECTOR    0
 #define PVKVM_CANCEL_VECTOR  1
+#define PVKVM_IRQFD_VECTOR   2
 
 struct pvkvm_msr_batch {
 	__u32 count;

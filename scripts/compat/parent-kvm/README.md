@@ -100,6 +100,12 @@ Add `--pit` to that run to create an i8254 timer with `KVM_CREATE_PIT2`.
 The child programs a one-shot tick over port I/O and halts. The timer
 interrupt wakes the same vCPU, and the guest acknowledges it before returning
 to the VMM. PIT state transfer is tracked in #1501.
+Use `--irqfd` in a separate run to route edge-triggered eventfds to the default
+x86 GSI lines. A doorbell per line allows native KVM to consume the event
+directly and lets the TCG worker pulse its controller during an active run.
+The client wakes a halted vCPU, exercises deassignment through a duplicated
+descriptor, and registers an eventfd with a signal already pending. Resampling,
+custom routes, and snapshot state are tracked in #1501.
 The worker uses one host mapping per consecutive extent. Highly fragmented
 slots can reach the host's mapping limit. A failed mapping releases the
 partially mapped worker span.
