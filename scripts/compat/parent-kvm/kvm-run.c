@@ -10,6 +10,7 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <unistd.h>
+#include "mailbox.h"
 
 static void check(bool valid, const char *why)
 {
@@ -46,8 +47,12 @@ static void check_registers(int cpu, unsigned char accumulator, unsigned int cou
 
 int main(int argc, char **argv)
 {
-    check(argc == 2 && (!strcmp(argv[1], "1") || !strcmp(argv[1], "2")), "select one or two RAM pages");
-    size_t pages = (size_t)(argv[1][0] - '0');
+    check(argc == 2, "specify the RAM page count");
+    char *end;
+    errno = 0;
+    long count = strtol(argv[1], &end, 10);
+    check(!errno && !*end && count > 0 && count <= PVKVM_MAX_PAGES, "select the RAM page count");
+    size_t pages = count;
     size_t ram_bytes = pages * 4096;
     int kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
     check(kvm >= 0, "open /dev/kvm");
@@ -59,13 +64,17 @@ int main(int argc, char **argv)
     unsigned char *ram = mmap(NULL, ram_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     check(ram != MAP_FAILED, "map client RAM");
     volatile unsigned char *scratch = NULL;
-    if (pages == 2) {
+    size_t gap = 32 * 4096;
+    size_t scratch_bytes = (pages - 1) * gap;
+    if (scratch_bytes) {
         volatile unsigned char *touch = ram;
-        touch[4096] = 0;
-        scratch = mmap(NULL, 32 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        scratch = mmap(NULL, scratch_bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         check(scratch != MAP_FAILED, "allocate intervening pages");
-        for (size_t byte = 0; byte < 32 * 4096; byte += 4096)
-            scratch[byte] = 1;
+        for (size_t page = pages - 1; page; page--) {
+            touch[page * 4096] = 0;
+            for (size_t byte = (page - 1) * gap; byte < page * gap; byte += 4096)
+                scratch[byte] = 1;
+        }
         touch[0] = 0;
     }
     struct kvm_userspace_memory_region region = {
@@ -73,17 +82,18 @@ int main(int argc, char **argv)
     };
     check(ioctl(vm, KVM_SET_USER_MEMORY_REGION, &region) == 0, "register client RAM");
     if (scratch)
-        check(munmap((void *)scratch, 32 * 4096) == 0, "release intervening pages");
-    unsigned char data_address = (unsigned char)(pages * 0x10);
+        check(munmap((void *)scratch, scratch_bytes) == 0, "release intervening pages");
     const unsigned char code[] = {
-        0xc6, 0x06, 0x20, data_address, 0x56, /* mov byte [data+0x20], 0x56 */
+        0xba, 0, pages, 0x8e, 0xda,   /* mov dx, pages * 0x100; mov ds, dx */
+        0x2e, 0xc6, 0x06, 0x90, 0x10, 0x57, /* mov byte cs:[0x1090], 0x57 */
+        0xc6, 0x06, 0x80, 0x00, 0x56, /* mov byte ds:[0x80], 0x56 */
         0xb9, 0x57, 0x13,             /* mov cx, 0x1357 */
         0x14, 0x00, 0xe6, 0x30,       /* adc al, 0; out 0x30, al */
         0xf4,                         /* hlt */
     };
     const unsigned char resumed[] = {
-        0xa0, 0x21, data_address,     /* mov al, [data+0x21] */
-        0xa2, 0x22, data_address,     /* mov [data+0x22], al */
+        0xa0, 0x81, 0x00,             /* mov al, ds:[0x81] */
+        0xa2, 0x82, 0x00,             /* mov ds:[0x82], al */
         0x30, 0xd8,                   /* xor al, bl */
         0xb9, 0x68, 0x24,             /* mov cx, 0x2468 */
         0xe6, 0x30, 0xf4,             /* out 0x30, al; hlt */
@@ -113,8 +123,9 @@ int main(int argc, char **argv)
     unsigned long long first = timed_run(cpu);
     check_output(run, size, 0x42);
     check_registers(cpu, 0x42, 0x1357);
-    check(data[0x20] == 0x56 && data[0x22] == 0, "child stopped after its first output");
-    data[0x21] = 0x52;
+    check(ram[0x90] == 0x57 && data[0x80] == 0x56 && data[0x82] == 0,
+          "child wrote the first and last slots and stopped after its first output");
+    data[0x81] = 0x52;
     const struct kvm_regs update = {
         .rbx = 0xf5, .rcx = 0x3579, .rsp = 0x1f00, .rbp = 0x12345678,
         .rip = 0x1040, .rflags = 2,
@@ -125,7 +136,7 @@ int main(int argc, char **argv)
     unsigned long long second = timed_run(cpu);
     check_output(run, size, 0xa7);
     check_registers(cpu, 0xa7, 0x2468);
-    check(data[0x22] == 0x52, "child saw the client's write during re-entry");
+    check(data[0x82] == 0x52, "child saw the client's write during re-entry");
     munmap(run, size);
     close(cpu);
     munmap(ram, ram_bytes);

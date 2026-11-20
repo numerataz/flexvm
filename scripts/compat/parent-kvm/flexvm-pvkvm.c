@@ -87,8 +87,8 @@ static int request(struct pvkvm *provider, enum pvkvm_command command,
 	}
 	seq = before + 1;
 	interrupts = atomic_read(&provider->interrupt_count);
-	for (index = 0; index < PVKVM_MAX_PAGES; index++) {
-		u64 address = index < pages ? PFN_PHYS(page_to_pfn(memory->slot[index])) : 0;
+	for (index = 0; index < pages; index++) {
+		u64 address = PFN_PHYS(page_to_pfn(memory->slot[index]));
 		void __iomem *entry = m + PVKVM_RAM_ADDRESS_AT + index * sizeof(u64);
 
 		writel(lower_32_bits(address), entry);
@@ -222,7 +222,7 @@ static int run_cpu(struct pvcpu *cpu)
 	vm->slot_exposed = true;
 	if (!cpu->ran)
 		memcpy_toio(p->mailbox + PVKVM_REGISTERS_AT, &cpu->regs, sizeof(cpu->regs));
-	result = request(p, PVKVM_RUN, vm, &cpu->page->data);
+	result = request(p, PVKVM_RUN, cpu->ran ? NULL : vm, &cpu->page->data);
 	if (!result)
 		cpu->ran = true;
 unlock:
@@ -528,7 +528,7 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	BUILD_BUG_ON(sizeof(struct run_page) > PAGE_SIZE);
 	BUILD_BUG_ON(PAGE_SIZE != PVKVM_MEMORY_LEN);
 	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
-	    pci_resource_len(dev, 2) < PVKVM_REGISTERS_AT + sizeof(struct kvm_regs))
+	    pci_resource_len(dev, 2) < PVKVM_RAM_ADDRESS_AT + PVKVM_MAX_PAGES * sizeof(u64))
 		return -ENODEV;
 	result = pcim_enable_device(dev);
 	if (result)
