@@ -440,20 +440,22 @@ impl Config {
                 kvm_arg,
             ),
         ]);
+        // ARM virt auto-assigns MMIO buses in reverse enumeration order. With managed
+        // disks, bind the root and each disk to the buses Linux enumerates first.
+        let root_bus = if arch == "aarch64" && !disks.is_empty() { ",bus=virtio-mmio-bus.0" } else { "" };
         cmd.args([
             "-blockdev",
             &json!({"driver":"raw", "node-name":"root", "read-only":true, "file":{"driver":"file", "filename":rootfs}}).to_string(),
             "-device",
-            &format!("{block},drive=root"),
+            &format!("{block},drive=root{root_bus}"),
         ]);
         for (index, (id, path)) in disks.iter().enumerate() {
             let node = format!("managed-{index}");
-            cmd.args([
-                "-blockdev",
-                &json!({"driver":"raw", "node-name":node, "file":{"driver":"file", "filename":path}}).to_string(),
-                "-device",
-                &format!("{block},drive={node},serial={}", &id[..20]),
-            ]);
+            let mut device = format!("{block},drive={node},serial={}", &id[..20]);
+            if arch == "aarch64" {
+                device.push_str(&format!(",bus=virtio-mmio-bus.{}", index + 1));
+            }
+            cmd.args(["-blockdev", &json!({"driver":"raw", "node-name":node, "file":{"driver":"file", "filename":path}}).to_string(), "-device", &device]);
         }
         // Private short socket paths contain no keyval separators.
         if self.control == Control::Vsock {
