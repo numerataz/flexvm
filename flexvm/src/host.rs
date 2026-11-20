@@ -3890,6 +3890,10 @@ pub struct NameLock {
 }
 
 impl NameLock {
+    pub(crate) fn state_path(&self) -> &Path {
+        &self.host.state
+    }
+
     /// Explicit removal clears both rotations before the name can be reused. A detached run's parent
     /// opens its log before the child takes the name, so clearing at the child's start is too late.
     pub fn remove_logs(&self) -> Result<()> {
