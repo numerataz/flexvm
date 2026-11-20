@@ -65,12 +65,14 @@ enum Status {
     Aborted,
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Journal {
     offer: Offer,
     source_key: String,
     status: Status,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    return_fence: Option<Offer>,
 }
 
 enum Action {
@@ -98,16 +100,25 @@ fn transition(state: &Path, offer: Offer, action: Action) -> Result<Status> {
                     dir.sync_all()?;
                     return Ok(current.status);
                 }
-                if current.status != Status::Aborted || offer.generation <= current.offer.generation || offer.transfer_id == current.offer.transfer_id {
+                if current.status == Status::Pending || offer.generation <= current.offer.generation || offer.transfer_id == current.offer.transfer_id {
                     bail!("software transfer conflicts with the destination journal");
                 }
             }
-            Journal { offer, source_key, status: Status::Pending }
+            let return_fence = return_fence(&dir, &offer, &source_key)?;
+            if let Some(current) = previous.as_ref().filter(|previous| previous.status == Status::Committed) {
+                if return_fence.as_ref().is_none_or(|fence| fence.generation <= current.offer.generation) {
+                    bail!("software transfer conflicts with the committed destination journal");
+                }
+            }
+            Journal { offer, source_key, status: Status::Pending, return_fence }
         }
         Action::Commit(signature) => {
-            let mut current = matching(&previous, &offer)?;
+            let mut current = matching(previous.clone(), &offer)?;
             if current.status == Status::Aborted {
                 bail!("software transfer was aborted");
+            }
+            if current.status == Status::Pending {
+                require_unchanged_return_fence(&dir, &current)?;
             }
             let key = decode::<32>(&current.source_key, "source public key")?;
             let signature = decode::<64>(&signature, "retirement signature")?;
@@ -118,7 +129,7 @@ fn transition(state: &Path, offer: Offer, action: Action) -> Result<Status> {
             current
         }
         Action::Abort => {
-            let mut current = matching(&previous, &offer)?;
+            let mut current = matching(previous.clone(), &offer)?;
             if current.status == Status::Committed {
                 bail!("committed software transfer cannot be aborted");
             }
@@ -147,6 +158,26 @@ fn source_record(vm_id: &str) -> String {
     format!(".software-transfer-source-v1-{vm_id}")
 }
 
+fn return_fence(state: &File, offer: &Offer, source_key: &str) -> Result<Option<Offer>> {
+    let Some(fence) = read_fence(state, &offer.vm_id)? else { return Ok(None) };
+    if fence.recovered
+        || fence.offer.destination_host != offer.source_host
+        || fence.destination_key != source_key
+        || fence.offer.generation >= offer.generation
+        || fence.offer.transfer_id == offer.transfer_id
+    {
+        bail!("software return transfer does not extend the pinned outgoing handoff");
+    }
+    Ok(Some(fence.offer))
+}
+
+fn require_unchanged_return_fence(state: &File, journal: &Journal) -> Result<()> {
+    if return_fence(state, &journal.offer, &journal.source_key)? != journal.return_fence {
+        bail!("software transfer outgoing handoff changed after preparation");
+    }
+    Ok(())
+}
+
 fn read_fence(state: &File, vm_id: &str) -> Result<Option<SourceFence>> {
     let path = source_record(&vm_id.to_ascii_lowercase());
     if present(state, &path)? {
@@ -159,6 +190,13 @@ fn read_fence(state: &File, vm_id: &str) -> Result<Option<SourceFence>> {
 /// Call under the state parent's exclusive lock, also taken by issuance.
 pub(super) fn local_restart_floor(state: &File, manifest: &Manifest) -> Result<u64> {
     let Some(fence) = read_fence(state, &manifest.vm_id)? else { return Ok(0) };
+    let grant = bundle::activate::return_grant_generation(state, &fence.offer)?;
+    if let Some(generation) = grant.filter(|generation| *generation > fence.offer.generation) {
+        if manifest.owner_generation < generation {
+            bail!("software checkpoint predates the return transfer grant");
+        }
+        return Ok(generation);
+    }
     if !fence.recovered {
         bail!("software VM retired for transfer; its source cannot restart it");
     }
@@ -230,17 +268,15 @@ fn issue(state: &File, checkpoint: &File, offer: Offer, key: &Ed25519KeyPair, de
     let path = source_record(&offer.vm_id);
     let fence = SourceFence { offer, source_key: STANDARD.encode(key.public_key()), destination_key: destination_key.into(), recovered: false };
     let previous = read_fence(state, &fence.offer.vm_id)?;
-    if previous.as_ref().is_some_and(|existing| existing.recovered) {
-        local_restart_floor(state, &manifest)?;
-    }
     match &previous {
         Some(existing) if existing == &fence => state.sync_all()?,
-        Some(existing)
-            if !existing.recovered || fence.offer.generation <= existing.offer.generation || fence.offer.transfer_id == existing.offer.transfer_id =>
-        {
-            bail!("software VM already has a newer or conflicting transfer fence");
+        _ => {
+            let floor = local_restart_floor(state, &manifest)?;
+            if fence.offer.generation <= floor || previous.as_ref().is_some_and(|existing| fence.offer.transfer_id == existing.offer.transfer_id) {
+                bail!("software VM already has a newer or conflicting transfer fence");
+            }
+            write_record(state, &path, &serde_json::to_vec(&fence)?, previous.is_some())?;
         }
-        _ => write_record(state, &path, &serde_json::to_vec(&fence)?, previous.is_some())?,
     }
     signed_receipt(fence.offer, key, RECEIPT_DOMAIN)
 }
@@ -329,19 +365,29 @@ fn require_incoming(state: &File, offer: &Offer) -> Result<()> {
     Ok(())
 }
 
-fn incoming_status(state: &File, offer: &Offer) -> Result<Status> {
+fn incoming_journal(state: &File, offer: &Offer) -> Result<Journal> {
     offer.validate()?;
     if offer.destination_host != host_id_in(state)? {
         bail!("software transfer does not name this host as its remote destination");
     }
-    Ok(matching(&read_incoming(state, offer)?, offer)?.status)
+    matching(read_incoming(state, offer)?, offer)
 }
 
-fn matching(previous: &Option<Journal>, offer: &Offer) -> Result<Journal> {
-    let Some(current) = previous.as_ref().filter(|j| &j.offer == offer) else {
-        bail!("software transfer does not match a prepared destination");
-    };
-    Ok(Journal { offer: offer.clone(), source_key: current.source_key.clone(), status: current.status })
+fn incoming_status(state: &File, offer: &Offer) -> Result<Status> {
+    Ok(incoming_journal(state, offer)?.status)
+}
+
+fn committed_return_fence(state: &File, offer: &Offer) -> Result<Option<Offer>> {
+    let journal = incoming_journal(state, offer)?;
+    if journal.status != Status::Committed {
+        bail!("software activation requires a committed destination transfer");
+    }
+    require_unchanged_return_fence(state, &journal)?;
+    Ok(journal.return_fence)
+}
+
+fn matching(previous: Option<Journal>, offer: &Offer) -> Result<Journal> {
+    previous.filter(|journal| &journal.offer == offer).ok_or_else(|| "software transfer does not match a prepared destination".into())
 }
 
 fn decode<const N: usize>(value: &str, label: &str) -> Result<[u8; N]> {
@@ -450,6 +496,61 @@ mod tests {
         assert!(transition(&state, old.clone(), sign(&signer, &old)).is_err());
         assert!(transition(&state, old, public_key(&signer)).is_err());
         assert_eq!(transition(&state, next.clone(), sign(&signer, &next)).unwrap(), Status::Committed);
+    }
+
+    #[test]
+    fn only_the_pinned_peer_can_replace_a_committed_destination_journal() {
+        let state = TempDir::new("transfer-return");
+        let first = offer(&state);
+        let signer = key(1);
+        let peer = key(2);
+        transition(&state, first.clone(), public_key(&signer)).unwrap();
+        transition(&state, first.clone(), sign(&signer, &first)).unwrap();
+        let mut returning = Offer { generation: 11, transfer_id: "55".repeat(16), ..first.clone() };
+        assert!(transition(&state, returning.clone(), public_key(&peer)).is_err());
+
+        let local = parent_directory(&state).unwrap();
+        let mut outgoing = SourceFence {
+            offer: Offer {
+                source_host: first.destination_host.clone(),
+                destination_host: first.source_host.clone(),
+                generation: 10,
+                transfer_id: "66".repeat(16),
+                ..first.clone()
+            },
+            source_key: STANDARD.encode(signer.public_key()),
+            destination_key: STANDARD.encode(peer.public_key()),
+            recovered: false,
+        };
+        let path = source_record(&first.vm_id);
+        write_record(&local, &path, &serde_json::to_vec(&outgoing).unwrap(), false).unwrap();
+        for invalid in [
+            Offer { source_host: "88".repeat(16), ..returning.clone() },
+            Offer { generation: outgoing.offer.generation, ..returning.clone() },
+            Offer { transfer_id: outgoing.offer.transfer_id.clone(), ..returning.clone() },
+        ] {
+            assert!(transition(&state, invalid, public_key(&peer)).is_err());
+        }
+        assert!(transition(&state, returning.clone(), public_key(&signer)).is_err());
+        assert_eq!(transition(&state, returning.clone(), public_key(&peer)).unwrap(), Status::Pending);
+        assert!(transition(&state, returning.clone(), sign(&signer, &returning)).is_err());
+
+        // A return prepared while the source was fenced cannot commit after
+        // the original outbound transfer was recovered locally.
+        outgoing.recovered = true;
+        write_record(&local, &path, &serde_json::to_vec(&outgoing).unwrap(), true).unwrap();
+        assert!(transition(&state, returning.clone(), sign(&peer, &returning)).is_err());
+        transition(&state, returning.clone(), Action::Abort).unwrap();
+        assert!(transition(&state, returning.clone(), sign(&peer, &returning)).is_err());
+
+        outgoing.recovered = false;
+        write_record(&local, &path, &serde_json::to_vec(&outgoing).unwrap(), true).unwrap();
+        returning.generation += 1;
+        returning.transfer_id = "77".repeat(16);
+        transition(&state, returning.clone(), public_key(&peer)).unwrap();
+        assert_eq!(transition(&state, returning.clone(), sign(&peer, &returning)).unwrap(), Status::Committed);
+        assert_eq!(committed_return_fence(&local, &returning).unwrap(), Some(outgoing.offer));
+        assert!(committed_return_fence(&local, &first).is_err());
     }
 
     #[test]
