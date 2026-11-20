@@ -1314,6 +1314,18 @@ mod tests {
 
     #[test]
     fn bodies_end_by_their_deadline_and_readers_are_capped() {
+        const CHILD: &str = "FLEXVM_TEST_BODY_READER_LIMIT";
+        if std::env::var_os(CHILD).is_none() {
+            // The limit is process-wide, and other request tests can hold
+            // reader slots while this fixture fills the entire pool.
+            let status = crate::test_util::status(
+                Command::new(std::env::current_exe().unwrap()).args(["--exact", "tests::bodies_end_by_their_deadline_and_readers_are_capped"]).env(CHILD, "1"),
+            )
+            .unwrap();
+            assert!(status.success(), "body reader limit helper: {status}");
+            return;
+        }
+
         let at = Instant::now() + Duration::from_secs(5);
         assert_eq!(read_body(&mut &b"echo hi"[..], -1, 7, at).unwrap(), b"echo hi");
         assert_eq!(read_body(&mut &b"echo"[..], -1, 7, at).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
