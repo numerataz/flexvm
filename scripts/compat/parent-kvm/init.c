@@ -85,6 +85,8 @@ int main(void)
             execl("/firecracker", "firecracker", "--no-api", "--config-file", "/firecracker.json", NULL);
             _exit(127);
         }
+        if (access("/parent-memory-quota", F_OK) == 0)
+            check(setenv("FLEXVM_TEST_PARENT_MEMORY_QUOTA", "1", 1) == 0, "set memory quota fixture");
         char *arguments[31] = {"kvm-run", pages};
         unsigned int next = 2;
         if (access("/split-slot", F_OK) == 0)

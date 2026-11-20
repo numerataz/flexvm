@@ -49,6 +49,7 @@ struct pvkvm {
 	wait_queue_head_t replied;
 	atomic_t interrupt_count;
 	int irq;
+	unsigned int page_limit;
 	bool dead;
 	bool vm_open;
 	bool parallel_run;
@@ -92,6 +93,7 @@ struct pvvm {
 	struct list_head irqfds;
 	struct work_struct irqfd_reap;
 	unsigned int total_pages;
+	unsigned int pending_pages;
 	bool slots_exposed;
 	bool topology_frozen;
 	bool irqchip_created;
@@ -1555,13 +1557,13 @@ static int install_slot(struct pvvm *vm, unsigned int id, u64 gpa,
 	u64 bytes = count * PAGE_SIZE;
 	unsigned int other;
 
-	if (vm->provider->dead)
+	if (READ_ONCE(vm->provider->dead))
 		return -ENODEV;
 	if (vm->slots_exposed)
 		return -EBUSY;
 	if (vm->slots[id].count)
 		return -EEXIST;
-	if (count > PVKVM_MAX_PAGES - vm->total_pages)
+	if (count > vm->provider->page_limit - vm->total_pages)
 		return -ENOSPC;
 	if (vm->tss_set && overlaps(gpa, bytes, vm->tss_gpa, PVKVM_TSS_SIZE))
 		return -EEXIST;
@@ -1955,6 +1957,25 @@ static long vm_clock(struct pvvm *vm, bool write, struct kvm_clock_data __user *
 	return result;
 }
 
+static int reserve_slot_pages(struct pvvm *vm, unsigned int pages)
+{
+	struct pvkvm *p = vm->provider;
+	int result = mutex_lock_interruptible(&p->lock);
+
+	if (result)
+		return result;
+	if (READ_ONCE(p->dead))
+		result = -ENODEV;
+	else if (vm->slots_exposed)
+		result = -EBUSY;
+	else if (pages > p->page_limit - vm->total_pages - vm->pending_pages)
+		result = -ENOSPC;
+	else
+		vm->pending_pages += pages;
+	mutex_unlock(&p->lock);
+	return result;
+}
+
 static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct pvvm *vm = file->private_data;
@@ -2003,23 +2024,36 @@ static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	    !PAGE_ALIGNED(memory.userspace_addr))
 		return -EINVAL;
 	pages = memory.memory_size / PAGE_SIZE;
+	result = reserve_slot_pages(vm, pages);
+	if (result)
+		return result;
 	slot = kvmalloc_array(pages, sizeof(*slot), GFP_KERNEL);
-	if (!slot)
-		return -ENOMEM;
+	if (!slot) {
+		result = -ENOMEM;
+		goto release_reservation;
+	}
 	pinned = pin_user_pages_fast(memory.userspace_addr, pages, FOLL_WRITE | FOLL_LONGTERM, slot);
 	if (pinned != pages) {
 		if (pinned > 0)
 			unpin_user_pages(slot, pinned);
 		kvfree(slot);
-		return pinned < 0 ? pinned : -EFAULT;
+		result = pinned < 0 ? pinned : -EFAULT;
+		goto release_reservation;
 	}
 	mutex_lock(&p->lock);
 	result = install_slot(vm, memory.slot, memory.guest_phys_addr, slot, pages);
+	if (!result)
+		vm->pending_pages -= pages;
 	mutex_unlock(&p->lock);
-	if (result) {
-		unpin_user_pages(slot, pages);
-		kvfree(slot);
-	}
+	if (!result)
+		return 0;
+	unpin_user_pages(slot, pages);
+	kvfree(slot);
+
+release_reservation:
+	mutex_lock(&p->lock);
+	vm->pending_pages -= pages;
+	mutex_unlock(&p->lock);
 	return result;
 }
 
@@ -2199,12 +2233,13 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	BUILD_BUG_ON(PVKVM_VCPU_EVENTS_AT + PVKVM_VCPU_EVENTS_BYTES > PVKVM_CLOCK_AT);
 	BUILD_BUG_ON(sizeof(struct kvm_clock_data) != PVKVM_CLOCK_BYTES);
 	BUILD_BUG_ON(PVKVM_FEATURES_AT + sizeof(u32) > PVKVM_REGISTERS_AT);
-	BUILD_BUG_ON(PVKVM_CLOCK_AT + PVKVM_CLOCK_BYTES > PVKVM_LANES_AT);
+	BUILD_BUG_ON(PVKVM_CLOCK_AT + PVKVM_CLOCK_BYTES > PVKVM_RAM_LIMIT_AT);
+	BUILD_BUG_ON(PVKVM_RAM_LIMIT_AT + sizeof(u32) > PVKVM_LANES_AT);
 	BUILD_BUG_ON(PVKVM_LANE_EXIT + sizeof(struct pvkvm_run_exit) > PVKVM_LANE_COMPLETE);
 	BUILD_BUG_ON(PVKVM_LANE_COMPLETE + sizeof(struct pvkvm_read_completion) > PVKVM_LANE_PIO);
 	BUILD_BUG_ON(PVKVM_LANE_PIO + PVKVM_PIO_BYTES > PVKVM_LANE_STRIDE);
 	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
-	    pci_resource_len(dev, 2) < PVKVM_CLOCK_AT + PVKVM_CLOCK_BYTES)
+	    pci_resource_len(dev, 2) < PVKVM_RAM_LIMIT_AT + sizeof(u32))
 		return -ENODEV;
 	result = pcim_enable_device(dev);
 	if (result)
@@ -2230,6 +2265,11 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	    readl(p->mailbox + PVKVM_VERSION_AT) != PVKVM_VERSION ||
 	    readl(p->mailbox + PVKVM_REQUEST_AT) || readl(p->mailbox + PVKVM_REPLY_AT)) {
 		result = -ENODEV;
+		goto free_provider;
+	}
+	p->page_limit = readl(p->mailbox + PVKVM_RAM_LIMIT_AT) ?: PVKVM_MAX_PAGES;
+	if (p->page_limit > PVKVM_MAX_PAGES) {
+		result = -EINVAL;
 		goto free_provider;
 	}
 	p->parallel_run = readl(p->mailbox + PVKVM_FEATURES_AT) & PVKVM_FEATURE_PARALLEL_RUN;
