@@ -1,11 +1,14 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 #define _GNU_SOURCE
 #include <fcntl.h>
+#include <inttypes.h>
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/random.h>
 #include <sys/reboot.h>
+#include <time.h>
 #include <unistd.h>
 
 static void check(int ok, const char *why)
@@ -41,13 +44,25 @@ int main(void)
     memset(data, 0, sizeof(data));
     check(pread(block, data, sizeof(data), 4096) == sizeof(data) &&
           memcmp(data, written, sizeof(written)) == 0, "read back written virtio block marker");
-    close(block);
     puts("PASS ARM Firecracker virtio block read, write and flush");
 #ifdef FLEXVM_ARM_TEST_CHECKPOINT
+    uint64_t canary;
+    struct timespec before, after;
+    check(getrandom(&canary, sizeof(canary), 0) == sizeof(canary) &&
+          clock_gettime(CLOCK_MONOTONIC, &before) == 0, "prepare ARM checkpoint canary");
+    printf("ARM Firecracker checkpoint canary %016" PRIx64 "\n", canary);
     puts("ARM Firecracker checkpoint window");
     sleep(5);
+    check(clock_gettime(CLOCK_MONOTONIC, &after) == 0 &&
+          (after.tv_sec > before.tv_sec || (after.tv_sec == before.tv_sec && after.tv_nsec > before.tv_nsec)),
+          "ARM guest clock advanced");
+    memset(data, 0, sizeof(data));
+    check(pread(block, data, sizeof(data), 4096) == sizeof(data) &&
+          memcmp(data, written, sizeof(written)) == 0, "read virtio block marker after resume");
+    printf("ARM Firecracker restored canary %016" PRIx64 "\n", canary);
     puts("PASS ARM Firecracker resumed after checkpoint freeze");
 #endif
+    close(block);
     sleep(1);
     puts("PASS ARM Firecracker architected timer");
     reboot(RB_POWER_OFF);
