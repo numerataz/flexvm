@@ -942,6 +942,27 @@ static long cpu_lapic(struct pvcpu *cpu, bool write, void __user *user)
 	return result;
 }
 
+static long cpu_debugregs(struct pvcpu *cpu, bool write, struct kvm_debugregs __user *user)
+{
+	struct kvm_debugregs state;
+	int result;
+
+	if (write) {
+		if (copy_from_user(&state, user, sizeof(state)))
+			return -EFAULT;
+		if (state.flags || state.dr6 > U32_MAX || state.dr7 > U32_MAX)
+			return -EINVAL;
+		memset(state.reserved, 0, sizeof(state.reserved));
+		return write_stopped_registers(cpu, PVKVM_SET_DEBUGREGS, PVKVM_DEBUGREGS_AT,
+					       &state, sizeof(state));
+	}
+	result = read_stopped_registers(cpu, PVKVM_GET_DEBUGREGS, PVKVM_DEBUGREGS_AT,
+					&state, sizeof(state));
+	if (!result && copy_to_user(user, &state, sizeof(state)))
+		return -EFAULT;
+	return result;
+}
+
 static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct pvcpu *cpu = file->private_data;
@@ -1063,6 +1084,10 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case KVM_SET_LAPIC:
 		result = cpu_lapic(cpu, cmd == KVM_SET_LAPIC, uarg);
 		break;
+	case KVM_GET_DEBUGREGS:
+	case KVM_SET_DEBUGREGS:
+		result = cpu_debugregs(cpu, cmd == KVM_SET_DEBUGREGS, uarg);
+		break;
 	case KVM_RUN:
 		if (arg || cpu->sregs.cs.base || !registers_fit_mode(&cpu->regs, &cpu->sregs) ||
 		    (!(cpu->sregs.cr0 & X86_CR0_PE) && cpu->regs.rip > U16_MAX)) {
@@ -1149,6 +1174,7 @@ static long device_capability(unsigned long capability)
 	case KVM_CAP_IRQFD:
 	case KVM_CAP_SET_TSS_ADDR:
 	case KVM_CAP_IRQCHIP:
+	case KVM_CAP_DEBUGREGS:
 		return 1;
 	case KVM_CAP_NR_MEMSLOTS:
 		return PVKVM_MAX_SLOTS;
@@ -1770,8 +1796,10 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	BUILD_BUG_ON(sizeof(struct kvm_irqchip) != PVKVM_IRQCHIP_BYTES);
 	BUILD_BUG_ON(PVKVM_IRQCHIP_AT + PVKVM_IRQCHIP_BYTES > PVKVM_PIT_STATE_AT);
 	BUILD_BUG_ON(sizeof(struct kvm_pit_state2) != PVKVM_PIT_STATE_BYTES);
+	BUILD_BUG_ON(PVKVM_PIT_STATE_AT + PVKVM_PIT_STATE_BYTES > PVKVM_DEBUGREGS_AT);
+	BUILD_BUG_ON(sizeof(struct kvm_debugregs) != PVKVM_DEBUGREGS_BYTES);
 	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
-	    pci_resource_len(dev, 2) < PVKVM_PIT_STATE_AT + PVKVM_PIT_STATE_BYTES)
+	    pci_resource_len(dev, 2) < PVKVM_DEBUGREGS_AT + PVKVM_DEBUGREGS_BYTES)
 		return -ENODEV;
 	result = pcim_enable_device(dev);
 	if (result)

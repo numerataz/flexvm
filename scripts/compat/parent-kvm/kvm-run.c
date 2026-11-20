@@ -57,6 +57,12 @@
 #define IOAPIC_VECTOR (32 + IOAPIC_GSI)
 #define IOAPIC_HANDLER_OFFSET 0xd40
 #define IOAPIC_ENTRY_OFFSET 0xe00
+#define DEBUG_ENTRY_OFFSET 0xb80
+#define DEBUG_HANDLER_OFFSET 0xc00
+#define DEBUG_IDT_OFFSET 0xd00
+#define DEBUG_IDTR_OFFSET 0x540
+#define DEBUG_TARGET_OFFSET (DEBUG_ENTRY_OFFSET + 7)
+#define DEBUG_DR1_GUEST_VALUE 0x3399
 #define MMIO_BASE 0xd0000000ULL
 #define MMIO_FIRST_VALUE 0x5a443322U
 #define MMIO_SECOND_VALUE 0xaabbccddeeff0011ULL
@@ -695,6 +701,82 @@ static struct kvm_pit_state2 read_pit_state(int vm)
     return state;
 }
 
+static struct kvm_debugregs read_debugregs(int cpu)
+{
+    struct kvm_debugregs state;
+
+    check(ioctl(cpu, KVM_GET_DEBUGREGS, &state) == 0, "read actual debug registers");
+    return state;
+}
+
+static void stage_debugregs(int kvm, int cpu, uint64_t gpa)
+{
+    check(ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_DEBUGREGS) > 0, "check debug register support");
+    struct kvm_debugregs state = read_debugregs(cpu);
+
+    check(state.db[0] == 0 && !(state.dr6 & 0xf) && state.dr7 == 0x400 && !state.flags,
+          "read the reset debug registers");
+    state.db[0] = gpa + DEBUG_TARGET_OFFSET;
+    state.db[1] = 0x1111;
+    state.dr7 |= 1; /* Enable local execution breakpoint 0. */
+    state.flags = 1;
+    check(ioctl(cpu, KVM_SET_DEBUGREGS, &state) == -1 && errno == EINVAL, "reject nonzero debug flags");
+    state.flags = 0;
+    check(ioctl(cpu, KVM_SET_DEBUGREGS, &state) == 0, "stage a hardware breakpoint before first execution");
+    struct kvm_debugregs staged = read_debugregs(cpu);
+
+    check(!memcmp(&state, &staged, sizeof(state)), "read back staged debug registers");
+}
+
+static void test_debugregs(int cpu, struct kvm_run *run, int size, unsigned char *ram, unsigned char *data,
+                           uint64_t gpa, uint64_t data_address)
+{
+    const unsigned char program[] = {
+        0x0f, 0x01, 0x9f, 0x40, 0x05, 0, 0, /* lidt [edi+0x540] */
+        0x90,                               /* execution breakpoint 0 */
+        0xb8, 0x99, 0x33, 0, 0,             /* mov eax, 0x3399 */
+        0x0f, 0x23, 0xc8,                   /* mov dr1, eax */
+        0xb0, 0x7d, 0xe6, 0x30, 0xf4,
+    };
+    const unsigned char exception[] = {
+        0x0f, 0x21, 0xf0,                   /* mov eax, dr6 */
+        0x89, 0x87, 0xe4, 0, 0, 0,          /* store DR6 in shared data */
+        0xff, 0x04, 0x24,                   /* skip the faulting NOP */
+        0xcf,                               /* iret */
+    };
+    uint32_t handler = gpa + DEBUG_HANDLER_OFFSET;
+    uint32_t idt = gpa + DEBUG_IDT_OFFSET;
+    uint16_t limit = 15; /* Debug exception is vector 1. */
+    const uint32_t gate[] = {(handler & 0xffff) | (8 << 16), (handler & 0xffff0000) | 0x8e00};
+    const struct kvm_regs regs = {
+        .rcx = 0x7654, .rsp = gpa + 0xf00, .rdi = data_address,
+        .rip = gpa + DEBUG_ENTRY_OFFSET, .rflags = 2,
+    };
+
+    memcpy(ram + DEBUG_ENTRY_OFFSET, program, sizeof(program));
+    memcpy(ram + DEBUG_HANDLER_OFFSET, exception, sizeof(exception));
+    memcpy(ram + DEBUG_IDT_OFFSET + 8, gate, sizeof(gate));
+    memcpy(data + DEBUG_IDTR_OFFSET, &limit, sizeof(limit));
+    memcpy(data + DEBUG_IDTR_OFFSET + sizeof(limit), &idt, sizeof(idt));
+    check(ioctl(cpu, KVM_SET_REGS, &regs) == 0, "enter the guest debug program");
+    timed_run(cpu);
+    check_output(run, size, 0x7d);
+    check_registers(cpu, 0x7d, 0x7654, gpa + DEBUG_ENTRY_OFFSET);
+    uint32_t guest_dr6;
+    memcpy(&guest_dr6, data + 0xe4, sizeof(guest_dr6));
+    struct kvm_debugregs live = read_debugregs(cpu);
+
+    check((guest_dr6 & 0xf) == 1 && (live.dr6 & 0xf) == 1 && live.db[1] == DEBUG_DR1_GUEST_VALUE &&
+          live.db[0] == gpa + DEBUG_TARGET_OFFSET, "observe the real #DB and guest-written DR1");
+    live.dr7 &= ~1ULL;
+    live.db[0] = 0x7788;
+    check(ioctl(cpu, KVM_SET_DEBUGREGS, &live) == 0, "replace debug registers on the stopped vCPU");
+    struct kvm_debugregs restored = read_debugregs(cpu);
+
+    check(!memcmp(&live, &restored, sizeof(live)), "read the restored live debug registers");
+    puts("PASS staged hardware breakpoint and live debug registers");
+}
+
 static void stage_pit_state(int vm)
 {
     struct kvm_pit_state2 state = read_pit_state(vm);
@@ -1089,6 +1171,7 @@ int main(int argc, char **argv)
     bool irqchip = false;
     bool pit = false;
     bool pit_state = false;
+    bool debugregs = false;
     bool irqfd = false;
     bool zero_slot = false;
     bool tss = false;
@@ -1125,6 +1208,8 @@ int main(int argc, char **argv)
             pit = true;
         else if (!pit_state && !strcmp(argv[i], "pit-state"))
             pit_state = true;
+        else if (!debugregs && !strcmp(argv[i], "debugregs"))
+            debugregs = true;
         else if (!irqfd && !strcmp(argv[i], "irqfd"))
             irqfd = true;
         else if (!zero_slot && !strcmp(argv[i], "zero-slot"))
@@ -1164,6 +1249,8 @@ int main(int argc, char **argv)
           "test a single protected-mode PIC vCPU");
     check(!pit || irqchip, "test the PIT with a PIC vCPU");
     check(!pit_state || pit, "PIT_STATE2 requires the PIT fixture");
+    check(!debugregs || (protected_mode && !two_vcpus && !zero_slot && !long_mode &&
+                         !mmio && !irqchip && !cpuid), "use the single-vCPU protected debug fixture");
     check(!irqfd || (irqchip && !pit), "test IRQFD in a separate PIC vCPU run");
     check(!zero_slot || (count >= 258 && protected_mode && !split_slot && !long_mode &&
           !irqchip && !cpuid && !two_vcpus), "test one zero-based slot across the PC legacy region");
@@ -1512,6 +1599,8 @@ int main(int argc, char **argv)
     check(ioctl(cpu, KVM_GET_REGS, &readback) == 0 && !memcmp(&readback, &regs, sizeof(regs)),
           "read back initial registers");
     select_segments(cpu, protected_mode, long_mode, gpa, pvh);
+    if (debugregs)
+        stage_debugregs(kvm, cpu, gpa);
     if (fpu)
         prepare_fpu(cpu);
     if (msrs)
@@ -1688,6 +1777,8 @@ int main(int argc, char **argv)
         puts("PASS child CPUID instructions used the installed vCPU profiles");
     if (mmio)
         puts("PASS MMIO writes returned physical addresses and exact data");
+    if (debugregs)
+        test_debugregs(cpu, run, size, ram, data, gpa, data_address);
     munmap(run, size);
     close(cpu);
     munmap(ram, ram_bytes);

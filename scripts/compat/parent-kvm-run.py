@@ -43,7 +43,7 @@ EFER_LONG_MODE_ENABLE = 1 << 8
 (OPEN_VM, CLOSE_VM, OPEN_CPU, CLOSE_CPU, RUN, GET_REGS, SET_REGS, GET_SREGS,
  GET_FPU, SET_FPU, GET_MSRS, SET_MSRS, GET_SUPPORTED_CPUID, CREATE_IRQCHIP, SET_IRQ_LINE,
  CREATE_PIT, SET_TSS_ADDR, GET_LAPIC, SET_LAPIC, COMPLETE_READ, GET_IRQCHIP, SET_IRQCHIP,
- GET_PIT, SET_PIT) = range(1, 25)
+ GET_PIT, SET_PIT, GET_DEBUGREGS, SET_DEBUGREGS) = range(1, 27)
 FPU_VALID_AT = 48
 FPU_AT = 768
 FPU_SIZE = 416
@@ -74,6 +74,9 @@ IRQCHIP_HEADER = struct.Struct("<II")
 IRQCHIP_PAYLOAD_SIZES = (16, 16, 216)
 PIT_STATE_AT = 0x87300
 PIT_STATE_SIZE = 112
+DEBUGREGS_AT = 0x87400
+DEBUGREGS = struct.Struct("<6Q80x")
+DEBUGREGS_FIELDS = ("dr0", "dr1", "dr2", "dr3", "dr6", "dr7")
 PIO_WRITES = ((0x3f8, 1, b"L"), (0x2f8, 2, b"\xcd\xab"),
               (0xcf8, 4, b"\x00\x00\x00\x80"), (0x3f8, 1, b"vmio"))
 PIO_READS = ((0x3fd, 1, b"\x60"), (0x2f8, 2, b"\x67\x45"),
@@ -587,6 +590,14 @@ class TcgChild:
     def set_pit_state(self, record):
         self.special_command("x-flexvm-access-x86-pit", {"record": record.hex()})
 
+    def debugregs(self, cpu):
+        result = self.special_command("x-flexvm-access-x86-debugregs", {"cpu-index": cpu})
+        return pack_debugregs(result)
+
+    def set_debugregs(self, cpu, record):
+        state = dict(zip(DEBUGREGS_FIELDS, DEBUGREGS.unpack(record), strict=True))
+        self.special_command("x-flexvm-access-x86-debugregs", {"cpu-index": cpu, "state": state})
+
     def pulse_irq(self, gsi):
         self.special_command("x-flexvm-pulse-x86-gsi", {"gsi": gsi})
 
@@ -742,6 +753,18 @@ class KvmChild:
         self.channel.connection.sendall(b"Y\0" + record)
         if self.channel.connection.recv(2) != b"Y":
             raise RuntimeError("native parent worker did not acknowledge the PIT write")
+
+    def debugregs(self, cpu):
+        self.channel.connection.sendall(bytes((ord("H"), cpu)))
+        result = self.channel.connection.recv(DEBUGREGS.size + 1)
+        if len(result) != DEBUGREGS.size:
+            raise RuntimeError("native parent worker returned an invalid debug register image")
+        return result
+
+    def set_debugregs(self, cpu, record):
+        self.channel.connection.sendall(bytes((ord("I"), cpu)) + record)
+        if self.channel.connection.recv(2) != b"I":
+            raise RuntimeError("native parent worker did not acknowledge the debug registers")
 
     def close(self):
         if self.channel is not None:
@@ -912,6 +935,21 @@ def unstarted_pit_state(engine, qemu, output, control, flags, staged):
         return parse_pit_state(monitor.ask("x-flexvm-access-x86-pit", args))
 
 
+def pack_debugregs(state):
+    return DEBUGREGS.pack(*(state[field] for field in DEBUGREGS_FIELDS))
+
+
+def reset_debugregs(engine, qemu, output, control, cpu_count, cpu):
+    if engine == "kvm":
+        native = subprocess.run([output / "native-worker", "--reset-debugregs", str(cpu)],
+                                capture_output=True, timeout=3)
+        if native.returncode or len(native.stdout) != DEBUGREGS.size:
+            raise RuntimeError(f"native debug register query failed: {native.stderr.decode(errors='replace')}")
+        return native.stdout
+    with model_monitor(qemu, output, control, cpu_count, "debugregs") as monitor:
+        return pack_debugregs(monitor.ask("x-flexvm-access-x86-debugregs", {"cpu-index": cpu}))
+
+
 def read_slot_table(mailbox, ram_pages, outer_bytes, protected_entry, split_slot, zero_slot):
     first_gpa = PROTECTED_GPA if protected_entry else PAGE_SIZE
     if zero_slot:
@@ -993,7 +1031,7 @@ def verify_slot_spans(pid, slots):
 def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry,
              split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs, cpuid, mmio, mmio_read,
              ioeventfd, irqchip, pit, irqfd, zero_slot, tss, lapic, pio, complete_read, pio_boundary, pvh,
-             irqchip_state, pit_state):
+             irqchip_state, pit_state, debugregs):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
@@ -1013,6 +1051,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
     elif pvh:
         expected.append(CREATE_IRQCHIP)
     expected.extend((OPEN_CPU, GET_SREGS) * cpu_count)
+    if debugregs:
+        expected.extend((GET_DEBUGREGS, SET_DEBUGREGS, GET_DEBUGREGS))
     if lapic:
         expected.append(GET_LAPIC)
     expected_counters = []
@@ -1076,6 +1116,10 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         expected.extend((SET_REGS, RUN, GET_REGS) * 2)
         expected_counters.extend((0x5432, 0x5432))
         expected_io.extend(((0, 0x6c), (0, 0x6c)))
+    if debugregs:
+        expected.extend((SET_REGS, RUN, GET_REGS, GET_DEBUGREGS, SET_DEBUGREGS, GET_DEBUGREGS))
+        expected_counters.append(0x7654)
+        expected_io.append((0, 0x7d))
     expected.extend((CLOSE_CPU, CLOSE_VM))
     if reject_close:
         expected = expected[:-1]
@@ -1093,6 +1137,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
     irqchip_created = False
     pit_flags = None
     staged_pit = None
+    staged_debugregs = {}
     tss_gpa = None
     irq_levels = []
     expected_irq_levels = IRQ_LEVELS + ([(6, 1), (6, 0)] if irqchip_state else []) if irqchip else []
@@ -1118,7 +1163,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 29)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 30)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
         os.ftruncate(outer_ram, outer_ram_size)
@@ -1176,7 +1221,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 raise RuntimeError(f"unexpected doorbell request {pending}, command {opcode}")
             cpu, = struct.unpack_from("<I", mapping, 44)
             cpu_commands = (CLOSE_CPU, RUN, GET_REGS, GET_SREGS, SET_REGS, GET_FPU, SET_FPU, GET_MSRS, SET_MSRS,
-                            GET_LAPIC, SET_LAPIC, COMPLETE_READ)
+                            GET_LAPIC, SET_LAPIC, COMPLETE_READ, GET_DEBUGREGS, SET_DEBUGREGS)
             if opcode in cpu_commands and cpu not in open_cpus:
                 raise RuntimeError(f"command {opcode} requested unopened vCPU {cpu}")
             status = 0
@@ -1267,6 +1312,24 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                     raise RuntimeError("completion-only entry requires an outstanding read")
                 child.complete_read(cpu, read_completion(mapping, pending_read, pio_reads, completed_reads))
                 pending_read = None
+            elif opcode in (GET_DEBUGREGS, SET_DEBUGREGS):
+                if length:
+                    raise RuntimeError("unexpected memory argument for debug registers")
+                end = DEBUGREGS_AT + DEBUGREGS.size
+                if opcode == SET_DEBUGREGS:
+                    record = mapping[DEBUGREGS_AT:end]
+                    if child is None:
+                        staged_debugregs[cpu] = record
+                    else:
+                        child.set_debugregs(cpu, record)
+                else:
+                    if child is not None:
+                        record = child.debugregs(cpu)
+                    elif cpu in staged_debugregs:
+                        record = staged_debugregs[cpu]
+                    else:
+                        record = reset_debugregs(parent_engine, qemu, output, control, cpu_count, cpu)
+                    mapping[DEBUGREGS_AT:end] = record
             elif opcode == RUN:
                 if child is None:
                     if length != slot_size or len(open_cpus) != cpu_count:
@@ -1280,6 +1343,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                         child.set_irqchip(id, image)
                     if staged_pit is not None:
                         child.set_pit_state(staged_pit)
+                    for id, record in staged_debugregs.items():
+                        child.set_debugregs(id, record)
                     for line, level in staged_irq_levels:
                         child.set_irq(line, level)
                 elif length:
@@ -1414,6 +1479,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 or irqchip and "PASS child PIC delivered and acknowledged the parent IRQ" not in guest
                 or pit and "PASS PIT woke the halted vCPU" not in guest
                 or pit_state and "PASS restored live PIT state woke the halted vCPU" not in guest
+                or debugregs and "PASS staged hardware breakpoint and live debug registers" not in guest
                 or irqfd and "PASS KVM_IRQFD woke an active run and honored deassignment and pending signals" not in guest
                 or zero_slot and "PASS zero-based RAM shared every tested page across the legacy PC region" not in guest
                 or tss and "PASS child ran with Firecracker's three-page TSS reservation" not in guest
@@ -1459,6 +1525,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         "irqchip_state": irqchip_state,
         "pit_flags": pit_flags,
         "pit_state": pit_state,
+        "debugregs": debugregs,
         "irqfd": irqfd,
         "tcg_irqfd_pulses": pulses,
         "zero_based_ram": zero_slot,
@@ -1511,6 +1578,7 @@ def main():
     parser.add_argument("--irqchip", action="store_true", help="deliver a real PIC interrupt on a stopped worker")
     parser.add_argument("--pit", action="store_true", help="program a PIT interrupt that wakes a halted worker")
     parser.add_argument("--pit-state", action="store_true", help="restore timer state and verify a real wakeup")
+    parser.add_argument("--debugregs", action="store_true", help="verify staged debug registers and a hardware breakpoint")
     parser.add_argument("--irqfd", action="store_true", help="wake an active run through KVM_IRQFD")
     parser.add_argument("--zero-slot", action="store_true", help="share RAM at GPA zero across the PC legacy region")
     parser.add_argument("--tss", action="store_true", help="reserve Firecracker's x86 TSS address")
@@ -1570,6 +1638,9 @@ def main():
         parser.error("--interrupt-run requires protected mode")
     if args.two_vcpus and not args.protected_entry:
         parser.error("--two-vcpus requires protected mode")
+    if args.debugregs and (not args.protected_entry or args.two_vcpus or args.zero_slot or args.long_mode or
+                           args.mmio_write or args.irqchip or args.cpuid):
+        parser.error("--debugregs requires the single-vCPU protected-mode fixture")
     qemu, kernel = (path.resolve(strict=True) for path in (args.qemu, args.kernel))
     output = args.output.resolve()
     if os.geteuid() != 0 or platform.machine() != "x86_64":
@@ -1580,7 +1651,7 @@ def main():
                                   2 if args.two_vcpus else 1, args.long_mode, args.fpu, args.msrs, args.cpuid,
                                   args.mmio_write, args.mmio_read, args.ioeventfd, args.irqchip, args.pit,
                                   args.irqfd, args.zero_slot, args.tss, args.lapic, args.pio, args.complete_read,
-                                  args.pio_boundary, args.pvh, args.irqchip_state, args.pit_state)))
+                                  args.pio_boundary, args.pvh, args.irqchip_state, args.pit_state, args.debugregs)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -1650,6 +1721,8 @@ def main():
                 oracle.append("irqchip-state")
             if args.pit_state:
                 oracle.append("pit-state")
+            if args.debugregs:
+                oracle.append("debugregs")
             HELPERS["run"](oracle, 14 if args.interrupt_run else 8, output / "native-kvm.log")
             report["same_client_passed_native_kvm"] = True
             report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
@@ -1701,6 +1774,8 @@ def main():
             files["irqchip-state"] = b""
         if args.pit_state:
             files["pit-state"] = b""
+        if args.debugregs:
+            files["debugregs"] = b""
         image = HELPERS["initramfs"](init.read_bytes(), files=files)
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
@@ -1744,6 +1819,7 @@ def main():
                             *(["--pvh"] if args.pvh else []),
                             *(["--irqchip-state"] if args.irqchip_state else []),
                             *(["--pit-state"] if args.pit_state else []),
+                            *(["--debugregs"] if args.debugregs else []),
                             *(["--reject-close"] if args.reject_close else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}
@@ -1755,7 +1831,7 @@ def main():
             workers = {line.split()[0] for line in lines if worker_path in line and line.endswith(" = 0")}
             kvm_users = {line.split()[0] for line in lines if '"/dev/kvm"' in line}
             reset_queries = 2 if args.two_vcpus else 1
-            model_queries = int(args.cpuid) + int(args.lapic) + int(args.irqchip_state) + 2 * int(args.pit_state)
+            model_queries = sum((args.cpuid, args.lapic, args.irqchip_state, args.debugregs)) + 2 * int(args.pit_state)
             if len(workers) != 1 + model_queries + reset_queries or kvm_users != workers:
                 raise RuntimeError("only the native parent worker may use host KVM")
         report.update(json.loads(worker.read_text()), status="passed", host_device_access=bool(devices),
