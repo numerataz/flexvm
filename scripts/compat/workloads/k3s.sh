@@ -81,7 +81,8 @@ PYFIXTURE
         image=docker.io/flexvm/busybox:compat
         policy=Never
         k3s crictl inspecti "$image" > "$base/fixture-image.json"
-        k3s ctr --namespace k8s.io images export "$base/imported-image.tar" "$image"
+        # The direct exporter writes the complete archive before ctr returns.
+        k3s ctr --namespace k8s.io images export --local --skip-manifest-json "$base/imported-image.tar" "$image"
         python3 /nested-input/verify-fixture-import.py --archive "$base/imported-image.tar" --metadata /nested-input/busybox.json
         rm "$base/imported-image.tar"
     fi
