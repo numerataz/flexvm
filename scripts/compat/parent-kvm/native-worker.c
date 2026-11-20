@@ -30,10 +30,11 @@ static void interrupt_run(int signal, siginfo_t *info, void *context)
     (void)context;
     if (info->si_code != SI_QUEUE || info->si_value.sival_int < 0)
         return;
-    if (info->si_value.sival_int == 0)
+    int seq = info->si_value.sival_int;
+    if (seq == 0)
         stop_requested = 1;
-    else
-        cancelled_run = info->si_value.sival_int;
+    else if (seq > cancelled_run)
+        cancelled_run = seq;
     if (active_run && (stop_requested || cancelled_run == active_run))
         __atomic_store_n(&run_page->immediate_exit, 1, __ATOMIC_RELAXED);
 }
@@ -286,7 +287,11 @@ static void serve_cpu_request(struct native_lane *lane, int control,
     active_run = (sig_atomic_t)sequence;
     if (stop_requested || cancelled_run == active_run)
         __atomic_store_n(&run->immediate_exit, 1, __ATOMIC_RELAXED);
-    int result = ioctl(lane->cpu, KVM_RUN, 0);
+    int result;
+    do {
+        result = ioctl(lane->cpu, KVM_RUN, 0);
+    } while (result < 0 && errno == EINTR && !stop_requested &&
+             cancelled_run != (sig_atomic_t)sequence);
     active_run = 0;
     lane->pending_write = false;
     if (stop_requested)
