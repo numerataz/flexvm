@@ -719,7 +719,7 @@ class TcgChild:
         self.debugger = None
         self.special_monitor = None
         self.cpuid_profiles = {}
-        self.irqchip = bool(irq_fds)
+        self.irqchip_enabled = bool(irq_fds)
         self.directory = control / "c"
         self.directory.mkdir(mode=0o700)
         socket_path = self.directory / "child.sock"
@@ -979,7 +979,7 @@ class TcgChild:
         return state["status"]
 
     def vcpu_events(self, cpu, record=None):
-        args = {"cpu-index": cpu, "irqchip": self.irqchip}
+        args = {"cpu-index": cpu, "irqchip": self.irqchip_enabled}
         if record is not None:
             args["record"] = record.hex()
         state = self.special_command("x-flexvm-access-x86-vcpu-events", args)
