@@ -837,6 +837,7 @@ fn restore_config(manifest: &software_state::Manifest) -> qemu::Config {
         mem_mib: manifest.memory_mib,
         vcpus: manifest.vcpus,
         boot_timeout: Duration::from_secs(120),
+        parent_kvm: None,
     }
 }
 

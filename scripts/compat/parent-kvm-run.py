@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run a parent worker against a pinned KVM memory slot in shared outer RAM."""
 import argparse
+from collections import deque
 from contextlib import ExitStack, contextmanager
 import ctypes
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ import platform
 import re
 import runpy
 import select
+import shutil
 import signal
 import socket
 import struct
@@ -328,10 +330,41 @@ def cpuid_arguments(cpu, entries):
     ]}
 
 
+@dataclass(frozen=True)
+class OuterLaunch:
+    command: tuple[str, ...]
+    inherited_fds: tuple[int, ...]
+    memory_mib: int
+    emulator_fd: int | None
+    control: Path | None
+
+
+def spawn_owned(command, **kwargs):
+    owner = os.getpid()
+    prctl = ctypes.CDLL(None, use_errno=True).prctl
+
+    def bind_to_owner():
+        if prctl(1, signal.SIGKILL, 0, 0, 0) or os.getppid() != owner:  # PR_SET_PDEATHSIG
+            os._exit(127)
+
+    return subprocess.Popen(command, preexec_fn=bind_to_owner, **kwargs)
+
+
 def stop_process(process):
     if process.poll() is None:
         process.kill()
     process.wait()
+
+
+def native_query(command, *, input=None):
+    with spawn_owned(command, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+                     stdout=subprocess.PIPE, stderr=subprocess.PIPE) as process:
+        try:
+            stdout, stderr = process.communicate(input, timeout=3)
+        except subprocess.TimeoutExpired:
+            stop_process(process)
+            raise
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
 def decode_run_exit(output):
@@ -492,7 +525,7 @@ class RegisterChannel:
 
 
 class TcgChild:
-    def __init__(self, qemu, output, socket_path, outer_ram, layouts, slots, cpu_count, mmio_base, pit_flags, irq_fds,
+    def __init__(self, qemu, output, control, outer_ram, layouts, slots, cpu_count, mmio_base, pit_flags, irq_fds,
                  fixture_checks, parallel):
         self.process = None
         self.channel = None
@@ -500,6 +533,9 @@ class TcgChild:
         self.debugger = None
         self.special_monitor = None
         self.irqchip = bool(irq_fds)
+        self.directory = control / "c"
+        self.directory.mkdir(mode=0o700)
+        socket_path = self.directory / "child.sock"
         debugger_path = socket_path.with_name("registers.sock")
         self.special_monitor_path = socket_path.with_name("special-registers.sock")
         self.memory = outer_ram
@@ -522,7 +558,7 @@ class TcgChild:
                     exit_device += f",mmio-base={mmio_base}"
                 pit = "off" if pit_flags is None else "on"
                 lane_args = []
-                if parallel:
+                if parallel and cpu_count > 1:
                     second_path = socket_path.with_name("child1.sock")
                     second = sockets.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
                     second.bind(str(second_path))
@@ -543,12 +579,15 @@ class TcgChild:
                 for slot, layout in zip(slots, layouts, strict=True):
                     command.extend(["-device", f"flexvm-shared-ram,id=slot{slot.identifier},"
                                     f"ram-fd={outer_ram},layout-fd={layout},addr={slot.gpa}"])
-                self.process = subprocess.Popen(command, pass_fds=(outer_ram, *layouts), stdout=log, stderr=log)
+                self.process = spawn_owned(command, pass_fds=(outer_ram, *layouts), stdout=log, stderr=log)
                 connection, _ = listener.accept()
                 self.channel = RunChannel(connection, irq_fds, self.pulse_irq)
                 if parallel:
-                    other_connection, _ = second.accept()
-                    self.lanes = RunLanes([self.channel, RunChannel(other_connection)])
+                    channels = [self.channel]
+                    if cpu_count > 1:
+                        other_connection, _ = second.accept()
+                        channels.append(RunChannel(other_connection))
+                    self.lanes = RunLanes(channels)
                 self.debugger = RegisterChannel(debugger_path)
                 description = self.debugger.exchange("qXfer:features:read:target.xml:0,fff")
                 if b'<xi:include href="i386-64bit.xml"/>' not in description:
@@ -704,21 +743,23 @@ class TcgChild:
         self.special_command("x-flexvm-pulse-x86-gsi", {"gsi": gsi})
 
     def close(self):
-        try:
-            if self.special_monitor is not None:
-                self.special_monitor.close()
-                self.special_monitor = None
-            if self.debugger is not None:
-                self.debugger.close()
-                self.debugger = None
-        finally:
-            if self.lanes is not None:
-                self.lanes.close()
-            elif self.channel is not None:
-                self.channel.close()
+        with ExitStack() as cleanup:
+            if self.directory is not None:
+                cleanup.callback(shutil.rmtree, self.directory)
+                self.directory = None
             if self.process is not None:
-                stop_process(self.process)
+                cleanup.callback(stop_process, self.process)
                 self.process = None
+            if self.lanes is not None:
+                cleanup.callback(self.lanes.close)
+            elif self.channel is not None:
+                cleanup.callback(self.channel.close)
+            if self.debugger is not None:
+                cleanup.callback(self.debugger.close)
+                self.debugger = None
+            if self.special_monitor is not None:
+                cleanup.callback(self.special_monitor.close)
+                self.special_monitor = None
 
 
 class RunLanes:
@@ -844,7 +885,7 @@ class KvmChild:
                     command.extend(["--run-sockets", *map(str, fds)])
                 for slot, layout in zip(slots, layouts, strict=True):
                     command.extend(map(str, (layout, slot.gpa, slot.identifier)))
-                self.process = subprocess.Popen(command, pass_fds=(control, outer_ram, *irq_fds, *fds, *layouts),
+                self.process = spawn_owned(command, pass_fds=(control, outer_ram, *irq_fds, *fds, *layouts),
                                                 stdout=log, stderr=log)
             self.channel = RunChannel(connection)
             if sockets:
@@ -1108,7 +1149,7 @@ def read_tcg_cpuid(monitor):
 def model_monitor(qemu, output, control, cpu_count, name):
     path = control / f"{name}.sock"
     with (output / f"{name}-model.log").open("ab") as log:
-        process = subprocess.Popen([
+        process = spawn_owned([
             qemu, *QEMU_OPTIONS, "-machine", "pc,accel=tcg", "-cpu", TCG_CHILD_CPU,
             "-m", "16", "-smp", str(cpu_count), "-serial", "none", "-S",
             "-qmp", f"unix:{path},server=on,wait=off",
@@ -1126,7 +1167,7 @@ def model_monitor(qemu, output, control, cpu_count, name):
 
 def model_cpuid(engine, qemu, output, control, cpu_count):
     if engine == "kvm":
-        native = subprocess.run([output / NATIVE_WORKER, "--supported-cpuid"], capture_output=True, timeout=3)
+        native = native_query([output / NATIVE_WORKER, "--supported-cpuid"])
         if native.returncode:
             raise RuntimeError(f"native CPUID query failed: {native.stderr.decode(errors='replace')}")
         entries = [entry for entry in unpack_cpuid(native.stdout) if not entry[2] & ~1]
@@ -1148,7 +1189,7 @@ def parse_lapic(value):
 
 def reset_lapic(engine, qemu, output, control, cpu_count, cpu):
     if engine == "kvm":
-        native = subprocess.run([output / NATIVE_WORKER, "--reset-lapic", str(cpu)], capture_output=True, timeout=3)
+        native = native_query([output / NATIVE_WORKER, "--reset-lapic", str(cpu)])
         if native.returncode or len(native.stdout) != LAPIC_SIZE:
             raise RuntimeError(f"native reset LAPIC query failed: {native.stderr.decode(errors='replace')}")
         return native.stdout
@@ -1158,8 +1199,7 @@ def reset_lapic(engine, qemu, output, control, cpu_count, cpu):
 
 def reset_sregs(engine, qemu, output, control, cpu_count, cpu, irqchip):
     if engine == "kvm":
-        native = subprocess.run([output / NATIVE_WORKER, "--reset-sregs", str(cpu), str(int(irqchip))],
-                                capture_output=True, timeout=3)
+        native = native_query([output / NATIVE_WORKER, "--reset-sregs", str(cpu), str(int(irqchip))])
         if native.returncode or len(native.stdout) != SPECIAL_REGISTERS_SIZE:
             raise RuntimeError(f"native reset SREGS query failed: {native.stderr.decode(errors='replace')}")
         return native.stdout
@@ -1177,7 +1217,7 @@ def pack_irqchip(chip_id, snapshot):
 def reset_irqchips(engine, qemu, output, control, cpu_count):
     count = len(IRQCHIP_PAYLOAD_SIZES)
     if engine == "kvm":
-        native = subprocess.run([output / NATIVE_WORKER, "--reset-irqchips"], capture_output=True, timeout=3)
+        native = native_query([output / NATIVE_WORKER, "--reset-irqchips"])
         if native.returncode or len(native.stdout) != count * IRQCHIP_SIZE:
             raise RuntimeError(f"native reset irqchip query failed: {native.stderr.decode(errors='replace')}")
         return [native.stdout[id * IRQCHIP_SIZE:(id + 1) * IRQCHIP_SIZE] for id in range(count)]
@@ -1196,8 +1236,7 @@ def parse_pit_state(snapshot):
 def unstarted_pit_state(engine, qemu, output, control, flags, staged):
     if engine == "kvm":
         option = "--reset-pit" if staged is None else "--staged-pit"
-        native = subprocess.run([output / NATIVE_WORKER, option, str(flags)], input=staged,
-                                capture_output=True, timeout=3)
+        native = native_query([output / NATIVE_WORKER, option, str(flags)], input=staged)
         if native.returncode or len(native.stdout) != PIT_STATE_SIZE:
             raise RuntimeError(f"native unstarted PIT query failed: {native.stderr.decode(errors='replace')}")
         return native.stdout
@@ -1212,8 +1251,7 @@ def pack_debugregs(state):
 
 def reset_debugregs(engine, qemu, output, control, cpu_count, cpu):
     if engine == "kvm":
-        native = subprocess.run([output / NATIVE_WORKER, "--reset-debugregs", str(cpu)],
-                                capture_output=True, timeout=3)
+        native = native_query([output / NATIVE_WORKER, "--reset-debugregs", str(cpu)])
         if native.returncode or len(native.stdout) != DEBUGREGS.size:
             raise RuntimeError(f"native debug register query failed: {native.stderr.decode(errors='replace')}")
         return native.stdout
@@ -1224,7 +1262,7 @@ def reset_debugregs(engine, qemu, output, control, cpu_count, cpu):
 def unstarted_mp_state(engine, qemu, output, control, cpu_count, cpu, irqchip, staged):
     if engine == "kvm":
         command = [output / NATIVE_WORKER, "--reset-mp", str(cpu), str(int(irqchip)), *map(str, staged)]
-        native = subprocess.run(command, capture_output=True, timeout=3)
+        native = native_query(command)
         if native.returncode or len(native.stdout) != MP_STATE.size:
             raise RuntimeError(f"native MP state query failed: {native.stderr.decode(errors='replace')}")
         return MP_STATE.unpack(native.stdout)[0]
@@ -1243,8 +1281,7 @@ def pack_xcrs(xcr0):
 
 def reset_xcrs(engine, qemu, output, control, cpu_count, cpu):
     if engine == "kvm":
-        native = subprocess.run([output / NATIVE_WORKER, "--reset-xcrs", str(cpu)],
-                                capture_output=True, timeout=3)
+        native = native_query([output / NATIVE_WORKER, "--reset-xcrs", str(cpu)])
         if native.returncode or len(native.stdout) != XCRS.size:
             raise RuntimeError(f"native XCR query failed: {native.stderr.decode(errors='replace')}")
         return native.stdout
@@ -1261,8 +1298,7 @@ def parse_xsave(state):
 
 def reset_xsave(engine, qemu, output, control, cpu_count, cpu):
     if engine == "kvm":
-        native = subprocess.run([output / NATIVE_WORKER, "--reset-xsave", str(cpu)],
-                                capture_output=True, timeout=3)
+        native = native_query([output / NATIVE_WORKER, "--reset-xsave", str(cpu)])
         if native.returncode or len(native.stdout) != XSAVE_SIZE:
             raise RuntimeError(f"native XSAVE query failed: {native.stderr.decode(errors='replace')}")
         return native.stdout
@@ -1279,8 +1315,7 @@ def parse_vcpu_events(state):
 
 def reset_vcpu_events(engine, qemu, output, control, cpu_count, cpu, irqchip):
     if engine == "kvm":
-        native = subprocess.run([output / NATIVE_WORKER, "--reset-events", str(cpu), str(int(irqchip))],
-                                capture_output=True, timeout=3)
+        native = native_query([output / NATIVE_WORKER, "--reset-events", str(cpu), str(int(irqchip))])
         if native.returncode or len(native.stdout) != VCPU_EVENTS_SIZE:
             raise RuntimeError(f"native event query failed: {native.stderr.decode(errors='replace')}")
         return native.stdout
@@ -1325,7 +1360,7 @@ def tcg_clock(command, record):
 
 def reset_clock(engine, qemu, output, control):
     if engine == "kvm":
-        native = subprocess.run([output / NATIVE_WORKER, "--reset-clock"], capture_output=True, timeout=3)
+        native = native_query([output / NATIVE_WORKER, "--reset-clock"])
         if native.returncode or len(native.stdout) != CLOCK_DATA.size:
             raise RuntimeError(f"native VM clock query failed: {native.stderr.decode(errors='replace')}")
         return native.stdout
@@ -1411,7 +1446,7 @@ def start_child(engine, qemu, output, control, outer_ram, slots, cpu_count, mmio
             layouts.append(manifest)
         if engine == "kvm":
             return KvmChild(output, outer_ram, layouts, slots, cpu_count, irqchip, pit_flags, irq_fds, tss_gpa, parallel)
-        return TcgChild(qemu, output, control / "child.sock", outer_ram, layouts, slots, cpu_count, mmio_base,
+        return TcgChild(qemu, output, control, outer_ram, layouts, slots, cpu_count, mmio_base,
                         pit_flags, irq_fds, fixture_checks, parallel)
 
 
@@ -1441,10 +1476,15 @@ def verify_slot_spans(pid, slots):
     return extents
 
 
-def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry,
-             split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs, cpuid, mmio, mmio_read,
-             ioeventfd, irqchip, pit, irqfd, zero_slot, tss, lapic, pio, complete_read, pio_boundary, pvh,
-             irqchip_state, pit_state, debugregs, mp_state, xcrs, xsave, vcpu_events, clock, firecracker, memory_quota):
+def exercise(
+    qemu, kernel, output, reject_close=False, parent_engine="tcg", ram_pages=2,
+    protected_entry=False, split_slot=False, interrupt_run=False, cpu_count=1, long_mode=False, fpu=False,
+    msrs=False, cpuid=False, mmio=False, mmio_read=False, ioeventfd=False, irqchip=False,
+    pit=False, irqfd=False, zero_slot=False, tss=False, lapic=False, pio=False,
+    complete_read=False, pio_boundary=False, pvh=False, irqchip_state=False, pit_state=False, debugregs=False,
+    mp_state=False, xcrs=False, xsave=False, vcpu_events=False, clock=False, firecracker=False,
+    memory_quota=False, launch=None,
+):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
@@ -1604,12 +1644,19 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
     special = None
     supported_cpuid = []
     child = None
+    fixture_checks = not (launch or firecracker)
+    active_vm = False
     slot_size = ram_pages * PAGE_SIZE
-    parallel = firecracker and cpu_count > 1
-    outer_mib = max(384 if firecracker else 192, (slot_size + MIB - 1) // MIB + 128)
+    parallel = launch is not None or firecracker and cpu_count > 1
+    outer_mib = launch.memory_mib if launch else max(384 if firecracker else 192, (slot_size + MIB - 1) // MIB + 128)
     outer_ram_size = outer_mib * MIB
     with ExitStack() as cleanup:
-        control = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix="flexvm-kvm-")))
+        if launch and launch.control is not None:
+            control = launch.control
+            control.mkdir(mode=0o700)
+            cleanup.callback(shutil.rmtree, control)
+        else:
+            control = Path(cleanup.enter_context(tempfile.TemporaryDirectory(prefix="flexvm-kvm-")))
         server = cleanup.enter_context(socket.socket(socket.AF_UNIX, socket.SOCK_STREAM))
         server.bind(str(control / "doorbell"))
         server.listen(1)
@@ -1619,7 +1666,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
         struct.pack_into("<II", mapping, 0, 0x4d564b46, 36)
-        if firecracker or memory_quota:
+        if launch or firecracker or memory_quota:
             struct.pack_into("<I", mapping, RAM_LIMIT_AT, ram_pages)
         if parallel:
             struct.pack_into("<I", mapping, FEATURES_AT, PARALLEL_RUN)
@@ -1638,18 +1685,31 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
             fd = os.eventfd(0, os.EFD_CLOEXEC | os.EFD_NONBLOCK)
             cleanup.callback(os.close, fd)
             irq_fds.append(fd)
-        command = [
-            qemu, *QEMU_OPTIONS, "-machine", "q35,accel=tcg,memory-backend=outer-ram",
-            "-cpu", "max,vmx=off,svm=off", "-m", str(outer_mib), "-smp", "1",
+        doorbell = [
             "-object", f"memory-backend-file,id=outer-ram,mem-path=/proc/self/fd/{outer_ram},share=on,size={outer_mib}M",
-            "-serial", "stdio", "-kernel", kernel, "-initrd", output / "initramfs",
-            "-append", "console=ttyS0 loglevel=5 panic=1 rdinit=/init",
             "-chardev", f"socket,id=doorbell,path={control / 'doorbell'}",
             "-device", f"ivshmem-doorbell,chardev=doorbell,vectors={2 + len(irq_fds)}",
         ]
-        with (output / "outer.log").open("wb") as log:
-            outer = subprocess.Popen(command, pass_fds=(outer_ram,), stdout=log, stderr=log)
+        if launch:
+            image = json.dumps({"driver": "raw", "node-name": "parent-kvm-module", "read-only": True,
+                                "file": {"driver": "file", "filename": str(output / PROVIDER_DIR / "flexvm-pvkvm.img")}})
+            command = [*launch.command, *doorbell, "-blockdev", image,
+                       "-device", "virtio-blk-pci,drive=parent-kvm-module,serial=flexvm-pvkvm"]
+            outer = spawn_owned(command, pass_fds=(outer_ram, *launch.inherited_fds))
+            for fd in launch.inherited_fds:
+                if fd != launch.emulator_fd:
+                    os.close(fd)
+        else:
+            command = [
+                qemu, *QEMU_OPTIONS, "-machine", "q35,accel=tcg,memory-backend=outer-ram",
+                "-cpu", "max,vmx=off,svm=off", "-m", str(outer_mib), "-smp", "1",
+                "-serial", "stdio", "-kernel", kernel, "-initrd", output / "initramfs",
+                "-append", "console=ttyS0 loglevel=5 panic=1 rdinit=/init", *doorbell,
+            ]
+            with (output / "outer.log").open("wb") as log:
+                outer = spawn_owned(command, pass_fds=(outer_ram,), stdout=log, stderr=log)
         cleanup.callback(stop_process, outer)
+        cleanup.callback(lambda: child.close() if child is not None else None)
         cleanup.enter_context(doorbell_peer(server, memory, requests, cancellations, irq_fds, replies))
         exited = os.pidfd_open(outer.pid)
         cleanup.callback(os.close, exited)
@@ -1661,7 +1721,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 descriptors.extend(child.channel.gsi_by_fd)
             if lanes:
                 descriptors.extend(lanes.descriptors())
-            readable, _, _ = select.select(descriptors, [], [], max(0, deadline - time.monotonic()))
+            timeout = None if launch else max(0, deadline - time.monotonic())
+            readable, _, _ = select.select(descriptors, [], [], timeout)
             if exited in readable:
                 break
             if parallel:
@@ -1673,7 +1734,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                     os.eventfd_read(cancellations)
                 if lanes:
                     child.channel.dispatch_irqs(readable, running=bool(lanes.live))
-                    if parent_engine == "kvm" or len(started_cpus) == cpu_count:
+                    if parent_engine == "kvm" or len(started_cpus) == len(lanes.connections):
                         lanes.service(mapping, readable, open_cpus, started_cpus, replies)
                 request_seq, reply_seq = struct.unpack_from("<II", mapping, 8)
                 if requests not in readable or request_seq == reply_seq:
@@ -1694,7 +1755,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 raise RuntimeError("multiple outstanding doorbell requests")
             pending, complete, opcode, _, length = struct.unpack_from("<IIIII", mapping, 8)
             if (pending != complete + 1 or
-                    (not firecracker and (len(observed) >= len(expected) or opcode != expected[len(observed)]))):
+                    (fixture_checks and (len(observed) >= len(expected) or opcode != expected[len(observed)]))):
                 raise RuntimeError(f"unexpected doorbell request {pending}, command {opcode}")
             cpu, = struct.unpack_from("<I", mapping, 44)
             cpu_commands = (CLOSE_CPU, RUN, PREPARE_RUN, GET_REGS, GET_SREGS, SET_REGS, GET_FPU, SET_FPU, GET_MSRS, SET_MSRS,
@@ -1704,7 +1765,29 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
             if opcode in cpu_commands and cpu not in open_cpus:
                 raise RuntimeError(f"command {opcode} requested unopened vCPU {cpu}")
             status = 0
-            if opcode == GET_SUPPORTED_CPUID:
+            if opcode == OPEN_VM and launch:
+                if length or active_vm:
+                    raise RuntimeError("invalid request to open a nested VM")
+                active_vm = True
+                child = None
+                irqchip_created = False
+                pit_flags = staged_pit = staged_clock = tss_gpa = reset_irqchip_images = None
+                for state in (open_cpus, started_cpus, reset_registers, staged_irqchips, staged_debugregs,
+                              staged_mp_states, staged_xcrs, staged_xsave, staged_vcpu_events, baseline_vcpu_events):
+                    state.clear()
+                staged_irq_levels.clear()
+                for fd in irq_fds:
+                    try:
+                        os.eventfd_read(fd)
+                    except BlockingIOError:
+                        pass
+            elif opcode == CLOSE_VM and launch:
+                if length or not active_vm or open_cpus or (child is not None and child.process is not None):
+                    raise RuntimeError("nested VM closed before all vCPUs stopped")
+                active_vm = False
+            elif launch and not active_vm and opcode != GET_SUPPORTED_CPUID:
+                raise RuntimeError("command requires an open nested VM")
+            elif opcode == GET_SUPPORTED_CPUID:
                 if length:
                     raise RuntimeError("unexpected memory argument for CPUID query")
                 supported_cpuid = model_cpuid(parent_engine, qemu, output, control, cpu_count)
@@ -1780,7 +1863,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 line, level = IRQ_RECORD.unpack_from(mapping, IRQ_AT)
                 if length or not irqchip_created or line >= GSI_COUNT or level > 1:
                     raise RuntimeError("invalid irqchip line request")
-                irq_levels.append((line, level))
+                if fixture_checks:
+                    irq_levels.append((line, level))
                 if child is None:
                     staged_irq_levels.append((line, level))
                 else:
@@ -1926,17 +2010,24 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 if parallel != (opcode == PREPARE_RUN):
                     raise RuntimeError("run command does not match the negotiated transport")
                 if child is None:
-                    if len(open_cpus) != cpu_count:
+                    worker_cpus = len(open_cpus) if launch else cpu_count
+                    if open_cpus != set(range(worker_cpus)):
                         raise RuntimeError("registered RAM requires the configured vCPUs")
                     slots = read_registered_slots(mapping, length, ram_pages, outer_ram_size)
-                    if not firecracker:
+                    if fixture_checks:
                         check_fixture_slots(slots, ram_pages, protected_entry, split_slot, zero_slot)
-                    mmio_base = FIRECRACKER_NET_MMIO_BASE if firecracker else MMIO_BASE if mmio else None
+                    mmio_base = FIRECRACKER_NET_MMIO_BASE if not fixture_checks else MMIO_BASE if mmio else None
                     child = start_child(parent_engine, qemu, output, control, outer_ram, slots,
-                                        cpu_count, mmio_base, irqchip_created, pit_flags, irq_fds, tss_gpa,
-                                        not firecracker, parallel)
-                    cleanup.callback(child.close)
-                    extents = verify_slot_spans(child.process.pid, slots)
+                                        worker_cpus, mmio_base, irqchip_created, pit_flags, irq_fds, tss_gpa,
+                                        fixture_checks, parallel)
+                    if launch:
+                        child.channel.irq_pulses = deque(maxlen=128)
+                        child.lanes.read_pio = deque(maxlen=128)
+                        child.lanes.written_pio = deque(maxlen=128)
+                        child.lanes.read_mmio = deque(maxlen=128)
+                        child.lanes.written_mmio = deque(maxlen=128)
+                    else:
+                        extents = verify_slot_spans(child.process.pid, slots)
                     if staged_clock is not None:
                         status, _ = child.clock(staged_clock_record(staged_clock, restore=True))
                         if status:
@@ -1962,7 +2053,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                     raise RuntimeError("unexpected slot registration after the first run")
                 if cpu not in started_cpus:
                     cpuid_valid, = struct.unpack_from("<I", mapping, CPUID_VALID_AT)
-                    if not firecracker and cpuid_valid != int(cpuid):
+                    if fixture_checks and cpuid_valid != int(cpuid):
                         raise RuntimeError("unexpected staged CPUID table")
                     if cpuid_valid:
                         child.set_cpuid(cpu, unpack_cpuid(mapping[CPUID_AT:CPUID_AT + CPUID_BYTES]))
@@ -1979,17 +2070,17 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                         child.set_protected_entry(cpu, state)
                     child.set_registers(cpu, mapping[64:64 + REGISTERS.size])
                     fpu_valid, = struct.unpack_from("<I", mapping, FPU_VALID_AT)
-                    if not firecracker and fpu_valid != int(fpu):
+                    if fixture_checks and fpu_valid != int(fpu):
                         raise RuntimeError("unexpected staged floating-point state")
                     if fpu_valid:
                         child.set_floating_point(cpu, mapping[FPU_AT:FPU_AT + FPU_SIZE])
                     initial_msrs = unpack_msr_batch(mapping[MSR_AT:MSR_AT + MSR_HEADER.size + MSR_ENTRY.size * MSR_BATCH_MAX])
-                    if not firecracker and bool(initial_msrs) != msrs:
+                    if fixture_checks and bool(initial_msrs) != msrs:
                         raise RuntimeError("unexpected staged boot MSR state")
                     if initial_msrs and child.access_msrs(cpu, initial_msrs, True) != initial_msrs:
                         raise RuntimeError("worker rejected staged boot MSR state")
                     lapic_valid, = struct.unpack_from("<I", mapping, LAPIC_VALID_AT)
-                    if not firecracker and lapic_valid != int(lapic):
+                    if fixture_checks and lapic_valid != int(lapic):
                         raise RuntimeError("unexpected staged LAPIC image")
                     if lapic_valid:
                         child.set_lapic(cpu, mapping[LAPIC_AT:LAPIC_AT + LAPIC_SIZE])
@@ -2042,7 +2133,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
             elif opcode == GET_REGS:
                 registers = child.registers(cpu)
                 mapping[64:64 + REGISTERS.size] = registers
-                counters.append(REGISTERS.unpack(registers)[2])
+                if not launch:
+                    counters.append(REGISTERS.unpack(registers)[2])
             elif opcode == SET_REGS:
                 child.set_registers(cpu, mapping[64:64 + REGISTERS.size])
             elif opcode == GET_SREGS:
@@ -2081,14 +2173,17 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                     # The guest can unpin its pages after the last CPU closes.
                     if reject_close:
                         status = -errno.EIO
-                    else:
+                    elif child is not None:
                         result = child.close()
                         if parent_engine == "kvm" and result != 0:
                             raise RuntimeError(f"native parent worker shut down with status {result}")
-            observed.append(opcode)
+            if not launch:
+                observed.append(opcode)
             struct.pack_into("<i", mapping, 20, status)
             struct.pack_into("<I", mapping, 12, pending)
             os.eventfd_write(replies, 1)
+        if launch:
+            return outer.wait()
         guest = (output / "outer.log").read_text(errors="replace")
         if memory_quota and "PASS parent memory quota before page pinning" not in guest:
             raise RuntimeError("the guest did not reject an over-quota slot before pinning")
@@ -2227,6 +2322,63 @@ def client_timings(log):
     if match is None:
         raise RuntimeError("missing client run timing")
     return {"first": int(match[1]), "warm": int(match[2])}
+
+
+def serve_outer(argv):
+    parser = argparse.ArgumentParser(description="Serve the parent KVM device for an outer QEMU launch")
+    parser.add_argument("--bundle", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--outer-memory", type=int, required=True)
+    parser.add_argument("--child-memory", type=int, default=256)
+    parser.add_argument("--engine", choices=("auto", "tcg", "kvm"), default="auto")
+    parser.add_argument("--inherit", type=int, action="append", default=[])
+    parser.add_argument("--emulator-fd", type=int)
+    parser.add_argument("--control", type=Path)
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    if platform.machine() != "x86_64":
+        parser.error("the parent KVM service requires x86_64")
+    if not 128 <= args.outer_memory <= 1_048_576 or not 1 <= args.child_memory <= min(256, args.outer_memory):
+        parser.error("invalid outer or nested VM memory limit")
+    if not args.command or args.command[0] != "--" or len(args.command) < 2:
+        parser.error("supply the configured outer QEMU command after --")
+    command = args.command[1:]
+    if len(args.inherit) != len(set(args.inherit)) or any(fd < 3 for fd in args.inherit):
+        parser.error("only unique non-standard inherited descriptors are supported")
+    for descriptor in args.inherit:
+        os.fstat(descriptor)
+    qemu = command[0]
+    if qemu.startswith("/proc/self/fd/") or args.emulator_fd is not None:
+        if args.emulator_fd not in args.inherit or qemu != f"/proc/self/fd/{args.emulator_fd}":
+            parser.error("the emulator descriptor must be inherited and match the executable")
+        # Model and child processes can use the pinned emulator without
+        # inheriting descriptors for the outer kernel, firmware, or disk.
+        qemu = f"/proc/{os.getpid()}/fd/{args.emulator_fd}"
+    bundle = args.bundle.resolve(strict=True)
+    if not (bundle / "flexvm-pvkvm.img").is_file():
+        parser.error("provider bundle has no guest module image")
+    output = args.output.resolve(strict=True)
+    destination = output / PROVIDER_DIR
+    if not destination.exists():
+        destination.symlink_to(bundle, target_is_directory=True)
+    if not destination.samefile(bundle):
+        parser.error("service directory already refers to another provider bundle")
+    engine = args.engine
+    if engine != "tcg":
+        worker = bundle / "native-worker"
+        try:
+            available = worker.is_file() and native_query([worker, "--supported-cpuid"]).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            available = False
+        if not available and engine == "kvm":
+            parser.error("native parent execution requires an available KVM worker")
+        engine = "kvm" if available else "tcg"
+    result = exercise(
+        qemu, None, output, parent_engine=engine, ram_pages=args.child_memory * MIB // PAGE_SIZE,
+        protected_entry=True, pvh=True, cpu_count=2,
+        launch=OuterLaunch(tuple(command), tuple(args.inherit), args.outer_memory, args.emulator_fd, args.control),
+    )
+    return 128 - result if result < 0 else result
 
 
 def main():
@@ -2616,4 +2768,6 @@ def main():
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--serve"]:
+        raise SystemExit(serve_outer(sys.argv[2:]))
     raise SystemExit(main())
