@@ -3,7 +3,15 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+      - '**/*.md'
   pull_request:
+    paths-ignore:
+      - 'README.md'
+      - 'docs/**'
+      - '**/*.md'
   workflow_dispatch:
     inputs:
       heavy:
@@ -72,10 +80,14 @@ jobs:
           # The native QEMU/OCI restore proof requires explicit external artifacts;
           # software-lifecycle.py exercises that real path in the software jobs.
           cargo test -p flexvm -p flexvm-init --config "target.$host.runner=\"sudo -E\"" -- --ignored --skip qemu::tests::real_agent_cold_restore_preserves_process_ram_and_sessions
+      - name: Dependencies
+        run: |
+          pkgs=(strace zstd)
+          if [ "${{ runner.arch }}" = X64 ]; then pkgs+=(btrfs-progs); fi
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends "${pkgs[@]}"
       - name: Storage CLI clones without virtualization devices
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends strace
           cargo build --locked -p flexvm
           for mode in host scan; do
             mode_args=()
@@ -85,7 +97,6 @@ jobs:
       - name: Storage CLI filesystem reflinks without virtualization devices
         if: runner.arch == 'X64'
         run: |
-          sudo apt-get install -y -q --no-install-recommends btrfs-progs
           sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/volume-clone.py --bin target/debug/flexvm --btrfs --output "$RUNNER_TEMP/volume-clone-btrfs"
       # The semver artifacts release (vMAJOR.MINOR.PATCH; what `cargo build` users download) must be built
       # from this checkout's inputs (scripts/pin-artifacts.sh --inputs): a change to them bumps ARTIFACTS_TAG
@@ -114,8 +125,6 @@ jobs:
               exit 1
               ;;
           esac
-      - name: Failure capture compression
-        run: sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends zstd
       - name: Compatibility harness tests
         run: |
           python3 scripts/compat/test_harness.py
@@ -191,7 +200,11 @@ jobs:
       - name: Fetch or build the reviewed kernel
         run: ./scripts/fetch.sh --kernel --state "$RUNNER_TEMP/software-state"
       - name: Fetch the unchanged hypervisor
-        run: ./scripts/fetch.sh --state "$RUNNER_TEMP/software-state"
+        id: fetch
+        run: |
+          ./scripts/fetch.sh --state "$RUNNER_TEMP/software-state"
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /var/lib/flexvm-test-image
+          echo "base=$(sha256sum "$RUNNER_TEMP/software-state/artifacts/base.squashfs" | cut -c1-16)" >> "$GITHUB_OUTPUT"
       - name: Boot with KVM masked
         run: |
           sudo python3 scripts/compat/software-boot.py --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-boot" ${{ matrix.extra }} --guest-firecracker "$RUNNER_TEMP/software-state/artifacts/firecracker"
@@ -234,18 +247,33 @@ jobs:
           cat "$RUNNER_TEMP/software-owner/report.json"
           sudo python3 scripts/compat/software-lifecycle.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --output "$RUNNER_TEMP/software-lifecycle" --timeout 600
           cat "$RUNNER_TEMP/software-lifecycle/report.json"
+      - name: Restore test image
+        id: test-image-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /var/lib/flexvm-test-image
+          key: test-image-base${{ steps.fetch.outputs.base }}-${{ hashFiles('scripts/test-image.py') }}
+      - name: Prepare test image
+        run: |
+          sudo chown -R root:root /var/lib/flexvm-test-image
+          sudo python3 scripts/test-image.py --state "$RUNNER_TEMP/software-state" /var/lib/flexvm-test-image
+      - name: Save test image
+        if: steps.test-image-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /var/lib/flexvm-test-image
+          key: ${{ steps.test-image-cache.outputs.cache-primary-key }}
       - name: Distro PID 1 and fresh-owner restore without virtualization devices
         run: |
-          sudo python3 scripts/test-image.py --state "$RUNNER_TEMP/software-state" "$RUNNER_TEMP/software-systemd-image"
-          sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --image "$RUNNER_TEMP/software-systemd-image" --workload scripts/compat/workloads/distro-systemd.sh --boot systemd --mem 1536 --timeout 900 --require storage.fuse --output "$RUNNER_TEMP/software-distro"
+          sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --image /var/lib/flexvm-test-image --workload scripts/compat/workloads/distro-systemd.sh --boot systemd --mem 1536 --timeout 900 --require storage.fuse --output "$RUNNER_TEMP/software-distro"
           cat "$RUNNER_TEMP/software-distro/report.json"
       - name: Elastic memory grow, shrink and restore without virtualization devices
         run: |
-          sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --image "$RUNNER_TEMP/software-systemd-image" --workload scripts/compat/workloads/software-elastic-mem.sh --boot systemd --timeout 900 --require storage.fuse --output "$RUNNER_TEMP/software-elastic-mem"
+          sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --image /var/lib/flexvm-test-image --workload scripts/compat/workloads/software-elastic-mem.sh --boot systemd --timeout 900 --require storage.fuse --output "$RUNNER_TEMP/software-elastic-mem"
           cat "$RUNNER_TEMP/software-elastic-mem/report.json"
       - name: Delegated user services without virtualization devices
         run: |
-          sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --image "$RUNNER_TEMP/software-systemd-image" --workload scripts/compat/workloads/user-sessions.sh --boot systemd --mem 2048 --timeout 900 --require storage.fuse --output "$RUNNER_TEMP/software-user-sessions"
+          sudo systemd-run --scope --collect -p MemoryMax=6G -p MemorySwapMax=0 -p CPUQuota=200% python3 scripts/compat/software-workload.py --bin target/release/flexvm --kernel "$RUNNER_TEMP/software-state/artifacts/vmlinux" --image /var/lib/flexvm-test-image --workload scripts/compat/workloads/user-sessions.sh --boot systemd --mem 2048 --timeout 900 --require storage.fuse --output "$RUNNER_TEMP/software-user-sessions"
           cat "$RUNNER_TEMP/software-user-sessions/report.json"
       - name: Restore pinned Alpine base for OpenRC
         id: openrc-alpine-cache
@@ -355,6 +383,36 @@ jobs:
           key: module-artifacts-${{ matrix.arch }}-${{ hashFiles('scripts/build-kernel.sh', 'scripts/package-kernel-modules.sh', 'scripts/fetch.sh', 'scripts/versions.sh', 'scripts/checksums.sha256', 'kernel/config/*', 'kernel/features*.config', 'kernel/source.env', 'kernel/patches/*', 'scripts/apply-kernel-patches.sh') }}
       - name: Fetch matching kernel, runtime modules and SDK
         run: scripts/fetch.sh --kernel-sdk --state "$RUNNER_TEMP/software-state"
+      - name: Restore stock Firecracker
+        id: stock-firecracker-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/stock-firecracker
+          key: stock-firecracker-v1-${{ matrix.arch }}-${{ hashFiles('scripts/versions.sh', 'scripts/checksums.sha256') }}
+      - name: Fetch stock Firecracker
+        run: |
+          # Use the published binary, independently of the FlexVM release artifacts.
+          root=$PWD
+          source scripts/versions.sh
+          stock="firecracker-$FC_VERSION-$ARCH"
+          cached="$RUNNER_TEMP/stock-firecracker/$stock"
+          if [ ! -f "$cached" ]; then
+            mkdir -p "$RUNNER_TEMP/stock-firecracker"
+            url="https://github.com/firecracker-microvm/firecracker/releases/download/$FC_VERSION/$stock.tgz"
+            archive="$RUNNER_TEMP/$stock.tgz"
+            curl --fail --silent --show-error --location --retry 3 --output "$archive" "$url"
+            checksum=$(pinned "$url")
+            printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check --status
+            tar -xOzf "$archive" "release-$FC_VERSION-$ARCH/$stock" > "$cached"
+            rm -f "$archive"
+          fi
+          cp "$cached" "$RUNNER_TEMP/$stock"
+      - name: Save stock Firecracker
+        if: steps.stock-firecracker-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/stock-firecracker
+          key: ${{ steps.stock-firecracker-cache.outputs.cache-primary-key }}
       - name: ARM guest negotiates parent KVM VM control
         if: matrix.arch == 'aarch64'
         run: |
@@ -387,15 +445,8 @@ jobs:
               --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64" --kernel "$artifacts/vmlinux" \
               --bundle "$bundle" --output "$RUNNER_TEMP/arm-parent-frontend-native"
           fi
-          root=$PWD
           source scripts/versions.sh
           stock="firecracker-$FC_VERSION-$ARCH"
-          url="https://github.com/firecracker-microvm/firecracker/releases/download/$FC_VERSION/$stock.tgz"
-          archive="$RUNNER_TEMP/$stock.tgz"
-          curl --fail --silent --show-error --location --retry 3 --output "$archive" "$url"
-          checksum=$(pinned "$url")
-          printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check --status
-          tar -xOzf "$archive" "release-$FC_VERSION-$ARCH/$stock" > "$RUNNER_TEMP/$stock"
           run_arm_parent() {
             local engine=$1
             local cpus=$2
@@ -518,16 +569,8 @@ jobs:
             --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64" --kernel "$artifacts/vmlinux" \
             --kernel-build "$sdk/lib/modules/$release/build" --output "$RUNNER_TEMP/parent-kvm-reject-close" --reject-close
           cat "$RUNNER_TEMP/parent-kvm-reject-close/report.json"
-          # Use the published binary, independently of the FlexVM release artifacts.
-          root=$PWD
           source scripts/versions.sh
           stock="firecracker-$FC_VERSION-$ARCH"
-          url="https://github.com/firecracker-microvm/firecracker/releases/download/$FC_VERSION/$stock.tgz"
-          archive="$RUNNER_TEMP/$stock.tgz"
-          curl --fail --silent --show-error --location --retry 3 --output "$archive" "$url"
-          checksum=$(pinned "$url")
-          printf '%s  %s\n' "$checksum" "$archive" | sha256sum --check --status
-          tar -xOzf "$archive" "release-$FC_VERSION-$ARCH/$stock" > "$RUNNER_TEMP/$stock"
           run_parent_firecracker() {
             local engine=$1
             local cpus=${2:-1}
@@ -778,11 +821,31 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Build FlexVM
         run: cargo build --release -p flexvm
-      - name: Prepare the systemd image for distro workloads
+      - name: Fetch base rootfs for distro workloads
+        id: fetch-base
         if: startsWith(matrix.workload, 'rootless-') || matrix.workload == 'nspawn' || matrix.workload == 'lxc' || matrix.workload == 'k3s' || matrix.workload == 'kind' || matrix.workload == 'incus' || matrix.workload == 'nested-flexvm' || matrix.workload == 'nested-flexvm-docker'
         run: |
           scripts/fetch.sh --state "$RUNNER_TEMP/software-state"
-          sudo python3 scripts/test-image.py --state "$RUNNER_TEMP/software-state" "$RUNNER_TEMP/software-distro-image"
+          sudo install -d -o "$(id -u)" -g "$(id -g)" /var/lib/flexvm-test-image
+          echo "base=$(sha256sum "$RUNNER_TEMP/software-state/artifacts/base.squashfs" | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - name: Restore test image for distro workloads
+        id: test-image-cache
+        if: startsWith(matrix.workload, 'rootless-') || matrix.workload == 'nspawn' || matrix.workload == 'lxc' || matrix.workload == 'k3s' || matrix.workload == 'kind' || matrix.workload == 'incus' || matrix.workload == 'nested-flexvm' || matrix.workload == 'nested-flexvm-docker'
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /var/lib/flexvm-test-image
+          key: test-image-base${{ steps.fetch-base.outputs.base }}-${{ hashFiles('scripts/test-image.py') }}
+      - name: Prepare the systemd image for distro workloads
+        if: startsWith(matrix.workload, 'rootless-') || matrix.workload == 'nspawn' || matrix.workload == 'lxc' || matrix.workload == 'k3s' || matrix.workload == 'kind' || matrix.workload == 'incus' || matrix.workload == 'nested-flexvm' || matrix.workload == 'nested-flexvm-docker'
+        run: |
+          sudo chown -R root:root /var/lib/flexvm-test-image
+          sudo python3 scripts/test-image.py --state "$RUNNER_TEMP/software-state" /var/lib/flexvm-test-image
+      - name: Save test image for distro workloads
+        if: (startsWith(matrix.workload, 'rootless-') || matrix.workload == 'nspawn' || matrix.workload == 'lxc' || matrix.workload == 'k3s' || matrix.workload == 'kind' || matrix.workload == 'incus' || matrix.workload == 'nested-flexvm' || matrix.workload == 'nested-flexvm-docker') && steps.test-image-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /var/lib/flexvm-test-image
+          key: ${{ steps.test-image-cache.outputs.cache-primary-key }}
       - name: Prepare the portable nested FlexVM CLI and child image
         if: matrix.workload == 'nested-flexvm' || matrix.workload == 'nested-flexvm-docker'
         run: |
@@ -871,7 +934,7 @@ jobs:
           cpu_quota=200%
           workload_timeout=1800
           if [[ "${{ matrix.workload }}" == rootless-* || "${{ matrix.workload }}" == nspawn || "${{ matrix.workload }}" == lxc || "${{ matrix.workload }}" == k3s || "${{ matrix.workload }}" == kind || "${{ matrix.workload }}" == incus || "${{ matrix.workload }}" == nested-flexvm || "${{ matrix.workload }}" == nested-flexvm-docker ]]; then
-            workload_args=(--boot systemd --image "$RUNNER_TEMP/software-distro-image")
+            workload_args=(--boot systemd --image /var/lib/flexvm-test-image)
           fi
           if [[ "${{ matrix.workload }}" == k3s || "${{ matrix.workload }}" == kind ]]; then
             workload_memory=4096
@@ -1097,7 +1160,6 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q --no-install-recommends build-essential dwarves
           if ./scripts/fetch.sh --urls | grep -q '^vmlinux build:'; then
-            sudo apt-get update -q
             sudo apt-get install -y -q --no-install-recommends build-essential flex bison bc libelf-dev libssl-dev dwarves xz-utils kmod pkg-config zlib1g-dev libzstd-dev
           fi
           ./scripts/fetch.sh
