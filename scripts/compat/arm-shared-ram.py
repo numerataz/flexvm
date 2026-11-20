@@ -98,7 +98,7 @@ def expect(stream, packet):
 
 
 @contextmanager
-def mmio_worker(qemu, program, cpu_count):
+def mmio_worker(qemu, program, cpu_count, *, monitor=False):
     with ExitStack() as resources:
         ram = memfd(resources, "arm-mmio-ram", PAGE)
         layout = memfd(resources, "arm-mmio-layout", 8)
@@ -121,6 +121,8 @@ def mmio_worker(qemu, program, cpu_count):
             listener.settimeout(5)
             listeners.append(listener)
             command.extend(["-chardev", f"socket,id=run{cpu},path={path}"])
+        if monitor:
+            command.extend(["-qmp", f"unix:{tmp / 'qmp'},server=on,wait=off"])
         second = ",parallel-chardev=run1" if cpu_count == 2 else ""
         command.extend(["-device", f"flexvm-mmio-run,chardev=run0,addr={MMIO}{second}"])
         log = resources.enter_context((tmp / "engine.log").open("w+b"))
@@ -135,7 +137,10 @@ def mmio_worker(qemu, program, cpu_count):
                 expect(stream, b"R")
                 connections.append(connection)
                 streams.append(stream)
-            yield ram, connections, streams
+            qmp = QMP(tmp / "qmp", proc, time.monotonic() + 10) if monitor else None
+            if qmp is not None:
+                resources.callback(qmp.close)
+            yield ram, connections, streams, qmp
         except BaseException:
             log.seek(0)
             print(log.read().decode(errors="replace"))
@@ -154,7 +159,7 @@ def exercise_mmio(qemu):
     # Read MMIO+4, store the value in shared RAM, write it to MMIO+8, then spin.
     program = struct.pack("<6I", 0x10000000, 0xd2a16002, 0xb9400441,
                           0xb9010001, 0xb9000841, 0x14000000)
-    with mmio_worker(qemu, program, 1) as (ram, [connection], [stream]):
+    with mmio_worker(qemu, program, 1) as (ram, [connection], [stream], _):
         connection.sendall(b"R")
         expect(stream, struct.pack("<cBQQ", b"Q", 4, MMIO + 4, 0))
         data = struct.pack("<I", 0x12345678)
@@ -180,7 +185,7 @@ def exercise_parallel_mmio(qemu):
         0x34ffffe7, 0xb90004a7, 0x14000000, 0x10fffe64, 0xd2a16005,
         0x52930ec7, 0x91041086, 0x889ffcc7, 0xb90008a7, 0x14000000,
     )
-    with mmio_worker(qemu, program, 2) as (ram, [first, second], [first_reply, second_reply]):
+    with mmio_worker(qemu, program, 2) as (ram, [first, second], [first_reply, second_reply], _):
         os.pwrite(ram, b"\xff" * 4, 256)
         first.sendall(b"R")
         deadline = time.monotonic() + 5
@@ -197,10 +202,33 @@ def exercise_parallel_mmio(qemu):
         expect(second_reply, b"I\0")
 
 
+def exercise_vgic(qemu, program):
+    with mmio_worker(qemu, program, 1, monitor=True) as (ram, [connection], [stream], qmp):
+        addresses = {"distributor": 0x3fff0000, "redistributor": 0x3ffd0000, "its": 0x3ffb0000}
+        for bad in ({"distributor": addresses["its"]}, {"its": 0x3fff0001}, {"its": 0x40000000}):
+            try:
+                qmp.ask("x-flexvm-map-arm-gic", addresses | bad)
+            except RuntimeError as error:
+                if "invalid FlexVM GIC mapping" not in str(error):
+                    raise
+            else:
+                raise RuntimeError("QEMU accepted an invalid GIC mapping")
+        qmp.ask("x-flexvm-map-arm-gic", addresses)
+        connection.sendall(b"R")
+        expect(stream, struct.pack("<cBQQ", b"M", 4, MMIO + 4, 0))
+        revisions = struct.unpack("<3I", os.pread(ram, 12, 256))
+        if any(revision & 0xf0 != 0x30 for revision in revisions):
+            raise RuntimeError(f"unexpected GICD, GICR and ITS architecture revisions: {revisions}")
+        connection.sendall(b"R")
+        qmp.ask("x-flexvm-pulse-arm-gsi", {"gsi": 3})
+        expect(stream, struct.pack("<cBQQ", b"M", 4, MMIO + 8, 35))
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--qemu", type=Path, required=True)
     parser.add_argument("--mmio-run", action="store_true")
+    parser.add_argument("--vgic-program", type=Path)
     args = parser.parse_args()
     qemu = args.qemu.resolve(strict=True)
     exercise(qemu)
@@ -210,3 +238,6 @@ if __name__ == "__main__":
         print("PASS ARM TCG MMIO exits, read completion and run cancellation")
         exercise_parallel_mmio(qemu)
         print("PASS ARM TCG vCPUs run concurrently and report independent MMIO exits")
+    if args.vgic_program:
+        exercise_vgic(qemu, args.vgic_program.read_bytes())
+        print("PASS ARM TCG guest received an interrupt through the remapped GICv3")

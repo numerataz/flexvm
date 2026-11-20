@@ -310,7 +310,10 @@ jobs:
         if: matrix.arch == 'aarch64'
         run: |
           trace="$RUNNER_TEMP/arm-parent-shared-ram.strace"
-          strace -f -e trace=file -o "$trace" python3 scripts/compat/arm-shared-ram.py --mmio-run \
+          program="$RUNNER_TEMP/arm-parent-tcg-vgic"
+          as scripts/compat/parent-kvm/arm-tcg-vgic.S -o "$program.o"
+          objcopy -O binary "$program.o" "$program.bin"
+          strace -f -e trace=file -o "$trace" python3 scripts/compat/arm-shared-ram.py --mmio-run --vgic-program "$program.bin" \
             --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-aarch64"
           if grep -F '"/dev/kvm"' "$trace"; then exit 1; fi
       - name: Kernel artifact directory

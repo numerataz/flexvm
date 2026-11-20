@@ -1,0 +1,173 @@
+--- a/hw/arm/virt.c
++++ b/hw/arm/virt.c
+@@ -53,6 +53,7 @@
+ #include "system/system.h"
+ #include "hw/loader.h"
+ #include "qapi/error.h"
++#include "qapi/qapi-commands-misc-arm.h"
+ #include "qemu/bitops.h"
+ #include "qemu/cutils.h"
+ #include "qemu/error-report.h"
+@@ -754,9 +755,82 @@
+     sysbus_mmio_map(SYS_BUS_DEVICE(dev), 0, vms->memmap[VIRT_GIC_ITS].base);
+ 
+     fdt_add_its_gic_node(vms);
++    vms->its_device = dev;
+     vms->msi_controller = VIRT_MSI_CTRL_ITS;
+ }
+ 
++static bool flexvm_disjoint(hwaddr a, hwaddr a_size,
++                             hwaddr b, hwaddr b_size)
++{
++    return a + a_size <= b || b + b_size <= a;
++}
++
++static bool flexvm_gic_address(hwaddr address, hwaddr size)
++{
++    /* The nested VMM owns this portion of the low PCI aperture. */
++    return address >= base_memmap[VIRT_PCIE_MMIO].base &&
++           address < base_memmap[VIRT_MEM].base &&
++           size <= base_memmap[VIRT_MEM].base - address &&
++           !(address & (64 * KiB - 1));
++}
++
++void qmp_x_flexvm_map_arm_gic(uint64_t distributor, uint64_t redistributor,
++                             uint64_t its, Error **errp)
++{
++    Object *machine = OBJECT(qdev_get_machine());
++    VirtMachineState *vms;
++    SysBusDevice *gic;
++    SysBusDevice *its_bus;
++    hwaddr distributor_size, redistributor_size, its_size;
++
++    if (!tcg_enabled() || !object_dynamic_cast(machine, TYPE_VIRT_MACHINE) ||
++        !runstate_check(RUN_STATE_PRELAUNCH)) {
++        error_setg(errp, "FlexVM GIC mapping requires a prelaunch TCG virt machine");
++        return;
++    }
++    vms = VIRT_MACHINE(machine);
++    if (vms->gic_version != VIRT_GIC_VERSION_3 || !vms->its_device ||
++        MACHINE(vms)->smp.cpus > 2 || vms->flexvm_gic_mapped) {
++        error_setg(errp, "FlexVM GIC mapping requires an unmapped GICv3 and ITS");
++        return;
++    }
++
++    gic = SYS_BUS_DEVICE(vms->gic);
++    its_bus = SYS_BUS_DEVICE(vms->its_device);
++    distributor_size = memory_region_size(sysbus_mmio_get_region(gic, 0));
++    redistributor_size = memory_region_size(sysbus_mmio_get_region(gic, 1));
++    its_size = memory_region_size(sysbus_mmio_get_region(its_bus, 0));
++    if (!flexvm_gic_address(distributor, distributor_size) ||
++        !flexvm_gic_address(redistributor, redistributor_size) ||
++        !flexvm_gic_address(its, its_size) ||
++        !flexvm_disjoint(distributor, distributor_size,
++                         redistributor, redistributor_size) ||
++        !flexvm_disjoint(distributor, distributor_size, its, its_size) ||
++        !flexvm_disjoint(redistributor, redistributor_size, its, its_size)) {
++        error_setg(errp, "invalid FlexVM GIC mapping");
++        return;
++    }
++
++    memory_region_transaction_begin();
++    sysbus_mmio_map_overlap(gic, 0, distributor, 1);
++    sysbus_mmio_map_overlap(gic, 1, redistributor, 1);
++    sysbus_mmio_map_overlap(its_bus, 0, its, 1);
++    memory_region_transaction_commit();
++    vms->flexvm_gic_mapped = true;
++}
++
++void qmp_x_flexvm_pulse_arm_gsi(uint32_t gsi, Error **errp)
++{
++    Object *machine = OBJECT(qdev_get_machine());
++
++    if (!tcg_enabled() || !object_dynamic_cast(machine, TYPE_VIRT_MACHINE) ||
++        !VIRT_MACHINE(machine)->flexvm_gic_mapped || gsi >= NUM_IRQS) {
++        error_setg(errp, "invalid FlexVM ARM GSI");
++        return;
++    }
++    qemu_irq_pulse(qdev_get_gpio_in(VIRT_MACHINE(machine)->gic, gsi));
++}
++
+ static void create_v2m(VirtMachineState *vms)
+ {
+     int i;
+--- a/include/hw/arm/virt.h
++++ b/include/hw/arm/virt.h
+@@ -171,6 +171,8 @@
+     int psci_conduit;
+     hwaddr highest_gpa;
+     DeviceState *gic;
++    DeviceState *its_device;
++    bool flexvm_gic_mapped;
+     DeviceState *acpi_dev;
+     Notifier powerdown_notifier;
+     Notifier generic_error_notifier;
+--- a/qapi/misc-arm.json
++++ b/qapi/misc-arm.json
+@@ -45,3 +45,37 @@
+ #                     { "version": 3, "emulated": false, "kernel": true } ] }
+ ##
+ { 'command': 'query-gic-capabilities', 'returns': ['GICCapability'] }
++
++##
++# @x-flexvm-map-arm-gic:
++#
++# Map an ARM TCG worker's GICv3 and ITS before the first vCPU runs.
++#
++# @distributor: Guest address of the GIC distributor.
++#
++# @redistributor: Guest address of the GIC redistributor region.
++#
++# @its: Guest address of the interrupt translation service.
++#
++# Features:
++#
++# @unstable: Experimental FlexVM worker protocol.
++##
++{ 'command': 'x-flexvm-map-arm-gic',
++  'data': { 'distributor': 'uint64', 'redistributor': 'uint64',
++            'its': 'uint64' },
++  'features': [ 'unstable' ] }
++
++##
++# @x-flexvm-pulse-arm-gsi:
++#
++# Pulse a GIC shared peripheral interrupt in a live TCG worker.
++#
++# @gsi: Zero-based SPI index, excluding the 32 private interrupt IDs.
++#
++# Features:
++#
++# @unstable: Experimental FlexVM worker protocol.
++##
++{ 'command': 'x-flexvm-pulse-arm-gsi',
++  'data': { 'gsi': 'uint32' }, 'features': [ 'unstable' ] }
+--- a/stubs/meson.build
++++ b/stubs/meson.build
+@@ -76,7 +76,7 @@
+   stub_ss.add(files('target-monitor-defs.c'))
+   stub_ss.add(files('win32-kbd-hook.c'))
+   stub_ss.add(files('xen-hw-stub.c'))
+-  stub_ss.add(files('monitor-arm-gic.c'))
++  stub_ss.add(files('monitor-arm-gic.c', 'monitor-arm-flexvm.c'))
+   stub_ss.add(files('monitor-i386-rtc.c'))
+   stub_ss.add(files('monitor-i386-sev.c'))
+   stub_ss.add(files('monitor-i386-sgx.c'))
+--- /dev/null
++++ b/stubs/monitor-arm-flexvm.c
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++#include "qemu/osdep.h"
++#include "qapi/error.h"
++#include "qapi/qapi-commands-misc-arm.h"
++
++void qmp_x_flexvm_map_arm_gic(uint64_t distributor, uint64_t redistributor,
++                             uint64_t its, Error **errp)
++{
++    error_setg(errp, "FlexVM GIC mapping requires an ARM virt machine");
++}
++
++void qmp_x_flexvm_pulse_arm_gsi(uint32_t gsi, Error **errp)
++{
++    error_setg(errp, "FlexVM GSI pulses require an ARM virt machine");
++}
