@@ -111,6 +111,10 @@ slot used by Firecracker. The guest reads and updates markers at the beginning
 and end of the slot, including within the legacy VGA and ROM windows. The
 worker maps the registered bytes there and limits VM RAM to addresses below
 the reserved 3 GiB device boundary.
+Add `--tss` to reserve the same three-page guest physical range that
+Firecracker configures before creating the x86 interrupt controller. Native
+KVM receives the exact address. The TCG worker uses the reservation when
+validating its RAM slots.
 The worker uses one host mapping per consecutive extent. Highly fragmented
 slots can reach the host's mapping limit. A failed mapping releases the
 partially mapped worker span.
