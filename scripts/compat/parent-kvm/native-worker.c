@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include "mailbox.h"
 #include "slot-map.h"
+#include "native-x86-state.h"
 
 static _Thread_local struct kvm_run *run_page;
 static _Thread_local volatile sig_atomic_t active_run;
@@ -432,10 +433,36 @@ int main(int argc, char **argv)
 
     check(write(control, "R", 1) == 1, "announce worker readiness");
     unsigned char request[2 + sizeof(cpuid)];
-    ssize_t received;
-    while ((received = recv(control, request, sizeof(request), MSG_TRUNC)) != 0) {
-        if (received < 0 && errno == EINTR) continue;
-        check(received >= 2 && request[1] < cpu_count, "invalid vCPU selector");
+    for (;;) {
+        union {
+            struct cmsghdr header;
+            unsigned char bytes[CMSG_SPACE(sizeof(int))];
+        } ancillary;
+        struct iovec data = {.iov_base = request, .iov_len = sizeof(request)};
+        struct msghdr message = {
+            .msg_iov = &data, .msg_iovlen = 1,
+            .msg_control = ancillary.bytes, .msg_controllen = sizeof(ancillary.bytes),
+        };
+        ssize_t received = recvmsg(control, &message, MSG_TRUNC | MSG_CMSG_CLOEXEC);
+        if (received < 0 && errno == EINTR)
+            continue;
+        if (received == 0)
+            break;
+        check(received >= 2 && received <= (ssize_t)sizeof(request) && request[1] < cpu_count &&
+              !(message.msg_flags & (MSG_CTRUNC | MSG_TRUNC)), "invalid native worker request");
+        struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+        if (received == 2 && (request[0] == 'a' || request[0] == 'b')) {
+            int fd;
+            check(parallel && request[1] == 0 && header && header->cmsg_level == SOL_SOCKET &&
+                  header->cmsg_type == SCM_RIGHTS && header->cmsg_len == CMSG_LEN(sizeof(fd)) &&
+                  !CMSG_NXTHDR(&message, header), "invalid native checkpoint request");
+            memcpy(&fd, CMSG_DATA(header), sizeof(fd));
+            int32_t status = native_x86_state_file(fd, kvm, vm, cpus, cpu_count, irqchip, pit_request, request[0] == 'a');
+            close(fd);
+            check(write(control, &status, sizeof(status)) == sizeof(status), "reply to native checkpoint request");
+            continue;
+        }
+        check(!header, "unexpected native worker descriptor");
         unsigned int id = request[1];
         int cpu = cpus[id];
         if (received == 2 + sizeof(registers) && request[0] == 'S') {
