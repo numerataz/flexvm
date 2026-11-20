@@ -367,6 +367,8 @@ struct PeersInner {
     resolved: RwLock<HashMap<String, Vec<IpAddr>>>,
     /// Each name's lookup: None while under way, else when the last one ended.
     lookups: Mutex<HashMap<String, Option<Instant>>>,
+    /// Notified whenever a lookup thread finishes and updates `lookups`.
+    done: std::sync::Condvar,
     /// The listener's: where each name's last-known addresses are kept for other processes
     /// (`PEER_CACHE` in RUN), with what was last written there.
     cache: Option<(std::path::PathBuf, Mutex<Cached>)>,
@@ -442,6 +444,7 @@ impl Peers {
                     }
                 });
                 p.0.lookups.lock().unwrap().insert(name, Some(Instant::now()));
+                p.0.done.notify_all();
             });
             lookups.insert(n.clone(), if lookup.is_ok() { None } else { Some(Instant::now()) });
         }
@@ -540,8 +543,9 @@ impl Peers {
             // Starts a lookup of a name with none; then addresses and lookups under way read
             // together, so one that publishes meanwhile is either in the addresses or waited for.
             let mut missing = Vec::new();
-            let (addrs, pending) = {
-                let (r, l) = (self.0.resolved.read().unwrap(), self.0.lookups.lock().unwrap());
+            let (addrs, pending, l) = {
+                let r = self.0.resolved.read().unwrap();
+                let l = self.0.lookups.lock().unwrap();
                 let mut addrs = Vec::new();
                 let mut pending = false;
                 for n in names {
@@ -560,17 +564,21 @@ impl Peers {
                         },
                     }
                 }
-                (addrs, pending)
+                drop(r);
+                (addrs, pending, l)
             };
             if !missing.is_empty() {
+                drop(l);
                 self.refresh(missing);
-            } else if !pending {
+                continue;
+            }
+            if !pending {
                 return Ok(addrs);
             }
-            if Instant::now() >= by {
+            let Some(left) = by.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
                 bail!("a peer's name is still being looked up; try again");
-            }
-            std::thread::sleep(Duration::from_millis(20));
+            };
+            let _ = self.0.done.wait_timeout(l, left).unwrap_or_else(|e| e.into_inner());
         }
     }
 
@@ -608,11 +616,21 @@ impl Peers {
     /// when none is left under way, or at `by`.
     fn admit_by(&self, host: &Host, from: IpAddr, by: Instant) -> bool {
         loop {
-            match self.check(&host.config_now().peers, from) {
+            let names = host.config_now().peers;
+            match self.check(&names, from) {
                 Admission::Peer => return true,
                 Admission::Refused => return false,
-                _ if Instant::now() >= by => return false,
-                _ => std::thread::sleep(Duration::from_millis(20)),
+                Admission::Unresolved | Admission::Moved => {
+                    let l = self.0.lookups.lock().unwrap();
+                    // Re-check under the lock so a lookup finishing between `check` and here is never missed.
+                    if !names.iter().any(|n| l.get(n) == Some(&None)) {
+                        continue;
+                    }
+                    let Some(left) = by.checked_duration_since(Instant::now()).filter(|d| !d.is_zero()) else {
+                        return false;
+                    };
+                    let _ = self.0.done.wait_timeout(l, left).unwrap_or_else(|e| e.into_inner());
+                }
             }
         }
     }
@@ -1377,15 +1395,32 @@ fn routable(ip: Ipv4Addr, cfg: &crate::host::Config, peers: &[IpAddr], gateways:
     routable_by(ip, cfg, peers, gateways, crate::net::is_local_ip)
 }
 
+/// Snapshot of this host's next hops and local addresses, captured outside `Host::lock`.
+pub struct HostNet {
+    gateways: Vec<IpAddr>,
+    local: Vec<IpAddr>,
+}
+
+impl HostNet {
+    pub fn snapshot() -> Result<HostNet> {
+        Ok(HostNet { gateways: crate::net::next_hops()?, local: crate::net::local_ips()? })
+    }
+
+    pub fn assignable<'a>(&'a self, run: &std::path::Path, cfg: &'a crate::host::Config) -> impl Fn(Ipv4Addr) -> Result<()> + 'a {
+        let cache = Cached::read(run, &cfg.peers);
+        let peers: Vec<IpAddr> = cfg.peers.iter().flat_map(|n| cache.addrs(n).unwrap_or_default()).collect();
+        move |ip: Ipv4Addr| routable_by(ip, cfg, &peers, &self.gateways, |ip| Ok(ip.is_loopback() || self.local.contains(&ip)))
+    }
+}
+
 /// `routable`'s refusals for a fresh VM's address (`Host::claim_new_in`), by the peers' addresses as
 /// last looked up (`Cached`) and this host's addresses and next hops now, read once: never one this
 /// host reaches its network or peers by (#1078).
 pub fn assignable<'a>(run: &std::path::Path, cfg: &'a crate::host::Config) -> Result<impl Fn(Ipv4Addr) -> Result<()> + 'a> {
     let cache = Cached::read(run, &cfg.peers);
     let peers: Vec<IpAddr> = cfg.peers.iter().flat_map(|n| cache.addrs(n).unwrap_or_default()).collect();
-    let gateways = crate::net::next_hops()?;
-    let local = crate::net::local_ips()?;
-    Ok(move |ip: Ipv4Addr| routable_by(ip, cfg, &peers, &gateways, |ip| Ok(ip.is_loopback() || local.contains(&ip))))
+    let net = HostNet::snapshot()?;
+    Ok(move |ip: Ipv4Addr| routable_by(ip, cfg, &peers, &net.gateways, |ip| Ok(ip.is_loopback() || net.local.contains(&ip))))
 }
 
 /// `local`: whether an address (the VM's, or its IPv6 address) is this host's.

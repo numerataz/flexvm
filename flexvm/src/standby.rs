@@ -1131,7 +1131,7 @@ fn claim(p: &Arc<Proc>, req: &Value) -> std::result::Result<Value, (Error, bool)
         (e, retry)
     };
     p.bind_ports().map_err(|e| not_run(e, false))?;
-    let claim = host.lock().and_then(|l| host.claim_new(&l, name, want)).map_err(|e| not_run(e, false))?;
+    let claim = host.claim_new_unlocked(name, want).map_err(|e| not_run(e, false))?;
     let mut failed = FailedClaim { p, name: Some(lock), claim: Some(claim), holder: name };
     let claim = failed.claim.as_ref().unwrap();
     p.serve_ports(claim.ip).map_err(|e| not_run(e, false))?;
