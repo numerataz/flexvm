@@ -2,9 +2,11 @@
 // PID 1 in the inner VM: independent progress and a clean hypervisor shutdown.
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <sched.h>
 #include <string.h>
+#include <sys/random.h>
 #include <sys/reboot.h>
 #include <unistd.h>
 
@@ -61,7 +63,18 @@ int main(void) {
         }
         puts("FLEXVM_SOFTWARE_INNER_NETWORK");
     }
+    int checkpoint = access("/firecracker-checkpoint", F_OK) == 0;
+    uint64_t nonce = 0;
+    if (checkpoint && getrandom(&nonce, sizeof(nonce), 0) != sizeof(nonce))
+        return 1;
+    volatile uint64_t canary = nonce;
     for (unsigned i = 0; i < 3; i++) {
+        if (checkpoint && i == 0) {
+            printf("FLEXVM_SOFTWARE_INNER_CANARY %016" PRIx64 "\n", canary);
+            sleep(5);
+        }
+        if (checkpoint && i == 1)
+            printf("FLEXVM_SOFTWARE_INNER_RESTORED %016" PRIx64 "\n", canary);
         printf("FLEXVM_SOFTWARE_INNER_TICK %u\n", i);
         if (i == 0 && access("/checkpoint-gate", F_OK) == 0) {
             puts("FLEXVM_SOFTWARE_INNER_WAITING");

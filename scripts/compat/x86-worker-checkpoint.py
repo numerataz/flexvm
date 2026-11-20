@@ -176,15 +176,21 @@ def exercise(qemu):
                 raise RuntimeError("x86 worker did not finish its completed input")
             frozen_registers = child.registers(0)
             child.freeze_run_control(True)
-            cpuid_profiles = child.capture(snapshot.fileno())
+            clock = child.capture_clock()
+            time.sleep(.05)
+            if child.capture_clock() != clock:
+                raise RuntimeError("the fenced x86 worker clock advanced")
+            worker_state = child.capture(snapshot.fileno())
         snapshot.seek(0)
         if marker in snapshot.read():
             raise RuntimeError("x86 worker stream duplicated external RAM")
         snapshot.seek(0)
         os.pwrite(target, os.pread(source, PAGE, start), destination)
-        with worker(qemu, state, target, destination, incoming=(snapshot.fileno(), cpuid_profiles)) as (child, run):
+        with worker(qemu, state, target, destination, incoming=(snapshot.fileno(), worker_state)) as (child, run):
             if child.registers(0) != frozen_registers:
                 raise RuntimeError("x86 worker did not restore its stopped registers")
+            if child.capture_clock() != clock:
+                raise RuntimeError("x86 worker did not restore its stopped clock")
             child.freeze_run_control(False)
             result = run()
             if not result.is_write or result.data != b"\x2b":

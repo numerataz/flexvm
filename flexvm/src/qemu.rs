@@ -85,13 +85,12 @@ impl ParentKvm {
         runtime: &SocketRoot,
         memory: u32,
         qmp: &Path,
-    ) -> Result<(Command, Option<software_state::Input>)> {
+    ) -> Result<(Command, software_state::Input)> {
         let directory = runtime.dir.join("logs/parent-kvm");
         fs::create_dir(&directory)?;
         let saved = incoming.and_then(|state| state.parent);
-        let staged_bundle = directory.join("bundle");
-        let frontend = self.stage_frontend(&staged_bundle, saved)?;
-        let bundle = if frontend.is_some() { &staged_bundle } else { &self.bundle };
+        let bundle = directory.join("bundle");
+        let frontend = self.stage_frontend(&bundle, saved)?;
         let broker = directory.join("parent-kvm-run.py");
         fs::write(&broker, include_bytes!("../../scripts/compat/parent-kvm-run.py"))?;
         fs::write(directory.join("software-boot.py"), include_bytes!("../../scripts/compat/software-boot.py"))?;
@@ -116,10 +115,7 @@ impl ParentKvm {
         Ok((cmd, frontend))
     }
 
-    fn stage_frontend(&self, bundle: &Path, saved: Option<&software_state::ParentInputs>) -> Result<Option<software_state::Input>> {
-        if !cfg!(target_arch = "aarch64") {
-            return Ok(None);
-        }
+    fn stage_frontend(&self, bundle: &Path, saved: Option<&software_state::ParentInputs>) -> Result<software_state::Input> {
         fs::create_dir(bundle)?;
         let frontend = bundle.join("flexvm-pvkvm.img");
         if let Some(saved) = saved {
@@ -136,7 +132,7 @@ impl ParentKvm {
                 std::os::unix::fs::symlink(worker, bundle.join("native-worker"))?;
             }
         }
-        Ok(Some(software_state::Input::open(&frontend)?))
+        software_state::Input::open(&frontend)
     }
 }
 
@@ -586,7 +582,8 @@ impl Config {
     pub fn restore(&self, verified: software_state::Verified, processes: Arc<Processes>, disks: Vec<volume::Writer>) -> Result<Machine> {
         match (&self.parent_kvm, &verified.manifest.parent) {
             (None, None) => {}
-            (Some(config), Some(parent)) if cfg!(target_arch = "aarch64") && config.engine == "tcg" && config.child_mem_mib == parent.child_memory_mib => {}
+            (Some(config), Some(parent))
+                if cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) && config.engine == "tcg" && config.child_mem_mib == parent.child_memory_mib => {}
             _ => bail!("software restore requires the captured parent KVM configuration"),
         }
         if self.control != Control::Serial {
@@ -701,7 +698,9 @@ impl Config {
                 if let Some(fds) = incoming.as_ref().and_then(Incoming::parent_fds) {
                     inherited.extend(fds);
                 }
-                (cmd, machine.parent_frontend) = provider.command(cmd, &inherited, incoming.as_ref(), &root, self.mem_mib, endpoints.api)?;
+                let (parent_command, frontend) = provider.command(cmd, &inherited, incoming.as_ref(), &root, self.mem_mib, endpoints.api)?;
+                cmd = parent_command;
+                machine.parent_frontend = Some(frontend);
             }
             machine.processes.spawn_with_fds(&mut cmd, &machine.logs.join("qemu.log"), &inherited)?;
             while !machine.sockets.api.exists() {
