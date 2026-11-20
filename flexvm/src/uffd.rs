@@ -1136,6 +1136,14 @@ pub(crate) fn runs_where(first: usize, end: usize, f: impl Fn(usize) -> bool) ->
     })
 }
 
+/// Append a half-open `[a, b)` range to `runs`, coalescing with the previous run when within `gap`.
+pub(crate) fn push_run<T: Copy + Ord + std::ops::Sub<Output = T>>(runs: &mut Vec<(T, T)>, a: T, b: T, gap: T) {
+    match runs.last_mut() {
+        Some((_, end)) if a <= *end || a - *end <= gap => *end = (*end).max(b),
+        _ => runs.push((a, b)),
+    }
+}
+
 fn regions(mappings: &[Mapping]) -> Vec<(u64, u64)> {
     mappings.iter().map(|m| (m.offset, m.size as u64)).collect()
 }

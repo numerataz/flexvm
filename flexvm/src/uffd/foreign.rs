@@ -90,7 +90,7 @@ fn scan_runs(pagemap: &std::fs::File, start: u64, len: u64) -> io::Result<Vec<(u
             return Err(io::Error::last_os_error());
         }
         for r in &regions[..n as usize] {
-            push_run(&mut runs, ((r.start - start) / PAGE_SIZE as u64) as usize, ((r.end - start) / PAGE_SIZE as u64) as usize);
+            super::push_run(&mut runs, ((r.start - start) / PAGE_SIZE as u64) as usize, ((r.end - start) / PAGE_SIZE as u64) as usize, 0);
         }
         if arg.walk_end <= at {
             break;
@@ -110,19 +110,12 @@ fn read_runs(pagemap: &std::fs::File, start: u64, len: u64) -> io::Result<Vec<(u
         std::os::unix::fs::FileExt::read_exact_at(pagemap, &mut raw[..n * 8], (start / PAGE_SIZE as u64 + first as u64) * 8)?;
         for (i, e) in raw[..n * 8].chunks(8).enumerate() {
             if u64::from_le_bytes(e.try_into().unwrap()) & (PM_PRESENT | PM_SWAP) != 0 {
-                push_run(&mut runs, first + i, first + i + 1);
+                super::push_run(&mut runs, first + i, first + i + 1, 0);
             }
         }
         first += n;
     }
     Ok(runs)
-}
-
-fn push_run(runs: &mut Vec<(usize, usize)>, a: usize, b: usize) {
-    match runs.last_mut() {
-        Some(last) if last.1 == a => last.1 = b,
-        _ => runs.push((a, b)),
-    }
 }
 
 /// Whether a page in `state` that Firecracker has mapped holds what the guest should not see: the pager installs
@@ -160,10 +153,7 @@ impl Pager {
                     Err(e) if unsupported(&e) => {
                         let mut runs: Vec<(usize, usize)> = Vec::new();
                         for p in (first..end).filter(|&p| unsettled(p)) {
-                            match runs.last_mut() {
-                                Some(last) if p - last.1 <= READ_GAP => last.1 = p + 1,
-                                _ => runs.push((p, p + 1)),
-                            }
+                            super::push_run(&mut runs, p, p + 1, READ_GAP);
                         }
                         let mut found = Vec::new();
                         for (a, b) in runs {
