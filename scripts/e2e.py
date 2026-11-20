@@ -1683,7 +1683,10 @@ def nettest_ipv6():
             os.killpg(p.pid, signal.SIGKILL)
             out, _ = p.communicate()
         out += "\n(timed out after 300 s)"
-    check("nettest V6=1: passes", p.returncode == 0 and "PASS" in out.splitlines(), out[-3000:])
+    passed = p.returncode == 0 and "PASS" in out.splitlines()
+    if not passed:
+        print(out[-64_000:], flush=True)
+    check("nettest V6=1: passes", passed)
 
 
 @case

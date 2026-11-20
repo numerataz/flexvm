@@ -84,7 +84,7 @@ wait_within() {
 }
 
 teardown() {
-    local pid
+    local pid site
     trap - EXIT INT TERM
     set +e
     for pid in "${bg_pids[@]}"; do kill "$pid" 2>/dev/null; done
@@ -98,7 +98,21 @@ teardown() {
     cp "$dir_B"/run/vms/*.log "$work/log/B/" 2>/dev/null
     forget_states "$dir_A" "$dir_B"
     rm -rf "$dir_A" "$dir_B"
-    if (( failed )); then say "logs kept in $work/log/A and $work/log/B"; else rm -rf "$work"; fi
+    if (( failed )); then
+        say "logs kept in $work"
+        if [[ -d $work/packets ]]; then
+            for site in A B C lan; do
+                [[ -f $work/packets/$site.links ]] || continue
+                say "=== $site: interfaces, route changes, and last captured packets ==="
+                tail -n 20 "$work/packets/$site.links" "$work/packets/$site.netlink" "$work/packets/$site.log"
+                if [[ -s $work/packets/$site.pcap ]]; then
+                    timeout 4s tcpdump -nn -tt -r "$work/packets/$site.pcap" | tail -n 40
+                fi
+            done
+        fi
+    else
+        rm -rf "$work"
+    fi
 }
 
 [[ $EUID == 0 ]] || die 'run as root'
@@ -135,9 +149,17 @@ if [[ $CAPTURE_TCP == 1 ]]; then
         ip -ts -n "$P$site" monitor link route neigh > "$work/packets/$site.netlink" 2>&1 &
         bg_pids+=("$!")
         # Open the output here so tcpdump may drop privileges while capturing.
-        ip netns exec "$P$site" tcpdump -n -i any -s 128 -U -c 60000 -w - 'tcp port 19012 or icmp6' \
+        LC_ALL=C ip netns exec "$P$site" tcpdump -n -i any -s 128 -U -c 60000 -w - 'tcp port 19012 or icmp6' \
             > "$work/packets/$site.pcap" 2> "$work/packets/$site.log" &
-        bg_pids+=("$!")
+        capture_pid=$!
+        bg_pids+=("$capture_pid")
+        deadline=$((SECONDS + 5))
+        until grep -Fsq 'listening on ' "$work/packets/$site.log"; do
+            if ! kill -0 "$capture_pid" 2>/dev/null || (( SECONDS >= deadline )); then
+                die "tcpdump did not start in namespace $P$site"
+            fi
+            sleep 0.1
+        done
     done
 fi
 start_listener() {
