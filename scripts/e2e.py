@@ -1495,6 +1495,7 @@ def guest_poweroff():
     """Unchanged Linux reboot(RB_POWER_OFF) terminates the VMM after each restore path."""
     for phase in ("run", "suspend", "checkpoint", "migration"):
         vm, host = f"e2e-poweroff-{phase}", A
+        release_blocked = False
         A.run(vm)
         try:
             if phase == "suspend":
@@ -1504,6 +1505,10 @@ def guest_poweroff():
                 saved = A.checkpoint(vm, stop=True)
                 A.restore(saved["id"])
             elif phase == "migration":
+                # Let the guest migrate and shut down while the old owner
+                # cannot yet learn that the destination released its memory.
+                release_blocked = True
+                B.cli("debug", "fault", "status", "120000")
                 A.migrate(vm, B)
                 host = B
             entry = host.ps()[vm]
@@ -1520,13 +1525,47 @@ def guest_poweroff():
                 result = host.exec(vm, "python3 -c " + shlex.quote(poweroff), timeout=30)
                 check(f"{phase}: actual VMM exits on guest poweroff", bool(poll.poll(10000)), result)
                 check(f"{phase}: owner retires after VMM exits", wait_for(lambda: not alive(entry["pid"]), 10), host.ps().get(vm))
+                if phase == "migration":
+                    source = A.ps().get(vm)
+                    check("migration: source is retained after target poweroff", source and source["state"] == "source", source)
+                    refused = A.rm(vm, force=True, check=False)
+                    check("migration: force-remove refuses a retained source",
+                          refused.returncode != 0 and "source of a migration in progress" in refused.stderr, refused)
+                    B.cli("debug", "fault", "status", "0")
+                    release_blocked = False
+
+                    def source_retired():
+                        source = A.ps().get(vm)
+                        if source and source.get("state") != "source":
+                            raise AssertionError(f"migration: unexpected source state after target poweroff: {source}")
+                        return source is None
+
+                    check("migration: source retires after target poweroff",
+                          wait_for(source_retired, 10), A.ps().get(vm))
             finally:
                 os.close(fd)
         finally:
-            A.rm(vm, force=True, check=False)
-            B.rm(vm, force=True, check=False)
-            clear_checkpoints(A, B)
-            check(f"{phase}: no VM records left", vm not in A.ps() and vm not in B.ps())
+            original_error = sys.exc_info()[1]
+            try:
+                if release_blocked:
+                    cleared = B.cli("debug", "fault", "status", "0", check=False)
+                    if cleared.returncode:
+                        print(f"{phase}: could not restore migration status replies: {cleared.stderr.strip()}", flush=True)
+                for label, peer in (("B", B), ("A", A)):
+                    if phase == "migration" and label == "A":
+                        if not wait_for(lambda: A.ps().get(vm, {}).get("state") != "source", 10):
+                            print(f"{phase}: source still retained during cleanup: {A.ps().get(vm)}", flush=True)
+                    removed = peer.rm(vm, force=True, check=False)
+                    print(f"{phase}: cleanup {label}: exit={removed.returncode} stdout={removed.stdout!r} stderr={removed.stderr!r}", flush=True)
+                clear_checkpoints(A, B)
+                records = {label: peer.ps().get(vm) for label, peer in (("A", A), ("B", B))}
+                if any(records.values()):
+                    print(f"{phase}: remaining VM records: {records}", flush=True)
+            except Exception as cleanup_error:
+                if original_error is None:
+                    raise
+                print(f"{phase}: cleanup failed: {cleanup_error}", file=sys.stderr, flush=True)
+        check(f"{phase}: no VM records left", not any(records.values()), records)
 
 
 @case
