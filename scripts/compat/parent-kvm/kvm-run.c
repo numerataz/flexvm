@@ -19,6 +19,8 @@
 #define SPLIT_SLOT_GPA 0x20000000
 #define GDT_OFFSET 0x200
 #define SECOND_CPU_OFFSET 0x300
+#define FPU_ENTRY_OFFSET 0x400
+#define FPU_RESUME_OFFSET 0x480
 #define LONG_ALIAS 0x4001000000ULL
 #define HUGE_PAGE_SIZE 0x200000ULL
 #define LONG_REGISTER 0x8fedcba987654321ULL
@@ -106,6 +108,65 @@ static void setup_page_tables(unsigned char *ram, uint64_t gpa, uint64_t middle,
     level2[entry + 2] = (last & ~(HUGE_PAGE_SIZE - 1)) | 0x83;
 }
 
+static void prepare_fpu(int cpu)
+{
+    const struct kvm_fpu fpu = {.fcw = 0x37f, .mxcsr = 0x1f80};
+    struct kvm_fpu staged;
+
+    check(ioctl(cpu, KVM_SET_FPU, &fpu) == 0, "stage x87 and XMM state before entry");
+    check(ioctl(cpu, KVM_GET_FPU, &staged) == 0 &&
+          staged.fcw == fpu.fcw && staged.fsw == fpu.fsw && staged.ftwx == fpu.ftwx && !staged.mxcsr &&
+          !memcmp(staged.fpr[0], fpu.fpr[0], 10) &&
+          !memcmp(staged.xmm[0], fpu.xmm[0], sizeof(fpu.xmm[0])),
+          "read staged x87 and XMM state");
+}
+
+static void update_fpu(int cpu, const unsigned char *ram)
+{
+    struct kvm_fpu observed;
+    uint16_t control;
+    uint32_t integer;
+
+    memcpy(&control, ram + 0xb0, sizeof(control));
+    memcpy(&integer, ram + 0xb4, sizeof(integer));
+    check(control == 0x77f && integer == 1, "child executed x87 instructions");
+    check(ioctl(cpu, KVM_GET_FPU, &observed) == 0 && observed.fcw == 0x77f &&
+          ((observed.fsw >> 11) & 7) == 7 && observed.ftwx == (1 << 7) &&
+          observed.xmm[0][0] == 0xfe && observed.xmm[0][1] == 0xfe && observed.xmm[0][15] == 0xfe,
+          "read x87 and XMM changes made by the child");
+    const struct kvm_fpu fpu = {
+        .fcw = 0xb7f, .fsw = 5 << 11, .ftwx = 1 << 5,
+        .fpr = {{0, 0, 0, 0, 0, 0, 0, 0x80, 0, 0x40}}, /* ST(0) = 2.0 */
+        .xmm = {{7, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 30}},
+    };
+    check(ioctl(cpu, KVM_SET_FPU, &fpu) == 0, "update floating-point state after the exit");
+}
+
+static void check_resumed_fpu(int cpu, const unsigned char *data)
+{
+    struct kvm_fpu fpu;
+    uint16_t control;
+    uint32_t integer;
+    uint32_t mxcsr;
+
+    memcpy(&control, data + 0xb0, sizeof(control));
+    memcpy(&integer, data + 0xb4, sizeof(integer));
+    memcpy(&mxcsr, data + 0xbc, sizeof(mxcsr));
+    check(control == 0xb7f && integer == 2 && mxcsr == 0x3f80 &&
+          ioctl(cpu, KVM_GET_FPU, &fpu) == 0 && fpu.fcw == 0xb7f &&
+          ((fpu.fsw >> 11) & 7) == 6 && !fpu.ftwx &&
+          fpu.xmm[0][0] == 14 && fpu.xmm[0][1] == 8 && fpu.xmm[0][15] == 60,
+          "read updated floating-point state after re-entry");
+    puts("PASS x87 and XMM state reached the parent worker");
+}
+
+static void install_jump(unsigned char *ram, int from, int to)
+{
+    int32_t target = to - (from + 5);
+    ram[from] = 0xe9;
+    memcpy(ram + from + 1, &target, sizeof(target));
+}
+
 struct interrupt_test {
     uint32_t *counter;
     uint32_t baseline;
@@ -173,6 +234,7 @@ int main(int argc, char **argv)
     bool interrupt_run = false;
     bool two_vcpus = false;
     bool long_mode = false;
+    bool fpu = false;
     check(argc == 2 || protected_mode, "specify RAM pages and optional protected or split mode");
     for (int i = 3; i < argc; i++) {
         if (!interrupt_run && !strcmp(argv[i], "interrupt"))
@@ -181,6 +243,8 @@ int main(int argc, char **argv)
             two_vcpus = true;
         else if (!long_mode && !strcmp(argv[i], "long"))
             long_mode = true;
+        else if (!fpu && !strcmp(argv[i], "fpu"))
+            fpu = true;
         else
             check(false, "invalid execution option");
     }
@@ -191,6 +255,7 @@ int main(int argc, char **argv)
     check(protected_mode || count <= PVKVM_REAL_MODE_MAX_PAGES, "select protected mode for a large slot");
     check(!split_slot || count >= 2, "split mode needs at least two RAM pages");
     check(!long_mode || (!two_vcpus && count >= (split_slot ? 8 : 4)), "reserve four low pages for long mode");
+    check(!fpu || long_mode, "exercise floating-point state in long mode");
     size_t pages = count;
     size_t ram_bytes = pages * 4096;
     uint64_t gpa = protected_mode ? PROTECTED_SLOT_GPA : PVKVM_GUEST_START;
@@ -306,14 +371,47 @@ int main(int argc, char **argv)
     const uint64_t gdt[] = { 0, long_mode ? 0x00af9b000000ffff : 0x00cf9b000000ffff, 0x00cf93000000ffff };
     if (protected_mode) {
         const unsigned char long_prelude[] = {0x4d, 0x89, 0xf8}; /* mov r8, r15 */
+        const unsigned char fpu_entry[] = {
+            0x0f, 0x20, 0xe0,                   /* mov rax, cr4 */
+            0x0d, 0, 0x02, 0, 0,               /* or eax, 0x200 (OSFXSR) */
+            0x0f, 0x22, 0xe0,                   /* mov cr4, rax */
+            0x0f, 0xae, 0x97, 0xbc, 0, 0, 0,   /* ldmxcsr [rdi+0xbc] */
+            0x66, 0x0f, 0x74, 0xc0,             /* pcmpeqb xmm0, xmm0 */
+            0x66, 0x0f, 0xfc, 0xc0,             /* paddb xmm0, xmm0 */
+            0xd9, 0xaf, 0xb8, 0, 0, 0,          /* fldcw [rdi+0xb8] */
+            0xd9, 0xbf, 0xb0, 0, 0, 0,          /* fnstcw [rdi+0xb0] */
+            0xd9, 0xe8,                         /* fld1 */
+            0xdb, 0x9f, 0xb4, 0, 0, 0,          /* fistp dword [rdi+0xb4] */
+            0xd9, 0xe8,                         /* fld1, leave a nonempty stack */
+            0xb8, 0x41, 0, 0, 0, 0xf9,          /* mov eax, 0x41; stc */
+        };
+        const unsigned char fpu_resume[] = {
+            0x66, 0x0f, 0xfc, 0xc0,             /* paddb xmm0, xmm0 */
+            0xd9, 0xbf, 0xb0, 0, 0, 0,          /* fnstcw [rdi+0xb0] */
+            0xdb, 0x9f, 0xb4, 0, 0, 0,          /* fistp dword [rdi+0xb4] */
+            0x0f, 0xae, 0x9f, 0xbc, 0, 0, 0,   /* stmxcsr [rdi+0xbc] */
+        };
         size_t startup = 0x10;
+        size_t resume = 0x40;
+        if (fpu) {
+            const uint16_t control = 0x77f;
+            const uint32_t mxcsr = 0x3f80;
+            memcpy(ram + 0xb8, &control, sizeof(control));
+            memcpy(ram + 0xbc, &mxcsr, sizeof(mxcsr));
+            memcpy(ram + FPU_ENTRY_OFFSET, fpu_entry, sizeof(fpu_entry));
+            install_jump(ram, FPU_ENTRY_OFFSET + sizeof(fpu_entry), startup);
+            install_jump(ram, resume, FPU_RESUME_OFFSET);
+            resume += 5;
+            memcpy(ram + FPU_RESUME_OFFSET, fpu_resume, sizeof(fpu_resume));
+            install_jump(ram, FPU_RESUME_OFFSET + sizeof(fpu_resume), resume);
+        }
         if (long_mode) {
             setup_page_tables(ram, gpa, middle_page, last_page);
             memcpy(ram + startup, long_prelude, sizeof(long_prelude));
             startup += sizeof(long_prelude);
         }
         memcpy(ram + startup, flat_code, sizeof(flat_code));
-        memcpy(ram + 0x40, flat_resumed, sizeof(flat_resumed));
+        memcpy(ram + resume, flat_resumed, sizeof(flat_resumed));
         if (interrupt_run)
             memcpy(ram + 0x60, flat_interruptible, sizeof(flat_interruptible));
         memcpy(ram + GDT_OFFSET, gdt, sizeof(gdt));
@@ -328,6 +426,8 @@ int main(int argc, char **argv)
     struct kvm_run *run = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, cpu, 0);
     check(run != MAP_FAILED, "map kvm_run");
     struct kvm_regs regs = {.rax = 0x41, .rip = entry_base + 0x10, .rflags = 3};
+    if (fpu)
+        regs.rip = entry_base + FPU_ENTRY_OFFSET;
     if (protected_mode) {
         regs.rbx = data_address;
         regs.rdi = entry_base;
@@ -340,6 +440,8 @@ int main(int argc, char **argv)
     check(ioctl(cpu, KVM_GET_REGS, &readback) == 0 && !memcmp(&readback, &regs, sizeof(regs)),
           "read back initial registers");
     select_segments(cpu, protected_mode, long_mode, gpa);
+    if (fpu)
+        prepare_fpu(cpu);
     int other_cpu = -1;
     struct kvm_run *other_run = NULL;
     if (two_vcpus) {
@@ -392,6 +494,8 @@ int main(int argc, char **argv)
         check(data[0xa0] == 0x56 && data[0xa1] == 0, "second vCPU read shared RAM and stopped at its exit");
         check(munmap(other_run, size) == 0 && close(other_cpu) == 0, "close the second vCPU");
     }
+    if (fpu)
+        update_fpu(cpu, ram);
     data[0x81] = 0x52;
     const struct kvm_regs update = {
         .rbx = 0xf5, .rcx = 0x3579, .rsp = 0x1f00, .rbp = 0x12345678,
@@ -414,6 +518,8 @@ int main(int argc, char **argv)
         puts("PASS stopped and resumed the same running child");
     if (long_mode)
         puts("PASS x86-64 child used guest page tables and a virtual RAM alias");
+    if (fpu)
+        check_resumed_fpu(cpu, data);
     munmap(run, size);
     close(cpu);
     munmap(ram, ram_bytes);

@@ -40,19 +40,21 @@ int main(void)
     pid_t child = fork();
     check(child >= 0, "fork the KVM client");
     if (child == 0) {
-        const char *mode = NULL;
+        char *arguments[8] = {"kvm-run", pages};
+        unsigned int next = 2;
         if (access("/split-slot", F_OK) == 0)
-            mode = "split";
+            arguments[next++] = "split";
         else if (access("/protected-entry", F_OK) == 0)
-            mode = "protected";
-        const char *interrupt = access("/interrupt-run", F_OK) == 0 ? "interrupt" : NULL;
-        const char *cpu_mode = access("/two-vcpus", F_OK) == 0 ? "smp" : NULL;
+            arguments[next++] = "protected";
+        if (access("/interrupt-run", F_OK) == 0)
+            arguments[next++] = "interrupt";
+        if (access("/two-vcpus", F_OK) == 0)
+            arguments[next++] = "smp";
         if (access("/long-mode", F_OK) == 0)
-            cpu_mode = "long";
-        if (interrupt)
-            execl("/kvm-run", "kvm-run", pages, mode, interrupt, cpu_mode, NULL);
-        else
-            execl("/kvm-run", "kvm-run", pages, mode, cpu_mode, NULL);
+            arguments[next++] = "long";
+        if (access("/floating-point", F_OK) == 0)
+            arguments[next++] = "fpu";
+        execv("/kvm-run", arguments);
         _exit(127);
     }
     int status;

@@ -1,0 +1,180 @@
+--- a/qapi/misc-i386.json
++++ b/qapi/misc-i386.json
+@@ -547,3 +547,44 @@
+   'data': { 'cpu-index': 'uint16', 'gdt-base': 'uint32',
+             'gdt-limit': 'uint16', '*page-table-root': 'uint32' },
+   'features': [ 'unstable' ] }
++
++##
++# @FlexvmX86FpuRecord:
++#
++# The Linux x86 KVM floating-point ABI record.
++#
++# @record: A hex-encoded, little-endian struct kvm_fpu.
++##
++{ 'struct': 'FlexvmX86FpuRecord', 'data': { 'record': 'str' } }
++
++##
++# @x-flexvm-query-x86-fpu:
++#
++# Read the floating-point state of a stopped FlexVM TCG vCPU.
++#
++# @cpu-index: The vCPU to read.
++#
++# Features:
++#
++# @unstable: Experimental FlexVM worker protocol.
++##
++{ 'command': 'x-flexvm-query-x86-fpu',
++  'data': { 'cpu-index': 'uint16' }, 'returns': 'FlexvmX86FpuRecord',
++  'features': [ 'unstable' ] }
++
++##
++# @x-flexvm-set-x86-fpu:
++#
++# Write the floating-point state of a stopped FlexVM TCG vCPU.
++#
++# @cpu-index: The vCPU to update.
++#
++# @record: A hex-encoded, little-endian struct kvm_fpu.
++#
++# Features:
++#
++# @unstable: Experimental FlexVM worker protocol.
++##
++{ 'command': 'x-flexvm-set-x86-fpu',
++  'data': { 'cpu-index': 'uint16', 'record': 'str' },
++  'features': [ 'unstable' ] }
+--- a/target/i386/monitor.c
++++ b/target/i386/monitor.c
+@@ -740,3 +740,111 @@
+                               data_flags);
+     }
+ }
++
++/* The KVM UAPI record uses FXSAVE's logical x87 stack ordering. */
++typedef struct FlexvmKvmFpu {
++    uint8_t st[8][16];
++    uint8_t control[2];
++    uint8_t status[2];
++    uint8_t nonempty;
++    uint8_t pad1;
++    uint8_t opcode[2];
++    uint8_t ip[8];
++    uint8_t dp[8];
++    uint8_t xmm[16][16];
++    uint8_t mxcsr_and_pad[8];
++} FlexvmKvmFpu;
++
++G_STATIC_ASSERT(sizeof(FlexvmKvmFpu) == 416);
++
++static CPUX86State *flexvm_fpu_cpu(uint16_t cpu_index, Error **errp)
++{
++    CPUState *cpu = qemu_get_cpu(cpu_index);
++
++    if (!cpu || !tcg_enabled() ||
++        (!runstate_check(RUN_STATE_PRELAUNCH) &&
++         !runstate_check(RUN_STATE_PAUSED))) {
++        error_setg(errp, "FlexVM requires a stopped x86 TCG vCPU");
++        return NULL;
++    }
++    return &X86_CPU(cpu)->env;
++}
++
++FlexvmX86FpuRecord *qmp_x_flexvm_query_x86_fpu(uint16_t cpu_index,
++                                               Error **errp)
++{
++    CPUX86State *env = flexvm_fpu_cpu(cpu_index, errp);
++    FlexvmKvmFpu state = { 0 };
++    const uint8_t *bytes = (const uint8_t *)&state;
++    static const char hex[] = "0123456789abcdef";
++    FlexvmX86FpuRecord *result;
++
++    if (!env) {
++        return NULL;
++    }
++    stw_le_p(state.control, env->fpuc);
++    stw_le_p(state.status, (env->fpus & ~0x3800) | (env->fpstt << 11));
++    stw_le_p(state.opcode, env->fpop);
++    stq_le_p(state.ip, env->fpip);
++    stq_le_p(state.dp, env->fpdp);
++    for (size_t i = 0; i < ARRAY_SIZE(state.st); i++) {
++        floatx80 st = env->fpregs[(i + env->fpstt) % 8].d;
++        state.nonempty |= !env->fptags[i] << i;
++        stq_le_p(state.st[i], st.low);
++        stw_le_p(state.st[i] + 8, st.high);
++    }
++    for (size_t i = 0; i < CPU_NB_REGS; i++) {
++        stq_le_p(state.xmm[i], env->xmm_regs[i].ZMM_Q(0));
++        stq_le_p(state.xmm[i] + 8, env->xmm_regs[i].ZMM_Q(1));
++    }
++    result = g_new0(FlexvmX86FpuRecord, 1);
++    result->record = g_malloc0(2 * sizeof(state) + 1);
++    for (size_t i = 0; i < sizeof(state); i++) {
++        result->record[2 * i] = hex[bytes[i] >> 4];
++        result->record[2 * i + 1] = hex[bytes[i] & 15];
++    }
++    return result;
++}
++
++void qmp_x_flexvm_set_x86_fpu(uint16_t cpu_index, const char *record,
++                             Error **errp)
++{
++    CPUX86State *env = flexvm_fpu_cpu(cpu_index, errp);
++    FlexvmKvmFpu state;
++    uint8_t *bytes = (uint8_t *)&state;
++    uint16_t status;
++
++    if (!env) {
++        return;
++    }
++    if (strlen(record) != 2 * sizeof(state)) {
++        error_setg(errp, "invalid FlexVM KVM_FPU record size");
++        return;
++    }
++    for (size_t i = 0; i < sizeof(state); i++) {
++        int high = g_ascii_xdigit_value(record[2 * i]);
++        int low = g_ascii_xdigit_value(record[2 * i + 1]);
++        if (high < 0 || low < 0) {
++            error_setg(errp, "invalid FlexVM KVM_FPU record encoding");
++            return;
++        }
++        bytes[i] = (high << 4) | low;
++    }
++    cpu_set_fpuc(env, lduw_le_p(state.control));
++    status = lduw_le_p(state.status);
++    env->fpstt = (status >> 11) & 7;
++    env->fpus = status & ~0x3800;
++    env->fpop = lduw_le_p(state.opcode);
++    env->fpip = ldq_le_p(state.ip);
++    env->fpdp = ldq_le_p(state.dp);
++    for (size_t i = 0; i < ARRAY_SIZE(state.st); i++) {
++        env->fptags[i] = !(state.nonempty & (1 << i));
++        env->fpregs[(i + env->fpstt) % 8].d =
++            make_floatx80(lduw_le_p(state.st[i] + 8), ldq_le_p(state.st[i]));
++    }
++    for (size_t i = 0; i < CPU_NB_REGS; i++) {
++        env->xmm_regs[i].ZMM_Q(0) = ldq_le_p(state.xmm[i]);
++        env->xmm_regs[i].ZMM_Q(1) = ldq_le_p(state.xmm[i] + 8);
++    }
++    /* Linux's KVM_FPU ioctl leaves MXCSR unchanged. */
++}
+--- a/stubs/monitor-i386-flexvm.c
++++ b/stubs/monitor-i386-flexvm.c
+@@ -17,3 +17,16 @@
+ {
+     error_setg(errp, "FlexVM protected entry requires an x86 worker");
+ }
++
++FlexvmX86FpuRecord *qmp_x_flexvm_query_x86_fpu(uint16_t cpu_index,
++                                               Error **errp)
++{
++    error_setg(errp, "FlexVM floating-point state requires an x86 worker");
++    return NULL;
++}
++
++void qmp_x_flexvm_set_x86_fpu(uint16_t cpu_index, const char *record,
++                             Error **errp)
++{
++    error_setg(errp, "FlexVM floating-point state requires an x86 worker");
++}

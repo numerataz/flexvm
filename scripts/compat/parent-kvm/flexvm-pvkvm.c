@@ -70,8 +70,10 @@ struct pvcpu {
 	struct run_page *page;
 	struct kvm_regs regs;
 	struct kvm_sregs sregs;
+	struct kvm_fpu fpu;
 	unsigned int id;
 	bool ran;
+	bool fpu_set;
 };
 
 static const struct kvm_sregs reset_sregs = {
@@ -366,6 +368,9 @@ static int run_cpu(struct pvcpu *cpu)
 	if (!cpu->ran) {
 		memcpy_toio(p->mailbox + PVKVM_REGISTERS_AT, &cpu->regs, sizeof(cpu->regs));
 		memcpy_toio(p->mailbox + PVKVM_INITIAL_SREGISTERS_AT, &cpu->sregs, sizeof(cpu->sregs));
+		writel(cpu->fpu_set, p->mailbox + PVKVM_FPU_VALID_AT);
+		if (cpu->fpu_set)
+			memcpy_toio(p->mailbox + PVKVM_FPU_AT, &cpu->fpu, sizeof(cpu->fpu));
 	}
 	result = request_for_cpu(cpu, PVKVM_RUN, memory, &cpu->page->data);
 	if (!result || result == -EINTR)
@@ -376,7 +381,7 @@ unlock:
 }
 
 static int read_stopped_registers(struct pvcpu *cpu, enum pvkvm_command command,
-				  void *registers, size_t size)
+				  unsigned int offset, void *registers, size_t size)
 {
 	struct pvkvm *p = cpu->vm->provider;
 	int result = mutex_lock_interruptible(&p->lock);
@@ -385,7 +390,25 @@ static int read_stopped_registers(struct pvcpu *cpu, enum pvkvm_command command,
 		return result;
 	result = request_for_cpu(cpu, command, NULL, NULL);
 	if (!result)
-		memcpy_fromio(registers, p->mailbox + PVKVM_REGISTERS_AT, size);
+		memcpy_fromio(registers, p->mailbox + offset, size);
+	mutex_unlock(&p->lock);
+	return result;
+}
+
+static int write_stopped_registers(struct pvcpu *cpu, enum pvkvm_command command,
+				   unsigned int offset, const void *registers, size_t size)
+{
+	struct pvkvm *p = cpu->vm->provider;
+	int result = mutex_lock_interruptible(&p->lock);
+
+	if (result)
+		return result;
+	if (p->dead) {
+		result = -ENODEV;
+	} else {
+		memcpy_toio(p->mailbox + offset, registers, size);
+		result = request_for_cpu(cpu, command, NULL, NULL);
+	}
 	mutex_unlock(&p->lock);
 	return result;
 }
@@ -393,8 +416,8 @@ static int read_stopped_registers(struct pvcpu *cpu, enum pvkvm_command command,
 static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct pvcpu *cpu = file->private_data;
-	struct pvkvm *p = cpu->vm->provider;
 	struct run_page *page = cpu->page;
+	struct kvm_fpu fpu;
 	struct kvm_sregs sregs, wanted;
 	struct kvm_regs regs;
 	void __user *uarg = (void __user *)arg;
@@ -413,7 +436,7 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case KVM_GET_REGS:
 		regs = cpu->regs;
 		if (cpu->ran) {
-			result = read_stopped_registers(cpu, PVKVM_GET_REGS, &regs, sizeof(regs));
+			result = read_stopped_registers(cpu, PVKVM_GET_REGS, PVKVM_REGISTERS_AT, &regs, sizeof(regs));
 			if (result)
 				break;
 		}
@@ -431,17 +454,7 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			break;
 		}
 		if (cpu->ran) {
-			if (mutex_lock_interruptible(&p->lock)) {
-				result = -EINTR;
-				break;
-			}
-			if (p->dead) {
-				result = -ENODEV;
-			} else {
-				memcpy_toio(p->mailbox + PVKVM_REGISTERS_AT, &regs, sizeof(regs));
-				result = request_for_cpu(cpu, PVKVM_SET_REGS, NULL, NULL);
-			}
-			mutex_unlock(&p->lock);
+			result = write_stopped_registers(cpu, PVKVM_SET_REGS, PVKVM_REGISTERS_AT, &regs, sizeof(regs));
 			if (result)
 				break;
 		}
@@ -451,7 +464,7 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case KVM_GET_SREGS:
 		sregs = cpu->sregs;
 		if (cpu->ran) {
-			result = read_stopped_registers(cpu, PVKVM_GET_SREGS, &sregs, sizeof(sregs));
+			result = read_stopped_registers(cpu, PVKVM_GET_SREGS, PVKVM_REGISTERS_AT, &sregs, sizeof(sregs));
 			if (result)
 				break;
 		}
@@ -470,6 +483,33 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			break;
 		}
 		cpu->sregs = sregs;
+		result = 0;
+		break;
+	case KVM_GET_FPU:
+		fpu = cpu->fpu;
+		if (cpu->ran) {
+			result = read_stopped_registers(cpu, PVKVM_GET_FPU, PVKVM_FPU_AT, &fpu, sizeof(fpu));
+			if (result)
+				break;
+		}
+		result = copy_to_user(uarg, &fpu, sizeof(fpu)) ? -EFAULT : 0;
+		break;
+	case KVM_SET_FPU:
+		if (copy_from_user(&fpu, uarg, sizeof(fpu))) {
+			result = -EFAULT;
+			break;
+		}
+		/* Linux KVM_FPU preserves the worker's MXCSR. XSAVE includes it. */
+		fpu.mxcsr = 0;
+		fpu.pad1 = 0;
+		fpu.pad2 = 0;
+		if (cpu->ran) {
+			result = write_stopped_registers(cpu, PVKVM_SET_FPU, PVKVM_FPU_AT, &fpu, sizeof(fpu));
+			if (result)
+				break;
+		}
+		cpu->fpu = fpu;
+		cpu->fpu_set = true;
 		result = 0;
 		break;
 	case KVM_RUN:
@@ -527,6 +567,7 @@ static int new_cpu(struct pvvm *vm, unsigned long id)
 	cpu->regs.rip = 0xfff0;
 	cpu->regs.rflags = 2;
 	cpu->sregs = reset_sregs;
+	cpu->fpu.fcw = 0x37f;
 	mutex_init(&cpu->execution);
 	mutex_lock(&p->lock);
 	if (vm->created_cpus & BIT(id))
@@ -743,7 +784,9 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 
 	BUILD_BUG_ON(sizeof(struct run_page) > PAGE_SIZE);
 	BUILD_BUG_ON(PAGE_SIZE != PVKVM_GUEST_PAGE_SIZE);
-	BUILD_BUG_ON(PVKVM_SLOT_TABLE_AT + PVKVM_MAX_SLOTS * PVKVM_SLOT_RECORD_SIZE > PVKVM_RAM_ADDRESS_AT);
+	BUILD_BUG_ON(PVKVM_SLOT_TABLE_AT + PVKVM_MAX_SLOTS * PVKVM_SLOT_RECORD_SIZE > PVKVM_FPU_AT);
+	BUILD_BUG_ON(sizeof(struct kvm_fpu) != PVKVM_FPU_BYTES);
+	BUILD_BUG_ON(PVKVM_FPU_AT + PVKVM_FPU_BYTES > PVKVM_RAM_ADDRESS_AT);
 	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
 	    pci_resource_len(dev, 2) < PVKVM_RAM_ADDRESS_AT + PVKVM_MAX_PAGES * sizeof(u64))
 		return -ENODEV;

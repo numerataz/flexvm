@@ -65,6 +65,10 @@ execution of the first vCPU after closing the second vCPU's descriptor.
 Add `--long-mode` with at least four pages in the first slot. The client supplies
 page tables, enters at a virtual address above 4 GiB, checks the live control
 registers and executes a 64-bit transfer between extended registers.
+Add `--fpu` to exercise `KVM_GET_FPU` and `KVM_SET_FPU` in long mode. The
+client sets an x87 stack value and an XMM register, checks the effect of guest
+instructions, then writes new values and checks them after re-entry. The
+worker preserves MXCSR as the Linux KVM_FPU ioctl does.
 The worker uses one host mapping per consecutive extent. Highly fragmented
 slots can reach the host's mapping limit. A failed mapping releases the
 partially mapped worker span.
