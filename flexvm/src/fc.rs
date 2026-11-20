@@ -1265,7 +1265,7 @@ mod tests {
     fn api_stalled_response_keeps_one_deadline_and_drops_connection() {
         // Response bytes arrive halfway to the deadline: one restarted by them, not kept for the whole call, would
         // return no sooner than TIMEOUT after they were sent, so the call has TIMEOUT / 2 of scheduling slack.
-        const TIMEOUT: Duration = Duration::from_secs(2);
+        const TIMEOUT: Duration = Duration::from_millis(400);
         for response in [&b""[..], &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n"[..], &b"HTTP/1.1 200 OK\r\nContent-Length:"[..]] {
             let (sent_tx, sent_rx) = std::sync::mpsc::channel();
             let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();

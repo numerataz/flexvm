@@ -128,9 +128,27 @@ fn pins(root: &Path) {
     }
 }
 
-/// flexvm-init, static (it runs in any image), built by a cargo of its own into OUT_DIR: release, whatever this
-/// build's profile, and without this build's flags or wrappers (clippy's included). `FLEXVM_INIT` names a
-/// prebuilt one instead.
+/// Shared cargo target directory for the nested `flexvm-init` build so `cargo check`, `cargo clippy`,
+/// `cargo test`, and `build.rs` edits do not recompile `flexvm-init`'s dependencies for every `OUT_DIR` hash.
+/// Debug/test builds and release builds use separate directories so their profile overrides never clash.
+fn init_target_dir(out: &Path, release: bool) -> PathBuf {
+    let name = if release { "init-target" } else { "init-target-dev" };
+    // Cargo lays out OUT_DIR as `<target-dir>/<profile>/build/<pkg>-<hash>/out` (or with `<triple>` before `<profile>`).
+    let mut dir = out;
+    while let Some(parent) = dir.parent() {
+        if dir.file_name().and_then(|n| n.to_str()) == Some("build") {
+            if let Some(target_root) = parent.parent() {
+                return target_root.join(name);
+            }
+        }
+        dir = parent;
+    }
+    out.join(name)
+}
+
+/// flexvm-init, static (it runs in any image), built by a cargo of its own into OUT_DIR: release for release
+/// builds (full LTO, single codegen unit), or fast un-LTO'd release for debug/test/clippy builds, and without
+/// this build's flags or wrappers (clippy's included). `FLEXVM_INIT` names a prebuilt one instead.
 fn init(root: &Path) {
     let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
     let dest = out.join("flexvm-init");
@@ -145,13 +163,27 @@ fn init(root: &Path) {
     }
     // The guest runs on the same architecture as the flexvm binary that embeds it.
     let target = format!("{}-unknown-linux-gnu", std::env::var("CARGO_CFG_TARGET_ARCH").unwrap());
-    let target_dir = out.join("init-target");
+    let release = std::env::var("PROFILE").as_deref() == Ok("release");
+    let target_dir = init_target_dir(&out, release);
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut cmd = Command::new(cargo);
     cmd.current_dir(root)
         .args(["build", "--release", "--locked", "-p", "flexvm-init", "--target", &target, "--target-dir"])
         .arg(&target_dir)
         .env("CARGO_ENCODED_RUSTFLAGS", "-Ctarget-feature=+crt-static");
+    if !release {
+        // Avoid full LTO and single-CGU codegen during `cargo check`/`clippy`/`test`.
+        cmd.args([
+            "--config",
+            "profile.release.lto=false",
+            "--config",
+            "profile.release.codegen-units=16",
+            "--config",
+            "profile.release.opt-level=0",
+            "--config",
+            "profile.release.strip=false",
+        ]);
+    }
     for var in
         ["RUSTFLAGS", "RUSTC_WORKSPACE_WRAPPER", "CARGO_TARGET_DIR", "CARGO_BUILD_TARGET_DIR", "CARGO_BUILD_RUSTFLAGS", "CLIPPY_ARGS", "CARGO_PRIMARY_PACKAGE"]
     {
@@ -168,7 +200,22 @@ fn init(root: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{release_name, valid_tag};
+    use std::path::Path;
+
+    use super::{init_target_dir, release_name, valid_tag};
+
+    #[test]
+    fn init_target_dir_is_shared_under_cargo_target_root() {
+        let out = Path::new("/repo/target/debug/build/flexvm-abc123/out");
+        assert_eq!(init_target_dir(out, false), Path::new("/repo/target/init-target-dev"));
+        assert_eq!(init_target_dir(out, true), Path::new("/repo/target/init-target"));
+
+        let cross = Path::new("/repo/target/x86_64-unknown-linux-gnu/release/build/flexvm-abc123/out");
+        assert_eq!(init_target_dir(cross, true), Path::new("/repo/target/x86_64-unknown-linux-gnu/init-target"));
+
+        let fallback = Path::new("/tmp/custom-out");
+        assert_eq!(init_target_dir(fallback, false), Path::new("/tmp/custom-out/init-target-dev"));
+    }
 
     #[test]
     fn packed_refs_do_not_leave_missing_cargo_inputs() {
