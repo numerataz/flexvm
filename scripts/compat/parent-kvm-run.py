@@ -29,10 +29,14 @@ MAILBOX_SIZE = 64 << 10
 PAGE_SIZE = 4096
 OUTER_RAM_SIZE = 192 * MIB
 IO_VALUES = (0x42, 0xa7)
-OPEN_VM, CLOSE_VM, OPEN_CPU, CLOSE_CPU, RUN, GET_REGS = range(1, 7)
+OPEN_VM, CLOSE_VM, OPEN_CPU, CLOSE_CPU, RUN, GET_REGS, SET_REGS = range(1, 8)
 # Linux's x86 struct kvm_regs. The fixture runs in real mode.
 REGISTERS = struct.Struct("<18Q")
-LOW_REGISTERS = ("EAX", "EBX", "ECX", "EDX", "ESI", "EDI", "ESP", "EBP")
+# (GDB index, KVM index, bytes) from QEMU's i386-64bit.xml.
+GDB_REGISTERS = (
+    (0, 0, 8), (1, 1, 8), (2, 2, 8), (3, 3, 8), (4, 4, 8), (5, 5, 8),
+    (6, 7, 8), (7, 6, 8), (16, 16, 8), (17, 17, 4),
+)
 QEMU_OPTIONS = [
     "-nodefaults", "-display", "none", "-monitor", "none", "-nic", "none",
     "-smp", "1", "-no-reboot", "-sandbox", "on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny",
@@ -74,12 +78,59 @@ class RunChannel:
         self.connection.close()
 
 
+class RegisterChannel:
+    def __init__(self, path):
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            self.socket.settimeout(1)
+            self.socket.connect(str(path))
+            self.stream = self.socket.makefile("rb")
+        except BaseException:
+            self.socket.close()
+            raise
+
+    def exchange(self, command):
+        payload = command.encode("ascii")
+        checksum = f"{sum(payload) % 256:02x}".encode("ascii")
+        self.socket.sendall(b"$" + payload + b"#" + checksum)
+        if self.stream.read(2) != b"+$":
+            raise RuntimeError("unexpected QEMU register reply header")
+        payload = bytearray()
+        for _ in range(4096):
+            byte = self.stream.read(1)
+            if byte == b"#":
+                checksum = f"{sum(payload) % 256:02x}".encode("ascii")
+                if self.stream.read(2) != checksum:
+                    raise RuntimeError("invalid QEMU register reply checksum")
+                self.socket.sendall(b"+")
+                return bytes(payload)
+            if not byte:
+                break
+            payload.extend(byte)
+        raise RuntimeError("unterminated QEMU register reply")
+
+    def read(self, index, size):
+        value = self.exchange(f"p{index:x}")
+        if len(value) != size * 2:
+            raise RuntimeError(f"QEMU did not return a {size}-byte register for {index}")
+        return int.from_bytes(bytes.fromhex(value.decode("ascii")), "little")
+
+    def write(self, index, size, value):
+        encoded = value.to_bytes(size, "little").hex()
+        if self.exchange(f"P{index:x}={encoded}") != b"OK":
+            raise RuntimeError(f"QEMU rejected register {index}")
+
+    def close(self):
+        self.stream.close()
+        self.socket.close()
+
+
 class TcgChild:
     def __init__(self, qemu, output, socket_path, outer_ram, offsets):
         self.process = None
         self.channel = None
-        self.monitor = None
-        self.monitor_path = socket_path.with_name("registers.sock")
+        self.debugger = None
+        debugger_path = socket_path.with_name("registers.sock")
         self.memory = outer_ram
         self.offsets = offsets
         try:
@@ -90,7 +141,8 @@ class TcgChild:
                 command = [
                     qemu, *QEMU_OPTIONS, "-machine", "pc,accel=tcg", "-m", "16", "-serial", "none",
                     "-bios", output / "reset.rom", "-S", "-chardev", f"socket,id=port,path={socket_path}",
-                    "-qmp", f"unix:{self.monitor_path},server=on,wait=off",
+                    "-chardev", f"socket,id=regs,path={debugger_path},server=on,wait=off",
+                    "-gdb", "chardev:regs",
                     "-device", "isa-debugcon,iobase=0x30,chardev=port,run-control=on",
                 ]
                 for index, offset in enumerate(offsets):
@@ -101,6 +153,11 @@ class TcgChild:
                 self.process = subprocess.Popen(command, pass_fds=(outer_ram,), stdout=log, stderr=log)
                 connection, _ = listener.accept()
                 self.channel = RunChannel(connection)
+                self.debugger = RegisterChannel(debugger_path)
+                description = self.debugger.exchange("qXfer:features:read:target.xml:0,fff")
+                if b'<xi:include href="i386-64bit.xml"/>' not in description:
+                    raise RuntimeError("unexpected QEMU register layout")
+                self.debugger.write(18, 4, 0)  # Real-mode code segment with zero base.
         except BaseException:
             self.close()
             raise
@@ -111,24 +168,21 @@ class TcgChild:
         return self.channel.run()
 
     def registers(self):
-        deadline = time.monotonic() + 3
-        if self.monitor is None:
-            self.monitor = HELPERS["QMP"](self.monitor_path, self.process, deadline)
-        self.monitor.deadline = deadline
-        if self.monitor.ask("query-status")["status"] != "paused":
-            raise RuntimeError("registers can only be read from the stopped TCG worker")
-        dump = self.monitor.ask("human-monitor-command", {"command-line": "info registers"})
-        fields = {name: int(value, 16) for name, value in re.findall(r"\b([A-Z][A-Z0-9]+)=([0-9a-fA-F]+)", dump)}
-        if any(name not in fields for name in (*LOW_REGISTERS, "EIP", "EFL")):
-            raise RuntimeError("TCG worker did not report the expected real-mode registers")
-        return REGISTERS.pack(*(fields[name] for name in LOW_REGISTERS),
-                              *([0] * 8), fields["EIP"], fields["EFL"])
+        registers = [0] * 18
+        for peer_index, index, size in GDB_REGISTERS:
+            registers[index] = self.debugger.read(peer_index, size)
+        return REGISTERS.pack(*registers)
+
+    def set_registers(self, record):
+        registers = REGISTERS.unpack(record)
+        for peer_index, index, size in GDB_REGISTERS:
+            self.debugger.write(peer_index, size, registers[index])
 
     def close(self):
         try:
-            if self.monitor is not None:
-                self.monitor.close()
-                self.monitor = None
+            if self.debugger is not None:
+                self.debugger.close()
+                self.debugger = None
         finally:
             if self.channel is not None:
                 self.channel.close()
@@ -164,6 +218,11 @@ class KvmChild:
             raise RuntimeError("native parent worker did not return a register record")
         return registers
 
+    def set_registers(self, record):
+        self.channel.connection.sendall(b"S" + record)
+        if self.channel.connection.recv(2) != b"S":
+            raise RuntimeError("native parent worker did not acknowledge the register write")
+
     def close(self):
         if self.channel is not None:
             self.channel.close()
@@ -195,10 +254,9 @@ def doorbell_peer(server, memory, requests, replies):
 
 def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages):
     reset = bytearray(64 << 10)
-    # The reset vector far-jumps to 0000:1000, the client's guest RAM.
-    reset[0xfff0:0xfff5] = bytes.fromhex("ea00100000")
+    reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
-    expected = (OPEN_VM, OPEN_CPU, RUN, GET_REGS, RUN, GET_REGS, CLOSE_CPU, CLOSE_VM)
+    expected = (OPEN_VM, OPEN_CPU, RUN, GET_REGS, SET_REGS, GET_REGS, RUN, GET_REGS, CLOSE_CPU, CLOSE_VM)
     if reject_close:
         expected = expected[:-1]
     observed = []
@@ -214,7 +272,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages):
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 5)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 6)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
         os.ftruncate(outer_ram, OUTER_RAM_SIZE)
@@ -264,6 +322,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages):
                     else:
                         child = TcgChild(qemu, output, control / "child.sock", outer_ram, offsets)
                     cleanup.callback(child.close)
+                    child.set_registers(mapping[64:64 + REGISTERS.size])
                 if child.offsets != offsets:
                     raise RuntimeError("the registered pages changed between runs")
                 struct.pack_into("<I", mapping, 28, child.run())
@@ -273,6 +332,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages):
                 registers = child.registers()
                 mapping[64:64 + REGISTERS.size] = registers
                 counters.append(REGISTERS.unpack(registers)[2])
+            elif opcode == SET_REGS:
+                child.set_registers(mapping[64:64 + REGISTERS.size])
             elif opcode == CLOSE_CPU:
                 # The guest can unpin its page as soon as it sees this reply.
                 if reject_close:
@@ -287,7 +348,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages):
             os.eventfd_write(replies, 1)
         guest = (output / "outer.log").read_text(errors="replace")
         if (outer.wait() != 0 or tuple(observed) != expected or child is None or tuple(child.channel.exits) != IO_VALUES
-                or counters != [0x1357, 0x2468]
+                or counters != [0x1357, 0x3579, 0x2468]
                 or "PASS /dev/kvm returned two port I/O exits" not in guest
                 or "PASS parent KVM guest shutdown" not in guest):
             raise RuntimeError(f"parent execution proof failed; commands={observed}, see outer.log")

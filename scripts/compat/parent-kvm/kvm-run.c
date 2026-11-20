@@ -78,13 +78,18 @@ int main(int argc, char **argv)
     const unsigned char code[] = {
         0xc6, 0x06, 0x20, data_address, 0x56, /* mov byte [data+0x20], 0x56 */
         0xb9, 0x57, 0x13,             /* mov cx, 0x1357 */
-        0xb0, 0x42, 0xe6, 0x30,       /* mov al, 0x42; out 0x30, al */
+        0x14, 0x00, 0xe6, 0x30,       /* adc al, 0; out 0x30, al */
+        0xf4,                         /* hlt */
+    };
+    const unsigned char resumed[] = {
         0xa0, 0x21, data_address,     /* mov al, [data+0x21] */
         0xa2, 0x22, data_address,     /* mov [data+0x22], al */
+        0x30, 0xd8,                   /* xor al, bl */
         0xb9, 0x68, 0x24,             /* mov cx, 0x2468 */
         0xe6, 0x30, 0xf4,             /* out 0x30, al; hlt */
     };
-    memcpy(ram, code, sizeof(code));
+    memcpy(ram + 0x10, code, sizeof(code));
+    memcpy(ram + 0x40, resumed, sizeof(resumed));
     unsigned char *data = ram + ram_bytes - 4096;
     int cpu = ioctl(vm, KVM_CREATE_VCPU, 0);
     check(cpu >= 0 && (fcntl(cpu, F_GETFD) & FD_CLOEXEC), "vCPU file descriptor");
@@ -96,8 +101,11 @@ int main(int argc, char **argv)
     sregs.cs.base = 0;
     sregs.cs.selector = 0;
     check(ioctl(cpu, KVM_SET_SREGS, &sregs) == 0, "select real-mode code segment");
-    struct kvm_regs regs = {.rip = 4096, .rflags = 2};
+    struct kvm_regs regs = {.rax = 0x41, .rip = 0x1010, .rflags = 3};
     check(ioctl(cpu, KVM_SET_REGS, &regs) == 0, "set initial registers");
+    struct kvm_regs readback;
+    check(ioctl(cpu, KVM_GET_REGS, &readback) == 0 && !memcmp(&readback, &regs, sizeof(regs)),
+          "read back initial registers");
     close(vm);
     run->immediate_exit = 1;
     check(ioctl(cpu, KVM_RUN, 0) == -1 && errno == EINTR, "immediate exit");
@@ -106,11 +114,18 @@ int main(int argc, char **argv)
     check_output(run, size, 0x42);
     check_registers(cpu, 0x42, 0x1357);
     check(data[0x20] == 0x56 && data[0x22] == 0, "child stopped after its first output");
-    data[0x21] = 0xa7;
+    data[0x21] = 0x52;
+    const struct kvm_regs update = {
+        .rbx = 0xf5, .rcx = 0x3579, .rsp = 0x1f00, .rbp = 0x12345678,
+        .rip = 0x1040, .rflags = 2,
+    };
+    check(ioctl(cpu, KVM_SET_REGS, &update) == 0, "set stopped registers before re-entry");
+    check(ioctl(cpu, KVM_GET_REGS, &readback) == 0 && !memcmp(&readback, &update, sizeof(readback)),
+          "read back updated registers");
     unsigned long long second = timed_run(cpu);
     check_output(run, size, 0xa7);
     check_registers(cpu, 0xa7, 0x2468);
-    check(data[0x22] == 0xa7, "child saw the client's write during re-entry");
+    check(data[0x22] == 0x52, "child saw the client's write during re-entry");
     munmap(run, size);
     close(cpu);
     munmap(ram, ram_bytes);

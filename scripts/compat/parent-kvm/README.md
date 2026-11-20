@@ -5,19 +5,21 @@ with guest SVM and VMX disabled. A PCI shared-memory mailbox with
 eventfd-backed doorbells connects it to a parent process that starts a
 separate QEMU TCG worker. A standalone Linux KVM
 client opens `/dev/kvm`, creates a VM and vCPU, maps `kvm_run`, and gets a port
-I/O exit. A second `KVM_RUN` resumes the same child. The child reads a byte
-the client changed while it was paused and reports it on the next I/O exit.
+I/O exit. The client changes a byte in shared RAM and updates the stopped
+child's registers, including its instruction pointer. A second `KVM_RUN`
+resumes the same child. It uses both updates to produce the next I/O byte.
 
 The module supports one VM, one vCPU and one pinned slot of one or two
 4 KiB pages. The child maps each page directly from its physical offset in
 the outer VM's memory file. The parent stops the child before acknowledging
 release of the slot. If it cannot confirm release, the pages stay pinned
 until the outer VM exits.
-The worker supports byte output to one port with a fixed entry point.
-After each exit, the client reads the stopped worker's actual real-mode
-general registers through `KVM_GET_REGS`. Register writes beyond the fixed
-entry point, memory invalidation, interrupts, and checkpointing remain part
-of [issue #1501](https://github.com/numerataz/flexvm/issues/1501).
+The worker supports byte output to one port and a subset of x86 real-mode
+registers. The client writes those registers through `KVM_SET_REGS` before
+and between runs and reads actual worker state through `KVM_GET_REGS`.
+TCG register requests use a private Unix debugger socket. Memory invalidation,
+protected and long mode state, interrupts, and checkpointing remain part of
+[issue #1501](https://github.com/numerataz/flexvm/issues/1501).
 
 Run the fixture on x86 with the QEMU build from `scripts/build-qemu.sh` and
 the prepared kernel build tree for the selected FlexVM kernel.

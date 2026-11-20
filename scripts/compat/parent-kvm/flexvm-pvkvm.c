@@ -19,7 +19,12 @@
 #include <linux/uaccess.h>
 #include <linux/vmalloc.h>
 #include <linux/wait.h>
+#include <asm/processor-flags.h>
 #include "mailbox.h"
+
+#define PVKVM_REAL_MODE_FLAGS (X86_EFLAGS_FIXED | X86_EFLAGS_CF | X86_EFLAGS_PF | \
+			       X86_EFLAGS_AF | X86_EFLAGS_ZF | X86_EFLAGS_SF | \
+			       X86_EFLAGS_DF | X86_EFLAGS_OF)
 
 struct pvkvm {
 	struct kref refs;
@@ -56,11 +61,6 @@ struct pvcpu {
 	struct kvm_regs regs;
 	struct kvm_sregs sregs;
 	bool ran;
-};
-
-static const struct kvm_regs entry_regs = {
-	.rip = PVKVM_GUEST_START,
-	.rflags = 2,
 };
 
 static const struct kvm_sregs reset_sregs = {
@@ -210,11 +210,18 @@ static int run_cpu(struct pvcpu *cpu)
 		result = -EINTR;
 		goto unlock;
 	}
-	if (!vm->pages) {
+	if (p->dead) {
+		result = -ENODEV;
+		goto unlock;
+	}
+	if (!vm->pages || (!cpu->ran && (cpu->regs.rip < PVKVM_GUEST_START ||
+					 cpu->regs.rip >= PVKVM_GUEST_START + vm->pages * PAGE_SIZE))) {
 		result = -EINVAL;
 		goto unlock;
 	}
 	vm->slot_exposed = true;
+	if (!cpu->ran)
+		memcpy_toio(p->mailbox + PVKVM_REGISTERS_AT, &cpu->regs, sizeof(cpu->regs));
 	result = request(p, PVKVM_RUN, vm, &cpu->page->data);
 	if (!result)
 		cpu->ran = true;
@@ -238,7 +245,7 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	result = mutex_lock_interruptible(&cpu->execution);
 	if (result)
 		return -EINTR;
-	if (cpu->ran && cmd != KVM_RUN && cmd != KVM_GET_REGS) {
+	if (cpu->ran && (cmd == KVM_GET_SREGS || cmd == KVM_SET_SREGS)) {
 		mutex_unlock(&cpu->execution);
 		return -EOPNOTSUPP;
 	}
@@ -264,9 +271,29 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			result = -EFAULT;
 			break;
 		}
-		if (memcmp(&regs, &entry_regs, sizeof(regs))) {
+		/* Classic real-mode register subset, with arithmetic flags and DF. */
+		if ((regs.rax | regs.rbx | regs.rcx | regs.rdx | regs.rsi | regs.rdi |
+		     regs.rsp | regs.rbp) > U32_MAX ||
+		    regs.r8 || regs.r9 || regs.r10 || regs.r11 || regs.r12 || regs.r13 ||
+		    regs.r14 || regs.r15 || regs.rip > U16_MAX ||
+		    !(regs.rflags & X86_EFLAGS_FIXED) || (regs.rflags & ~PVKVM_REAL_MODE_FLAGS)) {
 			result = -EINVAL;
 			break;
+		}
+		if (cpu->ran) {
+			if (mutex_lock_interruptible(&p->lock)) {
+				result = -EINTR;
+				break;
+			}
+			if (p->dead) {
+				result = -ENODEV;
+			} else {
+				memcpy_toio(p->mailbox + PVKVM_REGISTERS_AT, &regs, sizeof(regs));
+				result = request(p, PVKVM_SET_REGS, NULL, NULL);
+			}
+			mutex_unlock(&p->lock);
+			if (result)
+				break;
 		}
 		cpu->regs = regs;
 		result = 0;
@@ -290,7 +317,7 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		result = 0;
 		break;
 	case KVM_RUN:
-		if (arg || cpu->regs.rip != PVKVM_GUEST_START || cpu->sregs.cs.base) {
+		if (arg || cpu->sregs.cs.base) {
 			result = -EINVAL;
 			break;
 		}
