@@ -505,7 +505,9 @@ fn rename_stopped_with_sync(host: &Host, from: &str, to: &str, sync: impl FnOnce
     }
     if !r.stopped() {
         return Err(match [("failed", r.failed), ("lost", r.lost)].into_iter().find(|(_, has)| *has) {
-            Some((ext, _)) => crate::util::coded(crate::util::ErrorKind::Conflict, format!("vm {from} is {ext}: only a running, stopped or exited vm can be renamed")),
+            Some((ext, _)) => {
+                crate::util::coded(crate::util::ErrorKind::Conflict, format!("vm {from} is {ext}: only a running, stopped or exited vm can be renamed"))
+            }
             None => crate::no_vm(host, from),
         });
     }

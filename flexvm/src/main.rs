@@ -2049,7 +2049,9 @@ fn remove_held(host: &Host, name: &str, had: bool, logs: bool, of: Option<&host:
         Ok(lock) => lock,
         // A VM of the name started meanwhile: `rm -f` (which killed or found none) is tried again.
         Err(_) if host.alive(name) && force => return Err(util::coded(util::ErrorKind::Conflict, format!("vm {name} started meanwhile: try again"))),
-        Err(_) if host.alive(name) => return Err(util::coded(util::ErrorKind::Conflict, format!("vm {name} is running: stop or kill it first, or flexvm rm -f {name}"))),
+        Err(_) if host.alive(name) => {
+            return Err(util::coded(util::ErrorKind::Conflict, format!("vm {name} is running: stop or kill it first, or flexvm rm -f {name}")))
+        }
         Err(e) => return Err(e),
     };
     let held = host::HeldName::new(lock);
