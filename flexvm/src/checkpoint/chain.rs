@@ -226,12 +226,13 @@ fn restore_pages(data: u64, runs: &Runs, working_set: &[(u64, u64)]) -> u64 {
     sorted.sort_unstable();
     let mut merged: Vec<(u64, u64)> = Vec::new();
     for (first, count) in sorted {
-        crate::uffd::push_run(&mut merged, first, first + count, 0);
+        crate::util::push_run(&mut merged, first, count);
     }
     let mut pages = data;
     let mut at = 0;
-    for (first, end) in merged {
-        pages += end - first;
+    for (first, count) in merged {
+        let end = first + count;
+        pages += count;
         while at < runs.len() && runs[at].0 + runs[at].1 <= first {
             at += 1;
         }

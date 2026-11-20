@@ -274,10 +274,7 @@ pub(super) fn write_pages(
                     continue;
                 }
                 unit.sums.push(sum);
-                match iov.last_mut() {
-                    Some(v) if unsafe { (v.iov_base as *const u8).add(v.iov_len) } == page.as_ptr() => v.iov_len += PAGE_SIZE,
-                    _ => iov.push(libc::iovec { iov_base: page.as_ptr() as *mut _, iov_len: PAGE_SIZE }),
-                }
+                crate::util::push_iov(&mut iov, page.as_ptr() as *mut _, PAGE_SIZE);
             }
             unit.at = placed.fetch_add(unit.sums.len() as u64, Ordering::Relaxed);
             if !iov.is_empty() {

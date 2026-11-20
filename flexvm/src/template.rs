@@ -1008,10 +1008,7 @@ fn pad_runs(runs: Vec<(u64, u64)>, align: u64) -> Vec<(u64, u64)> {
     let mut out: Vec<(u64, u64)> = Vec::new();
     for (first, count) in runs {
         let (start, end) = (first / align * align, (first + count).div_ceil(align) * align);
-        match out.last_mut() {
-            Some((f, n)) if start <= *f + *n => *n = end.max(*f + *n) - *f,
-            _ => out.push((start, end - start)),
-        }
+        crate::util::push_run(&mut out, start, end - start);
     }
     out
 }

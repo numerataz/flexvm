@@ -1,10 +1,10 @@
 //! Images as docker sees them: a template is an image, its generation's content id the image's id.
 
 use std::io::Read;
-use std::os::unix::fs::MetadataExt;
 use std::sync::Arc;
 
 use crate::image::registry::{blob_path, sha256_hex};
+use crate::util::FileStamp;
 use serde_json::Value;
 
 use super::Api;
@@ -12,25 +12,8 @@ use crate::template::Meta;
 
 const IMAGE_CONFIG_CACHE_MAX: usize = 256;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct BlobStamp {
-    dev: u64,
-    ino: u64,
-    len: u64,
-    mtime: i64,
-    mtime_nsec: i64,
-    ctime: i64,
-    ctime_nsec: i64,
-}
-
-impl BlobStamp {
-    fn of(m: &std::fs::Metadata) -> Self {
-        Self { dev: m.dev(), ino: m.ino(), len: m.len(), mtime: m.mtime(), mtime_nsec: m.mtime_nsec(), ctime: m.ctime(), ctime_nsec: m.ctime_nsec() }
-    }
-}
-
 pub(crate) struct CachedConfig {
-    stamp: BlobStamp,
+    stamp: FileStamp,
     config: Arc<Value>,
 }
 
@@ -54,17 +37,17 @@ pub fn config(api: &Api, meta: &Meta) -> Option<Arc<Value>> {
         api.image_configs.lock().unwrap_or_else(|e| e.into_inner()).remove(&path);
         return None;
     };
-    let stamp = BlobStamp::of(&metadata);
+    let stamp = FileStamp::of(&metadata);
     {
         let cache = api.image_configs.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(entry) = cache.get(&path).filter(|e| e.stamp == stamp) {
             return Some(entry.config.clone());
         }
     }
-    let parsed = (|| -> Option<(BlobStamp, Arc<Value>)> {
+    let parsed = (|| -> Option<(FileStamp, Arc<Value>)> {
         let mut file = std::fs::File::open(&path).ok()?;
-        let file_stamp = BlobStamp::of(&file.metadata().ok()?);
-        let mut blob = Vec::with_capacity(file_stamp.len.min(1 << 20) as usize);
+        let file_stamp = FileStamp::of(&file.metadata().ok()?);
+        let mut blob = Vec::with_capacity(file_stamp.len().min(1 << 20) as usize);
         file.read_to_end(&mut blob).ok()?;
         let mut config: Value = serde_json::from_slice(&blob).ok().filter(|_| sha256_hex(&blob) == *digest)?;
         let inner = config.as_object_mut().and_then(|o| o.remove("config")).unwrap_or(Value::Null);

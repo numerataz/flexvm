@@ -1908,9 +1908,107 @@ fn scope(prefix: &[u8], pid: u32, start: u64, ns: Option<u64>) -> bool {
     false
 }
 
+/// Appends `(start, len)` to sorted `(start, len)` runs, coalescing adjacent or overlapping ones.
+pub fn push_run(runs: &mut Vec<(u64, u64)>, start: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    match runs.last_mut() {
+        Some((f, n)) if start <= *f + *n => *n = (start + len).max(*f + *n) - *f,
+        _ => runs.push((start, len)),
+    }
+}
+
+/// Appends `(start, len, tag)` to sorted runs, coalescing adjacent runs with the same `tag`.
+pub fn push_tagged_run<T: PartialEq>(runs: &mut Vec<(u64, u64, T)>, start: u64, len: u64, tag: T) {
+    if len == 0 {
+        return;
+    }
+    match runs.last_mut() {
+        Some((f, n, t)) if *t == tag && *f + *n == start => *n += len,
+        _ => runs.push((start, len, tag)),
+    }
+}
+
+/// Appends `(base, len)` to `iov`, coalescing contiguous buffers.
+pub fn push_iov(iov: &mut Vec<libc::iovec>, base: *mut libc::c_void, len: usize) {
+    if len == 0 {
+        return;
+    }
+    match iov.last_mut() {
+        Some(v) if (v.iov_base as usize).checked_add(v.iov_len) == Some(base as usize) => v.iov_len += len,
+        _ => iov.push(libc::iovec { iov_base: base, iov_len: len }),
+    }
+}
+
+/// In-memory file identity and metadata snapshot for detecting concurrent changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileStamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    ctime: i64,
+    ctime_nsec: i64,
+    mtime: i64,
+    mtime_nsec: i64,
+}
+
+impl FileStamp {
+    pub fn of(m: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self { dev: m.dev(), ino: m.ino(), len: m.len(), ctime: m.ctime(), ctime_nsec: m.ctime_nsec(), mtime: m.mtime(), mtime_nsec: m.mtime_nsec() }
+    }
+
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn push_run_coalesces_adjacent_and_overlapping() {
+        let mut runs = Vec::new();
+        push_run(&mut runs, 10, 0);
+        assert!(runs.is_empty());
+        push_run(&mut runs, 10, 5);
+        push_run(&mut runs, 15, 3); // adjacent
+        push_run(&mut runs, 16, 10); // overlapping, extends
+        push_run(&mut runs, 12, 4); // contained within existing run
+        push_run(&mut runs, 30, 2); // disjoint
+        assert_eq!(runs, vec![(10, 16), (30, 2)]);
+    }
+
+    #[test]
+    fn push_tagged_run_coalesces_matching_adjacent_tags() {
+        let mut runs = Vec::new();
+        push_tagged_run(&mut runs, 0, 0, 1u8);
+        assert!(runs.is_empty());
+        push_tagged_run(&mut runs, 0, 2, 1u8);
+        push_tagged_run(&mut runs, 2, 3, 1u8); // adjacent, same tag
+        push_tagged_run(&mut runs, 5, 1, 2u8); // adjacent, different tag
+        push_tagged_run(&mut runs, 7, 1, 2u8); // gap, same tag
+        assert_eq!(runs, vec![(0, 5, 1), (5, 1, 2), (7, 1, 2)]);
+    }
+
+    #[test]
+    fn push_iov_coalesces_contiguous_buffers() {
+        let mut buf = [0u8; 16];
+        let base = buf.as_mut_ptr();
+        let mut iov = Vec::new();
+        push_iov(&mut iov, base.cast(), 0);
+        assert!(iov.is_empty());
+        push_iov(&mut iov, base.cast(), 4);
+        push_iov(&mut iov, unsafe { base.add(4) }.cast(), 4); // contiguous
+        push_iov(&mut iov, unsafe { base.add(10) }.cast(), 2); // gap
+        assert_eq!(iov.len(), 2);
+        assert_eq!(iov[0].iov_base, base.cast());
+        assert_eq!(iov[0].iov_len, 8);
+        assert_eq!(iov[1].iov_base, unsafe { base.add(10) }.cast());
+        assert_eq!(iov[1].iov_len, 2);
+    }
 
     #[test]
     fn only_4k_host_pages_are_taken() {
