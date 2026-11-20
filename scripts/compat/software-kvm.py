@@ -114,7 +114,7 @@ def main():
             raise RuntimeError('nested execution markers are out of order; see guest.log')
         if any('Kernel panic' in line or 'Oops:' in line for line in lines):
             raise RuntimeError('guest kernel failed; see guest.log')
-        abi_marker = 'PASS: 9 KVM ABI reference checks' if arch == 'x86_64' else 'FLEXVM_SOFTWARE_GUEST_KVM_PASSED'
+        abi_marker = 'PASS: 11 KVM ABI reference checks' if arch == 'x86_64' else 'FLEXVM_SOFTWARE_GUEST_KVM_PASSED'
         if abi_marker not in lines:
             raise RuntimeError('missing successful KVM ABI report; see guest.log')
         traced = trace.read_text(errors='replace')

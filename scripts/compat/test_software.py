@@ -254,5 +254,28 @@ class LifecycleFailureState(unittest.TestCase):
         self.assertFalse((self.out / 'failure-state.tar.zst').exists())
 
 
+class WorkloadSeeds(unittest.TestCase):
+    def test_rejects_special_oversized_and_escaping_inputs_before_reading(self):
+        seed = runpy.run_path(str(ROOT / 'software-workload.py'))['seed_files']
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            file = root / 'payload'
+            file.write_bytes(b'payload')
+            self.assertEqual(seed([(str(file), '/nested-input/a b')]), [(file, '/nested-input/a b')])
+            for target in ['/etc/payload', '/nested-input/../etc/payload', '/nested-input/']:
+                with self.assertRaises(ValueError):
+                    seed([(str(file), target)])
+            with self.assertRaises(ValueError):
+                seed([(str(file), '/nested-input/a'), (str(file), '/nested-input/a')])
+            fifo = root / 'fifo'
+            os.mkfifo(fifo)
+            with self.assertRaises(ValueError):
+                seed([(str(fifo), '/nested-input/fifo')])
+            with file.open('wb') as stream:
+                stream.truncate(256 * 1024 * 1024 + 1)
+            with self.assertRaises(ValueError):
+                seed([(str(file), '/nested-input/large')])
+
+
 if __name__ == '__main__':
     unittest.main()
