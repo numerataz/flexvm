@@ -270,7 +270,8 @@ impl Input {
 
     pub(crate) fn copy_to(&self, path: &Path, executable: bool) -> Result<Artifact> {
         self.unchanged()?;
-        let mut out = OpenOptions::new().write(true).read(true).create_new(true).mode(0o600).open(path)?;
+        let mut out = OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
+        let mut hash = Sha256::new();
         let mut offset = 0;
         let mut buf = vec![0; 1 << 20];
         while offset < self.artifact.bytes {
@@ -280,14 +281,18 @@ impl Input {
             if n == 0 {
                 bail!("software input was truncated while copying");
             }
+            hash.update(&buf[..n]);
             out.write_all(&buf[..n])?;
             offset += n as u64;
         }
         self.unchanged()?;
-        let verified = Self::read(out.try_clone()?, Some(&self.artifact))?;
+        let artifact = Artifact { bytes: offset, sha256: format!("{:x}", hash.finalize()) };
+        if artifact != self.artifact {
+            bail!("software artifact content or length does not match its manifest");
+        }
         out.set_permissions(fs::Permissions::from_mode(if executable { 0o500 } else { 0o400 }))?;
         out.sync_all()?;
-        Ok(verified.artifact)
+        Ok(artifact)
     }
 }
 
@@ -949,11 +954,14 @@ impl Staging {
                 let target = OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(path)?;
                 target.set_len(disk.size)?;
                 let before = Stamp::of(&disk.file.metadata()?);
-                crate::volume::copy_raw(&disk.file, &target, disk.size)?;
+                let hashed = crate::volume::copy_raw_hashed(&disk.file, &target, disk.size)?;
                 if before != Stamp::of(&disk.file.metadata()?) || before.2 != disk.size {
                     bail!("managed disk changed while capturing its checkpoint");
                 }
-                let content = Input::read(target.try_clone()?, None)?.artifact;
+                let content = match hashed {
+                    Some(sha256) => Artifact { bytes: disk.size, sha256 },
+                    None => Input::read(target.try_clone()?, None)?.artifact,
+                };
                 target.set_permissions(fs::Permissions::from_mode(0o400))?;
                 target.sync_all()?;
                 Ok(Disk { volume_id: disk.id.clone(), content })

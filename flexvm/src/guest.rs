@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::bail;
 use crate::host::{fault, tripped_once};
-use crate::util::{By, Error, Result};
+use crate::util::{By, Error, ReadTimeoutCache, Result};
 
 #[path = "../../guest/src/proto.rs"]
 mod proto;
@@ -154,8 +154,9 @@ pub fn request_by(s: UnixStream, line: &str, at: Instant) -> Result<BufReader<Un
     By { s: &s, at }.write_all(format!("CONNECT {PORT}\n{line}\n").as_bytes())?;
     let mut r = BufReader::new(s);
     let (mut ok, mut byte) = (Vec::new(), [0]);
+    let mut timed = By { s: ReadTimeoutCache::new(&mut r), at };
     while ok.len() < 64 {
-        By { s: &mut r, at }.read_exact(&mut byte)?;
+        timed.read_exact(&mut byte)?;
         if byte[0] == b'\n' {
             break;
         }

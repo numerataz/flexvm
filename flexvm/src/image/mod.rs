@@ -1031,7 +1031,7 @@ fn build_rootfs(staging: &Path, img: &source::Image, app: &App, init: &[u8], des
             let conf = inject(&mut root, app, init)?;
             root.restore_root_metadata()?;
             interrupted()?;
-            mkfs(&path, root.entries, dest)?;
+            mkfs(&path, root.entries, root.has_xattrs, dest)?;
             Ok(conf)
         })();
         // Before a retry; otherwise `work` removes it.
@@ -1228,9 +1228,9 @@ fn resolve_user(root: &Root, user: &str) -> Result<(u32, u32, String, Vec<u32>)>
 /// compression (its allocated blocks, `du`, undercount): a file's data regions (its logical size
 /// but for holes, which mkfs.ext4 keeps), counting a hard-linked inode once, plus directory
 /// entries, non-inline symlinks and an xattr block for each inode whose xattrs overflow it.
-fn ext4_content_kib(dir: &Path) -> Result<u64> {
+fn ext4_content_kib(dir: &Path, has_xattrs: bool) -> Result<u64> {
     let mut dirs = vec![dir.to_path_buf()];
-    let mut kib = xattr_kib(dir)?;
+    let mut kib = if has_xattrs { xattr_kib(dir)? } else { 0 };
     let mut seen = std::collections::HashSet::new();
     while let Some(dir) = dirs.pop() {
         let mut bytes = 24u64; // `.` and `..`, including their entry headers.
@@ -1245,7 +1245,9 @@ fn ext4_content_kib(dir: &Path) -> Result<u64> {
                 continue;
             }
             let path = entry.path();
-            kib += xattr_kib(&path)?;
+            if has_xattrs {
+                kib += xattr_kib(&path)?;
+            }
             if metadata.is_dir() {
                 dirs.push(path);
             } else if metadata.is_file() {
@@ -1353,7 +1355,7 @@ fn root_xattrs(dir: &Path) -> Result<bool> {
 }
 
 /// Sized to content and 256-byte inodes plus headroom, rounded up to 2 MiB as virtio-pmem requires.
-fn mkfs(dir: &Path, entries: u64, dest: &Path) -> Result<()> {
+fn mkfs(dir: &Path, entries: u64, has_xattrs: bool, dest: &Path) -> Result<()> {
     // Only an image whose root has them needs it: older hosts (RHEL 8, Ubuntu 20.04) build the rest.
     if root_xattrs(dir)? {
         let version = run_until(Command::new("mkfs.ext4").arg("-V"), interrupted)?;
@@ -1361,7 +1363,7 @@ fn mkfs(dir: &Path, entries: u64, dest: &Path) -> Result<()> {
             bail!("this image's root directory has ACLs or xattrs: mkfs.ext4 from e2fsprogs 1.45.7 or newer is required to keep them");
         }
     }
-    let kib = ext4_content_kib(dir)?;
+    let kib = ext4_content_kib(dir, has_xattrs)?;
     let inodes = entries * 12 / 10 + 4096;
     let mib = ((kib + inodes / 4) * 12 / 10 / 1024 + 64).div_ceil(2) * 2;
     // mkfs writes through our descriptor, so the name cannot be swapped for a symlink.
@@ -1379,13 +1381,12 @@ fn mkfs(dir: &Path, entries: u64, dest: &Path) -> Result<()> {
         bail!("mkfs.ext4 failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     // Root xattrs come with -d (from 1.45.7); its mode and mtime are set here, as older mke2fs can't.
-    for (field, value) in [("mode", format!("0{:o}", libc::S_IFDIR | (meta.mode() & 0o7777))), ("mtime", format!("@{}", meta.mtime()))] {
-        let out = run_until(Command::new("debugfs").args(["-w", "-R", &format!("set_inode_field / {field} {value}"), &image_path]), interrupted)?;
-        // debugfs also reports command errors on stderr with a successful exit status.
-        let errors = String::from_utf8_lossy(&out.stderr);
-        if !out.status.success() || errors.lines().any(|line| !line.starts_with("debugfs ")) {
-            bail!("debugfs setting root {field} failed: {}", errors.trim());
-        }
+    let commands = format!("set_inode_field / mode 0{:o}\nset_inode_field / mtime @{}\n", libc::S_IFDIR | (meta.mode() & 0o7777), meta.mtime());
+    let out = crate::util::run_until_stdin(Command::new("debugfs").args(["-w", "-f", "-", &image_path]), commands.as_bytes(), interrupted)?;
+    // debugfs also reports command errors on stderr with a successful exit status.
+    let errors = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() || errors.lines().any(|line| !line.starts_with("debugfs ")) {
+        bail!("debugfs setting root metadata failed: {}", errors.trim());
     }
     crate::log!("image: root filesystem built ({mib} MiB, {entries} entries)");
     Ok(())
@@ -1590,15 +1591,15 @@ mod tests {
     #[test]
     fn ext4_estimate_counts_directory_and_long_symlink_blocks() {
         let dir = tmpdir("ext4-blocks");
-        assert_eq!(ext4_content_kib(&dir).unwrap(), 4);
+        assert_eq!(ext4_content_kib(&dir, false).unwrap(), 4);
         std::fs::create_dir_all(dir.join("a/b")).unwrap();
         std::fs::write(dir.join("file"), b"contents").unwrap();
         symlink("a", dir.join("directory-link")).unwrap();
         symlink("x".repeat(59), dir.join("inline-link")).unwrap();
-        assert_eq!(ext4_content_kib(&dir).unwrap(), 16);
+        assert_eq!(ext4_content_kib(&dir, false).unwrap(), 16);
         symlink("x".repeat(60), dir.join("block-link")).unwrap();
         symlink("x".repeat(100), dir.join("a/b/long-link")).unwrap();
-        assert_eq!(ext4_content_kib(&dir).unwrap(), 24);
+        assert_eq!(ext4_content_kib(&dir, false).unwrap(), 24);
     }
 
     #[test]
@@ -1607,9 +1608,9 @@ mod tests {
         std::fs::write(dir.join("file"), vec![b'x'; 4097]).unwrap();
         std::fs::hard_link(dir.join("file"), dir.join("hardlink")).unwrap();
         symlink("file", dir.join("symlink")).unwrap();
-        assert_eq!(ext4_content_kib(&dir).unwrap(), 12);
+        assert_eq!(ext4_content_kib(&dir, false).unwrap(), 12);
         std::fs::write(dir.join("text"), vec![b'x'; 8193]).unwrap();
-        assert_eq!(ext4_content_kib(&dir).unwrap(), 24);
+        assert_eq!(ext4_content_kib(&dir, false).unwrap(), 24);
     }
 
     #[test]
@@ -1622,7 +1623,7 @@ mod tests {
         file.sync_all().unwrap();
         // One block at 1 MiB, two (an unaligned 4097 bytes) at the end; on a filesystem
         // without SEEK_DATA, the logical size.
-        let kib = ext4_content_kib(&dir).unwrap();
+        let kib = ext4_content_kib(&dir, false).unwrap();
         assert!(kib == 4 + 12 || kib == 4 + (1 << 20), "{kib}");
     }
 
@@ -1641,14 +1642,15 @@ mod tests {
             return; // No user xattrs on this filesystem.
         }
         // 8 + 16 + 4 + 40 = 68 of 96: in the inode.
-        assert_eq!(ext4_content_kib(&dir).unwrap(), 4);
+        assert_eq!(ext4_content_kib(&dir, true).unwrap(), 4);
         // Another such: 128, a block of its own.
         assert!(set("overflows", "user.a", 40) && set("overflows", "user.b", 40));
-        assert_eq!(ext4_content_kib(&dir).unwrap(), 8);
+        assert_eq!(ext4_content_kib(&dir, true).unwrap(), 8);
+        assert_eq!(ext4_content_kib(&dir, false).unwrap(), 4, "skips xattr probing when has_xattrs is false");
         symlink("overflows", dir.join("link")).unwrap();
         let fifo = cpath(&dir.join("fifo")).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
-        assert_eq!(ext4_content_kib(&dir).unwrap(), 8, "symlinks do not count their target's xattrs; FIFOs are never opened");
+        assert_eq!(ext4_content_kib(&dir, true).unwrap(), 8, "symlinks do not count their target's xattrs; FIFOs are never opened");
     }
 
     #[test]
@@ -1658,7 +1660,7 @@ mod tests {
             std::fs::write(dir.join(format!("{i:0255}")), b"").unwrap();
         }
         // 24 bytes for dot entries, 264 per long name, doubled for headroom.
-        assert_eq!(ext4_content_kib(&dir).unwrap(), 52);
+        assert_eq!(ext4_content_kib(&dir, false).unwrap(), 52);
     }
 
     #[test]
@@ -1816,7 +1818,8 @@ mod tests {
             root.restore_root_metadata().unwrap();
             assert_eq!(metadata(), expected);
             let dest = dir.join(format!("{note}.ext4"));
-            mkfs(&staging, root.entries, &dest).unwrap();
+            assert!(root.has_xattrs);
+            mkfs(&staging, root.entries, root.has_xattrs, &dest).unwrap();
             // debugfs's root edits keep the inode checksum valid.
             let fsck = Command::new("e2fsck").arg("-fn").arg(&dest).output().unwrap();
             assert!(fsck.status.success(), "{}", String::from_utf8_lossy(&fsck.stdout));
@@ -1841,7 +1844,7 @@ mod tests {
         symlink("empty", root.join("link")).unwrap();
         let dest = dir.join("root.ext4");
         // Request the inode budget of a million-entry tree without creating it.
-        mkfs(&root, 1_000_000, &dest).unwrap();
+        mkfs(&root, 1_000_000, false, &dest).unwrap();
         let mut superblock = [0u8; 256];
         File::open(&dest).unwrap().read_exact_at(&mut superblock, 1024).unwrap();
         assert_eq!(&superblock[56..58], &0xef53u16.to_le_bytes());

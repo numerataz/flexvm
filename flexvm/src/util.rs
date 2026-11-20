@@ -1338,8 +1338,21 @@ fn default_stop_signals() -> io::Result<()> {
 /// the child is killed and reaped and its error returned (also when the child exited failing
 /// meanwhile, as a Ctrl-C to the process group does).
 pub fn run_until(cmd: &mut std::process::Command, stop: impl Fn() -> Result<()>) -> Result<std::process::Output> {
+    run_until_with_stdin(cmd, None, stop)
+}
+
+/// As `run_until`, feeding a small `input` buffer to the child's stdin before closing it.
+pub fn run_until_stdin(cmd: &mut std::process::Command, input: &[u8], stop: impl Fn() -> Result<()>) -> Result<std::process::Output> {
+    run_until_with_stdin(cmd, Some(input), stop)
+}
+
+fn run_until_with_stdin(cmd: &mut std::process::Command, input: Option<&[u8]>, stop: impl Fn() -> Result<()>) -> Result<std::process::Output> {
     use std::process::Stdio;
-    let mut child = unblock_signals_in(cmd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let stdin = if input.is_some() { Stdio::piped() } else { Stdio::null() };
+    let mut child = unblock_signals_in(cmd).stdin(stdin).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    if let (Some(bytes), Some(mut pipe)) = (input, child.stdin.take()) {
+        let _ = pipe.write_all(bytes);
+    }
     let drain = |r: Option<Box<dyn io::Read + Send>>| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
