@@ -2617,8 +2617,9 @@ def openrc_test_image():
     if (output / "index.json").exists():
         return str(output)
     builder = "e2e-openrc-builder"
+    image = fixture["base_image"](ENV.get("FLEXVM_OPENRC_ALPINE_LAYOUT"))
     A.cli("pull", "--tag", "ci-openrc-builder", "--max", "1024", "--vcpus", "2",
-          "--cmd", '["/bin/sleep","1800"]', fixture["IMAGE"], timeout=300)
+          "--cmd", '["/bin/sleep","1800"]', image, timeout=300)
     dns = json.load(open(os.path.join(A.state_dir, "host.json"))).get("dns")
     try:
         A.configure(dns=ENV["FLEXVM_TEST_DNS"].split())
@@ -2993,6 +2994,10 @@ def containerd():
 def compat_workload(workload, boot="app", memory_mib=2048):
     output = os.path.join(args.log_dir, workload + "-compat")
     previous_dns = [(host, json.load(open(os.path.join(host.state_dir, "host.json"))).get("dns")) for host in (A, B)]
+    image = TEST_IMAGE if boot != "app" else ENV.get(
+        "FLEXVM_COMPAT_APP_IMAGE",
+        "public.ecr.aws/docker/library/ubuntu@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8",
+    )
     fixture_args = []
     if workload in ("kind", "k3s") and ENV.get("FLEXVM_WORKLOAD_FIXTURE"):
         for name in ("busybox.tar", "busybox.json"):
@@ -3004,7 +3009,7 @@ def compat_workload(workload, boot="app", memory_mib=2048):
         subprocess.run([
             "python3", os.path.join(ROOT, "scripts/compat.py"), "--bin", BIN,
             "--state", A.state_dir, "--run", A.run_dir, "--boot", boot,
-            "--image", TEST_IMAGE if boot != "app" else "public.ecr.aws/docker/library/ubuntu@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8",
+            "--image", image,
             "--workload", os.path.join(ROOT, f"scripts/compat/workloads/{workload}.sh"),
             "--phases", "run,suspend,checkpoint,migration", "--migration-to", B.addr,
             "--to-state", B.state_dir, "--to-run", B.run_dir,
