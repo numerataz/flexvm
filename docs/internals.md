@@ -275,14 +275,17 @@ queued) waits until the event thread has read events, instead of polling.
 locally, fetched, waited for another installer), measured from reading the
 fault to the copy that woke it, plus fetch, queueing and pull times.
 
-**Huge pages after the pull** (`uffd/collapse.rs`, #141). The pager installs 4 KiB
-pages, so KVM maps guest memory 4 KiB at a time. After a migration or restore
-nothing is mapped in KVM yet, so the guest's first pass over its memory exits once
-per page: reading 500 MiB took 1.1 s even with every page pulled, and 50 ms the
-second time. Once the pull is done, one thread collapses each 2 MiB chunk whose
-pages are all PRESENT into a transparent huge page
-(`process_madvise(MADV_COLLAPSE)` on Firecracker), which KVM then maps with one
-entry. It uses at most half a core (it sleeps as long as each collapse took CPU).
+**Huge pages after the pull** (`uffd/collapse.rs`, #141). The pager installs base
+host pages (4 KiB on 4 KiB hosts), so KVM maps guest memory one base page at a
+time. After a migration or restore nothing is mapped in KVM yet, so the guest's
+first pass over its memory exits once per page: reading 500 MiB took 1.1 s even
+with every page pulled, and 50 ms the second time. Once the pull is done, one
+thread collapses each host PMD huge-page chunk (read at runtime from
+`/sys/kernel/mm/transparent_hugepage/hpage_pmd_size`, falling back to 2 MiB —
+2 MiB on 4 KiB-page kernels, 512 MiB on 64 KiB-page kernels) whose pages are all
+PRESENT into a transparent huge page (`process_madvise(MADV_COLLAPSE)` on
+Firecracker), which KVM then maps with one PMD entry. It uses at most half a
+core (it sleeps as long as each collapse took CPU).
 Before every pause (migration, checkpoint, suspend, `kill -TSTP`, the paused
 start of an arriving VM) the VM process holds the pass and waits out a collapse
 in flight, so no pause waits behind a collapse's mmap write lock or compaction
@@ -291,11 +294,12 @@ on. It ends when the pager stops, at a checkpoint or migration barrier, once
 write tracking is registered, or when the kernel has no huge page to give
 (ENOMEM). Nothing else changes:
 
-- The kernel collapses a chunk of a userfaultfd-registered range only if all 512
-  pages are mapped, none of them the zero page and none write-protected. It checks
-  this again under the mmap write lock before copying. So a collapse never fills a
-  missing page behind the pager's back, and never drops a protection a checkpoint
-  relies on. Contents and page states stay the same, and RSS does not grow.
+- The kernel collapses a chunk of a userfaultfd-registered range only if all of
+  its pages are mapped, none of them the zero page and none write-protected. It
+  checks this again under the mmap write lock before copying. So a collapse
+  never fills a missing page behind the pager's back, and never drops a
+  protection a checkpoint relies on. Contents and page states stay the same, and
+  RSS does not grow.
 - Write-protecting a huge page protects it whole (arming tracking got faster:
   5–9 ms against 26–37 ms for 500 MiB). A write fault on it is reported for its
   4 KiB page as before, and unprotecting the 64 KiB block splits the huge page.

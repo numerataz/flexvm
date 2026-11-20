@@ -6276,17 +6276,22 @@ def cow_rescue_fail():
     check("rescue fail: the original is intact", errors == 0, out)
 
 
-def host_hpage():
-    """The host's PMD size, its transparent huge pages' (2 MiB with 4 KiB pages, on x86_64 and aarch64 alike)."""
+def host_hpage(host_page):
+    """The host's PMD size, its transparent huge pages' (2 MiB with 4 KiB pages, 512 MiB with 64 KiB pages)."""
     try:
-        return int(open("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size").read())
+        size = int(open("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size").read())
+        if size >= host_page and (size & (size - 1)) == 0:
+            return size
     except (OSError, ValueError):
-        return 2 << 20
+        pass
+    return 2 << 20
 
 
 # The host's page size (what /proc/PID/pagemap and /proc/kpageflags index by) and huge page size; a huge page's
 # pages, and its buddy allocator order.
-HOST_PAGE, HPAGE = os.sysconf("SC_PAGE_SIZE"), host_hpage()
+HOST_PAGE = os.sysconf("SC_PAGE_SIZE")
+HPAGE = host_hpage(HOST_PAGE)
+HPAGE_MIB = HPAGE >> 20
 HPAGE_PAGES = HPAGE // HOST_PAGE
 HPAGE_ORDER = HPAGE_PAGES.bit_length() - 1
 
@@ -6329,7 +6334,7 @@ def cow_collapsed():
     their pause, the restored copy (collapsed in turn) is intact, and free page reporting still returns memory."""
     if "[never]" in open("/sys/kernel/mm/transparent_hugepage/enabled").read():
         raise Skip("transparent huge pages are disabled here")
-    require_huge_pages(200)
+    require_huge_pages(max(1, 400 // HPAGE_MIB))
     n, paths = "ft-huge", [ckpt_path("ft-huge0"), ckpt_path("ft-huge1")]
     ok(run(A, n))
     code, out = sh(A, n, "dd if=/dev/urandom of=/tmp/f bs=1M count=200 iflag=fullblock 2>/dev/null && wc -c </tmp/f && md5sum /tmp/f")
@@ -6343,7 +6348,7 @@ def cow_collapsed():
     c = collapse_report(B, n)
     huge, _ = huge_mib(B, n)
     print(f"huge: collapse {c}, {huge} MiB in huge pages")
-    check("huge: paged-in memory collapsed into huge pages", c and c["collapsed"] >= 100 and huge >= 200, (c, huge))
+    check("huge: paged-in memory collapsed into huge pages", c and c["collapsed"] * HPAGE_MIB >= 200 and huge >= 200, (c, huge))
     errors, _, out = writer_check(B, n)
     check("huge: guest memory intact after the collapse", errors == 0 and md5(B, n) == m, out)
     with armed_fault(B, "ckpt_memhash", 120000):
@@ -6382,7 +6387,7 @@ def collapse_abort():
     again, and the pass goes on to the end instead of leaving the VM on 4 KiB pages for good."""
     if "[never]" in open("/sys/kernel/mm/transparent_hugepage/enabled").read():
         raise Skip("transparent huge pages are disabled here")
-    require_huge_pages(200)
+    require_huge_pages(max(1, 400 // HPAGE_MIB))
     n = "ft-collapse-abort"
     m = setup(n, mib=600)
     # Parked mid-way at `collapse_hold` (after a call) until the migration back quiesces it: unheld it can be over in
@@ -6407,7 +6412,7 @@ def collapse_abort():
     huge, _ = huge_mib(B, n)
     print(f"collapse abort: before the migration {mid}, after {c}, {huge} MiB in huge pages")
     check("collapse abort: the pass was mid-way when the source paused", mid is None, mid)
-    check("collapse abort: the pass went on to the end", c and c["stopped"] is None and c["collapsed"] >= 200 and huge >= 400, (c, huge))
+    check("collapse abort: the pass went on to the end", c and c["stopped"] is None and c["collapsed"] * HPAGE_MIB >= 400 and huge >= 400, (c, huge))
     check("collapse abort: md5 intact", md5(B, n) == m)
 
 
@@ -6418,7 +6423,7 @@ def collapse_ckpt_fail():
     runs on and the pass starts again and goes on to the end, as after an aborted migration."""
     if "[never]" in open("/sys/kernel/mm/transparent_hugepage/enabled").read():
         raise Skip("transparent huge pages are disabled here")
-    require_huge_pages(200)
+    require_huge_pages(max(1, 400 // HPAGE_MIB))
     n, path = "ft-collapse-ckpt", ckpt_path("ft-collapse-ckpt")
     rm_ckpt(path)
     m = setup(n, mib=600)
@@ -6442,7 +6447,7 @@ def collapse_ckpt_fail():
     huge, _ = huge_mib(B, n)
     print(f"collapse ckpt fail: before the checkpoint {mid}, after {c}, {huge} MiB in huge pages")
     check("collapse ckpt fail: the pass was mid-way when the checkpoint paused", mid is None, mid)
-    check("collapse ckpt fail: the pass went on to the end", c and c["stopped"] is None and c["collapsed"] >= 200 and huge >= 400, (c, huge))
+    check("collapse ckpt fail: the pass went on to the end", c and c["stopped"] is None and c["collapsed"] * HPAGE_MIB >= 400 and huge >= 400, (c, huge))
     check("collapse ckpt fail: md5 intact", md5(B, n) == m)
     rm_ckpt(path)
 
@@ -6513,7 +6518,7 @@ def unplug_collapsed():
     gone, and the guest's memory stays intact. Deterministic: the guest offlines the hotplugged blocks that hold the
     most huge pages, and virtio-mem unplugs offline blocks first. PLUG_TEMPLATE picks a template with at least
     1.5 GiB of unplugged hotplug room."""
-    require_huge_pages(100)
+    require_huge_pages(max(1, 200 // HPAGE_MIB))
     n = "ft-huge-unplug"
     m = setup(n, template=os.environ.get("PLUG_TEMPLATE"))
     v = vms(A)[n]
@@ -6533,7 +6538,7 @@ def unplug_collapsed():
     check("huge unplug: migrated and pulled", st["released"] and st["state"] == "running", st)
     wait_for(lambda: collapse_report(B, n) is not None, 120)
     c = collapse_report(B, n)
-    check("huge unplug: memory collapsed", c and c["collapsed"] >= 100, c)
+    check("huge unplug: memory collapsed", c and c["collapsed"] * HPAGE_MIB >= 200, c)
     rss0 = settle_rss(B, n)
     # Host address of each hotplugged block (the hotplug region is the last guest memory region).
     offset, _, host_base = control(B, n, {"op": "debug", "what": "status"})["result"]["host_regions"][-1]
@@ -6550,7 +6555,7 @@ def unplug_collapsed():
         ranked = sorted(online, key=lambda blk: -len(chunks_of(blk) & huge0))
         chosen = []
         for blk in ranked[:6]:
-            if len(chunks_of(blk) & huge0) >= (32 << 20) // HPAGE and len(chosen) < 2:
+            if len(chunks_of(blk) & huge0) >= max(1, (32 << 20) // HPAGE) and len(chosen) < 2:
                 code, out = sh(B, n, f"echo offline > /sys/devices/system/memory/memory{blk}/state")
                 if code == 0:
                     chosen.append(blk)
