@@ -49,9 +49,10 @@ alternates between a sustained CPU loop and timer sleeps. Observations retain th
 outer supervisor and VMM PID/start time, inner process identity, separate RAM
 canaries, an inner counter and monotonic time. The test repeats normal
 pause/unpause, fresh-owner stop/start, rollback and publication-owner-death
-recovery, and checks that the inner guest boots once. This extends the earlier
-input-gated raw-emulator experiment; cross-host and accelerated nested migration
-still have separate acceptance gates.
+recovery, and checks that the inner guest boots once. It also transfers a
+checkpoint with the inner CPU loop active, checks that both levels retain
+their process and memory identity, and requires fresh inner timer and CPU
+progress before an orderly shutdown.
 
 ## Execution and state identity
 
