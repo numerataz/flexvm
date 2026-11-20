@@ -80,6 +80,27 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
       --checkpoint NAME|ID           start it from a stored checkpoint instead of IMAGE (its name and
                                      address unless --name and --ip IP|auto), or from a checkpoint
                                      directory (a path, with a '/'); --paused holds it until unpause
+  flexvm software-transfer id        show the local software host identity
+  flexvm software-transfer offer VM DESTINATION
+                                     identify a stopped VM and its intended destination
+  flexvm software-transfer retire VM OFFER --signing-key FILE --destination-key KEY
+                                     fence local restart and sign a retirement receipt
+  flexvm software-transfer prepare OFFER --source-key KEY
+                                     record an incoming transfer and its base64 Ed25519 public key
+  flexvm software-transfer commit RECEIPT
+                                     verify source retirement and commit the destination journal
+  flexvm software-transfer abort OFFER
+                                     durably reject the prepared transfer
+  flexvm software-transfer acknowledge-abort OFFER --signing-key FILE
+                                     write the abort and sign its acknowledgment
+  flexvm software-transfer recover ABORT-RECEIPT
+                                     authorize the source at a higher generation
+  flexvm software-transfer send VM OFFER
+                                     stream the exact retired software checkpoint to stdout
+  flexvm software-transfer receive OFFER [--max-bundle-mib MIB]
+                                     verify a prepared checkpoint bundle from stdin
+  flexvm software-transfer activate OFFER VM --qemu FILE
+                                     run one committed checkpoint with a matching local emulator
   flexvm software --kernel FILE [OPTIONS] IMAGE [CMD...]
                                      --kernel-sdk: matching native module build inputs;
                                      --kernel-modules FILE: custom runtime or SDK bundle
@@ -116,6 +137,7 @@ flexvm: elastic Firecracker microVMs with post-copy live migration
                                      -f: a running one too
   flexvm volume create NAME --size BYTES
                                      create an unattached sparse raw volume (512-byte multiple)
+  flexvm volume clone SOURCE NAME    clone unused raw storage to an independent sparse volume
   flexvm volume ls                   list volume IDs, names, logical and allocated bytes as JSON
   flexvm volume inspect NAME|ID      inspect a volume (VM attachment is not implemented yet)
   flexvm volume rm NAME|ID           remove an unused volume; refuses a held disk lock
@@ -450,7 +472,8 @@ fn main() {
         _ => false,
     };
     util::set_verbose(args.has("verbose") || logged);
-    let vm = matches!(args.positional.first().map(String::as_str), Some("run" | "start" | "exec" | "software"));
+    let vm = matches!(args.positional.first().map(String::as_str), Some("run" | "start" | "exec" | "software"))
+        || args.positional.first().is_some_and(|s| s == "software-transfer") && args.positional.get(1).is_some_and(|s| s == "activate");
     // Here, not in `real_main`, which unit tests run on any host; after the arguments, whose errors come first.
     let host_fits = || if reads_only(&args) { Ok(()) } else { check_applies(&args).and_then(|()| util::check_page_size()) };
     let result = error.map_or_else(|| host_fits().and_then(|()| real_main(&args)), Err);
@@ -541,6 +564,7 @@ const COMMANDS: &[(&str, usize, &[&str])] = &[
     ("rm", NAMES, &["force"]),
     ("volume", NAMES, &["size"]),
     ("checkpoint", NAMES, &["stop", "incremental", "quiet", "format", "filter", "force", "older-than", "output", "input", "name", "sha256"]),
+    ("software-transfer", 4, &["source-key", "signing-key", "destination-key", "max-bundle-mib", "qemu"]),
     ("migrate", 3, &[]),
     ("reclaim", 2, &["force"]),
     ("listen", 2, &[]),
@@ -618,12 +642,35 @@ fn check_applies(args: &Args) -> Result<()> {
             let words = args.positional.len();
             let valid = match first.map(String::as_str) {
                 Some("create") => words == 3 && args.get("size").is_some(),
+                Some("clone") => words == 4 && !args.has("size"),
                 Some("inspect" | "rm") => words == 3 && !args.has("size"),
                 Some("ls") => words == 2 && !args.has("size"),
                 _ => false,
             };
             if !valid {
-                bail!("volume needs create NAME --size BYTES, inspect NAME|ID, ls, or rm NAME|ID");
+                bail!("volume needs create NAME --size BYTES, clone SOURCE NAME, inspect NAME|ID, ls, or rm NAME|ID");
+            }
+        }
+        "software-transfer" => {
+            let words = args.positional.len();
+            let keys = (args.has("source-key"), args.has("signing-key"), args.has("destination-key"));
+            if args.has("max-bundle-mib") && first.map(String::as_str) != Some("receive") {
+                bail!("--max-bundle-mib applies only to software-transfer receive");
+            }
+            let activating = first.map(String::as_str) == Some("activate");
+            if args.has("qemu") != activating {
+                bail!("software-transfer activate requires --qemu FILE; other transfer commands do not take it");
+            }
+            if !matches!(
+                (first.map(String::as_str), words, keys),
+                (Some("id"), 2, (false, false, false))
+                    | (Some("prepare"), 3, (true, false, false))
+                    | (Some("commit" | "abort" | "recover" | "receive"), 3, (false, false, false))
+                    | (Some("acknowledge-abort"), 3, (false, true, false))
+                    | (Some("offer" | "send" | "activate"), 4, (false, false, false))
+                    | (Some("retire"), 4, (false, true, true))
+            ) {
+                bail!("invalid software-transfer arguments (see flexvm --help)");
             }
         }
         "checkpoint" => {
@@ -770,6 +817,7 @@ fn real_main(args: &Args) -> Result<()> {
             let catalog = volume::Catalog::open(&state(args)?)?;
             match name {
                 "create" => print(json!(catalog.create(arg2.unwrap(), args.get("size").unwrap().parse().map_err(|_| "volume --size needs a byte count")?)?)),
+                "clone" => print(json!(catalog.clone_volume(arg2.unwrap(), pos[3])?)),
                 "ls" => print(json!(catalog.list()?)),
                 "inspect" => print(json!(catalog.inspect(arg2.unwrap())?)),
                 "rm" => catalog.remove(arg2.unwrap()),
@@ -777,6 +825,35 @@ fn real_main(args: &Args) -> Result<()> {
             }
         }
         Some("pull") => pull(args, name),
+        Some("software-transfer") if name == "activate" => {
+            util::block_signals(&[libc::SIGTSTP, libc::SIGCONT, libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGHUP]);
+            util::exit(software::activate(open_host(args)?, pos[3], Path::new(pos[2]), Path::new(args.get("qemu").unwrap()))?)
+        }
+        Some("software-transfer") if name == "send" => {
+            software_state::transfer::bundle::send(&open_host(args)?, pos[2], Path::new(pos[3]), &mut std::io::stdout().lock())
+        }
+        Some("software-transfer") if name == "offer" => print(software_state::transfer::offer(&open_host(args)?, pos[2], pos[3])?),
+        Some("software-transfer") if name == "retire" => print(software_state::transfer::retire(
+            &open_host(args)?,
+            pos[2],
+            Path::new(pos[3]),
+            Path::new(args.get("signing-key").unwrap()),
+            args.get("destination-key").unwrap(),
+        )?),
+        Some("software-transfer") => {
+            let path = state(args)?;
+            host::host_dir(&path, 0o755)?;
+            if name == "receive" {
+                return print(software_state::transfer::bundle::import(&path, Path::new(pos[2]), &mut std::io::stdin().lock(), args.get("max-bundle-mib"))?);
+            }
+            if name == "acknowledge-abort" {
+                return print(software_state::transfer::acknowledge_abort(&path, Path::new(pos[2]), Path::new(args.get("signing-key").unwrap()))?);
+            }
+            if name == "recover" {
+                return print(software_state::transfer::recover(&path, Path::new(pos[2]))?);
+            }
+            print(software_state::transfer::command(&path, name, Path::new(arg2.unwrap_or("")), args.get("source-key"))?)
+        }
         Some("software") => util::exit(software(args, name)?),
         Some("images") => images(&open_host(args)?, &paths(args)?, args),
         Some("tag") => print(template::tag(&paths(args)?, name, arg2.ok_or("tag needs SRC DST")?)?),

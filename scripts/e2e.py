@@ -2616,8 +2616,9 @@ def openrc_test_image():
     if (output / "index.json").exists():
         return str(output)
     builder = "e2e-openrc-builder"
+    image = fixture["base_image"](ENV.get("FLEXVM_OPENRC_ALPINE_LAYOUT"))
     A.cli("pull", "--tag", "ci-openrc-builder", "--max", "1024", "--vcpus", "2",
-          "--cmd", '["/bin/sleep","1800"]', fixture["IMAGE"], timeout=300)
+          "--cmd", '["/bin/sleep","1800"]', image, timeout=300)
     dns = json.load(open(os.path.join(A.state_dir, "host.json"))).get("dns")
     try:
         A.configure(dns=ENV["FLEXVM_TEST_DNS"].split())
@@ -2992,6 +2993,10 @@ def containerd():
 def compat_workload(workload, boot="app", memory_mib=2048):
     output = os.path.join(args.log_dir, workload + "-compat")
     previous_dns = [(host, json.load(open(os.path.join(host.state_dir, "host.json"))).get("dns")) for host in (A, B)]
+    image = TEST_IMAGE if boot != "app" else ENV.get(
+        "FLEXVM_COMPAT_APP_IMAGE",
+        "public.ecr.aws/docker/library/ubuntu@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8",
+    )
     fixture_args = []
     if workload in ("kind", "k3s") and ENV.get("FLEXVM_WORKLOAD_FIXTURE"):
         for name in ("busybox.tar", "busybox.json"):
@@ -3003,7 +3008,7 @@ def compat_workload(workload, boot="app", memory_mib=2048):
         subprocess.run([
             "python3", os.path.join(ROOT, "scripts/compat.py"), "--bin", BIN,
             "--state", A.state_dir, "--run", A.run_dir, "--boot", boot,
-            "--image", TEST_IMAGE if boot != "app" else "public.ecr.aws/docker/library/ubuntu@sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8",
+            "--image", image,
             "--workload", os.path.join(ROOT, f"scripts/compat/workloads/{workload}.sh"),
             "--phases", "run,suspend,checkpoint,migration", "--migration-to", B.addr,
             "--to-state", B.state_dir, "--to-run", B.run_dir,
@@ -3843,13 +3848,14 @@ BATCH_S = 20
 SELFTEST_SKIP_NAME = "wildcard_listen"
 
 
-def faults_scenarios():
-    """{scenario: whether it needs KVM} of faults.py's SCENARIOS, less its BENCHMARKS: whether its function is
-    tagged @needs_kvm (a wrapped one's, as in no_evict(f), is f's). Read from faults.py's source: it cannot be
-    imported without its hosts."""
+def faults_scenarios(tag="needs_kvm"):
+    """Whether each scenario has `tag` (default @needs_kvm), excluding benchmarks.
+    A wrapped scenario inherits its underlying function's tags. Read the source:
+    faults.py cannot be imported without creating its hosts.
+    """
     import ast
     tree = ast.parse(open(os.path.join(ROOT, "scripts", "faults.py")).read())
-    tagged = {n.name for n in tree.body if isinstance(n, ast.FunctionDef) and any(getattr(d, "id", None) == "needs_kvm" for d in n.decorator_list)}
+    tagged = {n.name for n in tree.body if isinstance(n, ast.FunctionDef) and any(getattr(d, "id", None) == tag for d in n.decorator_list)}
     fn = lambda v: v.id if isinstance(v, ast.Name) else fn(v.args[0]) if isinstance(v, ast.Call) and v.args else None
     dicts = {t.id: {k.arg: fn(k.value) for k in n.value.keywords} for n in tree.body if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call)
              and getattr(n.value.func, "id", None) == "dict" for t in n.targets if isinstance(t, ast.Name)}
@@ -3938,6 +3944,7 @@ def main():
         assert c in CASES, f"unknown case {c}; have {', '.join(CASES)}"
     scenarios = args.faults.split() if "faults" in selected else []
     kvm = faults_scenarios()
+    exclusive_names = {f"faults/{name}" for name, tagged in faults_scenarios("host_exclusive").items() if tagged}
     # Without KVM, only what needs none (the self-test checks that selection).
     why = None if args.selftest else "--no-kvm" if args.no_kvm else kvm_unusable()
     if why and args.require_kvm:
@@ -4010,6 +4017,8 @@ def main():
             return [w[0] for w in batch]
 
     spawned = []
+    active_selftest = []
+    resource_overlaps = []
 
     def own(name):
         return name.startswith("faults/") and name.split("/", 1)[1] in LISTENER_FAULTS
@@ -4026,7 +4035,15 @@ def main():
                     f"[print(f'scenario {{x}}: ' + ('SKIPPED (selftest)' if x == {SELFTEST_SKIP_NAME!r} else 'ok') + ' in 0.0 s') for x in s]; "
                     "json.dump([[x, 'PASS', 0.0] for x in c] + ([['faults', 'PASS', 0.0]] if s else []), open(res, 'w'))")
             cmd = [sys.executable, "-c", fake, json.dumps([cases, scens, res])]
-        return subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True, env=ENV)
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True, env=ENV)
+        if args.selftest:
+            exclusive = any(f"faults/{name}" in exclusive_names for name in scens)
+            with lock:
+                live = [(child, alone) for child, alone in active_selftest if child.poll() is None]
+                if live and (exclusive or any(alone for _, alone in live)):
+                    resource_overlaps.append((cases, scens))
+                active_selftest.append((process, exclusive))
+        return process
 
     def run_batch(i, label, batch, port, net_a, net_b):
         """Runs one batch in a worker; returns its results."""
@@ -4115,7 +4132,29 @@ def main():
         builders.append(threading.Thread(target=build, args=(APP, *APP_OPTS), kwargs={"image": True}))
     runners = [threading.Thread(target=lane, args=(i, *l), daemon=True) for i, l in enumerate(lanes())]
     try:
-        for t in builders + runners:
+        for t in builders:
+            t.start()
+        exclusive_work = [item for item in work if item[0] in exclusive_names]
+        if exclusive_work:
+            # Template builds also run VMs. Finish them before reserving the host,
+            # then run each contiguous-memory fixture before ordinary workers.
+            for t in builders:
+                t.join()
+            for index, item in enumerate(exclusive_work, 1):
+                name, dependencies, _ = item
+                label = f"host-exclusive.{index}"
+                work.remove(item)
+                if not dependencies <= built:
+                    say(f"FAIL {name}: its template failed")
+                    summary.append((name, "FAIL", 0.0, label))
+                    continue
+                try:
+                    got = run_batch(0, label, [name], *lanes()[0])
+                except Exception as error:
+                    say(f"[{label}] FAIL batch: {type(error).__name__}: {error}")
+                    got = [(name, "FAIL", 0.0, label)]
+                summary.extend(got)
+        for t in runners:
             t.start()
         for t in builders + runners:
             t.join()
@@ -4154,6 +4193,13 @@ def main():
         print(f"selftest: failed {bad}, expected {want}; skipped {sorted(r[0] for r in skipped)}, expected {want_skip}")
         mixed = [b for b in spawned if len({s in LISTENER_FAULTS for s in b[1]}) > 1]
         print(f"selftest: batches mixing listener-owning scenarios with others: {mixed}")
+        isolated = [index for index, (_, scens) in enumerate(spawned)
+                    if any(f"faults/{name}" in exclusive_names for name in scens)]
+        expected_isolated = sum(name in exclusive_names for name, _, _ in scheduled)
+        isolated_first = isolated == list(range(expected_isolated)) and all(
+            not spawned[index][0] and len(spawned[index][1]) == 1 for index in isolated)
+        print(f"selftest: host-exclusive singleton batches first: {isolated_first}")
+        print(f"selftest: host-exclusive batches overlapping other workers: {resource_overlaps}")
         # CI runs only the shards: a scenario in none of them never runs.
         unsharded, unknown = shard_coverage()
         print(f"selftest: faults.py scenarios in no shard: {unsharded}; shards' names that are no scenario: {unknown}")
@@ -4169,7 +4215,7 @@ def main():
         probe = kvm_unusable("/dev/null"), kvm_unusable(os.path.join(WORK, "no-such-kvm"))
         print(f"selftest: without KVM, {len(out)} left out, running {runs}: {'as tagged' if selection else 'WRONG'}; "
               f"unusable KVM: {probe}")
-        return 0 if (bad == want and len(summary) == len(scheduled) + len(builders) and not mixed
+        return 0 if (bad == want and len(summary) == len(scheduled) + len(builders) and not mixed and not resource_overlaps and isolated_first
                      and sorted(r[0] for r in skipped) == want_skip and not unsharded and not unknown
                      and selection and all(probe)) else 1
     return 1 if failed else 0

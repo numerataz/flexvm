@@ -82,7 +82,7 @@ owned by the host and inaccessible for writes by guests or other principals. No 
 
 The x86 profile keeps SVM and NPT enabled and requires QEMU 9.2 or newer for real
 mode nested page walks. The pinned x86 engine is 10.2.1 with the TCG SVM restore fix from
-`scripts/build-qemu.sh` (package `flexvm-tcg-nested-1`). Stock Linux builds can
+`scripts/build-qemu.sh` (package `flexvm-tcg-nested-2`). Stock Linux builds can
 incorrectly require KVM's opaque nested-state blob when restoring TCG while a
 vCPU is in SVM guest mode. The patch restricts that validation to the KVM
 accelerator; TCG's architectural SVM/NPT state uses its existing serialization.
@@ -188,6 +188,73 @@ idempotently, and retain the source tombstone across owner/host restarts. Test
 every crash window, including retirement recorded before the source exits, and
 destination commit before its acknowledgment reaches the source.
 
+The transfer journals use `flexvm software-transfer`. Run `id` on the
+destination to get its host ID, then `offer VM DESTINATION` on the source
+after the software VM has stopped. The offer identifies the exact unconsumed
+checkpoint and the next generation. On the destination, use
+`prepare OFFER --source-key KEY` with the source's trusted 32-byte Ed25519
+public key in standard padded base64.
+
+On the source, `retire VM OFFER --signing-key FILE --destination-key KEY`
+pins the destination's separately configured Ed25519 public key. It checks
+that the exact checkpoint is retired and that neither its owner nor engine is still alive.
+It writes a durable restart fence keyed by VM identity before returning the
+signed receipt. The private key must be a private, locally owned regular file
+containing Ed25519 PKCS#8 DER. Keep the source checkpoint for receipt retries
+and artifact transfer. Retirement blocks local starts, including grants that
+were prepared before the fence was written. If the destination aborts, run `acknowledge-abort OFFER --signing-key FILE`
+there. It durably rejects the offer before signing the acknowledgment with the
+destination key. Its message uses the same offer encoding with the separate
+domain `flexvm/software-abort/v1` followed by a NUL. Run
+`recover ABORT-RECEIPT` at the source. A valid acknowledgment for the exact
+fence permits restart above that transfer generation. A recovered source
+retains the generation floor, and a previous acknowledgment cannot release a
+newer fence. Use portable matching artifacts on both hosts.
+
+An offer is a JSON object with these fields in wire order:
+
+1. `vm_id`
+2. `source_host`
+3. `destination_host`
+4. `transfer_id`
+5. `manifest_sha256`
+6. `generation`
+
+The first four fields are 32 lowercase hexadecimal characters. The digest is
+64 lowercase hexadecimal characters and the generation is a positive integer.
+`commit RECEIPT` verifies a JSON object containing the original `offer` and a
+standard padded base64 `signature`. The Ed25519 message is the ASCII bytes
+`flexvm/software-retirement/v1`, one NUL, and the compact JSON offer serialized
+in the field order above. The destination pins the public key and offer at
+preparation. A commit retry verifies the same receipt. `abort OFFER` permanently
+rejects that offer, and a replacement needs a higher generation and a different
+transfer ID. These commands record ownership decisions for subsequent activation.
+
+For a prepared destination and a retired source, run
+`software-transfer send VM OFFER` on the source. Pipe its stdout into
+`software-transfer receive OFFER` on the destination, for example through SSH.
+Both sides use the same offer file. The receiver enforces a 16 GiB artifact
+limit by default, configurable with `--max-bundle-mib`, and reserves disk
+space before writing each member. It publishes the bundle under
+`STATE/software-incoming/VM-ID-TRANSFER-ID` after digest verification and
+a final check that the exact offer is still pending or committed. Retrying
+the same transfer rechecks the stored bytes.
+
+The stream starts with `flexvm-software-bundle-v1` and a newline, followed by
+the four-byte big-endian header length and a JSON object with `offer` and
+`manifest`. Raw members follow in the order engine, kernel, root filesystem,
+VM state, and firmware in manifest key order. The manifest supplies every
+length and digest. A truncated, extended or corrupted stream fails verification.
+The published bundle carries artifacts and the offer identity. After the
+destination commits the retirement receipt, run
+`software-transfer activate OFFER VM --qemu FILE` there. Choose a locally
+trusted QEMU binary with exactly the engine digest and size in the bundle.
+FlexVM launches from the local descriptor, loads the guest with its CPUs
+paused, and records its one-time execution grant in the host journal before
+resuming. A retry before the grant uses the same destination name and a newer
+generation. The grant survives removal of the VM or its imported artifacts.
+After activation, ordinary destination `stop` and `start` use local checkpoints.
+
 After load, use the guest agent to step CLOCK_REALTIME from the current host time.
 Do not reset CLOCK_MONOTONIC through the agent. Preserve the engine virtual clock
 and device timers through migration, and test nondecreasing monotonic time and
@@ -280,3 +347,15 @@ canonical profiles generated locally for these two layouts. It rebuilds the
 engine command from the matched layout and fresh host endpoints, preserving
 the selected layout on subsequent captures. Manifest arguments are never
 executed directly. Active and saved guest metadata report the selected address.
+
+Package `flexvm-tcg-nested-2` also faults Intel's feature-control MSR on SVM
+CPUs. The old unknown-MSR default returned zero, causing the guest Linux KVM
+driver to advertise state it could not read back during an unchanged client's
+snapshot. The x86 ABI acceptance checks advertised feature-control state and
+runs ten reference checks. Read/write interception still precedes the fault;
+non-SVM behavior is unchanged.
+
+Use the updated engine for newly booted software guests. A restored older guest
+retains the kernel capability list captured in its RAM; changing an engine does
+not repair that cached list. Keep the engine recorded by existing checkpoints
+available, and retain normal engine-identity fencing.

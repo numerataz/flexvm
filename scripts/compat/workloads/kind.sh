@@ -211,7 +211,7 @@ PY
     test "$(k exec "$first" -- wget -qO- http://web.flexvm-compat.svc.cluster.local:8080)" = "$nonce"
     peer=$(k get pod "$second" -o jsonpath='{.status.podIP}')
     test "$(k exec "$first" -- wget -qO- "http://$peer:8080")" = "$nonce"
-    k exec "$first" -- wget -qO /dev/null http://example.com
+    k exec "$first" -- wget -qO /dev/null https://github.com/robots.txt
     test "$(curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:18089)" = "$nonce"
     printf 'KIND_PHASE_OK %s\n' "$phase"
     ;;
