@@ -82,7 +82,12 @@ static void reset_lapic(unsigned int id)
     close(kvm);
 }
 
-static unsigned int reply_run(int control, const struct kvm_run *run, int mapping_bytes)
+struct pending_read {
+    unsigned char *data;
+    size_t length;
+};
+
+static struct pending_read reply_run(int control, struct kvm_run *run, int mapping_bytes)
 {
     if (run->exit_reason == KVM_EXIT_MMIO) {
         unsigned int width = run->mmio.len;
@@ -93,14 +98,24 @@ static unsigned int reply_run(int control, const struct kvm_run *run, int mappin
         if (run->mmio.is_write)
             memcpy(output + 10, run->mmio.data, width);
         check(write(control, output, sizeof(output)) == sizeof(output), "return a host MMIO exit");
-        return run->mmio.is_write ? 0 : width;
+        return run->mmio.is_write ? (struct pending_read){0} : (struct pending_read){run->mmio.data, width};
     }
-    check(run->exit_reason == KVM_EXIT_IO && run->io.direction == KVM_EXIT_IO_OUT &&
-          run->io.port == PVKVM_IO_PORT && run->io.count == 1 && run->io.size == 1 &&
-          run->io.data_offset < (unsigned long)mapping_bytes, "unexpected host vCPU exit");
-    unsigned char output[] = {'O', ((const unsigned char *)run)[run->io.data_offset]};
-    check(write(control, output, sizeof(output)) == sizeof(output), "return a host port write");
-    return 0;
+    check(run->exit_reason == KVM_EXIT_IO && run->io.direction <= KVM_EXIT_IO_OUT &&
+          (run->io.size == 1 || run->io.size == 2 || run->io.size == 4) &&
+          run->io.count > 0 && run->io.count <= PVKVM_PIO_BYTES / run->io.size &&
+          run->io.data_offset < (unsigned long)mapping_bytes, "invalid host port I/O exit");
+    size_t length = (size_t)run->io.count * run->io.size;
+    check(length <= (unsigned long)mapping_bytes - run->io.data_offset, "host I/O data outside run mapping");
+    unsigned char *data = (unsigned char *)run + run->io.data_offset;
+    bool is_write = run->io.direction == KVM_EXIT_IO_OUT;
+    unsigned char output[8 + PVKVM_PIO_BYTES] = {is_write ? 'U' : 'V', run->io.size};
+    memcpy(output + 2, &run->io.port, sizeof(run->io.port));
+    memcpy(output + 4, &run->io.count, sizeof(run->io.count));
+    if (is_write)
+        memcpy(output + 8, data, length);
+    size_t bytes = 8 + (is_write ? length : 0);
+    check(write(control, output, bytes) == (ssize_t)bytes, "return a host port I/O exit");
+    return is_write ? (struct pending_read){0} : (struct pending_read){data, length};
 }
 
 int main(int argc, char **argv)
@@ -160,7 +175,7 @@ int main(int argc, char **argv)
     close(outer_ram);
     int cpus[PVKVM_MAX_CPUS];
     struct kvm_run *runs[PVKVM_MAX_CPUS];
-    unsigned int pending_read[PVKVM_MAX_CPUS] = {0};
+    struct pending_read pending_read[PVKVM_MAX_CPUS] = {0};
     struct kvm_sregs segments;
     for (unsigned int id = 0; id < cpu_count; id++) {
         cpus[id] = ioctl(vm, KVM_CREATE_VCPU, id);
@@ -182,6 +197,7 @@ int main(int argc, char **argv)
     struct pvkvm_cpuid_table cpuid;
     _Static_assert(sizeof(fpu) == PVKVM_FPU_BYTES && sizeof(cpuid) >= sizeof(fpu) &&
                    sizeof(lapic) == PVKVM_LAPIC_BYTES && sizeof(cpuid) >= sizeof(lapic) &&
+                   sizeof(cpuid) >= PVKVM_PIO_BYTES + sizeof(uint32_t) &&
                    sizeof(cpuid) >= sizeof(segments) && sizeof(cpuid) >= sizeof(msrs),
                    "native worker control record size");
 
@@ -291,12 +307,12 @@ int main(int argc, char **argv)
         }
         uint32_t sequence;
         size_t run_header = 2 + sizeof(sequence);
-        check(received == (ssize_t)(run_header + pending_read[id]) && request[0] == 'R', "invalid run request");
+        check(received == (ssize_t)(run_header + pending_read[id].length) && request[0] == 'R', "invalid run request");
         memcpy(&sequence, request + 2, sizeof(sequence));
         check(sequence > 0 && sequence <= INT_MAX, "invalid run sequence");
-        if (pending_read[id]) {
-            memcpy(run->mmio.data, request + run_header, pending_read[id]);
-            pending_read[id] = 0;
+        if (pending_read[id].length) {
+            memcpy(pending_read[id].data, request + run_header, pending_read[id].length);
+            pending_read[id] = (struct pending_read){0};
         }
         run_page = run;
         __atomic_store_n(&run->immediate_exit, 0, __ATOMIC_RELAXED);

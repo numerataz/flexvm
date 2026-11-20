@@ -100,7 +100,7 @@ struct pvvm {
 
 struct run_page {
 	struct kvm_run run;
-	u8 data;
+	u8 pio[PVKVM_PIO_BYTES] __aligned(PAGE_SIZE);
 };
 
 static const u32 boot_msr_indices[] = {
@@ -121,7 +121,8 @@ struct pvcpu {
 	u64 msrs[ARRAY_SIZE(boot_msr_indices)];
 	unsigned long msrs_set;
 	unsigned int id;
-	unsigned int mmio_read_width;
+	unsigned int read_bytes;
+	bool read_pio;
 	bool ran;
 	bool fpu_set;
 	bool lapic_set;
@@ -440,7 +441,7 @@ static int cpu_mmap(struct file *file, struct vm_area_struct *vma)
 
 	if (cpu->vm->owner != current->mm)
 		return -EIO;
-	if (vma->vm_pgoff || vma->vm_end - vma->vm_start != PAGE_SIZE ||
+	if (vma->vm_pgoff || vma->vm_end - vma->vm_start != sizeof(*cpu->page) ||
 	    !(vma->vm_flags & VM_SHARED) || (vma->vm_flags & VM_EXEC))
 		return -EINVAL;
 	vma->vm_flags &= ~VM_MAYEXEC;
@@ -507,36 +508,48 @@ enum { PVKVM_IOEVENT_HANDLED = 1 };
 
 static int complete_run(struct pvcpu *cpu, const struct pvkvm_run_exit *exit)
 {
+	struct pvkvm *p = cpu->vm->provider;
 	struct run_page *page = cpu->page;
+	unsigned int bytes;
 
-	if (exit->is_write > 1 || exit->reserved)
+	if (exit->is_write > 1 || !exit->count)
 		return -EIO;
+	if (!exit->is_write && hweight_long(cpu->vm->open_cpus) > 1)
+		return -EOPNOTSUPP;
 	switch (exit->reason) {
 	case KVM_EXIT_IO:
-		if (exit->length != 1 || exit->address != PVKVM_IO_PORT || !exit->is_write)
+		if (!is_power_of_2(exit->length) || exit->length > 4 ||
+		    exit->address > U16_MAX || exit->count > sizeof(page->pio) / exit->length)
 			return -EIO;
-		if (signal_ioeventfd(cpu->vm, exit))
+		if (exit->count == 1 && signal_ioeventfd(cpu->vm, exit))
 			return PVKVM_IOEVENT_HANDLED;
-		page->data = exit->data[0];
-		page->run.io.direction = KVM_EXIT_IO_OUT;
-		page->run.io.size = 1;
-		page->run.io.port = PVKVM_IO_PORT;
-		page->run.io.count = 1;
-		page->run.io.data_offset = offsetof(struct run_page, data);
+		bytes = exit->length * exit->count;
+		if (exit->is_write) {
+			memcpy_fromio(page->pio, p->mailbox + PVKVM_PIO_DATA_AT, bytes);
+		} else {
+			memset(page->pio, 0, bytes);
+			cpu->read_bytes = bytes;
+			cpu->read_pio = true;
+		}
+		page->run.io.direction = exit->is_write ? KVM_EXIT_IO_OUT : KVM_EXIT_IO_IN;
+		page->run.io.size = exit->length;
+		page->run.io.port = exit->address;
+		page->run.io.count = exit->count;
+		page->run.io.data_offset = offsetof(struct run_page, pio);
 		break;
 	case KVM_EXIT_MMIO:
-		if (!is_power_of_2(exit->length) || exit->length > sizeof(exit->data))
+		if (!is_power_of_2(exit->length) || exit->length > sizeof(exit->data) || exit->count != 1)
 			return -EIO;
 		if (signal_ioeventfd(cpu->vm, exit))
 			return PVKVM_IOEVENT_HANDLED;
-		if (!exit->is_write && hweight_long(cpu->vm->open_cpus) > 1)
-			return -EOPNOTSUPP;
 		page->run.mmio.phys_addr = exit->address;
 		memset(page->run.mmio.data, 0, sizeof(page->run.mmio.data));
 		if (exit->is_write)
 			memcpy(page->run.mmio.data, exit->data, exit->length);
-		else
-			cpu->mmio_read_width = exit->length;
+		else {
+			cpu->read_bytes = exit->length;
+			cpu->read_pio = false;
+		}
 		page->run.mmio.len = exit->length;
 		page->run.mmio.is_write = exit->is_write;
 		break;
@@ -599,15 +612,17 @@ static int run_cpu(struct pvcpu *cpu)
 				    cpu->cpuid->count * sizeof(cpu->cpuid->entries[0]));
 	}
 	do {
-		struct pvkvm_mmio_completion completion = { .length = cpu->mmio_read_width };
+		struct pvkvm_read_completion completion = { .length = cpu->read_bytes };
 
-		if (completion.length)
+		if (completion.length && cpu->read_pio)
+			memcpy_toio(p->mailbox + PVKVM_PIO_DATA_AT, cpu->page->pio, completion.length);
+		else if (completion.length)
 			memcpy(completion.data, cpu->page->run.mmio.data, completion.length);
 		memcpy_toio(p->mailbox + PVKVM_COMPLETION_AT, &completion, sizeof(completion));
 		result = request_for_cpu(cpu, PVKVM_RUN, memory, &exit);
 		if (!result || result == -EINTR) {
 			cpu->ran = true;
-			cpu->mmio_read_width = 0;
+			cpu->read_bytes = 0;
 		}
 		if (result)
 			break;
@@ -1012,7 +1027,7 @@ static int new_cpu(struct pvvm *vm, unsigned long id)
 	cpu = kzalloc(sizeof(*cpu), GFP_KERNEL);
 	if (!cpu)
 		return -ENOMEM;
-	cpu->page = vmalloc_user(PAGE_SIZE);
+	cpu->page = vmalloc_user(sizeof(*cpu->page));
 	if (!cpu->page) {
 		kfree(cpu);
 		return -ENOMEM;
@@ -1535,7 +1550,7 @@ static long device_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 	case KVM_GET_API_VERSION:
 		return KVM_API_VERSION;
 	case KVM_GET_VCPU_MMAP_SIZE:
-		return PAGE_SIZE;
+		return sizeof(struct run_page);
 	case KVM_CHECK_EXTENSION:
 		return device_capability(arg);
 	case KVM_GET_MSR_INDEX_LIST: {
@@ -1578,7 +1593,7 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	struct pvkvm *p;
 	int result;
 
-	BUILD_BUG_ON(sizeof(struct run_page) > PAGE_SIZE);
+	BUILD_BUG_ON(sizeof(struct run_page) != 2 * PAGE_SIZE);
 	BUILD_BUG_ON(PAGE_SIZE != PVKVM_GUEST_PAGE_SIZE);
 	BUILD_BUG_ON(PVKVM_SLOT_TABLE_AT + PVKVM_MAX_SLOTS * PVKVM_SLOT_RECORD_SIZE > PVKVM_FPU_AT);
 	BUILD_BUG_ON(sizeof(struct kvm_fpu) != PVKVM_FPU_BYTES);
@@ -1587,14 +1602,15 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	BUILD_BUG_ON(PVKVM_MSR_AT + sizeof(struct pvkvm_msr_batch) > PVKVM_CPUID_AT);
 	BUILD_BUG_ON(PVKVM_CPUID_AT + sizeof(struct pvkvm_cpuid_table) > PVKVM_EXIT_AT);
 	BUILD_BUG_ON(PVKVM_EXIT_AT + sizeof(struct pvkvm_run_exit) > PVKVM_COMPLETION_AT);
-	BUILD_BUG_ON(PVKVM_COMPLETION_AT + sizeof(struct pvkvm_mmio_completion) > PVKVM_IRQ_AT);
+	BUILD_BUG_ON(PVKVM_COMPLETION_AT + sizeof(struct pvkvm_read_completion) > PVKVM_IRQ_AT);
 	BUILD_BUG_ON(PVKVM_IRQ_AT + sizeof(struct kvm_irq_level) > PVKVM_PIT_FLAGS_AT);
 	BUILD_BUG_ON(PVKVM_PIT_FLAGS_AT + sizeof(u32) > PVKVM_TSS_AT);
 	BUILD_BUG_ON(PVKVM_TSS_AT + sizeof(u32) > PVKVM_LAPIC_AT);
 	BUILD_BUG_ON(sizeof(struct kvm_lapic_state) != PVKVM_LAPIC_BYTES);
 	BUILD_BUG_ON(PVKVM_LAPIC_VALID_AT + sizeof(u32) > PVKVM_REGISTERS_AT);
+	BUILD_BUG_ON(PVKVM_LAPIC_AT + PVKVM_LAPIC_BYTES > PVKVM_PIO_DATA_AT);
 	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
-	    pci_resource_len(dev, 2) < PVKVM_LAPIC_AT + PVKVM_LAPIC_BYTES)
+	    pci_resource_len(dev, 2) < PVKVM_PIO_DATA_AT + PVKVM_PIO_BYTES)
 		return -ENODEV;
 	result = pcim_enable_device(dev);
 	if (result)

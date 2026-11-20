@@ -36,6 +36,7 @@
 #define PIT_ENTRY_OFFSET 0xe00
 #define IRQFD_ENTRY_OFFSET 0xe00
 #define ZERO_SLOT_ENTRY_OFFSET 0xe00
+#define PORT_IO_ENTRY_OFFSET 0xe80
 #define PIC_IDT_OFFSET 0x400
 #define PIC_IDTR_OFFSET 0x540
 #define PIC_GSI 3
@@ -496,6 +497,65 @@ static void prepare_zero_slot(unsigned char *ram, const uint32_t *offsets, size_
     install_jump(ram, pc, 0x10);
 }
 
+static void prepare_port_io(unsigned char *ram, unsigned char *data, int next)
+{
+    const unsigned char program[] = {
+        0xba, 0xf8, 0x03, 0, 0, 0xb0, 0x4c, 0xee,  /* out 0x3f8, al */
+        0x66, 0xba, 0xfd, 0x03, 0xec,               /* in al, 0x3fd */
+        0x88, 0x83, 0x40, 0x01, 0, 0,              /* mov [ebx+0x140], al */
+        0x66, 0xba, 0xf8, 0x02, 0x66, 0xb8, 0xcd, 0xab, 0x66, 0xef, /* out 0x2f8, ax */
+        0x66, 0xed, 0x66, 0x89, 0x83, 0x42, 0x01, 0, 0, /* in ax, dx; mov [ebx+0x142], ax */
+        0x66, 0xba, 0xf8, 0x0c, 0xb8, 0, 0, 0, 0x80, 0xef, /* out 0xcf8, eax */
+        0x66, 0xba, 0xfc, 0x0c, 0xed,               /* in eax, 0xcfc */
+        0x89, 0x83, 0x44, 0x01, 0, 0,              /* mov [ebx+0x144], eax */
+        0x56, 0x57, 0xfc,                           /* push esi; push edi; cld */
+        0x8d, 0xb3, 0x80, 0x01, 0, 0,              /* lea esi, [ebx+0x180] */
+        0x66, 0xba, 0xf8, 0x03, 0xb9, 4, 0, 0, 0, 0xf3, 0x6e, /* rep outsb to 0x3f8 */
+        0x8d, 0xbb, 0x88, 0x01, 0, 0,              /* lea edi, [ebx+0x188] */
+        0x66, 0xba, 0xf8, 0x02, 0xb9, 4, 0, 0, 0, 0xf3, 0x6c, /* rep insb from 0x2f8 */
+        0x5f, 0x5e, 0xb8, 0x41, 0, 0, 0, 0xf9,     /* restore ESI and EDI, then mov eax, 0x41; stc */
+    };
+
+    memcpy(data + 0x180, "vmio", 4);
+    memcpy(ram + PORT_IO_ENTRY_OFFSET, program, sizeof(program));
+    install_jump(ram, PORT_IO_ENTRY_OFFSET + sizeof(program), next);
+}
+
+static void test_port_access(int cpu, struct kvm_run *run, size_t mapping_bytes,
+                             uint16_t port, unsigned int width, bool write, const char *expected,
+                             unsigned int bytes)
+{
+    unsigned int transferred = 0;
+
+    while (transferred < bytes) {
+        timed_run(cpu);
+        check(run->exit_reason == KVM_EXIT_IO && run->io.port == port && run->io.size == width &&
+              run->io.direction == (write ? KVM_EXIT_IO_OUT : KVM_EXIT_IO_IN) &&
+              run->io.count > 0 && run->io.count <= (bytes - transferred) / width &&
+              run->io.data_offset < mapping_bytes, "get the correct x86 port, direction, width and count");
+        unsigned int chunk = run->io.count * width;
+        check(chunk <= mapping_bytes - run->io.data_offset, "read a bounded mapped PIO payload");
+        unsigned char *payload = (unsigned char *)run + run->io.data_offset;
+        if (write)
+            check(!memcmp(payload, expected + transferred, chunk), "verify the port output bytes");
+        else
+            memcpy(payload, expected + transferred, chunk);
+        transferred += chunk;
+    }
+}
+
+static void test_port_io(int cpu, struct kvm_run *run, size_t bytes)
+{
+    test_port_access(cpu, run, bytes, 0x3f8, 1, true, "L", 1);
+    test_port_access(cpu, run, bytes, 0x3fd, 1, false, "\x60", 1);
+    test_port_access(cpu, run, bytes, 0x2f8, 2, true, "\xcd\xab", 2);
+    test_port_access(cpu, run, bytes, 0x2f8, 2, false, "\x67\x45", 2);
+    test_port_access(cpu, run, bytes, 0xcf8, 4, true, "\x00\x00\x00\x80", 4);
+    test_port_access(cpu, run, bytes, 0xcfc, 4, false, "\xef\xbe\x34\x12", 4);
+    test_port_access(cpu, run, bytes, 0x3f8, 1, true, "vmio", 4);
+    test_port_access(cpu, run, bytes, 0x2f8, 1, false, "data", 4);
+}
+
 static void set_pic_line(int vm, unsigned int level)
 {
     const struct kvm_irq_level irq = {.irq = PIC_GSI, .level = level};
@@ -782,6 +842,7 @@ int main(int argc, char **argv)
     bool tss = false;
     bool provider_tss = false;
     bool lapic = false;
+    bool pio = false;
     check(argc == 2 || protected_mode, "specify RAM pages and optional protected or split mode");
     for (int i = 3; i < argc; i++) {
         if (!interrupt_run && !strcmp(argv[i], "interrupt"))
@@ -815,6 +876,8 @@ int main(int argc, char **argv)
             provider_tss = !strcmp(argv[i], "provider-tss");
         } else if (!lapic && !strcmp(argv[i], "lapic"))
             lapic = true;
+        else if (!pio && !strcmp(argv[i], "pio"))
+            pio = true;
         else
             check(false, "invalid execution option");
     }
@@ -839,6 +902,8 @@ int main(int argc, char **argv)
           !irqchip && !cpuid && !two_vcpus), "test one zero-based slot across the PC legacy region");
     check(!tss || irqchip, "program the TSS before creating the x86 irqchip");
     check(!lapic || irqchip, "get and set the local APIC with an irqchip");
+    check(!pio || (protected_mode && !long_mode && !cpuid && !two_vcpus && !zero_slot),
+          "test port I/O with a single protected-mode vCPU");
     size_t pages = count;
     size_t ram_bytes = pages * 4096;
     uint64_t gpa = PVKVM_GUEST_START;
@@ -1144,6 +1209,11 @@ int main(int argc, char **argv)
         regs.rip = gpa + PIC_ENTRY_OFFSET;
         regs.rsp = gpa + 0xf00;
     }
+    if (pio) {
+        prepare_port_io(ram, data, regs.rip - entry_base);
+        regs.rip = entry_base + PORT_IO_ENTRY_OFFSET;
+        regs.rsp = gpa + 0xf00;
+    }
     if (cpuid) {
         regs.rip = entry_base + CPUID_ENTRY_OFFSET;
         regs.rsp = entry_base + 0xf00;
@@ -1202,8 +1272,15 @@ int main(int argc, char **argv)
     }
     if (mmio_read)
         complete_mmio_reads(cpu, run, ram, entry_base);
+    if (pio)
+        test_port_io(cpu, run, size);
     unsigned long long first = timed_run(cpu);
     check_output(run, size, 0x42);
+    if (pio) {
+        check(data[0x140] == 0x60 && !memcmp(data + 0x142, "\x67\x45\xef\xbe\x34\x12", 6) &&
+              !memcmp(data + 0x188, "data", 4), "observe all supplied port input bytes in guest RAM");
+        puts("PASS x86 port I/O preserved widths, counts, and VMM read data");
+    }
     if (zero_slot) {
         for (size_t i = 0; i < sizeof(zero_slot_offsets) / sizeof(zero_slot_offsets[0]); i++)
             check(ram[zero_slot_offsets[i]] == ((0x13 + i) ^ 0x5a), "alias a marker across the legacy RAM range");

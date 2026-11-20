@@ -1,0 +1,257 @@
+--- a/hw/char/debugcon.c
++++ b/hw/char/debugcon.c
+@@ -48,5 +48,16 @@
+
+-typedef struct DebugconState {
++typedef struct DebugconState DebugconState;
++
++typedef struct DebugconPioRange {
++    MemoryRegion region;
++    DebugconState *debugcon;
++    unsigned int first;
++} DebugconPioRange;
++
++struct DebugconState {
+     MemoryRegion io;
+     MemoryRegion mmio;
++    DebugconPioRange pio[6];
++    unsigned int pio_count;
++    unsigned int pio_waiters;
+     CharFrontend chr;
+@@ -55,2 +66,5 @@
+     bool run_control;
++    bool forward_pio;
++    bool keep_pic_ports;
++    bool keep_pit_ports;
+     bool run_active;
+@@ -69,3 +83,3 @@
+     VMChangeStateEntry *run_state;
+-} DebugconState;
++};
+
+@@ -90,5 +104,5 @@
+         }
+-        if (s->read_width) {
+-            qemu_cond_signal(&s->read_completed);
+-        }
++    }
++    if (s->read_width || s->pio_waiters) {
++        qemu_cond_broadcast(&s->read_completed);
+     }
+@@ -150,2 +164,4 @@
+         debugcon_run_failed(s);
++    } else if (s->pio_waiters) {
++        qemu_cond_broadcast(&s->read_completed);
+     }
+@@ -189,11 +205,11 @@
+ {
+-    if (s->run_active && !s->run_failed && !s->output_length &&
+-        current_cpu == s->run_cpu) {
+-        memcpy(s->output, reply, bytes);
+-        s->output_length = bytes;
+-    } else {
+-        s->run_failed = true;
++    if (!s->run_active || s->run_failed || s->output_length ||
++        current_cpu != s->run_cpu) {
++        debugcon_run_failed(s);
++        return false;
+     }
++    memcpy(s->output, reply, bytes);
++    s->output_length = bytes;
+     vm_stop(RUN_STATE_PAUSED);
+-    return !s->run_failed;
++    return true;
+ }
+@@ -248,8 +264,7 @@
+
+-static MemTxResult debugcon_mmio_read(void *opaque, hwaddr address,
+-                                      uint64_t *value, unsigned width,
+-                                      MemTxAttrs attrs)
++static MemTxResult debugcon_complete_read(DebugconState *s,
++                                          const uint8_t *reply,
++                                          unsigned int reply_bytes,
++                                          uint64_t *value, unsigned width)
+ {
+-    DebugconState *s = opaque;
+-    uint8_t reply[DEBUGCON_EXIT_MAX] = {'Q', width};
+     bool ready;
+@@ -260,4 +275,3 @@
+     }
+-    stq_le_p(reply + 2, s->mmio_base + address);
+-    if (!debugcon_stop_at_exit(s, reply, sizeof(reply))) {
++    if (!debugcon_stop_at_exit(s, reply, reply_bytes)) {
+         return MEMTX_ERROR;
+@@ -286,2 +300,118 @@
+
++static MemTxResult debugcon_mmio_read(void *opaque, hwaddr address,
++                                      uint64_t *value, unsigned width,
++                                      MemTxAttrs attrs)
++{
++    DebugconState *s = opaque;
++    uint8_t reply[DEBUGCON_EXIT_MAX] = {'Q', width};
++
++    stq_le_p(reply + 2, s->mmio_base + address);
++    return debugcon_complete_read(s, reply, sizeof(reply), value, width);
++}
++
++static bool debugcon_wait_for_pio_run(DebugconState *s)
++{
++    CPUState *cpu = current_cpu;
++
++    if (!s->output_length) {
++        return !s->run_failed;
++    }
++
++    /*
++     * TCG may execute another iteration of REP OUTS in the same translation
++     * block. Stop at that access until userspace acknowledges the prior exit.
++     */
++    s->pio_waiters++;
++    cpu_pause(cpu);
++    while (!s->run_failed &&
++           (s->output_length || !s->run_active || s->run_cpu != cpu)) {
++        qemu_cond_wait_bql(&s->read_completed);
++    }
++    s->pio_waiters--;
++    qemu_cond_broadcast(&s->read_completed);
++    return !s->run_failed;
++}
++
++static MemTxResult debugcon_pio_read(void *opaque, hwaddr address,
++                                     uint64_t *value, unsigned width,
++                                     MemTxAttrs attrs)
++{
++    DebugconPioRange *range = opaque;
++    uint8_t reply[8] = {'V', width};
++
++    if (!debugcon_wait_for_pio_run(range->debugcon)) {
++        return MEMTX_ERROR;
++    }
++    stw_le_p(reply + 2, range->first + address);
++    stl_le_p(reply + 4, 1);
++    return debugcon_complete_read(range->debugcon, reply, sizeof(reply),
++                                  value, width);
++}
++
++static void debugcon_pio_write(void *opaque, hwaddr address, uint64_t value,
++                                unsigned width)
++{
++    DebugconPioRange *range = opaque;
++    uint8_t reply[12] = {'U', width};
++
++    if (!debugcon_wait_for_pio_run(range->debugcon)) {
++        return;
++    }
++    stw_le_p(reply + 2, range->first + address);
++    stl_le_p(reply + 4, 1);
++    stl_le_p(reply + 8, value);
++    debugcon_stop_at_exit(range->debugcon, reply, 8 + width);
++}
++
++static const MemoryRegionOps debugcon_pio_ops = {
++    .read_with_attrs = debugcon_pio_read,
++    .write = debugcon_pio_write,
++    .valid.min_access_size = 1,
++    .valid.max_access_size = 4,
++    .valid.unaligned = true,
++    .impl.min_access_size = 1,
++    .impl.max_access_size = 4,
++    .impl.unaligned = true,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++};
++
++static void debugcon_map_pio_range(ISADevice *dev, DebugconState *s,
++                                   unsigned int first, unsigned int end)
++{
++    DebugconPioRange *range;
++
++    assert(s->pio_count < ARRAY_SIZE(s->pio));
++    range = &s->pio[s->pio_count++];
++    range->debugcon = s;
++    range->first = first;
++    memory_region_init_io(&range->region, OBJECT(dev), &debugcon_pio_ops,
++                          range, "flexvm-pio", end - first);
++    memory_region_add_subregion_overlap(isa_address_space_io(dev), first,
++                                        &range->region, 10);
++}
++
++static void debugcon_map_pio(ISADevice *dev, DebugconState *s)
++{
++    const struct {
++        unsigned int first;
++        unsigned int end;
++        bool keep;
++    } reserved[] = {
++        { 0x20, 0x22, s->keep_pic_ports },
++        { 0x40, 0x44, s->keep_pit_ports },
++        { 0x61, 0x62, s->keep_pit_ports },
++        { 0xa0, 0xa2, s->keep_pic_ports },
++        { 0x4d0, 0x4d2, s->keep_pic_ports },
++    };
++    unsigned int first = 0;
++
++    for (size_t i = 0; i < ARRAY_SIZE(reserved); i++) {
++        if (reserved[i].keep) {
++            debugcon_map_pio_range(dev, s, first, reserved[i].first);
++            first = reserved[i].end;
++        }
++    }
++    debugcon_map_pio_range(dev, s, first, 0x10000);
++}
++
+ static void debugcon_mmio_write(void *opaque, hwaddr address, uint64_t value,
+@@ -341,2 +471,6 @@
+     }
++    if (s->forward_pio && !s->run_control) {
++        error_setg(errp, "debugcon PIO forwarding requires run control");
++        return;
++    }
+     debugcon_realize_core(s, &err);
+@@ -346,8 +480,14 @@
+     }
+-    memory_region_init_io(&s->io, OBJECT(dev), &debugcon_ops, s,
+-                          TYPE_ISA_DEBUGCON_DEVICE, 1);
+-    memory_region_add_subregion(isa_address_space_io(d),
+-                                isa->iobase, &s->io);
+-    if (s->mmio_base) {
++    if (s->forward_pio) {
++        debugcon_map_pio(d, s);
++    } else {
++        memory_region_init_io(&s->io, OBJECT(dev), &debugcon_ops, s,
++                              TYPE_ISA_DEBUGCON_DEVICE, 1);
++        memory_region_add_subregion(isa_address_space_io(d),
++                                    isa->iobase, &s->io);
++    }
++    if (s->mmio_base || s->forward_pio) {
+         qemu_cond_init(&s->read_completed);
++    }
++    if (s->mmio_base) {
+         memory_region_init_io(&s->mmio, OBJECT(dev), &debugcon_mmio_ops, s,
+@@ -364,10 +504,16 @@
+     if (s->run_state) {
+-        if (s->mmio_base) {
++        if (s->mmio_base || s->forward_pio) {
+             debugcon_run_failed(s);
+-            while (s->read_width) {
++            while (s->read_width || s->pio_waiters) {
+                 qemu_cond_wait_bql(&s->read_completed);
+             }
+-            memory_region_del_subregion(get_system_memory(), &s->mmio);
+             qemu_cond_destroy(&s->read_completed);
+         }
++        if (s->mmio_base) {
++            memory_region_del_subregion(get_system_memory(), &s->mmio);
++        }
++        for (unsigned int i = 0; i < s->pio_count; i++) {
++            memory_region_del_subregion(isa_address_space_io(ISA_DEVICE(dev)),
++                                        &s->pio[i].region);
++        }
+         qemu_chr_fe_set_handlers(&s->chr, NULL, NULL, NULL, NULL,
+@@ -386,2 +532,7 @@
+     DEFINE_PROP_UINT64("mmio-base", ISADebugconState, state.mmio_base, 0),
++    DEFINE_PROP_BOOL("forward-pio", ISADebugconState, state.forward_pio, false),
++    DEFINE_PROP_BOOL("keep-pic-ports", ISADebugconState, state.keep_pic_ports,
++                     false),
++    DEFINE_PROP_BOOL("keep-pit-ports", ISADebugconState, state.keep_pit_ports,
++                     false),
+ };

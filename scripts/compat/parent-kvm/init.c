@@ -40,7 +40,7 @@ int main(void)
     pid_t child = fork();
     check(child >= 0, "fork the KVM client");
     if (child == 0) {
-        char *arguments[19] = {"kvm-run", pages};
+        char *arguments[20] = {"kvm-run", pages};
         unsigned int next = 2;
         if (access("/split-slot", F_OK) == 0)
             arguments[next++] = "split";
@@ -76,6 +76,8 @@ int main(void)
             arguments[next++] = "provider-tss";
         if (access("/lapic", F_OK) == 0)
             arguments[next++] = "lapic";
+        if (access("/pio", F_OK) == 0)
+            arguments[next++] = "pio";
         execv("/kvm-run", arguments);
         _exit(127);
     }

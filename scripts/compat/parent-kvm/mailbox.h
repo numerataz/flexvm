@@ -3,7 +3,7 @@
 #define FLEXVM_PVKVM_MAILBOX_H
 
 #define PVKVM_MAGIC        0x4d564b46
-#define PVKVM_VERSION      24
+#define PVKVM_VERSION      25
 #define PVKVM_MAGIC_AT     0
 #define PVKVM_VERSION_AT   4
 #define PVKVM_REQUEST_AT   8
@@ -33,6 +33,8 @@
 #define PVKVM_TSS_AT         0x8420c
 #define PVKVM_LAPIC_AT       0x85000
 #define PVKVM_LAPIC_BYTES    1024
+#define PVKVM_PIO_DATA_AT    0x86000
+#define PVKVM_PIO_BYTES      4096
 #define PVKVM_GSI_COUNT      24
 #define PVKVM_REGISTERS_AT   64
 #define PVKVM_INITIAL_SREGISTERS_AT 256
@@ -69,10 +71,10 @@ struct pvkvm_run_exit {
 	__u64 address;
 	__u8 data[8];
 	__u32 is_write;
-	__u32 reserved;
+	__u32 count;
 };
 
-struct pvkvm_mmio_completion {
+struct pvkvm_read_completion {
 	__u32 length;
 	__u32 reserved;
 	__u8 data[8];

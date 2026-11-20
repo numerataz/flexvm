@@ -64,6 +64,13 @@ KVM_EXIT_MMIO = 6
 IO_PORT = 0x30
 MMIO_BASE = 0xd0000000
 MMIO_WIRE = struct.Struct("<cBQ8s")
+PIO_HEADER = struct.Struct("<cBHI")
+PIO_DATA_AT = 0x86000
+PIO_BYTES = 4096
+PIO_WRITES = ((0x3f8, 1, b"L"), (0x2f8, 2, b"\xcd\xab"),
+              (0xcf8, 4, b"\x00\x00\x00\x80"), (0x3f8, 1, b"vmio"))
+PIO_READS = ((0x3fd, 1, b"\x60"), (0x2f8, 2, b"\x67\x45"),
+             (0xcfc, 4, b"\xef\xbe\x34\x12"), (0x2f8, 1, b"data"))
 EXIT_AT = 0x84000
 EXIT_RECORD = struct.Struct("<IIQ8sII")
 COMPLETION_AT = 0x84100
@@ -133,9 +140,30 @@ class RunExit:
     address: int
     data: bytes
     is_write: bool = True
+    count: int = 1
+
+    @property
+    def width(self):
+        return len(self.data) // self.count
 
     def record(self):
-        return EXIT_RECORD.pack(self.reason, len(self.data), self.address, self.data, self.is_write, 0)
+        return EXIT_RECORD.pack(self.reason, self.width, self.address, self.data[:8], self.is_write, self.count)
+
+
+def pio_size(width, count):
+    if width not in (1, 2, 4) or not 0 < count <= PIO_BYTES // width:
+        raise RuntimeError("invalid worker port I/O size")
+    return width * count
+
+
+def coalesce_pio(records):
+    groups = []
+    for port, width, data in records:
+        if groups and (port, width) == groups[-1][:2]:
+            groups[-1] = (port, width, groups[-1][2] + data)
+        else:
+            groups.append((port, width, data))
+    return tuple(groups)
 
 
 class SignalValue(ctypes.Union):
@@ -246,7 +274,7 @@ class RunChannel:
 
     def read_exit(self):
         if self.connection.type != socket.SOCK_STREAM:
-            return self.connection.recv(MMIO_WIRE.size + 1)
+            return self.connection.recv(PIO_HEADER.size + PIO_BYTES + 1)
         data = bytearray()
         expected = 2
         while len(data) < expected:
@@ -256,6 +284,13 @@ class RunChannel:
             data.extend(chunk)
             if data[0] in (ord("M"), ord("Q")):
                 expected = MMIO_WIRE.size
+            elif data[0] in (ord("U"), ord("V")):
+                expected = PIO_HEADER.size
+                if len(data) >= expected:
+                    operation, width, _, count = PIO_HEADER.unpack_from(data)
+                    length = pio_size(width, count)
+                    if operation == b"U":
+                        expected += length
         return bytes(data)
 
     def dispatch_irqs(self, ready, running=False):
@@ -293,8 +328,15 @@ class RunChannel:
             self.interruptions.append(round((time.monotonic() - started) * 1000, 3))
             return None
         if len(output) == 2 and output[0] == ord("O"):
-            self.exits.append(output[1])
             result = RunExit(KVM_EXIT_IO, IO_PORT, output[1:])
+        elif len(output) >= PIO_HEADER.size and output[0] in (ord("U"), ord("V")):
+            operation, width, port, count = PIO_HEADER.unpack_from(output)
+            length = pio_size(width, count)
+            is_write = operation == b"U"
+            payload = output[PIO_HEADER.size:]
+            if len(payload) != (length if is_write else 0):
+                raise RuntimeError("invalid worker port I/O payload")
+            result = RunExit(KVM_EXIT_IO, port, payload if is_write else bytes(length), is_write, count)
         elif len(output) == MMIO_WIRE.size and output[0] in (ord("M"), ord("Q")):
             operation, length, address, data = MMIO_WIRE.unpack(output)
             if length not in (1, 2, 4, 8):
@@ -302,6 +344,8 @@ class RunChannel:
             result = RunExit(KVM_EXIT_MMIO, address, data[:length], operation == b"M")
         else:
             raise RuntimeError("parent worker did not return a recognized stopped exit")
+        if result.reason == KVM_EXIT_IO and result.address == IO_PORT and result.is_write and result.width == 1:
+            self.exits.extend(result.data)
         self.timings.append(round((time.monotonic() - started) * 1000, 3))
         return result
 
@@ -378,7 +422,11 @@ class TcgChild:
                 listener.bind(str(socket_path))
                 listener.listen(1)
                 listener.settimeout(3)
-                exit_device = "isa-debugcon,iobase=0x30,chardev=port,run-control=on"
+                exit_device = "isa-debugcon,iobase=0x30,chardev=port,run-control=on,forward-pio=on"
+                if irq_fds:
+                    exit_device += ",keep-pic-ports=on"
+                if pit_flags is not None:
+                    exit_device += ",keep-pit-ports=on"
                 if mmio:
                     exit_device += f",mmio-base={MMIO_BASE}"
                 pit = "off" if pit_flags is None else "on"
@@ -801,7 +849,7 @@ def verify_slot_spans(pid, slots):
 
 def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry,
              split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs, cpuid, mmio, mmio_read,
-             ioeventfd, irqchip, pit, irqfd, zero_slot, tss, lapic):
+             ioeventfd, irqchip, pit, irqfd, zero_slot, tss, lapic, pio):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
@@ -872,6 +920,9 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
     io_events = []
     mmio_events = []
     completed_reads = []
+    pio_writes = []
+    pio_reads = []
+    pio_exit_limit = sum(len(data) // width for _, width, data in (*PIO_WRITES, *PIO_READS))
     pending_read = None
     irqchip_created = False
     pit_flags = None
@@ -896,7 +947,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 24)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 25)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
         os.ftruncate(outer_ram, outer_ram_size)
@@ -1042,24 +1093,46 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                     started_cpus.add(cpu)
                 size, reserved, value = COMPLETION_RECORD.unpack_from(mapping, COMPLETION_AT)
                 completion = b""
-                if reserved or size != (pending_read[1] if pending_read else 0):
-                    raise RuntimeError("guest changed the outstanding MMIO read width")
+                if reserved or size != (len(pending_read.data) if pending_read else 0):
+                    raise RuntimeError("guest changed the outstanding I/O read size")
                 if pending_read:
-                    completion = value[:size]
-                    completed_reads.append((pending_read[0], completion))
+                    if pending_read.reason == KVM_EXIT_IO:
+                        completion = mapping[PIO_DATA_AT:PIO_DATA_AT + size]
+                        pio_reads.append((pending_read.address, pending_read.width, completion))
+                    else:
+                        completion = value[:size]
+                        completed_reads.append((pending_read.address, completion))
                     pending_read = None
-                result = child.run(cpu, RunCancellation(cancellations, mapping, pending, deadline), completion)
+                try:
+                    result = child.run(cpu, RunCancellation(cancellations, mapping, pending, deadline), completion)
+                except TimeoutError as error:
+                    raise TimeoutError(f"KVM_RUN {pending} stopped responding; PIO writes={pio_writes}, "
+                                       f"PIO reads={pio_reads}, last port values={io_events}") from error
                 if result is None:
                     status = -errno.EINTR
                 else:
                     if result.reason == KVM_EXIT_IO:
-                        io_events.append((cpu, result.data[0]))
+                        if result.is_write and result.address == IO_PORT and result.width == 1 and result.count == 1:
+                            io_events.append((cpu, result.data[0]))
+                        elif not pio:
+                            raise RuntimeError("unexpected port I/O exit")
+                        else:
+                            if io_events or len(pio_writes) + len(pio_reads) >= pio_exit_limit:
+                                raise RuntimeError("unexpected port I/O after the fixture prelude")
+                            # A REP instruction may complete through one or several exits.
+                            expected.insert(len(observed), RUN)
+                            if result.is_write:
+                                pio_writes.append((result.address, result.width, result.data))
+                            else:
+                                pending_read = result
+                        if result.is_write:
+                            mapping[PIO_DATA_AT:PIO_DATA_AT + len(result.data)] = result.data
                     elif result.is_write:
                         mmio_events.append((result.address, result.data))
                     else:
                         if not mmio_read or cpu_count != 1:
                             raise RuntimeError("unexpected MMIO read")
-                        pending_read = (result.address, len(result.data))
+                        pending_read = result
                     mapping[EXIT_AT:EXIT_AT + EXIT_RECORD.size] = result.record()
             elif length:
                 raise RuntimeError(f"unexpected memory argument for command {opcode}")
@@ -1109,6 +1182,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         guest = (output / "outer.log").read_text(errors="replace")
         if (outer.wait() != 0 or observed != expected or child is None or io_events != expected_io
                 or tuple(mmio_events) != expected_mmio
+                or coalesce_pio(pio_writes) != (PIO_WRITES if pio else ())
+                or coalesce_pio(pio_reads) != (PIO_READS if pio else ())
                 or pending_read is not None or tuple(completed_reads) != (MMIO_READS if mmio_read else ())
                 or irq_levels != (IRQ_LEVELS if irqchip else [])
                 or pit_flags != (KVM_PIT_SPEAKER_DUMMY if pit else None)
@@ -1128,6 +1203,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 or zero_slot and "PASS zero-based RAM shared every tested page across the legacy PC region" not in guest
                 or tss and "PASS child ran with Firecracker's three-page TSS reservation" not in guest
                 or lapic and "PASS VMM and guest updated the parent LAPIC" not in guest
+                or pio and "PASS x86 port I/O preserved widths, counts, and VMM read data" not in guest
                 or "PASS /dev/kvm returned two port I/O exits" not in guest
                 or "PASS parent KVM guest shutdown" not in guest):
             raise RuntimeError(f"parent execution proof failed; commands={observed}, see outer.log")
@@ -1167,6 +1243,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         "zero_based_ram": zero_slot,
         "tss_gpa": tss_gpa,
         "lapic": lapic,
+        "pio_writes": [{"port": port, "width": width, "data": data.hex()} for port, width, data in pio_writes],
+        "pio_reads": [{"port": port, "width": width, "data": data.hex()} for port, width, data in pio_reads],
         "register_counters": counters,
         "interrupted_runs": len(child.channel.interruptions),
         "interrupted_run_ms": child.channel.interruptions,
@@ -1212,6 +1290,7 @@ def main():
     parser.add_argument("--zero-slot", action="store_true", help="share RAM at GPA zero across the PC legacy region")
     parser.add_argument("--tss", action="store_true", help="reserve Firecracker's x86 TSS address")
     parser.add_argument("--lapic", action="store_true", help="get and set parent-owned xAPIC state")
+    parser.add_argument("--pio", action="store_true", help="exercise arbitrary x86 port reads and writes")
     parser.add_argument("--reject-close", action="store_true", help="verify page retention when the parent refuses close")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -1238,6 +1317,8 @@ def main():
     if args.zero_slot and (not args.protected_entry or args.ram_pages < 258 or args.split_slot or
                            args.long_mode or args.irqchip or args.cpuid or args.two_vcpus):
         parser.error("--zero-slot requires one protected-mode vCPU and one slot of at least 258 pages")
+    if args.pio and (not args.protected_entry or args.long_mode or args.cpuid or args.two_vcpus or args.zero_slot):
+        parser.error("--pio requires a single protected-mode vCPU")
     if not 1 <= args.ram_pages <= MAX_SLOT_PAGES:
         parser.error(f"--ram-pages must be between 1 and {MAX_SLOT_PAGES}")
     if args.ram_pages > MAX_REAL_MODE_PAGES and not args.protected_entry:
@@ -1257,7 +1338,7 @@ def main():
                                   args.protected_entry, args.split_slot, args.interrupt_run,
                                   2 if args.two_vcpus else 1, args.long_mode, args.fpu, args.msrs, args.cpuid,
                                   args.mmio_write, args.mmio_read, args.ioeventfd, args.irqchip, args.pit,
-                                  args.irqfd, args.zero_slot, args.tss, args.lapic)))
+                                  args.irqfd, args.zero_slot, args.tss, args.lapic, args.pio)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -1315,6 +1396,8 @@ def main():
                 oracle.append("tss")
             if args.lapic:
                 oracle.append("lapic")
+            if args.pio:
+                oracle.append("pio")
             HELPERS["run"](oracle, 14 if args.interrupt_run else 8, output / "native-kvm.log")
             report["same_client_passed_native_kvm"] = True
             report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
@@ -1354,6 +1437,8 @@ def main():
             files["tss"] = b""
         if args.lapic:
             files["lapic"] = b""
+        if args.pio:
+            files["pio"] = b""
         image = HELPERS["initramfs"](init.read_bytes(), files=files)
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
@@ -1391,6 +1476,7 @@ def main():
                             *(["--zero-slot"] if args.zero_slot else []),
                             *(["--tss"] if args.tss else []),
                             *(["--lapic"] if args.lapic else []),
+                            *(["--pio"] if args.pio else []),
                             *(["--reject-close"] if args.reject_close else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}
