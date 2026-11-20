@@ -32,6 +32,7 @@
 #define MMIO_DEASSIGNED_OFFSET 0xb80
 #define PIC_ENTRY_OFFSET 0xc00
 #define PIC_HANDLER_OFFSET 0xd00
+#define PIT_ENTRY_OFFSET 0xe00
 #define PIC_IDT_OFFSET 0x400
 #define PIC_IDTR_OFFSET 0x540
 #define PIC_GSI 3
@@ -474,10 +475,16 @@ static void set_pic_line(int vm, unsigned int level)
     check(ioctl(vm, KVM_IRQ_LINE, &irq) == 0, "set the parent IRQ line");
 }
 
-static void prepare_pic(int vm, unsigned char *ram, uint32_t gpa)
+static void prepare_pic(int vm, unsigned char *ram, uint32_t gpa, bool pit)
 {
     check(ioctl(vm, KVM_CREATE_IRQCHIP, 0) == 0, "create the x86 irqchip");
     check(ioctl(vm, KVM_CREATE_IRQCHIP, 0) == -1 && errno == EEXIST, "reject duplicate irqchip creation");
+    if (pit) {
+        struct kvm_pit_config config = {.flags = KVM_PIT_SPEAKER_DUMMY};
+        check(ioctl(vm, KVM_CHECK_EXTENSION, KVM_CAP_PIT2) > 0, "check PIT support");
+        check(ioctl(vm, KVM_CREATE_PIT2, &config) == 0, "create the x86 PIT");
+        check(ioctl(vm, KVM_CREATE_PIT, 0) == -1 && errno == EEXIST, "reject duplicate PIT creation");
+    }
     set_pic_line(vm, 0);
 
     const uint32_t idt = gpa + PIC_IDT_OFFSET;
@@ -487,6 +494,8 @@ static void prepare_pic(int vm, unsigned char *ram, uint32_t gpa)
         (handler & 0xffff) | (8 << 16), (handler & 0xffff0000) | 0x8e00,
     };
     memcpy(ram + PIC_IDT_OFFSET + PIC_VECTOR * 8, gate, sizeof(gate));
+    if (pit)
+        memcpy(ram + PIC_IDT_OFFSET + 32 * 8, gate, sizeof(gate));
     memcpy(ram + PIC_IDTR_OFFSET, &limit, sizeof(limit));
     memcpy(ram + PIC_IDTR_OFFSET + sizeof(limit), &idt, sizeof(idt));
     const unsigned char pic_setup[] = {
@@ -512,6 +521,35 @@ static void prepare_pic(int vm, unsigned char *ram, uint32_t gpa)
     memcpy(ram + PIC_ENTRY_OFFSET, pic_setup, sizeof(pic_setup));
     memcpy(ram + PIC_HANDLER_OFFSET, pic_handler, sizeof(pic_handler));
     install_jump(ram, PIC_ENTRY_OFFSET + sizeof(pic_setup), 0x10);
+}
+
+static void test_pit(int cpu, struct kvm_run *run, int size, unsigned char *ram, unsigned char *data,
+                     uint64_t gpa, uint64_t data_address)
+{
+    const unsigned char pit_program[] = {
+        0xb0, 0x11, 0xe6, 0x20, /* reset master PIC to clear pending edges */
+        0xb0, 0x20, 0xe6, 0x21, /* deliver IRQ0 at vector 32 */
+        0xb0, 0x04, 0xe6, 0x21, /* slave PIC on input 2 */
+        0xb0, 0x01, 0xe6, 0x21, /* 8086 mode */
+        0xb0, 0xff, 0xe6, 0x21, /* mask all master inputs */
+        0xb0, 0x30, 0xe6, 0x43, /* channel 0, low then high, one-shot mode */
+        0xb0, 0x9b, 0xe6, 0x40, /* low byte of 11931 ticks */
+        0xb0, 0x2e, 0xe6, 0x40, /* high byte, nominal delay 10 ms */
+        0xb0, 0xfe, 0xe6, 0x21, /* unmask only the timer */
+        0xfb, 0xf4, 0xfa,       /* sti; hlt; cli */
+        0xb0, 0x5c, 0xe6, 0x30, 0xf4, /* return to the VMM after the wake */
+    };
+    memcpy(ram + PIT_ENTRY_OFFSET, pit_program, sizeof(pit_program));
+    const struct kvm_regs regs = {
+        .rcx = 0x4321, .rsp = gpa + 0xf00, .rdi = data_address,
+        .rip = gpa + PIT_ENTRY_OFFSET, .rflags = 2,
+    };
+    check(ioctl(cpu, KVM_SET_REGS, &regs) == 0, "start the PIT program");
+    unsigned long long elapsed = timed_run(cpu);
+    check_output(run, size, 0x5c);
+    check_registers(cpu, 0x5c, 0x4321, gpa + PIT_ENTRY_OFFSET);
+    check(data[0xf8] == 2 && elapsed >= 5000000, "wake from halt on one new PIT tick");
+    printf("PASS PIT woke the halted vCPU after %llu ns\n", elapsed);
 }
 
 struct interrupt_test {
@@ -588,6 +626,7 @@ int main(int argc, char **argv)
     bool mmio_read = false;
     bool ioeventfd = false;
     bool irqchip = false;
+    bool pit = false;
     check(argc == 2 || protected_mode, "specify RAM pages and optional protected or split mode");
     for (int i = 3; i < argc; i++) {
         if (!interrupt_run && !strcmp(argv[i], "interrupt"))
@@ -610,6 +649,8 @@ int main(int argc, char **argv)
             ioeventfd = true;
         else if (!irqchip && !strcmp(argv[i], "irqchip"))
             irqchip = true;
+        else if (!pit && !strcmp(argv[i], "pit"))
+            pit = true;
         else
             check(false, "invalid execution option");
     }
@@ -628,6 +669,7 @@ int main(int argc, char **argv)
     check(!ioeventfd || mmio, "test eventfd notifications in the MMIO fixture");
     check(!irqchip || (protected_mode && !long_mode && !cpuid && !two_vcpus),
           "test a single protected-mode PIC vCPU");
+    check(!pit || irqchip, "test the PIT with a PIC vCPU");
     size_t pages = count;
     size_t ram_bytes = pages * 4096;
     uint64_t gpa = protected_mode ? PROTECTED_SLOT_GPA : PVKVM_GUEST_START;
@@ -882,7 +924,7 @@ int main(int argc, char **argv)
         memcpy(data + 0x100, gdtr, sizeof(gdtr));
     }
     if (irqchip)
-        prepare_pic(vm, ram, gpa);
+        prepare_pic(vm, ram, gpa, pit);
     int cpu = ioctl(vm, KVM_CREATE_VCPU, 0);
     check(cpu >= 0 && (fcntl(cpu, F_GETFD) & FD_CLOEXEC), "vCPU file descriptor");
     check(ioctl(vm, KVM_CREATE_VCPU, 0) == -1 && errno == EEXIST, "reject duplicate vCPU");
@@ -1046,8 +1088,10 @@ int main(int argc, char **argv)
     if (irqchip) {
         check(data[0xf8] == 1, "deliver exactly one real PIC interrupt to the child");
         set_pic_line(vm, 0);
-        close(vm);
         puts("PASS child PIC delivered and acknowledged the parent IRQ");
+        if (pit)
+            test_pit(cpu, run, size, ram, data, gpa, data_address);
+        close(vm);
     }
     if (cpuid)
         puts("PASS child CPUID instructions used the installed vCPU profiles");

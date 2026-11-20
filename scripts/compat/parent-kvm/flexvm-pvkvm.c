@@ -70,6 +70,7 @@ struct pvvm {
 	bool slots_exposed;
 	bool topology_frozen;
 	bool irqchip_created;
+	bool pit_created;
 	unsigned long created_cpus;
 	unsigned long open_cpus;
 };
@@ -930,6 +931,8 @@ static long device_capability(unsigned long capability)
 	case KVM_CAP_IOEVENTFD:
 	case KVM_CAP_IOEVENTFD_NO_LENGTH:
 	case KVM_CAP_IOEVENTFD_ANY_LENGTH:
+	case KVM_CAP_PIT:
+	case KVM_CAP_PIT2:
 		return 1;
 	case KVM_CAP_NR_MEMSLOTS:
 		return PVKVM_MAX_SLOTS;
@@ -1087,6 +1090,37 @@ static long set_irq_line(struct pvvm *vm, struct kvm_irq_level __user *user)
 	return result;
 }
 
+static long create_pit(struct pvvm *vm, struct kvm_pit_config __user *user)
+{
+	struct pvkvm *p = vm->provider;
+	struct kvm_pit_config config = { .flags = KVM_PIT_SPEAKER_DUMMY };
+	int result;
+
+	if (user && copy_from_user(&config, user, sizeof(config)))
+		return -EFAULT;
+	if (config.flags & ~KVM_PIT_SPEAKER_DUMMY)
+		return -EINVAL;
+	result = mutex_lock_interruptible(&p->lock);
+	if (result)
+		return result;
+	if (vm->pit_created) {
+		result = -EEXIST;
+	} else if (!vm->irqchip_created) {
+		result = -ENXIO;
+	} else if (vm->topology_frozen) {
+		result = -EBUSY;
+	} else if (p->dead) {
+		result = -ENODEV;
+	} else {
+		writel(config.flags, p->mailbox + PVKVM_PIT_FLAGS_AT);
+		result = request(p, PVKVM_CREATE_PIT, NULL, NULL);
+		if (!result)
+			vm->pit_created = true;
+	}
+	mutex_unlock(&p->lock);
+	return result;
+}
+
 static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct pvvm *vm = file->private_data;
@@ -1109,6 +1143,10 @@ static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return create_irqchip(vm, arg);
 	if (cmd == KVM_IRQ_LINE)
 		return set_irq_line(vm, (void __user *)arg);
+	if (cmd == KVM_CREATE_PIT)
+		return create_pit(vm, NULL);
+	if (cmd == KVM_CREATE_PIT2)
+		return arg ? create_pit(vm, (void __user *)arg) : -EFAULT;
 	if (cmd != KVM_SET_USER_MEMORY_REGION)
 		return -ENOTTY;
 	if (copy_from_user(&memory, (void __user *)arg, sizeof(memory)))
@@ -1293,8 +1331,9 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	BUILD_BUG_ON(PVKVM_CPUID_AT + sizeof(struct pvkvm_cpuid_table) > PVKVM_EXIT_AT);
 	BUILD_BUG_ON(PVKVM_EXIT_AT + sizeof(struct pvkvm_run_exit) > PVKVM_COMPLETION_AT);
 	BUILD_BUG_ON(PVKVM_COMPLETION_AT + sizeof(struct pvkvm_mmio_completion) > PVKVM_IRQ_AT);
+	BUILD_BUG_ON(PVKVM_IRQ_AT + sizeof(struct kvm_irq_level) > PVKVM_PIT_FLAGS_AT);
 	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
-	    pci_resource_len(dev, 2) < PVKVM_IRQ_AT + sizeof(struct kvm_irq_level))
+	    pci_resource_len(dev, 2) < PVKVM_PIT_FLAGS_AT + sizeof(u32))
 		return -ENODEV;
 	result = pcim_enable_device(dev);
 	if (result)
