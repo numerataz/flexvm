@@ -59,6 +59,9 @@
 #define PVKVM_ARM_INIT_AT     0x89300
 #define PVKVM_ARM_REG_AT      0x89400
 #define PVKVM_ARM_EVENT_AT    0x89520
+#define PVKVM_ARM_DEVICE_AT   0x89600
+#define PVKVM_ARM_GSI_AT      0x89620
+#define PVKVM_ARM_MP_STATE_AT 0x89624
 #define PVKVM_ARM_REGS_AT     0x96000
 #define PVKVM_ARM_REG_BYTES   256
 #define PVKVM_ARM_MAX_REGS    4096
@@ -76,7 +79,11 @@
 #define PVKVM_LANE_ARM_EVENT  128
 #define PVKVM_LANE_PIO        0x1000
 #define PVKVM_IOAPIC_GPA     0xfec00000ULL
+#ifdef CONFIG_ARM64
+#define PVKVM_GSI_COUNT      FLEXVM_ARM_GSI_COUNT
+#else
 #define PVKVM_GSI_COUNT      24
+#endif
 #define PVKVM_REGISTERS_AT   64
 #define PVKVM_INITIAL_SREGISTERS_AT 256
 #define PVKVM_GUEST_PAGE_SIZE 4096
@@ -112,6 +119,15 @@ struct pvkvm_cpuid_table {
 struct pvkvm_arm_register {
 	__u64 id;
 	__u8 data[PVKVM_ARM_REG_BYTES];
+};
+
+struct pvkvm_arm_device {
+	__u32 type;
+	__u32 flags;
+	__u32 group;
+	__u32 reserved;
+	__u64 attribute;
+	__u64 value;
 };
 
 struct pvkvm_arm_event {
@@ -178,6 +194,14 @@ enum pvkvm_command {
 	PVKVM_ARM_GET_REG_LIST,
 	PVKVM_ARM_GET_ONE_REG,
 	PVKVM_ARM_SET_ONE_REG,
+	PVKVM_ARM_CREATE_DEVICE,
+	PVKVM_ARM_CLOSE_DEVICE,
+	PVKVM_ARM_GET_DEVICE_ATTR,
+	PVKVM_ARM_SET_DEVICE_ATTR,
+	PVKVM_ARM_HAS_DEVICE_ATTR,
+	PVKVM_ARM_BIND_IRQFD,
+	PVKVM_ARM_GET_MP_STATE,
+	PVKVM_ARM_SET_MP_STATE,
 };
 
 #endif

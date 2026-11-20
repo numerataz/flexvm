@@ -25,8 +25,15 @@ ARM_INIT_AT = 0x89300
 ARM_REG_AT = 0x89400
 ARM_REGS_AT = 0x96000
 ARM_LANE_EVENT = 128
+ARM_DEVICE_AT = 0x89600
+ARM_GSI_AT = 0x89620
+ARM_MP_STATE_AT = 0x89624
+ARM_GSI_COUNT = 128
+CREATE_DEVICE, HAS_DEVICE_ATTR, GET_DEVICE_ATTR, BIND_IRQFD = 13, 17, 15, 18
+GET_MP_STATE, SET_MP_STATE = 19, 20
 SYSTEM_EVENT = 24
-ARM_IOCTL = dict(zip(range(38, 43), (1, 3, 4, 5, 6), strict=True))
+ARM_IOCTL = dict(zip(range(38, 51), (1, 3, 4, 5, 6, 13, 14, 15, 16, 17, 18, 19, 20), strict=True))
+VM_IOCTL = {38, *range(43, 49)}
 CREATE_CPU, WORKER_RUN, REGISTER_RAM, OPEN_LANE, CANCEL_RUN, COMPLETE_READ, CLOSE_CPU = 2, 7, 8, 9, 10, 11, 12
 REQUEST = struct.Struct("<IIII264s")
 REPLY = struct.Struct("<iI256s")
@@ -191,9 +198,20 @@ def service_lanes(worker, cpus, mailbox, replies, ready):
             lane.cancelled = True
 
 
-def arm_ioctl(worker, mailbox, command, cpu):
+def arm_ioctl(worker, mailbox, command, cpu, irq_fds):
     op = ARM_IOCTL[command]
-    if op == 3:
+    descriptors = ()
+    if CREATE_DEVICE <= op <= HAS_DEVICE_ATTR:
+        data = mailbox[ARM_DEVICE_AT:ARM_DEVICE_AT + 32]
+    elif op == BIND_IRQFD:
+        data = mailbox[ARM_GSI_AT:ARM_GSI_AT + 4]
+        gsi, = struct.unpack("<I", data)
+        if gsi >= len(irq_fds):
+            return -errno.EINVAL
+        descriptors = (irq_fds[gsi],)
+    elif op == SET_MP_STATE:
+        data = mailbox[ARM_MP_STATE_AT:ARM_MP_STATE_AT + 4]
+    elif op == 3:
         data = mailbox[ARM_INIT_AT:ARM_INIT_AT + 32]
     elif op == 4:
         data = mailbox[ARM_REGS_AT:ARM_REGS_AT + 8]
@@ -201,8 +219,12 @@ def arm_ioctl(worker, mailbox, command, cpu):
         data = mailbox[ARM_REG_AT:ARM_REG_AT + 264]
     else:
         data = b""
-    status, result, extra = worker.call(op, cpu, data)
-    if op == 1 and not status:
+    status, result, extra = worker.call(op, cpu, data, fds=descriptors)
+    if op == GET_DEVICE_ATTR and not status:
+        mailbox[ARM_DEVICE_AT + 24:ARM_DEVICE_AT + 32] = result[:8]
+    elif op == GET_MP_STATE and not status:
+        mailbox[ARM_MP_STATE_AT:ARM_MP_STATE_AT + 4] = result[:4]
+    elif op == 1 and not status:
         mailbox[ARM_INIT_AT:ARM_INIT_AT + 32] = result[:32]
     elif op == 4 and status in (0, -errno.E2BIG):
         count, = struct.unpack_from("<Q", result)
@@ -214,7 +236,7 @@ def arm_ioctl(worker, mailbox, command, cpu):
     return status
 
 
-def serve_commands(outer, mailbox, requests, cancellations, replies, binary, outer_ram, outer_bytes, max_pages):
+def serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, binary, outer_ram, outer_bytes, max_pages):
     worker = None
     vm_open = False
     cpus = set()
@@ -266,8 +288,8 @@ def serve_commands(outer, mailbox, requests, cancellations, replies, binary, out
                     elif length:
                         raise RuntimeError("ARM slots were registered twice")
                     worker.add_lane(cpu)
-                elif command in ARM_IOCTL and worker and (command == 38 or cpu in cpus):
-                    status = arm_ioctl(worker, mailbox, command, cpu)
+                elif command in ARM_IOCTL and worker and (command in VM_IOCTL or cpu in cpus):
+                    status = arm_ioctl(worker, mailbox, command, cpu, irq_fds)
                 else:
                     status = -errno.ENOTTY
             except OSError as error:
@@ -323,9 +345,13 @@ def main():
         outer_bytes = args.mem * MIB
         os.ftruncate(memory, outer_bytes)
         fcntl.fcntl(memory, fcntl.F_ADD_SEALS, fcntl.F_SEAL_GROW | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_SEAL)
-        requests, cancellations, replies = [os.eventfd(0, os.EFD_CLOEXEC | os.EFD_NONBLOCK) for _ in range(3)]
-        for fd in (requests, cancellations, replies):
+        def eventfd():
+            fd = os.eventfd(0, os.EFD_CLOEXEC | os.EFD_NONBLOCK)
             resources.callback(os.close, fd)
+            return fd
+
+        requests, cancellations, replies = (eventfd() for _ in range(3))
+        irq_fds = tuple(eventfd() for _ in range(ARM_GSI_COUNT))
         command = [
             args.qemu.resolve(strict=True), "-machine", "virt,gic-version=3,memory-backend=outer-ram",
             "-accel", "tcg,thread=multi", "-cpu", "cortex-a72", "-m", str(args.mem), "-smp", "1",
@@ -334,12 +360,12 @@ def main():
             "-chardev", "stdio,id=console,signal=off", "-device", "virtio-serial-device,id=serial",
             "-device", "virtconsole,chardev=console,bus=serial.0", "-kernel", args.kernel.resolve(strict=True),
             "-initrd", args.initrd.resolve(strict=True), "-append", "console=hvc0 quiet panic=1 rdinit=/init",
-            "-chardev", f"socket,id=doorbell,path={doorbell}", "-device", "ivshmem-doorbell,chardev=doorbell,vectors=2",
+            "-chardev", f"socket,id=doorbell,path={doorbell}", "-device", f"ivshmem-doorbell,chardev=doorbell,vectors={2 + len(irq_fds)}",
         ]
         outer = SPAWN(command, pass_fds=(memory,))
         resources.callback(PARENT["stop_process"], outer)
-        resources.enter_context(PARENT["doorbell_peer"](server, mailbox_fd, requests, cancellations, (), replies))
-        return serve_commands(outer, mailbox, requests, cancellations, replies, worker, memory, outer_bytes, max_pages)
+        resources.enter_context(PARENT["doorbell_peer"](server, mailbox_fd, requests, cancellations, irq_fds, replies))
+        return serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, worker, memory, outer_bytes, max_pages)
 
 
 if __name__ == "__main__":

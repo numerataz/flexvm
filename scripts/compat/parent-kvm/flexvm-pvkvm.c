@@ -30,6 +30,8 @@
 #include <asm/msr-index.h>
 #include <asm/processor-flags.h>
 #include <asm/fpu/types.h>
+#else
+#include "arm-vgic.h"
 #endif
 #include "mailbox.h"
 
@@ -1589,6 +1591,9 @@ static long device_capability(const struct pvkvm *provider, unsigned long capabi
 #else
 	case KVM_CAP_ONE_REG:
 	case KVM_CAP_ARM_PSCI_0_2:
+	case KVM_CAP_DEVICE_CTRL:
+	case KVM_CAP_IRQFD:
+	case KVM_CAP_MP_STATE:
 #endif
 		return 1;
 	case KVM_CAP_NR_MEMSLOTS:
@@ -1712,7 +1717,7 @@ out:
 	return result;
 }
 
-static long __maybe_unused configure_irqfd(struct pvvm *vm, struct kvm_irqfd __user *user)
+static long configure_irqfd(struct pvvm *vm, struct kvm_irqfd __user *user)
 {
 	struct kvm_irqfd argument;
 	struct pv_irqfd *entry, *next, *new = NULL;
@@ -1736,6 +1741,13 @@ static long __maybe_unused configure_irqfd(struct pvvm *vm, struct kvm_irqfd __u
 		result = PTR_ERR(eventfd);
 		goto put_file;
 	}
+#ifdef CONFIG_ARM64
+	if (!remove) {
+		result = arm_bind_irqfd(vm, argument.gsi);
+		if (result)
+			goto put_event;
+	}
+#endif
 	if (!remove) {
 		new = kzalloc(sizeof(*new), GFP_KERNEL);
 		if (!new) {
@@ -2058,6 +2070,8 @@ static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return device_capability(p, arg);
 	if (cmd == KVM_IOEVENTFD)
 		return vm_ioeventfd(vm, (void __user *)arg);
+	if (cmd == KVM_IRQFD)
+		return configure_irqfd(vm, (void __user *)arg);
 #ifdef CONFIG_X86_64
 	if (cmd == KVM_CREATE_IRQCHIP)
 		return create_irqchip(vm, arg);
@@ -2065,8 +2079,6 @@ static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return access_irqchip(vm, cmd == KVM_SET_IRQCHIP, (void __user *)arg);
 	if (cmd == KVM_IRQ_LINE)
 		return set_irq_line(vm, (void __user *)arg);
-	if (cmd == KVM_IRQFD)
-		return configure_irqfd(vm, (void __user *)arg);
 	if (cmd == KVM_CREATE_PIT)
 		return create_pit(vm, NULL);
 	if (cmd == KVM_CREATE_PIT2)
@@ -2080,6 +2092,8 @@ static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 #else
 	if (cmd == KVM_ARM_PREFERRED_TARGET)
 		return arm_preferred_target(vm, (void __user *)arg);
+	if (cmd == KVM_CREATE_DEVICE)
+		return arm_create_device(vm, (void __user *)arg);
 #endif
 	if (cmd != KVM_SET_USER_MEMORY_REGION)
 		return -ENOTTY;
@@ -2327,7 +2341,9 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 #else
 	BUILD_BUG_ON(PVKVM_ARM_INIT_AT + sizeof(struct kvm_vcpu_init) > PVKVM_ARM_REG_AT);
 	BUILD_BUG_ON(PVKVM_ARM_REG_AT + sizeof(struct pvkvm_arm_register) > PVKVM_ARM_EVENT_AT);
-	BUILD_BUG_ON(PVKVM_ARM_EVENT_AT + sizeof(struct pvkvm_arm_event) > PVKVM_LANES_AT);
+	BUILD_BUG_ON(PVKVM_ARM_EVENT_AT + sizeof(struct pvkvm_arm_event) > PVKVM_ARM_DEVICE_AT);
+	BUILD_BUG_ON(PVKVM_ARM_DEVICE_AT + sizeof(struct pvkvm_arm_device) > PVKVM_ARM_GSI_AT);
+	BUILD_BUG_ON(PVKVM_ARM_MP_STATE_AT + sizeof(struct kvm_mp_state) > PVKVM_LANES_AT);
 	BUILD_BUG_ON(PVKVM_LANE_ARM_EVENT + sizeof(struct pvkvm_arm_event) > PVKVM_LANE_PIO);
 	BUILD_BUG_ON(PVKVM_LANES_AT + PVKVM_MAX_CPUS * PVKVM_LANE_STRIDE > PVKVM_ARM_REGS_AT);
 #endif

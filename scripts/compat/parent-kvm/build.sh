@@ -51,7 +51,7 @@ publish=
 trap 'rm -rf -- "$work" "${publish:-}"' EXIT
 publish=$(mktemp -d -- "$parent/.parent-kvm-build.XXXXXXXX")
 mkdir -- "$work/module" "$publish/bundle"
-cp -- "$source_dir"/{Makefile,mailbox.h,flexvm-pvkvm.c,arm-frontend.h} "$work/module/"
+cp -- "$source_dir"/{Makefile,mailbox.h,flexvm-pvkvm.c,arm-frontend.h,arm-vgic.h} "$work/module/"
 env -u KVM -u LOCALVERSION make -j2 -C "$kernel_build" "ARCH=$kernel_arch" "CROSS_COMPILE=$cross" "M=$work/module" modules
 install -m 0644 -- "$work/module/flexvm-pvkvm.ko" "$publish/bundle/"
 printf '%s\n' "$release" > "$publish/bundle/kernel.release"

@@ -19,6 +19,14 @@ enum flexvm_arm_command {
     FLEXVM_ARM_CANCEL_RUN,
     FLEXVM_ARM_COMPLETE_READ,
     FLEXVM_ARM_CLOSE_VCPU,
+    FLEXVM_ARM_CREATE_DEVICE,
+    FLEXVM_ARM_CLOSE_DEVICE,
+    FLEXVM_ARM_GET_DEVICE_ATTR,
+    FLEXVM_ARM_SET_DEVICE_ATTR,
+    FLEXVM_ARM_HAS_DEVICE_ATTR,
+    FLEXVM_ARM_BIND_IRQFD,
+    FLEXVM_ARM_GET_MP_STATE,
+    FLEXVM_ARM_SET_MP_STATE,
 };
 
 #define FLEXVM_ARM_MAX_REGS 4096
@@ -44,6 +52,16 @@ struct flexvm_arm_request {
             uint32_t slot;
             uint32_t reserved;
         } ram;
+        struct {
+            uint32_t type;
+            uint32_t flags;
+            uint32_t group;
+            uint32_t reserved;
+            uint64_t attribute;
+            uint64_t value;
+        } device;
+        uint32_t gsi;
+        uint32_t mp_state;
         uint64_t count;
         uint8_t completion[8];
     };
@@ -55,6 +73,8 @@ struct flexvm_arm_reply {
     union {
         struct kvm_vcpu_init init;
         uint8_t reg_data[FLEXVM_ARM_MAX_REG_BYTES];
+        uint64_t device_value;
+        uint32_t mp_state;
         uint64_t count;
         struct {
             uint64_t address;
