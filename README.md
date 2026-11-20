@@ -1269,9 +1269,9 @@ flexvm kill --signal TERM my-vm     # request systemd power-off
 
 For OpenRC images, use `--boot openrc` with an executable `/sbin/openrc-init`,
 `openrc-run` and `supervise-daemon` installed. FlexVM enables the normal
-`flexvm-runtime` service in the default runlevel; use `rc-service` to manage
-your distro's services. `kill --signal TERM` requests OpenRC power-off through
-its init control FIFO.
+`flexvm-runtime` service in the `default` and `single` runlevels; use
+`rc-service` to manage your distro's services. `kill --signal TERM` requests
+OpenRC power-off through its init control FIFO.
 
 Each fresh VM gets its hostname, environment and a fresh machine ID before
 the distro init becomes PID 1. The template pauses before service startup;
@@ -1288,9 +1288,15 @@ restores exec without replacing PID 1 or other service processes. FlexVM
 manages `eth0`; other interfaces remain available to distro network managers.
 
 Suspend, checkpoint restore and migration preserve machine identity and
-running services. Normal power-off waits for actual VMM exit before recording
-status zero; a kernel panic or VMM failure remains a failure. The writable
-root remains VM memory, with the same lifecycle semantics as app mode.
+running services. `flexvm-runtime.service` sets `IgnoreOnIsolate=yes` and is
+enabled for `rescue.target` and `emergency.target` (and OpenRC's `single`
+runlevel), keeping `flexvm exec` responsive during rescue isolation while still
+stopping cleanly on shutdown. Normal power-off waits for actual VMM exit before
+recording status zero; a clean guest reboot (`systemctl reboot` /
+`openrc-shutdown --reboot`) in a detached VM cold-boots a fresh VM instance
+automatically, while foreground or `--rm` VMs exit cleanly with status zero. A
+kernel panic or VMM failure remains a failure. The writable root remains VM
+memory, with the same lifecycle semantics as app mode.
 
 Both profiles also run with the software CPU engine, without host virtualization
 devices. Start a distro OCI layout directly:
@@ -1315,8 +1321,9 @@ can run a user manager and user D-Bus. The lifecycle tests use
 `loginctl enable-linger USER` and normal user units, preserving their process
 and bus identities and enforcing CPU, memory and PID limits across restores.
 
-Runtime-specific rootless service integration and guest reboot semantics remain tracked in
-[the distro boot issue](https://github.com/numerataz/flexvm/issues/1328).
+Rootless service integration is verified in [docs/compatibility.md](docs/compatibility.md)
+(tracked under [#1322](https://github.com/numerataz/flexvm/issues/1322)); distro
+init tracking is in [the distro boot issue](https://github.com/numerataz/flexvm/issues/1328).
 
 ## Docker inside a VM
 
