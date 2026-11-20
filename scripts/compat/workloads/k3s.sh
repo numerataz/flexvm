@@ -182,7 +182,7 @@ PY
     test "$(k exec "$first" -- wget -qO- http://web.flexvm-compat.svc.cluster.local:8080)" = "$nonce"
     peer=$(k get pod "$second" -o jsonpath='{.status.podIP}')
     test "$(k exec "$first" -- wget -qO- "http://$peer:8080")" = "$nonce"
-    k exec "$first" -- wget -qO /dev/null http://example.com
+    k exec "$first" -- wget -qO /dev/null https://github.com/robots.txt
     node_port=$(cat "$base/node-port")
     case $node_port in ''|*[!0-9]*) exit 1 ;; esac
     test "$node_port" -ge 30000 && test "$node_port" -le 32767
