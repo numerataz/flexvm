@@ -120,7 +120,7 @@ PYDAEMON
         test "$(cat /sys/fs/cgroup/memory.max)" = 536870912
         test "$(cat /sys/fs/cgroup/pids.max)" = 128
         test "$(cat /sys/fs/cgroup/cpu.max)" = "50000 100000"
-        python3 -c "import urllib.request; urllib.request.urlopen(\"http://example.com\", timeout=15).read()"'
+        python3 -c "import urllib.request; urllib.request.urlopen(\"https://github.com/robots.txt\", timeout=15).read()"'
     ip=$(incus exec fc -- hostname -I | awk '{print $1}')
     test "$(curl --fail --silent --show-error --retry 10 --retry-connrefused --retry-delay 1 "http://$ip:18088")" = "$nonce"
     python3 - "$base/initial" "/proc/$pid/root/run/state-probe.json" <<'PYCHECK'
