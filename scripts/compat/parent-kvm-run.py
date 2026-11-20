@@ -206,23 +206,39 @@ def pack_special_registers(snapshot):
     return b"".join((*segments, gdt, idt, controls))
 
 
-def read_protected_entry(mailbox, slots, long_mode):
+def read_protected_entry(mailbox, slots, long_mode, pvh, reset):
     record = mailbox[256:256 + SPECIAL_REGISTERS_SIZE]
-    base, limit = DESCRIPTOR_TABLE.unpack_from(record, 8 * SEGMENT.size)
-    control_at = 8 * SEGMENT.size + 2 * DESCRIPTOR_TABLE.size
+    gdt_at = 8 * SEGMENT.size
+    idt_at = gdt_at + DESCRIPTOR_TABLE.size
+    control_at = idt_at + DESCRIPTOR_TABLE.size
+    base, limit = DESCRIPTOR_TABLE.unpack_from(record, gdt_at)
     root = CONTROL_REGISTERS.unpack_from(record, control_at)[2]
-    if limit != 23 or not slot_contains(slots, base, limit + 1):
+    if limit != (31 if pvh else 23) or not slot_contains(slots, base, limit + 1):
         raise RuntimeError("protected entry GDT lies outside registered RAM")
     if long_mode and (root % PAGE_SIZE or not slot_contains(slots, root, PAGE_SIZE)):
         raise RuntimeError("long-mode page table root lies outside registered RAM")
+    idt_base, idt_limit = DESCRIPTOR_TABLE.unpack_from(record, idt_at)
+    if pvh and (idt_limit != 7 or not slot_contains(slots, idt_base, idt_limit + 1)):
+        raise RuntimeError("PVH entry IDT lies outside registered RAM")
     code = SEGMENT.pack(0, 0xffffffff, 8, 11, 1, 0, not long_mode, 1, long_mode, 1, 0, 0)
     data = SEGMENT.pack(0, 0xffffffff, 16, 3, 1, 0, 1, 1, 0, 1, 0, 0)
-    controls = (CONTROL_REGISTERS.pack(1 | CR0_PAGING, 0, root, CR4_PAE, 0,
-                                      EFER_LONG_MODE_ENABLE | EFER_LONG_MODE_ACTIVE, 0)
-                if long_mode else CONTROL_REGISTERS.pack(1, 0, 0, 0, 0, 0, 0))
-    expected = (code + data * 5 + bytes(2 * SEGMENT.size) + DESCRIPTOR_TABLE.pack(base, limit) +
-                bytes(DESCRIPTOR_TABLE.size) + controls)
-    if record != expected:
+    def expected(initial):
+        profile = bytearray(initial)
+        profile[:6 * SEGMENT.size] = code + data * 5
+        DESCRIPTOR_TABLE.pack_into(profile, gdt_at, base, limit)
+        controls = list(CONTROL_REGISTERS.unpack_from(initial, control_at))
+        controls[0] |= 1
+        if pvh:
+            SEGMENT.pack_into(profile, 6 * SEGMENT.size, 0, 103, 24, 11, 1, 0, 0, 0, 0, 0, 0, 0)
+            DESCRIPTOR_TABLE.pack_into(profile, idt_at, idt_base, idt_limit)
+            controls[0] = 0x11
+        if long_mode:
+            controls[0] |= CR0_PAGING
+            controls[2:4] = (root, CR4_PAE)
+            controls[5] = EFER_LONG_MODE_ENABLE | EFER_LONG_MODE_ACTIVE
+        CONTROL_REGISTERS.pack_into(profile, control_at, *controls)
+        return profile
+    if record not in (expected(reset), expected(bytes(SPECIAL_REGISTERS_SIZE))):
         raise RuntimeError("unsupported protected entry state")
     return record
 
@@ -517,6 +533,8 @@ class TcgChild:
         arguments = {"cpu-index": cpu, "gdt-base": base, "gdt-limit": limit}
         if controls[5] & EFER_LONG_MODE_ACTIVE:
             arguments["page-table-root"] = controls[2]
+        if limit == 31:
+            arguments["pvh-idt-base"] = DESCRIPTOR_TABLE.unpack_from(record, table_at + DESCRIPTOR_TABLE.size)[0]
         self.special_command("x-flexvm-set-x86-protected-entry", arguments)
 
     def floating_point(self, cpu):
@@ -798,6 +816,17 @@ def reset_lapic(engine, qemu, output, control, cpu_count, cpu):
         return parse_lapic(monitor.ask("x-flexvm-query-x86-lapic", {"cpu-index": cpu}))
 
 
+def reset_sregs(engine, qemu, output, control, cpu_count, cpu, irqchip):
+    if engine == "kvm":
+        native = subprocess.run([output / "native-worker", "--reset-sregs", str(cpu), str(int(irqchip))],
+                                capture_output=True, timeout=3)
+        if native.returncode or len(native.stdout) != SPECIAL_REGISTERS_SIZE:
+            raise RuntimeError(f"native reset SREGS query failed: {native.stderr.decode(errors='replace')}")
+        return native.stdout
+    with model_monitor(qemu, output, control, cpu_count, "sregs") as monitor:
+        return pack_special_registers(monitor.ask("x-flexvm-query-x86-sregs", {"cpu-index": cpu}))
+
+
 def read_slot_table(mailbox, ram_pages, outer_bytes, protected_entry, split_slot, zero_slot):
     first_gpa = PROTECTED_GPA if protected_entry else PAGE_SIZE
     if zero_slot:
@@ -878,7 +907,7 @@ def verify_slot_spans(pid, slots):
 
 def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry,
              split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs, cpuid, mmio, mmio_read,
-             ioeventfd, irqchip, pit, irqfd, zero_slot, tss, lapic, pio, complete_read, pio_boundary):
+             ioeventfd, irqchip, pit, irqfd, zero_slot, tss, lapic, pio, complete_read, pio_boundary, pvh):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
@@ -891,7 +920,9 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         if pit:
             expected.append(CREATE_PIT)
         expected.append(SET_IRQ_LINE)
-    expected.extend([OPEN_CPU] * cpu_count)
+    elif pvh:
+        expected.append(CREATE_IRQCHIP)
+    expected.extend((OPEN_CPU, GET_SREGS) * cpu_count)
     if lapic:
         expected.append(GET_LAPIC)
     expected_counters = []
@@ -966,6 +997,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
     staged_irq_levels = []
     open_cpus = set()
     started_cpus = set()
+    reset_registers = {}
     special = None
     supported_cpuid = []
     child = None
@@ -982,7 +1014,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 26)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 27)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
         os.ftruncate(outer_ram, outer_ram_size)
@@ -1083,6 +1115,12 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 record = (reset_lapic(parent_engine, qemu, output, control, cpu_count, cpu)
                           if child is None else child.lapic(cpu))
                 mapping[LAPIC_AT:LAPIC_AT + LAPIC_SIZE] = record
+            elif opcode == GET_SREGS and cpu not in started_cpus:
+                if length:
+                    raise RuntimeError("unexpected memory argument for reset SREGS")
+                registers = reset_sregs(parent_engine, qemu, output, control, cpu_count, cpu, irqchip_created)
+                reset_registers[cpu] = registers
+                mapping[64:64 + SPECIAL_REGISTERS_SIZE] = registers
             elif opcode == SET_LAPIC:
                 if length or not irqchip_created or cpu not in started_cpus:
                     raise RuntimeError("LAPIC write requires a stopped, initialized vCPU")
@@ -1112,7 +1150,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                     if cpuid_valid:
                         child.set_cpuid(cpu, unpack_cpuid(mapping[CPUID_AT:CPUID_AT + CPUID_BYTES]))
                     if protected_entry:
-                        state = read_protected_entry(mapping, slots, long_mode)
+                        state = read_protected_entry(mapping, slots, long_mode, pvh, reset_registers[cpu])
                         child.set_protected_entry(cpu, state)
                     child.set_registers(cpu, mapping[64:64 + REGISTERS.size])
                     fpu_valid, = struct.unpack_from("<I", mapping, FPU_VALID_AT)
@@ -1184,6 +1222,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                     "cs_long": bool(SEGMENT.unpack_from(registers)[8]),
                     "ds_base": SEGMENT.unpack_from(registers, SEGMENT.size)[0],
                     "gdt_base": DESCRIPTOR_TABLE.unpack_from(registers, 8 * SEGMENT.size)[0],
+                    "idt_base": DESCRIPTOR_TABLE.unpack_from(registers, 8 * SEGMENT.size + DESCRIPTOR_TABLE.size)[0],
+                    "tr_selector": SEGMENT.unpack_from(registers, 6 * SEGMENT.size)[2],
                 }
                 control_state = CONTROL_REGISTERS.unpack_from(registers, 8 * SEGMENT.size + 2 * DESCRIPTOR_TABLE.size)
                 special.update(cr0=control_state[0], cr2=control_state[1], cr3=control_state[2],
@@ -1239,6 +1279,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 or pio and "PASS x86 port I/O preserved widths, counts, and VMM read data" not in guest
                 or complete_read and "PASS interrupted KVM_RUN completed one input without executing the following instruction" not in guest
                 or pio_boundary and "PASS x86 port I/O kept the original width across device boundaries" not in guest
+                or pvh and "PASS PVH entry executed with Firecracker's descriptor and control state" not in guest
                 or "PASS /dev/kvm returned two port I/O exits" not in guest
                 or "PASS parent KVM guest shutdown" not in guest):
             raise RuntimeError(f"parent execution proof failed; commands={observed}, see outer.log")
@@ -1280,6 +1321,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         "lapic": lapic,
         "completed_read_without_entry": complete_read,
         "pio_boundary": pio_boundary,
+        "pvh": pvh,
         "pio_writes": [{"port": port, "width": width, "data": data.hex()} for port, width, data in pio_writes],
         "pio_reads": [{"port": port, "width": width, "data": data.hex()} for port, width, data in pio_reads],
         "register_counters": counters,
@@ -1330,6 +1372,7 @@ def main():
     parser.add_argument("--pio", action="store_true", help="exercise arbitrary x86 port reads and writes")
     parser.add_argument("--complete-read", action="store_true", help="complete a read before an immediate exit")
     parser.add_argument("--pio-boundary", action="store_true", help="preserve the port and width across device boundaries")
+    parser.add_argument("--pvh", action="store_true", help="install Firecracker's x86 PVH bootstrap state")
     parser.add_argument("--reject-close", action="store_true", help="verify page retention when the parent refuses close")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -1337,6 +1380,10 @@ def main():
         args.mmio_write = True
     if args.pio_boundary:
         args.pio = args.irqchip = True
+    if args.pvh:
+        args.zero_slot = args.protected_entry = True
+        if args.ram_pages < 8192:
+            parser.error("--pvh needs at least 8192 pages for the kernel entry point")
     if args.pit or args.irqfd or args.tss or args.lapic:
         args.irqchip = True
     if args.pit and args.irqfd:
@@ -1382,7 +1429,7 @@ def main():
                                   2 if args.two_vcpus else 1, args.long_mode, args.fpu, args.msrs, args.cpuid,
                                   args.mmio_write, args.mmio_read, args.ioeventfd, args.irqchip, args.pit,
                                   args.irqfd, args.zero_slot, args.tss, args.lapic, args.pio, args.complete_read,
-                                  args.pio_boundary)))
+                                  args.pio_boundary, args.pvh)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -1446,6 +1493,8 @@ def main():
                 oracle.append("complete-read")
             if args.pio_boundary:
                 oracle.append("pio-boundary")
+            if args.pvh:
+                oracle.append("pvh")
             HELPERS["run"](oracle, 14 if args.interrupt_run else 8, output / "native-kvm.log")
             report["same_client_passed_native_kvm"] = True
             report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
@@ -1491,6 +1540,8 @@ def main():
             files["complete-read"] = b""
         if args.pio_boundary:
             files["pio-boundary"] = b""
+        if args.pvh:
+            files["pvh"] = b""
         image = HELPERS["initramfs"](init.read_bytes(), files=files)
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
@@ -1531,6 +1582,7 @@ def main():
                             *(["--pio"] if args.pio else []),
                             *(["--complete-read"] if args.complete_read else []),
                             *(["--pio-boundary"] if args.pio_boundary else []),
+                            *(["--pvh"] if args.pvh else []),
                             *(["--reject-close"] if args.reject_close else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}
@@ -1541,7 +1593,8 @@ def main():
             worker_path = f'execve("{output / "native-worker"}",'
             workers = {line.split()[0] for line in lines if worker_path in line and line.endswith(" = 0")}
             kvm_users = {line.split()[0] for line in lines if '"/dev/kvm"' in line}
-            if len(workers) != 1 + int(args.cpuid) + int(args.lapic) or kvm_users != workers:
+            reset_queries = 2 if args.two_vcpus else 1
+            if len(workers) != 1 + int(args.cpuid) + int(args.lapic) + reset_queries or kvm_users != workers:
                 raise RuntimeError("only the native parent worker may use host KVM")
         report.update(json.loads(worker.read_text()), status="passed", host_device_access=bool(devices),
                       host_devices=sorted(devices))

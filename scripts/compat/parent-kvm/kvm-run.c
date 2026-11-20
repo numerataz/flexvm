@@ -38,6 +38,9 @@
 #define ZERO_SLOT_ENTRY_OFFSET 0xe00
 #define PORT_IO_ENTRY_OFFSET 0xe80
 #define PORT_BOUNDARY_ENTRY_OFFSET 0xb00
+#define PVH_GDT_OFFSET 0x500
+#define PVH_IDT_OFFSET 0x520
+#define PVH_ENTRY_OFFSET 0x1000540
 #define PIC_IDT_OFFSET 0x400
 #define PIC_IDTR_OFFSET 0x540
 #define PIC_GSI 3
@@ -103,10 +106,13 @@ static struct kvm_regs check_registers(int cpu, unsigned char accumulator, unsig
     return regs;
 }
 
-static void select_segments(int cpu, bool protected_mode, bool long_mode, uint64_t gpa)
+static void select_segments(int cpu, bool protected_mode, bool long_mode, uint64_t gpa, bool pvh)
 {
     struct kvm_sregs sregs;
     check(ioctl(cpu, KVM_GET_SREGS, &sregs) == 0, "read reset segments");
+    if (pvh)
+        check(sregs.cs.base == 0xffff0000 && sregs.cs.selector == 0xf000 &&
+              sregs.apic_base == 0xfee00900ULL, "obtain the actual reset code segment and APIC base");
     if (protected_mode) {
         const struct kvm_segment code = {
             .limit = UINT32_MAX, .selector = 8, .type = 11, .present = 1,
@@ -120,6 +126,12 @@ static void select_segments(int cpu, bool protected_mode, bool long_mode, uint64
         sregs.ds = sregs.es = sregs.fs = sregs.gs = sregs.ss = data;
         sregs.gdt = (struct kvm_dtable){.base = gpa + GDT_OFFSET, .limit = 23};
         sregs.cr0 |= 1;
+        if (pvh) {
+            sregs.gdt = (struct kvm_dtable){.base = PVH_GDT_OFFSET, .limit = 31};
+            sregs.idt = (struct kvm_dtable){.base = PVH_IDT_OFFSET, .limit = 7};
+            sregs.tr = (struct kvm_segment){.limit = 103, .selector = 24, .type = 11, .present = 1};
+            sregs.cr0 = 0x11;
+        }
         if (long_mode) {
             sregs.cr0 |= LONG_CR0;
             sregs.cr3 = gpa + 4096;
@@ -516,6 +528,41 @@ static void prepare_zero_slot(unsigned char *ram, const uint32_t *offsets, size_
     install_jump(ram, pc, 0x10);
 }
 
+static void prepare_pvh(unsigned char *ram)
+{
+    const uint64_t gdt[] = {0, 0x00cf9b000000ffffULL, 0x00cf93000000ffffULL, 0x00008b0000000067ULL};
+    const unsigned char program[] = {
+        0x0f, 0x01, 0x83, 0xc0, 0x01, 0, 0, /* sgdt [ebx+0x1c0] */
+        0x0f, 0x01, 0x8b, 0xc8, 0x01, 0, 0, /* sidt [ebx+0x1c8] */
+        0x66, 0x0f, 0x00, 0xc8,             /* str ax */
+        0x66, 0x89, 0x83, 0xd0, 0x01, 0, 0, /* mov [ebx+0x1d0], ax */
+        0x0f, 0x20, 0xc0,                   /* mov eax, cr0 */
+        0x89, 0x83, 0xd4, 0x01, 0, 0,       /* mov [ebx+0x1d4], eax */
+        0xb8, 0x41, 0, 0, 0, 0xf9,         /* mov eax, 0x41; stc */
+    };
+
+    memcpy(ram + PVH_GDT_OFFSET, gdt, sizeof(gdt));
+    memcpy(ram + PVH_ENTRY_OFFSET, program, sizeof(program));
+    install_jump(ram, PVH_ENTRY_OFFSET + sizeof(program), ZERO_SLOT_ENTRY_OFFSET);
+}
+
+static void check_pvh(const struct kvm_sregs *sregs, const unsigned char *data)
+{
+    const unsigned char gdt[] = {31, 0, 0, 5, 0, 0};
+    const unsigned char idt[] = {7, 0, 0x20, 5, 0, 0};
+    uint16_t tr;
+    uint32_t cr0;
+
+    memcpy(&tr, data + 0x1d0, sizeof(tr));
+    memcpy(&cr0, data + 0x1d4, sizeof(cr0));
+    check(!memcmp(data + 0x1c0, gdt, sizeof(gdt)) && !memcmp(data + 0x1c8, idt, sizeof(idt)) &&
+          tr == 24 && cr0 == 0x11, "execute PVH entry using actual guest descriptor and control registers");
+    check(sregs->idt.base == PVH_IDT_OFFSET && sregs->idt.limit == 7 && sregs->tr.selector == 24 &&
+          sregs->tr.base == 0 && sregs->tr.limit == 103 && sregs->tr.type == 11 && sregs->tr.present &&
+          sregs->cr0 == 0x11 && sregs->apic_base == 0xfee00900ULL, "read back live PVH core registers");
+    puts("PASS PVH entry executed with Firecracker's descriptor and control state");
+}
+
 static void prepare_port_io(unsigned char *ram, unsigned char *data, int next)
 {
     const unsigned char program[] = {
@@ -896,6 +943,7 @@ int main(int argc, char **argv)
     bool pio = false;
     bool complete_read = false;
     bool pio_boundary = false;
+    bool pvh = false;
     check(argc == 2 || protected_mode, "specify RAM pages and optional protected or split mode");
     for (int i = 3; i < argc; i++) {
         if (!interrupt_run && !strcmp(argv[i], "interrupt"))
@@ -935,6 +983,8 @@ int main(int argc, char **argv)
             complete_read = true;
         else if (!pio_boundary && !strcmp(argv[i], "pio-boundary"))
             pio_boundary = true;
+        else if (!pvh && !strcmp(argv[i], "pvh"))
+            pvh = true;
         else
             check(false, "invalid execution option");
     }
@@ -963,6 +1013,7 @@ int main(int argc, char **argv)
           "test port I/O with a single protected-mode vCPU");
     check(!complete_read || pio || mmio_read, "exercise completion-only entry with a pending read");
     check(!pio_boundary || (pio && irqchip), "test port boundary behavior with the PIC enabled");
+    check(!pvh || (zero_slot && count >= 8192), "use a zero-based slot containing the x86 PVH entry");
     size_t pages = count;
     size_t ram_bytes = pages * 4096;
     uint64_t gpa = PVKVM_GUEST_START;
@@ -1245,6 +1296,10 @@ int main(int argc, char **argv)
         prepare_pic(vm, ram, gpa, pit, lapic);
     if (zero_slot)
         prepare_zero_slot(ram, zero_slot_offsets, sizeof(zero_slot_offsets) / sizeof(zero_slot_offsets[0]));
+    if (pvh) {
+        check(ioctl(vm, KVM_CREATE_IRQCHIP, 0) == 0, "create a PVH irqchip");
+        prepare_pvh(ram);
+    }
     int cpu = ioctl(vm, KVM_CREATE_VCPU, 0);
     check(cpu >= 0 && (fcntl(cpu, F_GETFD) & FD_CLOEXEC), "vCPU file descriptor");
     check(ioctl(vm, KVM_CREATE_VCPU, 0) == -1 && errno == EEXIST, "reject duplicate vCPU");
@@ -1258,6 +1313,8 @@ int main(int argc, char **argv)
     struct kvm_regs regs = {.rax = 0x41, .rip = entry_base + 0x10, .rflags = 3};
     if (zero_slot)
         regs.rip = ZERO_SLOT_ENTRY_OFFSET;
+    if (pvh)
+        regs.rip = PVH_ENTRY_OFFSET;
     if (fpu)
         regs.rip = entry_base + FPU_ENTRY_OFFSET;
     if (msrs)
@@ -1293,7 +1350,7 @@ int main(int argc, char **argv)
     struct kvm_regs readback;
     check(ioctl(cpu, KVM_GET_REGS, &readback) == 0 && !memcmp(&readback, &regs, sizeof(regs)),
           "read back initial registers");
-    select_segments(cpu, protected_mode, long_mode, gpa);
+    select_segments(cpu, protected_mode, long_mode, gpa, pvh);
     if (fpu)
         prepare_fpu(cpu);
     if (msrs)
@@ -1316,7 +1373,7 @@ int main(int argc, char **argv)
             other_regs.rsp = gpa + 0xf00;
         }
         check(ioctl(other_cpu, KVM_SET_REGS, &other_regs) == 0, "set second vCPU registers");
-        select_segments(other_cpu, true, false, gpa);
+        select_segments(other_cpu, true, false, gpa, false);
     }
     if (lapic)
         configure_lapic(cpu);
@@ -1367,8 +1424,11 @@ int main(int argc, char **argv)
     if (protected_mode) {
         check((sregs.cr0 & 1) && sregs.cs.selector == 8 && sregs.cs.db == !long_mode &&
               sregs.ds.selector == 16 && sregs.ds.base == 0 && sregs.ds.limit == UINT32_MAX &&
-              sregs.gdt.base == gpa + GDT_OFFSET && sregs.gdt.limit == 23,
+              sregs.gdt.base == (pvh ? PVH_GDT_OFFSET : gpa + GDT_OFFSET) &&
+              sregs.gdt.limit == (pvh ? 31 : 23),
               "observe the client's flat protected-mode state");
+        if (pvh)
+            check_pvh(&sregs, data);
         if (long_mode)
             check(sregs.cs.l && (sregs.cr0 & LONG_CR0) == LONG_CR0 && sregs.cr3 == gpa + 4096 &&
                   (sregs.cr4 & LONG_CR4) && (sregs.efer & LONG_EFER) == LONG_EFER,

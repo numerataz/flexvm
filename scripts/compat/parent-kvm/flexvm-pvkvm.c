@@ -115,6 +115,7 @@ struct pvcpu {
 	struct run_page *page;
 	struct kvm_regs regs;
 	struct kvm_sregs sregs;
+	struct kvm_sregs sregs_reset;
 	struct kvm_fpu fpu;
 	struct kvm_lapic_state lapic;
 	struct pvkvm_cpuid_table *cpuid;
@@ -126,6 +127,8 @@ struct pvcpu {
 	bool ran;
 	bool fpu_set;
 	bool lapic_set;
+	bool sregs_reset_known;
+	bool sregs_set;
 };
 
 static const struct kvm_sregs reset_sregs = {
@@ -137,7 +140,7 @@ static bool long_mode(const struct kvm_sregs *sregs)
 	return sregs->efer & EFER_LMA;
 }
 
-static bool valid_protected_entry(const struct kvm_sregs *sregs)
+static bool valid_protected_entry(const struct kvm_sregs *sregs, const struct kvm_sregs *baseline)
 {
 	static const struct kvm_segment code = {
 		.limit = U32_MAX, .selector = 8, .type = 11, .present = 1,
@@ -147,13 +150,26 @@ static bool valid_protected_entry(const struct kvm_sregs *sregs)
 		.limit = U32_MAX, .selector = 16, .type = 3, .present = 1,
 		.db = 1, .s = 1, .g = 1,
 	};
-	struct kvm_sregs wanted = reset_sregs;
+	static const struct kvm_segment pvh_tr = {
+		.limit = 103, .selector = 24, .type = 11, .present = 1,
+	};
+	struct kvm_sregs wanted = *baseline;
+	bool pvh = !long_mode(sregs) && sregs->gdt.limit == 31;
 
 	wanted.cs = code;
 	wanted.ds = wanted.es = wanted.fs = wanted.gs = wanted.ss = data;
-	wanted.cr0 = X86_CR0_PE;
+	wanted.cr0 |= X86_CR0_PE;
 	wanted.gdt.limit = 23;
 	wanted.gdt.base = sregs->gdt.base;
+	if (pvh) {
+		wanted.tr = pvh_tr;
+		wanted.gdt.limit = 31;
+		wanted.idt.base = sregs->idt.base;
+		wanted.idt.limit = 7;
+		wanted.cr0 = X86_CR0_PE | X86_CR0_ET;
+		if (sregs->idt.base > U32_MAX)
+			return false;
+	}
 	if (long_mode(sregs)) {
 		wanted.cs.db = 0;
 		wanted.cs.l = 1;
@@ -165,6 +181,15 @@ static bool valid_protected_entry(const struct kvm_sregs *sregs)
 			return false;
 	}
 	return !memcmp(sregs, &wanted, sizeof(wanted)) && sregs->gdt.base <= U32_MAX;
+}
+
+static bool valid_real_entry(const struct kvm_sregs *sregs, const struct kvm_sregs *baseline)
+{
+	struct kvm_sregs wanted = *baseline;
+
+	wanted.cs.base = 0;
+	wanted.cs.selector = 0;
+	return !memcmp(sregs, &wanted, sizeof(wanted));
 }
 
 static bool registers_fit_mode(const struct kvm_regs *regs, const struct kvm_sregs *sregs)
@@ -614,6 +639,11 @@ static int run_cpu(struct pvcpu *cpu)
 		result = -EINVAL;
 		goto unlock;
 	}
+	if (!cpu->ran && cpu->sregs.gdt.limit == 31 &&
+	    !slot_contains(vm, cpu->sregs.idt.base, cpu->sregs.idt.limit + 1)) {
+		result = -EINVAL;
+		goto unlock;
+	}
 	if (!cpu->ran && long_mode(&cpu->sregs) && !slot_contains(vm, cpu->sregs.cr3, PAGE_SIZE)) {
 		result = -EINVAL;
 		goto unlock;
@@ -870,6 +900,19 @@ static long cpu_cpuid(struct pvcpu *cpu, bool write, struct kvm_cpuid2 __user *u
 	return result;
 }
 
+static int read_reset_sregs(struct pvcpu *cpu)
+{
+	int result;
+
+	if (cpu->sregs_reset_known)
+		return 0;
+	result = read_stopped_registers(cpu, PVKVM_GET_SREGS, PVKVM_REGISTERS_AT,
+					&cpu->sregs_reset, sizeof(cpu->sregs_reset));
+	if (!result)
+		cpu->sregs_reset_known = true;
+	return result;
+}
+
 static long cpu_lapic(struct pvcpu *cpu, bool write, void __user *user)
 {
 	struct kvm_lapic_state *record;
@@ -903,7 +946,7 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
 	struct pvcpu *cpu = file->private_data;
 	struct kvm_fpu fpu;
-	struct kvm_sregs sregs, wanted;
+	struct kvm_sregs sregs;
 	struct kvm_regs regs;
 	void __user *uarg = (void __user *)arg;
 	long result;
@@ -954,6 +997,11 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			result = read_stopped_registers(cpu, PVKVM_GET_SREGS, PVKVM_REGISTERS_AT, &sregs, sizeof(sregs));
 			if (result)
 				break;
+		} else if (!cpu->sregs_set) {
+			result = read_reset_sregs(cpu);
+			if (result)
+				break;
+			sregs = cpu->sregs_reset;
 		}
 		result = copy_to_user(uarg, &sregs, sizeof(sregs)) ? -EFAULT : 0;
 		break;
@@ -962,14 +1010,18 @@ static long cpu_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 			result = -EFAULT;
 			break;
 		}
-		wanted = reset_sregs;
-		wanted.cs.base = 0;
-		wanted.cs.selector = 0;
-		if (memcmp(&sregs, &wanted, sizeof(sregs)) && !valid_protected_entry(&sregs)) {
+		result = read_reset_sregs(cpu);
+		if (result)
+			break;
+		if (!valid_real_entry(&sregs, &cpu->sregs_reset) &&
+		    !valid_protected_entry(&sregs, &cpu->sregs_reset) &&
+		    !valid_real_entry(&sregs, &reset_sregs) &&
+		    !valid_protected_entry(&sregs, &reset_sregs)) {
 			result = -EINVAL;
 			break;
 		}
 		cpu->sregs = sregs;
+		cpu->sregs_set = true;
 		result = 0;
 		break;
 	case KVM_GET_FPU:
