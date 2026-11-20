@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -136,6 +137,65 @@ static pid_t start_worker(const char *path, int ipa_bits, int link[2])
     return worker;
 }
 
+static void configure_gic(int socket, struct result *result)
+{
+    struct flexvm_arm_request request = {.command = FLEXVM_ARM_CREATE_DEVICE, .device = {.type = KVM_DEV_TYPE_ARM_VGIC_V3}};
+    ASSERT(!exchange(socket, request, result).status);
+    request.command = FLEXVM_ARM_SET_DEVICE_ATTR;
+    request.device.group = KVM_DEV_ARM_VGIC_GRP_ADDR;
+    request.device.attribute = KVM_VGIC_V3_ADDR_TYPE_DIST;
+    request.device.value = UINT64_C(0x3fff0000);
+    ASSERT(!exchange(socket, request, result).status);
+    request.device.attribute = KVM_VGIC_V3_ADDR_TYPE_REDIST;
+    request.device.value = UINT64_C(0x3ffb0000);
+    ASSERT(!exchange(socket, request, result).status);
+    request.device.group = KVM_DEV_ARM_VGIC_GRP_NR_IRQS;
+    request.device.attribute = 0;
+    request.device.value = 128;
+    ASSERT(!exchange(socket, request, result).status);
+    request.device.group = KVM_DEV_ARM_VGIC_GRP_CTRL;
+    request.device.attribute = KVM_DEV_ARM_VGIC_CTRL_INIT;
+    ASSERT(!exchange(socket, request, result).status);
+}
+
+static void check_gic_checkpoint(int source, int target, struct result *result)
+{
+    int event = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+    struct flexvm_arm_request bind = {.command = FLEXVM_ARM_BIND_IRQFD, .gsi = 3};
+    ASSERT(event >= 0 && pass_descriptors(source, bind, &event, 1) == 0 && eventfd_write(event, 1) == 0);
+
+    // The kernel queues IRQFD injection. Wait while the source stays fenced.
+    ASSERT(poll(NULL, 0, 50) == 0);
+    int gic = memfd_create("arm-native-gic-checkpoint", MFD_CLOEXEC);
+    ASSERT(gic >= 0);
+    struct flexvm_arm_request save = {.command = FLEXVM_ARM_SAVE_GIC};
+    ASSERT(pass_descriptors(source, save, &gic, 1) == 0 && close(event) == 0);
+    struct flexvm_arm_request restore = {.command = FLEXVM_ARM_RESTORE_GIC};
+    ASSERT(pass_descriptors(target, restore, &gic, 1) == 0 && close(gic) == 0);
+
+    // Read GICD_ISPENDR1 through the target vCPU's actual MMIO mapping.
+    const uint32_t probe[] = {0xd2a7ffe6, 0xb94204c1, 0xd2a20000, 0xb9000001, 0x14000000};
+    const uint64_t offset = 0;
+    const unsigned int seals = F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_SEAL;
+    int ram = memfd_create("arm-native-gic-probe", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    int layout = memfd_create("arm-native-gic-layout", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    ASSERT(ram >= 0 && layout >= 0 && ftruncate(ram, PAGE) == 0 &&
+           pwrite(ram, probe, sizeof(probe), 0) == sizeof(probe) &&
+           fcntl(ram, F_ADD_SEALS, seals) == 0 && write(layout, &offset, sizeof(offset)) == sizeof(offset) &&
+           fcntl(layout, F_ADD_SEALS, seals | F_SEAL_WRITE) == 0);
+    ASSERT(register_slot(target, 0, FLEXVM_ARM_RAM_BASE, ram, layout) == 0 && close(ram) == 0 && close(layout) == 0);
+    set_core(target, result, 0, offsetof(struct kvm_regs, regs.pc), FLEXVM_ARM_RAM_BASE);
+    int lane = open_lane(target, 0);
+    send_run(lane, (struct flexvm_arm_request){.command = FLEXVM_ARM_RUN, .sequence = 1});
+    struct flexvm_arm_reply reply = read_reply(lane);
+    uint32_t pending;
+    memcpy(&pending, reply.mmio.data, sizeof(pending));
+    ASSERT(!reply.status && reply.exit_reason == KVM_EXIT_MMIO && reply.mmio.is_write &&
+           reply.mmio.address == 0x10000000 && reply.mmio.length == sizeof(pending) && (pending & (1u << 3)));
+    ASSERT(close(lane) == 0);
+    puts("PASS native ARM GICv3 restored a pending IRQFD interrupt");
+}
+
 int main(int argc, char *argv[])
 {
     ASSERT(argc == 2);
@@ -151,6 +211,8 @@ int main(int argc, char *argv[])
         ASSERT(fcntl(layouts[index], F_ADD_SEALS, seals | F_SEAL_WRITE) == 0);
     }
     const uint32_t code[] = {
+        // Configure SPI 35 as edge-triggered in GICD_ICFGR2.
+        0xd2a7ffe6, 0x52801007, 0xb90c08c7,
         // CPU 0 releases the first flag and waits for CPU 1's flag.
         0x91002043, 0x91003044, 0x52800025, 0x889ffc65, 0x88dffc85, 0x34ffffe5,
         0xb9400001, // ldr w1, [x0] from the VMM's MMIO address
@@ -187,6 +249,7 @@ int main(int argc, char *argv[])
         ASSERT(!exchange(link[0], (struct flexvm_arm_request){.command = FLEXVM_ARM_CREATE_VCPU, .cpu = cpu}, &result).status);
         ASSERT(!exchange(link[0], (struct flexvm_arm_request){.command = FLEXVM_ARM_INIT_VCPU, .cpu = cpu, .init = init}, &result).status);
     }
+    configure_gic(link[0], &result);
     reply = exchange(link[0], (struct flexvm_arm_request){.command = FLEXVM_ARM_GET_REG_LIST}, &result);
     ASSERT(reply.status == -E2BIG && reply.count >= 34 && reply.count <= FLEXVM_ARM_MAX_REGS);
     reply = exchange(link[0], (struct flexvm_arm_request){.command = FLEXVM_ARM_GET_REG_LIST, .count = reply.count}, &result);
@@ -301,8 +364,11 @@ int main(int argc, char *argv[])
     ASSERT(fcntl(checkpoint, F_ADD_SEALS, seals | F_SEAL_WRITE) == 0);
     int target[2];
     pid_t replacement = start_worker(argv[1], ipa_bits, target);
-    ASSERT(!exchange(target[0], (struct flexvm_arm_request){.command = FLEXVM_ARM_CREATE_VCPU}, &result).status);
-    ASSERT(!exchange(target[0], (struct flexvm_arm_request){.command = FLEXVM_ARM_INIT_VCPU, .init = init}, &result).status);
+    for (unsigned int cpu = 0; cpu < 2; cpu++) {
+        ASSERT(!exchange(target[0], (struct flexvm_arm_request){.command = FLEXVM_ARM_CREATE_VCPU, .cpu = cpu}, &result).status);
+        ASSERT(!exchange(target[0], (struct flexvm_arm_request){.command = FLEXVM_ARM_INIT_VCPU, .cpu = cpu, .init = init}, &result).status);
+    }
+    configure_gic(target[0], &result);
     struct flexvm_arm_request restore = {.command = FLEXVM_ARM_RESTORE_CORE};
     int malformed = memfd_create("arm-native-malformed-core", MFD_CLOEXEC);
     off_t size = lseek(checkpoint, 0, SEEK_END);
@@ -338,6 +404,7 @@ int main(int argc, char *argv[])
         memcpy(&physical, reply.reg_data, sizeof(physical));
         ASSERT(!reply.status && physical > after && physical - after >= 27 * frequency && physical - after <= 30 * frequency);
     }
+    check_gic_checkpoint(link[0], target[0], &result);
     close(target[0]);
     int replacement_status;
     ASSERT(waitpid(replacement, &replacement_status, 0) == replacement && WIFEXITED(replacement_status) && !WEXITSTATUS(replacement_status));

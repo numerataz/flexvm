@@ -14,6 +14,7 @@
 #include <sys/socket.h>
 #include "arm-native-wire.h"
 #include "arm-native-state.h"
+#include "arm-native-gic-state.h"
 #include "arm-vgic.h"
 #include "slot-map.h"
 
@@ -486,15 +487,22 @@ static int checkpoint_core(struct arm_vm *vm, const struct flexvm_arm_request *r
     }
     if (!status) {
         struct arm_cpu *cpu = &vm->cpus[request->cpu];
-        if (!cpu->initialized)
+        bool gic = request->command == FLEXVM_ARM_SAVE_GIC || request->command == FLEXVM_ARM_RESTORE_GIC;
+        if (!gic && !cpu->initialized)
             status = -ENOEXEC;
         for (unsigned int id = 0; !status && id < FLEXVM_ARM_MAX_CPUS; id++) {
             const struct arm_cpu *peer = &vm->cpus[id];
             if (peer->pending_read || atomic_load(&peer->admitted) != atomic_load(&peer->completed))
                 status = -EBUSY;
         }
-        if (!status)
+        if (!status && gic) {
+            int cpus[FLEXVM_ARM_MAX_CPUS];
+            for (unsigned int id = 0; id < FLEXVM_ARM_MAX_CPUS; id++)
+                cpus[id] = vm->cpus[id].fd;
+            status = arm_gic_state_file(vm->vgic[0], cpus, fd, request->command == FLEXVM_ARM_SAVE_GIC);
+        } else if (!status) {
             status = arm_core_state_file(cpu->fd, request->cpu, fd, list, request->command == FLEXVM_ARM_SAVE_CORE);
+        }
     }
     while (locked > 0)
         pthread_mutex_unlock(&vm->cpus[--locked].execution);
@@ -538,7 +546,7 @@ static void serve(struct arm_vm *vm, int control)
         if (request->command == FLEXVM_ARM_REGISTER_RAM)
             descriptors_needed = 2;
         else if (request->command == FLEXVM_ARM_OPEN_LANE || request->command == FLEXVM_ARM_BIND_IRQFD ||
-                 request->command == FLEXVM_ARM_SAVE_CORE || request->command == FLEXVM_ARM_RESTORE_CORE)
+                 (request->command >= FLEXVM_ARM_SAVE_CORE && request->command <= FLEXVM_ARM_RESTORE_GIC))
             descriptors_needed = 1;
         if (!packet.well_formed || packet.count != descriptors_needed || request->reserved ||
             (request->sequence && request->command != FLEXVM_ARM_CANCEL_RUN)) {
@@ -553,7 +561,7 @@ static void serve(struct arm_vm *vm, int control)
             reply.status = ioctl_result(ioctl(vm->fd, KVM_ARM_PREFERRED_TARGET, &reply.init));
         } else if (request->cpu >= FLEXVM_ARM_MAX_CPUS) {
             reply.status = -EINVAL;
-        } else if (request->command == FLEXVM_ARM_SAVE_CORE || request->command == FLEXVM_ARM_RESTORE_CORE) {
+        } else if (request->command >= FLEXVM_ARM_SAVE_CORE && request->command <= FLEXVM_ARM_RESTORE_GIC) {
             reply.status = checkpoint_core(vm, request, packet.descriptors[0], list);
         } else if (request->command == FLEXVM_ARM_CREATE_VCPU) {
             reply.status = create_cpu(vm, request->cpu);
