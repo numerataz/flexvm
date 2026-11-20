@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run an ARM guest with the parent-owned KVM device and native child worker."""
 import argparse
-from contextlib import ExitStack, suppress
+from contextlib import ExitStack
 from dataclasses import dataclass
 import errno
 import fcntl
@@ -490,21 +490,7 @@ def restore_interrupts(irq_fds, pending):
         os.eventfd_write(irq_fds[index], count)
 
 
-def transfer(monitor, fd, *, incoming=False):
-    monitor.send_fd(fd)
-    try:
-        monitor.ask("migrate-incoming" if incoming else "migrate", {"uri": "fd:snapshot"})
-    except BaseException:
-        with suppress(Exception):
-            monitor.ask("closefd", {"fdname": "snapshot"})
-        raise
-    while True:
-        result = monitor.ask("query-migrate")
-        if result["status"] == "completed":
-            return
-        if result["status"] not in ("setup", "active", "device"):
-            raise RuntimeError(f"ARM checkpoint state transfer failed: {result}")
-        time.sleep(min(.01, monitor.remaining()))
+transfer = PARENT["transfer_state"]
 
 
 def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=None, frontend=None,

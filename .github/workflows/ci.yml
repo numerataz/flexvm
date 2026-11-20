@@ -306,6 +306,13 @@ jobs:
             sudo ln -sf "$engine" /usr/local/bin/qemu-system-x86_64
           fi
           "$engine" --version
+      - name: x86 TCG worker resumes from a checkpoint backed by parent RAM
+        if: matrix.arch == 'x86_64'
+        run: |
+          trace="$RUNNER_TEMP/x86-parent-worker-checkpoint.strace"
+          strace -f -e trace=file -o "$trace" python3 scripts/compat/x86-worker-checkpoint.py \
+            --qemu "$RUNNER_TEMP/software-qemu/bin/qemu-system-x86_64"
+          if grep -F '"/dev/kvm"' "$trace"; then exit 1; fi
       - name: ARM TCG worker shares guest RAM and forwards MMIO without KVM
         if: matrix.arch == 'aarch64'
         run: |

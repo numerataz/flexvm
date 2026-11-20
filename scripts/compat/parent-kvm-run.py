@@ -2,7 +2,7 @@
 """Run a parent worker against a pinned KVM memory slot in shared outer RAM."""
 import argparse
 from collections import deque
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 import ctypes
 from dataclasses import dataclass
 import errno
@@ -524,9 +524,29 @@ class RegisterChannel:
         self.socket.close()
 
 
+def transfer_state(monitor, descriptor, *, incoming=False):
+    monitor.send_fd(descriptor)
+    try:
+        monitor.ask("migrate-incoming" if incoming else "migrate", {"uri": "fd:snapshot"})
+        while True:
+            result = monitor.ask("query-migrate")
+            status = result.get("status")
+            if status == "completed":
+                return
+            if status not in (None, "setup", "active", "device", "wait-unplug"):
+                raise RuntimeError(f"worker checkpoint state transfer failed: {result}")
+            time.sleep(min(.01, monitor.remaining()))
+    except BaseException:
+        with suppress(Exception):
+            monitor.ask("closefd", {"fdname": "snapshot"})
+        raise
+
+
 class TcgChild:
     def __init__(self, qemu, output, control, outer_ram, layouts, slots, cpu_count, mmio_base, pit_flags, irq_fds,
-                 fixture_checks, parallel):
+                 fixture_checks, parallel, *, checkpoint=False, incoming=None):
+        if incoming is not None and not checkpoint:
+            raise RuntimeError("incoming x86 state requires checkpoint-enabled run control")
         self.process = None
         self.channel = None
         self.lanes = None
@@ -548,6 +568,8 @@ class TcgChild:
                 listener.listen(1)
                 listener.settimeout(3)
                 exit_device = "isa-debugcon,iobase=0x30,chardev=port,run-control=on,forward-pio=on"
+                if checkpoint:
+                    exit_device += ",checkpoint-control=on"
                 if irq_fds:
                     exit_device += ",keep-pic-ports=on"
                 if pit_flags is not None:
@@ -576,9 +598,13 @@ class TcgChild:
                     "-qmp", f"unix:{self.special_monitor_path},server=on,wait=off",
                     *lane_args, "-device", exit_device,
                 ]
+                if incoming is not None:
+                    command.extend(["-incoming", "defer"])
                 for slot, layout in zip(slots, layouts, strict=True):
-                    command.extend(["-device", f"flexvm-shared-ram,id=slot{slot.identifier},"
-                                    f"ram-fd={outer_ram},layout-fd={layout},addr={slot.gpa}"])
+                    device = f"flexvm-shared-ram,id=slot{slot.identifier},ram-fd={outer_ram},layout-fd={layout},addr={slot.gpa}"
+                    if checkpoint:
+                        device += ",external-ram-state=on"
+                    command.extend(["-device", device])
                 self.process = spawn_owned(command, pass_fds=(outer_ram, *layouts), stdout=log, stderr=log)
                 connection, _ = listener.accept()
                 self.channel = RunChannel(connection, irq_fds, self.pulse_irq)
@@ -592,6 +618,13 @@ class TcgChild:
                 description = self.debugger.exchange("qXfer:features:read:target.xml:0,fff")
                 if b'<xi:include href="i386-64bit.xml"/>' not in description:
                     raise RuntimeError("unexpected QEMU register layout")
+                if incoming is not None:
+                    self.freeze_run_control(True)
+                    monitor = self.monitor(timeout=30)
+                    transfer_state(monitor, incoming, incoming=True)
+                    if monitor.ask("query-status")["status"] != "paused":
+                        raise RuntimeError("restored x86 worker is not paused")
+                    return
                 self.clock()
                 for cpu in range(cpu_count):
                     self.debugger.select_cpu(cpu)
@@ -631,12 +664,21 @@ class TcgChild:
         for peer_index, index, size in GDB_REGISTERS:
             self.debugger.write(peer_index, size, registers[index])
 
-    def special_command(self, operation, arguments=None):
-        deadline = time.monotonic() + 3
+    def monitor(self, *, timeout=3):
+        deadline = time.monotonic() + timeout
         if self.special_monitor is None:
             self.special_monitor = HELPERS["QMP"](self.special_monitor_path, self.process, deadline)
         self.special_monitor.deadline = deadline
-        return self.special_monitor.ask(operation, arguments)
+        return self.special_monitor
+
+    def special_command(self, operation, arguments=None):
+        return self.monitor().ask(operation, arguments)
+
+    def freeze_run_control(self, frozen):
+        self.special_command("x-flexvm-freeze-run-control", {"frozen": frozen})
+
+    def capture(self, descriptor):
+        transfer_state(self.monitor(timeout=30), descriptor)
 
     def special_registers(self, cpu):
         return pack_special_registers(self.special_command("x-flexvm-query-x86-sregs", {"cpu-index": cpu}))
