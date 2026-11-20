@@ -1178,6 +1178,7 @@ stop_post() {
 depend() {
     need localmount
     after cgroups
+    keyword -stop
 }
 "#,
         0o755,
@@ -2888,6 +2889,8 @@ mod tests {
         let rc = tmpdir("inject-openrc");
         let mut root = unpack::Root::open(&rc, Limits::default()).unwrap();
         inject_openrc(&mut root).unwrap();
+        let script = read(rc.join("etc/init.d/flexvm-runtime"));
+        assert!(script.contains("keyword -stop"), "{script}");
         for runlevel in ["default", "single"] {
             let link = rc.join("etc/runlevels").join(runlevel).join("flexvm-runtime");
             assert_eq!(std::fs::read_link(&link).unwrap(), Path::new("/etc/init.d/flexvm-runtime"));
