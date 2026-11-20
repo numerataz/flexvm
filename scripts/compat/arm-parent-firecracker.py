@@ -27,8 +27,10 @@ def main():
     checkpoint.add_argument("--freeze", action="store_true", help="freeze and thaw the direct ARM TCG run lanes")
     checkpoint.add_argument("--transfer", action="store_true", help="retire and restore the ARM parent and its nested worker")
     checkpoint.add_argument("--pause", action="store_true", help="pause and resume both VMs through the public command")
+    checkpoint.add_argument("--rollback", action="store_true", help="resume the source after aborting a completed capture")
     args = parser.parse_args()
-    if (args.freeze or args.transfer) and (args.bin or args.engine != "tcg"):
+    checkpoint_test = args.freeze or args.transfer or args.rollback
+    if checkpoint_test and (args.bin or args.engine != "tcg"):
         parser.error("checkpoint tests require the standalone ARM TCG broker")
     if args.pause and (not args.bin or args.engine != "tcg"):
         parser.error("--pause needs the public ARM TCG command")
@@ -41,7 +43,7 @@ def main():
     mode = ["-DFLEXVM_ARM_FIRECRACKER_APP"] if args.bin else []
     HELPERS["run"]([*cc, *mode, ROOT / "parent-kvm/arm-firecracker-init.c", "-o", outer], 30, output / "outer-build.log")
     inner_flags = [f"-DFLEXVM_ARM_TEST_CPUS={args.vcpus}"]
-    if args.freeze or args.transfer or args.pause:
+    if checkpoint_test or args.pause:
         inner_flags.append("-DFLEXVM_ARM_TEST_CHECKPOINT")
     HELPERS["run"]([*cc, *inner_flags, ROOT / "parent-kvm/arm-block-init.c", "-o", inner],
                    30, output / "inner-build.log")
@@ -90,8 +92,8 @@ def main():
             sys.executable, ROOT / "arm-parent-run.py", "--qemu", args.qemu, "--kernel", kernel,
             "--initrd", cpio, "--mem", "384", *options,
         ]
-        if args.transfer:
-            transfer_checkpoint(command, output, log)
+        if args.transfer or args.rollback:
+            transfer_checkpoint(command, output, log, rollback=args.rollback)
         elif args.freeze:
             with tempfile.TemporaryDirectory(prefix="flexvm-arm-freeze-") as directory:
                 runtime = Path(directory) / "parent"
@@ -107,7 +109,7 @@ def main():
         "PASS ARM Firecracker architected timer",
         "PASS stock ARM Firecracker used the parent-owned KVM device",
     )
-    if args.freeze or args.transfer or args.pause:
+    if checkpoint_test or args.pause:
         markers += ("PASS ARM Firecracker resumed after checkpoint freeze",)
         before = [line.rsplit(" ", 1)[-1] for line in lines if line.startswith("ARM Firecracker checkpoint canary ")]
         after = [line.rsplit(" ", 1)[-1] for line in lines if line.startswith("ARM Firecracker restored canary ")]
@@ -117,7 +119,7 @@ def main():
         if lines.count(marker) != 1:
             raise RuntimeError(f"missing or repeated {marker}; see {log}")
     report = {"status": "passed", "nested_vcpus": args.vcpus, "parent_engine": args.engine,
-              "checkpoint": "transfer" if args.transfer else "freeze" if args.freeze or args.pause else None,
+              "checkpoint": next((mode for mode in ("transfer", "freeze", "rollback", "pause") if getattr(args, mode)), None),
               "virtio_block": "read-write-flush",
               "arm_timer": "passed", "firecracker_sha256": HELPERS["digest"](args.firecracker)}
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
@@ -176,7 +178,15 @@ def pause_public(proc, deadline, log, binary, state, output):
     HELPERS["run"]([binary, "unpause", "--state", state, "arm-kvm-pause"], 15, output / "unpause.log")
 
 
-def transfer_checkpoint(command, output, log):
+def resume_outer(proc, deadline, runtime):
+    monitor = HELPERS["QMP"](runtime / "outer-qmp", proc, deadline)
+    try:
+        monitor.ask("cont")
+    finally:
+        monitor.close()
+
+
+def transfer_checkpoint(command, output, log, *, rollback=False):
     with ExitStack() as resources:
         root = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix="flexvm-arm-transfer-")))
         source, target = root / "source", root / "target"
@@ -190,11 +200,18 @@ def transfer_checkpoint(command, output, log):
                 connect_checkpoint(control, proc, deadline, source)
                 checkpoint_request(control, b"freeze")
                 checkpoint_request(control, b"save", fds)
-                control.sendall(b"retire")
-                if control.recv(64):
-                    raise RuntimeError("source did not retire after capture")
+                if rollback:
+                    checkpoint_request(control, b"rollback")
+                    resume_outer(proc, deadline, source)
+                else:
+                    control.sendall(b"retire")
+                    if control.recv(64):
+                        raise RuntimeError("source did not retire after capture")
 
         HELPERS["run"]([*command, "--checkpoint-control", source], 90, source_log, during=capture)
+        if rollback:
+            log.write_bytes(source_log.read_bytes())
+            return
         for file in files:
             file.seek(0)
         if "PASS ARM Firecracker resumed" in source_log.read_text(errors="replace"):
@@ -204,11 +221,7 @@ def transfer_checkpoint(command, output, log):
             with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as control:
                 connect_checkpoint(control, proc, deadline, target)
                 checkpoint_request(control, b"thaw")
-                monitor = HELPERS["QMP"](target / "outer-qmp", proc, deadline)
-                try:
-                    monitor.ask("cont")
-                finally:
-                    monitor.close()
+                resume_outer(proc, deadline, target)
 
         HELPERS["run"]([*command, "--checkpoint-control", target, "--restore-fds", *map(str, fds)],
                        90, target_log, during=resume, pass_fds=fds)

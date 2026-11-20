@@ -72,11 +72,12 @@ class CheckpointGate:
         self.listener = listener
         self.client = None
         self.phase = "running"
+        self.captured_interrupts = {}
 
     def descriptor(self):
         return self.client if self.client is not None else self.listener
 
-    def service(self, ready, worker, capture):
+    def service(self, ready, worker, capture, rollback):
         if self.descriptor() not in ready:
             return False
         if self.client is None:
@@ -89,9 +90,9 @@ class CheckpointGate:
                 os.set_inheritable(fd, False)
             if flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
                 raise RuntimeError("truncated ARM checkpoint request")
-            return self.handle(request, fds, worker, capture)
+            return self.handle(request, fds, worker, capture, rollback)
 
-    def handle(self, request, fds, worker, capture):
+    def handle(self, request, fds, worker, capture, rollback):
         if not request:
             self.close()
             if self.phase != "running":
@@ -106,8 +107,13 @@ class CheckpointGate:
             self.phase = "running"
             self.client.sendall(b"ok")
         elif request == b"save" and len(fds) == 3 and self.phase == "frozen":
-            capture(worker, fds)
+            self.captured_interrupts = capture(worker, fds)
             self.phase = "captured"
+            self.client.sendall(b"ok")
+        elif request == b"rollback" and not fds and self.phase == "captured":
+            rollback(worker, self.captured_interrupts)
+            self.captured_interrupts = {}
+            self.phase = "running"
             self.client.sendall(b"ok")
         elif request == b"retire" and not fds and self.phase == "captured":
             return True
@@ -341,7 +347,7 @@ def arm_ioctl(worker, mailbox, command, cpu, irq_fds):
 
 
 def serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, create_worker, outer_ram, outer_bytes, max_pages,
-                   gate=None, capture=None, worker=None):
+                   gate=None, capture=None, rollback=None, worker=None):
     vm_open = worker is not None
     cpus = set(worker.cpus) if worker else set()
     registered = worker is not None
@@ -357,7 +363,7 @@ def serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, cr
             for fd in (requests, cancellations):
                 if fd in readable:
                     os.eventfd_read(fd)
-            if gate and gate.service(readable, worker, capture):
+            if gate and gate.service(readable, worker, capture, rollback):
                 return 0
             hold = gate is not None and gate.phase != "running"
             if worker:
@@ -464,6 +470,15 @@ def capture_state(outer, qmp, irq_fds, worker, fds):
         transfer(monitor, outer_fd)
     finally:
         monitor.close()
+    return pending
+
+
+def restore_interrupts(irq_fds, pending):
+    for gsi, count in pending.items():
+        index = int(gsi)
+        if not 0 <= index < len(irq_fds) or not 0 < count < (1 << 64) - 1:
+            raise RuntimeError("invalid ARM checkpoint pending interrupt")
+        os.eventfd_write(irq_fds[index], count)
 
 
 def transfer(monitor, fd, *, incoming=False):
@@ -603,19 +618,20 @@ def launch_arm(command, worker, memory_mib, child_mib, *, inherited=(), control=
                 restored_worker = create_worker(record["worker"]["vm_type"])
                 resources.callback(restored_worker.close)
                 restored_worker.restore(record["worker"], memory, irq_fds, child_fd, max_pages, outer_bytes)
-                for gsi, count in record["pending"].items():
-                    index = int(gsi)
-                    if not 0 <= index < len(irq_fds) or not 0 < count < (1 << 64) - 1:
-                        raise RuntimeError("invalid ARM checkpoint pending interrupt")
-                    os.eventfd_write(irq_fds[index], count)
+                restore_interrupts(irq_fds, record["pending"])
                 os.eventfd_write(replies, 1)
                 gate.phase = "frozen"
 
         def capture(worker, fds):
-            capture_state(outer, outer_qmp, irq_fds, worker, fds)
+            return capture_state(outer, outer_qmp, irq_fds, worker, fds)
+
+        def rollback(worker, pending):
+            worker.freeze_run_control(False)
+            restore_interrupts(irq_fds, pending)
 
         return serve_commands(outer, mailbox, requests, cancellations, replies, irq_fds, create_worker,
-                              memory, outer_bytes, max_pages, gate=gate, capture=capture, worker=restored_worker)
+                              memory, outer_bytes, max_pages, gate=gate, capture=capture,
+                              rollback=rollback, worker=restored_worker)
 
 
 def main():
