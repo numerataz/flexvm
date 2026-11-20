@@ -443,11 +443,40 @@ impl Cow {
 /// checkpoint: pause-time contents, read out of the guest or taken from
 /// what faults rescued.
 pub struct CowPages<'a> {
-    pub guest: &'a dyn GuestPages,
-    pub cow: &'a Cow,
+    guest: &'a dyn GuestPages,
+    cow: &'a Cow,
     /// Test faults `ckpt_slow` and `ckpt_crawl`: how long to wait over each unit,
     /// asked before each one, so a copy goes on at full speed once they are disarmed.
-    pub slow: fn() -> Duration,
+    slow: fn() -> Duration,
+    abort_at: Option<usize>,
+}
+
+impl<'a> CowPages<'a> {
+    pub fn new(guest: &'a dyn GuestPages, cow: &'a Cow, slow: fn() -> Duration) -> Self {
+        Self { guest, cow, slow, abort_at: None }
+    }
+
+    /// Arm the test fault on this exact copy before checkpoint writers start.
+    pub fn abort_halfway(&mut self) {
+        self.abort_at = Some(self.cow.left() / 2);
+    }
+
+    /// The publish boundary also covers empty copies and completed reads that
+    /// never crossed the threshold in a writer.
+    pub fn abort_if_armed(&self) -> Result<()> {
+        if self.abort_at.is_some() {
+            self.cow.invalidate("the copy was aborted");
+            self.cow.check_active()?;
+        }
+        Ok(())
+    }
+
+    fn check_abort_progress(&self) -> Result<()> {
+        if self.abort_at.is_some_and(|left| self.cow.left() <= left) {
+            self.abort_if_armed()?;
+        }
+        Ok(())
+    }
 }
 
 impl GuestPages for CowPages<'_> {
@@ -460,6 +489,7 @@ impl GuestPages for CowPages<'_> {
         cow.writing.store(true, Ordering::SeqCst);
         std::thread::sleep((self.slow)());
         cow.check_active()?;
+        self.check_abort_progress()?;
         let n = buf.len() / PAGE_SIZE;
         let mine: Vec<bool> = (0..n).map(|i| cow.claim(page + i, PENDING, READING)).collect();
         // Runs of pages claimed here, read straight out of the guest.
@@ -521,7 +551,7 @@ impl GuestPages for CowPages<'_> {
             done.1.push(slot);
             cow.set(p, CLEAN);
         }
-        Ok(())
+        self.check_abort_progress()
     }
 
     fn wanted(&self) -> Option<usize> {
@@ -938,6 +968,33 @@ mod tests {
     }
 
     #[test]
+    fn midpoint_fault_stops_only_the_copy_armed_for_it() {
+        let live = Live { pages: StdMutex::new(vec![0x5a; 4 * PAGE_SIZE]) };
+        let runs = vec![(0, 4, REMOTE)];
+        let aborted = Cow::new(4, &runs);
+        let mut pages = CowPages::new(&live, &aborted, || Duration::ZERO);
+        pages.abort_halfway();
+
+        let mut bytes = vec![0; PAGE_SIZE];
+        pages.read(0, &mut bytes).unwrap();
+        assert_eq!(aborted.left(), 3);
+        assert!(pages.read(1, &mut bytes).unwrap_err().to_string().contains("aborted"));
+        assert_eq!(aborted.left(), 2);
+
+        let next = Cow::new(4, &runs);
+        let pages = CowPages::new(&live, &next, || Duration::ZERO);
+        pages.read(1, &mut bytes).unwrap();
+        pages.abort_if_armed().unwrap();
+        assert!(next.active());
+        assert!(bytes.iter().all(|&byte| byte == 0x5a));
+
+        let empty = Cow::new(4, &vec![]);
+        let mut pages = CowPages::new(&live, &empty, || Duration::ZERO);
+        pages.abort_halfway();
+        assert!(pages.abort_if_armed().unwrap_err().to_string().contains("aborted"));
+    }
+
+    #[test]
     fn writes_after_the_pause_never_reach_the_copy() {
         let n = 64;
         let live = Live { pages: StdMutex::new((0..n * PAGE_SIZE).map(|i| (i / PAGE_SIZE) as u8).collect()) };
@@ -950,7 +1007,7 @@ mod tests {
         // Page 5 is being saved by a fault while the writer gets there.
         assert!(cow.claim(5, PENDING, RESCUING));
         assert!(!cow.claim(5, PENDING, READING), "one saver per page");
-        let pages = CowPages { guest: &live, cow: &cow, slow: || Duration::ZERO };
+        let pages = CowPages::new(&live, &cow, || Duration::ZERO);
         let mut buf = vec![0u8; 8 * PAGE_SIZE];
         std::thread::scope(|s| {
             s.spawn(|| {
@@ -1006,7 +1063,7 @@ mod tests {
             assert!(cow.claim(1, PENDING, RESCUING));
             let gate = Gate { entered: std::sync::Barrier::new(2), go: std::sync::Barrier::new(2) };
             let guest = Retry { gate: &gate, cow: &cow, fail };
-            let pages = CowPages { guest: &guest, cow: &cow, slow: || Duration::ZERO };
+            let pages = CowPages::new(&guest, &cow, || Duration::ZERO);
             let mut buf = vec![0; 2 * PAGE_SIZE];
             let result = std::thread::scope(|s| {
                 let writer = s.spawn(|| pages.read(0, &mut buf));
@@ -1037,7 +1094,7 @@ mod tests {
             let cow = Cow::new(1, &vec![(0, 1, REMOTE)]);
             let live = Live { pages: StdMutex::new(vec![9u8; PAGE_SIZE]) };
             assert!(cow.claim(0, PENDING, RESCUING));
-            let pages = CowPages { guest: &live, cow: &cow, slow: || Duration::ZERO };
+            let pages = CowPages::new(&live, &cow, || Duration::ZERO);
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::scope(|s| {
                 s.spawn(|| {
@@ -1085,7 +1142,7 @@ mod tests {
         for p in claimed {
             live.pages.lock().unwrap()[p * PAGE_SIZE..(p + 1) * PAGE_SIZE].fill(0xee);
         }
-        let pages = CowPages { guest: &live, cow: &cow, slow: || Duration::ZERO };
+        let pages = CowPages::new(&live, &cow, || Duration::ZERO);
         let mut buf = vec![0; 6 * PAGE_SIZE];
         pages.read(0, &mut buf).unwrap();
         for (p, bytes) in buf.chunks(PAGE_SIZE).enumerate() {
@@ -1169,7 +1226,7 @@ mod tests {
             assert!(cow.claim(1, PENDING, RESCUING));
             cow.rescue_copies(1, 2, [(1, vec![1u8; PAGE_SIZE].into())]);
             let gate = Gate { entered: std::sync::Barrier::new(2), go: std::sync::Barrier::new(2) };
-            let pages = CowPages { guest: &gate, cow: &cow, slow: || Duration::ZERO };
+            let pages = CowPages::new(&gate, &cow, || Duration::ZERO);
             let mut buf = vec![0u8; 2 * PAGE_SIZE];
             let e = std::thread::scope(|s| {
                 let w = s.spawn(|| pages.read(0, &mut buf));
@@ -1226,7 +1283,7 @@ mod tests {
         assert!(cow.over_budget());
         // A writer whose read fails gives its pages back, which wakes faults waiting on them.
         let fail = Fail;
-        let pages = CowPages { guest: &fail, cow: &cow, slow: || Duration::ZERO };
+        let pages = CowPages::new(&fail, &cow, || Duration::ZERO);
         cow.wait_for(4, PENDING);
         assert!(!woken(), "page 4 is wanted while over budget");
         assert!(pages.read(3, &mut vec![0u8; 2 * PAGE_SIZE]).is_err());
@@ -1272,7 +1329,7 @@ mod tests {
         assert_eq!(cow.left(), 6);
         assert_eq!((cow.state(2), cow.state(9)), (HELD, CLEAN));
         assert!(!cow.claim(2, PENDING, RESCUING) && !cow.claim(3, PENDING, READING));
-        let pages = CowPages { guest: &live, cow: &cow, slow: || Duration::ZERO };
+        let pages = CowPages::new(&live, &cow, || Duration::ZERO);
         let mut buf = vec![0u8; 8 * PAGE_SIZE];
         pages.read(0, &mut buf).unwrap();
         for (i, p) in buf.chunks(PAGE_SIZE).enumerate() {
@@ -1317,7 +1374,7 @@ mod tests {
         let cow = Cow::new(n, &vec![(0, n as u64, REMOTE)]);
         cow.hold(Arc::new(Held::of(&[(0, 0xaa), (1, 0xbb)])));
         let progress_before = *cow.progress.0.lock().unwrap();
-        let pages = CowPages { guest: &live, cow: &cow, slow: || Duration::ZERO };
+        let pages = CowPages::new(&live, &cow, || Duration::ZERO);
         let mut buf = vec![0u8; n * PAGE_SIZE];
         pages.read(0, &mut buf).unwrap();
         assert_eq!(*cow.progress.0.lock().unwrap(), progress_before);
