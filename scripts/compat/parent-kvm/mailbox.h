@@ -3,7 +3,7 @@
 #define FLEXVM_PVKVM_MAILBOX_H
 
 #define PVKVM_MAGIC        0x4d564b46
-#define PVKVM_VERSION      28
+#define PVKVM_VERSION      29
 #define PVKVM_MAGIC_AT     0
 #define PVKVM_VERSION_AT   4
 #define PVKVM_REQUEST_AT   8
@@ -37,6 +37,8 @@
 #define PVKVM_PIO_BYTES      4096
 #define PVKVM_IRQCHIP_AT     0x87000
 #define PVKVM_IRQCHIP_BYTES  520
+#define PVKVM_PIT_STATE_AT   0x87300
+#define PVKVM_PIT_STATE_BYTES 112
 #define PVKVM_IOAPIC_GPA     0xfec00000ULL
 #define PVKVM_GSI_COUNT      24
 #define PVKVM_REGISTERS_AT   64
@@ -106,6 +108,8 @@ enum pvkvm_command {
 	PVKVM_COMPLETE_READ,
 	PVKVM_GET_IRQCHIP,
 	PVKVM_SET_IRQCHIP,
+	PVKVM_GET_PIT,
+	PVKVM_SET_PIT,
 };
 
 #endif

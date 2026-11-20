@@ -123,6 +123,9 @@ Add `--lapic` to read the reset xAPIC image, stage LINT0 and LINT1 before
 the first run, and update the stopped controller. The guest receives a PIC
 interrupt through the installed state, then changes LINT1 through MMIO.
 The test checks that restoring ICR contents does not send an interrupt.
+Add `--pit-state` to stage a timer latch and the speaker state before
+execution. The guest consumes the latch and updates the speaker port. The
+VMM then restores a live one-shot timer and the interrupt wakes the guest.
 Add `--irqchip-state` to read and update the parent PIC and IOAPIC state.
 The VMM installs an IOAPIC route before the first run, reads the live PIC
 configuration, and verifies that the new IOAPIC route delivers a guest

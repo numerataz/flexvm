@@ -1145,6 +1145,7 @@ static long device_capability(unsigned long capability)
 	case KVM_CAP_IOEVENTFD_ANY_LENGTH:
 	case KVM_CAP_PIT:
 	case KVM_CAP_PIT2:
+	case KVM_CAP_PIT_STATE2:
 	case KVM_CAP_IRQFD:
 	case KVM_CAP_SET_TSS_ADDR:
 	case KVM_CAP_IRQCHIP:
@@ -1450,6 +1451,47 @@ static long create_pit(struct pvvm *vm, struct kvm_pit_config __user *user)
 	return result;
 }
 
+static long access_pit_state(struct pvvm *vm, bool write, struct kvm_pit_state2 __user *user)
+{
+	struct pvkvm *p = vm->provider;
+	struct kvm_pit_state2 state;
+	unsigned int i;
+	int result;
+
+	if (write && copy_from_user(&state, user, sizeof(state)))
+		return -EFAULT;
+	if (write) {
+		if (state.flags & ~(KVM_PIT_FLAGS_HPET_LEGACY | KVM_PIT_FLAGS_SPEAKER_DATA_ON))
+			return -EINVAL;
+		for (i = 0; i < ARRAY_SIZE(state.channels); i++) {
+			const struct kvm_pit_channel_state *ch = &state.channels[i];
+
+			if (ch->count > 65536 || ch->count_latched > 3 || ch->status_latched > 1 ||
+			    ch->read_state > 4 || ch->write_state > 4 || ch->rw_mode > 3 ||
+			    (ch->mode > 7 && ch->mode != 0xff) || ch->bcd > 1 || ch->gate > 1)
+				return -EINVAL;
+		}
+	}
+	result = mutex_lock_interruptible(&p->lock);
+	if (result)
+		return result;
+	if (!vm->pit_created) {
+		result = -ENXIO;
+	} else if (p->dead) {
+		result = -ENODEV;
+	} else {
+		if (write)
+			memcpy_toio(p->mailbox + PVKVM_PIT_STATE_AT, &state, sizeof(state));
+		result = request(p, write ? PVKVM_SET_PIT : PVKVM_GET_PIT, NULL, NULL);
+		if (!result && !write)
+			memcpy_fromio(&state, p->mailbox + PVKVM_PIT_STATE_AT, sizeof(state));
+	}
+	mutex_unlock(&p->lock);
+	if (!result && !write && copy_to_user(user, &state, sizeof(state)))
+		return -EFAULT;
+	return result;
+}
+
 static bool valid_tss_address(unsigned long gpa)
 {
 	if (!PAGE_ALIGNED(gpa) || gpa > (1ULL << 32) - PVKVM_TSS_SIZE)
@@ -1529,6 +1571,8 @@ static long vm_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 		return create_pit(vm, NULL);
 	if (cmd == KVM_CREATE_PIT2)
 		return arg ? create_pit(vm, (void __user *)arg) : -EFAULT;
+	if (cmd == KVM_GET_PIT2 || cmd == KVM_SET_PIT2)
+		return access_pit_state(vm, cmd == KVM_SET_PIT2, (void __user *)arg);
 	if (cmd == KVM_SET_TSS_ADDR)
 		return set_tss_address(vm, arg);
 	if (cmd != KVM_SET_USER_MEMORY_REGION)
@@ -1724,8 +1768,10 @@ static int pvkvm_probe(struct pci_dev *dev, const struct pci_device_id *id)
 	BUILD_BUG_ON(PVKVM_LAPIC_AT + PVKVM_LAPIC_BYTES > PVKVM_PIO_DATA_AT);
 	BUILD_BUG_ON(PVKVM_PIO_DATA_AT + PVKVM_PIO_BYTES > PVKVM_IRQCHIP_AT);
 	BUILD_BUG_ON(sizeof(struct kvm_irqchip) != PVKVM_IRQCHIP_BYTES);
+	BUILD_BUG_ON(PVKVM_IRQCHIP_AT + PVKVM_IRQCHIP_BYTES > PVKVM_PIT_STATE_AT);
+	BUILD_BUG_ON(sizeof(struct kvm_pit_state2) != PVKVM_PIT_STATE_BYTES);
 	if (pci_resource_len(dev, 0) < PVKVM_DOORBELL_AT + sizeof(u32) ||
-	    pci_resource_len(dev, 2) < PVKVM_IRQCHIP_AT + PVKVM_IRQCHIP_BYTES)
+	    pci_resource_len(dev, 2) < PVKVM_PIT_STATE_AT + PVKVM_PIT_STATE_BYTES)
 		return -ENODEV;
 	result = pcim_enable_device(dev);
 	if (result)

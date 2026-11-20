@@ -107,6 +107,25 @@ static void reset_irqchips(void)
     close(kvm);
 }
 
+static void query_unstarted_pit(unsigned int flags, bool restore)
+{
+    int kvm = host_kvm();
+    int vm = ioctl(kvm, KVM_CREATE_VM, 0);
+    struct kvm_pit_config config = {.flags = flags};
+    struct kvm_pit_state2 pit;
+
+    check(vm >= 0 && ioctl(vm, KVM_CREATE_IRQCHIP, 0) == 0, "create a host reset irqchip");
+    check(ioctl(vm, KVM_CREATE_PIT2, &config) == 0, "create a host reset PIT");
+    if (restore) {
+        check(read(STDIN_FILENO, &pit, sizeof(pit)) == sizeof(pit), "read the staged PIT image");
+        check(ioctl(vm, KVM_SET_PIT2, &pit) == 0, "install the staged PIT image");
+    }
+    check(ioctl(vm, KVM_GET_PIT2, &pit) == 0, "read the host reset PIT");
+    check(write(STDOUT_FILENO, &pit, sizeof(pit)) == sizeof(pit), "write the reset PIT image");
+    close(vm);
+    close(kvm);
+}
+
 static struct pending_read reply_run(int control, struct kvm_run *run, int mapping_bytes)
 {
     if (run->exit_reason == KVM_EXIT_MMIO) {
@@ -154,6 +173,10 @@ int main(int argc, char **argv)
     }
     if (argc == 2 && !strcmp(argv[1], "--reset-irqchips")) {
         reset_irqchips();
+        return 0;
+    }
+    if (argc == 3 && (!strcmp(argv[1], "--reset-pit") || !strcmp(argv[1], "--staged-pit"))) {
+        query_unstarted_pit(number(argv[2], KVM_PIT_SPEAKER_DUMMY), !strcmp(argv[1], "--staged-pit"));
         return 0;
     }
     check(argc >= 10, "expected control, outer RAM, vCPU count, device configuration, and slots");
@@ -224,6 +247,7 @@ int main(int argc, char **argv)
     struct pvkvm_msr_batch msrs;
     struct pvkvm_cpuid_table cpuid;
     _Static_assert(sizeof(fpu) == PVKVM_FPU_BYTES && sizeof(cpuid) >= sizeof(fpu) &&
+                   sizeof(struct kvm_pit_state2) == PVKVM_PIT_STATE_BYTES &&
                    sizeof(lapic) == PVKVM_LAPIC_BYTES && sizeof(cpuid) >= sizeof(lapic) &&
                    sizeof(cpuid) >= PVKVM_PIO_BYTES + sizeof(uint32_t) &&
                    sizeof(cpuid) >= sizeof(segments) && sizeof(cpuid) >= sizeof(msrs),
@@ -298,6 +322,21 @@ int main(int argc, char **argv)
                 check(write(control, "K", 1) == 1, "acknowledge host irqchip state");
             else
                 check(write(control, &chip, sizeof(chip)) == sizeof(chip), "return host irqchip state");
+            continue;
+        }
+        if (received == 2 && request[0] == 'T') {
+            struct kvm_pit_state2 pit;
+
+            check(pit_request && ioctl(vm, KVM_GET_PIT2, &pit) == 0, "read the live host PIT");
+            check(write(control, &pit, sizeof(pit)) == sizeof(pit), "return the host PIT image");
+            continue;
+        }
+        if (received == 2 + sizeof(struct kvm_pit_state2) && request[0] == 'Y') {
+            struct kvm_pit_state2 pit;
+
+            memcpy(&pit, request + 2, sizeof(pit));
+            check(pit_request && ioctl(vm, KVM_SET_PIT2, &pit) == 0, "restore the live host PIT");
+            check(write(control, "Y", 1) == 1, "acknowledge the host PIT image");
             continue;
         }
         if (received == 2 && request[0] == 'F') {

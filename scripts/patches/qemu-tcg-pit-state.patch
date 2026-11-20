@@ -1,0 +1,238 @@
+--- a/hw/audio/pcspk.c
++++ b/hw/audio/pcspk.c
+@@ -170,2 +170,24 @@
+
++bool flexvm_pcspk_data_on(bool write, bool data_on)
++{
++    bool ambiguous = false;
++    Object *object = object_resolve_path_type("", TYPE_PC_SPEAKER, &ambiguous);
++    PCSpkState *s;
++
++    if (!object || ambiguous) {
++        return false;
++    }
++    s = PC_SPEAKER(object);
++    if (write) {
++        PITChannelInfo channel;
++
++        s->data_on = data_on;
++        if (s->voice) {
++            pit_get_channel_info(s->pit, 2, &channel);
++            AUD_set_active_out(s->voice, channel.gate && data_on);
++        }
++    }
++    return s->data_on;
++}
++
+ static const MemoryRegionOps pcspk_io_ops = {
+--- a/hw/timer/i8254.c
++++ b/hw/timer/i8254.c
+@@ -25,2 +25,3 @@
+ #include "qemu/osdep.h"
++#include "qemu/bswap.h"
+ #include "hw/irq.h"
+@@ -281,2 +282,87 @@
+ }
++
++/* Layout of the x86 KVM PIT_STATE2 userspace record. */
++#define FLEXVM_PIT_CHANNEL_SIZE 24
++#define FLEXVM_PIT_HPET_LEGACY 1
++
++static void flexvm_pit_channel(PITChannelState *s, bool write, uint8_t *record,
++                               int64_t now)
++{
++    if (write) {
++        uint32_t count = ldl_le_p(record);
++
++        s->count = count ? count : 65536;
++        s->latched_count = lduw_le_p(record + 4);
++        s->count_latched = record[6];
++        s->status_latched = record[7];
++        s->status = record[8];
++        s->read_state = record[9];
++        s->write_state = record[10];
++        s->write_latch = record[11];
++        s->rw_mode = record[12];
++        s->mode = record[13];
++        s->bcd = record[14];
++        s->gate = record[15];
++        /* KVM reloads the counters at SET_PIT2, using its local clock. */
++        s->count_load_time = now;
++    } else {
++        stl_le_p(record, s->count);
++        stw_le_p(record + 4, s->latched_count);
++        record[6] = s->count_latched;
++        record[7] = s->status_latched;
++        record[8] = s->status;
++        record[9] = s->read_state;
++        record[10] = s->write_state;
++        record[11] = s->write_latch;
++        record[12] = s->rw_mode;
++        record[13] = s->mode;
++        record[14] = s->bcd;
++        record[15] = s->gate;
++        stq_le_p(record + 16, s->count_load_time);
++    }
++}
++
++bool flexvm_pit_state(PITCommonState *pit, bool write,
++                      uint8_t record[FLEXVM_PIT_STATE_SIZE])
++{
++    PITChannelState *channel0 = &pit->channels[0];
++    const int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    const uint32_t flags = ldl_le_p(record + FLEXVM_PIT_FLAGS_OFFSET);
++
++    if (write) {
++        if (flags & ~(FLEXVM_PIT_HPET_LEGACY | FLEXVM_PIT_SPEAKER_DATA_ON)) {
++            return false;
++        }
++        for (size_t i = 0; i < ARRAY_SIZE(pit->channels); i++) {
++            uint8_t *channel = record + i * FLEXVM_PIT_CHANNEL_SIZE;
++
++            if (ldl_le_p(channel) > 65536 || channel[6] > 3 ||
++                channel[7] > 1 || channel[9] > 4 || channel[10] > 4 ||
++                channel[12] > 3 || (channel[13] > 7 && channel[13] != 0xff) ||
++                channel[14] > 1 || channel[15] > 1) {
++                return false;
++            }
++        }
++        for (size_t i = 0; i < ARRAY_SIZE(pit->channels); i++) {
++            flexvm_pit_channel(&pit->channels[i], true,
++                               record + i * FLEXVM_PIT_CHANNEL_SIZE, now);
++        }
++        channel0->irq_disabled = (flags & FLEXVM_PIT_HPET_LEGACY) != 0;
++        if (channel0->irq_disabled || channel0->mode > 5) {
++            timer_del(channel0->irq_timer);
++            channel0->next_transition_time = -1;
++            qemu_set_irq(channel0->irq, 0);
++        } else {
++            pit_irq_timer_update(channel0, now);
++        }
++    }
++    memset(record, 0, FLEXVM_PIT_STATE_SIZE);
++    for (size_t i = 0; i < ARRAY_SIZE(pit->channels); i++) {
++        flexvm_pit_channel(&pit->channels[i], false,
++                           record + i * FLEXVM_PIT_CHANNEL_SIZE, now);
++    }
++    stl_le_p(record + FLEXVM_PIT_FLAGS_OFFSET,
++             channel0->irq_disabled ? FLEXVM_PIT_HPET_LEGACY : 0);
++    return true;
++}
+
+--- a/include/hw/audio/pcspk.h
++++ b/include/hw/audio/pcspk.h
+@@ -29,2 +29,4 @@
+
++bool flexvm_pcspk_data_on(bool write, bool data_on);
++
+ #endif /* HW_PCSPK_H */
+--- a/include/hw/timer/i8254.h
++++ b/include/hw/timer/i8254.h
+@@ -80,2 +80,8 @@
+
++#define FLEXVM_PIT_STATE_SIZE 112
++#define FLEXVM_PIT_FLAGS_OFFSET 72
++#define FLEXVM_PIT_SPEAKER_DATA_ON 2
++bool flexvm_pit_state(PITCommonState *pit, bool write,
++                      uint8_t record[FLEXVM_PIT_STATE_SIZE]);
++
+ #endif /* HW_I8254_H */
+--- a/qapi/misc-i386.json
++++ b/qapi/misc-i386.json
+@@ -796 +796,22 @@
+   'features': [ 'unstable' ] }
++
++##
++# @FlexvmX86PitRecord:
++#
++# @record: Hex-encoded Linux KVM PIT_STATE2 image.
++##
++{ 'struct': 'FlexvmX86PitRecord', 'data': { 'record': 'str' } }
++
++##
++# @x-flexvm-access-x86-pit:
++#
++# Read or install the i8254 state for a stopped x86 worker.
++#
++# @record: New hex-encoded timer state, when writing.
++#
++# Features:
++#
++# @unstable: Experimental FlexVM worker protocol.
++##
++{ 'command': 'x-flexvm-access-x86-pit', 'data': { '*record': 'str' },
++  'returns': 'FlexvmX86PitRecord', 'features': [ 'unstable' ] }
+--- a/stubs/monitor-i386-flexvm.c
++++ b/stubs/monitor-i386-flexvm.c
+@@ -88 +88,7 @@
+ }
++
++FlexvmX86PitRecord *qmp_x_flexvm_access_x86_pit(const char *record, Error **errp)
++{
++    error_setg(errp, "FlexVM PIT state requires an x86 worker");
++    return NULL;
++}
+--- a/target/i386/monitor.c
++++ b/target/i386/monitor.c
+@@ -35,2 +35,3 @@
+ #include "qapi/util.h"
++#include "hw/audio/pcspk.h"
+ #include "hw/i386/apic.h"
+@@ -39,2 +40,3 @@
+ #include "hw/irq.h"
++#include "hw/timer/i8254.h"
+ #include "system/runstate.h"
+@@ -1169,2 +1171,53 @@
+     return result;
++}
++
++FlexvmX86PitRecord *qmp_x_flexvm_access_x86_pit(const char *record, Error **errp)
++{
++    static const char hex[] = "0123456789abcdef";
++    uint8_t bytes[FLEXVM_PIT_STATE_SIZE] = { 0 };
++    FlexvmX86PitRecord *result;
++    bool ambiguous = false;
++    Object *pit;
++    bool speaker_data;
++
++    if (!flexvm_stopped_cpu(0, errp)) {
++        return NULL;
++    }
++    pit = object_resolve_path_type("", TYPE_I8254, &ambiguous);
++    if (!pit || ambiguous) {
++        error_setg(errp, "FlexVM requires exactly one emulated i8254");
++        return NULL;
++    }
++    if (record) {
++        if (strlen(record) != 2 * sizeof(bytes)) {
++            error_setg(errp, "Invalid FlexVM PIT image size");
++            return NULL;
++        }
++        for (size_t i = 0; i < sizeof(bytes); i++) {
++            int high = g_ascii_xdigit_value(record[2 * i]);
++            int low = g_ascii_xdigit_value(record[2 * i + 1]);
++
++            if (high < 0 || low < 0) {
++                error_setg(errp, "Invalid hex in FlexVM PIT image");
++                return NULL;
++            }
++            bytes[i] = (high << 4) | low;
++        }
++    }
++    speaker_data = (bytes[FLEXVM_PIT_FLAGS_OFFSET] & FLEXVM_PIT_SPEAKER_DATA_ON) != 0;
++    if (!flexvm_pit_state(PIT_COMMON(pit), record != NULL, bytes)) {
++        error_setg(errp, "Invalid FlexVM PIT state");
++        return NULL;
++    }
++    if (flexvm_pcspk_data_on(record != NULL, speaker_data)) {
++        bytes[FLEXVM_PIT_FLAGS_OFFSET] |= FLEXVM_PIT_SPEAKER_DATA_ON;
++    }
++    result = g_new(FlexvmX86PitRecord, 1);
++    result->record = g_malloc(2 * sizeof(bytes) + 1);
++    for (size_t i = 0; i < sizeof(bytes); i++) {
++        result->record[2 * i] = hex[bytes[i] >> 4];
++        result->record[2 * i + 1] = hex[bytes[i] & 15];
++    }
++    result->record[2 * sizeof(bytes)] = '\0';
++    return result;
+ }

@@ -42,7 +42,8 @@ EFER_LONG_MODE_ACTIVE = 1 << 10
 EFER_LONG_MODE_ENABLE = 1 << 8
 (OPEN_VM, CLOSE_VM, OPEN_CPU, CLOSE_CPU, RUN, GET_REGS, SET_REGS, GET_SREGS,
  GET_FPU, SET_FPU, GET_MSRS, SET_MSRS, GET_SUPPORTED_CPUID, CREATE_IRQCHIP, SET_IRQ_LINE,
- CREATE_PIT, SET_TSS_ADDR, GET_LAPIC, SET_LAPIC, COMPLETE_READ, GET_IRQCHIP, SET_IRQCHIP) = range(1, 23)
+ CREATE_PIT, SET_TSS_ADDR, GET_LAPIC, SET_LAPIC, COMPLETE_READ, GET_IRQCHIP, SET_IRQCHIP,
+ GET_PIT, SET_PIT) = range(1, 25)
 FPU_VALID_AT = 48
 FPU_AT = 768
 FPU_SIZE = 416
@@ -71,6 +72,8 @@ IRQCHIP_AT = 0x87000
 IRQCHIP_SIZE = 520
 IRQCHIP_HEADER = struct.Struct("<II")
 IRQCHIP_PAYLOAD_SIZES = (16, 16, 216)
+PIT_STATE_AT = 0x87300
+PIT_STATE_SIZE = 112
 PIO_WRITES = ((0x3f8, 1, b"L"), (0x2f8, 2, b"\xcd\xab"),
               (0xcf8, 4, b"\x00\x00\x00\x80"), (0x3f8, 1, b"vmio"))
 PIO_READS = ((0x3fd, 1, b"\x60"), (0x2f8, 2, b"\x67\x45"),
@@ -578,6 +581,12 @@ class TcgChild:
         payload = record[IRQCHIP_HEADER.size:IRQCHIP_HEADER.size + IRQCHIP_PAYLOAD_SIZES[chip_id]]
         self.special_command("x-flexvm-access-x86-irqchip", {"chip-id": chip_id, "record": payload.hex()})
 
+    def pit_state(self):
+        return parse_pit_state(self.special_command("x-flexvm-access-x86-pit", {}))
+
+    def set_pit_state(self, record):
+        self.special_command("x-flexvm-access-x86-pit", {"record": record.hex()})
+
     def pulse_irq(self, gsi):
         self.special_command("x-flexvm-pulse-x86-gsi", {"gsi": gsi})
 
@@ -721,6 +730,18 @@ class KvmChild:
         self.channel.connection.sendall(b"K\0" + record)
         if self.channel.connection.recv(2) != b"K":
             raise RuntimeError("native parent worker did not acknowledge the irqchip write")
+
+    def pit_state(self):
+        self.channel.connection.sendall(b"T\0")
+        result = self.channel.connection.recv(PIT_STATE_SIZE + 1)
+        if len(result) != PIT_STATE_SIZE:
+            raise RuntimeError("native parent worker returned an invalid PIT image")
+        return result
+
+    def set_pit_state(self, record):
+        self.channel.connection.sendall(b"Y\0" + record)
+        if self.channel.connection.recv(2) != b"Y":
+            raise RuntimeError("native parent worker did not acknowledge the PIT write")
 
     def close(self):
         if self.channel is not None:
@@ -871,6 +892,26 @@ def reset_irqchips(engine, qemu, output, control, cpu_count):
                 for id in range(count)]
 
 
+def parse_pit_state(snapshot):
+    record = bytes.fromhex(snapshot["record"])
+    if len(record) != PIT_STATE_SIZE:
+        raise RuntimeError("TCG parent worker returned an invalid PIT image")
+    return record
+
+
+def unstarted_pit_state(engine, qemu, output, control, flags, staged):
+    if engine == "kvm":
+        option = "--reset-pit" if staged is None else "--staged-pit"
+        native = subprocess.run([output / "native-worker", option, str(flags)], input=staged,
+                                capture_output=True, timeout=3)
+        if native.returncode or len(native.stdout) != PIT_STATE_SIZE:
+            raise RuntimeError(f"native unstarted PIT query failed: {native.stderr.decode(errors='replace')}")
+        return native.stdout
+    with model_monitor(qemu, output, control, 1, "pit") as monitor:
+        args = {} if staged is None else {"record": staged.hex()}
+        return parse_pit_state(monitor.ask("x-flexvm-access-x86-pit", args))
+
+
 def read_slot_table(mailbox, ram_pages, outer_bytes, protected_entry, split_slot, zero_slot):
     first_gpa = PROTECTED_GPA if protected_entry else PAGE_SIZE
     if zero_slot:
@@ -952,7 +993,7 @@ def verify_slot_spans(pid, slots):
 def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, protected_entry,
              split_slot, interrupt_run, cpu_count, long_mode, fpu, msrs, cpuid, mmio, mmio_read,
              ioeventfd, irqchip, pit, irqfd, zero_slot, tss, lapic, pio, complete_read, pio_boundary, pvh,
-             irqchip_state):
+             irqchip_state, pit_state):
     reset = bytearray(64 << 10)
     reset[0xfff0] = 0xf4  # Halt if register setup did not select the client's code.
     (output / "reset.rom").write_bytes(reset)
@@ -964,6 +1005,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         expected.append(CREATE_IRQCHIP)
         if pit:
             expected.append(CREATE_PIT)
+        if pit_state:
+            expected.extend((GET_PIT, SET_PIT, GET_PIT))
         if irqchip_state:
             expected.extend((GET_IRQCHIP, GET_IRQCHIP, GET_IRQCHIP, SET_IRQCHIP))
         expected.append(SET_IRQ_LINE)
@@ -1022,7 +1065,11 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         expected_counters.append(0x6543)
         expected_io.append((0, 0x7c))
     if pit:
-        expected.extend((SET_REGS, RUN, GET_REGS))
+        expected.extend((SET_REGS, RUN))
+        if pit_state:
+            expected.extend((GET_PIT, SET_PIT, GET_PIT, RUN))
+            expected_io.append((0, 0x5b))
+        expected.append(GET_REGS)
         expected_counters.append(0x4321)
         expected_io.append((0, 0x5c))
     if irqfd:
@@ -1045,6 +1092,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
     pending_read = None
     irqchip_created = False
     pit_flags = None
+    staged_pit = None
     tss_gpa = None
     irq_levels = []
     expected_irq_levels = IRQ_LEVELS + ([(6, 1), (6, 0)] if irqchip_state else []) if irqchip else []
@@ -1070,7 +1118,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         cleanup.callback(os.close, memory)
         os.ftruncate(memory, MAILBOX_SIZE)
         mapping = cleanup.enter_context(mmap.mmap(memory, MAILBOX_SIZE))
-        struct.pack_into("<II", mapping, 0, 0x4d564b46, 28)
+        struct.pack_into("<II", mapping, 0, 0x4d564b46, 29)
         outer_ram = os.memfd_create("flexvm-outer-ram", os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING)
         cleanup.callback(os.close, outer_ram)
         os.ftruncate(outer_ram, outer_ram_size)
@@ -1152,6 +1200,19 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 if length or not irqchip_created or pit_flags is not None or flags & ~KVM_PIT_SPEAKER_DUMMY:
                     raise RuntimeError("invalid PIT creation request")
                 pit_flags = flags
+            elif opcode in (GET_PIT, SET_PIT):
+                if length or pit_flags is None:
+                    raise RuntimeError("PIT state requires an initialized timer")
+                if opcode == GET_PIT:
+                    record = (child.pit_state() if child is not None else
+                              unstarted_pit_state(parent_engine, qemu, output, control, pit_flags, staged_pit))
+                    mapping[PIT_STATE_AT:PIT_STATE_AT + PIT_STATE_SIZE] = record
+                else:
+                    record = mapping[PIT_STATE_AT:PIT_STATE_AT + PIT_STATE_SIZE]
+                    if child is None:
+                        staged_pit = record
+                    else:
+                        child.set_pit_state(record)
             elif opcode in (GET_IRQCHIP, SET_IRQCHIP):
                 record = mapping[IRQCHIP_AT:IRQCHIP_AT + IRQCHIP_SIZE]
                 id = IRQCHIP_HEADER.unpack_from(record)[0]
@@ -1217,6 +1278,8 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                     extents = verify_slot_spans(child.process.pid, slots)
                     for id, image in staged_irqchips.items():
                         child.set_irqchip(id, image)
+                    if staged_pit is not None:
+                        child.set_pit_state(staged_pit)
                     for line, level in staged_irq_levels:
                         child.set_irq(line, level)
                 elif length:
@@ -1350,6 +1413,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
                 or ioeventfd and "PASS KVM_IOEVENTFD signaled matched MMIO and PIO writes" not in guest
                 or irqchip and "PASS child PIC delivered and acknowledged the parent IRQ" not in guest
                 or pit and "PASS PIT woke the halted vCPU" not in guest
+                or pit_state and "PASS restored live PIT state woke the halted vCPU" not in guest
                 or irqfd and "PASS KVM_IRQFD woke an active run and honored deassignment and pending signals" not in guest
                 or zero_slot and "PASS zero-based RAM shared every tested page across the legacy PC region" not in guest
                 or tss and "PASS child ran with Firecracker's three-page TSS reservation" not in guest
@@ -1394,6 +1458,7 @@ def exercise(qemu, kernel, output, reject_close, parent_engine, ram_pages, prote
         "irq_levels": irq_levels,
         "irqchip_state": irqchip_state,
         "pit_flags": pit_flags,
+        "pit_state": pit_state,
         "irqfd": irqfd,
         "tcg_irqfd_pulses": pulses,
         "zero_based_ram": zero_slot,
@@ -1445,6 +1510,7 @@ def main():
     parser.add_argument("--ioeventfd", action="store_true", help="signal guest eventfds for MMIO and port writes")
     parser.add_argument("--irqchip", action="store_true", help="deliver a real PIC interrupt on a stopped worker")
     parser.add_argument("--pit", action="store_true", help="program a PIT interrupt that wakes a halted worker")
+    parser.add_argument("--pit-state", action="store_true", help="restore timer state and verify a real wakeup")
     parser.add_argument("--irqfd", action="store_true", help="wake an active run through KVM_IRQFD")
     parser.add_argument("--zero-slot", action="store_true", help="share RAM at GPA zero across the PC legacy region")
     parser.add_argument("--tss", action="store_true", help="reserve Firecracker's x86 TSS address")
@@ -1465,6 +1531,8 @@ def main():
         args.zero_slot = args.protected_entry = True
         if args.ram_pages < 8192:
             parser.error("--pvh needs at least 8192 pages for the kernel entry point")
+    if args.pit_state:
+        args.pit = True
     if args.pit or args.irqfd or args.tss or args.lapic or args.irqchip_state:
         args.irqchip = True
     if args.pit and args.irqfd:
@@ -1512,7 +1580,7 @@ def main():
                                   2 if args.two_vcpus else 1, args.long_mode, args.fpu, args.msrs, args.cpuid,
                                   args.mmio_write, args.mmio_read, args.ioeventfd, args.irqchip, args.pit,
                                   args.irqfd, args.zero_slot, args.tss, args.lapic, args.pio, args.complete_read,
-                                  args.pio_boundary, args.pvh, args.irqchip_state)))
+                                  args.pio_boundary, args.pvh, args.irqchip_state, args.pit_state)))
         return 0
     if args.kernel_build is None:
         parser.error("--kernel-build needs the development tree matching --kernel")
@@ -1580,6 +1648,8 @@ def main():
                 oracle.append("pvh")
             if args.irqchip_state:
                 oracle.append("irqchip-state")
+            if args.pit_state:
+                oracle.append("pit-state")
             HELPERS["run"](oracle, 14 if args.interrupt_run else 8, output / "native-kvm.log")
             report["same_client_passed_native_kvm"] = True
             report["native_client_run_ns"] = client_timings((output / "native-kvm.log").read_text())
@@ -1629,6 +1699,8 @@ def main():
             files["pvh"] = b""
         if args.irqchip_state:
             files["irqchip-state"] = b""
+        if args.pit_state:
+            files["pit-state"] = b""
         image = HELPERS["initramfs"](init.read_bytes(), files=files)
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
@@ -1671,6 +1743,7 @@ def main():
                             *(["--pio-boundary"] if args.pio_boundary else []),
                             *(["--pvh"] if args.pvh else []),
                             *(["--irqchip-state"] if args.irqchip_state else []),
+                            *(["--pit-state"] if args.pit_state else []),
                             *(["--reject-close"] if args.reject_close else [])], 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}
@@ -1682,7 +1755,7 @@ def main():
             workers = {line.split()[0] for line in lines if worker_path in line and line.endswith(" = 0")}
             kvm_users = {line.split()[0] for line in lines if '"/dev/kvm"' in line}
             reset_queries = 2 if args.two_vcpus else 1
-            model_queries = int(args.cpuid) + int(args.lapic) + int(args.irqchip_state)
+            model_queries = int(args.cpuid) + int(args.lapic) + int(args.irqchip_state) + 2 * int(args.pit_state)
             if len(workers) != 1 + model_queries + reset_queries or kvm_users != workers:
                 raise RuntimeError("only the native parent worker may use host KVM")
         report.update(json.loads(worker.read_text()), status="passed", host_device_access=bool(devices),

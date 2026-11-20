@@ -687,7 +687,34 @@ static void configure_irqchip_state(int vm)
     check(ioctl(vm, KVM_SET_IRQCHIP, &ioapic) == 0, "stage the IOAPIC route before first execution");
 }
 
-static void prepare_pic(int vm, unsigned char *ram, uint32_t gpa, bool pit, bool lapic, bool irqchip_state)
+static struct kvm_pit_state2 read_pit_state(int vm)
+{
+    struct kvm_pit_state2 state;
+
+    check(ioctl(vm, KVM_GET_PIT2, &state) == 0, "read the actual PIT state");
+    return state;
+}
+
+static void stage_pit_state(int vm)
+{
+    struct kvm_pit_state2 state = read_pit_state(vm);
+
+    check(state.flags == 0 && state.channels[0].count == 65536, "read the reset PIT");
+    state.flags = KVM_PIT_FLAGS_SPEAKER_DATA_ON;
+    state.channels[0].mode = 0xff;
+    state.channels[2] = (struct kvm_pit_channel_state) {
+        .latched_count = 0x4321, .count_latched = 3, .read_state = 3,
+        .write_state = 3, .rw_mode = 3, .mode = 0, .gate = 1,
+    };
+    check(ioctl(vm, KVM_SET_PIT2, &state) == 0, "stage timer latches and speaker state");
+    state = read_pit_state(vm);
+    check(state.channels[2].count == 65536 && state.channels[2].latched_count == 0x4321 &&
+          state.channels[2].count_latched == 3 && state.flags == KVM_PIT_FLAGS_SPEAKER_DATA_ON,
+          "observe normalized staged counts, latch and speaker");
+}
+
+static void prepare_pic(int vm, unsigned char *ram, uint32_t gpa, bool pit, bool lapic,
+                        bool irqchip_state, bool pit_state)
 {
     check(ioctl(vm, KVM_CREATE_IRQCHIP, 0) == 0, "create the x86 irqchip");
     check(ioctl(vm, KVM_CREATE_IRQCHIP, 0) == -1 && errno == EEXIST, "reject duplicate irqchip creation");
@@ -696,8 +723,17 @@ static void prepare_pic(int vm, unsigned char *ram, uint32_t gpa, bool pit, bool
     if (pit) {
         struct kvm_pit_config config = {.flags = KVM_PIT_SPEAKER_DUMMY};
         check(ioctl(vm, KVM_CHECK_EXTENSION, KVM_CAP_PIT2) > 0, "check PIT support");
+        if (pit_state) {
+            struct kvm_pit_state2 state;
+
+            check(ioctl(vm, KVM_CHECK_EXTENSION, KVM_CAP_PIT_STATE2) > 0, "check PIT_STATE2 support");
+            check(ioctl(vm, KVM_GET_PIT2, &state) == -1 && errno == ENXIO,
+                  "reject a PIT state query before creating the timer");
+        }
         check(ioctl(vm, KVM_CREATE_PIT2, &config) == 0, "create the x86 PIT");
         check(ioctl(vm, KVM_CREATE_PIT, 0) == -1 && errno == EEXIST, "reject duplicate PIT creation");
+        if (pit_state)
+            stage_pit_state(vm);
     }
     set_irq_line(vm, PIC_GSI, 0);
 
@@ -836,33 +872,71 @@ static void reconfigure_lapic(int cpu)
           !(lapic_reg(&lapic, 0x210) & (1U << 8)), "restore LAPIC state without sending an IPI");
 }
 
-static void test_pit(int cpu, struct kvm_run *run, int size, unsigned char *ram, unsigned char *data,
-                     uint64_t gpa, uint64_t data_address)
+static void test_pit(int vm, int cpu, struct kvm_run *run, int size, unsigned char *ram, unsigned char *data,
+                     uint64_t gpa, uint64_t data_address, bool pit_state)
 {
-    const unsigned char pit_program[] = {
+    const unsigned char setup_pic[] = {
         0xb0, 0x11, 0xe6, 0x20, /* reset master PIC to clear pending edges */
         0xb0, 0x20, 0xe6, 0x21, /* deliver IRQ0 at vector 32 */
         0xb0, 0x04, 0xe6, 0x21, /* slave PIC on input 2 */
         0xb0, 0x01, 0xe6, 0x21, /* 8086 mode */
         0xb0, 0xff, 0xe6, 0x21, /* mask all master inputs */
+    };
+    const unsigned char program_pit[] = {
         0xb0, 0x30, 0xe6, 0x43, /* channel 0, low then high, one-shot mode */
         0xb0, 0x9b, 0xe6, 0x40, /* low byte of 11931 ticks */
         0xb0, 0x2e, 0xe6, 0x40, /* high byte, nominal delay 10 ms */
+    };
+    const unsigned char read_pit[] = {
+        0xe4, 0x42, 0x88, 0x87, 0xfb, 0, 0, 0, /* read and store latched low byte */
+        0xe4, 0x42, 0x88, 0x87, 0xfc, 0, 0, 0, /* read and store latched high byte */
+        0xe4, 0x61, 0x88, 0x87, 0xfd, 0, 0, 0, /* record speaker port */
+        0x30, 0xc0, 0xe6, 0x61,                 /* clear speaker bit and gate */
+        0xb0, 0x5b, 0xe6, 0x30,                 /* let the VMM load channel 0 */
+    };
+    const unsigned char wait_pit[] = {
         0xb0, 0xfe, 0xe6, 0x21, /* unmask only the timer */
         0xfb, 0xf4, 0xfa,       /* sti; hlt; cli */
         0xb0, 0x5c, 0xe6, 0x30, 0xf4, /* return to the VMM after the wake */
     };
-    memcpy(ram + PIT_ENTRY_OFFSET, pit_program, sizeof(pit_program));
+    unsigned char *entry = ram + PIT_ENTRY_OFFSET;
+    const unsigned char *setup = pit_state ? read_pit : program_pit;
+    size_t setup_size = pit_state ? sizeof(read_pit) : sizeof(program_pit);
+
+    memcpy(entry, setup_pic, sizeof(setup_pic));
+    memcpy(entry + sizeof(setup_pic), setup, setup_size);
+    memcpy(entry + sizeof(setup_pic) + setup_size, wait_pit, sizeof(wait_pit));
     const struct kvm_regs regs = {
         .rcx = 0x4321, .rsp = gpa + 0xf00, .rdi = data_address,
         .rip = gpa + PIT_ENTRY_OFFSET, .rflags = 2,
     };
     check(ioctl(cpu, KVM_SET_REGS, &regs) == 0, "start the PIT program");
+    if (pit_state) {
+        const unsigned int one_shot_ticks = 35795; /* Nominally 30 ms. */
+
+        timed_run(cpu);
+        check_output(run, size, 0x5b);
+        check(data[0xfb] == 0x21 && data[0xfc] == 0x43 && (data[0xfd] & 3) == 3,
+              "guest reads the restored timer latch and speaker state");
+        struct kvm_pit_state2 state = read_pit_state(vm);
+
+        check(state.channels[2].count_latched == 0 && state.channels[2].gate == 0 &&
+              !(state.flags & KVM_PIT_FLAGS_SPEAKER_DATA_ON), "observe the guest's live PIT updates");
+        state.channels[0] = (struct kvm_pit_channel_state) {
+            .count = one_shot_ticks, .read_state = 3, .write_state = 3, .rw_mode = 3, .gate = 1,
+        };
+        check(ioctl(vm, KVM_SET_PIT2, &state) == 0, "arm the live one-shot timer with PIT_STATE2");
+        state = read_pit_state(vm);
+        check(state.channels[0].count == one_shot_ticks && state.channels[0].mode == 0 &&
+              state.channels[0].rw_mode == 3, "read the restored live one-shot timer");
+    }
     unsigned long long elapsed = timed_run(cpu);
     check_output(run, size, 0x5c);
     check_registers(cpu, 0x5c, 0x4321, gpa + PIT_ENTRY_OFFSET);
     check(data[0xf8] == 2 && elapsed >= 5000000, "wake from halt on one new PIT tick");
     printf("PASS PIT woke the halted vCPU after %llu ns\n", elapsed);
+    if (pit_state)
+        puts("PASS restored live PIT state woke the halted vCPU");
 }
 
 struct irqfd_test {
@@ -1014,6 +1088,7 @@ int main(int argc, char **argv)
     bool ioeventfd = false;
     bool irqchip = false;
     bool pit = false;
+    bool pit_state = false;
     bool irqfd = false;
     bool zero_slot = false;
     bool tss = false;
@@ -1048,6 +1123,8 @@ int main(int argc, char **argv)
             irqchip = true;
         else if (!pit && !strcmp(argv[i], "pit"))
             pit = true;
+        else if (!pit_state && !strcmp(argv[i], "pit-state"))
+            pit_state = true;
         else if (!irqfd && !strcmp(argv[i], "irqfd"))
             irqfd = true;
         else if (!zero_slot && !strcmp(argv[i], "zero-slot"))
@@ -1086,6 +1163,7 @@ int main(int argc, char **argv)
     check(!irqchip || (protected_mode && !long_mode && !cpuid && !two_vcpus),
           "test a single protected-mode PIC vCPU");
     check(!pit || irqchip, "test the PIT with a PIC vCPU");
+    check(!pit_state || pit, "PIT_STATE2 requires the PIT fixture");
     check(!irqfd || (irqchip && !pit), "test IRQFD in a separate PIC vCPU run");
     check(!zero_slot || (count >= 258 && protected_mode && !split_slot && !long_mode &&
           !irqchip && !cpuid && !two_vcpus), "test one zero-based slot across the PC legacy region");
@@ -1376,7 +1454,7 @@ int main(int argc, char **argv)
         memcpy(data + 0x100, gdtr, sizeof(gdtr));
     }
     if (irqchip)
-        prepare_pic(vm, ram, gpa, pit, lapic, irqchip_state);
+        prepare_pic(vm, ram, gpa, pit, lapic, irqchip_state, pit_state);
     if (zero_slot)
         prepare_zero_slot(ram, zero_slot_offsets, sizeof(zero_slot_offsets) / sizeof(zero_slot_offsets[0]));
     if (pvh) {
@@ -1597,7 +1675,7 @@ int main(int argc, char **argv)
         set_irq_line(vm, PIC_GSI, 0);
         puts("PASS child PIC delivered and acknowledged the parent IRQ");
         if (pit)
-            test_pit(cpu, run, size, ram, data, gpa, data_address);
+            test_pit(vm, cpu, run, size, ram, data, gpa, data_address, pit_state);
         if (irqfd)
             test_irqfd(vm, cpu, run, size, ram, data, gpa, data_address);
         if (irqchip_state)
