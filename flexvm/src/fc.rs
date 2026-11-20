@@ -188,8 +188,12 @@ impl Firecracker {
 
     /// Classify an already terminated VMM, after draining its console. A console
     /// message alone must never terminate a live VM or turn a panic into success.
-    pub fn powered_off(&self) -> bool {
-        matches!(exited(&self.child), Ok(Some(status)) if status.success()) && kernel_powered_off(&self.log_tail())
+    pub fn distro_shutdown(&self) -> Option<GuestShutdown> {
+        if matches!(exited(&self.child), Ok(Some(status)) if status.success()) {
+            kernel_shutdown(&self.log_tail())
+        } else {
+            None
+        }
     }
 
     pub fn post_mortem(&self) -> String {
@@ -311,12 +315,29 @@ pub(crate) fn snapshot_load_body(vmstate: &Path, template: &crate::template::Tem
     }))
 }
 
-pub(crate) fn kernel_powered_off(log: &str) -> bool {
-    !log.contains("Kernel panic")
-        && log.lines().any(|line| {
-            let line = line.trim_end_matches('\r');
-            line.starts_with('[') && line.ends_with("] reboot: Power down")
-        })
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GuestShutdown {
+    PowerOff,
+    Reboot,
+}
+
+pub(crate) fn kernel_shutdown(log: &str) -> Option<GuestShutdown> {
+    if log.contains("Kernel panic") {
+        return None;
+    }
+    log.lines().rev().find_map(|line| {
+        let line = line.trim_end_matches('\r');
+        if !line.starts_with('[') {
+            return None;
+        }
+        if line.ends_with("] reboot: Power down") {
+            Some(GuestShutdown::PowerOff)
+        } else if line.ends_with("] reboot: Restarting system") || line.contains("] reboot: Restarting system with command ") {
+            Some(GuestShutdown::Reboot)
+        } else {
+            None
+        }
+    })
 }
 
 /// One reader for both streams, with bounded memory even for a console without newlines.
@@ -773,16 +794,19 @@ mod tests {
     use std::thread::JoinHandle;
 
     #[test]
-    fn poweroff_requires_kernel_completion_and_rejects_panic() {
-        assert!(kernel_powered_off("Unmounting filesystems\r\n[    3.725045] reboot: Power down\r\n"));
+    fn shutdown_classifies_poweroff_and_reboot_and_rejects_panic() {
+        assert_eq!(kernel_shutdown("Unmounting filesystems\r\n[    3.725045] reboot: Power down\r\n"), Some(GuestShutdown::PowerOff));
+        assert_eq!(kernel_shutdown("Stopping services\r\n[    3.725045] reboot: Restarting system\r\n"), Some(GuestShutdown::Reboot));
+        assert_eq!(kernel_shutdown("[    3.725045] reboot: Restarting system with command 'recovery'\r\n"), Some(GuestShutdown::Reboot));
         for log in [
             "Powering off.\n",
             "[    3.0] reboot: System halted\n",
-            "[    3.0] reboot: Restarting system\n",
             "a service says reboot: Power down\n",
+            "a service says reboot: Restarting system\n",
             "[    2.0] Kernel panic - not syncing: fatal\n[    3.0] reboot: Power down\n",
+            "[    2.0] Kernel panic - not syncing: fatal\n[    3.0] reboot: Restarting system\n",
         ] {
-            assert!(!kernel_powered_off(log), "{log}");
+            assert_eq!(kernel_shutdown(log), None, "{log}");
         }
     }
 
