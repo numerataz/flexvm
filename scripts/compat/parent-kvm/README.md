@@ -16,12 +16,12 @@ shared mappings of the outer VM RAM and combine consecutive offsets into
 one mapping. The parent stops the child before acknowledging
 release of the slot. If it cannot confirm release, the pages stay pinned
 until the outer VM exits.
-The worker supports byte output to one port and a subset of x86 real-mode
-registers. The client writes those registers through `KVM_SET_REGS` before
+The worker supports byte output to one port in x86 real mode and flat
+32-bit protected mode. The client writes general registers through `KVM_SET_REGS` before
 and between runs and reads actual worker state through `KVM_GET_REGS`.
 After an exit, `KVM_GET_SREGS` also returns live segment caches, descriptor
 tables, and control registers. The TCG worker uses private Unix sockets for
-debugger and QMP register requests. Memory invalidation, protected and long
+debugger and QMP register requests. Memory invalidation, paging and long
 mode state, interrupts, and checkpointing remain part of
 [issue #1501](https://github.com/numerataz/flexvm/issues/1501).
 
@@ -46,3 +46,5 @@ The default TCG run masks the host KVM device and exercises software execution.
 Add `--ram-pages 1` to run the same client with a single-page slot.
 Use `--ram-pages 64` to exercise a larger slot. The test checks the worker's
 actual address mappings and the child's writes at both ends of the slot.
+Add `--protected-entry` to set initial x86 protected mode through
+`KVM_SET_SREGS` and execute a 32-bit program at 16 MiB.
