@@ -1844,6 +1844,19 @@ fn unseen(name: &str, e: util::Error) -> util::Error {
 /// How long `stop` waits for a suspend: its copy of the VM's memory to disk.
 const STOP_WAIT: Duration = Duration::from_secs(600);
 
+/// Sentinel returned from `Tracked::send`'s check closure when `name` resolves to a software VM
+/// so `stop` hands off to `software::stop` once without sending a second `"stop"` RPC.
+#[derive(Debug)]
+struct SoftwareEntry(host::Ident);
+
+impl std::fmt::Display for SoftwareEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("software vm")
+    }
+}
+
+impl std::error::Error for SoftwareEntry {}
+
 /// Sends `{"op": "stop"}` over `NAME.sock` and waits until the VM is suspended (its process gone).
 /// Stopped or exited: a no-op. Returns the name the VM has last (a rename as it was stopped moves it on: `restart` starts that).
 pub(crate) fn stop(host: &Host, name: &str) -> Result<String> {
@@ -1851,18 +1864,21 @@ pub(crate) fn stop(host: &Host, name: &str) -> Result<String> {
     let start_deadline = Instant::now() + START_WAIT;
     let suspend_deadline = Instant::now() + STOP_WAIT;
     let mut vm = loop {
-        if let Ok(entry) = host.entry(name) {
+        let sent = match Tracked::send(host, name, &json!({"op": "stop"}), &|entry| {
             if !entry.backend.is_firecracker() {
-                software::stop(host, name, &entry.ident)?;
-                return Ok(name.into());
-            }
-        }
-        let sent = Tracked::send(host, name, &json!({"op": "stop"}), &|entry| {
-            if !entry.backend.is_firecracker() {
-                software::stop(host, name, &entry.ident)?;
+                return Err(Box::new(SoftwareEntry(entry.ident.clone())));
             }
             Ok(())
-        })?;
+        }) {
+            Ok(sent) => sent,
+            Err(err) => {
+                if let Some(SoftwareEntry(ident)) = err.downcast_ref::<SoftwareEntry>() {
+                    software::stop(host, name, ident)?;
+                    return Ok(name.into());
+                }
+                return Err(err);
+            }
+        };
         let Some((conn, mut vm)) = sent else {
             // A stopped VM's checkpoint, not debris (a consumed or discarded one) under its name.
             // An exited one whose restart policy would run it again is not (docker's stop ends a restart loop).
@@ -3961,6 +3977,35 @@ s.close()
         stop(&host, "app").unwrap();
         assert_eq!(read_fake_vm_req(app)["op"], "stop");
         drop(lock);
+    }
+
+    #[test]
+    fn stop_of_a_starting_software_vm_stops_it_once_without_sending_stop_rpc() {
+        let root = crate::test_util::TempDir::new("stop-starting-software");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let lock = host.take_name("soft", false).unwrap();
+        // Closes socket after receiving the single `suspend` RPC from `software::stop`; the recorded
+        // clean app exit lets `software::stop` succeed without a full QEMU checkpoint bundle.
+        let app = fake_vm_sock(&host.sock("soft").unwrap(), None, None);
+        let ident = host::Ident::of(app.id()).unwrap();
+        std::fs::write(host.vms("soft", "lock").unwrap(), serde_json::to_vec(&ident).unwrap()).unwrap();
+        containers::record_exit(&host, "soft", &ident, 0, true);
+        let entry = host::Entry {
+            name: "soft".into(),
+            ident: ident.clone(),
+            state: "running".into(),
+            backend: host::Backend::QemuTcg { process: ident, image: "alpine".into(), digest: "sha256:0".into(), argv: vec!["/bin/sh".into()], ram_mib: 512 },
+            ..host::Entry::default()
+        };
+        // Publish after `stop()` has already entered `Tracked::send()`'s wait loop.
+        let publisher = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            lock.publish(&entry).unwrap();
+            lock
+        });
+        assert_eq!(stop(&host, "soft").unwrap(), "soft");
+        assert_eq!(read_fake_vm_req(app)["op"], "suspend", "software VM must receive only suspend, never a second stop RPC");
+        drop(publisher.join().unwrap());
     }
 
     #[test]

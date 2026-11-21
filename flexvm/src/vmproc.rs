@@ -840,6 +840,8 @@ pub struct Runtime {
     pub standby_grant: AtomicU64,
     /// Set once the control socket is bound (a failed bind is tried again).
     serving: Mutex<bool>,
+    /// SIGTSTP and SIGCONT, serialized in arrival order off the signal thread (which a later SIGINT needs).
+    pauses: Latest,
     /// The code of a destroy waiting for `op` (0: none): a pause or resume that gets it first does nothing.
     destroying: AtomicI32,
     /// The controller's tick gaps, for `debug status`.
@@ -859,6 +861,37 @@ impl std::ops::Deref for Proc {
     type Target = Runtime;
     fn deref(&self) -> &Runtime {
         &self.runtime
+    }
+}
+
+/// Latest requested `SIGTSTP`/`SIGCONT`, drained by a single worker so arrival order is preserved.
+#[derive(Default)]
+struct Latest {
+    wanted: AtomicI32,
+    busy: AtomicBool,
+}
+
+impl Latest {
+    /// True if the caller is to start the worker.
+    fn offer(&self, sig: i32) -> bool {
+        self.wanted.store(sig, Ordering::SeqCst);
+        !self.busy.swap(true, Ordering::SeqCst)
+    }
+
+    /// The worker's next request; None once there is none (and it is to stop).
+    fn next(&self) -> Option<i32> {
+        loop {
+            match self.wanted.swap(0, Ordering::SeqCst) {
+                0 => {
+                    self.busy.store(false, Ordering::SeqCst);
+                    // An offer between the two found it busy: this worker takes it, unless a new one started.
+                    if self.wanted.load(Ordering::SeqCst) == 0 || self.busy.swap(true, Ordering::SeqCst) {
+                        return None;
+                    }
+                }
+                sig => return Some(sig),
+            }
+        }
     }
 }
 
@@ -2120,6 +2153,15 @@ impl Proc {
     /// `flexvm stop`: suspends the VM to disk and exits after sending the reply.
     fn stop_request(&self, c: &mut dyn std::io::Write) -> Result<Value> {
         self.stop_asked.store(true, Ordering::SeqCst);
+        {
+            let mut early = self.early.lock().unwrap();
+            if self.vm.get().is_none() {
+                if self.destroy_code().is_none() && !early.contains(&libc::SIGTERM) {
+                    early.push(libc::SIGTERM);
+                }
+                return Ok(json!({"suspending": true, "name": self.name()}));
+            }
+        }
         if let Some(vm) = self.vm.get() {
             if matches!(vm.state(), State::Source(_)) {
                 bail!("vm {} is migrating away; it ends once the target has its memory", vm.name);
@@ -2142,6 +2184,16 @@ impl Proc {
 
     /// `flexvm kill`: destroys the VM and exits after sending the reply (or returns the refusal).
     fn kill_request(&self, c: &mut dyn std::io::Write) -> Result<Value> {
+        {
+            let mut early = self.early.lock().unwrap();
+            if self.vm.get().is_none() {
+                if !early.contains(&libc::SIGINT) {
+                    early.push(libc::SIGINT);
+                }
+                self.destroying.store(128 + libc::SIGINT, Ordering::SeqCst);
+                return Ok(json!({"name": self.name(), "state": "killed"}));
+            }
+        }
         Err(self.destroy_with(128 + libc::SIGINT, Some(c)))
     }
 
@@ -2150,11 +2202,16 @@ impl Proc {
             self.stop_asked.store(true, Ordering::SeqCst);
         }
         if matches!(sig, libc::SIGTSTP | libc::SIGCONT) {
-            let p = self.clone();
-            if let Err(e) = thread::Builder::new().spawn(move || {
-                let _ = p.handle(sig);
-            }) {
-                crate::log!("vm {}: signal {sig}: {e}", self.name());
+            if self.pauses.offer(sig) {
+                let p = self.clone();
+                if let Err(e) = thread::Builder::new().spawn(move || {
+                    while let Some(sig) = p.pauses.next() {
+                        let _ = p.handle(sig);
+                    }
+                }) {
+                    self.pauses.busy.store(false, Ordering::SeqCst);
+                    crate::log!("vm {}: signal {sig}: {e}", self.name());
+                }
             }
             return;
         }
@@ -2240,7 +2297,7 @@ impl Proc {
                 }
             }
             // Bound before a resume or restore runs its VM (`restore_checkpoint`), or an arrival is prepared (`prepare_in`).
-            "checkpoint" | "migrate" | "debug" | "pause" | "resume" | "stop" | "kill" | "signal" | "rename" if self.vm.get().is_none() => {
+            "checkpoint" | "migrate" | "debug" | "pause" | "resume" | "signal" | "rename" if self.vm.get().is_none() => {
                 Err(Busy(format!("vm {} is starting", self.name())).into())
             }
             "pages" => return self.pages(&req, fds, slot),
@@ -5339,7 +5396,7 @@ mod tests {
         let (p, _root) = test_proc("lifecycle-starting", None);
         assert!(p.vm.get().is_none());
         static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        for op in ["pause", "resume", "stop", "kill"] {
+        for op in ["pause", "resume"] {
             let (mut client, server) = UnixStream::pair().unwrap();
             client.set_read_timeout(Some(WAIT)).unwrap();
             client.set_write_timeout(Some(WAIT)).unwrap();
@@ -5355,6 +5412,86 @@ mod tests {
             worker.join_within().unwrap();
             assert_eq!(COUNT.load(Ordering::SeqCst), 0);
         }
+    }
+
+    #[test]
+    fn stop_and_kill_rpcs_cancel_starting_vm_via_early() {
+        use std::io::Write;
+        static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let send_op = |p: &Arc<Proc>, op: &str| -> Value {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            client.set_read_timeout(Some(WAIT)).unwrap();
+            client.set_write_timeout(Some(WAIT)).unwrap();
+            let q = p.clone();
+            let slot = Slot::take(&COUNT, MAX_CONTROL).unwrap();
+            let worker = thread::spawn(move || q.control(server, slot));
+            writeln!(client, "{}", json!({"op": op})).unwrap();
+            let reply = crate::util::recv_json(&mut BufReader::new(client)).unwrap().unwrap();
+            worker.join_within().unwrap();
+            assert_eq!(COUNT.load(Ordering::SeqCst), 0);
+            reply
+        };
+
+        // `stop` on a starting VM queues SIGTERM in `early` (idempotently) and reports suspending.
+        let (p, _root) = test_proc("stop-starting", Some("starting-stop"));
+        assert!(p.vm.get().is_none());
+        let reply = send_op(&p, "stop");
+        assert_eq!(reply, json!({"ok": true, "result": {"suspending": true, "name": "starting-stop"}}));
+        assert!(p.stop_asked.load(Ordering::SeqCst));
+        assert!(p.suspend_coming());
+        assert_eq!(p.stop_requested(), Some(128 + libc::SIGTERM));
+        // Repeated `stop` RPC while still starting does not duplicate SIGTERM in `early`.
+        let reply = send_op(&p, "stop");
+        assert_eq!(reply, json!({"ok": true, "result": {"suspending": true, "name": "starting-stop"}}));
+        assert_eq!(*p.early.lock().unwrap(), vec![libc::SIGTERM]);
+
+        // `kill` on a starting VM queues SIGINT in `early` and marks `destroying` so startup cancels.
+        let (p, _root) = test_proc("kill-starting", Some("starting-kill"));
+        assert!(p.vm.get().is_none());
+        let reply = send_op(&p, "kill");
+        assert_eq!(reply, json!({"ok": true, "result": {"name": "starting-kill", "state": "killed"}}));
+        assert_eq!(p.destroy_code(), Some(128 + libc::SIGINT));
+        assert_eq!(p.stop_requested(), Some(128 + libc::SIGINT));
+        // Repeated `kill` RPC is idempotent; a subsequent `stop` does not enqueue SIGTERM.
+        let _ = send_op(&p, "kill");
+        let stop_after_kill = send_op(&p, "stop");
+        assert_eq!(stop_after_kill, json!({"ok": true, "result": {"suspending": true, "name": "starting-kill"}}));
+        assert_eq!(*p.early.lock().unwrap(), vec![libc::SIGINT]);
+    }
+
+    #[test]
+    fn latest_serializes_sigtstp_and_sigcont_in_arrival_order() {
+        let latest = Arc::new(Latest::default());
+        // Case 1: SIGTSTP followed immediately by SIGCONT before the worker drains collapses to SIGCONT.
+        assert!(latest.offer(libc::SIGTSTP));
+        assert!(!latest.offer(libc::SIGCONT), "worker already claimed");
+        assert_eq!(latest.next(), Some(libc::SIGCONT));
+        assert_eq!(latest.next(), None);
+
+        // Case 2: SIGCONT arriving while the worker is handling SIGTSTP runs strictly after SIGTSTP.
+        let (entered_pause, pause_entered) = std::sync::mpsc::channel();
+        let (release_pause, pause_released) = std::sync::mpsc::channel();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        assert!(latest.offer(libc::SIGTSTP));
+        let (l, s) = (latest.clone(), seen.clone());
+        let worker = thread::spawn(move || {
+            while let Some(sig) = l.next() {
+                if sig == libc::SIGTSTP {
+                    entered_pause.send(()).unwrap();
+                    pause_released.recv_timeout(WAIT).unwrap();
+                }
+                s.lock().unwrap().push(sig);
+            }
+        });
+        pause_entered.recv_timeout(WAIT).unwrap();
+        assert!(!latest.offer(libc::SIGCONT), "in-flight worker handles follow-up SIGCONT");
+        release_pause.send(()).unwrap();
+        worker.join_within().unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec![libc::SIGTSTP, libc::SIGCONT]);
+        // Worker exited cleanly; next offer spawns a new worker.
+        assert!(latest.offer(libc::SIGTSTP));
+        assert_eq!(latest.next(), Some(libc::SIGTSTP));
+        assert_eq!(latest.next(), None);
     }
 
     #[test]
