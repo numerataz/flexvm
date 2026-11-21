@@ -339,6 +339,28 @@ impl Drop for Slot {
 
 pub const PAGE_SIZE: usize = 4096;
 
+/// Host kernel page size from `sysconf(_SC_PAGESIZE)`, validated as a power of two `>= PAGE_SIZE`.
+pub fn host_page_size() -> usize {
+    static SIZE: OnceLock<usize> = OnceLock::new();
+    *SIZE.get_or_init(|| parse_host_page_size(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }))
+}
+
+fn parse_host_page_size(raw: libc::c_long) -> usize {
+    let size = usize::try_from(raw).expect("sysconf(_SC_PAGESIZE) returned a negative value");
+    assert!(size >= PAGE_SIZE && size.is_power_of_two(), "unsupported host page size: {size} bytes");
+    size
+}
+
+/// Log2 of `host_page_size()` (12 on 4 KiB hosts, 16 on 64 KiB hosts).
+pub fn host_page_shift() -> u32 {
+    host_page_size().trailing_zeros()
+}
+
+/// Number of 4 KiB guest pages covered by one host page (1 on 4 KiB hosts, 16 on 64 KiB hosts).
+pub fn pages_per_host_page() -> usize {
+    1usize << (host_page_shift() - PAGE_SIZE.trailing_zeros())
+}
+
 /// Fail before any VM or pager when host pages are not `PAGE_SIZE`: userfaultfd and pagemap
 /// work in host pages, which flexvm takes for guest ones (#1270).
 pub fn check_page_size() -> Result<()> {
@@ -409,7 +431,7 @@ impl Mmap {
         #[cfg(not(test))]
         let fail = false;
         if fail || unsafe { libc::madvise(self.ptr.cast(), self.len, MADV_POPULATE_WRITE) } != 0 {
-            (0..self.len).step_by(PAGE_SIZE).for_each(|o| unsafe { self.ptr.add(o).write_volatile(0) });
+            (0..self.len).step_by(host_page_size()).for_each(|o| unsafe { self.ptr.add(o).write_volatile(0) });
         }
     }
 }
@@ -2042,6 +2064,17 @@ mod tests {
         let e = page_size_refused(65536).unwrap();
         assert!(e.contains("65536 bytes") && e.contains("issues/1270"), "{e}");
         assert!(page_size_refused(16384).is_some());
+    }
+
+    #[test]
+    fn host_page_size_is_valid_power_of_two() {
+        let hp = host_page_size();
+        assert!(hp >= PAGE_SIZE && hp.is_power_of_two());
+        assert_eq!(1usize << host_page_shift(), hp);
+        assert_eq!(pages_per_host_page() * PAGE_SIZE, hp);
+        assert_eq!(parse_host_page_size(4096), 4096);
+        assert_eq!(parse_host_page_size(16384), 16384);
+        assert_eq!(parse_host_page_size(65536), 65536);
     }
 
     #[test]

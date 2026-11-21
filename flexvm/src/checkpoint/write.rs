@@ -356,7 +356,7 @@ mod buf_tests {
             if !huge {
                 assert_eq!(b.mem.len(), UNIT * PAGE_SIZE);
             }
-            assert_eq!(b.mem.ptr() as usize % if huge { HUGE } else { PAGE_SIZE }, 0);
+            assert_eq!(b.mem.ptr() as usize % if huge { HUGE } else { crate::util::host_page_size() }, 0);
             let mut b = b;
             let bytes = b.bytes();
             assert_eq!(bytes.len(), UNIT * PAGE_SIZE);
@@ -379,7 +379,7 @@ mod buf_tests {
         assert_eq!(bufs.iter().map(|b| b.mem.len() == HUGE).collect::<Vec<_>>(), [true, true, false, false]);
         assert_eq!(room.get(), 1);
         for b in bufs.iter().filter(|b| b.mem.len() == HUGE) {
-            let mut resident = vec![0u8; b.mem.len() / PAGE_SIZE];
+            let mut resident = vec![0u8; b.mem.len().div_ceil(crate::util::host_page_size())];
             assert_eq!(unsafe { libc::mincore(b.mem.ptr().cast(), b.mem.len(), resident.as_mut_ptr()) }, 0);
             assert!(resident.iter().all(|&v| v & 1 == 1), "the whole huge buffer is populated when the take returns");
         }
@@ -404,7 +404,7 @@ mod buf_tests {
         FAIL_POPULATE.with(|f| f.set(true));
         let b = Buf::new(&room).unwrap();
         assert!(b.mem.len() == HUGE && !FAIL_POPULATE.with(|f| f.get()), "huge, and the populate failed");
-        let mut vec = vec![0u8; b.mem.len() / PAGE_SIZE];
+        let mut vec = vec![0u8; b.mem.len().div_ceil(crate::util::host_page_size())];
         assert_eq!(unsafe { libc::mincore(b.mem.ptr().cast(), b.mem.len(), vec.as_mut_ptr()) }, 0);
         assert!(vec.iter().all(|&v| v & 1 == 1), "every page in");
     }

@@ -811,25 +811,34 @@ impl Template {
 
     /// Starts page-cache reads of up to `n` pages from `page`, clamped to the whole pages mapped; best effort.
     pub fn willneed(&self, page: usize, n: usize) {
-        let n = n.min((self.len / PAGE_SIZE).saturating_sub(page));
-        if n > 0 {
-            // Page aligned and within the mapping; an advisory failure changes nothing.
-            unsafe { libc::madvise(self.map.add(page * PAGE_SIZE) as *mut libc::c_void, n * PAGE_SIZE, libc::MADV_WILLNEED) };
+        if let Some((start, len)) = host_aligned_madvise_range(page, n, self.len, crate::util::host_page_size()) {
+            // Host-page aligned and within the mapping; an advisory failure changes nothing.
+            unsafe { libc::madvise(self.map.add(start) as *mut libc::c_void, len, libc::MADV_WILLNEED) };
         }
     }
 
     /// Faults up to `n` pages from `page` in, clamped to the whole pages mapped, so a copy from them does not wait on
     /// disk; without MADV_POPULATE_READ (Linux < 5.14) a read-ahead hint instead. Best effort.
     pub fn prefault(&self, page: usize, n: usize) {
-        let n = n.min((self.len / PAGE_SIZE).saturating_sub(page));
-        if n > 0 {
-            // Page aligned and within the mapping; failure leaves the copy to fault it in.
-            let rc = unsafe { libc::madvise(self.map.add(page * PAGE_SIZE) as *mut libc::c_void, n * PAGE_SIZE, libc::MADV_POPULATE_READ) };
+        if let Some((start, len)) = host_aligned_madvise_range(page, n, self.len, crate::util::host_page_size()) {
+            // Host-page aligned and within the mapping; failure leaves the copy to fault it in.
+            let rc = unsafe { libc::madvise(self.map.add(start) as *mut libc::c_void, len, libc::MADV_POPULATE_READ) };
             if rc != 0 {
-                self.willneed(page, n);
+                unsafe { libc::madvise(self.map.add(start) as *mut libc::c_void, len, libc::MADV_WILLNEED) };
             }
         }
     }
+}
+
+/// Host-page-aligned byte range `(start, len)` covering `n` guest pages from `page`, clamped to `mapped_len`.
+fn host_aligned_madvise_range(page: usize, n: usize, mapped_len: usize, host_page: usize) -> Option<(usize, usize)> {
+    let n = n.min((mapped_len / PAGE_SIZE).saturating_sub(page));
+    if n == 0 {
+        return None;
+    }
+    let start = (page * PAGE_SIZE) & !(host_page - 1);
+    let end = (page + n) * PAGE_SIZE;
+    Some((start, end - start))
 }
 
 impl Drop for Template {
@@ -4628,5 +4637,19 @@ pub(crate) mod tests {
         assert_eq!(data_extents(&file, 700 * page).unwrap(), vec![(0, page), (3 * page, 4 * page), (600 * page, 601 * page)]);
         assert_eq!(content_hash(&file).unwrap(), before);
         assert_eq!(sparsify(&path).unwrap(), 0);
+    }
+
+    #[test]
+    fn host_aligned_madvise_range_rounds_start_down_for_64k_hosts() {
+        let mapped = 32 * PAGE_SIZE;
+        // 4 KiB host: exact guest-page range.
+        assert_eq!(host_aligned_madvise_range(5, 3, mapped, 4096), Some((5 * PAGE_SIZE, 3 * PAGE_SIZE)));
+        // 64 KiB host: start rounds down to 64 KiB boundary, length covers through page + n.
+        assert_eq!(host_aligned_madvise_range(5, 3, mapped, 65536), Some((0, 8 * PAGE_SIZE)));
+        assert_eq!(host_aligned_madvise_range(17, 4, mapped, 65536), Some((16 * PAGE_SIZE, 5 * PAGE_SIZE)));
+        // Clamped to mapped length; empty or out-of-range returns None.
+        assert_eq!(host_aligned_madvise_range(30, 10, mapped, 65536), Some((16 * PAGE_SIZE, 16 * PAGE_SIZE)));
+        assert_eq!(host_aligned_madvise_range(32, 4, mapped, 65536), None);
+        assert_eq!(host_aligned_madvise_range(0, 0, mapped, 65536), None);
     }
 }

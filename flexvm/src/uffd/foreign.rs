@@ -71,13 +71,24 @@ fn unsupported(e: &io::Error) -> bool {
 }
 
 fn scan_runs(pagemap: &std::fs::File, start: u64, len: u64) -> io::Result<Vec<(usize, usize)>> {
-    let (end, mut at, mut runs) = (start + len, start, Vec::new());
+    scan_runs_with(pagemap, start, len, crate::util::host_page_size())
+}
+
+fn scan_runs_with(pagemap: &std::fs::File, start: u64, len: u64, host_page: usize) -> io::Result<Vec<(usize, usize)>> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let hp = host_page as u64;
+    let end = start + len;
+    let scan_start = start & !(hp - 1);
+    let scan_end = end.next_multiple_of(hp);
+    let (mut at, mut runs) = (scan_start, Vec::new());
     let mut regions = [PageRegion::default(); SCAN_REGIONS];
-    while at < end {
+    while at < scan_end {
         let mut arg = PmScanArg {
             size: std::mem::size_of::<PmScanArg>() as u64,
             start: at,
-            end,
+            end: scan_end,
             vec: regions.as_mut_ptr() as u64,
             vec_len: SCAN_REGIONS as u64,
             category_anyof_mask: PAGE_IS_PRESENT | PAGE_IS_SWAPPED,
@@ -90,7 +101,11 @@ fn scan_runs(pagemap: &std::fs::File, start: u64, len: u64) -> io::Result<Vec<(u
             return Err(io::Error::last_os_error());
         }
         for r in &regions[..n as usize] {
-            super::push_run(&mut runs, ((r.start - start) / PAGE_SIZE as u64) as usize, ((r.end - start) / PAGE_SIZE as u64) as usize, 0);
+            let lo = r.start.max(start);
+            let hi = r.end.min(end);
+            if lo < hi {
+                super::push_run(&mut runs, ((lo - start) / PAGE_SIZE as u64) as usize, ((hi - start) / PAGE_SIZE as u64) as usize, 0);
+            }
         }
         if arg.walk_end <= at {
             break;
@@ -100,24 +115,46 @@ fn scan_runs(pagemap: &std::fs::File, start: u64, len: u64) -> io::Result<Vec<(u
     Ok(runs)
 }
 
-/// `scan_runs` for kernels before 6.7: the pagemap entries themselves.
+/// `scan_runs` for kernels before 6.7: the pagemap entries themselves, indexed by host page.
 fn read_runs(pagemap: &std::fs::File, start: u64, len: u64) -> io::Result<Vec<(usize, usize)>> {
-    let pages = (len / PAGE_SIZE as u64) as usize;
-    let (mut runs, mut raw) = (Vec::new(), vec![0u8; READ_PAGES.min(pages) * 8]);
+    read_runs_with(pagemap, start, len, crate::util::host_page_size())
+}
+
+fn read_runs_with(pagemap: &std::fs::File, start: u64, len: u64, host_page: usize) -> io::Result<Vec<(usize, usize)>> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let hp = host_page as u64;
+    let end = start + len;
+    let aligned_start = start & !(hp - 1);
+    let aligned_end = end.next_multiple_of(hp);
+    let host_pages = ((aligned_end - aligned_start) / hp) as usize;
+    let (mut runs, mut raw) = (Vec::new(), vec![0u8; READ_PAGES.min(host_pages) * 8]);
     let mut first = 0;
-    while first < pages {
-        let n = READ_PAGES.min(pages - first);
-        std::os::unix::fs::FileExt::read_exact_at(pagemap, &mut raw[..n * 8], (start / PAGE_SIZE as u64 + first as u64) * 8)?;
-        for (i, e) in raw[..n * 8].chunks(8).enumerate() {
-            if u64::from_le_bytes(e.try_into().unwrap()) & (PM_PRESENT | PM_SWAP) != 0 {
-                super::push_run(&mut runs, first + i, first + i + 1, 0);
-            }
-        }
+    while first < host_pages {
+        let n = READ_PAGES.min(host_pages - first);
+        std::os::unix::fs::FileExt::read_exact_at(pagemap, &mut raw[..n * 8], (aligned_start / hp + first as u64) * 8)?;
+        decode_pagemap_chunk(&raw[..n * 8], aligned_start + first as u64 * hp, start, end, host_page, &mut runs);
         first += n;
     }
     Ok(runs)
 }
 
+/// Converts raw `/proc/PID/pagemap` entries (one 8-byte entry per `host_page` starting at `chunk_start`) into
+/// guest-page (`PAGE_SIZE`) runs relative to `start`, clamped to `[start, end)`.
+fn decode_pagemap_chunk(raw: &[u8], chunk_start: u64, start: u64, end: u64, host_page: usize, runs: &mut Vec<(usize, usize)>) {
+    let hp = host_page as u64;
+    for (i, e) in raw.chunks_exact(8).enumerate() {
+        if u64::from_le_bytes(e.try_into().unwrap()) & (PM_PRESENT | PM_SWAP) != 0 {
+            let page_start = chunk_start + i as u64 * hp;
+            let lo = page_start.max(start);
+            let hi = (page_start + hp).min(end);
+            if lo < hi {
+                super::push_run(runs, ((lo - start) / PAGE_SIZE as u64) as usize, ((hi - start) / PAGE_SIZE as u64) as usize, 0);
+            }
+        }
+    }
+}
 /// Whether a page in `state` that Firecracker has mapped holds what the guest should not see: the pager installs
 /// every page it moves out of BASE or REMOTE, so mapped in either means mapped behind its back. A template hole
 /// (BASE, no data) is zero either way. ZERO is not checked: a REMOVE already applied may not have zapped it yet.
@@ -213,46 +250,68 @@ pub const FOREIGN: &str = "another process read firecracker's guest memory while
 mod tests {
     use super::*;
 
-    /// An anonymous mapping of `pages`, of which those in `touch` are read (mapping the zero page) or written.
-    fn mapping(pages: usize, read: &[usize], write: &[usize]) -> (*mut u8, usize) {
-        let len = pages * PAGE_SIZE;
+    /// An anonymous mapping of `host_pages` host pages, of which those in `read` (mapping the zero page) or `write` are touched.
+    fn mapping(host_pages: usize, read: &[usize], write: &[usize]) -> (*mut u8, usize) {
+        let hp = crate::util::host_page_size();
+        let len = host_pages * hp;
         let p = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
         assert_ne!(p, libc::MAP_FAILED);
-        // 4 KiB pages only: one huge page would map all of them.
+        // Base host pages only: one huge page would map all of them.
         unsafe { libc::madvise(p, len, libc::MADV_NOHUGEPAGE) };
         let p = p as *mut u8;
         for &i in read {
-            unsafe { std::ptr::read_volatile(p.add(i * PAGE_SIZE)) };
+            unsafe { std::ptr::read_volatile(p.add(i * hp)) };
         }
         for &i in write {
-            unsafe { std::ptr::write_volatile(p.add(i * PAGE_SIZE + 7), 1) };
+            unsafe { std::ptr::write_volatile(p.add(i * hp + 7), 1) };
         }
         (p, len)
     }
 
     #[test]
     fn mapped_runs_see_zero_pages_and_written_ones() {
+        let hp = crate::util::host_page_size() as u64;
+        let g = crate::util::pages_per_host_page();
         let (p, len) = mapping(64, &[3, 4, 5, 40], &[10, 11, 63]);
         let pagemap = std::fs::File::open("/proc/self/pagemap").unwrap();
-        let want = vec![(3, 6), (10, 12), (40, 41), (63, 64)];
+        let want = vec![(3 * g, 6 * g), (10 * g, 12 * g), (40 * g, 41 * g), (63 * g, 64 * g)];
         assert_eq!(mapped_runs(&pagemap, p as u64, len as u64).unwrap(), want);
         // The pagemap reads give the same answer as PAGEMAP_SCAN (or are what answered).
         assert_eq!(read_runs(&pagemap, p as u64, len as u64).unwrap(), want);
         // A range from the middle reports offsets from its own start.
-        assert_eq!(mapped_runs(&pagemap, p as u64 + 4 * PAGE_SIZE as u64, 8 * PAGE_SIZE as u64).unwrap(), vec![(0, 2), (6, 8)]);
+        assert_eq!(mapped_runs(&pagemap, p as u64 + 4 * hp, 8 * hp).unwrap(), vec![(0, 2 * g), (6 * g, 8 * g)]);
         unsafe { libc::munmap(p.cast(), len) };
     }
 
     #[test]
     fn mapped_runs_of_many_regions_go_on_past_a_full_vector() {
-        // Every other page: more regions than one PAGEMAP_SCAN call returns.
+        let g = crate::util::pages_per_host_page();
+        // Every other host page: more regions than one PAGEMAP_SCAN call returns.
         let n = 3 * SCAN_REGIONS;
         let read: Vec<usize> = (0..n).step_by(2).collect();
         let (p, len) = mapping(n, &read, &[]);
         let pagemap = std::fs::File::open("/proc/self/pagemap").unwrap();
         let runs = mapped_runs(&pagemap, p as u64, len as u64).unwrap();
-        assert_eq!(runs, read.iter().map(|&i| (i, i + 1)).collect::<Vec<_>>());
+        assert_eq!(runs, read.iter().map(|&i| (i * g, (i + 1) * g)).collect::<Vec<_>>());
         unsafe { libc::munmap(p.cast(), len) };
+    }
+
+    #[test]
+    fn decode_pagemap_runs_with_64k_host_pages() {
+        let hp = 65536usize;
+        let entries = [0u64, PM_PRESENT, PM_SWAP, 0, PM_PRESENT];
+        let raw: Vec<u8> = entries.iter().flat_map(|e| e.to_le_bytes()).collect();
+        let base = 10 * hp as u64;
+        // Full range: host pages 1..3 merged into guest pages 16..48, host page 4 -> 64..80.
+        let mut runs = Vec::new();
+        decode_pagemap_chunk(&raw, base, base, base + 5 * hp as u64, hp, &mut runs);
+        assert_eq!(runs, vec![(16, 48), (64, 80)]);
+        // Unaligned subrange starting 3 guest pages into host page 1 and ending 5 guest pages into host page 4.
+        let start = base + hp as u64 + 3 * PAGE_SIZE as u64;
+        let end = base + 4 * hp as u64 + 5 * PAGE_SIZE as u64;
+        let mut clamped = Vec::new();
+        decode_pagemap_chunk(&raw, base, start, end, hp, &mut clamped);
+        assert_eq!(clamped, vec![(0, 29), (45, 50)]);
     }
 
     #[test]

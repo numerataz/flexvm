@@ -104,7 +104,23 @@ const UFFDIO_COPY_MODE_WP: u64 = 2;
 /// Pages write-protected per call while the VM runs (2 MiB).
 const ARM_CHUNK: usize = 512;
 
-static ZEROES: [u8; PAGE_SIZE] = [0; PAGE_SIZE];
+/// One zero-filled host page, for `UFFDIO_COPY` of zero pages with `UFFDIO_COPY_MODE_WP`.
+pub(super) fn zero_host_page() -> &'static [u8] {
+    static ZEROES: OnceLock<Box<[u8]>> = OnceLock::new();
+    ZEROES.get_or_init(|| vec![0u8; crate::util::host_page_size()].into_boxed_slice())
+}
+
+/// Aligns guest page `page` down to a `granule`-page boundary relative to `region_start`.
+pub(super) fn align_down_in(page: usize, region_start: usize, granule: usize) -> usize {
+    let off = page - region_start;
+    region_start + (off - off % granule)
+}
+
+/// Aligns guest page `page` up to a `granule`-page boundary relative to `region_start`, clamped to `region_end`.
+pub(super) fn align_up_in(page: usize, region_start: usize, region_end: usize, granule: usize) -> usize {
+    let off = page - region_start;
+    (region_start + off.div_ceil(granule) * granule).min(region_end)
+}
 
 /// One guest memory region, as Firecracker describes it in the UFFD handshake.
 #[derive(Debug, Clone, Deserialize)]
@@ -515,24 +531,41 @@ impl Pager {
 
     fn prefetch_pass_with(&self, mut populate: impl FnMut(usize, usize, Option<&[u8]>) -> io::Result<usize>) -> bool {
         let pages = self.pages();
+        let g = crate::util::pages_per_host_page();
         let mut cut = false;
         let mut scratch = Vec::with_capacity(PREFETCH_RUN * PAGE_SIZE);
-        for (mut i, end) in self.chunks(self.working_set(0, 1), PREFETCH_RUN) {
-            while i < end {
+        for (a, b) in self.chunks(self.working_set(0, 1), PREFETCH_RUN) {
+            let (mut i, end) = if g == 1 {
+                (a, b)
+            } else {
+                let Some(m) = self.locate((a * PAGE_SIZE) as u64) else { continue };
+                let (from, to) = m.span();
+                let lo = align_down_in(a, from, g);
+                let chunk_end = from + ((lo - from) / ARM_CHUNK + 1) * ARM_CHUNK;
+                let hi = align_up_in(b, from, to, g).min(chunk_end).min(lo + PREFETCH_RUN);
+                (lo, hi)
+            };
+            while i + g <= end {
                 if self.quiesce.load(Ordering::SeqCst) {
                     cut = true;
                     break;
                 }
-                if pages.get(i) != BASE {
-                    i += 1;
+                if (i..i + g).any(|p| pages.get(p) != BASE) {
+                    i += g;
                     continue;
                 }
                 // Test gate `prefetch_park`: a run parks here, off the prefetch gate, so a checkpoint can quiesce it.
                 crate::host::hold("prefetch_park");
                 // Holes were zero at snapshot time (mostly free memory the guest allocates again); map them too, or
                 // each one costs a fault. Prepare a homogeneous run before claiming it.
-                let data = self.base.has_data(i);
-                let prepared_end = (i + 1..end).find(|&p| pages.get(p) != BASE || self.base.has_data(p) != data).unwrap_or(end);
+                let data = (i..i + g).any(|p| self.base.has_data(p));
+                let mut prepared_end = i + g;
+                while prepared_end + g <= end
+                    && (prepared_end..prepared_end + g).all(|p| pages.get(p) == BASE)
+                    && (prepared_end..prepared_end + g).any(|p| self.base.has_data(p)) == data
+                {
+                    prepared_end += g;
+                }
                 let prepared = data.then(|| {
                     #[cfg(test)]
                     if let Some(pause) = self.before_prefetch_read.get() {
@@ -554,17 +587,32 @@ impl Pager {
                 if let Some(pause) = self.before_prefetch_claim.get() {
                     pause();
                 }
-                let n = pages.claim(i, prepared_end - i, BASE, |p| self.base.has_data(p) == data);
-                if n > 0 {
-                    let stop = || self.quiesce.load(Ordering::SeqCst);
-                    let (_, installed) = pages.install(i, n, BASE, Some(&stop), |p, c| {
-                        let src = prepared.as_ref().map(|buf| &buf[(p - i) * PAGE_SIZE..(p - i + c) * PAGE_SIZE]);
-                        populate(p, c, src)
-                    });
-                    // Even the final run can return its claims when quiesce interrupts an EAGAIN retry.
-                    cut |= installed.is_err_and(|e| e.raw_os_error() == Some(libc::EAGAIN));
-                }
-                i += n.max(1);
+                let n = if g == 1 {
+                    let n = pages.claim(i, prepared_end - i, BASE, |p| self.base.has_data(p) == data);
+                    if n > 0 {
+                        let stop = || self.quiesce.load(Ordering::SeqCst);
+                        let (_, installed) = pages.install(i, n, BASE, Some(&stop), |p, c| {
+                            let src = prepared.as_ref().map(|buf| &buf[(p - i) * PAGE_SIZE..(p - i + c) * PAGE_SIZE]);
+                            populate(p, c, src)
+                        });
+                        // Even the final run can return its claims when quiesce interrupts an EAGAIN retry.
+                        cut |= installed.is_err_and(|e| e.raw_os_error() == Some(libc::EAGAIN));
+                    }
+                    n
+                } else {
+                    let orig = pages
+                        .claim_granules(i, prepared_end - i, g, |h, snap| snap.iter().all(|&s| s == BASE) && (h..h + g).any(|p| self.base.has_data(p)) == data);
+                    if !orig.is_empty() {
+                        let stop = || self.quiesce.load(Ordering::SeqCst);
+                        let (_, installed) = pages.install_granules(i, &orig, g, Some(&stop), |p, c| {
+                            let src = prepared.as_ref().map(|buf| &buf[(p - i) * PAGE_SIZE..(p - i + c) * PAGE_SIZE]);
+                            populate(p, c, src)
+                        });
+                        cut |= installed.is_err_and(|e| e.raw_os_error() == Some(libc::EAGAIN));
+                    }
+                    orig.len()
+                };
+                i += n.max(g);
             }
         }
         // Publish completion only for a finished pass. A cut still owes the working set, including while
@@ -601,41 +649,102 @@ impl Pager {
             }
         }
         let pages = self.pages();
+        let g = crate::util::pages_per_host_page();
         let mut installed = 0;
-        for (index, n) in page_runs(list, self.mappings()) {
-            let (mut index, end) = (index, index + n);
-            while index < end {
-                let page = list[index] as usize;
-                if let Some(why) = self.failed() {
-                    bail!("the pager failed: {why}");
-                }
-                // Wait for other installers too: they may fail and return REMOTE.
-                match pages.states.get(page).map(|s| s.load(Ordering::SeqCst)) {
-                    Some(REMOTE) => {
-                        let n = pages.claim(page, end - index, REMOTE, |_| true);
-                        if n > 0 {
-                            let src = |p: usize, c: usize| &data[(index + p - page) * PAGE_SIZE..(index + p - page + c) * PAGE_SIZE];
-                            let (resolved, res) =
-                                pages.install(page, n, REMOTE, Some(&|| self.stop.load(Ordering::SeqCst) || Instant::now() >= deadline), |p, c| {
-                                    self.populate(p, c, Some(src(p, c)))
-                                });
-                            self.pulled(resolved);
-                            installed += resolved;
-                            res?;
-                            index += n;
+        if g == 1 {
+            for (index, n) in page_runs(list, self.mappings()) {
+                let (mut index, end) = (index, index + n);
+                while index < end {
+                    let page = list[index] as usize;
+                    if let Some(why) = self.failed() {
+                        bail!("the pager failed: {why}");
+                    }
+                    // Wait for other installers too: they may fail and return REMOTE.
+                    match pages.states.get(page).map(|s| s.load(Ordering::SeqCst)) {
+                        Some(REMOTE) => {
+                            let n = pages.claim(page, end - index, REMOTE, |_| true);
+                            if n > 0 {
+                                let src = |p: usize, c: usize| &data[(index + p - page) * PAGE_SIZE..(index + p - page + c) * PAGE_SIZE];
+                                let (resolved, res) =
+                                    pages.install(page, n, REMOTE, Some(&|| self.stop.load(Ordering::SeqCst) || Instant::now() >= deadline), |p, c| {
+                                        self.populate(p, c, Some(src(p, c)))
+                                    });
+                                self.pulled(resolved);
+                                installed += resolved;
+                                res?;
+                                index += n;
+                                continue;
+                            }
+                        }
+                        Some(INFLIGHT | DISCARDED) => {}
+                        _ => {
+                            index += 1;
                             continue;
                         }
                     }
-                    Some(INFLIGHT | DISCARDED) => {}
-                    _ => {
-                        index += 1;
-                        continue;
+                    if self.stop.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                        bail!("page {page} still being installed at the deadline");
                     }
+                    thread::sleep(Duration::from_micros(50));
                 }
-                if self.stop.load(Ordering::SeqCst) || Instant::now() >= deadline {
-                    bail!("page {page} still being installed at the deadline");
+            }
+        } else {
+            let mut buf = vec![0u8; g * PAGE_SIZE];
+            let mut idx = 0;
+            while idx < list.len() {
+                let page = list[idx] as usize;
+                let Some(m) = self.locate((page * PAGE_SIZE) as u64) else {
+                    idx += 1;
+                    continue;
+                };
+                let h = align_down_in(page, m.span().0, g);
+                let h_end = (h + g).min(m.span().1);
+                let mut next_idx = idx + 1;
+                while next_idx < list.len() && (list[next_idx] as usize) < h_end {
+                    next_idx += 1;
                 }
-                thread::sleep(Duration::from_micros(50));
+                let slice = &list[idx..next_idx];
+                loop {
+                    if let Some(why) = self.failed() {
+                        bail!("the pager failed: {why}");
+                    }
+                    match pages.states.get(h).map(|s| s.load(Ordering::SeqCst)) {
+                        Some(INFLIGHT | DISCARDED) => {}
+                        Some(BASE | ZERO | REMOTE) if h_end - h == g => {
+                            let orig = pages.claim_granules(h, g, g, |_, snap| {
+                                snap.iter().enumerate().all(|(k, &s)| s != REMOTE || slice.binary_search(&((h + k) as u64)).is_ok())
+                            });
+                            if !orig.is_empty() {
+                                for (k, &s) in orig.iter().enumerate() {
+                                    let dst = &mut buf[k * PAGE_SIZE..(k + 1) * PAGE_SIZE];
+                                    match s {
+                                        REMOTE => {
+                                            let pos = slice.binary_search(&((h + k) as u64)).unwrap();
+                                            let off = (idx + pos) * PAGE_SIZE;
+                                            dst.copy_from_slice(&data[off..off + PAGE_SIZE]);
+                                        }
+                                        BASE if self.base.has_data(h + k) => dst.copy_from_slice(self.base.pages(h + k, 1)),
+                                        _ => dst.fill(0),
+                                    }
+                                }
+                                let (resolved, res) =
+                                    pages.install_granules(h, &orig, g, Some(&|| self.stop.load(Ordering::SeqCst) || Instant::now() >= deadline), |p, c| {
+                                        self.populate(p, c, Some(&buf[(p - h) * PAGE_SIZE..(p - h + c) * PAGE_SIZE]))
+                                    });
+                                self.pulled(resolved);
+                                installed += resolved;
+                                res?;
+                            }
+                            break;
+                        }
+                        _ => break,
+                    }
+                    if self.stop.load(Ordering::SeqCst) || Instant::now() >= deadline {
+                        bail!("page {page} still being installed at the deadline");
+                    }
+                    thread::sleep(Duration::from_micros(50));
+                }
+                idx = next_idx;
             }
         }
         if let Some(why) = self.failed() {
@@ -1030,6 +1139,16 @@ impl Pager {
     /// Where `page` is mapped in Firecracker.
     fn addr(&self, page: usize) -> io::Result<u64> {
         self.host_addr((page * PAGE_SIZE) as u64).map(|(a, _)| a).ok_or_else(|| io::Error::other("bad page"))
+    }
+
+    /// The first guest page of the host page holding `page`.
+    pub(super) fn host_page_start(&self, page: usize) -> io::Result<usize> {
+        let g = crate::util::pages_per_host_page();
+        if g == 1 {
+            return Ok(page);
+        }
+        let m = self.locate((page * PAGE_SIZE) as u64).ok_or_else(|| io::Error::other("bad page"))?;
+        Ok(align_down_in(page, m.span().0, g))
     }
 
     /// Populates up to `n` pages starting at `page`, from `src` or with zeroes, and wakes their waiters. Returns how

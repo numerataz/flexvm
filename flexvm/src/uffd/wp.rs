@@ -82,6 +82,9 @@ impl Pager {
     /// protected for the copy, and marks them dirty. Unless it must wait for a writer to save the page first
     /// (`Served::Writer`).
     pub(super) fn wp_fault(&self, page: usize, m: &Mapping, first_try: bool) -> io::Result<Served> {
+        let g = crate::util::pages_per_host_page();
+        let h = super::align_down_in(page, m.span().0, g);
+        let h_end = (h + g).min(m.span().1);
         let cow = self.cow();
         // On its first try only: a fault is retried after errors, and on every pass of the event loop while it waits.
         cow.iter().for_each(|c| _ = c.stats.faults.fetch_add(first_try as u64, Ordering::Relaxed));
@@ -90,22 +93,22 @@ impl Pager {
         // that unprotect woke the others but before the page table changed: wake it, which costs nothing like an
         // unprotect (which makes KVM drop its mappings of the range and flush the vCPUs' TLBs). Only an optimization:
         // a failure to read the pagemap leaves it to the unprotect.
-        if self.pagemap_one(page).is_ok_and(|e| e & PM_PRESENT != 0 && e & PM_UFFD_WP == 0) {
-            return self.wake(page).map(|()| Served::Done(WP));
+        if self.pagemap_one(h).is_ok_and(|e| e & PM_PRESENT != 0 && e & PM_UFFD_WP == 0) {
+            return self.wake(h).map(|()| Served::Done(WP));
         }
-        if let Some(cow) = cow.as_ref().filter(|c| c.state(page) == READING) {
-            cow.wait_for(page, READING);
+        if let Some((cow, p)) = cow.as_ref().and_then(|c| (h..h_end).find(|&p| c.state(p) == READING).map(|p| (c, p))) {
+            cow.wait_for(p, READING);
             return Ok(Served::Writer(cow.clone()));
         }
         // Over budget, nothing more is copied here, and only the least block is unprotected.
         let over = cow.as_ref().is_some_and(|c| c.over_budget());
-        let (mut first, mut end) = self.wp_block(page, m, !over);
+        let (mut first, mut end) = self.wp_block(h, m, !over);
         if let Some(cow) = &cow {
             // Test fault `ckpt_wp_race`: a writer claims the faulting page right here (#88).
             self.wp_race(cow, page, &[PENDING]);
             let start = Instant::now();
-            let least = || self.wp_block(page, m, false);
-            let Some((rescued, block)) = rescue_or_want(cow, page, over, (first, end), least, |f, e| self.rescue(cow, f, e, first_try))? else {
+            let least = || self.wp_block(h, m, false);
+            let Some((rescued, block)) = rescue_or_want(cow, (h, h_end), over, (first, end), least, |f, e| self.rescue(cow, f, e, first_try))? else {
                 return Ok(Served::Writer(cow.clone()));
             };
             (first, end) = block;
@@ -118,39 +121,28 @@ impl Pager {
                 s.rescue_max_ns.fetch_max(ns, Ordering::Relaxed);
             }
         }
-        // Unprotect what may change now: the run of pages around the faulting one that need not stay protected for the
-        // copy (saved, here or before), within its block, but for pages at its ends already unprotected since the last
-        // pause (a range costs by its size as well as by the call). One call: more would cost more than the faults
-        // they spare.
+        // Unprotect what may change now: the run of host pages around the faulting one that need not stay protected for
+        // the copy (saved, here or before), within its block, but for host pages at its ends already unprotected since
+        // the last pause (a range costs by its size as well as by the call). One call: more would cost more than the
+        // faults they spare.
         let keep = |p: usize| cow.as_ref().is_some_and(|c| matches!(c.state(p), PENDING | READING | RESCUING));
-        let Some(cow) = cow.as_ref().filter(|_| keep(page)) else {
-            let (mut p, mut q) = (page, page + 1);
-            while p > first && !keep(p - 1) {
-                p -= 1;
-            }
-            while q < end && !keep(q) {
-                q += 1;
-            }
-            while p < page && self.pages().is_dirty(p) {
-                p += 1;
-            }
-            while q - 1 > page && self.pages().is_dirty(q - 1) {
-                q -= 1;
-            }
+        if let Some((p, q)) = wp_unprotect_range(h, (first, end), g, keep, |d| self.pages().is_dirty(d)) {
             // Dirty only once unprotected: a failed unprotect (EAGAIN while a REMOVE is queued) changes nothing, and its
             // retry must not trim these pages as already unprotected. Marked after is safe: `freeze` takes the dirty
             // bits under the same lock (`wp`), so it sees both or neither.
             self.writeprotect(p, q - p, false)?;
             self.pages().mark_dirty_range(p, q);
             return Ok(Served::Done(WP));
-        };
-        // A writer claimed the faulting page itself (PENDING -> READING) after the check above, so it stayed protected,
-        // and nothing else wakes the fault (writers never unprotect, even once they are done with it): retry it once the
-        // writer is done, and unprotect it then. (Only with a copy: nothing is kept protected without one.)
+        }
+        // A writer claimed a page in the faulting host page (PENDING -> READING) after the check above, so it stayed
+        // protected, and nothing else wakes the fault (writers never unprotect, even once they are done with it): retry
+        // it once the writer is done, and unprotect it then. (Only with a copy: nothing is kept protected without one.)
+        let cow = cow.as_ref().unwrap();
+        let wait_page = (h..h_end).find(|&p| keep(p)).unwrap_or(h);
         // Test fault `ckpt_wp_race`: the writer that claimed the page is done with it before the fault is settled.
-        self.wp_race(cow, page, &[PENDING, READING, RESCUING]);
+        self.wp_race(cow, wait_page, &[PENDING, READING, RESCUING]);
         cow.stats.writer_claimed.fetch_add(1, Ordering::Relaxed);
-        cow.wait_for(page, cow.state(page));
+        cow.wait_for(wait_page, cow.state(wait_page));
         Ok(Served::Writer(cow.clone()))
     }
 
@@ -242,16 +234,26 @@ impl Pager {
     fn pagemap_one(&self, page: usize) -> io::Result<u64> {
         let f = self.pagemap_file()?;
         let mut raw = [0u8; 8];
-        std::os::unix::fs::FileExt::read_exact_at(f, &mut raw, self.addr(page)? / PAGE_SIZE as u64 * 8)?;
+        let hp = crate::util::host_page_size() as u64;
+        std::os::unix::fs::FileExt::read_exact_at(f, &mut raw, self.addr(page)? / hp * 8)?;
         Ok(u64::from_le_bytes(raw))
     }
 
-    /// The pagemap entries of `n` pages from `page` in Firecracker (`PM_*` bits).
+    /// The pagemap entries of `n` guest pages from `page` in Firecracker (`PM_*` bits), indexed by host page.
     fn pagemap(&self, page: usize, n: usize) -> io::Result<Vec<u64>> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
         let f = self.pagemap_file()?;
-        let mut raw = vec![0u8; n * 8];
-        std::os::unix::fs::FileExt::read_exact_at(f, &mut raw, self.addr(page)? / PAGE_SIZE as u64 * 8)?;
-        Ok(raw.chunks(8).map(|e| u64::from_le_bytes(e.try_into().unwrap())).collect())
+        let addr = self.addr(page)?;
+        let hp = crate::util::host_page_size() as u64;
+        let first_host = addr / hp;
+        let last_host = (addr + (n * PAGE_SIZE) as u64 - 1) / hp;
+        let count = (last_host - first_host + 1) as usize;
+        let mut raw = vec![0u8; count * 8];
+        std::os::unix::fs::FileExt::read_exact_at(f, &mut raw, first_host * 8)?;
+        let host_entries: Vec<u64> = raw.chunks_exact(8).map(|e| u64::from_le_bytes(e.try_into().unwrap())).collect();
+        Ok(expand_pagemap_entries(&host_entries, addr, n, hp as usize))
     }
 
     /// While a REMOVE is held back (and with it every fault, as the kernel refuses our ioctls until it is read): copies
@@ -421,7 +423,8 @@ impl Pager {
                 }
                 pages.get(p) == PRESENT && kept.get(k) != Some(&p)
             });
-            match self.protect(protect_ranges(dirty_here, &kept[kept_start..]), Some(&dirty)) {
+            let ranges = align_ranges(protect_ranges(dirty_here, &kept[kept_start..]), (from, to), crate::util::pages_per_host_page());
+            match self.protect(ranges, Some(&dirty)) {
                 Ok(n) => protected += n,
                 Err(e) => {
                     self.recycle_hot(hot);
@@ -603,8 +606,62 @@ impl Pager {
     }
 
     pub(super) fn wake(&self, page: usize) -> io::Result<()> {
-        self.ioctl(UFFDIO_WAKE, &mut [self.addr(page)?, PAGE_SIZE as u64])
+        let base = self.host_page_start(page)?;
+        self.ioctl(UFFDIO_WAKE, &mut [self.addr(base)?, crate::util::host_page_size() as u64])
     }
+}
+
+/// Expands host-page pagemap entries covering `[addr, addr + n * PAGE_SIZE)` into one entry per guest page.
+fn expand_pagemap_entries(host_entries: &[u64], addr: u64, n: usize, host_page: usize) -> Vec<u64> {
+    let off = (addr as usize) & (host_page - 1);
+    (0..n).map(|i| host_entries[(off + i * PAGE_SIZE) / host_page]).collect()
+}
+
+/// Expands guest-page ranges `[a, b)` outward to `granule`-page host-page boundaries within `(from, to)` and merges
+/// overlapping or adjacent ranges.
+fn align_ranges(ranges: Vec<(usize, usize)>, (from, to): (usize, usize), granule: usize) -> Vec<(usize, usize)> {
+    if granule == 1 {
+        return ranges;
+    }
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (a, b) in ranges {
+        let lo = super::align_down_in(a, from, granule);
+        let hi = super::align_up_in(b, from, to, granule);
+        match out.last_mut() {
+            Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+            _ => out.push((lo, hi)),
+        }
+    }
+    out
+}
+
+/// The host-page-aligned range `[p, q)` within `[first, end)` to unprotect around `h` (aligned to `granule`), or None
+/// if any guest page in `h`'s host page must stay protected (`keep`).
+fn wp_unprotect_range(
+    h: usize,
+    (first, end): (usize, usize),
+    granule: usize,
+    keep: impl Fn(usize) -> bool,
+    is_dirty: impl Fn(usize) -> bool,
+) -> Option<(usize, usize)> {
+    let h_end = (h + granule).min(end);
+    if (h..h_end).any(&keep) {
+        return None;
+    }
+    let (mut p, mut q) = (h, h_end);
+    while p >= first + granule && (p - granule..p).all(|x| !keep(x)) {
+        p -= granule;
+    }
+    while q + granule <= end && (q..q + granule).all(|x| !keep(x)) {
+        q += granule;
+    }
+    while p < h && (p..p + granule).all(&is_dirty) {
+        p += granule;
+    }
+    while q > h_end && (q - granule..q).all(&is_dirty) {
+        q -= granule;
+    }
+    Some((p, q))
 }
 
 /// The aligned block of `size` pages of the region `span` holding `page`, cut short at the region's end. Aligned within
@@ -615,13 +672,13 @@ fn block_at(page: usize, (from, to): (usize, usize), size: usize) -> (usize, usi
     (first, (first + size).min(to))
 }
 
-/// For a fault on `page`, rescues its `block` with `rescue` unless `over` budget. Over budget, or without memory for
-/// the copies (`rescue` gives None; on the `least` block then), nothing more is copied here: the unsaved pages of the
-/// block stay protected, and the writers take them first. None if the fault waits for them (its page is one); else the
-/// pages rescued and the block to unprotect around `page`.
+/// For a fault on host page `[h, h_end)`, rescues its `block` with `rescue` unless `over` budget. Over budget, or
+/// without memory for the copies (`rescue` gives None; on the `least` block then), nothing more is copied here: the
+/// unsaved pages of the block stay protected, and the writers take them first. None if the fault waits for them (any
+/// page of its host page is one); else the pages rescued and the block to unprotect around it.
 fn rescue_or_want(
     cow: &Cow,
-    page: usize,
+    (h, h_end): (usize, usize),
     over: bool,
     block: (usize, usize),
     least: impl FnOnce() -> (usize, usize),
@@ -636,8 +693,8 @@ fn rescue_or_want(
     };
     let unsaved: Vec<usize> = (first..end).filter(|&p| cow.state(p) == PENDING).collect();
     unsaved.iter().for_each(|&p| cow.want(p));
-    if unsaved.contains(&page) {
-        cow.wait_for(page, PENDING);
+    if let Some(wait) = (h..h_end).find(|p| unsaved.contains(p)) {
+        cow.wait_for(wait, PENDING);
         return Ok(None);
     }
     Ok(Some((0, (first, end))))
@@ -1003,19 +1060,19 @@ mod tests {
         room.set(0);
         let present = |c: &[usize]| Ok(vec![PM_PRESENT; c.len().max(512)]);
         let rescue = |f, e| rescue_block(&cow, f, e, present, |_, _| panic!("nothing read"));
-        assert_eq!(rescue_or_want(&cow, 700, false, (512, 1024), || (688, 704), rescue).unwrap(), None, "the fault waits");
+        assert_eq!(rescue_or_want(&cow, (700, 701), false, (512, 1024), || (688, 704), rescue).unwrap(), None, "the fault waits");
         assert_eq!(cow.wanted_pages(), (688..704).collect::<Vec<_>>(), "the least block, asked for");
         assert!((512..1024).all(|p| cow.state(p) == PENDING));
         // Its page saved already: nothing to wait for, the least block unprotected around it.
         cow.claim(720, PENDING, READING);
         let rescue = |f, e| rescue_block(&cow, f, e, present, |_, _| panic!("nothing read"));
-        assert_eq!(rescue_or_want(&cow, 720, false, (512, 1024), || (720, 736), rescue).unwrap(), Some((0, (720, 736))));
+        assert_eq!(rescue_or_want(&cow, (720, 721), false, (512, 1024), || (720, 736), rescue).unwrap(), Some((0, (720, 736))));
         // With room, the whole block is rescued and nothing asked for.
         room.set(10);
         let cow = Cow::new(n, &vec![(0, n as u64, crate::uffd::REMOTE)]).keep_slots(Arc::new(Mutex::new(None)), room.clone());
         cow.start_writing();
         let rescue = |f, e| rescue_block(&cow, f, e, present, guest_read(&mem));
-        assert_eq!(rescue_or_want(&cow, 700, false, (512, 1024), || panic!("not the least"), rescue).unwrap(), Some((512, (512, 1024))));
+        assert_eq!(rescue_or_want(&cow, (700, 701), false, (512, 1024), || panic!("not the least"), rescue).unwrap(), Some((512, (512, 1024))));
         assert!(cow.wanted_pages().is_empty());
     }
 
@@ -1080,30 +1137,32 @@ mod tests {
     fn template_prefault_populates_the_source_mapping() {
         use std::os::unix::fs::FileExt;
 
-        let (dir, mut pager) = test_pager(1);
-        std::fs::write(dir.join("mem"), vec![42; PAGE_SIZE]).unwrap();
+        let hp = crate::util::host_page_size();
+        let g = crate::util::pages_per_host_page();
+        let (dir, mut pager) = test_pager(g);
+        std::fs::write(dir.join("mem"), vec![42; hp]).unwrap();
         pager.base = crate::template::Template::open_dir("test", dir.to_path_buf()).unwrap();
-        let ptr = pager.base.pages(0, 1).as_ptr() as *mut libc::c_void;
+        let ptr = pager.base.pages(0, g).as_ptr() as *mut libc::c_void;
         // Older kernels only support the asynchronous fallback.
-        if unsafe { libc::madvise(ptr, PAGE_SIZE, libc::MADV_POPULATE_READ) } != 0 {
+        if unsafe { libc::madvise(ptr, hp, libc::MADV_POPULATE_READ) } != 0 {
             return;
         }
-        assert_eq!(unsafe { libc::madvise(ptr, PAGE_SIZE, libc::MADV_DONTNEED) }, 0);
+        assert_eq!(unsafe { libc::madvise(ptr, hp, libc::MADV_DONTNEED) }, 0);
         let map = std::fs::File::open("/proc/self/pagemap").unwrap();
         let present = || {
             let mut entry = [0; 8];
-            map.read_exact_at(&mut entry, ptr as u64 / PAGE_SIZE as u64 * 8).unwrap();
+            map.read_exact_at(&mut entry, ptr as u64 / hp as u64 * 8).unwrap();
             u64::from_ne_bytes(entry) & PM_PRESENT != 0
         };
         assert!(!present());
         // Fault preparation needs neither wp nor a claim, so freeze can take a consistent snapshot meanwhile.
         let _wp = pager.wp.lock().unwrap();
-        assert_eq!(pager.prepare_fault_template(0, 16), 1);
+        assert_eq!(pager.prepare_fault_template(0, 16), g);
         assert!(present(), "the copy must not be the first access to the source");
         assert_eq!(pager.pages().get(0), BASE);
         assert!(!pager.pages().is_dirty(0));
         assert_eq!(pager.prepare_fault_template(0, 0), 0);
-        assert_eq!(pager.prepare_fault_template(1, 16), 0);
+        assert_eq!(pager.prepare_fault_template(g, 16), 0);
     }
 
     #[test]
@@ -1351,5 +1410,30 @@ mod tests {
             true => assert!(registered.is_ok(), "uffd-wp reported, but registering failed: {registered:?}"),
             false => assert_eq!(registered.map_err(|e| e.raw_os_error()), Err(Some(libc::EINVAL))),
         }
+    }
+
+    #[test]
+    fn wp_granule_helpers_work_for_64k_host_pages() {
+        // expand_pagemap_entries maps host-page entries to each guest page in [addr, addr + n * PAGE_SIZE).
+        let hp = 65536usize;
+        let entries = [PM_PRESENT, PM_PRESENT | PM_UFFD_WP, 0];
+        let addr = hp as u64 + 14 * PAGE_SIZE as u64;
+        let expanded = expand_pagemap_entries(&entries, addr, 4, hp);
+        assert_eq!(expanded, [PM_PRESENT, PM_PRESENT, PM_PRESENT | PM_UFFD_WP, PM_PRESENT | PM_UFFD_WP]);
+
+        // align_ranges aligns outward to 16-page host granules within the region and merges overlaps.
+        assert_eq!(align_ranges(vec![(3, 5), (12, 18), (65, 66)], (0, 128), 16), vec![(0, 32), (64, 80)]);
+        assert_eq!(align_ranges(vec![(3, 5), (12, 18)], (0, 128), 1), vec![(3, 5), (12, 18)]);
+
+        // wp_unprotect_range never unprotects a host page containing a kept guest page, and trims only wholly-dirty host pages.
+        let kept = |p: usize| p == 5 || p == 50;
+        // Faulting host page 0..16 contains kept page 5 -> must wait.
+        assert_eq!(wp_unprotect_range(0, (0, 64), 16, kept, |_| false), None);
+        // Faulting host page 16..32: host page 0..16 has kept page 5, host page 48..64 has kept page 50 -> [16, 48).
+        assert_eq!(wp_unprotect_range(16, (0, 64), 16, kept, |_| false), Some((16, 48)));
+        // If host page 32..48 is wholly dirty, it is trimmed off -> [16, 32).
+        assert_eq!(wp_unprotect_range(16, (0, 64), 16, kept, |p| (32..48).contains(&p)), Some((16, 32)));
+        // If only part of host page 32..48 is dirty, it stays in the range -> [16, 48).
+        assert_eq!(wp_unprotect_range(16, (0, 64), 16, kept, |p| (32..40).contains(&p)), Some((16, 48)));
     }
 }

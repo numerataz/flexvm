@@ -95,8 +95,8 @@ mod hw {
 
     #[target_feature(enable = "sse4.2")]
     pub(super) unsafe fn update(mut c: u32, bytes: &[u8]) -> u32 {
-        let mut pages = bytes.chunks_exact(4096);
-        if bytes.len() >= 4096 {
+        let mut pages = bytes.chunks_exact(crate::util::PAGE_SIZE);
+        if bytes.len() >= crate::util::PAGE_SIZE {
             let t = super::shift_tables();
             for p in &mut pages {
                 c = page(c, p, t).0;
@@ -149,8 +149,8 @@ mod hw {
 
     #[target_feature(enable = "crc")]
     pub(super) unsafe fn update(mut c: u32, bytes: &[u8]) -> u32 {
-        let mut pages = bytes.chunks_exact(4096);
-        if bytes.len() >= 4096 {
+        let mut pages = bytes.chunks_exact(crate::util::PAGE_SIZE);
+        if bytes.len() >= crate::util::PAGE_SIZE {
             let t = super::shift_tables();
             for p in &mut pages {
                 c = page(c, p, t).0;

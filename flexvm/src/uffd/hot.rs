@@ -130,7 +130,7 @@ impl Pager {
         if !self.tracking() {
             return;
         }
-        let want = (self.dirty_count() * 2 + 1024).min(HOT_MIB << 20 >> 12);
+        let want = (self.dirty_count() * 2 + 1024).min((HOT_MIB << 20) / PAGE_SIZE);
         let mut spare = self.hot_spare.lock().unwrap();
         if spare.as_ref().is_some_and(|b| b.pages() >= want) {
             return;
@@ -375,7 +375,7 @@ mod tests {
 
     #[test]
     fn hot_pages_over_cap_keep_previous_hot_pages_first() {
-        let cap = HOT_MIB << 20 >> 12;
+        let cap = (HOT_MIB << 20) / PAGE_SIZE;
         let pages = super::super::pages::Pages::new(cap + 3);
         for p in 0..cap + 3 {
             pages.mark_dirty(p);

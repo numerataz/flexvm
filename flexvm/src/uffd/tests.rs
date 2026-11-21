@@ -1447,3 +1447,98 @@ fn working_set_chunks_stay_within_region_relative_arm_boundaries() {
         assert_eq!(runs, [(750, 768), (768, 800)]);
     }
 }
+
+#[test]
+fn fetch_install_granules_assembles_mixed_64k_host_pages() {
+    const G: usize = 16;
+    // Two 64 KiB host pages (32 guest pages): mixed BASE, REMOTE, ZERO.
+    let mut p = Pages::new(2 * G);
+    p.fill(3, 4, REMOTE); // host page 0: [3..7) REMOTE
+    p.fill(10, 2, ZERO); // host page 0: [10..12) ZERO
+    p.fill(G + 1, 3, REMOTE); // host page 1: [17..20) REMOTE
+    p.fill(G + 12, 4, ZERO); // host page 1: [28..32) ZERO
+    let orig = p.claim_granules(0, 2 * G, G, |_, snap| snap.contains(&REMOTE));
+    assert_eq!(orig.len(), 2 * G);
+
+    let stop = AtomicBool::new(false);
+    let mut fetched_ranges = Vec::new();
+    let mut fetch = |off: u64, buf: &mut [u8], _: &AtomicBool, progress: &mut dyn FnMut(&[u8]) -> bool| {
+        let start = off as usize / PAGE_SIZE;
+        let count = buf.len() / PAGE_SIZE;
+        fetched_ranges.push((start, count));
+        for i in 0..count {
+            buf[i * PAGE_SIZE..(i + 1) * PAGE_SIZE].fill(0x80 | (start + i) as u8);
+        }
+        assert!(progress(buf));
+        Ok(())
+    };
+    let mut installed = vec![0u8; 2 * G * PAGE_SIZE];
+    let mut install_calls = Vec::new();
+    let (resolved, res) = p.fetch_install_granules(
+        0,
+        2 * G,
+        Some(&orig),
+        G,
+        &mut vec![0u8; 2 * G * PAGE_SIZE],
+        &mut fetch,
+        &stop,
+        &mut |_| false,
+        |page, dst| dst.fill(0x40 | page as u8),
+        |pg, c, src| {
+            assert_eq!(pg % G, 0);
+            assert_eq!(c % G, 0);
+            install_calls.push((pg, c));
+            installed[pg * PAGE_SIZE..(pg + c) * PAGE_SIZE].copy_from_slice(src);
+            Ok(c)
+        },
+    );
+    assert!(res.is_ok());
+    assert_eq!(resolved, 7);
+    assert_eq!(fetched_ranges, [(3, 4), (G + 1, 3)], "only REMOTE sub-runs are fetched");
+    assert_eq!(install_calls, [(0, G), (G, G)], "each host page is installed once its REMOTE pages arrive");
+    for pg in 0..2 * G {
+        assert_eq!(p.get(pg), PRESENT);
+        let want = match orig[pg] {
+            REMOTE => 0x80 | pg as u8,
+            BASE => 0x40 | pg as u8,
+            ZERO => 0,
+            s => unreachable!("unexpected state {s}"),
+        };
+        assert!(installed[pg * PAGE_SIZE..(pg + 1) * PAGE_SIZE].iter().all(|&b| b == want), "page {pg}");
+    }
+
+    // Homogeneous REMOTE streaming with granule = 16 installs only in multiples of 16 guest pages.
+    let mut p = Pages::new(2 * G);
+    p.fill(0, 2 * G, REMOTE);
+    assert_eq!(p.claim(0, 2 * G, REMOTE, |_| true), 2 * G);
+    let mut calls = Vec::new();
+    let mut fetch = |off: u64, buf: &mut [u8], _: &AtomicBool, progress: &mut dyn FnMut(&[u8]) -> bool| {
+        assert_eq!(off, 0);
+        // Trickle 4 KiB at a time: must not install until 16 pages (64 KiB) have arrived.
+        for k in 1..=buf.len() / PAGE_SIZE {
+            buf[(k - 1) * PAGE_SIZE..k * PAGE_SIZE].fill(k as u8);
+            assert!(progress(&buf[..k * PAGE_SIZE]));
+        }
+        Ok(())
+    };
+    let (resolved, res) = p.fetch_install_granules(
+        0,
+        2 * G,
+        None,
+        G,
+        &mut vec![0u8; 2 * G * PAGE_SIZE],
+        &mut fetch,
+        &stop,
+        &mut |_| false,
+        |_, _| {},
+        |pg, c, _| {
+            assert_eq!(pg % G, 0);
+            assert_eq!(c % G, 0);
+            calls.push((pg, c));
+            Ok(c)
+        },
+    );
+    assert!(res.is_ok());
+    assert_eq!(resolved, 2 * G);
+    assert_eq!(calls, [(0, G), (G, G)]);
+}

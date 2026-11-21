@@ -1,5 +1,5 @@
 use super::event::{FETCH, FIRST, QUEUED};
-use super::{os, Pager, Pages, Source, FAULT_FETCHERS, FAULT_TIMEOUT, PAGE_SIZE, REMOTE, REMOTE_FAULT_RUN};
+use super::{os, Pager, Pages, Source, BASE, FAULT_FETCHERS, FAULT_TIMEOUT, PAGE_SIZE, REMOTE, REMOTE_FAULT_RUN};
 use crate::checkpoint::Buf;
 use std::collections::VecDeque;
 use std::io::{self, IoSliceMut, Read, Write};
@@ -35,6 +35,7 @@ impl Pages {
     /// then at least `STREAM_RUN` at a time, so that a fault on any of them waits only for its part of the transfer. A
     /// failed fetch is tried again, for what has yet to arrive, while `retry` says so. Pages it does not install are
     /// given back. Returns the REMOTE pages resolved, and the error that stopped it.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn fetch_install(
         &self,
@@ -44,24 +45,113 @@ impl Pages {
         fetch: &mut FetchAny<'_>,
         stop: &AtomicBool,
         retry: &mut dyn FnMut(&io::Error) -> bool,
+        populate: impl FnMut(usize, usize, &[u8]) -> io::Result<usize>,
+    ) -> (usize, std::result::Result<(), Failed>) {
+        self.fetch_install_granules(first, n, None, 1, buf, fetch, stop, retry, |_, _| {}, populate)
+    }
+
+    /// `fetch_install` in `granule`-page host-page units. When `orig` is `Some`, the claimed run mixes `REMOTE` with
+    /// `BASE`/`ZERO` guest pages inside its host pages: only `REMOTE` sub-runs are fetched, `BASE` pages are filled
+    /// with `fill_base`, `ZERO` pages are zeroed, and whole host pages are installed together.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn fetch_install_granules(
+        &self,
+        first: usize,
+        n: usize,
+        orig: Option<&[u8]>,
+        granule: usize,
+        buf: &mut [u8],
+        fetch: &mut FetchAny<'_>,
+        stop: &AtomicBool,
+        retry: &mut dyn FnMut(&io::Error) -> bool,
+        fill_base: impl Fn(usize, &mut [u8]),
         mut populate: impl FnMut(usize, usize, &[u8]) -> io::Result<usize>,
     ) -> (usize, std::result::Result<(), Failed>) {
+        debug_assert_eq!(n % granule, 0);
+        if let Some(orig) = orig {
+            debug_assert_eq!(orig.len(), n);
+            // Fill non-REMOTE guest pages into `buf` up front.
+            for (k, &s) in orig.iter().enumerate() {
+                if s != REMOTE {
+                    let dst = &mut buf[k * PAGE_SIZE..(k + 1) * PAGE_SIZE];
+                    if s == BASE {
+                        fill_base(first + k, dst);
+                    } else {
+                        dst.fill(0);
+                    }
+                }
+            }
+            let (mut done, mut resolved) = (0, 0);
+            let mut sub = 0;
+            while sub < n {
+                if orig[sub] != REMOTE {
+                    sub += 1;
+                    continue;
+                }
+                let sub_end = (sub + 1..n).find(|&k| orig[k] != REMOTE).unwrap_or(n);
+                let mut got = sub;
+                while got < sub_end {
+                    let base = got;
+                    let mut arrived = base;
+                    let fetched = fetch(((first + base) * PAGE_SIZE) as u64, &mut buf[base * PAGE_SIZE..sub_end * PAGE_SIZE], stop, &mut |data| {
+                        arrived = base + data.len() / PAGE_SIZE;
+                        true
+                    });
+                    match fetched {
+                        Ok(()) => got = sub_end,
+                        Err(e) if arrived < sub_end && retry(&e) => got = arrived,
+                        Err(e) => return (resolved + self.release_granules(first + done, &orig[done..]), Err(Failed::Fetch(e))),
+                    }
+                }
+                // Install every host-page granule that has no remaining unfetched REMOTE pages.
+                let next_remote = (sub_end..n).find(|&k| orig[k] == REMOTE).unwrap_or(n);
+                let ready = (next_remote / granule) * granule;
+                if ready > done {
+                    let (r, res) = self.install_granules(first + done, &orig[done..ready], granule, Some(&|| stop.load(Ordering::SeqCst)), |p, c| {
+                        populate(p, c, &buf[(p - first) * PAGE_SIZE..(p - first + c) * PAGE_SIZE])
+                    });
+                    resolved += r;
+                    done = ready;
+                    if let Err(e) = res {
+                        return (resolved + self.release_granules(first + done, &orig[done..]), Err(Failed::Install(e)));
+                    }
+                }
+                sub = sub_end;
+            }
+            if done < n {
+                let (r, res) = self.install_granules(first + done, &orig[done..n], granule, Some(&|| stop.load(Ordering::SeqCst)), |p, c| {
+                    populate(p, c, &buf[(p - first) * PAGE_SIZE..(p - first + c) * PAGE_SIZE])
+                });
+                resolved += r;
+                if let Err(e) = res {
+                    return (resolved, Err(Failed::Install(e)));
+                }
+            }
+            return (resolved, Ok(()));
+        }
+        let step = STREAM_RUN.max(granule).div_ceil(granule) * granule;
+        let host_bytes = granule * PAGE_SIZE;
         // Installs pages `from..to` (counted from `first`) out of `data`, which holds them from page `base` on.
         let mut install = |from: usize, to: usize, data: &[u8], base: usize| {
             let src = |p: usize, c: usize| &data[(p - first - base) * PAGE_SIZE..(p - first - base + c) * PAGE_SIZE];
-            self.install(first + from, to - from, REMOTE, Some(&|| stop.load(Ordering::SeqCst)), |p, c| populate(p, c, src(p, c)))
+            if granule == 1 {
+                self.install(first + from, to - from, REMOTE, Some(&|| stop.load(Ordering::SeqCst)), |p, c| populate(p, c, src(p, c)))
+            } else {
+                let orig = vec![REMOTE; to - from];
+                self.install_granules(first + from, &orig, granule, Some(&|| stop.load(Ordering::SeqCst)), |p, c| populate(p, c, src(p, c)))
+            }
         };
         // Pages from `first` installed (or given back by a failed install).
         let (mut done, mut resolved) = (0, 0);
         let mut failed: Option<io::Error> = None;
         loop {
             let base = done;
-            // Pages from `first` in `buf`, installed or not.
+            // Whole host-page granules from `first` in `buf`, installed or not.
             let mut arrived = base;
             let fetched = fetch(((first + base) * PAGE_SIZE) as u64, &mut buf[base * PAGE_SIZE..n * PAGE_SIZE], stop, &mut |data| {
-                let ready = base + data.len() / PAGE_SIZE;
+                let ready = base + (data.len() / host_bytes) * granule;
                 arrived = ready;
-                if failed.is_none() && ready > done && (done == 0 || ready - done >= STREAM_RUN) {
+                if failed.is_none() && ready > done && (done == 0 || ready - done >= step) {
                     let (r, res) = install(done, ready, data, base);
                     resolved += r;
                     failed = res.err();
@@ -124,12 +214,12 @@ impl Pager {
 
     /// Queues a run of REMOTE pages a fault claimed for the fault fetcher with the fewest runs queued (see `Lane`),
     /// passing over one busy writing requests.
-    pub(super) fn queue_fault(&self, job: Job) {
+    pub(super) fn queue_fault(&self, job: Job, orig: Option<Vec<u8>>) {
         let queued = |l: &Lane| l.q.try_lock().map_or(usize::MAX, |q| q.jobs.len());
         // Test gate `fetch_connect_gate` holds the last fault fetcher: none of its runs go there meanwhile.
         let n = FAULT_FETCHERS - usize::from(crate::host::fault("fetch_connect_gate"));
         let lane = self.lanes[..n].iter().min_by_key(|l| queued(l)).unwrap();
-        lane.push(job);
+        lane.push_with(job, orig);
     }
 
     /// Fetches and installs the runs faults claimed (`lane`), so that the event thread never waits for the network or
@@ -146,14 +236,14 @@ impl Pager {
             return self.fail(format!("fetching pages for faults: {e}"));
         }
         loop {
-            let (page, n, queued) = {
+            let ((page, n, queued), orig) = {
                 let mut q = lane.q.lock().unwrap();
                 loop {
                     if self.stop.load(Ordering::SeqCst) {
                         return;
                     }
                     if let Some(front) = q.jobs.front() {
-                        break front.job;
+                        break (front.job, front.orig.clone());
                     }
                     // Claimed pages count as left until they settle, so with none left no fault can queue another run.
                     if self.remote_left() == 0 {
@@ -175,7 +265,7 @@ impl Pager {
             let mut held = false;
             let mut fetch = |off: u64, buf: &mut [u8], stop: &AtomicBool, progress: &mut dyn FnMut(&[u8]) -> bool| {
                 fetch(off, buf, stop, &mut |data: &[u8]| {
-                    if tail_fail && !held && data.len() > PAGE_SIZE {
+                    if tail_fail && !held && data.len() > crate::util::host_page_size() {
                         held = true;
                         // A fault has its run: the pullers go on (they waited for this, `pull_range`).
                         let _ = self.tail_fail.compare_exchange(2, 1, Ordering::SeqCst, Ordering::SeqCst);
@@ -189,7 +279,7 @@ impl Pager {
             };
             let mut first = true;
             let stuck = *self.stuck_from.lock().unwrap();
-            let res = self.install_claimed(page, n, buf, &mut fetch, |p, c, src| {
+            let res = self.install_claimed(page, n, orig.as_deref(), buf, &mut fetch, |p, c, src| {
                 if tail_fail && p != page && self.tail_fail.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |k| k.checked_sub(1)).is_ok() {
                     return Err(os(libc::ENOMEM));
                 }
@@ -217,40 +307,72 @@ impl Pager {
                     // What went back to REMOTE may have no fault waiting on it any more (the faulting page went in
                     // first) and the pullers may be past it: queue it again, with its failure history, so it is not
                     // stranded.
-                    self.reclaim(page, n, |job| self.queue_fault(job));
+                    self.reclaim(page, n, |job, orig| self.queue_fault(job, orig));
                 }
             }
         }
     }
 
     /// Claims again what of `[page, page + n)` went back to REMOTE, a run at a time, for `queue`.
-    pub(super) fn reclaim(&self, page: usize, n: usize, mut queue: impl FnMut(Job)) {
+    pub(super) fn reclaim(&self, page: usize, n: usize, mut queue: impl FnMut(Job, Option<Vec<u8>>)) {
+        let g = crate::util::pages_per_host_page();
         let mut i = page;
         while i < page + n {
-            match self.pages().claim(i, page + n - i, REMOTE, |_| true) {
-                0 => i += 1,
-                k => {
-                    queue((i, k, Instant::now()));
+            if g == 1 {
+                match self.pages().claim(i, page + n - i, REMOTE, |_| true) {
+                    0 => i += 1,
+                    k => {
+                        queue((i, k, Instant::now()), None);
+                        i += k;
+                    }
+                }
+            } else {
+                let orig = self.pages().claim_granules(i, page + n - i, g, |_, snap| snap.contains(&REMOTE));
+                if orig.is_empty() {
+                    i += g;
+                } else {
+                    let k = orig.len();
+                    let mixed = orig.iter().any(|&s| s != REMOTE);
+                    queue((i, k, Instant::now()), mixed.then_some(orig));
                     i += k;
                 }
             }
         }
     }
 
-    /// `Pages::fetch_install`, counting the REMOTE pages resolved. A fetch that failed once every page was resolved
-    /// anyway (discarded meanwhile) is no failure.
+    /// `Pages::fetch_install_granules`, counting the REMOTE pages resolved. A fetch that failed once every page was
+    /// resolved anyway (discarded meanwhile) is no failure.
     pub(super) fn install_claimed(
         &self,
         first: usize,
         n: usize,
+        orig: Option<&[u8]>,
         buf: &mut [u8],
         fetch: &mut FetchAny<'_>,
         populate: impl FnMut(usize, usize, &[u8]) -> io::Result<usize>,
     ) -> std::result::Result<(), Failed> {
-        let (resolved, res) = self.pages().fetch_install(first, n, buf, fetch, &self.stop, &mut |e| self.retry_fetch(e), populate);
+        let remote_count = orig.map_or(n, |o| o.iter().filter(|&&s| s == REMOTE).count());
+        let (resolved, res) = self.pages().fetch_install_granules(
+            first,
+            n,
+            orig,
+            crate::util::pages_per_host_page(),
+            buf,
+            fetch,
+            &self.stop,
+            &mut |e| self.retry_fetch(e),
+            |p, dst| {
+                if self.base.has_data(p) {
+                    dst.copy_from_slice(self.base.pages(p, 1));
+                } else {
+                    dst.fill(0);
+                }
+            },
+            populate,
+        );
         self.pulled(resolved);
         match res {
-            Err(Failed::Fetch(_)) if resolved == n => Ok(()),
+            Err(Failed::Fetch(_)) if resolved == remote_count => Ok(()),
             r => r,
         }
     }
@@ -294,16 +416,23 @@ struct Queued {
     job: Job,
     /// What its request asks for, `(offset, len)`: the run, or what is left of it to fetch again.
     req: (u64, usize),
+    /// Original per-guest-page states when a host-page run mixes `REMOTE` with `BASE`/`ZERO` pages (not pipelined).
+    orig: Option<Vec<u8>>,
 }
 
 impl Lane {
-    /// Queues `job`, writing its request now if the connection takes it without blocking; otherwise the fetcher writes
-    /// it.
+    /// Queues an all-REMOTE `job`, writing its request now if the connection takes it without blocking.
     pub(super) fn push(&self, job: Job) {
+        self.push_with(job, None);
+    }
+
+    /// Queues `job` (with optional mixed-granule original states), pipelining homogeneous REMOTE requests on `conn`.
+    pub(super) fn push_with(&self, job: Job, orig: Option<Vec<u8>>) {
         let mut q = self.q.lock().unwrap();
         let req = ((job.0 * PAGE_SIZE) as u64, job.1 * PAGE_SIZE);
-        q.jobs.push_back(Queued { job, req });
-        if !q.writing && q.sent + 1 == q.jobs.len() {
+        let mixed = orig.is_some();
+        q.jobs.push_back(Queued { job, req, orig });
+        if !mixed && !q.writing && q.sent + 1 == q.jobs.len() {
             if let Some(conn) = &q.conn {
                 let (buf, len) = request(req.0, req.1, q.head);
                 let n = unsafe { libc::send(conn.as_raw_fd(), buf.as_ptr().cast(), len, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
@@ -327,6 +456,16 @@ impl Lane {
         (q.jobs.front().map(|j| j.job), q.jobs.len())
     }
 
+    /// The front job with its optional mixed-granule original states, and how many are queued.
+    pub(super) fn front_with(&self) -> (Option<FrontJob>, usize) {
+        let q = self.q.lock().unwrap();
+        (q.jobs.front().map(|j| (j.job, j.orig.clone())), q.jobs.len())
+    }
+
+    fn front_mixed(&self) -> bool {
+        self.q.lock().unwrap().jobs.front().is_some_and(|j| j.orig.is_some())
+    }
+
     /// The fetcher is done with the front job.
     pub(super) fn pop(&self) {
         let mut q = self.q.lock().unwrap();
@@ -348,14 +487,15 @@ impl Lane {
             debug_assert_eq!(q.sent, 0, "refetching part of a run");
         }
         // Written without holding `q`, so that queueing (the event thread) never waits for a write; it writes nothing
-        // meanwhile (`writing`), which keeps requests in order.
-        while q.sent < q.jobs.len() {
+        // meanwhile (`writing`), which keeps requests in order. Stop before any mixed-granule job.
+        while q.sent < q.jobs.len() && q.jobs[q.sent].orig.is_none() {
             let mut out = Vec::new();
-            for j in q.jobs.range(q.sent..) {
+            let mut upto = q.sent;
+            for j in q.jobs.range(q.sent..).take_while(|j| j.orig.is_none()) {
                 let (buf, len) = request(j.req.0, j.req.1, q.head);
                 out.extend_from_slice(&buf[..len]);
+                upto += 1;
             }
-            let upto = q.jobs.len();
             q.writing = true;
             drop(q);
             let res = crate::util::By { s: conn, at }.write_all(&out);
@@ -441,6 +581,7 @@ impl Link {
             };
             let res = match lane {
                 Some(lane) if buf.is_empty() => lane.flush(&client.stream.s.s, None, head, at),
+                Some(lane) if lane.front_mixed() => client.fetch(offset, buf, head, &mut counted, at),
                 Some(lane) => lane.flush(&client.stream.s.s, Some((offset, buf.len())), head, at).and_then(|()| client.recv(buf, head, &mut counted, at)),
                 None => client.fetch(offset, buf, head, &mut counted, at),
             };
@@ -736,6 +877,7 @@ pub(super) type Fetch = dyn FnMut(u64, &mut [u8], &AtomicBool, &mut dyn FnMut(&[
 type FetchAny<'a> = dyn FnMut(u64, &mut [u8], &AtomicBool, &mut dyn FnMut(&[u8]) -> bool) -> io::Result<()> + 'a;
 /// A run of REMOTE pages a fault claimed, `(first, count)`, and when it was queued.
 pub(super) type Job = (usize, usize, Instant);
+pub(super) type FrontJob = (Job, Option<Vec<u8>>);
 
 /// Errors after which the pager gives up on the VM: its migration source has been gone too long, or its checkpoint file
 /// is unreadable or corrupt.

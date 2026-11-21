@@ -1,7 +1,7 @@
 use super::fetch::fatal;
 use super::{
-    os, Mapping, Pager, BASE, DISCARDED, FAULT_AROUND, FAULT_TIMEOUT, INFLIGHT, PAGE_SIZE, PRESENT, PULL_RUN, REMOTE, REMOTE_FAULT_RUN, UFFDIO_COPY_MODE_WP,
-    ZERO, ZEROES,
+    align_down_in, os, zero_host_page, Mapping, Pager, BASE, DISCARDED, FAULT_AROUND, FAULT_TIMEOUT, INFLIGHT, PAGE_SIZE, PRESENT, PULL_RUN, REMOTE,
+    REMOTE_FAULT_RUN, UFFDIO_COPY_MODE_WP, ZERO,
 };
 use crate::cow::{Cow, PENDING, READING, RESCUING};
 use std::collections::VecDeque;
@@ -258,7 +258,9 @@ impl Pager {
                     }
                     Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => p.parked = false,
                     // Firecracker unmapped guest memory (tearing down a failed load, or exiting).
-                    Err(e) if page.is_some_and(|page| self.unmapped(&e, page, 1)) => return self.gone(),
+                    Err(e) if page.is_some_and(|page| self.unmapped(&e, self.host_page_start(page).unwrap_or(page), crate::util::pages_per_host_page())) => {
+                        return self.gone();
+                    }
                     Err(e) if fatal(&e) => return self.fail(e.to_string()),
                     Err(e) => {
                         p.parked = false;
@@ -295,10 +297,11 @@ impl Pager {
     fn discard(&self, removing: &RwLockWriteGuard<'_, ()>, start: u64, end: u64) -> usize {
         self.discards.fetch_add(1, Ordering::SeqCst);
         let cow = self.cow();
-        let (mut a, mut resolved) = (start & !(PAGE_SIZE as u64 - 1), 0);
+        let hp = crate::util::host_page_size() as u64;
+        let (mut a, mut resolved) = (start & !(hp - 1), 0);
         while a < end {
             let Some((first, m)) = self.page_of(a) else {
-                a += PAGE_SIZE as u64;
+                a += hp;
                 continue;
             };
             let n = ((end.min(m.base_host_virt_addr + m.size as u64) - a) as usize).div_ceil(PAGE_SIZE);
@@ -316,14 +319,17 @@ impl Pager {
     /// reads for queued faults and nearby future faults; UFFDIO_COPY still waits if their data is not ready.
     /// Returns the pages hinted.
     fn readahead_template(&self, page: usize, m: &Mapping) -> std::ops::Range<usize> {
-        let n = self.pages().base_run(page, FAULT_AROUND.min(m.span().1 - page), |p| self.base.has_data(p));
+        let g = crate::util::pages_per_host_page();
+        let page = align_down_in(page, m.span().0, g);
+        let n = self.pages().base_run(page, FAULT_AROUND.max(g).min(m.span().1 - page), |p| self.base.has_data(p));
         self.base.willneed(page, n);
         page..page + n
     }
 
     /// Prepare before wp, without claiming: freeze still sees the old state until the install settles under wp.
     pub(super) fn prepare_fault_template(&self, page: usize, limit: usize) -> usize {
-        let around = if self.template_next.load(Ordering::Relaxed) == page { FAULT_AROUND } else { 1 };
+        let g = crate::util::pages_per_host_page();
+        let around = if self.template_next.load(Ordering::Relaxed) == page { FAULT_AROUND.max(g) } else { g };
         let n = self.pages().base_run(page, around.min(limit), |p| self.base.has_data(p));
         self.base.prefault(page, n);
         n
@@ -331,6 +337,8 @@ impl Pager {
 
     /// Serves a fault: REMOTE reads go to fetchers, while BASE copies can wait for template disk I/O.
     fn fault(&self, page: usize, m: &Mapping, flags: u64, waiting: bool, first: bool) -> io::Result<Served> {
+        let g = crate::util::pages_per_host_page();
+        let page = align_down_in(page, m.span().0, g);
         // Runs stay within a 2 MiB chunk: Firecracker keeps unplugged virtio-mem slots PROT_NONE, which splits the
         // region into VMAs at slot boundaries, and a uffd copy across a VMA end fails (ENOENT).
         let chunk = (2 << 20) / PAGE_SIZE;
@@ -348,15 +356,15 @@ impl Pager {
             // settled (see `Pages`). Missing at a checkpoint's pause too, so zero then: if the copy has yet to save it,
             // keep it protected until it has.
             PRESENT => {
-                let unsaved = self.cow().is_some_and(|c| matches!(c.state(page), PENDING | READING));
+                let unsaved = self.cow().is_some_and(|c| (page..page + g).any(|p| matches!(c.state(p), PENDING | READING)));
                 let res = match unsaved {
-                    true => self.copy(page, 1, &ZEROES, UFFDIO_COPY_MODE_WP),
-                    false => self.populate(page, 1, None),
+                    true => self.copy(page, g, zero_host_page(), UFFDIO_COPY_MODE_WP),
+                    false => self.populate(page, g, None),
                 };
                 match res {
                     Err(e) if e.raw_os_error() == Some(libc::EEXIST) => self.wake(page)?,
                     Err(e) => return Err(e),
-                    Ok(_) if !unsaved => pages.mark_dirty(page),
+                    Ok(_) if !unsaved => (page..page + g).for_each(|p| pages.mark_dirty(p)),
                     Ok(_) => {}
                 }
                 Ok(Served::Done(LOCAL))
@@ -364,17 +372,17 @@ impl Pager {
             // Someone else is installing it: their copy wakes the faulting thread, and their settling this thread, to
             // finish the fault.
             INFLIGHT | DISCARDED => Ok(Served::Waiting),
-            REMOTE => {
+            REMOTE if g == 1 => {
                 let n = pages.claim(page, REMOTE_FAULT_RUN.min(region_left), REMOTE, |_| true);
                 if n == 0 {
                     return Err(os(libc::EAGAIN));
                 }
-                self.queue_fault((page, n, Instant::now()));
+                self.queue_fault((page, n, Instant::now()), None);
                 // The pullers go on from there.
                 *self.steer.lock().unwrap() = (page + n, (page + n + STEER_AHEAD).min(m.span().1));
                 Ok(Served::Fetching)
             }
-            state => {
+            state if g == 1 => {
                 // BASE or ZERO: serve a run of neighbours with the same source.
                 let from_template = state == BASE && self.base.has_data(page);
                 let same = |p: usize| state == ZERO || self.base.has_data(p) == from_template;
@@ -390,6 +398,48 @@ impl Pager {
                 }
                 let src = |p: usize, c: usize| from_template.then(|| self.base.pages(p, c));
                 pages.install(page, n, state, None, |p, c| self.populate(p, c, src(p, c))).1.map(|()| Served::Done(LOCAL))
+            }
+            _ => {
+                // Host page covers `g` guest pages: claim, resolve, and install them together.
+                if (page..page + g).any(|p| pages.get(p) == REMOTE) {
+                    let orig = pages.claim_granules(page, REMOTE_FAULT_RUN.max(g).min(region_left), g, |_, snap| snap.contains(&REMOTE));
+                    if orig.is_empty() {
+                        return Err(os(libc::EAGAIN));
+                    }
+                    let n = orig.len();
+                    let mixed = orig.iter().any(|&s| s != REMOTE);
+                    self.queue_fault((page, n, Instant::now()), mixed.then_some(orig));
+                    *self.steer.lock().unwrap() = (page + n, (page + n + STEER_AHEAD).min(m.span().1));
+                    return Ok(Served::Fetching);
+                }
+                let from_template = (page..page + g).any(|p| pages.get(p) == BASE && self.base.has_data(p));
+                let around = if from_template { prepared.max(g) } else { FAULT_AROUND.max(g) };
+                let orig = pages.claim_granules(page, around.min(region_left), g, |h, snap| {
+                    !snap.contains(&REMOTE) && (0..g).any(|k| snap[k] == BASE && self.base.has_data(h + k)) == from_template
+                });
+                if orig.is_empty() {
+                    return Err(os(libc::EAGAIN));
+                }
+                let n = orig.len();
+                if from_template {
+                    self.template_next.store(page + n, Ordering::Relaxed);
+                }
+                if !from_template {
+                    pages.install_granules(page, &orig, g, None, |p, c| self.populate(p, c, None)).1.map(|()| Served::Done(LOCAL))
+                } else if orig.iter().all(|&s| s == BASE) {
+                    pages.install_granules(page, &orig, g, None, |p, c| self.populate(p, c, Some(self.base.pages(p, c)))).1.map(|()| Served::Done(LOCAL))
+                } else {
+                    let mut buf = vec![0u8; n * PAGE_SIZE];
+                    for (k, &s) in orig.iter().enumerate() {
+                        if s == BASE && self.base.has_data(page + k) {
+                            buf[k * PAGE_SIZE..(k + 1) * PAGE_SIZE].copy_from_slice(self.base.pages(page + k, 1));
+                        }
+                    }
+                    pages
+                        .install_granules(page, &orig, g, None, |p, c| self.populate(p, c, Some(&buf[(p - page) * PAGE_SIZE..(p - page + c) * PAGE_SIZE])))
+                        .1
+                        .map(|()| Served::Done(LOCAL))
+                }
             }
         }
     }
