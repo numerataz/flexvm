@@ -465,9 +465,13 @@ impl UdevWatcher {
                     }
                     match udev_event(&buf[..n as usize]) {
                         Some((b"add", i)) => {
-                            let removed = self.taps.lock().unwrap().remove(&i);
-                            if let Some(tap) = removed {
-                                restore(i, &tap.name);
+                            let name = self.taps.lock().unwrap().get(&i).map(|t| t.name.clone());
+                            if let Some(name) = name {
+                                restore(i, &name);
+                                let mut taps = self.taps.lock().unwrap();
+                                if taps.get(&i).is_some_and(|t| t.name == name) {
+                                    taps.remove(&i);
+                                }
                             }
                         }
                         Some((b"remove", i)) => {
