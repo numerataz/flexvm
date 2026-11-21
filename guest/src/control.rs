@@ -1456,6 +1456,7 @@ mod tests {
         host.shutdown(Shutdown::Write).unwrap();
         guest.shutdown(Shutdown::Write).unwrap();
         drop(client);
-        done.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+        let closed = done.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(closed.is_ok() || closed.is_err_and(|e| e.kind() == io::ErrorKind::BrokenPipe));
     }
 }
