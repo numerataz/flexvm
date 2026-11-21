@@ -151,7 +151,7 @@ impl Pager {
     pub(super) fn copy_hot(&self) -> Result<Option<Hot>, Previous> {
         let Some(buf) = self.hot_spare.lock().unwrap().take() else { return Ok(None) };
         // Written in two intervals in a row: one written once (a file being written, say) is better left to the writers.
-        let before = self.hot_dirty.lock().unwrap().clone();
+        let before = self.wp.lock().unwrap().hot_dirty.clone();
         // This is only a candidate scan: it clears no dirty bits. Freeze later takes the authoritative snapshot
         // under the fault lock and protects every dirty page not copied here, including intervening writes.
         let pages = self.pages();

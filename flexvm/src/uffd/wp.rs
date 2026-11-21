@@ -48,6 +48,29 @@ const UFFDIO_WRITEPROTECT: libc::c_ulong = 0xC018_AA06;
 const UFFDIO_WAKE: libc::c_ulong = 0x8010_AA02;
 const UFFDIO_REGISTER: libc::c_ulong = 0xC020_AA00;
 
+/// State guarded by `Pager::wp`: the previous interval's dirty snapshot, sparse words for kept hot pages, and
+/// reusable scratch buffers for WP-fault rescues on the event thread.
+#[derive(Default)]
+pub(super) struct WpState {
+    pub(super) hot_dirty: Arc<DirtyBits>,
+    pub(super) hot_kept: std::collections::BTreeMap<usize, u64>,
+    pub(super) scratch: RescueScratch,
+}
+
+/// Reusable scratch buffers for `rescue_block` and `fill_slots`, avoiding per-rescue heap allocations.
+#[derive(Default)]
+pub(super) struct RescueScratch {
+    claimed: Vec<usize>,
+    slots: Vec<Slot>,
+    pagemap_raw: Vec<u8>,
+    pagemap: Vec<u64>,
+    local: Vec<libc::iovec>,
+}
+
+// SAFETY: `local` is transient iovec scratch cleared before `fill_slots` returns, and `RescueScratch` is only accessed
+// exclusively (`&mut`).
+unsafe impl Send for RescueScratch {}
+
 /// What `Pager::freeze` captured for a checkpoint.
 pub struct Frozen {
     /// Page states for the writer: REMOTE pages are saved from the guest, ZERO pages are discarded, BASE pages
@@ -81,7 +104,7 @@ impl Pager {
     /// Then unprotects the pages of its block (`wp_block`) around it that need not stay
     /// protected for the copy, and marks them dirty. Unless it must wait for a writer to save the page first
     /// (`Served::Writer`).
-    pub(super) fn wp_fault(&self, page: usize, m: &Mapping, first_try: bool) -> io::Result<Served> {
+    pub(super) fn wp_fault(&self, page: usize, m: &Mapping, first_try: bool, wp: &mut WpState) -> io::Result<Served> {
         let g = crate::util::pages_per_host_page();
         let h = super::align_down_in(page, m.span().0, g);
         let h_end = (h + g).min(m.span().1);
@@ -102,13 +125,14 @@ impl Pager {
         }
         // Over budget, nothing more is copied here, and only the least block is unprotected.
         let over = cow.as_ref().is_some_and(|c| c.over_budget());
-        let (mut first, mut end) = self.wp_block(h, m, !over);
+        let (mut first, mut end) = self.wp_block(h, m, !over, wp);
         if let Some(cow) = &cow {
             // Test fault `ckpt_wp_race`: a writer claims the faulting page right here (#88).
             self.wp_race(cow, page, &[PENDING]);
             let start = Instant::now();
-            let least = || self.wp_block(h, m, false);
-            let Some((rescued, block)) = rescue_or_want(cow, (h, h_end), over, (first, end), least, |f, e| self.rescue(cow, f, e, first_try))? else {
+            let least = || block_at(h, m.span(), WP_BLOCK);
+            let Some((rescued, block)) = rescue_or_want(cow, (h, h_end), over, (first, end), least, |f, e| self.rescue(cow, f, e, first_try, &mut wp.scratch))?
+            else {
                 return Ok(Served::Writer(cow.clone()));
             };
             (first, end) = block;
@@ -163,19 +187,19 @@ impl Pager {
 
     /// The pages a write fault on `page` unprotects: an aligned block of its 2 MiB chunk within its region, the larger
     /// the more of the chunk is dirty since the last pause (see `WP_CHUNK`), unless not to `grow`.
-    fn wp_block(&self, page: usize, m: &Mapping, grow: bool) -> (usize, usize) {
+    fn wp_block(&self, page: usize, m: &Mapping, grow: bool, wp: &WpState) -> (usize, usize) {
         let (from, to) = m.span();
         let at = page - from;
         let size = match grow {
             true => {
                 let chunk = from + at - at % WP_CHUNK;
-                let (dirty, before) = (&self.pages().dirty, self.hot_dirty.lock().unwrap());
-                // Hot pages kept unprotected are dirty from the pause on whether written or not.
-                let kept = self.hot_kept.lock().unwrap();
+                let (dirty, before, kept) = (&self.pages().dirty, &wp.hot_dirty, &wp.hot_kept);
+                let kept_empty = kept.is_empty();
                 // Its pages dirty now and in the interval before the last pause. Regions are whole MiB: whole words.
+                // Hot pages kept unprotected are dirty from the pause on whether written or not.
                 let (mut n, mut was) = (0, 0);
                 for w in chunk / 64..(chunk + WP_CHUNK).min(to) / 64 {
-                    let k = kept.get(&w).copied().unwrap_or(0);
+                    let k = if kept_empty { 0 } else { kept.get(&w).copied().unwrap_or(0) };
                     n += (dirty.get(w).map_or(0, |d| d.load(Ordering::Relaxed)) & !k).count_ones() as usize;
                     was += (before.bits.get(w).copied().unwrap_or(0) & !k).count_ones() as usize;
                 }
@@ -192,10 +216,12 @@ impl Pager {
     /// missing, which would fault back to the event thread: only pages the pagemap shows populated are read (a missing
     /// one was missing, so zero, at the pause). `may_fail`: test fault `ckpt_rescue_fail` may fail it (not a fault's
     /// retry).
-    fn rescue(&self, cow: &Cow, first: usize, end: usize, may_fail: bool) -> io::Result<Option<usize>> {
-        let map =
-            |claimed: &[usize]| self.rescue_fail(cow, claimed, may_fail).and_then(|()| self.pagemap(claimed[0], claimed[claimed.len() - 1] + 1 - claimed[0]));
-        rescue_block(cow, first, end, map, |p, local| self.read_at((p * PAGE_SIZE) as u64, local))
+    fn rescue(&self, cow: &Cow, first: usize, end: usize, may_fail: bool, scratch: &mut RescueScratch) -> io::Result<Option<usize>> {
+        let map = |claimed: &[usize], raw: &mut Vec<u8>, out: &mut Vec<u64>| {
+            self.rescue_fail(cow, claimed, may_fail)?;
+            self.pagemap_into(claimed[0], claimed[claimed.len() - 1] + 1 - claimed[0], raw, out)
+        };
+        rescue_block(cow, first, end, scratch, map, |p, local| self.read_at((p * PAGE_SIZE) as u64, local))
     }
 
     /// Test fault `ckpt_rescue_fail`, once the writers run: every other eligible rescue (`may_fail`: a fault's first
@@ -239,10 +265,12 @@ impl Pager {
         Ok(u64::from_le_bytes(raw))
     }
 
-    /// The pagemap entries of `n` guest pages from `page` in Firecracker (`PM_*` bits), indexed by host page.
-    fn pagemap(&self, page: usize, n: usize) -> io::Result<Vec<u64>> {
+    /// The pagemap entries of `n` guest pages from `page` in Firecracker (`PM_*` bits), indexed by host page,
+    /// reusing `raw` and `out` scratch buffers.
+    fn pagemap_into(&self, page: usize, n: usize, raw: &mut Vec<u8>, out: &mut Vec<u64>) -> io::Result<()> {
+        out.clear();
         if n == 0 {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let f = self.pagemap_file()?;
         let addr = self.addr(page)?;
@@ -250,10 +278,10 @@ impl Pager {
         let first_host = addr / hp;
         let last_host = (addr + (n * PAGE_SIZE) as u64 - 1) / hp;
         let count = (last_host - first_host + 1) as usize;
-        let mut raw = vec![0u8; count * 8];
-        std::os::unix::fs::FileExt::read_exact_at(f, &mut raw, first_host * 8)?;
-        let host_entries: Vec<u64> = raw.chunks_exact(8).map(|e| u64::from_le_bytes(e.try_into().unwrap())).collect();
-        Ok(expand_pagemap_entries(&host_entries, addr, n, hp as usize))
+        raw.resize(count * 8, 0);
+        std::os::unix::fs::FileExt::read_exact_at(f, raw, first_host * 8)?;
+        expand_pagemap_raw_into(raw, addr, n, hp as usize, out);
+        Ok(())
     }
 
     /// While a REMOVE is held back (and with it every fault, as the kernel refuses our ioctls until it is read): copies
@@ -273,13 +301,16 @@ impl Pager {
         thread::scope(|s| {
             for _ in 0..threads {
                 // Fewer threads if they cannot be had; the writers do the rest.
-                let spawned = thread::Builder::new().spawn_scoped(s, || loop {
-                    let Some(&(first, end)) = chunks.get(next.fetch_add(1, Ordering::Relaxed)) else { return };
-                    if cow.left() == 0 || !cow.active() {
-                        return;
-                    }
-                    if let Ok(Some(n)) = self.rescue(cow, first, end, true) {
-                        cow.stats.held_pages.fetch_add(n as u64, Ordering::Relaxed);
+                let spawned = thread::Builder::new().spawn_scoped(s, || {
+                    let mut scratch = RescueScratch::default();
+                    loop {
+                        let Some(&(first, end)) = chunks.get(next.fetch_add(1, Ordering::Relaxed)) else { return };
+                        if cow.left() == 0 || !cow.active() {
+                            return;
+                        }
+                        if let Ok(Some(n)) = self.rescue(cow, first, end, true, &mut scratch) {
+                            cow.stats.held_pages.fetch_add(n as u64, Ordering::Relaxed);
+                        }
                     }
                 });
                 if spawned.is_err() {
@@ -321,9 +352,11 @@ impl Pager {
         // never unprotects one whose mark this reset cleared. (Not held while protecting: the serve thread must be free
         // to read events, or a queued REMOVE would fail the calls.)
         {
-            let _wp = self.wp.lock().unwrap();
+            let mut wp = self.wp.lock().unwrap();
             self.pages().dirty_bits(true);
             self.tracking.store(true, Ordering::SeqCst);
+            wp.hot_dirty = Arc::default();
+            wp.hot_kept.clear();
         }
         // No delta base now, nor hot pages.
         {
@@ -331,8 +364,6 @@ impl Pager {
             prev.0 = prev.0.checked_add(1).unwrap();
             prev.1 = None;
         }
-        *self.hot_dirty.lock().unwrap() = Arc::default();
-        self.hot_kept.lock().unwrap().clear();
         // In chunks: while the kernel changes a range, KVM retries guest faults anywhere in it, so one call over a
         // whole region would stall the vCPUs for as long as it takes.
         self.protect(self.chunks(ALL, ARM_CHUNK), None)?;
@@ -391,7 +422,7 @@ impl Pager {
             Err((generation, prev)) => (None, Some(generation), prev),
         };
         let hot_time = start.elapsed();
-        let _wp = self.wp.lock().unwrap();
+        let mut wp = self.wp.lock().unwrap();
         if (cow || incremental) && !self.tracking() {
             self.recycle_hot(hot);
             self.recycle(prev);
@@ -470,10 +501,10 @@ impl Pager {
             }
             // Only copied pages stay unprotected and are marked dirty again above before resume. The sparse map
             // merely excludes those pages from the fault-growth heuristic; it does not replace dirty tracking.
-            *self.hot_kept.lock().unwrap() = bits;
+            wp.hot_kept = bits;
             // Share the immutable snapshot instead of copying it during the pause. Frozen retains the same bits
             // for rollback; writes after the take accumulate separately in Pages::dirty, so none can be lost.
-            *self.hot_dirty.lock().unwrap() = dirty.clone();
+            wp.hot_dirty = dirty.clone();
         }
         let cow = cow.then(|| {
             let c = Cow::new(pages.len(), &out)
@@ -611,10 +642,17 @@ impl Pager {
     }
 }
 
-/// Expands host-page pagemap entries covering `[addr, addr + n * PAGE_SIZE)` into one entry per guest page.
-fn expand_pagemap_entries(host_entries: &[u64], addr: u64, n: usize, host_page: usize) -> Vec<u64> {
+/// Expands raw little-endian host-page pagemap entries covering `[addr, addr + n * PAGE_SIZE)` into one entry per
+/// guest page, writing into `out`.
+fn expand_pagemap_raw_into(raw: &[u8], addr: u64, n: usize, host_page: usize, out: &mut Vec<u64>) {
     let off = (addr as usize) & (host_page - 1);
-    (0..n).map(|i| host_entries[(off + i * PAGE_SIZE) / host_page]).collect()
+    out.clear();
+    out.reserve(n);
+    for i in 0..n {
+        let idx = (off + i * PAGE_SIZE) / host_page;
+        let bytes = &raw[idx * 8..(idx + 1) * 8];
+        out.push(u64::from_le_bytes(bytes.try_into().unwrap()));
+    }
 }
 
 /// Expands guest-page ranges `[a, b)` outward to `granule`-page host-page boundaries within `(from, to)` and merges
@@ -700,43 +738,50 @@ fn rescue_or_want(
     Ok(Some((0, (first, end))))
 }
 
-/// `Pager::rescue` of `first..end`, with `map` giving their pagemap entries (once it has claimed the pages it gets),
+/// `Pager::rescue` of `first..end`, with `map` filling `scratch.pagemap` (once it has claimed the pages it gets),
 /// and `read` (see `fill_slots`). None if there is no memory for their copies now.
 fn rescue_block(
     cow: &Cow,
     first: usize,
     end: usize,
-    map: impl FnOnce(&[usize]) -> io::Result<Vec<u64>>,
+    scratch: &mut RescueScratch,
+    map: impl FnOnce(&[usize], &mut Vec<u8>, &mut Vec<u64>) -> io::Result<()>,
     read: impl FnMut(usize, &[libc::iovec]) -> io::Result<()>,
 ) -> io::Result<Option<usize>> {
     // Only pages no one saved or is saving: a writer may hold some (READING), or have saved them, or they are hot.
-    let claimed: Vec<usize> = (first..end).filter(|&p| cow.claim(p, PENDING, RESCUING)).collect();
-    if claimed.is_empty() {
+    scratch.claimed.clear();
+    scratch.claimed.extend((first..end).filter(|&p| cow.claim(p, PENDING, RESCUING)));
+    if scratch.claimed.is_empty() {
         return Ok(Some(0));
     }
-    let slots = match cow.take_slots(claimed.len()) {
-        Ok(Some(s)) => s,
+    match cow.take_slots_into(scratch.claimed.len(), &mut scratch.slots) {
+        Ok(true) => {}
         // No memory for them now (`Room`): they stay protected for the writers, and the fault asks for them and waits
         // as over budget (`Cow::over_budget` says so too now).
-        Ok(None) => {
-            cow.unclaim_many(&claimed);
+        Ok(false) => {
+            cow.unclaim_many(&scratch.claimed);
             return Ok(None);
         }
         Err(e) => {
             cow.stats.rescue_failures.fetch_add(1, Ordering::Relaxed);
-            cow.unclaim_many(&claimed);
+            cow.unclaim_many(&scratch.claimed);
             return Err(e);
         }
-    };
-    let filled = map(&claimed).and_then(|map| fill_slots(&claimed, &slots, |p| map[p - claimed[0]] & (PM_PRESENT | PM_SWAP) != 0, read));
+    }
+    let filled = map(&scratch.claimed, &mut scratch.pagemap_raw, &mut scratch.pagemap).and_then(|()| {
+        let base = scratch.claimed[0];
+        let pagemap = &scratch.pagemap;
+        fill_slots(&scratch.claimed, &scratch.slots, &mut scratch.local, |p| pagemap[p - base] & (PM_PRESENT | PM_SWAP) != 0, read)
+    });
     if let Err(e) = filled {
         cow.stats.rescue_failures.fetch_add(1, Ordering::Relaxed);
-        cow.give_slots(slots);
-        cow.unclaim_many(&claimed);
+        cow.give_slots_from(&mut scratch.slots);
+        cow.unclaim_many(&scratch.claimed);
         return Err(e);
     }
-    cow.rescue_many(first, end, claimed.iter().copied().zip(slots));
-    Ok(Some(claimed.len()))
+    let n = scratch.claimed.len();
+    cow.rescue_many(first, end, scratch.claimed.iter().copied().zip(scratch.slots.drain(..)));
+    Ok(Some(n))
 }
 
 /// Fills `slots[i]` with the pause-time contents of page `claimed[i]` (ascending): runs of consecutive `present` pages
@@ -745,31 +790,35 @@ fn rescue_block(
 fn fill_slots(
     claimed: &[usize],
     slots: &[Slot],
+    local: &mut Vec<libc::iovec>,
     present: impl Fn(usize) -> bool,
     mut read: impl FnMut(usize, &[libc::iovec]) -> io::Result<()>,
 ) -> io::Result<()> {
     assert_eq!(claimed.len(), slots.len());
     // One for every run: a run's slots are mostly next to each other, so it rarely grows.
-    let mut local: Vec<libc::iovec> = Vec::new();
     let mut i = 0;
-    while i < claimed.len() {
-        if !present(claimed[i]) {
-            unsafe { std::ptr::write_bytes(slots[i].as_mut_ptr(), 0, PAGE_SIZE) };
-            i += 1;
-            continue;
+    let res = (|| {
+        while i < claimed.len() {
+            if !present(claimed[i]) {
+                unsafe { std::ptr::write_bytes(slots[i].as_mut_ptr(), 0, PAGE_SIZE) };
+                i += 1;
+                continue;
+            }
+            let mut j = i + 1;
+            while j < claimed.len() && j - i < 1024 && claimed[j] == claimed[j - 1] + 1 && present(claimed[j]) {
+                j += 1;
+            }
+            local.clear();
+            for s in &slots[i..j] {
+                crate::util::push_iov(local, s.as_mut_ptr().cast(), PAGE_SIZE);
+            }
+            read(claimed[i], local)?;
+            i = j;
         }
-        let mut j = i + 1;
-        while j < claimed.len() && j - i < 1024 && claimed[j] == claimed[j - 1] + 1 && present(claimed[j]) {
-            j += 1;
-        }
-        local.clear();
-        for s in &slots[i..j] {
-            crate::util::push_iov(&mut local, s.as_mut_ptr().cast(), PAGE_SIZE);
-        }
-        read(claimed[i], &local)?;
-        i = j;
-    }
-    Ok(())
+        Ok(())
+    })();
+    local.clear();
+    res
 }
 
 /// The ranges that protect `pages` (ascending): merged across gaps of up to `PROTECT_GAP` pages, wider ones while there
@@ -846,9 +895,11 @@ mod tests {
         let claimed = [3, 4, 5, 9, 10];
         let reads = Mutex::new(Vec::new());
         let read = guest_read(&mem);
+        let mut local = Vec::new();
         fill_slots(
             &claimed,
             &slots,
+            &mut local,
             |p| p != 4,
             |p, local| {
                 reads.lock().unwrap().push((p, local.iter().map(|v| v.iov_len / PAGE_SIZE).collect::<Vec<_>>()));
@@ -856,6 +907,7 @@ mod tests {
             },
         )
         .unwrap();
+        assert!(local.is_empty());
         let reads = reads.into_inner().unwrap();
         // A call per run of present pages; slots next to each other go as one piece.
         assert_eq!(reads.len(), 3);
@@ -883,28 +935,42 @@ mod tests {
         assert!(cow.claim(3, PENDING, READING));
         let left = cow.left();
         // Page 6 was missing at the pause: zero.
-        let map = |_: &[usize]| Ok((0..16).map(|i| if i == 6 { 0 } else { PM_PRESENT }).collect());
-        assert_eq!(rescue_block(&cow, 0, 16, map, guest_read(&mem)).unwrap(), Some(13));
+        let mut scratch = RescueScratch::default();
+        let map = |_: &[usize], _: &mut Vec<u8>, out: &mut Vec<u64>| {
+            out.clear();
+            out.extend((0..16).map(|i| if i == 6 { 0 } else { PM_PRESENT }));
+            Ok(())
+        };
+        assert_eq!(rescue_block(&cow, 0, 16, &mut scratch, map, guest_read(&mem)).unwrap(), Some(13));
         assert_eq!(cow.left(), left - 13);
         assert!([0, 4, 5, 6, 15].iter().all(|&p| cow.state(p) == RESCUED));
         assert_eq!((cow.state(1), cow.state(2), cow.state(3)), (CLEAN, HELD, READING));
         // Another fault on the block saves nothing again; the block's end is the next one's start.
-        assert_eq!(rescue_block(&cow, 0, 16, |_| panic!("nothing to read"), |_, _| panic!()).unwrap(), Some(0));
-        assert_eq!(rescue_block(&cow, 16, 18, |_| Ok(vec![PM_PRESENT; 2]), guest_read(&mem)).unwrap(), Some(2));
+        assert_eq!(rescue_block(&cow, 0, 16, &mut scratch, |_, _, _| panic!("nothing to read"), |_, _| panic!()).unwrap(), Some(0));
+        let fill_present = |n: usize| {
+            move |_: &[usize], _: &mut Vec<u8>, out: &mut Vec<u64>| {
+                out.clear();
+                out.resize(n, PM_PRESENT);
+                Ok(())
+            }
+        };
+        assert_eq!(rescue_block(&cow, 16, 18, &mut scratch, fill_present(2), guest_read(&mem)).unwrap(), Some(2));
         // Sparse rescue only reads pagemap for the claimed span (e.g. 20..22 within 0..64 block).
         let cow_sparse = Cow::new(64, &vec![(0, 64, crate::uffd::REMOTE)]);
         (0..20).chain(22..64).for_each(|p| assert!(cow_sparse.claim(p, PENDING, CLEAN)));
         let mem_sparse = guest_mem(64);
-        let sparse_map = |c: &[usize]| {
+        let sparse_map = |c: &[usize], _: &mut Vec<u8>, out: &mut Vec<u64>| {
             assert_eq!(c, &[20, 21]);
-            Ok(vec![PM_PRESENT; c.len()])
+            out.clear();
+            out.resize(c.len(), PM_PRESENT);
+            Ok(())
         };
-        assert_eq!(rescue_block(&cow_sparse, 0, 64, sparse_map, guest_read(&mem_sparse)).unwrap(), Some(2));
+        assert_eq!(rescue_block(&cow_sparse, 0, 64, &mut scratch, sparse_map, guest_read(&mem_sparse)).unwrap(), Some(2));
         assert_eq!(cow_sparse.state(20), RESCUED);
         assert_eq!(cow_sparse.state(21), RESCUED);
         // A failed read gives its pages and slots back.
         let fail = |_: usize, _: &[libc::iovec]| Err(io::Error::other("gone"));
-        assert!(rescue_block(&cow, 18, 24, |_| Ok(vec![PM_PRESENT; 6]), fail).is_err());
+        assert!(rescue_block(&cow, 18, 24, &mut scratch, fill_present(6), fail).is_err());
         assert!((18..24).all(|p| cow.state(p) == PENDING));
         assert_eq!(cow.left(), left - 15);
         // The guest writes on; the writer gets the pause-time contents.
@@ -964,6 +1030,7 @@ mod tests {
                 s.spawn(|| {
                     // Blocks of all sizes, all over, from the end down: they meet the writer's units at every offset.
                     let mut x = 0x9e37_79b9_u64 + round;
+                    let mut scratch = RescueScratch::default();
                     for i in 0..400 {
                         x ^= x << 13;
                         x ^= x >> 7;
@@ -971,8 +1038,15 @@ mod tests {
                         let size = [4, 16, 64, 512][i % 4];
                         let page = n - 1 - (x as usize % n) / 2 - i * 4 % (n / 2);
                         let first = page - page % size;
-                        let map = |_: &[usize]| Ok(vec![PM_PRESENT; size]);
-                        rescued.fetch_add(rescue_block(&cow, first, (first + size).min(n), map, guest_read(&guest.0)).unwrap().unwrap(), Ordering::Relaxed);
+                        let map = |_: &[usize], _: &mut Vec<u8>, out: &mut Vec<u64>| {
+                            out.clear();
+                            out.resize(size, PM_PRESENT);
+                            Ok(())
+                        };
+                        rescued.fetch_add(
+                            rescue_block(&cow, first, (first + size).min(n), &mut scratch, map, guest_read(&guest.0)).unwrap().unwrap(),
+                            Ordering::Relaxed,
+                        );
                     }
                 });
                 let start = Instant::now();
@@ -1017,13 +1091,18 @@ mod tests {
         crate::checkpoint::GuestPages::read(&pages, 0, &mut vec![0u8; PAGE_SIZE]).unwrap();
         room.set(3);
         assert!(!cow.over_budget());
-        let present = |c: &[usize]| Ok(vec![PM_PRESENT; c.len().max(512)]);
-        assert_eq!(rescue_block(&cow, 512, 1024, present, guest_read(&mem)).unwrap(), Some(512));
+        let mut scratch = RescueScratch::default();
+        let present = |c: &[usize], _: &mut Vec<u8>, out: &mut Vec<u64>| {
+            out.clear();
+            out.resize(c.len().max(512), PM_PRESENT);
+            Ok(())
+        };
+        assert_eq!(rescue_block(&cow, 512, 1024, &mut scratch, present, guest_read(&mem)).unwrap(), Some(512));
         assert_eq!(room.get(), 1, "a chunk taken out of the room");
         // No room for another chunk: the pages stay unsaved (and protected) for the writers; nothing fails.
         assert!(cow.over_budget(), "faults wait for the writers");
         let left = cow.left();
-        assert_eq!(rescue_block(&cow, 1024, 1536, present, |_, _| panic!("nothing read")).unwrap(), None, "no room");
+        assert_eq!(rescue_block(&cow, 1024, 1536, &mut scratch, present, |_, _| panic!("nothing read")).unwrap(), None, "no room");
         assert_eq!(cow.left(), left);
         assert!((1024..1536).all(|p| cow.state(p) == PENDING));
         // Once the writer takes the copies, their slots serve the next rescue without more room.
@@ -1031,7 +1110,7 @@ mod tests {
         crate::checkpoint::GuestPages::read(&pages, 512, &mut buf).unwrap();
         assert!(buf == mem[512 * PAGE_SIZE..1024 * PAGE_SIZE]);
         assert!(!cow.over_budget());
-        assert_eq!(rescue_block(&cow, 1024, 1536, present, guest_read(&mem)).unwrap(), Some(512));
+        assert_eq!(rescue_block(&cow, 1024, 1536, &mut scratch, present, guest_read(&mem)).unwrap(), Some(512));
         assert_eq!(room.get(), 1);
         crate::checkpoint::GuestPages::read(&pages, 1024, &mut buf).unwrap();
         assert!(buf == mem[1024 * PAGE_SIZE..1536 * PAGE_SIZE]);
@@ -1043,7 +1122,7 @@ mod tests {
         none.set(0);
         let early = early.keep_slots(Arc::new(Mutex::new(None)), none);
         assert!(!early.over_budget());
-        assert_eq!(rescue_block(&early, 0, 512, present, guest_read(&mem)).unwrap(), Some(512));
+        assert_eq!(rescue_block(&early, 0, 512, &mut scratch, present, guest_read(&mem)).unwrap(), Some(512));
     }
 
     /// A fault whose rescue finds no memory for its copies (the room went between `over_budget` and the take, as the
@@ -1058,20 +1137,25 @@ mod tests {
         let cow = Cow::new(n, &vec![(0, n as u64, crate::uffd::REMOTE)]).keep_slots(Arc::new(Mutex::new(None)), room.clone());
         cow.start_writing();
         room.set(0);
-        let present = |c: &[usize]| Ok(vec![PM_PRESENT; c.len().max(512)]);
-        let rescue = |f, e| rescue_block(&cow, f, e, present, |_, _| panic!("nothing read"));
+        let mut scratch = RescueScratch::default();
+        let present = |c: &[usize], _: &mut Vec<u8>, out: &mut Vec<u64>| {
+            out.clear();
+            out.resize(c.len().max(512), PM_PRESENT);
+            Ok(())
+        };
+        let rescue = |f, e| rescue_block(&cow, f, e, &mut scratch, present, |_, _| panic!("nothing read"));
         assert_eq!(rescue_or_want(&cow, (700, 701), false, (512, 1024), || (688, 704), rescue).unwrap(), None, "the fault waits");
         assert_eq!(cow.wanted_pages(), (688..704).collect::<Vec<_>>(), "the least block, asked for");
         assert!((512..1024).all(|p| cow.state(p) == PENDING));
         // Its page saved already: nothing to wait for, the least block unprotected around it.
         cow.claim(720, PENDING, READING);
-        let rescue = |f, e| rescue_block(&cow, f, e, present, |_, _| panic!("nothing read"));
+        let rescue = |f, e| rescue_block(&cow, f, e, &mut scratch, present, |_, _| panic!("nothing read"));
         assert_eq!(rescue_or_want(&cow, (720, 721), false, (512, 1024), || (720, 736), rescue).unwrap(), Some((0, (720, 736))));
         // With room, the whole block is rescued and nothing asked for.
         room.set(10);
         let cow = Cow::new(n, &vec![(0, n as u64, crate::uffd::REMOTE)]).keep_slots(Arc::new(Mutex::new(None)), room.clone());
         cow.start_writing();
-        let rescue = |f, e| rescue_block(&cow, f, e, present, guest_read(&mem));
+        let rescue = |f, e| rescue_block(&cow, f, e, &mut scratch, present, guest_read(&mem));
         assert_eq!(rescue_or_want(&cow, (700, 701), false, (512, 1024), || panic!("not the least"), rescue).unwrap(), Some((512, (512, 1024))));
         assert!(cow.wanted_pages().is_empty());
     }
@@ -1113,9 +1197,10 @@ mod tests {
         pager.uffd.set(std::fs::File::open("/dev/null").unwrap().into()).unwrap();
         let m = Mapping { offset: 0, size: WP_CHUNK * PAGE_SIZE, base_host_virt_addr: 0 };
         for first in [true, false] {
-            assert_eq!(pager.wp_fault(8, &m, first).err().unwrap().raw_os_error(), Some(libc::ENOTTY));
+            let mut wp = pager.wp.lock().unwrap();
+            assert_eq!(pager.wp_fault(8, &m, first, &mut wp).err().unwrap().raw_os_error(), Some(libc::ENOTTY));
             assert!((0..WP_CHUNK).all(|p| !pager.pages().is_dirty(p)));
-            assert_eq!(pager.wp_block(8, &m, true), (0, WP_BLOCK));
+            assert_eq!(pager.wp_block(8, &m, true, &wp), (0, WP_BLOCK));
         }
     }
 
@@ -1171,7 +1256,7 @@ mod tests {
         // No process at pid 0: a hot candidate's read fails without a VM or a userfaultfd.
         pager.runtime.pages.get_mut().unwrap().fill(1, 1, PRESENT);
         pager.pages().mark_dirty(1);
-        *pager.hot_dirty.lock().unwrap() = Arc::new(pager.pages().dirty_bits(false));
+        pager.wp.lock().unwrap().hot_dirty = Arc::new(pager.pages().dirty_bits(false));
         pager.prepare_hot();
         pager.hot_prev.lock().unwrap().1 = Some(Arc::new(Held::of(&[(1, 42)])));
         let Err((_, prev)) = pager.copy_hot() else { panic!("read should fail") };
@@ -1180,7 +1265,7 @@ mod tests {
         assert!(pager.hot_prev.lock().unwrap().1.is_none(), "failed copy invalidates comparisons");
 
         // No hot candidates now: the hot copy succeeds without a read, but protecting the dirty page fails.
-        *pager.hot_dirty.lock().unwrap() = Arc::default();
+        pager.wp.lock().unwrap().hot_dirty = Arc::default();
         *pager.hot_spare.lock().unwrap() = None;
         pager.hot_prev.lock().unwrap().1 = Some(Arc::new(Held::of(&[(1, 42)])));
         pager.prepare_hot();
@@ -1205,7 +1290,7 @@ mod tests {
     fn failed_hot_read(pager: &mut Pager) -> (Frozen, Arc<Held>) {
         pager.runtime.pages.get_mut().unwrap().fill(1, 1, PRESENT);
         pager.pages().mark_dirty(1);
-        *pager.hot_dirty.lock().unwrap() = Arc::new(pager.pages().dirty_bits(false));
+        pager.wp.lock().unwrap().hot_dirty = Arc::new(pager.pages().dirty_bits(false));
         pager.prepare_hot();
         let held = Arc::new(Held::of(&[(1, 42)]));
         pager.hot_prev.lock().unwrap().1 = Some(held.clone());
@@ -1414,11 +1499,12 @@ mod tests {
 
     #[test]
     fn wp_granule_helpers_work_for_64k_host_pages() {
-        // expand_pagemap_entries maps host-page entries to each guest page in [addr, addr + n * PAGE_SIZE).
+        // expand_pagemap_raw_into maps host-page entries to each guest page in [addr, addr + n * PAGE_SIZE).
         let hp = 65536usize;
-        let entries = [PM_PRESENT, PM_PRESENT | PM_UFFD_WP, 0];
+        let raw: Vec<u8> = [PM_PRESENT, PM_PRESENT | PM_UFFD_WP, 0u64].into_iter().flat_map(u64::to_le_bytes).collect();
         let addr = hp as u64 + 14 * PAGE_SIZE as u64;
-        let expanded = expand_pagemap_entries(&entries, addr, 4, hp);
+        let mut expanded = Vec::new();
+        expand_pagemap_raw_into(&raw, addr, 4, hp, &mut expanded);
         assert_eq!(expanded, [PM_PRESENT, PM_PRESENT, PM_PRESENT | PM_UFFD_WP, PM_PRESENT | PM_UFFD_WP]);
 
         // align_ranges aligns outward to 16-page host granules within the region and merges overlaps.

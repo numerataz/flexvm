@@ -914,6 +914,9 @@ impl<S: Timed + Write> Write for By<S> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         until(&mut self.s, self.at, S::write_timeout, |s| s.write(buf))
     }
+    fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        until(&mut self.s, self.at, S::write_timeout, |s| s.write_vectored(bufs))
+    }
     fn flush(&mut self) -> io::Result<()> {
         self.s.flush()
     }

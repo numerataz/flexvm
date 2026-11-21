@@ -1507,15 +1507,54 @@ fn missing_template(e: &Error) -> bool {
     e.contains("no image ") || e.contains(" id mismatch: local ")
 }
 
+/// Writes all of `slices` in order using `write_vectored`, handling partial writes and `EINTR` without allocating.
+fn write_all_vectored<const N: usize>(w: &mut impl Write, mut slices: [&[u8]; N]) -> std::io::Result<()> {
+    let mut start = 0;
+    while start < N {
+        if slices[start].is_empty() {
+            start += 1;
+            continue;
+        }
+        let mut iovs = [std::io::IoSlice::new(&[]); N];
+        let mut count = 0;
+        for s in &slices[start..] {
+            if !s.is_empty() {
+                iovs[count] = std::io::IoSlice::new(s);
+                count += 1;
+            }
+        }
+        match w.write_vectored(&iovs[..count]) {
+            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "failed to write whole buffer")),
+            Ok(mut n) => {
+                while n > 0 && start < N {
+                    if n >= slices[start].len() {
+                        n -= slices[start].len();
+                        start += 1;
+                    } else {
+                        slices[start] = &slices[start][n..];
+                        n = 0;
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Header, state, preload and commit reply share one cap: partial writes cannot extend the pause.
 fn send_paused(conn: &TcpStream, header: &Header<'_>, state: &[u8], data: &[u8], at: Instant, t: &mut Phases) -> Result<Value> {
     let mut conn = By { s: conn, at };
-    send_json(&mut conn, header)?;
-    conn.write_all(state)?;
+    let mut head = serde_json::to_vec(header)?;
+    head.push(b'\n');
     if fault("slow_preload") {
+        write_all_vectored(&mut conn, [&head[..], state])?;
         thread::sleep(Duration::from_millis(300));
+        conn.write_all(data)?;
+    } else {
+        write_all_vectored(&mut conn, [&head[..], state, data])?;
     }
-    conn.write_all(data)?;
     t.mark("send_state");
     Ok(recv_json(&mut BufReader::new(conn))?.ok_or("target hung up")?)
 }
@@ -2459,5 +2498,55 @@ mod tests {
         assert!(check_regions(&[(0, 512 << 20), (1 << 32, (512 << 20) + 4096)], 1024).is_err());
         assert!(check_regions(&[(0, 256 << 20)], 128).is_err());
         assert!(check_regions(&[(0, u64::MAX), (1, 2)], u64::MAX >> 20).is_err());
+    }
+
+    #[test]
+    fn write_all_vectored_coalesces_and_handles_partial_writes() {
+        struct PartialWriter {
+            out: Vec<u8>,
+            limits: std::collections::VecDeque<std::io::Result<usize>>,
+            calls: usize,
+        }
+        impl Write for PartialWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.write_vectored(&[std::io::IoSlice::new(buf)])
+            }
+            fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
+                self.calls += 1;
+                let max = self.limits.pop_front().unwrap_or(Ok(usize::MAX))?;
+                let mut left = max;
+                for b in bufs {
+                    let take = left.min(b.len());
+                    self.out.extend_from_slice(&b[..take]);
+                    left -= take;
+                    if left == 0 {
+                        break;
+                    }
+                }
+                Ok(max - left)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        // Single coalesced write when the underlying socket accepts everything at once.
+        let mut w = PartialWriter { out: Vec::new(), limits: std::collections::VecDeque::new(), calls: 0 };
+        write_all_vectored(&mut w, [b"head\n".as_slice(), b"state", b"preload"]).unwrap();
+        assert_eq!(w.out, b"head\nstatepreload");
+        assert_eq!(w.calls, 1);
+
+        // Partial writes across slice boundaries, empty middle slice, and EINTR.
+        let mut w = PartialWriter {
+            out: Vec::new(),
+            limits: std::collections::VecDeque::from([Ok(2), Err(std::io::Error::from(std::io::ErrorKind::Interrupted)), Ok(4), Ok(100)]),
+            calls: 0,
+        };
+        write_all_vectored(&mut w, [b"abc".as_slice(), b"", b"defgh"]).unwrap();
+        assert_eq!(w.out, b"abcdefgh");
+        assert_eq!(w.calls, 4);
+
+        // Zero-byte write errors with WriteZero.
+        let mut w = PartialWriter { out: Vec::new(), limits: std::collections::VecDeque::from([Ok(0)]), calls: 0 };
+        assert_eq!(write_all_vectored(&mut w, [b"abc".as_slice()]).unwrap_err().kind(), std::io::ErrorKind::WriteZero);
     }
 }
