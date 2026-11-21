@@ -63,7 +63,7 @@ pub fn wait(host: &Host, name: &str) -> Result<i32> {
     let before = exit_record(host, name).map(|e| e.ident);
     loop {
         if host.name_locked(name) != Some(true) {
-            return ended(host, name);
+            return wait_ended(host, name);
         }
         // Empty while a start writes it: read again.
         let Some(id) = host.name_holder(name)? else {
@@ -78,6 +78,10 @@ fn wait_for(host: &Host, name: &str, id: &Ident, before: Option<Ident>) -> Resul
     if let Some(fd) = host::PidFd::open(id)? {
         while !fd.wait(Duration::from_secs(1)) {}
     }
+    wait_finish(host, name, id, before)
+}
+
+pub(crate) fn wait_finish(host: &Host, name: &str, id: &Ident, before: Option<Ident>) -> Result<i32> {
     // Written before it let the name go, under the name it had then (a rename moves it on).
     if let Some(e) = exit_of(host, name, id) {
         return Ok(e.code);
@@ -91,7 +95,7 @@ fn wait_for(host: &Host, name: &str, id: &Ident, before: Option<Ident>) -> Resul
     if exit_record(host, name).map(|e| e.ident) != before {
         bail!("{}; another vm has run under the name since", unrecorded());
     }
-    ended(host, name)
+    wait_ended(host, name)
 }
 
 /// `id`'s exit record: under `name`, else under whatever name it had last (`rename`).
@@ -115,7 +119,7 @@ pub fn last_name(host: &Host, name: &str, id: &Ident) -> Option<(String, Exit)> 
 }
 
 /// The status of `name` with no process running it.
-fn ended(host: &Host, name: &str) -> Result<i32> {
+pub(crate) fn wait_ended(host: &Host, name: &str) -> Result<i32> {
     // The exit record first, then the holder (`Records::read`), as an instance writes one before it lets the name go.
     let record = exit_record(host, name);
     let r = crate::host::Records::read(host, name);
@@ -216,7 +220,7 @@ pub fn logs(host: &Host, name: &str, follow: bool, lines: Option<usize>) -> Resu
 }
 
 /// `logs`, to `out` (false once its reader is gone).
-fn logs_to(host: &Host, name: &str, follow: bool, lines: Option<usize>, out: &mut dyn FnMut(&[u8]) -> Result<bool>) -> Result<()> {
+pub(crate) fn logs_to(host: &Host, name: &str, follow: bool, lines: Option<usize>, out: &mut dyn FnMut(&[u8]) -> Result<bool>) -> Result<()> {
     use crate::util::output::{open_dir, open_in};
     host::check_name(name)?;
     let at = host.vms(name, "logs")?;
@@ -263,9 +267,9 @@ fn logs_to(host: &Host, name: &str, follow: bool, lines: Option<usize>, out: &mu
         return Ok(());
     }
     let mut buf = vec![0; 64 << 10];
-    let mut drain = |f: &mut std::fs::File| -> Result<bool> {
+    let drain = |f: &mut std::fs::File, buf: &mut [u8], out: &mut dyn FnMut(&[u8]) -> Result<bool>| -> Result<bool> {
         loop {
-            match f.read(&mut buf)? {
+            match f.read(buf)? {
                 0 => return Ok(true),
                 n if !out(&buf[..n])? => return Ok(false),
                 _ => {}
@@ -275,8 +279,11 @@ fn logs_to(host: &Host, name: &str, follow: bool, lines: Option<usize>, out: &mu
     let mut gone_since: Option<Instant> = None;
     'poll: loop {
         std::thread::sleep(FOLLOW_EVERY);
+        if !out(&[])? {
+            return Ok(());
+        }
         if let Some(f) = cur.as_mut() {
-            if !drain(f)? {
+            if !drain(f, &mut buf, out)? {
                 return Ok(());
             }
             // Truncated by hand: from its start.
@@ -321,7 +328,7 @@ fn logs_to(host: &Host, name: &str, follow: bool, lines: Option<usize>, out: &mu
             if let Some(mut between) = open(d, &prev) {
                 if let Some(b) = unread(&between, cur.as_ref().and_then(ino)) {
                     mark(&mut read, Some(b));
-                    if !cur.as_mut().map_or(Ok(true), &mut drain)? || !drain(&mut between)? {
+                    if !cur.as_mut().map_or(Ok(true), |f| drain(f, &mut buf, out))? || !drain(&mut between, &mut buf, out)? {
                         return Ok(());
                     }
                     continue;
@@ -332,7 +339,7 @@ fn logs_to(host: &Host, name: &str, follow: bool, lines: Option<usize>, out: &mu
             if open(d, &prev).is_some_and(|p| unread(&p, ino(&next)).is_some_and(|b| Some(b) != cur.as_ref().and_then(ino))) {
                 continue;
             }
-            if !cur.as_mut().map_or(Ok(true), &mut drain)? {
+            if !cur.as_mut().map_or(Ok(true), |f| drain(f, &mut buf, out))? {
                 return Ok(());
             }
             mark(&mut read, cur.as_ref().and_then(ino));
@@ -343,7 +350,7 @@ fn logs_to(host: &Host, name: &str, follow: bool, lines: Option<usize>, out: &mu
             continue 'poll;
         }
         if retired {
-            cur.as_mut().map_or(Ok(true), &mut drain)?;
+            cur.as_mut().map_or(Ok(true), |f| drain(f, &mut buf, out))?;
             return Ok(());
         }
         // Ended for a while (not a restart's moment between its stop and start). Its VM's: the
@@ -466,17 +473,21 @@ pub(crate) fn described_meta(host: &Host, paths: &template::Paths, name: &str, m
 /// `rename OLD NEW`: a running VM's process renames itself (`Proc::rename`); a stopped one is
 /// renamed here, holding both names.
 pub fn rename(host: &Host, from: &str, to: &str) -> Result<()> {
+    rename_vm(host, from, to)?;
+    crate::output(format_args!("{to}\n"))
+}
+
+pub(crate) fn rename_vm(host: &Host, from: &str, to: &str) -> Result<()> {
     host::check_name(from)?;
     host::check_new_name(to)?;
     if from == to {
-        bail!("vm {from} is named {to} already");
+        return Err(crate::util::coded(crate::util::ErrorKind::Conflict, format!("vm {from} is named {to} already")));
     }
     if host.alive(from) {
         crate::vmproc::call(host, from, json!({"op": "rename", "to": to}), Some(Instant::now() + Duration::from_secs(45)))?;
-        return crate::output(format_args!("{to}\n"));
+        return Ok(());
     }
-    rename_stopped(host, from, to)?;
-    crate::output(format_args!("{to}\n"))
+    rename_stopped(host, from, to)
 }
 
 /// A suspended (or quarantined) VM: its checkpoint directory, the claim on its address (which a
@@ -494,7 +505,9 @@ fn rename_stopped_with_sync(host: &Host, from: &str, to: &str, sync: impl FnOnce
     }
     if !r.stopped() {
         return Err(match [("failed", r.failed), ("lost", r.lost)].into_iter().find(|(_, has)| *has) {
-            Some((ext, _)) => format!("vm {from} is {ext}: only a running, stopped or exited vm can be renamed").into(),
+            Some((ext, _)) => {
+                crate::util::coded(crate::util::ErrorKind::Conflict, format!("vm {from} is {ext}: only a running, stopped or exited vm can be renamed"))
+            }
             None => crate::no_vm(host, from),
         });
     }
@@ -502,7 +515,7 @@ fn rename_stopped_with_sync(host: &Host, from: &str, to: &str, sync: impl FnOnce
     let held = crate::host::HeldName::new(take_rename_name(host, from)?);
     // Taking the name removed what an interrupted suspend, resume or discard left.
     if !held.records.stopped() {
-        bail!("no vm named {from:?}");
+        return Err(crate::util::coded(crate::util::ErrorKind::NotFound, format!("no vm named {from:?}")));
     }
     let _from; // Let go after `to`.
     let _to = host.take_unrecorded_name(to)?;
@@ -555,7 +568,7 @@ fn rename_stopped_with_sync(host: &Host, from: &str, to: &str, sync: impl FnOnce
 fn rename_exited(host: &Host, from: &str, to: &str) -> Result<()> {
     let held = crate::host::HeldName::new(take_rename_name(host, from)?);
     if !held.records.exited || held.records.stopped() {
-        bail!("vm {from} changed meanwhile: try again");
+        return Err(crate::util::coded(crate::util::ErrorKind::Conflict, format!("vm {from} changed meanwhile: try again")));
     }
     let _from;
     // Refuses a `failed`, `lost` or `exited` record of `to`, and a stopped vm of it.
@@ -567,7 +580,7 @@ fn rename_exited(host: &Host, from: &str, to: &str) -> Result<()> {
 /// Hold the old name, reporting a concurrent start consistently for stopped and exited VMs.
 fn take_rename_name(host: &Host, from: &str) -> Result<host::NameLock> {
     host.take_name(from, true).map_err(|e| match host.alive(from) {
-        true => format!("vm {from} started meanwhile: try again").into(),
+        true => crate::util::coded(crate::util::ErrorKind::Conflict, format!("vm {from} started meanwhile: try again")),
         false => e,
     })
 }

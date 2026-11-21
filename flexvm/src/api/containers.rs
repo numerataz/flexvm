@@ -11,7 +11,6 @@ use hyper::{Request, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncReadExt;
 
 use super::{channel, images, lifecycle, ok, rfc3339_secs, Api, Error, Query, Reply};
 
@@ -184,11 +183,10 @@ impl Detail {
         // A created container has no VM yet: what it will run is its record's.
         let (described, meta) = match (&record, created) {
             (Some(r), true) => {
-                let ports: Vec<crate::ports::Port> = r.run.windows(2).filter(|w| w[0] == "--publish").filter_map(|w| w[1].parse().ok()).collect();
                 let id = if r.generation.is_empty() { images::linked(api, &r.template) } else { Some(r.generation.clone()) };
                 let meta = id.as_deref().and_then(|id| images::meta(api, id));
                 (
-                    json!({"name": name, "state": "created", "config": {"image": r.image, "template": r.template, "template_id": id, "ports": ports, "run": {}}}),
+                    json!({"name": name, "state": "created", "config": {"image": r.image, "template": r.template, "template_id": id, "ports": &r.spec.ports, "run": {}}}),
                     meta,
                 )
             }
@@ -574,39 +572,27 @@ pub async fn logs(api: &Arc<Api>, key: &str, q: Query) -> Reply {
     let vm = vm.clone();
     let log_name = name.clone();
     let tty = api.blocking(move |api| Ok(crate::containers::described(&api.host, &api.paths, &log_name, vm)["config"]["run"]["tty"] == true)).await?;
-    let mut words = vec!["logs".to_string()];
-    if q.flag("follow", false)? {
-        words.push("--follow".into());
-    }
-    if let Some(n) = tail {
-        words.extend(["--tail".into(), n.to_string()]);
-    }
-    words.extend(["--".into(), name]);
-    let mut child = api.command(&words).spawn()?;
-    let mut out = child.stdout.take().ok_or_else(|| Error::from(crate::util::Error::from("logs: no stdout")))?;
+    let follow = q.flag("follow", false)?;
+    let lines = tail.map(|n| n as usize);
     let (tx, body) = channel();
-    tokio::spawn(async move {
-        let mut buf = vec![0; 32 << 10];
-        loop {
-            let Some(read) = connected(&tx, out.read(&mut buf)).await else { break };
-            match read {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let data = match (tty, stdout) {
-                        (true, _) => bytes::Bytes::copy_from_slice(&buf[..n]),
-                        (false, true) => frame(1, &buf[..n]),
-                        // Stderr alone: the log has none apart.
-                        (false, false) => continue,
-                    };
-                    if tx.send(data).await.is_err() {
-                        break;
-                    }
-                }
+    let host = api.host.clone();
+    std::thread::Builder::new().name(format!("api-logs-{name}")).spawn(move || {
+        let _ = crate::containers::logs_to(&host, &name, follow, lines, &mut |data| {
+            if tx.is_closed() {
+                return Ok(false);
             }
-        }
-        // Its client gone (or done): `kill_on_drop` ends a follow.
-        drop(child);
-    });
+            if data.is_empty() {
+                return Ok(true);
+            }
+            let bytes = match (tty, stdout) {
+                (true, _) => bytes::Bytes::copy_from_slice(data),
+                (false, true) => frame(1, data),
+                // Stderr alone: the log has none apart.
+                (false, false) => return Ok(true),
+            };
+            Ok(tx.blocking_send(bytes).is_ok())
+        });
+    })?;
     let mut res = Response::new(body);
     res.headers_mut().insert(CONTENT_TYPE, stream_type(tty));
     Ok(res)
@@ -690,6 +676,44 @@ async fn wait_removed(api: &Arc<Api>, name: &str, code: i64) -> Result<i64, Erro
     }
 }
 
+async fn wait_not_running(api: &Arc<Api>, name: &str) -> Result<i64, Error> {
+    let n = name.to_string();
+    let before = api
+        .blocking(move |api| {
+            crate::host::check_name(&n)?;
+            Ok(crate::containers::exit_record(&api.host, &n).map(|e| e.ident))
+        })
+        .await?;
+    loop {
+        let n = name.to_string();
+        let step = api
+            .blocking(move |api| {
+                if api.host.name_locked(&n) != Some(true) {
+                    return Ok(Err(crate::containers::wait_ended(&api.host, &n)?));
+                }
+                Ok(Ok(api.host.name_holder(&n)?))
+            })
+            .await?;
+        let id = match step {
+            Err(code) => return Ok(code as i64),
+            Ok(None) => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                continue;
+            }
+            Ok(Some(id)) => id,
+        };
+        let ident = id.clone();
+        let fd = api.blocking(move |_| crate::host::PidFd::open(&ident)).await?;
+        if let Some(fd) = fd {
+            // SAFETY: PidFd owns its descriptor and keeps it unchanged until dropped.
+            let fd = unsafe { tokio::io::unix::AsyncFd::register(fd) }.map_err(std::io::Error::from)?;
+            let _ = fd.readable().await?;
+        }
+        let n = name.to_string();
+        return api.blocking(move |api| crate::containers::wait_finish(&api.host, &n, &id, before).map(i64::from)).await;
+    }
+}
+
 /// `POST /containers/{id}/wait?condition=not-running|next-exit|removed`: `flexvm wait`. The reply's head
 /// goes at once and its body once the VM's process ends (`next-exit`: one that runs or starts later;
 /// `removed`: then until nothing is left of it).
@@ -725,7 +749,7 @@ pub async fn wait(api: &Arc<Api>, key: &str, q: Query) -> Reply {
             } else if created {
                 Ok(0)
             } else {
-                api.run(&["wait", "--", &name]).await.map(|out| String::from_utf8_lossy(&out.stdout).trim().parse::<i64>().unwrap_or(-1))
+                wait_not_running(&api, &name).await
             }
         })
         .await
@@ -773,6 +797,7 @@ pub async fn route(api: &Arc<Api>, req: Request<Incoming>, words: &[&str]) -> Op
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
 
     fn vm(name: &str, state: &str) -> Value {
         json!({"name": name, "state": state, "status": 3})
@@ -1152,5 +1177,24 @@ mod tests {
         let rows: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(rows.as_array().unwrap().len(), 1);
         assert_eq!(rows[0]["Names"][0], "/stopped");
+    }
+
+    #[tokio::test]
+    async fn in_process_logs_and_wait_not_running_work_without_subprocess() {
+        use http_body_util::BodyExt;
+        let (_d, api) = fixture();
+        let rec = crate::app::Exited::new(42, "image".into(), None, Default::default(), Default::default(), 1);
+        std::fs::write(api.host.vms("web", "exited").unwrap(), serde_json::to_vec(&rec).unwrap()).unwrap();
+        let log_dir = api.host.vms("web", "logs").unwrap();
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(log_dir.join("log"), b"hello\nworld\n").unwrap();
+
+        let res = logs(&api, "web", Query::parse("stdout=1&tail=1")).await.unwrap();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(bytes, frame(1, b"world\n"));
+
+        let res = wait(&api, "web", Query::parse("condition=not-running")).await.unwrap();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), json!({"StatusCode": 42, "Error": null}));
     }
 }

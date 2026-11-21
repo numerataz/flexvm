@@ -1,12 +1,12 @@
 //! `flexvm api`: the Docker Engine API on a Unix socket, so docker's CLI, Compose and the SDKs drive
 //! flexvm's VMs as containers. It keeps no state that matters: what it answers comes from the records in
-//! the state and run directories (as `ps` and `inspect` read them), and what it changes it changes as the
-//! commands do, by running them (this binary, with this process's `--state` and `--run`). Killed and
-//! started again, it has lost nothing; socket-activated, it starts at the first connection.
+//! the state and run directories (as `ps` and `inspect` read them), and what it changes it changes
+//! directly through the same in-process host, container and VM operations (only spawning a detached VM
+//! owner process when starting a VM). Killed and started again, it has lost nothing; socket-activated,
+//! it starts at the first connection.
 //!
 //! An endpoint is served only where flexvm has the machinery under it: the rest answer 501, saying so.
 
-mod cli;
 mod containers;
 pub(crate) mod create;
 mod images;
@@ -70,6 +70,17 @@ impl Error {
 
 impl From<crate::util::Error> for Error {
     fn from(e: crate::util::Error) -> Error {
+        if let Some(c) = e.downcast_ref::<crate::util::CodedError>() {
+            let status = match c.kind {
+                crate::util::ErrorKind::NotFound => StatusCode::NOT_FOUND,
+                crate::util::ErrorKind::Conflict => StatusCode::CONFLICT,
+                crate::util::ErrorKind::BadRequest => StatusCode::BAD_REQUEST,
+            };
+            return Error::new(status, c.message.clone());
+        }
+        if e.is::<crate::vmproc::Busy>() || crate::host::name_taken(&e) {
+            return Error::conflict(e.to_string());
+        }
         Error::new(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     }
 }
@@ -609,5 +620,16 @@ mod tests {
         assert_eq!(secs(951782400), "2000-02-29T00:00:00.000000000Z");
         assert_eq!(secs(1792713600 + 3661), "2026-10-23T01:01:01.000000000Z");
         assert_eq!(rfc3339(std::time::UNIX_EPOCH + std::time::Duration::new(86399, 5)), "1970-01-01T23:59:59.000000005Z");
+    }
+
+    #[test]
+    fn coded_and_host_errors_map_to_docker_statuses() {
+        use crate::util::{coded, ErrorKind};
+        let e = Error::from(coded(ErrorKind::NotFound, "no vm named \"web\""));
+        assert_eq!((e.status, e.message.as_str()), (StatusCode::NOT_FOUND, "no vm named \"web\""));
+        assert_eq!(Error::from(coded(ErrorKind::Conflict, "vm web is running")).status, StatusCode::CONFLICT);
+        assert_eq!(Error::from(coded(ErrorKind::BadRequest, "bad --memory")).status, StatusCode::BAD_REQUEST);
+        assert_eq!(Error::from(crate::util::Error::from("vm web is taken")).status, StatusCode::CONFLICT);
+        assert_eq!(Error::from(crate::util::Error::from("vm web did not suspend")).status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

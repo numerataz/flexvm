@@ -63,9 +63,12 @@ pub async fn create(api: &Arc<Api>, q: Query, body: Value) -> Reply {
 
 /// `run -d` of a created container's record; then the record says it started.
 async fn run_created(api: &Arc<Api>, mut r: Record) -> Result<(), Error> {
-    let mut words: Vec<String> = vec!["run".into(), "--detach".into(), "--name".into(), r.name.clone()];
-    words.extend(r.run.iter().cloned());
-    api.run(&words).await?;
+    let run = r.clone();
+    api.blocking(move |api| {
+        let template = if run.generation.is_empty() { run.template.clone() } else { run.generation.clone() };
+        crate::run_detached(&api.host, &api.paths, &api.globals, &template, run.name, run.cmd, run.resources, &run.spec)
+    })
+    .await?;
     r.started = true;
     api.blocking(move |api| create::store(api, &r, false).map(drop)).await
 }
@@ -83,7 +86,7 @@ pub async fn start(api: &Arc<Api>, key: &str, q: Query) -> Reply {
         }
         "paused" => return Err(Error::conflict(format!("cannot start a paused container {name}, try unpause instead"))),
         _ if state(&v).running => return empty(StatusCode::NOT_MODIFIED),
-        _ => drop(api.run(&["start", "--", &name]).await?),
+        _ => api.blocking(move |api| crate::start_vm(&api.host, &api.globals, None, &name).map(drop)).await?,
     }
     empty(StatusCode::NO_CONTENT)
 }
@@ -102,7 +105,7 @@ pub async fn stop(api: &Arc<Api>, key: &str, q: Query) -> Reply {
     if !st.running && st.status != "restarting" {
         return empty(StatusCode::NOT_MODIFIED);
     }
-    api.run(&["stop", "--", &name]).await?;
+    api.blocking(move |api| crate::stop(&api.host, &name).map(drop)).await?;
     empty(StatusCode::NO_CONTENT)
 }
 
@@ -111,7 +114,13 @@ pub async fn restart(api: &Arc<Api>, key: &str) -> Reply {
     let (name, v) = found(api, key).await?;
     match v["state"].as_str() {
         Some("created") => return start(api, key, Query::parse("")).await,
-        _ => drop(api.run(&["restart", "--", &name]).await?),
+        _ => {
+            api.blocking(move |api| {
+                let last = crate::stop(&api.host, &name)?;
+                crate::start_vm(&api.host, &api.globals, None, &last).map(drop)
+            })
+            .await?;
+        }
     }
     empty(StatusCode::NO_CONTENT)
 }
@@ -125,10 +134,11 @@ pub async fn kill(api: &Arc<Api>, key: &str, q: Query) -> Reply {
     if !state(&v).running {
         return Err(Error::conflict(format!("Cannot kill container: {name}: container {} is not running", id_of(&name))));
     }
-    match sig {
-        libc::SIGKILL => api.run(&["kill", "--", &name]).await?,
-        _ => api.run(&["kill", "--signal", &sig.to_string(), "--", &name]).await?,
-    };
+    api.blocking(move |api| match sig {
+        libc::SIGKILL => crate::remove(&api.host, &name, true, false),
+        _ => crate::signal_app(&api.host, &name, sig),
+    })
+    .await?;
     empty(StatusCode::NO_CONTENT)
 }
 
@@ -142,7 +152,11 @@ pub async fn pause(api: &Arc<Api>, key: &str, pause: bool) -> Reply {
         _ if !st.running => return Err(Error::conflict(format!("container {} is not running", id_of(&name)))),
         _ => {}
     }
-    api.run(&[if pause { "pause" } else { "unpause" }, "--", &name]).await?;
+    api.blocking(move |api| match pause {
+        true => crate::pause(&api.host, &name),
+        false => crate::unpause_vm(&api.host, &name),
+    })
+    .await?;
     empty(StatusCode::NO_CONTENT)
 }
 
@@ -159,7 +173,7 @@ pub async fn rename(api: &Arc<Api>, key: &str, q: Query) -> Reply {
     tokio::spawn(async move {
         rename_to(&api, name, &v, to, |from, to| {
             let api = api.clone();
-            async move { api.run(&["rename", "--", &from, &to]).await.map(drop) }
+            async move { api.blocking(move |api| crate::containers::rename_vm(&api.host, &from, &to)).await }
         })
         .await
     })
@@ -280,12 +294,8 @@ async fn remove_vm(api: &Arc<Api>, name: String, v: &Value, force: bool) -> Resu
                 "cannot remove container \"/{name}\": container is running: stop the container before removing or force remove"
             )));
         }
-        let mut words = vec!["rm"];
-        if force {
-            words.push("--force");
-        }
-        words.extend(["--", &name]);
-        api.run(&words).await?;
+        let rm_name = name.clone();
+        api.blocking(move |api| crate::remove(&api.host, &rm_name, force, true)).await?;
     }
     api.blocking(move |api| {
         create::remove(api, &name);

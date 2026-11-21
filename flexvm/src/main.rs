@@ -969,27 +969,24 @@ fn real_main(args: &Args) -> Result<()> {
         }
         Some("pause") => {
             let host = open_host(args)?;
-            each(args.names(), |n| pause(&host, n))
+            each(args.names(), |n| pause(&host, n).and_then(|()| output(format_args!("{n}\n"))))
         }
         Some("unpause") => {
             let host = open_host(args)?;
-            each(args.names(), |n| match resume(&host, n)? {
-                true => output(format_args!("{n}\n")),
-                false => Err(not_running(&host, n)),
-            })
+            each(args.names(), |n| unpause_vm(&host, n).and_then(|()| output(format_args!("{n}\n"))))
         }
         Some("kill") if args.has("signal") => {
             let sig = app::parse_signal(args.get("signal").unwrap_or_default())?;
             let host = open_host(args)?;
-            each(args.names(), |n| signal_app(&host, n, sig))
+            each(args.names(), |n| signal_app(&host, n, sig).and_then(|()| output(format_args!("{n}\n"))))
         }
         Some("kill") => {
             let host = open_host(args)?;
-            each(args.names(), |n| remove(&host, n, true, false))
+            each(args.names(), |n| remove(&host, n, true, false).and_then(|()| output(format_args!("{n}\n"))))
         }
         Some("rm") => {
             let host = open_host(args)?;
-            each(args.names(), |n| remove(&host, n, args.has("force"), true))
+            each(args.names(), |n| remove(&host, n, args.has("force"), true).and_then(|()| output(format_args!("{n}\n"))))
         }
         Some("reclaim") => {
             let gen = args.get("force").map(|v| v.parse().map_err(|_| format!("bad --force generation {v:?}"))).transpose()?;
@@ -1408,14 +1405,101 @@ fn rerun(host: &Host, name: &str) -> Result<Option<Start>> {
     }))
 }
 
+/// `run -d` from an already-parsed spec (used by the Docker API): claims a standby VM in-process,
+/// or spawns the detached VM owner process directly via `FLEXVM_NOTIFY_FD`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_detached(
+    host: &Host,
+    paths: &Paths,
+    globals: &[String],
+    template: &str,
+    name: String,
+    cmd: Option<String>,
+    resources: vm::Resources,
+    spec: &app::RunSpec,
+) -> Result<()> {
+    host::check_new_name(&name).map_err(|e| util::coded(util::ErrorKind::BadRequest, e.to_string()))?;
+    for kv in &spec.env {
+        app::validate_env(kv).map_err(|e| util::coded(util::ErrorKind::BadRequest, e.to_string()))?;
+    }
+    for (i, p) in spec.ports.iter().enumerate() {
+        if let Some(old) = spec.ports[..i].iter().find(|old| old.overlaps(p)) {
+            return Err(util::coded(util::ErrorKind::BadRequest, format!("duplicate port mapping {p}: {old} already publishes that host address and port")));
+        }
+    }
+    let tpl = if spec.changes_app() || !resources.is_empty() {
+        Some(template::Template::open(paths, template).map_err(|e| util::coded(util::ErrorKind::NotFound, e.to_string()))?)
+    } else {
+        None
+    };
+    spec.check(tpl.as_ref().and_then(|t| t.meta.image.as_ref())).map_err(|e| util::coded(util::ErrorKind::BadRequest, e.to_string()))?;
+    if let Some(tpl) = &tpl {
+        resources.check(&tpl.meta).map_err(|e| util::coded(util::ErrorKind::BadRequest, e.to_string()))?;
+    }
+    let log = new_run_log(host, &name)?;
+    let req = json!({"op": "claim", "name": name, "ip": spec.ip.map(|i| i.to_string()), "cmd": cmd, "resources": resources, "spec": spec, "tty": false, "verbose": util::verbose(), "attached": false, "attacher": false, "logs_handoff": log.token.as_str()});
+    let fds = [log.as_raw_fd(); 2].map(|fd| unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned());
+    let outs = fds.into_iter().map(|f| Ok(util::output::own(f?.into()))).collect::<std::io::Result<Vec<_>>>()?;
+    let raw_fds: Vec<_> = outs.iter().map(|f| f.as_raw_fd()).collect();
+    if standby::take(host, paths, template, &req, &raw_fds)?.is_some() {
+        return Ok(());
+    }
+    let child = run_child_args(globals, &name, template, cmd.as_deref(), &resources, spec);
+    spawn_detached(host, &name, &child, &log, false)?;
+    Ok(())
+}
+
+fn run_child_args(globals: &[String], name: &str, template: &str, cmd: Option<&str>, resources: &vm::Resources, spec: &app::RunSpec) -> Vec<String> {
+    let mut args = globals.to_vec();
+    args.extend(["run".into(), "--name".into(), name.into()]);
+    if let Some(ep) = &spec.entrypoint {
+        args.extend(["--entrypoint".into(), serde_json::to_string(ep).unwrap_or_default()]);
+    }
+    for kv in &spec.env {
+        args.extend(["-e".into(), kv.clone()]);
+    }
+    if spec.stdin {
+        args.push("--interactive".into());
+    }
+    if spec.tty {
+        args.push("--tty".into());
+    }
+    if spec.keep {
+        args.push("--keep".into());
+    }
+    if spec.rm {
+        args.push("--rm".into());
+    }
+    if let Some(r) = &spec.restart {
+        args.extend(["--restart".into(), r.to_string()]);
+    }
+    if let Some(ip) = spec.ip {
+        args.extend(["--ip".into(), ip.to_string()]);
+    }
+    for p in &spec.ports {
+        args.extend(["--publish".into(), p.to_string()]);
+    }
+    if let Some(m) = resources.memory_mib {
+        args.extend(["--memory".into(), format!("{m}m")]);
+    }
+    if let Some(c) = resources.cpus {
+        args.extend(["--cpus".into(), c.to_string()]);
+    }
+    args.push(template.into());
+    if let Some(c) = cmd {
+        args.extend(["--".into(), c.into()]);
+    }
+    args
+}
+
 /// `kill -s SIGNAL NAME`: to its app.
-fn signal_app(host: &Host, name: &str, sig: i32) -> Result<()> {
+pub(crate) fn signal_app(host: &Host, name: &str, sig: i32) -> Result<()> {
     host::check_name(name)?;
     if !host.alive(name) {
         return Err(not_running(host, name));
     }
     vmproc::call(host, name, json!({"op": "signal", "signal": sig}), None)?;
-    output(format_args!("{name}\n"))
+    Ok(())
 }
 
 /// `run --checkpoint DIR`: the checkpoint's name and address unless `--name`, `--ip`.
@@ -1543,24 +1627,32 @@ fn follow(mut conn: BufReader<std::os::unix::net::UnixStream>, id: host::Ident) 
 /// process. A start that lost the name to another meanwhile (two `start`s at once) is that one's:
 /// done once it runs, as resuming a running VM is.
 fn start(host: &Host, args: &Args, name: &str) -> Result<()> {
+    match start_vm(host, &child_args(args, &[]), args.get("parent-kvm-bundle"), name)? {
+        Some(v) => print(v),
+        None => output(format_args!("{name}\n")),
+    }
+}
+
+pub(crate) fn start_vm(host: &Host, globals: &[String], parent_kvm_bundle: Option<&str>, name: &str) -> Result<Option<Value>> {
     if resume(host, name)? {
-        return output(format_args!("{name}\n"));
+        return Ok(None);
     }
     // Nothing to start (no process, no stopped or exited VM): said here, before a process is
     // spawned whose taking the name would clear a moved VM's hint.
     if !host.alive(name) && !host.suspended(name)?.exists() && !host.has_record(name, "exited") {
         return Err(no_vm(host, name));
     }
-    let mut words = vec!["start", "--attach"];
-    let bundle = args.get("parent-kvm-bundle").map(Path::new).map(Path::canonicalize).transpose()?;
+    let mut child = globals.to_vec();
+    child.extend(["start".into(), "--attach".into()]);
+    let bundle = parent_kvm_bundle.map(Path::new).map(Path::canonicalize).transpose()?;
     if let Some(bundle) = &bundle {
-        words.extend(["--parent-kvm-bundle", bundle.to_str().ok_or("native parent KVM bundle path is not UTF-8")?]);
+        child.extend(["--parent-kvm-bundle".into(), bundle.to_str().ok_or("native parent KVM bundle path is not UTF-8")?.into()]);
     }
-    words.extend(["--", name]);
-    match spawn_detached(host, name, &child_args(args, &words), &log_file(host, name)?, false) {
-        Ok(v) => print(v),
+    child.extend(["--".into(), name.into()]);
+    match spawn_detached(host, name, &child, &log_file(host, name)?, false) {
+        Ok(v) => Ok(Some(v)),
         Err(e) if host::name_taken(&e) || host.alive(name) => match started_meanwhile(host, name, Instant::now() + Duration::from_secs(60))? {
-            true => output(format_args!("{name}\n")),
+            true => Ok(None),
             false => Err(e),
         },
         Err(e) => Err(e),
@@ -1658,12 +1750,12 @@ pub fn no_vm(host: &Host, name: &str) -> util::Error {
 fn no_process(host: &Host, name: &str, none: &str) -> util::Error {
     // A stopped VM's checkpoint, not debris (consumed by a resume, or being discarded).
     match host::Records::read(host, name) {
-        r if r.stopped() => format!("vm {name} is stopped: flexvm start {name}").into(),
-        r if r.exited => format!("vm {name} has exited: flexvm start {name} runs it again").into(),
-        r if r.failed => format!("vm {name} has failed: see flexvm ps -a; flexvm rm {name} clears it").into(),
-        r if r.lost => format!("vm {name} is lost: see flexvm ps -a; flexvm rm {name} clears it").into(),
-        host::Records { moved: Some(Some(to)), .. } => format!("vm {name} moved to {to}; it runs there").into(),
-        _ => format!("{none} {name:?}").into(),
+        r if r.stopped() => util::coded(util::ErrorKind::Conflict, format!("vm {name} is stopped: flexvm start {name}")),
+        r if r.exited => util::coded(util::ErrorKind::Conflict, format!("vm {name} has exited: flexvm start {name} runs it again")),
+        r if r.failed => util::coded(util::ErrorKind::Conflict, format!("vm {name} has failed: see flexvm ps -a; flexvm rm {name} clears it")),
+        r if r.lost => util::coded(util::ErrorKind::Conflict, format!("vm {name} is lost: see flexvm ps -a; flexvm rm {name} clears it")),
+        host::Records { moved: Some(Some(to)), .. } => util::coded(util::ErrorKind::Conflict, format!("vm {name} moved to {to}; it runs there")),
+        _ => util::coded(util::ErrorKind::NotFound, format!("{none} {name:?}")),
     }
 }
 
@@ -1710,7 +1802,10 @@ impl Tracked {
                 return Ok(None);
             }
             if Instant::now() >= deadline {
-                bail!("vm {name:?} is starting or its registry is unavailable; try again once it is ready, or see {}", host.vms(name, "log")?.display());
+                return Err(util::coded(
+                    util::ErrorKind::Conflict,
+                    format!("vm {name:?} is starting or its registry is unavailable; try again once it is ready, or see {}", host.vms(name, "log")?.display()),
+                ));
             }
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -1755,7 +1850,7 @@ const STOP_WAIT: Duration = Duration::from_secs(600);
 
 /// SIGTERM, and waits until the VM is suspended (its process gone). Stopped or exited: a no-op.
 /// Returns the name the VM has last (a rename as it was signalled moves it on: `restart` starts that).
-fn stop(host: &Host, name: &str) -> Result<String> {
+pub(crate) fn stop(host: &Host, name: &str) -> Result<String> {
     host::check_name(name)?;
     if let Ok(entry) = host.entry(name) {
         if !entry.backend.is_firecracker() {
@@ -1808,7 +1903,7 @@ fn stop(host: &Host, name: &str) -> Result<String> {
         return Ok(last);
     }
     if let Some(Some(to)) = r.moved {
-        return Err(format!("vm {shown} moved to {to} before it was stopped; stop it there").into());
+        return Err(util::coded(util::ErrorKind::Conflict, format!("vm {shown} moved to {to} before it was stopped; stop it there")));
     }
     // Not failed or lost, and its own exit record, as read and checked (a later instance of the name may replace it since).
     match !(r.failed || r.lost) && app_exited(exit.as_ref(), ident) {
@@ -1825,13 +1920,13 @@ fn app_exited(exit: Option<&containers::Exit>, ident: &host::Ident) -> bool {
 }
 
 /// SIGTSTP, and waits until the instance signalled (`Tracked`, under whatever name it has) has its vCPUs paused.
-fn pause(host: &Host, name: &str) -> Result<()> {
+pub(crate) fn pause(host: &Host, name: &str) -> Result<()> {
     host::check_name(name)?;
     let mut vm = Tracked::signal(host, name, libc::SIGTSTP, &|_| Ok(()))?.ok_or_else(|| not_running(host, name))?;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match vm.refresh(host).map(|e| e.state) {
-            Some(s) if s == "paused" => return output(format_args!("{name}\n")),
+            Some(s) if s == "paused" => return Ok(()),
             Some(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
             Some(s) => bail!("vm {} is still {s}; see {}", vm.shown(), host.vms(&vm.last, "log")?.display()),
             // Not registered for a moment (its entry rewritten), or ended: its pidfd tells.
@@ -1841,28 +1936,37 @@ fn pause(host: &Host, name: &str) -> Result<()> {
     }
 }
 
+pub(crate) fn unpause_vm(host: &Host, name: &str) -> Result<()> {
+    match resume(host, name)? {
+        true => Ok(()),
+        false => Err(not_running(host, name)),
+    }
+}
+
 /// `kill` (`running`) destroys a running VM; `rm` (`stopped`) removes a stopped one (suspended,
 /// failed or lost), and with -f a running one too.
-fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
+pub(crate) fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
     host::check_name(name)?;
     let alive = host.alive(name);
     if alive && !running {
-        bail!("vm {name} is running: stop or kill it first, or flexvm rm -f {name}");
+        return Err(util::coded(util::ErrorKind::Conflict, format!("vm {name} is running: stop or kill it first, or flexvm rm -f {name}")));
     }
     // Its tap and route go now, not at a sweep; best effort, as taking the name reaps again where it must.
     let _ = host.reap_dead_holder(name);
     let records = || host::Records::read(host, name).recorded();
     if !alive && !stopped && records() {
-        bail!("vm {name} is not running (see flexvm ps -a); flexvm rm {name} removes it");
+        return Err(util::coded(util::ErrorKind::Conflict, format!("vm {name} is not running (see flexvm ps -a); flexvm rm {name} removes it")));
     }
-    let done = || output(format_args!("{name}\n"));
     if !running {
-        return remove_stopped(host, name, records(), true, None, false).and_then(|()| done());
+        return remove_stopped(host, name, records(), true, None, false);
     }
     // Reconciling sources accept SIGINT too; the process records the owed outcome before ending.
     let not_source = |e: &host::Entry| -> Result<()> {
         match e.state == "source" {
-            true => Err(format!("vm {name} is the source of a migration in progress; it ends once the target has its memory (kill it where it runs)").into()),
+            true => Err(util::coded(
+                util::ErrorKind::Conflict,
+                format!("vm {name} is the source of a migration in progress; it ends once the target has its memory (kill it where it runs)"),
+            )),
             false => Ok(()),
         }
     };
@@ -1877,11 +1981,11 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
         let (Ended { last, shown, records, .. }, ident) = (vm.ended(host), &vm.ident);
         // A migration past its pause refused the kill, and the VM runs on at its target (#567).
         if let Some(Some(to)) = records.moved {
-            return Err(format!("vm {shown} moved to {to} before the kill took; kill it there").into());
+            return Err(util::coded(util::ErrorKind::Conflict, format!("vm {shown} moved to {to} before the kill took; kill it there")));
         }
         // `rm -f` also removes logs and any exit or suspend record that won the race, under its name.
         if stopped {
-            return remove_stopped(host, &last, true, true, Some(ident), true).and_then(|()| done());
+            return remove_stopped(host, &last, true, true, Some(ident), true);
         }
         // A suspend that finished before the kill took is undone: the kill wins.
         if host.suspended(&last)?.exists() {
@@ -1896,21 +2000,22 @@ fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> Result<()> {
                 }
             }
         }
-        return done();
+        return Ok(());
     }
     if stopped {
-        return remove_stopped(host, name, records(), true, None, true).and_then(|()| done());
+        return remove_stopped(host, name, records(), true, None, true);
     }
     // Nothing signalled: what held the name (`alive`) was no registered VM, or let it go since (a
     // start whose resume failed, a sweep, an `rm` deciding). A stopped or ended VM's records stay:
     // `kill` is for a running VM.
     if host.alive(name) {
-        return Err(
-            format!("vm {name:?} is starting or its registry is unavailable; try again once it is ready, or see {}", host.vms(name, "log")?.display()).into()
-        );
+        return Err(util::coded(
+            util::ErrorKind::Conflict,
+            format!("vm {name:?} is starting or its registry is unavailable; try again once it is ready, or see {}", host.vms(name, "log")?.display()),
+        ));
     }
     if records() {
-        bail!("vm {name} is not running (see flexvm ps -a); flexvm rm {name} removes it");
+        return Err(util::coded(util::ErrorKind::Conflict, format!("vm {name} is not running (see flexvm ps -a); flexvm rm {name} removes it")));
     }
     nothing_to_remove(host, name)
 }
@@ -1943,18 +2048,23 @@ fn remove_held(host: &Host, name: &str, had: bool, logs: bool, of: Option<&host:
     let lock = match host.take_name(name, true) {
         Ok(lock) => lock,
         // A VM of the name started meanwhile: `rm -f` (which killed or found none) is tried again.
-        Err(_) if host.alive(name) && force => bail!("vm {name} started meanwhile: try again"),
-        Err(_) if host.alive(name) => bail!("vm {name} is running: stop or kill it first, or flexvm rm -f {name}"),
+        Err(_) if host.alive(name) && force => return Err(util::coded(util::ErrorKind::Conflict, format!("vm {name} started meanwhile: try again"))),
+        Err(_) if host.alive(name) => {
+            return Err(util::coded(util::ErrorKind::Conflict, format!("vm {name} is running: stop or kill it first, or flexvm rm -f {name}")))
+        }
         Err(e) => return Err(e),
     };
     let held = host::HeldName::new(lock);
     let r = &held.records;
     if !had && (r.moved.is_some() || r.recorded()) {
-        return Err(match &r.moved {
-            Some(Some(to)) => format!("vm {name} moved to {to}; kill it there").into(),
-            Some(None) => format!("vm {name} moved away; kill it where it runs").into(),
-            None => format!("vm {name} ended meanwhile (see flexvm ps -a): left as it is; flexvm rm {name} removes it").into(),
-        });
+        return Err(util::coded(
+            util::ErrorKind::Conflict,
+            match &r.moved {
+                Some(Some(to)) => format!("vm {name} moved to {to}; kill it there"),
+                Some(None) => format!("vm {name} moved away; kill it where it runs"),
+                None => format!("vm {name} ended meanwhile (see flexvm ps -a): left as it is; flexvm rm {name} removes it"),
+            },
+        ));
     }
     match of.map(|id| held.verdict(id)) {
         None | Some(Verdict::Mine) => {}
@@ -1997,11 +2107,14 @@ fn nothing_to_remove(host: &Host, name: &str) -> Result<()> {
     let alive = host.alive(name);
     let r = host::Records::read(host, name);
     if alive || r.logs && !host.left_unrecorded(name)? {
-        bail!("vm {name:?} is starting or its registry is unavailable; try again once it is ready, or see {}", host.vms(name, "log")?.display());
+        return Err(util::coded(
+            util::ErrorKind::Conflict,
+            format!("vm {name:?} is starting or its registry is unavailable; try again once it is ready, or see {}", host.vms(name, "log")?.display()),
+        ));
     }
     match r.moved {
-        Some(Some(to)) => Err(format!("vm {name} moved to {to}; kill it there").into()),
-        _ => Err(format!("no vm named {name:?}").into()),
+        Some(Some(to)) => Err(util::coded(util::ErrorKind::Conflict, format!("vm {name} moved to {to}; kill it there"))),
+        _ => Err(util::coded(util::ErrorKind::NotFound, format!("no vm named {name:?}"))),
     }
 }
 
