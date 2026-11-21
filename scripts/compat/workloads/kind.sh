@@ -35,10 +35,17 @@ diagnose)
     # The host can request this after a timed-out verify connection is gone.
     k --request-timeout=4s get pods -l app=web -o wide || true
     k --request-timeout=4s describe pods -l app=web || true
-    timeout 6 docker exec fvkind-control-plane journalctl --no-pager -u kubelet -n 80 || true
     timeout 6 docker exec fvkind-control-plane sh -c '
-        cat /sys/fs/cgroup/cpu.stat /sys/fs/cgroup/memory.events
-        crictl ps -a' || true
+        crictl ps -a
+        for id in $(crictl ps -a --name web -q); do
+            echo "=== container $id ==="
+            for dir in /sys/fs/cgroup/kubelet.slice/kubelet-kubepods.slice/*/*/cri-containerd-"$id".scope; do
+                [ -d "$dir" ] || continue
+                echo "cgroup: $dir"
+                cat "$dir/cpu.max" "$dir/cpu.stat" "$dir/memory.events" 2>/dev/null || true
+            done
+        done' || true
+    timeout 6 docker exec fvkind-control-plane journalctl --no-pager -u kubelet -n 30 || true
     ;;
 prepare)
     export DEBIAN_FRONTEND=noninteractive
