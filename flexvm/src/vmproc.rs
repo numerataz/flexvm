@@ -82,7 +82,9 @@ fn relay_session<G: Read + Write>(
             guest::FRAME_EXIT => (wait.exited)(),
             guest::FRAME_MSG if rejoin.is_some_and(|r| data == r.id.as_bytes()) => echoed = true,
             guest::FRAME_MSG if guest::at_session_cap(&String::from_utf8_lossy(data)) => *REFUSED.lock().unwrap() = Some(Instant::now()),
-            guest::FRAME_STDOUT | guest::FRAME_STDERR => next = next.max(output_end(data)),
+            guest::FRAME_STDOUT | guest::FRAME_STDERR if rejoin.is_some() => {
+                next = next.max(output_end(data).ok_or("bad session output frame")?);
+            }
             _ => {}
         }
         let bytes = frame.bytes();
@@ -96,7 +98,7 @@ fn relay_session<G: Read + Write>(
                     // Queued before the cut, it is still there to read; then the guest has the rest.
                     while let Ok(Some(frame)) = guest::read_wire_frame(guest) {
                         if matches!(frame.kind(), guest::FRAME_STDOUT | guest::FRAME_STDERR) {
-                            next = next.max(output_end(frame.data()));
+                            next = next.max(output_end(frame.data()).ok_or("bad session output frame")?);
                         }
                         pending.push_back(frame);
                     }
@@ -128,8 +130,9 @@ fn relay_session<G: Read + Write>(
 }
 
 /// Where an output frame's bytes end in the session's stream.
-fn output_end(data: &[u8]) -> u64 {
-    data.get(..8).map_or(0, |o| u64::from_le_bytes(o.try_into().unwrap()).saturating_add((data.len() - 8) as u64))
+fn output_end(data: &[u8]) -> Option<u64> {
+    let offset = u64::from_le_bytes(data.get(..8)?.try_into().unwrap());
+    offset.checked_add((data.len() - 8) as u64)
 }
 
 /// An exec's way back to its session after a checkpoint cut its connection.
@@ -5277,19 +5280,6 @@ mod tests {
         drop(blocker);
     }
 
-    #[test]
-    fn output_end_saturates_on_untrusted_offset() {
-        let mut frame = u64::MAX.to_le_bytes().to_vec();
-        frame.extend_from_slice(b"hello");
-        assert_eq!(output_end(&frame), u64::MAX);
-
-        let mut normal = 10u64.to_le_bytes().to_vec();
-        normal.extend_from_slice(b"abc");
-        assert_eq!(output_end(&normal), 13);
-
-        assert_eq!(output_end(&[1, 2, 3]), 0);
-    }
-
     /// #533: an arrival's revision is its own from its commit, recorded only after its reply and
     /// handoff: it is published before the commit's host lock is let go, so no announcement of the
     /// source's is judged by the trailing record in between.
@@ -6571,6 +6561,42 @@ mod session_relay_tests {
 
     fn out(offset: u64, data: &[u8]) -> Vec<u8> {
         guest::frame(guest::FRAME_STDOUT, &[&offset.to_le_bytes()[..], data])
+    }
+
+    #[test]
+    fn output_end_rejects_short_and_overflowing_frames() {
+        let with_offset = |offset: u64, payload: &[u8]| [&offset.to_le_bytes()[..], payload].concat();
+        assert_eq!(output_end(b""), None);
+        assert_eq!(output_end(&[0u8; 7]), None);
+        assert_eq!(output_end(&with_offset(10, b"hello")), Some(15));
+        assert_eq!(output_end(&with_offset(u64::MAX, b"")), Some(u64::MAX));
+        assert_eq!(output_end(&with_offset(u64::MAX - 3, b"abc")), Some(u64::MAX));
+        assert_eq!(output_end(&with_offset(u64::MAX, b"x")), None);
+        assert_eq!(output_end(&with_offset(u64::MAX - 2, b"abc")), None);
+    }
+
+    #[test]
+    fn relay_session_rejects_overflowing_output_offset_when_rejoining() {
+        type CursorAttach = Result<Option<(BufReader<std::io::Cursor<Vec<u8>>>, std::os::fd::RawFd)>>;
+        let frames = [guest::frame(guest::FRAME_MSG, &[b"sid"]), out(u64::MAX, b"x")].concat();
+        let (relay, _client) = UnixStream::pair().unwrap();
+        let mut guest = BufReader::new(std::io::Cursor::new(frames));
+        let attach = |_: u64| -> CursorAttach { Ok(None) };
+        let rejoin = Rejoin { id: "sid", from: 0, attach: &attach };
+        let err = relay_session(&mut guest, &mut &relay, &idle(), false, Some(&rejoin)).unwrap_err();
+        assert!(err.to_string().contains("bad session output frame"), "{err}");
+    }
+
+    #[test]
+    fn relay_session_without_rejoin_preserves_raw_output_starting_with_u64_max() {
+        let frames = out(u64::MAX, b"x");
+        let (relay, mut client) = UnixStream::pair().unwrap();
+        let mut guest = BufReader::new(std::io::Cursor::new(frames.clone()));
+        assert!(relay_session(&mut guest, &mut &relay, &idle(), false, None).unwrap().is_none());
+        drop(relay);
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).unwrap();
+        assert_eq!(got, frames);
     }
 
     /// #1016: a checkpoint cutting the guest's connection while the client is stalled does not end an exec's
