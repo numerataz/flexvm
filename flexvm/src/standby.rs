@@ -300,19 +300,11 @@ fn wait_gone(mut waiting: Vec<(Ident, PidFd)>, by: Instant, claimed: impl Fn() -
     }
 }
 
-/// Periodic recovery, run by listeners and running VM processes. A
-/// nonblocking refill lock avoids piling up workers behind a slow restore.
-/// No refill for a minute after pressure stopped standby VMs (so they do not
-/// cycle) or after a template's refill failed (its error is in standby.log).
-pub fn maintain(host: Host) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(5));
-        refill_round(&host);
-    });
-}
-
-/// One round of `maintain`: each template short of its count refilled, unless pressure or
-/// its refill failed lately.
+/// One round of periodic standby maintenance (`gc::maintain`): each template short of its count
+/// refilled, unless pressure or its refill failed lately. A nonblocking refill lock avoids
+/// piling up workers behind a slow restore. No refill for a minute after pressure stopped
+/// standby VMs (so they do not cycle) or after a template's refill failed (its error is in
+/// standby.log).
 pub fn refill_round(host: &Host) {
     if recent(&pressure(host)) {
         return;
@@ -2402,5 +2394,31 @@ mod tests {
         assert_eq!(started, 0);
         assert!(live(&host, "default").is_empty());
         assert!(!dir(&host, "default").join(".failed").exists());
+    }
+
+    #[test]
+    fn refill_round_respects_pressure_and_failure_backoff() {
+        let root = crate::test_util::TempDir::new("refill-round-backoff");
+        let mut host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        host.cfg.reserve_mib = Some(u64::MAX / 2);
+        crate::util::write_file(&host.state.join("standby"), "default", b"1", true).unwrap();
+        let pool_dir = dir(&host, "default");
+
+        // Recent pressure skips the entire refill round without touching the pool.
+        crate::host::write_record(&pressure(&host), b"").unwrap();
+        refill_round(&host);
+        assert!(!pool_dir.join(".template").exists(), "recent pressure skips refill_round");
+        std::fs::remove_file(pressure(&host)).unwrap();
+
+        // A failing refill (standby.log is a symlink rejected by O_NOFOLLOW) records `.failed`.
+        std::fs::create_dir_all(&pool_dir).unwrap();
+        std::os::unix::fs::symlink("blocked", pool_dir.join("standby.log")).unwrap();
+        refill_round(&host);
+        assert!(pool_dir.join(".failed").exists(), "failed refill_round records backoff marker");
+
+        // While `.failed` is recent, subsequent rounds skip the template.
+        std::fs::remove_file(pool_dir.join("standby.log")).unwrap();
+        refill_round(&host);
+        assert!(!pool_dir.join("standby.log").exists(), "recent .failed skips template in refill_round");
     }
 }

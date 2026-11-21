@@ -215,8 +215,7 @@ pub fn main(host: Host, listeners: Vec<TcpListener>, validated: Cached) -> Resul
             Ok(true) => {}
         }
     });
-    crate::standby::maintain(host.clone());
-    crate::gc::periodic(host.clone());
+    let _maint = crate::gc::maintain(host.clone());
     let peers = Peers::watch(host.clone(), validated);
     let (waits, moved) = (Waiting::new(MAX_WAITING, MAX_WAITING_FROM), Waiting::new(MAX_MOVED, MAX_MOVED_FROM));
     let host = std::sync::Arc::new(host);
