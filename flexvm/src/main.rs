@@ -1762,7 +1762,7 @@ fn no_process(host: &Host, name: &str, none: &str) -> util::Error {
 /// How long `stop`, `pause`, `kill` and `rm -f` wait for a VM that holds its name but is not registered yet (starting).
 const START_WAIT: Duration = Duration::from_secs(if cfg!(test) { 3 } else { 60 });
 
-/// An instance `stop`, `pause`, `kill` or `rm -f` signalled under `asked`, followed by its process identity under
+/// An instance `stop`, `kill` or `rm -f` sent a lifecycle RPC to under `asked`, followed by its process identity under
 /// whatever name it has (`last`): never by (ip, gen), which `Pin` follows and a resume or migration keeps.
 struct Tracked {
     ident: host::Ident,
@@ -1780,21 +1780,27 @@ struct Ended {
 }
 
 impl Tracked {
-    /// Signals the instance registered under `name` (one read of the registry), waiting while the name is held with no
-    /// entry (a VM starting, #1189, or an `rm` or sweep deciding): None once nothing holds it. Anything else that keeps
-    /// it from being signalled (`host::Unseen`, a process not told apart, a refused signal) is an error, never "not
-    /// running". `check` refuses an entry before it is signalled.
-    fn signal(host: &Host, name: &str, sig: i32, check: &dyn Fn(&host::Entry) -> Result<()>) -> Result<Option<Tracked>> {
+    /// Connects to the control socket of the instance registered under `name` and sends `req`, verifying
+    /// the peer PID matches the registry entry. Waits while the name is held with no entry (a VM starting,
+    /// #1189, or an `rm` or sweep deciding): None once nothing holds it. `check` refuses an entry before connecting.
+    fn send(host: &Host, name: &str, req: &Value, check: &dyn Fn(&host::Entry) -> Result<()>) -> Result<Option<(std::os::unix::net::UnixStream, Tracked)>> {
         let deadline = Instant::now() + START_WAIT;
         loop {
             if let Ok(e) = host.entry(name) {
                 check(&e)?;
                 if let Some(pidfd) = host::PidFd::open(&e.ident).map_err(|err| if err.is::<host::Unseen>() { unseen(name, err) } else { err })? {
-                    match pidfd.signal(sig) {
-                        Ok(()) => return Ok(Some(Tracked { ident: e.ident, pidfd, asked: name.into(), last: name.into() })),
-                        // Its process gone meanwhile.
+                    let mut verify = |c: &std::os::unix::net::UnixStream| {
+                        if !e.ident.is(util::peer_pid(c)?) {
+                            bail!("vm {name} owner changed");
+                        }
+                        Ok(())
+                    };
+                    match vmproc::connect(host, name, req, &[], Instant::now() + Duration::from_secs(10), Some(&mut verify)) {
+                        Ok(conn) => return Ok(Some((conn, Tracked { ident: e.ident, pidfd, asked: name.into(), last: name.into() }))),
+                        // Its process gone meanwhile, or socket not ready yet while starting.
                         Err(_) if !e.ident.alive() => {}
-                        Err(err) => bail!("vm {name}: {err}"),
+                        Err(_) if Instant::now() < deadline => {}
+                        Err(err) => return Err(err),
                     }
                 }
             }
@@ -1809,16 +1815,6 @@ impl Tracked {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-    }
-
-    /// Its registry entry now, under `last` or whatever name a rename that held its op as the signal
-    /// landed gave it (#1178), which `last` follows. None while it is not registered (its entry rewritten) or once it ended.
-    fn refresh(&mut self, host: &Host) -> Option<host::Entry> {
-        let entry = host.entry(&self.last).ok().filter(|e| e.ident == self.ident).or_else(|| host.entries().into_iter().find(|e| e.ident == self.ident));
-        if let Some(e) = &entry {
-            self.last.clone_from(&e.name);
-        }
-        entry
     }
 
     /// `asked`, as a message names it, renamed `last` meanwhile.
@@ -1848,56 +1844,75 @@ fn unseen(name: &str, e: util::Error) -> util::Error {
 /// How long `stop` waits for a suspend: its copy of the VM's memory to disk.
 const STOP_WAIT: Duration = Duration::from_secs(600);
 
-/// SIGTERM, and waits until the VM is suspended (its process gone). Stopped or exited: a no-op.
-/// Returns the name the VM has last (a rename as it was signalled moves it on: `restart` starts that).
+/// Sends `{"op": "stop"}` over `NAME.sock` and waits until the VM is suspended (its process gone).
+/// Stopped or exited: a no-op. Returns the name the VM has last (a rename as it was stopped moves it on: `restart` starts that).
 pub(crate) fn stop(host: &Host, name: &str) -> Result<String> {
     host::check_name(name)?;
-    if let Ok(entry) = host.entry(name) {
-        if !entry.backend.is_firecracker() {
-            software::stop(host, name, &entry.ident)?;
-            return Ok(name.into());
+    let start_deadline = Instant::now() + START_WAIT;
+    let suspend_deadline = Instant::now() + STOP_WAIT;
+    let mut vm = loop {
+        if let Ok(entry) = host.entry(name) {
+            if !entry.backend.is_firecracker() {
+                software::stop(host, name, &entry.ident)?;
+                return Ok(name.into());
+            }
         }
-    }
-    // The instance signalled: its exit status tells an app that exited first (`--rm` or attached VMs leave no exited record).
-    let mut vm = match Tracked::signal(host, name, libc::SIGTERM, &|entry| {
-        if !entry.backend.is_firecracker() {
-            // A software owner may have become ready after the initial lookup.
-            // Complete its acknowledged stop before considering the legacy signal.
-            software::stop(host, name, &entry.ident)?;
+        let sent = Tracked::send(host, name, &json!({"op": "stop"}), &|entry| {
+            if !entry.backend.is_firecracker() {
+                software::stop(host, name, &entry.ident)?;
+            }
+            Ok(())
+        })?;
+        let Some((conn, mut vm)) = sent else {
+            // A stopped VM's checkpoint, not debris (a consumed or discarded one) under its name.
+            // An exited one whose restart policy would run it again is not (docker's stop ends a restart loop).
+            if host.is_suspended(name)
+                || host.has_record(name, "exited")
+                || (containers::exit_record(host, name).is_some_and(|exit| exit.app == Some(true))
+                    && !host.has_record(name, "failed")
+                    && !host.has_record(name, "lost"))
+            {
+                restart::cancel(host, name)?;
+                return Ok(name.into());
+            }
+            return Err(not_running(host, name));
+        };
+        let reply = recv_json(&mut BufReader::new(util::By { s: conn, at: suspend_deadline }));
+        match reply {
+            Ok(Some(v)) if v["ok"] == true && v["result"]["suspending"] == true => {
+                if Instant::now() >= suspend_deadline {
+                    return Err(format!("vm {} did not suspend (it runs on); see {}", vm.shown(), host.vms(&vm.last, "log")?.display()).into());
+                }
+                if vm.pidfd.wait(Duration::from_millis(100)) {
+                    break vm;
+                }
+            }
+            Ok(Some(v)) if v["ok"] == true => {
+                if let Some(last) = v["result"]["name"].as_str() {
+                    vm.last = last.into();
+                }
+                let _ = vm.pidfd.wait(Duration::from_secs(10));
+                return Ok(vm.last);
+            }
+            Ok(Some(v)) if (v["error"] == "busy" || v["busy"] == true) && Instant::now() < start_deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Ok(Some(v)) => return Err(v["error"].as_str().unwrap_or("stop refused").to_string().into()),
+            Ok(None) | Err(_) => {
+                let left = suspend_deadline.saturating_duration_since(Instant::now());
+                if !vm.pidfd.wait(left) {
+                    return Err(format!("vm {} did not suspend (it runs on); see {}", vm.shown(), host.vms(&vm.last, "log")?.display()).into());
+                }
+                break vm;
+            }
         }
-        Ok(())
-    })? {
-        Some(vm) => vm,
-        // A stopped VM's checkpoint, not debris (a consumed or discarded one) under its name.
-        // An exited one whose restart policy would run it again is not (docker's stop ends a restart loop).
-        None if host.is_suspended(name)
-            || host.has_record(name, "exited")
-            || (containers::exit_record(host, name).is_some_and(|exit| exit.app == Some(true))
-                && !host.has_record(name, "failed")
-                && !host.has_record(name, "lost")) =>
-        {
-            restart::cancel(host, name)?;
-            return Ok(name.into());
-        }
-        None => return Err(not_running(host, name)),
     };
-    let (start, mut seen) = (Instant::now(), false);
-    while !vm.pidfd.wait(Duration::from_millis(100)) {
-        let state = vm.refresh(host).map(|e| e.state).unwrap_or_default();
-        seen |= state == "suspending" || state == "checkpointing";
-        // Back to running: the suspend failed, and the VM runs on (its log says why).
-        let gave_up = seen && matches!(state.as_str(), "running" | "paused");
-        if gave_up || start.elapsed() > STOP_WAIT || (!seen && start.elapsed() > Duration::from_secs(10) && !matches!(state.as_str(), "source" | "reconciling"))
-        {
-            return Err(format!("vm {} did not suspend (it runs on); see {}", vm.shown(), host.vms(&vm.last, "log")?.display()).into());
-        }
-    }
     let (Ended { last, exit, shown, records: r }, ident) = (vm.ended(host), &vm.ident);
-    // Its app exited as the stop came: a restart that instance scheduled (before it took the SIGTERM) is not run.
+    // Its app exited as the stop came: a restart that instance scheduled (before it took the stop) is not run.
     if r.exited && exit.as_ref().is_some_and(|e| e.ident == *ident) {
         restart::cancel(host, &last)?;
     }
-    // Suspended by the instance signalled, as its checkpoint's OWNER says (never debris, a checkpoint consumed by a
+    // Suspended by the instance stopped, as its checkpoint's OWNER says (never debris, a checkpoint consumed by a
     // resume that then died, or another instance's), or its app exited first (the VM, ending, took no suspend).
     if matches!(&r.checkpoint, Some(host::Checkpoint::Resumable { owner: Some(o) }) if o == ident) || r.exited {
         return Ok(last);
@@ -1919,20 +1934,22 @@ fn app_exited(exit: Option<&containers::Exit>, ident: &host::Ident) -> bool {
     exit.is_some_and(|e| e.ident == *ident && e.app.unwrap_or(![vmproc::DIED, 128 + libc::SIGINT, 128 + libc::SIGQUIT].contains(&e.code)))
 }
 
-/// SIGTSTP, and waits until the instance signalled (`Tracked`, under whatever name it has) has its vCPUs paused.
+/// Sends `{"op": "pause"}` over `NAME.sock` and waits for the VM process's confirmation.
 pub(crate) fn pause(host: &Host, name: &str) -> Result<()> {
     host::check_name(name)?;
-    let mut vm = Tracked::signal(host, name, libc::SIGTSTP, &|_| Ok(()))?.ok_or_else(|| not_running(host, name))?;
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + START_WAIT;
     loop {
-        match vm.refresh(host).map(|e| e.state) {
-            Some(s) if s == "paused" => return Ok(()),
-            Some(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            Some(s) => bail!("vm {} is still {s}; see {}", vm.shown(), host.vms(&vm.last, "log")?.display()),
-            // Not registered for a moment (its entry rewritten), or ended: its pidfd tells.
-            None if !vm.pidfd.wait(Duration::ZERO) && Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            None => bail!("vm {} ended before it paused; see {}", vm.shown(), host.vms(&vm.last, "log")?.display()),
+        let Some((conn, _vm)) = Tracked::send(host, name, &json!({"op": "pause"}), &|_| Ok(()))? else {
+            return Err(not_running(host, name));
+        };
+        match recv_json(&mut BufReader::new(util::By { s: conn, at: Instant::now() + Duration::from_secs(30) })) {
+            Ok(Some(v)) if v["ok"] == true => return Ok(()),
+            Ok(Some(v)) if (v["error"] == "busy" || v["busy"] == true) && Instant::now() < deadline => {}
+            Ok(Some(v)) => return Err(v["error"].as_str().unwrap_or("pause refused").to_string().into()),
+            Err(e) if host.alive(name) => bail!("vm {name}: pause was not confirmed: {e}"),
+            _ => bail!("vm {name} ended before it paused; see {}", host.vms(name, "log")?.display()),
         }
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
@@ -1960,7 +1977,7 @@ pub(crate) fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> R
     if !running {
         return remove_stopped(host, name, records(), true, None, false);
     }
-    // Reconciling sources accept SIGINT too; the process records the owed outcome before ending.
+    // Reconciling sources accept kill too; the process records the owed outcome before ending.
     let not_source = |e: &host::Entry| -> Result<()> {
         match e.state == "source" {
             true => Err(util::coded(
@@ -1970,9 +1987,29 @@ pub(crate) fn remove(host: &Host, name: &str, running: bool, stopped: bool) -> R
             false => Ok(()),
         }
     };
-    let killed = Tracked::signal(host, name, libc::SIGINT, &not_source)?;
-    // Test gate `kill_gate`: the name's lock probed (`alive`), the VM signalled if it had an entry.
-    host::gate("kill_gate");
+    let start_deadline = Instant::now() + START_WAIT;
+    let killed = loop {
+        let sent = Tracked::send(host, name, &json!({"op": "kill"}), &not_source)?;
+        // Test gate `kill_gate`: the name's lock probed (`alive`), the VM sent kill if it had an entry.
+        host::gate("kill_gate");
+        let Some((conn, mut vm)) = sent else {
+            break None;
+        };
+        match recv_json(&mut BufReader::new(util::By { s: conn, at: Instant::now() + Duration::from_secs(30) })) {
+            Ok(Some(v)) if (v["error"] == "busy" || v["busy"] == true) && Instant::now() < start_deadline => {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Ok(Some(v)) if v["ok"] != true => return Err(v["error"].as_str().unwrap_or("kill refused").to_string().into()),
+            Ok(Some(v)) => {
+                if let Some(last) = v["result"]["name"].as_str() {
+                    vm.last = last.into();
+                }
+            }
+            Ok(None) | Err(_) => {}
+        }
+        break Some(vm);
+    };
     if let Some(mut vm) = killed {
         if !vm.pidfd.wait(Duration::from_secs(30)) {
             return Err(format!("vm {name} is still there; see {}", host.vms(name, "log")?.display()).into());
@@ -3813,6 +3850,54 @@ mod exec_tests {
         assert!(!exited.exists());
     }
 
+    /// Spawns a child process that binds `sock` (so `SO_PEERCRED` matches its own PID), accepts one
+    /// control RPC line, prints it to stdout, optionally sends `reply`, and exits.
+    fn fake_vm_sock(sock: &Path, reply: Option<&str>, keep_fd: Option<i32>) -> crate::test_util::ChildGuard {
+        let script = r#"
+import os, socket, sys
+sock, reply = sys.argv[1], sys.argv[2]
+if os.path.exists(sock):
+    os.unlink(sock)
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(sock)
+s.listen(4)
+c, _ = s.accept()
+line = c.makefile("r").readline()
+sys.stdout.write(line)
+sys.stdout.flush()
+if reply:
+    c.sendall((reply + "\n").encode())
+c.close()
+s.close()
+"#;
+        let mut cmd = std::process::Command::new("python3");
+        cmd.args(["-c", script, sock.to_str().unwrap(), reply.unwrap_or("")]).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::inherit());
+        if let Some(fd) = keep_fd {
+            unsafe {
+                std::os::unix::process::CommandExt::pre_exec(&mut cmd, move || {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let child = crate::test_util::ChildGuard(cmd.spawn().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !sock.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(sock.exists(), "fake vm socket {} was not created", sock.display());
+        child
+    }
+
+    fn read_fake_vm_req(mut child: crate::test_util::ChildGuard) -> Value {
+        let mut out = String::new();
+        std::io::Read::read_to_string(child.stdout.as_mut().unwrap(), &mut out).unwrap();
+        assert!(child.wait().unwrap().success());
+        serde_json::from_str(out.trim()).unwrap()
+    }
+
     /// #1189: `kill` of a VM starting (holding its name, not registered yet) waits for it, as `stop`
     /// does, and kills it once it is there; `rm -f` of one that never registers is refused as starting,
     /// never told to `rm -f`, and the records it saw stay.
@@ -3821,18 +3906,17 @@ mod exec_tests {
         let root = crate::test_util::TempDir::new("kill-starting");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         let lock = host.take_name("app", false).unwrap();
-        let mut app = crate::test_util::sleeper(60);
+        let app = fake_vm_sock(&host.sock("app").unwrap(), Some(r#"{"ok":true,"result":{"name":"app","state":"killed"}}"#), None);
         let ident = host::Ident::of(app.id()).unwrap();
         std::fs::write(host.vms("app", "lock").unwrap(), serde_json::to_vec(&ident).unwrap()).unwrap();
         let entry = host::Entry { name: "app".into(), ident, state: "running".into(), ..host::Entry::default() };
         let publisher = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(500));
+            std::thread::sleep(Duration::from_millis(200));
             lock.publish(&entry).unwrap();
             lock
         });
         remove(&host, "app", true, false).unwrap();
-        let status = app.wait().unwrap();
-        assert_eq!(std::os::unix::process::ExitStatusExt::signal(&status), Some(libc::SIGINT), "killed once registered");
+        assert_eq!(read_fake_vm_req(app)["op"], "kill", "killed via NAME.sock once registered");
         drop(publisher.join().unwrap());
 
         let exited = host.vms("job", "exited").unwrap();
@@ -3867,14 +3951,15 @@ mod exec_tests {
         let root = crate::test_util::TempDir::new("stop-exit");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         let lock = host.take_name("app", false).unwrap();
-        let mut app = crate::test_util::sleeper(60);
+        // Closes socket without replying (app exited first, leaving its exited record).
+        let app = fake_vm_sock(&host.sock("app").unwrap(), None, None);
         let ident = host::Ident::of(app.id()).unwrap();
         std::fs::write(host.vms("app", "lock").unwrap(), serde_json::to_vec(&ident).unwrap()).unwrap();
         lock.publish(&host::Entry { name: "app".into(), ident, state: "running".into(), ..host::Entry::default() }).unwrap();
         // Its app exited first: the VM, ending, takes no suspend and leaves its exited record (#1151).
         std::fs::write(host.vms("app", "exited").unwrap(), "its run").unwrap();
         stop(&host, "app").unwrap();
-        assert!(app.wait().is_ok());
+        assert_eq!(read_fake_vm_req(app)["op"], "stop");
         drop(lock);
     }
 
@@ -3884,11 +3969,12 @@ mod exec_tests {
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         for moved in [false, true] {
             let lock = host.take_name("app", false).unwrap();
-            let mut app = crate::test_util::sleeper(60);
+            let reply = if moved { None } else { Some(r#"{"ok":true,"result":{"name":"app-new","state":"suspended"}}"#) };
+            let app = fake_vm_sock(&host.sock("app").unwrap(), reply, None);
             let ident = host::Ident::of(app.id()).unwrap();
             std::fs::write(host.vms("app", "lock").unwrap(), serde_json::to_vec(&ident).unwrap()).unwrap();
             lock.publish(&host::Entry { name: "app".into(), ident: ident.clone(), state: "running".into(), ..host::Entry::default() }).unwrap();
-            // A rename that held its op as the SIGTERM landed: its records are under the new name (#1178).
+            // A rename that held its op as the stop landed: its records are under the new name (#1178).
             containers::record_exit(&host, "app-new", &ident, 128 + libc::SIGTERM, false);
             let r = match moved {
                 false => {
@@ -3904,7 +3990,7 @@ mod exec_tests {
                     stop(&host, "app").map_err(|e| e.to_string())
                 }
             };
-            assert!(app.wait().is_ok());
+            assert_eq!(read_fake_vm_req(app)["op"], "stop");
             drop(lock);
             match moved {
                 // `restart` starts it under the name stop returns (#1189).
@@ -4183,7 +4269,6 @@ mod exec_tests {
     #[test]
     fn force_rm_clears_a_running_vms_logs_but_kill_keeps_them() {
         use crate::test_util::JoinWithin;
-        use std::os::unix::process::ExitStatusExt;
         let root = crate::test_util::TempDir::new("force-rm-logs");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         for (force, record) in [(false, "none"), (true, "none"), (true, "exited"), (true, "suspended")] {
@@ -4192,18 +4277,7 @@ mod exec_tests {
             // process instead, it outlived the process by whatever the load made it (#1103).
             let lock = host::lock_path(&host.vms("web", "lock").unwrap(), libc::LOCK_EX | libc::LOCK_NB).unwrap();
             let fd = lock.as_raw_fd();
-            let mut command = std::process::Command::new("sleep");
-            unsafe {
-                std::os::unix::process::CommandExt::pre_exec(&mut command, move || {
-                    libc::signal(libc::SIGINT, libc::SIG_DFL);
-                    // Kept across exec: the child shares the lock's open file description.
-                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-            let mut child = crate::test_util::ChildGuard(command.arg("60").spawn().unwrap());
+            let child = fake_vm_sock(&host.sock("web").unwrap(), Some(r#"{"ok":true,"result":{"name":"web","state":"killed"}}"#), Some(fd));
             drop(lock);
             let entry = host::Entry { name: "web".into(), ident: host::Ident::of(child.id()).unwrap(), state: "running".into(), ..host::Entry::default() };
             std::fs::write(host.vms("web", "lock").unwrap(), serde_json::to_vec(&entry.ident).unwrap()).unwrap();
@@ -4220,11 +4294,11 @@ mod exec_tests {
                 std::fs::create_dir_all(&dir).unwrap();
                 std::fs::write(dir.join("manifest.json"), "{}").unwrap();
             }
-            let ended = std::thread::spawn(move || child.wait().unwrap());
+            let ended = std::thread::spawn(move || read_fake_vm_req(child));
             let result = remove(&host, "web", true, force);
-            let status = ended.join_within().unwrap();
+            let req = ended.join_within().unwrap();
             result.unwrap();
-            assert_eq!(status.signal(), Some(libc::SIGINT));
+            assert_eq!(req["op"], "kill");
             for ext in ["log", "log.1"] {
                 assert_eq!(host.has_record("web", ext), !force, "{record}, force={force}: {ext}");
             }
@@ -4961,18 +5035,10 @@ mod exec_tests {
 
     #[test]
     fn kill_refuses_a_committed_source_but_signals_a_reconciling_one() {
-        use std::os::unix::process::ExitStatusExt;
         let root = crate::test_util::TempDir::new("kill-source");
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         let name = host.take_name("moving", false).unwrap();
-        let mut child = std::process::Command::new("sleep");
-        unsafe {
-            std::os::unix::process::CommandExt::pre_exec(&mut child, || {
-                libc::signal(libc::SIGINT, libc::SIG_DFL);
-                Ok(())
-            });
-        }
-        let mut child = crate::test_util::ChildGuard(child.arg("60").spawn().unwrap());
+        let mut child = fake_vm_sock(&host.sock("moving").unwrap(), Some(r#"{"ok":true,"result":{"name":"moving","state":"killed"}}"#), None);
         let mut entry = host::Entry { name: "moving".into(), ident: host::Ident::of(child.id()).unwrap(), state: "source".into(), ..host::Entry::default() };
         // Hold the name on the child's behalf, with its identity in both records.
         std::fs::write(host.vms("moving", "lock").unwrap(), serde_json::to_vec(&entry.ident).unwrap()).unwrap();
@@ -4983,12 +5049,37 @@ mod exec_tests {
         entry.state = "reconciling".into();
         name.publish(&entry).unwrap();
         let result = remove(&host, "moving", true, false);
-        // Reap even on failure, so a failed assertion does not leave the child behind.
-        let _ = child.kill();
-        let status = child.wait().unwrap();
         result.unwrap();
-        assert_eq!(status.signal(), Some(libc::SIGINT));
+        assert_eq!(read_fake_vm_req(child)["op"], "kill");
         drop(name);
+    }
+
+    #[test]
+    fn pause_uses_direct_sock_rpc_and_retries_busy() {
+        let root = crate::test_util::TempDir::new("pause-rpc");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        // Not running: reports no running vm.
+        assert_eq!(pause(&host, "missing").unwrap_err().to_string(), r#"no running vm named "missing""#);
+        let name = host.take_name("app", false).unwrap();
+        name.publish(&host::Entry { name: "app".into(), ident: host::Ident::me(), state: "running".into(), ..Default::default() }).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(host.sock("app").unwrap()).unwrap();
+        let server = std::thread::spawn(move || {
+            // First attempt: busy (starting).
+            let mut c1 = listener.accept().unwrap().0;
+            assert_eq!(recv_json(&mut BufReader::new(&mut c1)).unwrap().unwrap()["op"], "pause");
+            util::send_json(&mut c1, &json!({"ok": false, "busy": true, "error": "vm app is starting"})).unwrap();
+            // Second attempt: succeeds.
+            let mut c2 = listener.accept().unwrap().0;
+            assert_eq!(recv_json(&mut BufReader::new(&mut c2)).unwrap().unwrap()["op"], "pause");
+            util::send_json(&mut c2, &json!({"ok": true, "result": {"name": "app", "state": "paused"}})).unwrap();
+            // Third attempt: refused error surfaces immediately.
+            let mut c3 = listener.accept().unwrap().0;
+            assert_eq!(recv_json(&mut BufReader::new(&mut c3)).unwrap().unwrap()["op"], "pause");
+            util::send_json(&mut c3, &json!({"ok": false, "error": "vm app is being destroyed"})).unwrap();
+        });
+        pause(&host, "app").unwrap();
+        assert_eq!(pause(&host, "app").unwrap_err().to_string(), "vm app is being destroyed");
+        server.join().unwrap();
     }
 
     fn frames(fs: &[(u8, &[u8])]) -> Vec<u8> {
@@ -5298,6 +5389,23 @@ mod exec_tests {
         assert_eq!(software_memory_limits(true, None, 49152).unwrap(), (qemu::ELASTIC_BASE_MIB, 49152));
         assert_eq!(software_memory_limits(true, Some(2048), 49152).unwrap(), (qemu::ELASTIC_BASE_MIB, 2048));
         assert!(software_memory_limits(true, None, 0).is_err());
+    }
+
+    #[test]
+    fn pause_refuses_unseen_pid_namespace() {
+        let root = crate::test_util::TempDir::new("pause-unseen-pidns");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let lock = host.take_name("unseen-vm", false).unwrap();
+        let mut ident = host::Ident::me();
+        ident.pid = 1;
+        ident.ns = Some(ident.ns.unwrap_or(0).wrapping_add(1));
+        std::fs::write(host.vms("unseen-vm", "lock").unwrap(), serde_json::to_vec(&ident).unwrap()).unwrap();
+        lock.publish(&host::Entry { name: "unseen-vm".into(), ident, state: "running".into(), ..Default::default() }).unwrap();
+        let sock = host.sock("unseen-vm").unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let err = pause(&host, "unseen-vm").unwrap_err();
+        assert!(err.is::<host::Unseen>(), "expected host::Unseen, got: {err}");
+        assert!(err.to_string().contains("cannot be seen"), "{err}");
     }
 }
 
