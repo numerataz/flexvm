@@ -74,16 +74,6 @@ def main():
         print("PASS ARM parent KVM frontend handshake")
 
 
-def wait_transfer(monitor):
-    while True:
-        state = monitor.ask("query-migrate")
-        if state.get("status") == "completed":
-            return
-        if state.get("status") not in ("setup", "active", "device"):
-            raise RuntimeError(f"unexpected ARM parent transfer state: {state}")
-        time.sleep(min(.01, monitor.remaining()))
-
-
 def exercise(args, cpio, output, *, snapshot=None, incoming=False):
     with ExitStack() as resources:
         runtime = Path(resources.enter_context(tempfile.TemporaryDirectory(prefix="flexvm-arm-front-")))
@@ -154,14 +144,10 @@ def exercise(args, cpio, output, *, snapshot=None, incoming=False):
                 if not incoming:
                     check_request(PARENT["OPEN_VM"])
                     monitor.ask("stop")
-                    monitor.send_fd(snapshot.fileno())
-                    monitor.ask("migrate", {"uri": "fd:snapshot"})
-                    wait_transfer(monitor)
+                    PARENT["transfer_state"](monitor, snapshot.fileno())
                     monitor.ask("quit")
                     return
-                monitor.send_fd(snapshot.fileno())
-                monitor.ask("migrate-incoming", {"uri": "fd:snapshot"})
-                wait_transfer(monitor)
+                PARENT["transfer_state"](monitor, snapshot.fileno(), incoming=True)
                 if monitor.ask("query-status")["status"] != "paused":
                     raise RuntimeError("ARM parent resumed before the mailbox was ready")
                 reply(check_request(PARENT["OPEN_VM"], restored=True))

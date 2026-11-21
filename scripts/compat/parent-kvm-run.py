@@ -3221,19 +3221,11 @@ def main():
         (output / "initramfs").write_bytes(image)
         trace = output / "files.strace"
         worker = output / "worker.log"
-        setup = """
-            for path in /dev/kvm /dev/vhost-vsock /dev/vhost-net; do
-                if [ "$path" = /dev/kvm ] && [ "$2" = kvm ]; then continue; fi
-                if [ -e "$path" ]; then mount --bind "$1" "$path"; fi
-            done
-            shift 2
-            exec "$@"
-        """
+        masked = tuple(device for device in DEVICES if not (device == "/dev/kvm" and args.parent_engine == "kvm"))
         with tempfile.TemporaryDirectory(prefix="flexvm-parent-kvm-") as scratch:
             mask = Path(scratch) / "mask"
             mask.touch(mode=0o600)
-            HELPERS["run"](["unshare", "--mount", "--propagation", "private", "sh", "-ec", setup, "sh", mask, args.parent_engine,
-                            "strace", "-f", "-e", "trace=file", "-o", trace, sys.executable,
+            HELPERS["run"](HELPERS["mask_devices"](mask, [sys.executable,
                             Path(__file__).resolve(), "--worker", "--qemu", qemu, "--kernel", kernel,
                             "--output", output, "--parent-engine", args.parent_engine,
                             "--ram-pages", str(args.ram_pages),
@@ -3269,7 +3261,8 @@ def main():
                             *(["--memory-quota"] if args.memory_quota else []),
                             *(["--reject-close"] if args.reject_close else []),
                             *(["--firecracker", args.firecracker, "--firecracker-vcpus", str(args.firecracker_vcpus),
-                               "--firecracker-memory", str(args.firecracker_memory)] if firecracker else [])], 75, worker)
+                               "--firecracker-memory", str(args.firecracker_memory)] if firecracker else [])],
+                            devices=masked, trace=trace), 75, worker)
         lines = trace.read_text(errors="replace").splitlines()
         devices = {device for line in lines for device in DEVICES if f'"{device}"' in line}
         expected = {"/dev/kvm"} if args.parent_engine == "kvm" else set()

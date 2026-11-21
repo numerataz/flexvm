@@ -349,6 +349,9 @@ mod tests {
             crate::software_state::sweep(&target).unwrap();
             assert!(path.exists());
 
+            // Explicitly unlock before closing so a parallel test's fork cannot
+            // hold the shared flock via an inherited CLOEXEC fd until it execs.
+            crate::host::flock(&pinned, libc::LOCK_UN).unwrap();
             drop(pinned);
             crate::software_state::sweep(&target).unwrap();
             assert!(!path.exists());

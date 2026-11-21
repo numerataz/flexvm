@@ -67,22 +67,14 @@ def main():
     if args.suspend_initial:
         files["firecracker-initial-checkpoint"] = (b"", 0o600)
     image(archive, "amd64", files)
-    setup = """
-        for device in /dev/kvm /dev/vhost-net /dev/vhost-vsock; do
-            if [ "$device" = /dev/kvm ] && [ "$2" = kvm ]; then continue; fi
-            if [ -e "$device" ]; then mount --bind "$1" "$device"; fi
-        done
-        shift 2
-        exec "$@"
-    """
     trace, log = output / "files.strace", output / "guest.log"
+    masked = tuple(device for device in DEVICES if not (device == "/dev/kvm" and args.engine == "kvm"))
     with tempfile.TemporaryDirectory(prefix="flexvm-software-parent-", dir="/var/lib") as state:
         mask = Path(state) / "mask"
         mask.touch(mode=0o600)
-        prefix = ["unshare", "--mount", "--propagation", "private", "sh", "-ec", setup, "sh", mask, args.engine,
-                  "strace", "-f", "-e", "trace=file", "-o"]
+        isolate = lambda cmd, trace_path: HELPERS["mask_devices"](mask, cmd, devices=masked, trace=trace_path)
         command = [
-            *prefix, trace, binary, "software", "--kernel", kernel, "--qemu", qemu, "--state", state, "--verbose",
+            binary, "software", "--kernel", kernel, "--qemu", qemu, "--state", state, "--verbose",
             "--parent-kvm-bundle", bundle, "--parent-kvm-engine", args.engine, "--parent-kvm-mem", "128", "--mem", "512",
         ]
         during = None
@@ -91,11 +83,11 @@ def main():
             command.extend(["--name", name])
             during = lambda proc, deadline: pause_nested(proc, deadline, binary, state, name, output, log)
         if suspend:
-            suspend_nested(command, prefix, archive, binary, state, output, log,
+            suspend_nested(command, isolate, trace, archive, binary, state, output, log,
                            idle=args.suspend_idle, initial=args.suspend_initial,
                            native_bundle=bundle if args.engine == "kvm" else None)
         else:
-            HELPERS["run"]([*command, archive], 180, log, during=during)
+            HELPERS["run"](isolate([*command, archive], trace), 180, log, during=during)
     transcript = log.read_text(errors="replace")
     for marker in ("FLEXVM_SOFTWARE_INNER_CPU 0", "FLEXVM_SOFTWARE_INNER_CPU 1", "FLEXVM_SOFTWARE_INNER_COMPLETE",
                    "PASS Firecracker network echo"):
@@ -142,7 +134,7 @@ def wait_nested_window(proc, deadline, log, marker):
         time.sleep(.01)
 
 
-def suspend_nested(command, prefix, archive, binary, state, output, log, *, idle, initial, native_bundle):
+def suspend_nested(command, isolate, trace, archive, binary, state, output, log, *, idle, initial, native_bundle):
     name = "parent-kvm-suspend"
     source, target = output / "source.log", output / "target.log"
 
@@ -154,7 +146,7 @@ def suspend_nested(command, prefix, archive, binary, state, output, log, *, idle
         HELPERS["run"]([binary, "stop", "--state", state, name], 90, output / "stop.log")
 
     try:
-        HELPERS["run"]([*command, "--name", name, archive], 180, source, during=stop)
+        HELPERS["run"](isolate([*command, "--name", name, archive], trace), 180, source, during=stop)
         checkpoint = Path(state) / "suspended" / name
         manifest = json.loads((checkpoint / "manifest.json").read_text())
         if not (checkpoint / "RETIRED").is_file() or manifest["parent"]["child_memory_mib"] != 128:
@@ -171,7 +163,7 @@ def suspend_nested(command, prefix, archive, binary, state, output, log, *, idle
             if refused.returncode == 0 or b"requires a local --parent-kvm-bundle" not in refused.stderr:
                 raise RuntimeError("the native checkpoint restored without a locally supplied worker")
             command.extend(["--parent-kvm-bundle", native_bundle])
-        HELPERS["run"]([*prefix, output / "target.strace", *command, name], 150, target)
+        HELPERS["run"](isolate([*command, name], output / "target.strace"), 150, target)
     finally:
         log.write_bytes(b"".join(part.read_bytes() for part in (source, target) if part.exists()))
 
