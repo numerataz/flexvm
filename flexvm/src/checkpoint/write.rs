@@ -238,7 +238,7 @@ pub(super) fn write_pages(
         }
     }
     out.reserve(units.iter().map(|u| u.1).sum());
-    let done: Vec<Mutex<Option<Unit>>> = units.iter().map(|_| Mutex::new(None)).collect();
+    let done: Mutex<Vec<Option<Unit>>> = Mutex::new(std::iter::repeat_with(|| None).take(units.len()).collect());
     let taken: Vec<AtomicBool> = units.iter().map(|_| AtomicBool::new(false)).collect();
     let (next, placed, failed) = (AtomicUsize::new(0), AtomicU64::new(0), AtomicBool::new(false));
     let pick = || -> Option<usize> {
@@ -280,7 +280,7 @@ pub(super) fn write_pages(
             if !iov.is_empty() {
                 out.write(&mut iov, &mut scratch, unit.at * PAGE_SIZE as u64)?;
             }
-            *done[k].lock().unwrap() = Some(unit);
+            done.lock().unwrap()[k] = Some(unit);
         }
     };
     let work = || work().inspect_err(|_| failed.store(true, Ordering::Relaxed));
@@ -310,7 +310,7 @@ pub(super) fn write_pages(
             _ => map.push([page, count, kind, at]),
         }
     };
-    let mut done = done.into_iter().map(|u| u.into_inner().unwrap().unwrap()).peekable();
+    let mut done = done.into_inner().unwrap().into_iter().map(Option::unwrap).peekable();
     for &(first, count, state) in runs {
         if state == REMOTE {
             while let Some(u) = done.next_if(|u| u.first < (first + count) as usize) {

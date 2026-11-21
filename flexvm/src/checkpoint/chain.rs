@@ -245,41 +245,62 @@ fn restore_pages(data: u64, runs: &Runs, working_set: &[(u64, u64)]) -> u64 {
     pages
 }
 
-pub(super) fn overlay(base: &[Run], top: &[Run]) -> Vec<Run> {
-    let mut out: Vec<Run> = Vec::with_capacity(base.len() + top.len());
-    for &(first, count, kind, ck, at) in base {
-        let end = first + count;
-        let mut pos = first;
-        let mut t = top.partition_point(|r| r.0 + r.1 <= first);
-        while pos < end {
-            let next = top.get(t).filter(|r| r.0 < end);
-            let gap_end = next.map_or(end, |r| r.0.max(pos));
-            if gap_end > pos {
-                let skip = pos - first;
-                out.push((pos, gap_end - pos, kind, ck, if kind == DATA { at + skip } else { 0 }));
+/// Single-pass sweep-line merge over `layers` ordered oldest-first (later layers take precedence).
+fn merge_layers(layers: &[&[Run]], mut emit: impl FnMut(Run)) {
+    let mut cursor = vec![0usize; layers.len()];
+    let mut pos = 0u64;
+    loop {
+        let mut next_start = u64::MAX;
+        for (runs, idx) in layers.iter().zip(&mut cursor) {
+            while *idx < runs.len() && (runs[*idx].1 == 0 || runs[*idx].0 + runs[*idx].1 <= pos) {
+                *idx += 1;
             }
-            pos = next.map_or(end, |r| (r.0 + r.1).max(pos));
-            t += 1;
+            if let Some(r) = runs.get(*idx) {
+                next_start = next_start.min(r.0);
+            }
         }
+        if next_start == u64::MAX {
+            break;
+        }
+        pos = pos.max(next_start);
+        let mut win = None;
+        let mut seg_end = u64::MAX;
+        for (runs, &idx) in layers.iter().zip(&cursor).rev() {
+            let Some(&r) = runs.get(idx) else { continue };
+            if r.0 <= pos {
+                win = Some(r);
+                seg_end = seg_end.min(r.0 + r.1);
+                break;
+            }
+            seg_end = seg_end.min(r.0);
+        }
+        let (first, _, kind, ck, at) = win.unwrap();
+        let skip = pos - first;
+        emit((pos, seg_end - pos, kind, ck, if kind == DATA { at + skip } else { 0 }));
+        pos = seg_end;
     }
-    out.extend_from_slice(top);
-    out.sort_unstable_by_key(|r| r.0);
+}
+
+#[cfg(test)]
+pub(super) fn overlay(base: &[Run], top: &[Run]) -> Vec<Run> {
+    let mut out = Vec::with_capacity(base.len() + top.len());
+    merge_layers(&[base, top], |r| out.push(r));
     out
 }
 
 pub(super) fn flatten(layers: &[Vec<Run>], files: Vec<File>, sums: Vec<Vec<u32>>) -> (Runs, PageFile) {
-    let mut runs: Vec<Run> = Vec::new();
-    for layer in layers {
-        runs = overlay(&runs, layer);
-    }
+    let slices: Vec<&[Run]> = layers.iter().map(Vec::as_slice).collect();
     let mut states: Runs = Vec::new();
     let mut data = Vec::new();
-    for (first, count, kind, ck, at) in runs.into_iter().filter(|r| r.2 != TEMPLATE) {
+    merge_layers(&slices, |(first, count, kind, ck, at)| {
+        if kind == TEMPLATE {
+            return;
+        }
         if kind == DATA {
             data.push((first, count, ck, at));
         }
         states.push((first, count, if kind == DATA { REMOTE } else { crate::uffd::ZERO }));
-    }
+    });
     let files = files
         .into_iter()
         .map(|f| {
@@ -377,5 +398,25 @@ mod admission_tests {
         assert_eq!(restore_pages(400, &runs, &[(100, 300), (100, 300)]), 400);
         // A 2 GiB DATA checkpoint already supplies its 1 GiB working set.
         assert_eq!(restore_pages(524288, &vec![(0, 524288, REMOTE)], &[(0, 262144), (0, 262144)]), 524288);
+    }
+
+    #[test]
+    fn merge_layers_matches_iterative_overlay_across_many_layers() {
+        use super::super::format::ZERO;
+        let l0: Vec<Run> = vec![(0, 20, DATA, 3, 100), (30, 10, ZERO, 3, 0)];
+        let l1: Vec<Run> = vec![(5, 10, DATA, 2, 200), (25, 8, DATA, 2, 210)];
+        let l2: Vec<Run> = vec![];
+        let l3: Vec<Run> = vec![(8, 3, TEMPLATE, 1, 0), (18, 10, ZERO, 1, 0)];
+        let l4: Vec<Run> = vec![(9, 5, DATA, 0, 50), (35, 2, TEMPLATE, 0, 0)];
+        let layers = [l0.as_slice(), l1.as_slice(), l2.as_slice(), l3.as_slice(), l4.as_slice()];
+
+        let mut merged = Vec::new();
+        merge_layers(&layers, |r| merged.push(r));
+
+        let mut iterative: Vec<Run> = Vec::new();
+        for layer in &layers {
+            iterative = overlay(&iterative, layer);
+        }
+        assert_eq!(merged, iterative);
     }
 }

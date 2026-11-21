@@ -16,6 +16,10 @@
 //! upgrade, restart or migrate them; until then the reserve may be overcommitted.
 
 use crate::host::{load, locks, store, Host, Ident, Liveness};
+use std::ffi::CString;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -59,6 +63,20 @@ fn poll() -> Duration {
     POLL
 }
 
+/// Fallback timeout when watching `RUN/.locks` with inotify.
+#[cfg(not(test))]
+const WATCH_FALLBACK: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const WATCH_FALLBACK: Duration = POLL;
+
+fn watch_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(p) = PINNED.with(|p| p.get().1) {
+        return p;
+    }
+    WATCH_FALLBACK
+}
+
 /// The last request: its number and when it started (boottime ms).
 fn request(run: &Path) -> PathBuf {
     locks(run).join(format!("release-{}", crate::host::boot_id()))
@@ -73,6 +91,64 @@ fn last(run: &Path) -> Option<(u64, u64)> {
     load(&request(run)).ok().flatten()
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    dev: u64,
+    ino: u64,
+    mtime: i64,
+    mtime_nsec: i64,
+    size: u64,
+}
+
+/// Reads the request number only when `path`'s metadata has changed since `seen`.
+fn read_request(path: &Path, seen: &mut Option<FileStamp>) -> Option<u64> {
+    let m = std::fs::metadata(path).ok()?;
+    let stamp = FileStamp { dev: m.dev(), ino: m.ino(), mtime: m.mtime(), mtime_nsec: m.mtime_nsec(), size: m.len() };
+    if *seen == Some(stamp) {
+        return None;
+    }
+    // Unreadable: as no new request (the next one replaces it); leave `seen` unchanged to retry.
+    let (n, _) = load::<(u64, u64)>(path).ok().flatten()?;
+    *seen = Some(stamp);
+    Some(n)
+}
+
+/// Watches `dir` for newly written or atomically replaced files; returns `None` if inotify is unavailable.
+fn watch_locks(dir: &Path) -> Option<OwnedFd> {
+    let cdir = CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let fd = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
+    if fd < 0 {
+        return None;
+    }
+    // Safety: `fd` is a valid, newly created inotify descriptor owned by us.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let mask = libc::IN_MOVED_TO | libc::IN_CLOSE_WRITE | libc::IN_CREATE;
+    if unsafe { libc::inotify_add_watch(fd.as_raw_fd(), cdir.as_ptr(), mask) } < 0 {
+        return None;
+    }
+    Some(fd)
+}
+
+/// Waits for an inotify event on `watcher` up to `timeout` and drains queued events.
+fn wait_event(watcher: &OwnedFd, timeout: Duration) {
+    let mut pfd = libc::pollfd { fd: watcher.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+    let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
+    if rc > 0 && (pfd.revents & libc::POLLIN) != 0 {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = unsafe { libc::read(watcher.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+            if n > 0 {
+                continue;
+            }
+            if n < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break;
+        }
+    }
+}
+
 /// Answers release requests for the life of this process, calling `release` for each (one at a time). It joins as it
 /// starts: requests made before have no kept memory of its to ask for, and none waits on it before it can answer.
 /// Returns at once if it cannot join.
@@ -82,17 +158,23 @@ pub fn serve(run: &Path, release: impl Fn()) {
         crate::log!("hostmem: {}: {e}: memory kept for checkpoints is not released on request", dir.display());
         return;
     }
+    // Watch before reading the initial request so no update between the read and the first poll is missed.
+    let watcher = watch_locks(&locks(run));
+    let req_path = request(run);
+    let mut seen = None;
     // Its PID namespace in the name too (`ns_key`): another's of the same pid and start time is not it.
     let mine = dir.join(Ident::me().ns_key());
-    let mut answered = last(run).map_or(0, |r| r.0);
+    let mut answered = read_request(&req_path, &mut seen).unwrap_or(0);
     loop {
         if let Err(e) = store(&mine, &answered, false) {
             crate::log!("hostmem: {e}: requests do not wait for this process");
         }
         loop {
-            std::thread::sleep(poll());
-            // Unreadable: as no new request (the next one replaces it).
-            if let Some((n, _)) = last(run).filter(|r| r.0 != answered) {
+            match &watcher {
+                Some(w) => wait_event(w, watch_timeout()),
+                None => std::thread::sleep(poll()),
+            }
+            if let Some(n) = read_request(&req_path, &mut seen).filter(|&n| n != answered) {
                 release();
                 answered = n;
                 break;
@@ -401,5 +483,32 @@ mod tests {
         assert_eq!(b, a + 1);
         member(&h.run, &Ident::me(), b);
         assert!(wait(&h.run, a, Instant::now()), "a later answer answers it without waiting");
+    }
+
+    #[test]
+    fn unchanged_request_file_is_skipped_and_inotify_wakes_promptly() {
+        let (_dir, h) = crate::host::tests::host("hostmem-inotify");
+        crate::host::private_dir(&locks(&h.run)).unwrap();
+        let watcher = watch_locks(&locks(&h.run)).expect("inotify available");
+        let path = request(&h.run);
+        let mut seen = None;
+        assert_eq!(read_request(&path, &mut seen), None);
+        assert!(seen.is_none());
+
+        store(&path, &(7u64, 100u64), false).unwrap();
+        let t = Instant::now();
+        wait_event(&watcher, Duration::from_secs(5));
+        assert!(t.elapsed() < Duration::from_secs(1), "woke promptly on IN_MOVED_TO");
+        assert_eq!(read_request(&path, &mut seen), Some(7));
+        assert!(seen.is_some());
+        // Unchanged metadata: skipped without re-parsing.
+        assert_eq!(read_request(&path, &mut seen), None);
+
+        // Atomic replacement changes inode/mtime: re-read.
+        store(&path, &(8u64, 200u64), false).unwrap();
+        let t = Instant::now();
+        wait_event(&watcher, Duration::from_secs(5));
+        assert!(t.elapsed() < Duration::from_secs(1), "woke promptly on replacement");
+        assert_eq!(read_request(&path, &mut seen), Some(8));
     }
 }
