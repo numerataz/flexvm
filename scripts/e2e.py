@@ -2792,7 +2792,7 @@ def distro_openrc():
         before_boot = execute("cat /proc/sys/kernel/random/boot_id")[1].strip()
         before_pid = host.ps()[vm]["pid"]
         execute("openrc-shutdown --reboot now", False)
-        check("OpenRC: guest reboot cold-boots a fresh VM", wait_for(lambda: host.ps().get(vm, {}).get("state") == "running" and host.ps()[vm]["pid"] != before_pid, 45), host.ps().get(vm))
+        check("OpenRC: guest reboot cold-boots a fresh VM", wait_for(lambda: (entry := host.ps().get(vm, {})).get("state") == "running" and entry.get("pid") not in (None, before_pid), 45), host.ps().get(vm))
         check("OpenRC: exec reconnects with a new boot id after reboot", wait_for(lambda: (r := execute("cat /proc/sys/kernel/random/boot_id", False))[0] == 0 and r[1].strip() not in ("", before_boot), 45))
         execute("rc-service flexvm-runtime status")
         host.cli("kill", "--signal", "TERM", vm)

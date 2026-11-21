@@ -495,6 +495,22 @@ pub fn open_dir_at(dir: RawFd, name: &CStr) -> io::Result<OwnedFd> {
     openat(dir, name, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW)
 }
 
+/// Creates a new file `name` in `dir` (0600, O_EXCL | O_NOFOLLOW).
+pub fn create_at(dir: RawFd, name: &CStr) -> io::Result<std::fs::File> {
+    openat(dir, name, libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW).map(std::fs::File::from)
+}
+
+/// Opens `name` in `dir` for reading without following symlinks or blocking on FIFOs.
+pub fn open_readonly_at(dir: RawFd, name: &CStr) -> io::Result<std::fs::File> {
+    openat(dir, name, libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW).map(std::fs::File::from)
+}
+
+/// Whether `fd` is owned by this effective UID with none of `forbidden` permission bits set.
+pub fn is_owned_fd(fd: RawFd, forbidden: libc::mode_t) -> io::Result<bool> {
+    let st = fstat(fd)?;
+    Ok(st.st_uid == unsafe { libc::geteuid() } && st.st_mode & forbidden == 0)
+}
+
 pub fn fstat(fd: RawFd) -> io::Result<libc::stat> {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     check(unsafe { libc::fstat(fd, &mut st) })?;
@@ -3517,6 +3533,23 @@ pub mod output {
             let _ = crate::host::flock(&l, libc::LOCK_UN);
         }
         written
+    }
+
+    /// Spawns a thread that drains `reader` into a capped log file at `log` until EOF or error.
+    pub fn spawn_log_drain(mut reader: impl Read + Send + 'static, log: PathBuf, cap: u64) -> std::io::Result<JoinHandle<()>> {
+        std::thread::Builder::new().spawn(move || {
+            let mut buf = [0u8; 64 << 10];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        append_capped(&log, &buf[..n], cap);
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+        })
     }
 
     /// `log`'s lock: `.locks/NAME` in its directory.

@@ -96,7 +96,7 @@ impl Staging {
         let ck = (|| -> Result<_> {
             // Checked before it is locked: the directory's owner may have put another in its
             // place, perhaps one locked to hold this up. Ours is new, so never locked.
-            ensure!(private_dir(outer.as_raw_fd()), "staging directory in {} was replaced", parent_path.display());
+            ensure!(crate::util::is_owned_fd(outer.as_raw_fd(), 0o077).unwrap_or(false), "staging directory in {} was replaced", parent_path.display());
             ensure!(
                 unsafe { libc::flock(outer.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0,
                 "staging directory in {} was replaced",
@@ -372,11 +372,6 @@ fn empty_dir(dir: RawFd) -> io::Result<()> {
     Ok(())
 }
 
-/// Whether `fd` is ours and nobody else may enter it, as staging is made.
-fn private_dir(fd: RawFd) -> bool {
-    fstat(fd).is_ok_and(|st| st.st_uid == unsafe { libc::geteuid() } && st.st_mode & 0o077 == 0)
-}
-
 /// Reclaims interrupted writes, leaving live staging and foreign directories alone.
 pub(crate) fn clear_stale(dir: &Path) {
     let Ok(name) = CString::new(dir.as_os_str().as_bytes()) else { return };
@@ -406,7 +401,8 @@ fn clear_stale_fd(parent: &OwnedFd) {
             continue;
         }
         let Ok(outer) = open_dir_at(parent.as_raw_fd(), &cname(&name)) else { continue };
-        if !private_dir(outer.as_raw_fd()) || unsafe { libc::flock(outer.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        if !crate::util::is_owned_fd(outer.as_raw_fd(), 0o077).unwrap_or(false) || unsafe { libc::flock(outer.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
+        {
             continue;
         }
         let ck = open_dir_at(outer.as_raw_fd(), c"ck").ok();

@@ -212,7 +212,7 @@ impl Processes {
     fn spawn_kind(&self, cmd: &mut Command, log: &Path, inherited: &[RawFd], kind: crate::socket::SoftwareKind) -> Result<()> {
         template::interrupted()?;
         File::create(log)?;
-        let (mut reader, writer) = std::io::pipe()?;
+        let (reader, writer) = std::io::pipe()?;
         cmd.stdin(Stdio::null()).stdout(writer.try_clone()?).stderr(writer);
         let runtime = self.runtime.lock().unwrap().as_ref().and_then(Weak::upgrade);
         let mut leases = self.leases.lock().unwrap().iter().map(File::try_clone).collect::<std::io::Result<Vec<_>>>()?;
@@ -256,20 +256,7 @@ impl Processes {
         if let Some(runtime) = runtime {
             runtime.record_software_child(children.len(), kind, process.ident.clone().ok_or("cannot identify software child")?)?;
         }
-        let log = log.to_path_buf();
-        process.logging = Some(std::thread::Builder::new().spawn(move || {
-            let mut buf = [0; 64 << 10];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        util::output::append_capped(&log, &buf[..n], util::output::LOG_CAP);
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
-                }
-            }
-        })?);
+        process.logging = Some(util::output::spawn_log_drain(reader, log.to_path_buf(), util::output::LOG_CAP)?);
         children.push(process);
         Ok(())
     }

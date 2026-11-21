@@ -240,8 +240,7 @@ impl At {
 
     fn create(&self) -> Result<File> {
         self.remove()?;
-        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW;
-        Ok(open_at(self.dir.as_raw_fd(), &self.name, flags)?.into())
+        crate::util::create_at(self.dir.as_raw_fd(), &self.name).map_err(|e| format!("open {:?}: {e}", self.name).into())
     }
 
     /// Sets an xattr on the entry itself. When an open descriptor is provided (for regular files),

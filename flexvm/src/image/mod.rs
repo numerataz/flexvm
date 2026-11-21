@@ -467,7 +467,7 @@ const LEGACY: &str = "legacy";
 fn users_dir(pinned: &crate::host::Directory, cached: &Path, create: bool, legacy: bool) -> Result<Option<crate::host::Directory>> {
     let fd = pinned.fd.as_raw_fd();
     let name = cpath(Path::new(cached.with_extension("users").file_name().unwrap()))?;
-    let open = |name: &std::ffi::CStr| crate::util::openat(fd, name, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    let open = |name: &std::ffi::CStr| crate::util::open_dir_at(fd, name);
     let dir = match open(&name) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && !create => return Ok(None),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -564,7 +564,7 @@ pub(crate) fn rootfs_user_key(templates: &Path) -> std::io::Result<String> {
 fn rootfs_dir(cache: &Path) -> Result<Option<(crate::host::Directory, PathBuf)>> {
     let Ok(root) = std::fs::canonicalize(cache) else { return Ok(None) };
     let root_fd = crate::util::openat(libc::AT_FDCWD, &cpath(&root)?, libc::O_RDONLY | libc::O_DIRECTORY)?;
-    match crate::util::openat(root_fd.as_raw_fd(), c"rootfs", libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW) {
+    match crate::util::open_dir_at(root_fd.as_raw_fd(), c"rootfs") {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound || matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => Ok(None),
         fd => Ok(Some((crate::host::Directory::from_fd(fd?), root.join("rootfs")))),
     }
@@ -839,7 +839,7 @@ fn private_dir(cache: &Path, rel: &Path) -> Result<Option<OwnedFd>> {
     for c in rel.components() {
         let std::path::Component::Normal(name) = c else { bail!("{}: not a path below the image cache", rel.display()) };
         let name = cpath(Path::new(name))?;
-        let open = |dir: &OwnedFd| crate::util::openat(dir.as_raw_fd(), &name, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW);
+        let open = |dir: &OwnedFd| crate::util::open_dir_at(dir.as_raw_fd(), &name);
         let mut res = open(&fd);
         if res.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
             // Made in the directory as reached; a concurrent pull may make it first.
@@ -876,9 +876,8 @@ fn private_blobs(blobs: &Path) -> Result<Option<OwnedFd>> {
 /// through `dir`, its directory as `private_dir` returned it, or left as it is for None.
 fn private_file(dir: Option<&OwnedFd>, path: &Path) -> Result<File> {
     use std::os::unix::fs::OpenOptionsExt;
-    let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK;
     let f = match dir {
-        Some(dir) => File::from(crate::util::openat(dir.as_raw_fd(), &cpath(Path::new(path.file_name().ok_or("no file name")?))?, flags)?),
+        Some(dir) => crate::util::open_readonly_at(dir.as_raw_fd(), &cpath(Path::new(path.file_name().ok_or("no file name")?))?)?,
         None => File::options().read(true).custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?,
     };
     if !f.metadata()?.is_file() {
@@ -933,7 +932,7 @@ fn staging_dir(path: &Path) -> Result<OwnedFd> {
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(path)?;
     let path = std::fs::canonicalize(path)?;
     check_ancestry(&path)?;
-    let fd = open_at(libc::AT_FDCWD, &cpath(&path)?, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW)?;
+    let fd = unpack::open_dir_at(libc::AT_FDCWD, &cpath(&path)?)?;
     if !stat_at(fd.as_raw_fd(), c"").is_some_and(|st| st.st_uid == 0 && st.st_mode & libc::S_IFMT == libc::S_IFDIR) {
         bail!("{} is not a root-owned directory", path.display());
     }
@@ -964,8 +963,7 @@ impl<'a> Work<'a> {
         wait_lock(&lock, libc::LOCK_SH, interrupted)?;
         let _l = Flock::new(lock, libc::LOCK_SH | libc::LOCK_NB)?;
         let name = format!("rootfs-{}", random_hex(8)?);
-        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW;
-        let lock: File = open_at(staging.as_raw_fd(), &cpath(Path::new(&format!("{name}.lock")))?, flags)?.into();
+        let lock = crate::util::create_at(staging.as_raw_fd(), &cpath(Path::new(&format!("{name}.lock")))?)?;
         flock(&lock, libc::LOCK_EX)?;
         Ok(Work { staging, name, lock })
     }

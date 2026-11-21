@@ -406,17 +406,16 @@ fn parent_directory(path: &Path) -> Result<File> {
     owned_directory(path, 0o022)
 }
 
-fn owned_directory(path: &Path, forbidden: u32) -> Result<File> {
-    let dir = OpenOptions::new().read(true).custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(path)?;
-    let stat = dir.metadata()?;
-    if stat.uid() != unsafe { libc::geteuid() } || stat.mode() & forbidden != 0 {
+fn owned_directory(path: &Path, forbidden: libc::mode_t) -> Result<File> {
+    let dir = File::from(util::open_dir_at(libc::AT_FDCWD, &util::cpath(path)?)?);
+    if !util::is_owned_fd(dir.as_raw_fd(), forbidden)? {
         bail!("software state directory is not private to its owner");
     }
     Ok(dir)
 }
 
 fn member(dir: &File, name: &str) -> Result<File> {
-    let file = File::from(util::openat(dir.as_raw_fd(), &util::cpath(Path::new(name))?, libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK)?);
+    let file = util::open_readonly_at(dir.as_raw_fd(), &util::cpath(Path::new(name))?)?;
     let stat = file.metadata()?;
     if !stat.is_file() || stat.uid() != unsafe { libc::geteuid() } || stat.mode() & 0o222 != 0 || stat.nlink() != 1 {
         bail!("software artifact is not an immutable private regular file");

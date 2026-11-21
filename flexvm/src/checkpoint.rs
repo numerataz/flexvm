@@ -7,7 +7,7 @@
 //! fsynced and renamed into place, never over anything: complete or absent, never changed.
 
 use crate::bail;
-use crate::util::{check, cname, fstat, open_dir_at, openat};
+use crate::util::{check, cname, fstat, open_dir_at};
 use std::{fs::File, io, os::fd::RawFd};
 
 macro_rules! ensure {
@@ -79,13 +79,13 @@ fn present(dir: &std::path::Path, read: crate::util::Result<Manifest>) -> Option
 }
 
 fn create_at(dir: RawFd, name: &str) -> io::Result<File> {
-    openat(dir, &cname(name), libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW).map(File::from)
+    crate::util::create_at(dir, &cname(name))
 }
 
 /// Opens file `name` in `dir` for reading. O_NONBLOCK: a FIFO planted in its
 /// place must not block (callers check for a regular file).
 fn open_at(dir: RawFd, name: &str) -> io::Result<File> {
-    openat(dir, &cname(name), libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW).map(File::from)
+    crate::util::open_readonly_at(dir, &cname(name))
 }
 
 #[cfg(test)]
