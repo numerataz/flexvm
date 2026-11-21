@@ -89,18 +89,23 @@ fn wait_or_stop(stop: &(Mutex<bool>, Condvar), dur: Duration) -> bool {
     true
 }
 
+/// Follower election probe interval: matches `REFILL_EVERY` with up to 1s of
+/// per-PID jitter so failover completes in ~5–6s without thundering herds.
+fn elect_interval(pid: u32) -> Duration {
+    REFILL_EVERY + Duration::from_millis(u64::from(pid) % 1000)
+}
+
 /// One host-elected maintenance loop: at most one process on the host holds
 /// `RUN/.locks/maint` and runs periodic standby refills (every `REFILL_EVERY`)
 /// and GC sweeps / boot-recovery retries (every `EVERY`) on a single thread.
 /// Non-leader processes sleep on a condvar and only probe the lock periodically
 /// to fail over cleanly if the leader exits.
 pub fn maintain(host: Host) -> Maintainer {
-    let jitter = Duration::from_millis(std::process::id() as u64 % 5000);
     maintain_with(
         host,
         REFILL_EVERY,
         EVERY,
-        EVERY + jitter,
+        elect_interval(std::process::id()),
         |h| {
             // A boot's recovery left incomplete (a saved route not checkable yet: a peer's name not
             // looked up) is tried again, not only by the next command.
@@ -143,7 +148,9 @@ fn maintain_with(
                 }
             };
             let now = Instant::now();
-            let mut next_refill = now + refill_every;
+            // Run an immediate standby refill on winning leadership so failover
+            // does not wait another `refill_every` interval before refilling.
+            let mut next_refill = now;
             let mut next_gc = now + gc_every;
             loop {
                 let now = Instant::now();
@@ -1140,5 +1147,53 @@ mod tests {
         drop(leader);
         assert!(start.elapsed() < Duration::from_secs(2), "shutdown did not wake condvar promptly: {:?}", start.elapsed());
         assert!(maint_lock(&host).unwrap().is_some(), "leader released maintenance lock on stop");
+    }
+
+    #[test]
+    fn promoted_follower_runs_refill_immediately_on_failover() {
+        let d = dir("maint-failover-refill");
+        let host = Host::open(&d.join("state"), &d.join("run")).unwrap();
+
+        // Follower probe cadence matches REFILL_EVERY (+ <1s jitter), not EVERY.
+        for pid in [0, 1, 999, 1000, 12345] {
+            let interval = elect_interval(pid);
+            assert!(interval >= REFILL_EVERY && interval < REFILL_EVERY + Duration::from_secs(1), "unexpected election interval for pid {pid}: {interval:?}");
+        }
+
+        let long = Duration::from_secs(3600);
+        let probe = Duration::from_millis(15);
+        let (leader_tx, leader_rx) = std::sync::mpsc::channel();
+        let mut leader = maintain_with(
+            host.clone(),
+            long,
+            long,
+            probe,
+            |_| {},
+            move |_| {
+                let _ = leader_tx.send(());
+            },
+        );
+        leader_rx.recv_timeout(Duration::from_secs(5)).expect("initial leader must refill immediately on election");
+        assert!(maint_lock(&host).unwrap().is_none(), "leader holds maintenance lock");
+
+        let (follower_tx, follower_rx) = std::sync::mpsc::channel();
+        let mut follower = maintain_with(
+            host.clone(),
+            long,
+            long,
+            probe,
+            |_| {},
+            move |_| {
+                let _ = follower_tx.send(());
+            },
+        );
+        assert!(follower_rx.recv_timeout(Duration::from_millis(50)).is_err(), "follower must not refill while leader holds lock");
+
+        // Stop the leader; the promoted follower must run refill immediately upon
+        // acquiring the lock instead of waiting another `refill_every` (3600s).
+        leader.stop();
+        follower_rx.recv_timeout(Duration::from_secs(2)).expect("promoted follower must refill immediately upon acquiring maintenance lock");
+        follower.stop();
+        assert!(maint_lock(&host).unwrap().is_some(), "maintenance lock released on stop");
     }
 }
