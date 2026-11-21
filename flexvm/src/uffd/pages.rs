@@ -177,7 +177,10 @@ impl Pages {
 
     /// Tells a waiting event thread that claimed pages settled.
     fn settled(&self) {
-        if let Some(fd) = self.wake.get().filter(|_| self.waiting.load(Ordering::SeqCst)) {
+        // Pair with the event thread's fence after storing `waiting = true`: ensures either this
+        // thread sees `waiting == true` or the event thread sees the settled page state.
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if let Some(fd) = self.wake.get().filter(|_| self.waiting.load(Ordering::Relaxed)) {
             unsafe { libc::write(fd.as_raw_fd(), (&1u64 as *const u64).cast(), 8) };
         }
     }
@@ -293,7 +296,7 @@ impl Pages {
     }
 
     pub fn get(&self, page: usize) -> u8 {
-        self.states[page].load(Ordering::SeqCst)
+        self.states[page].load(Ordering::Acquire)
     }
 
     /// Seeds pages `[first, first + n)` with `state` before the map is shared: plain stores (a memset), and each chunk's
@@ -373,7 +376,7 @@ impl Pages {
             if from == BASE && (n == 0 || (first + n) % CHUNK == 0) {
                 self.touch(first + n);
             }
-            if self.states[first + n].compare_exchange(from, INFLIGHT, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            if self.states[first + n].compare_exchange(from, INFLIGHT, Ordering::AcqRel, Ordering::Relaxed).is_err() {
                 break;
             }
             n += 1;
@@ -393,7 +396,7 @@ impl Pages {
             let h = first + off;
             let mut claimable = true;
             for (k, slot) in snap.iter_mut().enumerate() {
-                let s = self.states[h + k].load(Ordering::SeqCst);
+                let s = self.states[h + k].load(Ordering::Acquire);
                 if !matches!(s, BASE | ZERO | REMOTE) {
                     claimable = false;
                     break;
@@ -407,7 +410,7 @@ impl Pages {
             if snap[0] == BASE {
                 self.touch(h);
             }
-            if self.states[h].compare_exchange(snap[0], INFLIGHT, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            if self.states[h].compare_exchange(snap[0], INFLIGHT, Ordering::AcqRel, Ordering::Relaxed).is_err() {
                 break;
             }
             orig.push(snap[0]);
@@ -417,7 +420,7 @@ impl Pages {
                     self.touch(p);
                 }
                 let prev = self.states[p]
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| matches!(s, BASE | ZERO | REMOTE).then_some(INFLIGHT))
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| matches!(s, BASE | ZERO | REMOTE).then_some(INFLIGHT))
                     .expect("granule page already claimed or present");
                 if prev == BASE {
                     self.touch(p);
@@ -509,7 +512,7 @@ impl Pages {
             let word = end.min((first / 64 + 1) * 64);
             self.touch(first);
             for page in first..word {
-                let old = self.states[page].fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| Some(if claimed(s) { DISCARDED } else { ZERO }));
+                let old = self.states[page].fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| Some(if claimed(s) { DISCARDED } else { ZERO }));
                 resolved += (old == Ok(REMOTE)) as usize;
             }
             self.dirty[first / 64].fetch_or((u64::MAX >> (64 - (word - first))) << (first % 64), Ordering::SeqCst);
@@ -580,15 +583,11 @@ impl Pages {
                 pause(page);
             }
         }
-        let old = self.states[page]
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |s| {
-                Some(match (s, populated) {
-                    (_, true) => PRESENT,
-                    (DISCARDED, false) => ZERO,
-                    (_, false) => from,
-                })
-            })
-            .unwrap();
+        let old = if populated {
+            self.states[page].swap(PRESENT, Ordering::AcqRel)
+        } else {
+            self.states[page].fetch_update(Ordering::AcqRel, Ordering::Acquire, |s| Some(if s == DISCARDED { ZERO } else { from })).unwrap()
+        };
         debug_assert!(old == INFLIGHT || (old == DISCARDED && !populated), "settling page {page} in state {old}");
         if populated || old == DISCARDED {
             self.forget_failure(page);

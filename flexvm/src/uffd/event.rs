@@ -221,8 +221,11 @@ impl Pager {
                 }
             }
             // Before the faults look at page states: an installer that settles a page after that sees it set, and wakes
-            // this thread.
-            pages.waiting.store(!pending.is_empty(), Ordering::SeqCst);
+            // this thread. Pair with `Pages::settled`'s SeqCst fence so `get(Acquire)` and `settle(AcqRel)` cannot miss a wakeup.
+            pages.waiting.store(!pending.is_empty(), Ordering::Relaxed);
+            if !pending.is_empty() {
+                std::sync::atomic::fence(Ordering::SeqCst);
+            }
             // Faults that hit EAGAIN are retried once the events ahead of them are drained; other errors (say ENOMEM)
             // for a while: a dropped fault would block its vCPU forever.
             for _ in 0..pending.len() {
@@ -344,9 +347,9 @@ impl Pager {
         let chunk = (2 << 20) / PAGE_SIZE;
         let region_left = (m.span().1 - page).min(chunk - (page - m.span().0) % chunk);
         let prepared = if flags & UFFD_PAGEFAULT_FLAG_WP == 0 { self.prepare_fault_template(page, region_left) } else { 0 };
-        let _wp = self.wp.lock().unwrap();
+        let mut wp = self.wp.lock().unwrap();
         if flags & UFFD_PAGEFAULT_FLAG_WP != 0 {
-            return self.wp_fault(page, m, first);
+            return self.wp_fault(page, m, first, &mut wp);
         }
         let pages = self.pages();
         match pages.get(page) {

@@ -1901,6 +1901,30 @@ fn read_words<const N: usize>(r: &mut impl Read) -> Result<[u64; N]> {
     Ok(out)
 }
 
+/// Reads `n` `(start, end)` extent pairs in chunks of 4096 extents (64 KiB) to avoid per-extent `read` syscalls.
+fn read_extents(r: &mut impl Read, n: usize) -> Result<Extents> {
+    const CHUNK_EXTENTS: usize = 4096;
+    let mut extents = Vec::with_capacity(n.min(CHUNK_EXTENTS));
+    if n == 0 {
+        return Ok(extents);
+    }
+    let mut buf = vec![0u8; n.min(CHUNK_EXTENTS) * 16];
+    let mut left = n;
+    while left > 0 {
+        let take = left.min(CHUNK_EXTENTS);
+        let bytes = &mut buf[..take * 16];
+        r.read_exact(bytes)?;
+        extents.reserve(take);
+        for pair in bytes.chunks_exact(16) {
+            let s = u64::from_le_bytes(pair[0..8].try_into().unwrap());
+            let e = u64::from_le_bytes(pair[8..16].try_into().unwrap());
+            extents.push((s, e));
+        }
+        left -= take;
+    }
+    Ok(extents)
+}
+
 /// The host-wide lock taken while a receive (or `checkpoint load`) checks its filesystem's room and
 /// allocates a file's blocks, so the next one's check, in whichever process, sees them gone.
 pub(crate) const ROOM_LOCK: &str = "receive-room";
@@ -1919,7 +1943,7 @@ fn receive_file(
     if !lens.contains(&len) || n > MAX_EXTENTS {
         bail!("{len} bytes in {n} extents is past the limits");
     }
-    let extents: Vec<(u64, u64)> = (0..n).map(|_| read_words(r).map(|[s, e]| (s, e))).collect::<Result<_>>()?;
+    let extents = read_extents(r, n as usize)?;
     if !valid_extents(&extents, len) {
         bail!("bad extents");
     }
@@ -3077,6 +3101,48 @@ pub(crate) mod tests {
         let dense = dir.join("dense");
         std::fs::write(&dense, std::fs::read(&path).unwrap()).unwrap();
         assert_eq!((hash_file(&dense).unwrap().hash, digest(&dense).unwrap()), (c.hash, sha));
+    }
+
+    #[test]
+    fn receive_file_bulk_reads_extents_across_chunks() {
+        struct CountingReader<'a> {
+            bytes: &'a [u8],
+            reads: usize,
+        }
+        impl Read for CountingReader<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                self.bytes.read(buf)
+            }
+        }
+        let dir = crate::test_util::TempDir::new("bulk-extents");
+        // 5000 extents (> 4096 chunk size) with sparse holes between them.
+        let count = 5000u64;
+        let stride = 8192u64;
+        let len = count * stride;
+        let extents: Vec<(u64, u64)> = (0..count).map(|i| (i * stride, i * stride + 16)).collect();
+        let mut stream: Vec<u8> = [len, count].into_iter().chain(extents.iter().flat_map(|&(s, e)| [s, e])).flat_map(u64::to_le_bytes).collect();
+        for i in 0..count {
+            stream.extend([(i % 251 + 1) as u8; 16]);
+        }
+        let path = dir.join("sparse");
+        let mut r = CountingReader { bytes: &stream, reads: 0 };
+        let (c, sha) = receive_file(&mut r, &path, 0..=len, &mut MAX_DATA.clone(), None).unwrap();
+        assert_eq!(c.hash, hash_file(&path).unwrap().hash);
+        assert_eq!(sha, digest(&path).unwrap());
+        // 2 header words + 2 extent chunks (4096 + 904) + 5000 data reads = 5004, vs 15002 with per-word extent reads.
+        assert_eq!(r.reads, 2 + 2 + count as usize);
+
+        // Zero extents (all-hole sparse file).
+        let empty_stream: Vec<u8> = [4096u64, 0].into_iter().flat_map(u64::to_le_bytes).collect();
+        let empty_path = dir.join("empty");
+        let (ec, esha) = receive_file(&mut &empty_stream[..], &empty_path, 0..=4096, &mut MAX_DATA.clone(), None).unwrap();
+        assert_eq!(ec.hash, hash_file(&empty_path).unwrap().hash);
+        assert_eq!(esha, digest(&empty_path).unwrap());
+
+        // Truncated extent table fails cleanly.
+        let trunc_stream: Vec<u8> = [len, 5000, 0, 16].into_iter().flat_map(u64::to_le_bytes).collect();
+        assert!(receive_file(&mut &trunc_stream[..], &dir.join("trunc"), 0..=len, &mut MAX_DATA.clone(), None).is_err());
     }
 
     /// Sets `path`'s times `secs` back.

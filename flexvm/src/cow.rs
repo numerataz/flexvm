@@ -320,12 +320,24 @@ impl Cow {
 
     /// Memory for `n` pages' copies: slots for `rescue_many`, or back with `give_slots`. None if there are not that many
     /// free and the host has no room for more.
+    #[cfg(test)]
     pub fn take_slots(&self, n: usize) -> std::io::Result<Option<Vec<Slot>>> {
-        self.slots.take(n, self.unbounded())
+        let mut out = Vec::new();
+        Ok(self.take_slots_into(n, &mut out)?.then_some(out))
     }
 
-    pub fn give_slots(&self, slots: Vec<Slot>) {
-        self.slots.give(slots)
+    /// Like `take_slots`, reusing `out`'s allocation. Returns `false` if there is no room.
+    pub fn take_slots_into(&self, n: usize, out: &mut Vec<Slot>) -> std::io::Result<bool> {
+        self.slots.take_into(n, self.unbounded(), out)
+    }
+
+    #[cfg(test)]
+    pub fn give_slots(&self, mut slots: Vec<Slot>) {
+        self.give_slots_from(&mut slots)
+    }
+
+    pub fn give_slots_from(&self, slots: &mut Vec<Slot>) {
+        self.slots.give_from(slots)
     }
 
     /// Keeps the pause-time copies of pages claimed RESCUING in `first..end`, each in its slot (`take_slots`).
@@ -606,7 +618,7 @@ struct Done<'a>(&'a Slots, Vec<Slot>);
 
 impl Drop for Done<'_> {
     fn drop(&mut self) {
-        self.0.give(std::mem::take(&mut self.1));
+        self.0.give_from(&mut self.1);
     }
 }
 
@@ -756,9 +768,9 @@ impl Slots {
         self.mapped.load(Ordering::Relaxed) * SLOT_CHUNK
     }
 
-    /// `n` slots, ascending where they come from a new chunk. None if there are not that many free and the host has no
-    /// `room` to map more (but for `unbounded`): nothing is taken then.
-    fn take(&self, n: usize, unbounded: bool) -> std::io::Result<Option<Vec<Slot>>> {
+    /// `n` slots, ascending where they come from a new chunk, written into `out`. Returns `false` if there are not that
+    /// many free and the host has no `room` to map more (but for `unbounded`): nothing is taken then.
+    fn take_into(&self, n: usize, unbounded: bool, out: &mut Vec<Slot>) -> std::io::Result<bool> {
         let mut inner = self.inner.lock().unwrap();
         let short = short_mib(n, inner.free.len());
         // Each chunk populated as it is mapped, within the take.
@@ -777,22 +789,22 @@ impl Slots {
         match short > 0 && !unbounded {
             true => match self.room.take(short, || grow(&mut inner)) {
                 Some(r) => r?,
-                None => return Ok(None),
+                None => return Ok(false),
             },
             false => grow(&mut inner)?,
         }
         let at = inner.free.len() - n;
-        let mut out = inner.free.split_off(at);
-        out.reverse();
+        out.clear();
+        out.extend(inner.free.drain(at..).rev());
         let used = self.used.fetch_add(n, Ordering::Relaxed) + n;
         self.peak.fetch_max(used, Ordering::Relaxed);
-        Ok(Some(out))
+        Ok(true)
     }
 
-    fn give(&self, slots: Vec<Slot>) {
+    fn give_from(&self, slots: &mut Vec<Slot>) {
         if !slots.is_empty() {
             self.used.fetch_sub(slots.len(), Ordering::Relaxed);
-            self.inner.lock().unwrap().free.extend(slots);
+            self.inner.lock().unwrap().free.append(slots);
         }
     }
 

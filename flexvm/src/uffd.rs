@@ -266,8 +266,9 @@ pub struct Runtime {
     /// The copy-on-write state of a checkpoint whose pages are being written.
     cow: Mutex<Option<Arc<Cow>>>,
     /// Held while handling a fault and while a checkpoint freezes memory, so a fault read before the freeze cannot
-    /// unprotect a page after it.
-    wp: Mutex<()>,
+    /// unprotect a page after it. Also guards the previous interval's dirty snapshot, kept hot pages, and WP rescue
+    /// scratch buffers so WP faults take only this one lock.
+    wp: Mutex<wp::WpState>,
     /// Firecracker's /proc/PID/pagemap, to tell populated pages apart.
     pagemap: OnceLock<std::fs::File>,
     /// Memory for the next checkpoint's hot pages, and the hot pages of the last one, while it is the delta base (see
@@ -278,9 +279,6 @@ pub struct Runtime {
     /// Host memory that memory may still take (`Pager::host_memory`).
     mem_room: crate::cow::Room,
     hot_prev: Mutex<hot::Previous>,
-    /// The previous interval's snapshot, shared with Frozen for rollback, and sparse words for kept hot pages.
-    hot_dirty: Mutex<Arc<pages::DirtyBits>>,
-    hot_kept: Mutex<std::collections::BTreeMap<usize, u64>>,
     /// Test fault: the next freeze fails to re-protect pages.
     pub fail_protect: AtomicBool,
     /// Test fault: the next freeze fails to read its hot pages.
