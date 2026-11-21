@@ -248,6 +248,35 @@ rc-service flexvm-state-probe start''')
                 owner.wait(timeout=5)
 
 
+def dump_failure_diagnostics(output, report_path, stream=sys.stderr, tail_bytes=8192):
+    print(f'--- {report_path.name} ---', file=stream)
+    print(report_path.read_text(errors='replace'), end='', file=stream)
+    candidates = ['worker.log', 'owner.log', 'restore.log', 'restore-no-runtime.log', 'workload.log']
+    seen = set()
+    logs = []
+    for name in candidates:
+        path = output / name
+        if path.is_file():
+            seen.add(name)
+            logs.append(path)
+    for pattern in ('prepare-*.log', 'verify-*.log'):
+        for path in sorted(output.glob(pattern)):
+            if path.is_file() and path.name not in seen:
+                seen.add(path.name)
+                logs.append(path)
+    for path in logs:
+        try:
+            data = path.read_bytes()
+        except OSError:
+            continue
+        if not data:
+            continue
+        tail = data[-tail_bytes:].decode(errors='replace')
+        header = f'--- {path.name} (last {len(tail)} chars) ---' if len(data) > tail_bytes else f'--- {path.name} ---'
+        print(header, file=stream)
+        print(tail, end='' if tail.endswith('\n') else '\n', file=stream)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('bin', 'kernel', 'workload', 'output'):
@@ -342,6 +371,8 @@ def main():
     report['elapsed_s'] = round(time.monotonic() - started, 3)
     report_path.write_text(json.dumps(report, indent=2) + '\n')
     print(f"{report['status'].upper()}: {report_path}")
+    if report['status'] != 'passed':
+        dump_failure_diagnostics(args.output, report_path)
     return 128 + report['signal'] if report['status'] == 'interrupted' else (0 if report['status'] == 'passed' else 1)
 
 

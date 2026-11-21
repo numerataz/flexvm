@@ -40,7 +40,15 @@ check_live_container() {
             done
             echo "nested docker container counter did not advance" >&2
             exit 1'\'' sh "$cookie")
-        test "$(wget -qO- http://127.0.0.1:18080/marker)" = "$nonce"
+        marker_ok=false
+        for _ in 1 2 3 4 5; do
+            if [ "$(wget -qO- http://127.0.0.1:18080/marker 2>/dev/null || true)" = "$nonce" ]; then
+                marker_ok=true
+                break
+            fi
+            sleep .5
+        done
+        $marker_ok
         docker run --rm --network nested-net -v nested-data:/data -e "NONCE=$nonce" \
             flexvm-nested-base:local sh -ec '\''
                 test "$(wget -qO- http://nested-srv:8080/marker)" = "$NONCE"

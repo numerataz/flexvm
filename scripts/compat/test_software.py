@@ -556,6 +556,42 @@ class WorkloadSeeds(unittest.TestCase):
                     self.assertEqual(result.returncode, 2, result.stderr)
                     self.assertIn('--mem 0 or 512..8192', result.stderr)
 
+    def test_failure_prints_report_and_log_tails_to_stderr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            commands = root / 'bin'
+            commands.mkdir()
+            arch = platform.machine()
+            fake_qemu = commands / f'qemu-system-{arch}'
+            fake_qemu.write_text('#!/bin/sh\necho "QEMU emulator version 9.0.0"\n')
+            fake_qemu.chmod(0o755)
+            fake_cc = commands / 'cc'
+            fake_cc.write_text('#!/bin/sh\nif [ "$1" = "--version" ]; then echo "cc 1.0"; exit 0; fi\nexit 1\n')
+            fake_cc.chmod(0o755)
+            fake_bin = root / 'flexvm'
+            fake_kernel = root / 'kernel'
+            fake_workload = root / 'workload.sh'
+            for path in (fake_bin, fake_kernel, fake_workload):
+                path.write_bytes(b'fixture')
+            output = root / 'output'
+            output.mkdir()
+            (output / 'owner.log').write_text('owner diagnostic line\n')
+            (output / 'workload.log').write_text('X' * 10000 + '\nWORKLOAD_TAIL_MARKER\n')
+            env = dict(os.environ, PATH=f'{commands}:{os.environ["PATH"]}', TEST_ARCH=arch)
+            argv = [sys.executable, '-c', HELPER, str(ROOT / 'software-workload.py'),
+                    '--bin', str(fake_bin), '--kernel', str(fake_kernel),
+                    '--workload', str(fake_workload), '--output', str(output)]
+            result = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(f'FAILED: {output / "report.json"}', result.stdout)
+            report = json.loads((output / 'report.json').read_text())
+            self.assertEqual(report['status'], 'failed')
+            self.assertIn('"status": "failed"', result.stderr)
+            self.assertIn(report['error'], result.stderr)
+            self.assertIn('owner diagnostic line', result.stderr)
+            self.assertIn('WORKLOAD_TAIL_MARKER', result.stderr)
+            self.assertIn('(last ', result.stderr)
+
 
 if __name__ == '__main__':
     unittest.main()

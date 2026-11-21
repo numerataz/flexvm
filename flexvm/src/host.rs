@@ -400,7 +400,51 @@ fn host_total_mib() -> u64 {
 const VIRTIO_MEM_HEADROOM_MIB: u64 = 64;
 const VIRTIO_MEM_CHUNK_MIB: u64 = 256;
 const VIRTIO_MEM_MIN_PROBE_MIB: u64 = 16;
-const VIRTIO_MEM_COOLDOWN_MS: u64 = 30_000;
+const VIRTIO_MEM_COOLDOWN_MS: u64 = 15_000;
+const VIRTIO_MEM_STEP_WAIT: Duration = Duration::from_secs(12);
+const VIRTIO_MEM_MAX_WAIT: Duration = Duration::from_secs(30);
+const VIRTIO_MEM_SETTLE_STABLE: Duration = Duration::from_millis(300);
+const VIRTIO_MEM_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+fn should_write_virtio_mem_cooldown(any_grew: bool) -> bool {
+    !any_grew
+}
+
+fn wait_for_virtio_mem_step(
+    initial_total_mib: u64,
+    observed_total_mib: u64,
+    need_mib: u64,
+    step_limit: std::time::Instant,
+    mut read_meminfo: impl FnMut() -> Option<(u64, u64)>,
+    mut now: impl FnMut() -> std::time::Instant,
+    mut sleep: impl FnMut(Duration),
+) -> bool {
+    let mut last_total = observed_total_mib.max(initial_total_mib);
+    let mut grew = last_total > initial_total_mib;
+    let mut last_change = grew.then(&mut now);
+    while now() < step_limit {
+        let Some((avail_mib, now_total)) = read_meminfo() else {
+            break;
+        };
+        if now_total > last_total {
+            last_total = now_total;
+            grew = true;
+            last_change = Some(now());
+        }
+        if grew && avail_mib >= need_mib {
+            break;
+        }
+        if grew && last_change.is_some_and(|t| now().saturating_duration_since(t) >= VIRTIO_MEM_SETTLE_STABLE) {
+            break;
+        }
+        let remaining = step_limit.saturating_duration_since(now());
+        if remaining.is_zero() {
+            break;
+        }
+        sleep(VIRTIO_MEM_POLL_INTERVAL.min(remaining));
+    }
+    grew
+}
 
 fn parse_virtio_mem_cooldown(text: &str) -> Option<(u64, u64)> {
     let mut parts = text.split_whitespace();
@@ -486,7 +530,7 @@ fn request_virtio_mem_growth(run: &Path, need_mib: u64, deadline: Option<std::ti
         return;
     }
     let now = std::time::Instant::now();
-    let max_wait = now + std::time::Duration::from_secs(15);
+    let max_wait = now + VIRTIO_MEM_MAX_WAIT;
     let limit = deadline.map_or(max_wait, |d| d.min(max_wait));
     // Serialize concurrent callers across threads and processes so parallel starts do not
     // stack probes into OOM; a waiter that acquires the lock after growth immediately sees
@@ -499,6 +543,7 @@ fn request_virtio_mem_growth(run: &Path, need_mib: u64, deadline: Option<std::ti
             return;
         }
     }
+    let mut any_grew = false;
     for _ in 0..16 {
         if std::time::Instant::now() >= limit {
             break;
@@ -511,6 +556,7 @@ fn request_virtio_mem_growth(run: &Path, need_mib: u64, deadline: Option<std::ti
         let max_probe_mib = avail_mib.saturating_sub(VIRTIO_MEM_HEADROOM_MIB);
         let mut probed_mib = 0u64;
         let mut probes: Vec<MmapGuard> = Vec::new();
+        let mut observed_total = total_mib;
         let mut grew = false;
         loop {
             if std::time::Instant::now() >= limit {
@@ -518,6 +564,7 @@ fn request_virtio_mem_growth(run: &Path, need_mib: u64, deadline: Option<std::ti
             }
             let Some(now_total) = meminfo_mib("MemTotal") else { break };
             if now_total > total_mib {
+                observed_total = now_total;
                 grew = true;
                 break;
             }
@@ -533,24 +580,27 @@ fn request_virtio_mem_growth(run: &Path, need_mib: u64, deadline: Option<std::ti
             probes.push(guard);
             probed_mib = probed_mib.saturating_add(chunk_mib);
         }
-        if !grew && (!probes.is_empty() || avail_mib < VIRTIO_MEM_HEADROOM_MIB + VIRTIO_MEM_MIN_PROBE_MIB) {
-            let step_limit = limit.min(std::time::Instant::now() + std::time::Duration::from_secs(5));
-            while std::time::Instant::now() < step_limit {
-                if let Some(now_total) = meminfo_mib("MemTotal") {
-                    if now_total > total_mib {
-                        grew = true;
-                        break;
-                    }
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
+        if grew || !probes.is_empty() || avail_mib < VIRTIO_MEM_HEADROOM_MIB + VIRTIO_MEM_MIN_PROBE_MIB {
+            let step_limit = limit.min(std::time::Instant::now() + VIRTIO_MEM_STEP_WAIT);
+            grew = wait_for_virtio_mem_step(
+                total_mib,
+                observed_total,
+                need_mib,
+                step_limit,
+                || Some((meminfo_mib("MemAvailable")?, meminfo_mib("MemTotal")?)),
+                std::time::Instant::now,
+                std::thread::sleep,
+            );
         }
         drop(probes);
         if !grew {
-            let final_total_mib = meminfo_mib("MemTotal").unwrap_or(total_mib);
-            write_virtio_mem_cooldown(&mut guard.0, boottime_ms().saturating_add(VIRTIO_MEM_COOLDOWN_MS), final_total_mib);
+            if should_write_virtio_mem_cooldown(any_grew) {
+                let final_total_mib = meminfo_mib("MemTotal").unwrap_or(total_mib);
+                write_virtio_mem_cooldown(&mut guard.0, boottime_ms().saturating_add(VIRTIO_MEM_COOLDOWN_MS), final_total_mib);
+            }
             break;
         }
+        any_grew = true;
         let _ = guard.0.set_len(0);
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
@@ -12542,6 +12592,73 @@ pub(crate) mod tests {
         assert!(!virtio_mem_cooldown_active(state, 49_999, 3072));
         assert!(!virtio_mem_cooldown_active(state, 49_999, 1024));
         assert!(!virtio_mem_cooldown_active(None, 49_999, 2048));
+    }
+
+    #[test]
+    fn virtio_mem_step_wait_settles_and_exceeds_grow_settle_timeout() {
+        assert!(VIRTIO_MEM_STEP_WAIT > crate::software::GROW_SETTLE_TIMEOUT);
+        assert!(VIRTIO_MEM_MAX_WAIT >= VIRTIO_MEM_STEP_WAIT);
+        assert!(should_write_virtio_mem_cooldown(false));
+        assert!(!should_write_virtio_mem_cooldown(true));
+
+        // Gradual 2 MiB block onlining: must wait until MemTotal stabilizes for VIRTIO_MEM_SETTLE_STABLE
+        // rather than returning on the very first 2 MiB bump.
+        let t0 = std::time::Instant::now();
+        let clock = std::cell::Cell::new(t0);
+        let grew = wait_for_virtio_mem_step(
+            1024,
+            1026,
+            1200,
+            t0 + VIRTIO_MEM_STEP_WAIT,
+            || {
+                let elapsed = clock.get().saturating_duration_since(t0);
+                let total = if elapsed < Duration::from_millis(100) {
+                    1026
+                } else if elapsed < Duration::from_millis(200) {
+                    1088
+                } else {
+                    1280
+                };
+                Some((600, total))
+            },
+            || clock.get(),
+            |d| clock.set(clock.get() + d),
+        );
+        assert!(grew);
+        assert_eq!(clock.get().saturating_duration_since(t0), Duration::from_millis(200) + VIRTIO_MEM_SETTLE_STABLE);
+
+        // Early exit once MemAvailable already satisfies need_mib after growth.
+        let t0 = std::time::Instant::now();
+        let clock = std::cell::Cell::new(t0);
+        let grew = wait_for_virtio_mem_step(1024, 1024, 800, t0 + VIRTIO_MEM_STEP_WAIT, || Some((850, 1280)), || clock.get(), |d| clock.set(clock.get() + d));
+        assert!(grew);
+        assert_eq!(clock.get().saturating_duration_since(t0), Duration::ZERO);
+
+        // Slow 1-vCPU TCG growth arriving after 7s (past the former 5s cap) succeeds within VIRTIO_MEM_STEP_WAIT.
+        let t0 = std::time::Instant::now();
+        let clock = std::cell::Cell::new(t0);
+        let grew = wait_for_virtio_mem_step(
+            1024,
+            1024,
+            1200,
+            t0 + VIRTIO_MEM_STEP_WAIT,
+            || {
+                let elapsed = clock.get().saturating_duration_since(t0);
+                let total = if elapsed < Duration::from_secs(7) { 1024 } else { 1280 };
+                Some((600, total))
+            },
+            || clock.get(),
+            |d| clock.set(clock.get() + d),
+        );
+        assert!(grew);
+        assert_eq!(clock.get().saturating_duration_since(t0), Duration::from_secs(7) + VIRTIO_MEM_SETTLE_STABLE);
+
+        // No growth before step_limit returns false.
+        let t0 = std::time::Instant::now();
+        let clock = std::cell::Cell::new(t0);
+        let grew = wait_for_virtio_mem_step(1024, 1024, 1200, t0 + VIRTIO_MEM_STEP_WAIT, || Some((500, 1024)), || clock.get(), |d| clock.set(clock.get() + d));
+        assert!(!grew);
+        assert_eq!(clock.get().saturating_duration_since(t0), VIRTIO_MEM_STEP_WAIT);
     }
 
     #[test]

@@ -81,8 +81,13 @@ impl Drop for Reservation {
     }
 }
 
-const SHRINK_COOLDOWN: Duration = Duration::from_secs(5);
-const GROW_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const SHRINK_COOLDOWN: Duration = Duration::from_secs(15);
+pub(crate) const GROW_SETTLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn shrink_cooldown_active(last_grow: Option<Instant>, last_shrink_attempt: Option<Instant>, now: Instant) -> bool {
+    last_grow.is_some_and(|t| now.saturating_duration_since(t) < SHRINK_COOLDOWN)
+        || last_shrink_attempt.is_some_and(|t| now.saturating_duration_since(t) < SHRINK_COOLDOWN)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reconcile {
@@ -356,9 +361,7 @@ impl Owner {
             crate::info!("software VM {}: grew memory +{add} MiB (plugged {next} MiB, ceiling {} MiB)", self.name.name, self.max_memory_mib);
             return true;
         }
-        if self.last_grow.lock().unwrap().is_some_and(|t| t.elapsed() < SHRINK_COOLDOWN)
-            || self.last_shrink_attempt.lock().unwrap().is_some_and(|t| t.elapsed() < SHRINK_COOLDOWN)
-        {
+        if shrink_cooldown_active(*self.last_grow.lock().unwrap(), *self.last_shrink_attempt.lock().unwrap(), Instant::now()) {
             return true;
         }
         if let Some(sub) = elastic_shrink_step(avail_mib, total_mib, plugged) {
@@ -1418,5 +1421,19 @@ mod tests {
         assert!(ended.load(Ordering::SeqCst));
         assert!(!handle.join().unwrap());
         assert!(start.elapsed() < Duration::from_millis(500), "request_kill must wake waiters immediately");
+    }
+
+    #[test]
+    fn shrink_cooldown_holds_off_aggressive_shrinking() {
+        assert!(SHRINK_COOLDOWN >= Duration::from_secs(15));
+        assert!(SHRINK_COOLDOWN > GROW_SETTLE_TIMEOUT);
+
+        let t0 = Instant::now();
+        assert!(!shrink_cooldown_active(None, None, t0));
+        assert!(shrink_cooldown_active(Some(t0), None, t0 + Duration::from_secs(5)));
+        assert!(shrink_cooldown_active(Some(t0), None, t0 + Duration::from_secs(14)));
+        assert!(!shrink_cooldown_active(Some(t0), None, t0 + SHRINK_COOLDOWN));
+        assert!(shrink_cooldown_active(None, Some(t0), t0 + Duration::from_secs(10)));
+        assert!(!shrink_cooldown_active(None, Some(t0), t0 + SHRINK_COOLDOWN));
     }
 }
