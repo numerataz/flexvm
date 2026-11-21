@@ -253,16 +253,205 @@ class SoftwareCheck(unittest.TestCase):
             proc.communicate()
 
     def test_c_checks_compile_with_strict_warnings(self):
-        sources = ['software-init.c', 'nested-init.c']
+        builds = [
+            ('software-init.c', []),
+            ('nested-init.c', []),
+            ('parent-kvm/init.c', []),
+            ('parent-kvm/init.c', ['-DFLEXVM_PARENT_KVM_APP']),
+        ]
         if platform.machine() == 'x86_64':
-            sources.extend(('kvm-abi.c', 'kvm-tsc.c', 'kvm-clock.c'))
+            builds.extend((
+                ('kvm-abi.c', []),
+                ('kvm-tsc.c', []),
+                ('kvm-clock.c', []),
+                ('parent-kvm/native-worker.c', []),
+            ))
         elif platform.machine() == 'aarch64':
-            sources.append('kvm-arm.c')
-        for source in sources:
-            with self.subTest(source=source):
+            builds.append(('kvm-arm.c', []))
+        for index, (source, flags) in enumerate(builds):
+            with self.subTest(source=source, flags=flags):
                 subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror', '-static', '-pthread',
-                                str(ROOT / source), '-o', str(self.root / source.removesuffix('.c'))],
+                                *flags, str(ROOT / source), '-o', str(self.root / f'check-{index}')],
                                check=True, capture_output=True, timeout=60)
+
+
+class ParentKvmRegressions(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='flexvm parent-kvm test ')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    @unittest.skipUnless(platform.machine() == 'x86_64', 'native-worker.c is x86_64 only')
+    def test_native_worker_monotonic_cancel_and_eintr_retry(self):
+        harness = self.root / 'test_native_worker.c'
+        binary = self.root / 'test_native_worker'
+        harness.write_text('''#define _GNU_SOURCE
+#include <assert.h>
+#include <errno.h>
+#include <linux/kvm.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdint.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+static int fake_ioctl(int fd, unsigned long request, ...);
+#define ioctl fake_ioctl
+#define main native_worker_main
+#include "native-worker.c"
+#undef main
+#undef ioctl
+
+static struct kvm_run *fake_run;
+static int kvm_run_calls;
+static int scenario;
+
+static void deliver_queue_signal(int value)
+{
+    siginfo_t info;
+    memset(&info, 0, sizeof(info));
+    info.si_code = SI_QUEUE;
+    info.si_value.sival_int = value;
+    interrupt_run(SIGRTMIN, &info, NULL);
+}
+
+static int fake_ioctl(int fd, unsigned long request, ...)
+{
+    (void)fd;
+    if (request != KVM_RUN)
+        return 0;
+    kvm_run_calls++;
+    if (scenario == 1) {
+        if (kvm_run_calls == 1) {
+            deliver_queue_signal(6);
+            errno = EINTR;
+            return -1;
+        }
+        assert(cancelled_run == 6);
+        assert(fake_run->immediate_exit == 0);
+        fake_run->exit_reason = KVM_EXIT_MMIO;
+        fake_run->mmio.phys_addr = 0x1000;
+        fake_run->mmio.len = 4;
+        fake_run->mmio.is_write = 1;
+        memset(fake_run->mmio.data, 0x5a, 4);
+        return 0;
+    }
+    if (scenario == 2) {
+        deliver_queue_signal(8);
+        deliver_queue_signal(6);
+        errno = EINTR;
+        return -1;
+    }
+    errno = EINVAL;
+    return -1;
+}
+
+int main(void)
+{
+    /* Monotonic cancelled_run must ignore stale older sequence numbers. */
+    deliver_queue_signal(5);
+    assert(cancelled_run == 5);
+    deliver_queue_signal(3);
+    assert(cancelled_run == 5);
+
+    int pair[2];
+    assert(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair) == 0);
+
+    struct kvm_run run;
+    memset(&run, 0, sizeof(run));
+    fake_run = &run;
+    struct native_lane lane = {
+        .control = pair[0],
+        .cpu = 42,
+        .id = 0,
+        .mapping_bytes = (int)sizeof(run),
+        .run = &run,
+    };
+
+    /* Scenario 1: stale EINTR from sequence 6 during sequence 7 retries KVM_RUN. */
+    scenario = 1;
+    kvm_run_calls = 0;
+    unsigned char req[6] = {'R', 0, 0, 0, 0, 0};
+    uint32_t seq = 7;
+    memcpy(req + 2, &seq, sizeof(seq));
+    serve_cpu_request(&lane, pair[0], req, sizeof(req));
+    assert(kvm_run_calls == 2);
+    unsigned char reply[32];
+    ssize_t n = recv(pair[1], reply, sizeof(reply), 0);
+    assert(n == 18 && reply[0] == 'M' && reply[1] == 4);
+
+    /* Scenario 2: cancel for sequence 8 followed by stale sequence 6 reports interrupted. */
+    scenario = 2;
+    kvm_run_calls = 0;
+    seq = 8;
+    memcpy(req + 2, &seq, sizeof(seq));
+    serve_cpu_request(&lane, pair[0], req, sizeof(req));
+    assert(kvm_run_calls == 1);
+    assert(cancelled_run == 8);
+    n = recv(pair[1], reply, sizeof(reply), 0);
+    assert(n == 2 && reply[0] == 'I' && reply[1] == 0);
+
+    close(pair[0]);
+    close(pair[1]);
+    return 0;
+}
+''')
+        subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
+                        '-I', str(ROOT / 'parent-kvm'), str(harness), '-o', str(binary)],
+                       check=True, capture_output=True, text=True, timeout=60)
+        result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_init_wait_child_reports_exit_status_without_stale_errno(self):
+        harness = self.root / 'test_init_wait.c'
+        binary = self.root / 'test_init_wait'
+        harness.write_text('''#define _GNU_SOURCE
+#include <errno.h>
+#include <signal.h>
+#include <string.h>
+#include <unistd.h>
+
+#define main init_main
+#include "init.c"
+#undef main
+
+int main(int argc, char **argv)
+{
+    pid_t child = fork();
+    if (child == 0) {
+        if (argc > 1 && !strcmp(argv[1], "signal"))
+            raise(SIGKILL);
+        _exit(7);
+    }
+    errno = ENOENT;
+    wait_child(child, argc > 1 && !strcmp(argv[1], "signal")
+               ? "Firecracker exit" : "Firecracker network echo exit");
+    return 0;
+}
+''')
+        subprocess.run(['cc', '-std=c11', '-O2', '-Wall', '-Wextra', '-Werror',
+                        '-DFLEXVM_PARENT_KVM_APP', '-I', str(ROOT / 'parent-kvm'),
+                        str(harness), '-o', str(binary)],
+                       check=True, capture_output=True, text=True, timeout=60)
+
+        exited = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
+        self.assertEqual(exited.returncode, 1)
+        self.assertIn('FAIL parent KVM setup: Firecracker network echo exit: exited with status 7', exited.stderr)
+        self.assertNotIn('No such file or directory', exited.stderr)
+
+        signaled = subprocess.run([str(binary), 'signal'], capture_output=True, text=True, timeout=10)
+        self.assertEqual(signaled.returncode, 1)
+        self.assertIn('FAIL parent KVM setup: Firecracker exit: terminated by signal 9', signaled.stderr)
+        self.assertNotIn('No such file or directory', signaled.stderr)
+
+    def test_firecracker_inner_boot_args_and_echo_timeout(self):
+        init_source = (ROOT / 'parent-kvm/init.c').read_text()
+        self.assertIn('test_datagram_socket(60)', init_source)
+        self.assertNotIn('test_datagram_socket(20)', init_source)
+        runner_source = (ROOT / 'parent-kvm-run.py').read_text()
+        self.assertIn('"boot_args": "console=ttyS0 panic=1 rdinit=/init reboot=k"', runner_source)
 
 
 class LifecycleFailureState(unittest.TestCase):
