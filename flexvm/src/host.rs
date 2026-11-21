@@ -5936,9 +5936,8 @@ pub fn lock_dir(path: &Path) -> std::io::Result<OwnedFd> {
         _ => {}
     }
     let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
-    let fd = crate::util::openat(libc::AT_FDCWD, &c, libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW)?;
-    let st = crate::util::stat_at(fd.as_raw_fd(), c"").ok_or_else(std::io::Error::last_os_error)?;
-    if st.st_mode & libc::S_IFMT != libc::S_IFDIR || st.st_uid != unsafe { libc::geteuid() } || st.st_mode & 0o077 != 0 {
+    let fd = crate::util::open_dir_at(libc::AT_FDCWD, &c)?;
+    if !crate::util::is_owned_fd(fd.as_raw_fd(), 0o077)? {
         return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("{}: not a directory only this user may enter", path.display())));
     }
     Ok(fd)

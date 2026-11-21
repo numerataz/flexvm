@@ -345,24 +345,12 @@ pub(crate) fn kernel_shutdown(log: &str) -> Option<GuestShutdown> {
 fn spawn_logged(mut cmd: Command, dir: &Path) -> std::io::Result<(Child, std::thread::JoinHandle<()>)> {
     let log = dir.join("firecracker.log");
     crate::host::write_record(&log, b"")?;
-    let (mut reader, writer) = std::io::pipe()?;
+    let (reader, writer) = std::io::pipe()?;
     cmd.stdout(writer.try_clone()?).stderr(writer);
     let child = crate::util::unblock_signals_in(&mut cmd).spawn()?;
     // Command retains the write ends too: close them so exit delivers EOF to the reader.
     drop(cmd);
-    let logging = std::thread::spawn(move || {
-        let mut buf = [0; 64 << 10];
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    crate::util::output::append_capped(&log, &buf[..n], crate::util::output::LOG_CAP);
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
-    });
+    let logging = crate::util::output::spawn_log_drain(reader, log, crate::util::output::LOG_CAP)?;
     Ok((child, logging))
 }
 
@@ -479,13 +467,13 @@ const API_LINE: u64 = 8192;
 const API_HEADERS: usize = 64;
 const API_BODY: usize = 1 << 20;
 
-fn response_line(r: &mut impl BufRead) -> Result<String> {
-    let mut line = String::new();
-    r.take(API_LINE + 1).read_line(&mut line)?;
+fn response_line(r: &mut impl BufRead, line: &mut String) -> Result<()> {
+    line.clear();
+    r.take(API_LINE + 1).read_line(line)?;
     if line.len() as u64 > API_LINE {
         bail!("response line too long");
     }
-    Ok(line)
+    Ok(())
 }
 
 fn exchange(r: &mut BufReader<crate::util::By<UnixStream>>, mut req: &[u8], sent: &mut bool) -> Result<(u16, Vec<u8>, bool)> {
@@ -501,30 +489,31 @@ fn exchange(r: &mut BufReader<crate::util::By<UnixStream>>, mut req: &[u8], sent
             Err(e) => return Err(e.into()),
         }
     }
-    let status = response_line(r)?;
-    if status.is_empty() {
+    let mut line = String::new();
+    response_line(r, &mut line)?;
+    if line.is_empty() {
         bail!("closed the connection without answering");
     }
-    let code: u16 = status.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
-    if code == 0 || !status.ends_with("\r\n") {
+    let code: u16 = line.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+    if code == 0 || !line.ends_with("\r\n") {
         bail!("invalid response status");
     }
     let mut len = None;
     let mut close = false;
     let mut headers = 0;
     loop {
-        let h = response_line(r)?;
-        if !h.ends_with("\r\n") {
+        response_line(r, &mut line)?;
+        if !line.ends_with("\r\n") {
             bail!("incomplete response headers");
         }
-        if h == "\r\n" {
+        if line == "\r\n" {
             break;
         }
         headers += 1;
         if headers > API_HEADERS {
             bail!("too many response headers");
         }
-        let Some((k, v)) = h.trim_end().split_once(':') else {
+        let Some((k, v)) = line.trim_end().split_once(':') else {
             bail!("invalid response header");
         };
         if k.eq_ignore_ascii_case("content-length") {
@@ -1326,7 +1315,9 @@ mod tests {
             assert!(!not_sent(&call(&api, &server.path).unwrap_err()));
             assert!(api.connection.borrow().is_none());
         }
-        assert_eq!(response_line(&mut &b"ok\r\n"[..]).unwrap(), "ok\r\n");
+        let mut line = String::new();
+        response_line(&mut &b"ok\r\n"[..], &mut line).unwrap();
+        assert_eq!(line, "ok\r\n");
     }
 
     #[test]
