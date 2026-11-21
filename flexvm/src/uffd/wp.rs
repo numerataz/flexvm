@@ -35,6 +35,8 @@ const WP_BLOCK: usize = 16;
 /// dirty in the interval before (so one written all over faults twice; one written less since shrinks back). Each
 /// fault costs the guest far more than unprotecting more pages: every unprotect makes KVM drop its mappings of the
 /// range and flush the vCPUs' TLBs, about 30-40 µs a call here, against well under 0.1 µs a page.
+/// Kept decoupled from the host THP size (`util::huge_page_size()`, which is 512 MiB on 64 KiB-page kernels) while
+/// staying aligned to `host_page_size()`.
 const WP_CHUNK: usize = 512;
 const WP_SIZES: [usize; 4] = [WP_BLOCK, 4 * WP_BLOCK, 16 * WP_BLOCK, WP_CHUNK];
 /// Pagemap bits: the page is present, swapped out, write-protected by userfaultfd.
@@ -184,6 +186,7 @@ impl Pager {
             }
             false => WP_BLOCK,
         };
+        let size = size.next_multiple_of(crate::util::pages_per_host_page());
         block_at(page, (from, to), size)
     }
 
@@ -335,7 +338,7 @@ impl Pager {
         self.hot_kept.lock().unwrap().clear();
         // In chunks: while the kernel changes a range, KVM retries guest faults anywhere in it, so one call over a
         // whole region would stall the vCPUs for as long as it takes.
-        self.protect(self.chunks(ALL, ARM_CHUNK), None)?;
+        self.protect(self.chunks(ALL, ARM_CHUNK.next_multiple_of(crate::util::pages_per_host_page())), None)?;
         Ok(start.elapsed())
     }
 
