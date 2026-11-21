@@ -193,16 +193,26 @@ impl Drop for Forwarder {
 
 /// Waits on `fds` and the stop eventfd (last); false once stopped.
 fn wait(fds: &mut Vec<libc::pollfd>, stop: BorrowedFd, until: Option<Instant>) -> bool {
+    wait_with(fds, stop, until, |fds, ms| unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, ms) })
+}
+
+fn wait_with(
+    fds: &mut Vec<libc::pollfd>,
+    stop: BorrowedFd,
+    until: Option<Instant>,
+    poll_fn: impl FnOnce(&mut [libc::pollfd], libc::c_int) -> libc::c_int,
+) -> bool {
     fds.push(libc::pollfd { fd: stop.as_raw_fd(), events: libc::POLLIN, revents: 0 });
     let ms = until.map_or(TICK, |u| (u.saturating_duration_since(Instant::now()).as_millis() as libc::c_int + 1).min(TICK));
-    let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, ms) };
-    let stopped = fds.pop().is_none_or(|s| rc > 0 && s.revents != 0);
-    if rc <= 0 {
+    let ready = poll_fn(fds, ms);
+    let stop_revents = fds.pop().map_or(0, |s| s.revents);
+    if ready <= 0 {
         for fd in fds.iter_mut() {
             fd.revents = 0;
         }
+        return true;
     }
-    !stopped
+    stop_revents == 0
 }
 
 fn poll(fd: &impl AsRawFd, events: i16) -> libc::pollfd {
@@ -883,6 +893,33 @@ mod tests {
         assert_eq!(udp_idle(&clients, now, IDLE / 2), Some(2));
         clients.remove(&2);
         assert_eq!(udp_idle(&clients, now, IDLE / 2), None);
+    }
+
+    #[test]
+    fn wait_clears_stale_revents_when_poll_returns_non_positive() {
+        let stop = unsafe { OwnedFd::from_raw_fd(libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK)) };
+        let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+
+        // EINTR (-1): kernel leaves revents untouched; wait must clear them and keep running.
+        let mut fds = vec![libc::pollfd { fd: sock.as_raw_fd(), events: libc::POLLIN, revents: libc::POLLIN }];
+        assert!(wait_with(&mut fds, stop.as_fd(), None, |_, _| -1));
+        assert_eq!(fds.len(), 1);
+        assert_eq!(fds[0].revents, 0);
+
+        // Timeout (0) with stale revents: wait must clear them and keep running.
+        fds[0].revents = libc::POLLIN | libc::POLLERR;
+        assert!(wait_with(&mut fds, stop.as_fd(), None, |_, _| 0));
+        assert_eq!(fds[0].revents, 0);
+
+        // Real libc::poll timeout clears stale revents and keeps running.
+        fds[0].revents = libc::POLLIN;
+        assert!(wait(&mut fds, stop.as_fd(), Some(Instant::now())));
+        assert_eq!(fds[0].revents, 0);
+
+        // Signaled stop returns false.
+        let one = 1u64;
+        assert_eq!(unsafe { libc::write(stop.as_raw_fd(), (&one as *const u64).cast(), 8) }, 8);
+        assert!(!wait(&mut fds, stop.as_fd(), Some(Instant::now())));
     }
 
     #[test]
