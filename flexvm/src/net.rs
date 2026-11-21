@@ -36,19 +36,29 @@ fn send_to<A>(fd: &OwnedFd, buf: &[u8], addr: &A) -> isize {
     unsafe { libc::sendto(fd.as_raw_fd(), buf.as_ptr().cast(), buf.len(), 0, (addr as *const A).cast(), len) }
 }
 
+thread_local!(static IOCTL_FD: std::cell::Cell<Option<OwnedFd>> = const { std::cell::Cell::new(None) });
+
+fn with_ioctl_fd<R>(f: impl FnOnce(&OwnedFd) -> Result<R>) -> Result<R> {
+    let fd = IOCTL_FD.take().map_or_else(|| socket(libc::AF_INET, libc::SOCK_DGRAM, 0, "socket"), Ok)?;
+    let res = f(&fd);
+    IOCTL_FD.set(Some(fd));
+    res
+}
+
 /// Down, a tap takes no packets, so Firecracker writes none into guest memory.
 pub fn set_link_up(name: &str, up: bool) -> Result<()> {
-    let fd = socket(libc::AF_INET, libc::SOCK_DGRAM, 0, "socket")?;
     let mut req = ifreq(name)?;
-    let done = unsafe {
-        libc::ioctl(fd.as_raw_fd(), libc::SIOCGIFFLAGS as _, &mut req) >= 0 && {
-            let flags = &mut req.ifr_ifru.ifru_flags;
-            *flags = if up { *flags | libc::IFF_UP as libc::c_short } else { *flags & !(libc::IFF_UP as libc::c_short) };
-            libc::ioctl(fd.as_raw_fd(), libc::SIOCSIFFLAGS as _, &req) >= 0
-        }
-    };
-    crate::syscall_check!(!done, "set {name} {}", if up { "up" } else { "down" });
-    Ok(())
+    with_ioctl_fd(|fd| {
+        let done = unsafe {
+            libc::ioctl(fd.as_raw_fd(), libc::SIOCGIFFLAGS as _, &mut req) >= 0 && {
+                let flags = &mut req.ifr_ifru.ifru_flags;
+                *flags = if up { *flags | libc::IFF_UP as libc::c_short } else { *flags & !(libc::IFF_UP as libc::c_short) };
+                libc::ioctl(fd.as_raw_fd(), libc::SIOCSIFFLAGS as _, &req) >= 0
+            }
+        };
+        crate::syscall_check!(!done, "set {name} {}", if up { "up" } else { "down" });
+        Ok(())
+    })
 }
 
 /// Whether frames wait on a tap for its guest, through a copy of Firecracker's descriptor of
@@ -165,7 +175,7 @@ pub fn create_tap_with(owner: &str, claim: impl FnOnce(&OwnedFd) -> Result<Strin
 }
 
 pub fn create_indexed_tap(owner: &str, claim: impl FnOnce(&OwnedFd) -> Result<String>) -> Result<(String, u32)> {
-    make_tap(owner, udev_monitor(), claim)
+    make_tap(owner, shared_udev_watcher().map(std::sync::Arc::as_ref), claim)
 }
 
 /// Never a leaked tap of a dead process with this name, nor its routes.
@@ -222,8 +232,8 @@ fn free_name(name: &str, mut claim: impl FnMut(&str) -> std::io::Result<()>) -> 
     }
 }
 
-/// `create_tap_with`, with `udev` (if any) handed to the tap's watcher (`keep_mac_from_udev`).
-fn make_tap(owner: &str, udev: Option<OwnedFd>, claim: impl FnOnce(&OwnedFd) -> Result<String>) -> Result<(String, u32)> {
+/// `create_tap_with`, with `watcher` (if any) watching the tap for udev replacing its MAC.
+fn make_tap(owner: &str, watcher: Option<&UdevWatcher>, claim: impl FnOnce(&OwnedFd) -> Result<String>) -> Result<(String, u32)> {
     if owner.len() >= 256 {
         bail!("tap: owner {owner:?} is over 255 bytes (a shorter run directory)");
     }
@@ -239,6 +249,9 @@ fn make_tap(owner: &str, udev: Option<OwnedFd>, claim: impl FnOnce(&OwnedFd) -> 
     netlink(RTM_SETLINK, 0, &alias).map_err(|e| format!("tap {name}: its owner: {e}"))?;
     crate::syscall_check!(unsafe { libc::ioctl(fd.as_raw_fd(), libc::TUNSETPERSIST, 1) } < 0, "create tap {name}");
     drop(fd);
+    if let Some(watcher) = watcher {
+        watcher.watch(index, name.to_string(), UDEV_RECHECK);
+    }
     let made = (|| -> Result<()> {
         let mut addr = [&[libc::AF_INET as u8, 32, 0, RT_SCOPE_HOST][..], &index.to_ne_bytes()].concat();
         attr(&mut addr, IFA_LOCAL, &TAP_ADDR.octets());
@@ -247,8 +260,10 @@ fn make_tap(owner: &str, udev: Option<OwnedFd>, claim: impl FnOnce(&OwnedFd) -> 
         set_mac(index, &GATEWAY_MAC)?;
         let mut q = ifreq(name)?;
         q.ifr_ifru.ifru_metric = TAP_QUEUE as i32;
-        let sock = socket(libc::AF_INET, libc::SOCK_DGRAM, 0, "socket")?;
-        crate::syscall_check!(unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFTXQLEN as _, &q) } < 0, "txqueuelen of {name}");
+        with_ioctl_fd(|sock| {
+            crate::syscall_check!(unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFTXQLEN as _, &q) } < 0, "txqueuelen of {name}");
+            Ok(())
+        })?;
         conf("ipv4", name, "arp_ignore", "3")?;
         // The guest is IPv4 only. With IPv6, the host sends an MLD report out of the tap as
         // it comes up: dropped (tx_dropped) when no Firecracker reads it yet (an arrival's),
@@ -258,16 +273,11 @@ fn make_tap(owner: &str, udev: Option<OwnedFd>, claim: impl FnOnce(&OwnedFd) -> 
         guard(index, None).map_err(|e| format!("tap {name}: {e}"))?;
         set_link_up(name, true)
     })();
-    match (&made, udev) {
-        (Err(_), _) => delete_link(index, name),
-        (Ok(()), Some(udev)) => {
-            let tap = name.to_string();
-            // Not fatal: neighbour still checks the MAC when the tap is handed to a VM.
-            if let Err(e) = std::thread::Builder::new().name("udev-mac".into()).spawn(move || keep_mac_from_udev(&udev, index, &tap, UDEV_RECHECK)) {
-                crate::log!("tap {name}: not watching for udev replacing its MAC: {e}");
-            }
+    if made.is_err() {
+        if let Some(watcher) = watcher {
+            watcher.unwatch(index);
         }
-        (Ok(()), None) => {}
+        delete_link(index, name);
     }
     made.map(|()| (name.to_string(), index))
 }
@@ -278,14 +288,197 @@ const NETLINK_KOBJECT_UEVENT: c_int = 15;
 /// The uevent socket's group udev (re)broadcasts each event on once it has handled it (1 is the kernel's).
 const UDEV_GROUP: u32 = 2;
 
-/// A socket on udev's monitor group, when udevd runs and sees this network namespace's devices:
-/// none without it (nothing to wait for), nor in another namespace than init's (`ip netns exec`
-/// keeps /run/udev, but uevents of its devices never reach udev), whose taps udev never touches.
-fn udev_monitor() -> Option<OwnedFd> {
+/// Whether udevd runs and sees this thread's network namespace's devices: false without udevd
+/// (nothing to wait for), and false in another namespace than init's (`ip netns exec` keeps
+/// /run/udev, but uevents of its devices never reach udev), whose taps udev never touches.
+fn in_udev_netns() -> bool {
     use std::os::unix::fs::MetadataExt;
-    let ns = |pid: &str| std::fs::metadata(format!("/proc/{pid}/ns/net")).map(|m| (m.dev(), m.ino())).ok();
-    let watched = std::path::Path::new("/run/udev/control").exists() && ns("self").is_some_and(|me| ns("1") == Some(me));
-    watched.then(|| uevent_socket(UDEV_GROUP)).flatten()
+    let ns = |path: &str| std::fs::metadata(path).map(|m| (m.dev(), m.ino())).ok();
+    std::path::Path::new("/run/udev/control").exists() && ns("/proc/thread-self/ns/net").is_some_and(|me| ns("/proc/1/ns/net") == Some(me))
+}
+
+/// Process-wide udev watcher in init's network namespace, multiplexing one `NETLINK_KOBJECT_UEVENT`
+/// socket over all active taps. Threads in other network namespaces return `None` without touching
+/// init's watcher.
+fn shared_udev_watcher() -> Option<&'static std::sync::Arc<UdevWatcher>> {
+    if !in_udev_netns() {
+        return None;
+    }
+    static WATCHER: std::sync::OnceLock<Option<std::sync::Arc<UdevWatcher>>> = std::sync::OnceLock::new();
+    WATCHER
+        .get_or_init(|| {
+            let udev = uevent_socket(UDEV_GROUP)?;
+            match UdevWatcher::start(udev) {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    // Not fatal: neighbour still checks the MAC when the tap is handed to a VM.
+                    crate::log!("not watching for udev replacing tap MACs: {e}");
+                    None
+                }
+            }
+        })
+        .as_ref()
+}
+
+struct WatchedTap {
+    name: String,
+    recheck: std::time::Duration,
+    next: std::time::Instant,
+}
+
+/// Single-thread watcher multiplexing one udev netlink socket over all watched taps.
+///
+/// udev (systemd's default `MACAddressPolicy=persistent`) gives a new tap a MAC of its own if it
+/// reads the tap's address as the kernel's random one, which it can in the millisecond or so
+/// before `create_tap` sets the gateway's; its write then lands whenever its worker gets to it,
+/// on a loaded host after `neighbour` checked the MAC and the VM runs: the host drops all the
+/// guest sends (to the gateway MAC), so no SYN it is sent is answered (#841). udev broadcasts its
+/// event for the tap only once it applied its link settings, so the gateway MAC goes back then.
+/// udev may take minutes (its event timeout is 3, and events queue before), or the event may be
+/// lost to an overrun: until it comes the MAC is checked every `recheck`, as long as the tap is
+/// there (an entry lives no longer than its tap).
+struct UdevWatcher {
+    taps: std::sync::Mutex<std::collections::HashMap<u32, WatchedTap>>,
+    wake: OwnedFd,
+    #[cfg(test)]
+    stopped: std::sync::atomic::AtomicBool,
+}
+
+impl UdevWatcher {
+    fn start(udev: OwnedFd) -> Result<std::sync::Arc<Self>> {
+        Self::start_with(udev, restore_mac)
+    }
+
+    fn start_with(udev: OwnedFd, restore: impl Fn(u32, &str) -> bool + Send + 'static) -> Result<std::sync::Arc<Self>> {
+        let wake = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        crate::syscall_check!(wake < 0, "eventfd");
+        let watcher = std::sync::Arc::new(Self {
+            taps: std::sync::Mutex::new(std::collections::HashMap::new()),
+            wake: unsafe { OwnedFd::from_raw_fd(wake) },
+            #[cfg(test)]
+            stopped: std::sync::atomic::AtomicBool::new(false),
+        });
+        let bg = watcher.clone();
+        std::thread::Builder::new().name("udev-mac".into()).spawn(move || bg.run(udev, restore))?;
+        Ok(watcher)
+    }
+
+    fn watch(&self, index: u32, name: String, recheck: std::time::Duration) {
+        let next = std::time::Instant::now() + recheck;
+        self.taps.lock().unwrap().insert(index, WatchedTap { name, recheck, next });
+        self.wake();
+    }
+
+    fn unwatch(&self, index: u32) {
+        if self.taps.lock().unwrap().remove(&index).is_some() {
+            self.wake();
+        }
+    }
+
+    fn wake(&self) {
+        let one = 1u64.to_ne_bytes();
+        let _ = unsafe { libc::write(self.wake.as_raw_fd(), one.as_ptr().cast(), one.len()) };
+    }
+
+    #[cfg(test)]
+    fn is_watching(&self, index: u32) -> bool {
+        self.taps.lock().unwrap().contains_key(&index)
+    }
+
+    #[cfg(test)]
+    fn stop(&self) {
+        self.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.wake();
+    }
+
+    fn run(&self, udev: OwnedFd, restore: impl Fn(u32, &str) -> bool) {
+        // A network device's event is a few hundred bytes; a longer one, truncated, is another's.
+        let mut buf = [0u8; 8192];
+        loop {
+            #[cfg(test)]
+            if self.stopped.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            // By the clock, not each poll's timeout: other devices' events, however many, hold no recheck up.
+            let (due, earliest) = {
+                let now = std::time::Instant::now();
+                let mut taps = self.taps.lock().unwrap();
+                let mut due = Vec::new();
+                let mut earliest: Option<std::time::Instant> = None;
+                for (&index, tap) in taps.iter_mut() {
+                    if now >= tap.next {
+                        due.push((index, tap.name.clone()));
+                        tap.next = now + tap.recheck;
+                    }
+                    earliest = Some(earliest.map_or(tap.next, |e| e.min(tap.next)));
+                }
+                (due, earliest)
+            };
+            if !due.is_empty() {
+                let mut gone = Vec::new();
+                for (index, name) in due {
+                    if !restore(index, &name) {
+                        gone.push((index, name));
+                    }
+                }
+                if !gone.is_empty() {
+                    let mut taps = self.taps.lock().unwrap();
+                    for (index, name) in gone {
+                        if taps.get(&index).is_some_and(|t| t.name == name) {
+                            taps.remove(&index);
+                        }
+                    }
+                }
+                continue;
+            }
+            let timeout = match earliest {
+                None => -1,
+                Some(next) => next.saturating_duration_since(std::time::Instant::now()).as_millis().clamp(1, i32::MAX as u128) as c_int,
+            };
+            let mut pfds = [
+                libc::pollfd { fd: udev.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+                libc::pollfd { fd: self.wake.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            ];
+            match crate::util::eintr(|| unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout) }) {
+                Err(_) => {
+                    let remaining: Vec<_> = self.taps.lock().unwrap().drain().map(|(i, t)| (i, t.name)).collect();
+                    for (index, name) in remaining {
+                        restore(index, &name);
+                    }
+                    return;
+                }
+                Ok(0) => continue,
+                Ok(_) => {}
+            }
+            if pfds[1].revents & libc::POLLIN != 0 {
+                let mut val = [0u8; 8];
+                let _ = unsafe { libc::read(self.wake.as_raw_fd(), val.as_mut_ptr().cast(), val.len()) };
+            }
+            if pfds[0].revents & (libc::POLLIN | libc::POLLERR) != 0 {
+                loop {
+                    let n = unsafe { libc::recv(udev.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
+                    if n <= 0 {
+                        if n < 0 && matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ENOBUFS | libc::EINTR)) {
+                            continue;
+                        }
+                        break;
+                    }
+                    match udev_event(&buf[..n as usize]) {
+                        Some((b"add", i)) => {
+                            let removed = self.taps.lock().unwrap().remove(&i);
+                            if let Some(tap) = removed {
+                                restore(i, &tap.name);
+                            }
+                        }
+                        Some((b"remove", i)) => {
+                            self.taps.lock().unwrap().remove(&i);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn uevent_socket(groups: u32) -> Option<OwnedFd> {
@@ -315,50 +508,6 @@ fn udev_event(msg: &[u8]) -> Option<(&[u8], u32)> {
         }
     }
     Some((action?, index?))
-}
-
-/// udev (systemd's default `MACAddressPolicy=persistent`) gives a new tap a MAC of its own if it
-/// reads the tap's address as the kernel's random one, which it can in the millisecond or so
-/// before `create_tap` sets the gateway's; its write then lands whenever its worker gets to it,
-/// on a loaded host after `neighbour` checked the MAC and the VM runs: the host drops all the
-/// guest sends (to the gateway MAC), so no SYN it is sent is answered (#841). udev broadcasts its
-/// event for the tap only once it applied its link settings, so the gateway MAC goes back then.
-/// udev may take minutes (its event timeout is 3, and events queue before), or the event may be
-/// lost to an overrun: until it comes the MAC is checked every `recheck`, as long as the tap is
-/// there (a watcher lives no longer than its tap).
-fn keep_mac_from_udev(udev: &OwnedFd, index: u32, name: &str, recheck: std::time::Duration) {
-    // A network device's event is a few hundred bytes; a longer one, truncated, is another's.
-    let mut buf = [0u8; 8192];
-    // By the clock, not each poll's timeout: other devices' events, however many, hold no recheck up.
-    let mut next = std::time::Instant::now() + recheck;
-    loop {
-        let now = std::time::Instant::now();
-        if now >= next {
-            if !restore_mac(index, name) {
-                return;
-            }
-            next = now + recheck;
-        }
-        let mut pfd = libc::pollfd { fd: udev.as_raw_fd(), events: libc::POLLIN, revents: 0 };
-        let ms = next.saturating_duration_since(now).as_millis().clamp(1, i32::MAX as u128) as c_int;
-        match crate::util::eintr(|| unsafe { libc::poll(&mut pfd, 1, ms) }) {
-            Err(_) => {
-                restore_mac(index, name);
-                return;
-            }
-            Ok(0) => continue,
-            Ok(_) => {}
-        }
-        let n = unsafe { libc::recv(udev.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), libc::MSG_DONTWAIT) };
-        match (n > 0).then(|| udev_event(&buf[..n as usize])).flatten() {
-            Some((b"add", i)) if i == index => {
-                restore_mac(index, name);
-                return;
-            }
-            Some((b"remove", i)) if i == index => return,
-            _ => {}
-        }
-    }
 }
 
 /// Puts the gateway MAC back on tap `name` at `index` if something replaced it, while the
@@ -739,12 +888,11 @@ pub fn unplug_tap(tap: &str) -> (u64, Result<()>) {
 pub fn drain_qdisc(tap: &str, wait: std::time::Duration) -> u64 {
     let Ok(ifindex) = ifindex(tap) else { return 0 };
     let end = std::time::Instant::now() + wait;
-    let Ok(sock) = socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE, "netlink socket") else { return 0 };
     loop {
         // Whatever the root qdisc is (a default one, or our plug); the answer waited for only
         // within `wait` (at least a millisecond), so an unanswered query never holds it longer.
         let left = end.saturating_duration_since(std::time::Instant::now()).max(std::time::Duration::from_millis(1));
-        let queued = qdisc_stats_on(&sock, ifindex, 0, left).map_or(0, |(_, queued)| queued);
+        let queued = qdisc_stats(ifindex, 0, left).map_or(0, |(_, queued)| queued);
         if queued == 0 || std::time::Instant::now() >= end {
             return queued;
         }
@@ -776,25 +924,15 @@ pub fn plug_is_root(tap: &str) -> bool {
 const STATS_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// The root qdisc's (drops, queued packets), if its handle is `handle` (0: whatever it is), from
-/// RTM_GETQDISC on a socket of its own: the qdisc echoed back (NLM_F_ECHO; a get without it
-/// answers nothing), no ACK, waited for up to `wait`.
+/// RTM_GETQDISC on this thread's timed netlink socket: the qdisc echoed back (NLM_F_ECHO; a get
+/// without it answers nothing), no ACK, waited for up to `wait`.
 fn qdisc_stats(ifindex: u32, handle: u32, wait: std::time::Duration) -> Option<(u64, u64)> {
-    let sock = socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE, "netlink socket").ok()?;
-    qdisc_stats_on(&sock, ifindex, handle, wait)
-}
-
-fn qdisc_stats_on(sock: &OwnedFd, ifindex: u32, handle: u32, wait: std::time::Duration) -> Option<(u64, u64)> {
     const NLM_F_ECHO: c_int = 8;
-    // A zero timeval would mean no timeout at all.
-    let wait = wait.max(std::time::Duration::from_micros(1));
-    let timeout = libc::timeval { tv_sec: wait.as_secs() as libc::time_t, tv_usec: wait.subsec_micros() as libc::suseconds_t };
-    let size = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
-    if unsafe { libc::setsockopt(sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVTIMEO, (&timeout as *const libc::timeval).cast(), size) } != 0 {
-        return None;
-    }
+    let (sock, wait) = take_timed_netlink(wait).ok()?;
     let body = tcmsg(ifindex, handle, TC_H_ROOT, 0);
     let mut buf = [0u8; 8192];
-    let reply = exchange(sock, libc::RTM_GETQDISC, NLM_F_ECHO, &body, &mut buf).ok()?;
+    let reply = exchange(&sock, libc::RTM_GETQDISC, NLM_F_ECHO, &body, &mut buf).ok()?;
+    TIMED_FD.set(Some((sock, wait)));
     if reply.len() < 36 || u16::from_ne_bytes([reply[4], reply[5]]) != libc::RTM_NEWQDISC {
         return None;
     }
@@ -879,7 +1017,7 @@ pub fn local_ips() -> Result<Vec<IpAddr>> {
 /// The kernel's route toward `to`, as `ip route get` reads it (policy routing
 /// included): its output device and the source address it would use, of `to`'s family.
 pub fn route_get(to: IpAddr) -> Result<(String, IpAddr)> {
-    let sock = socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE, "netlink socket")?;
+    let sock = FD.take().map_or_else(|| socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE, "netlink socket"), Ok)?;
     // struct rtmsg: family, dst_len (the whole address), the rest 0.
     let mut msg = match to {
         IpAddr::V4(_) => vec![libc::AF_INET as u8, 32, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -888,6 +1026,7 @@ pub fn route_get(to: IpAddr) -> Result<(String, IpAddr)> {
     attr(&mut msg, RTA_DST, &octets(to));
     let mut buf = [0u8; 4096];
     let reply = exchange(&sock, libc::RTM_GETROUTE, 0, &msg, &mut buf).map_err(|_| format!("no route toward {to}: netlink failed"))?;
+    FD.set(Some(sock));
     route_from_reply(to, reply)
 }
 
@@ -1124,6 +1263,25 @@ fn netlink(kind: u16, flags: c_int, body: &[u8]) -> Result<()> {
 }
 
 thread_local!(static FD: std::cell::Cell<Option<OwnedFd>> = const { std::cell::Cell::new(None) });
+thread_local!(static TIMED_FD: std::cell::Cell<Option<(OwnedFd, std::time::Duration)>> = const { std::cell::Cell::new(None) });
+
+fn take_timed_netlink(wait: std::time::Duration) -> Result<(OwnedFd, std::time::Duration)> {
+    // A zero timeval would mean no timeout at all.
+    let wait = wait.max(std::time::Duration::from_micros(1));
+    let (sock, prev) = match TIMED_FD.take() {
+        Some(pair) => pair,
+        None => (socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE, "netlink socket")?, std::time::Duration::ZERO),
+    };
+    if prev != wait {
+        let timeout = libc::timeval { tv_sec: wait.as_secs() as libc::time_t, tv_usec: wait.subsec_micros() as libc::suseconds_t };
+        let size = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+        crate::syscall_check!(
+            unsafe { libc::setsockopt(sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVTIMEO, (&timeout as *const libc::timeval).cast(), size) } != 0,
+            "netlink receive timeout"
+        );
+    }
+    Ok((sock, wait))
+}
 
 /// Opens this thread's netlink socket now, if it has none: before a lock its first request is made under.
 pub fn ready() {
@@ -1371,21 +1529,16 @@ fn proxy_entry(msg: &[u8]) -> Option<(u32, Ipv6Addr)> {
     None
 }
 
-/// A dump request (NLM_F_DUMP) on a socket of its own: `each` message of the answer, read until
-/// NLMSG_DONE.
+/// A dump request (NLM_F_DUMP) on this thread's timed netlink socket: `each` message of the
+/// answer, read until NLMSG_DONE.
 fn dump(kind: u16, body: &[u8], mut each: impl FnMut(&[u8])) -> Result<()> {
-    let sock = socket(libc::AF_NETLINK, libc::SOCK_RAW, libc::NETLINK_ROUTE, "netlink socket")?;
     // The kernel always ends a dump; never waited on longer than this all the same.
-    let timeout = libc::timeval { tv_sec: 5, tv_usec: 0 };
-    let size = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
-    crate::syscall_check!(
-        unsafe { libc::setsockopt(sock.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVTIMEO, (&timeout as *const libc::timeval).cast(), size) } != 0,
-        "netlink receive timeout"
-    );
+    let (sock, wait) = take_timed_netlink(std::time::Duration::from_secs(5))?;
     let mut buf = vec![0u8; 32 << 10];
     let mut n = exchange(&sock, kind, libc::NLM_F_DUMP, body, &mut buf).map_err(|(Failed::Unchanged(e) | Failed::Unanswered(e))| e)?.len();
     loop {
         if dump_part(&buf[..n], &mut each)? {
+            TIMED_FD.set(Some((sock, wait)));
             return Ok(());
         }
         let got = unsafe { libc::recv(sock.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
@@ -2069,6 +2222,67 @@ mod tests {
         assert_eq!(udev_event(&msg[..20]), None);
     }
 
+    #[test]
+    fn shared_udev_watcher_multiplexes_taps() {
+        use std::os::unix::net::UnixDatagram;
+        use std::sync::{Arc, Mutex};
+        use std::time::{Duration, Instant};
+
+        let (rx, tx) = UnixDatagram::pair().unwrap();
+        rx.set_nonblocking(true).unwrap();
+        let restored = Arc::new(Mutex::new(Vec::<(u32, String)>::new()));
+        let alive = Arc::new(Mutex::new(std::collections::HashSet::from([10u32, 20u32, 30u32])));
+        let (r_log, r_alive) = (restored.clone(), alive.clone());
+        let watcher = UdevWatcher::start_with(rx.into(), move |idx, name| {
+            r_log.lock().unwrap().push((idx, name.to_string()));
+            r_alive.lock().unwrap().contains(&idx)
+        })
+        .unwrap();
+
+        let wait_until = |cond: &dyn Fn() -> bool| {
+            let by = Instant::now() + Duration::from_secs(5);
+            while !cond() && Instant::now() < by {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            cond()
+        };
+
+        watcher.watch(10, "tap10".into(), Duration::from_secs(60));
+        watcher.watch(20, "tap20".into(), Duration::from_secs(60));
+        watcher.watch(30, "tap30".into(), Duration::from_millis(50));
+
+        // Unrelated event and change event leave watched taps untouched.
+        tx.send(&udev_message(&["ACTION=add", "IFINDEX=999"])).unwrap();
+        tx.send(&udev_message(&["ACTION=change", "IFINDEX=10"])).unwrap();
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(watcher.is_watching(10) && watcher.is_watching(20));
+
+        // ACTION=add restores tap 10 and stops watching it, leaving tap 20 watched.
+        tx.send(&udev_message(&["ACTION=add", "IFINDEX=10"])).unwrap();
+        assert!(wait_until(&|| !watcher.is_watching(10)));
+        assert!(restored.lock().unwrap().contains(&(10, "tap10".into())));
+        assert!(watcher.is_watching(20));
+
+        // ACTION=remove stops watching tap 20 without restoring it.
+        tx.send(&udev_message(&["ACTION=remove", "IFINDEX=20"])).unwrap();
+        assert!(wait_until(&|| !watcher.is_watching(20)));
+        assert!(!restored.lock().unwrap().iter().any(|(i, _)| *i == 20));
+
+        // Periodic recheck restores tap 30, and stops watching once it disappears.
+        assert!(wait_until(&|| restored.lock().unwrap().contains(&(30, "tap30".into()))));
+        assert!(watcher.is_watching(30));
+        alive.lock().unwrap().remove(&30);
+        assert!(wait_until(&|| !watcher.is_watching(30)));
+
+        // Explicit unwatch removes a tap immediately.
+        watcher.watch(40, "tap40".into(), Duration::from_secs(60));
+        assert!(watcher.is_watching(40));
+        watcher.unwatch(40);
+        assert!(!watcher.is_watching(40));
+
+        watcher.stop();
+    }
+
     /// Needs root: `sudo cargo test -- --ignored`. udev's late write of a MAC of its own (#841) is
     /// undone once udev says it is done with the tap, not before, and not for another device's
     /// event; the MAC is checked meanwhile, and the watcher ends with its tap.
@@ -2100,46 +2314,42 @@ mod tests {
             assert!(send_to(&sender, &udev_message(props), &to) > 0, "{}", std::io::Error::last_os_error());
         };
         let (on, other) = (format!("IFINDEX={index}"), format!("IFINDEX={}", index + 1000));
-        // Detached, so a failed assertion leaves it behind rather than joining a watcher that never ends.
-        let udev = std::sync::Arc::new(udev);
-        let watch = |recheck| {
-            let (udev, tap) = (udev.clone(), tap.clone());
-            std::thread::spawn(move || keep_mac_from_udev(&udev, index, &tap, recheck))
-        };
-        let ends = |w: &std::thread::JoinHandle<()>| {
+        let watcher = UdevWatcher::start(udev).unwrap();
+        let ends = || {
             let by = Instant::now() + Duration::from_secs(10);
-            while !w.is_finished() && Instant::now() < by {
+            while watcher.is_watching(index) && Instant::now() < by {
                 std::thread::sleep(Duration::from_millis(10));
             }
-            w.is_finished()
+            !watcher.is_watching(index)
         };
         set_mac(index, &ours).unwrap();
         let start = Instant::now();
-        let w = watch(Duration::from_secs(60));
+        watcher.watch(index, tap.clone(), Duration::from_secs(60));
         send(&["ACTION=add", "SUBSYSTEM=net", &other]);
         send(&["ACTION=change", "SUBSYSTEM=net", &on]);
         std::thread::sleep(Duration::from_millis(300));
-        assert!(!w.is_finished() && mac() == ours, "another device's event, or a change, is not udev done with this tap");
+        assert!(watcher.is_watching(index) && mac() == ours, "another device's event, or a change, is not udev done with this tap");
         send(&["ACTION=add", "SUBSYSTEM=net", &format!("INTERFACE={tap}"), &on]);
-        assert!(ends(&w) && mac() == GATEWAY_MAC && start.elapsed() < Duration::from_secs(10), "by the event, not a recheck: {:?}", start.elapsed());
+        assert!(ends() && mac() == GATEWAY_MAC && start.elapsed() < Duration::from_secs(10), "by the event, not a recheck: {:?}", start.elapsed());
         // With no event, a recheck puts it back, however busy udev is with other devices, and the
         // watcher goes on until udev's remove.
         set_mac(index, &ours).unwrap();
-        let w = watch(Duration::from_millis(200));
+        watcher.watch(index, tap.clone(), Duration::from_millis(200));
         let back = Instant::now() + Duration::from_secs(5);
         while mac() != GATEWAY_MAC && Instant::now() < back {
             send(&["ACTION=change", "SUBSYSTEM=net", &other]);
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(mac(), GATEWAY_MAC);
-        assert!(!w.is_finished());
+        assert!(watcher.is_watching(index));
         send(&["ACTION=remove", "SUBSYSTEM=net", &on]);
-        assert!(ends(&w));
+        assert!(ends());
         // A tap gone ends its watcher at the next recheck, touching no other device.
         assert!(!restore_mac(index, "flexvm-none0"));
-        let w = watch(Duration::from_millis(50));
+        watcher.watch(index, tap.clone(), Duration::from_millis(50));
         delete_tap(&tap);
-        assert!(ends(&w));
+        assert!(ends());
+        watcher.stop();
     }
 
     /// A classic BPF program's verdict on `frame` (with a VLAN tag stripped or not), by an
