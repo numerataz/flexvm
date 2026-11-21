@@ -61,6 +61,21 @@ def initramfs(init, kvm=None, files=None):
     return archive
 
 
+def mask_devices(mask, command, *, devices=("/dev/kvm", "/dev/vhost-vsock"), trace=None, trace_events="file"):
+    """Run command in a private mount namespace with host devices bind-mounted to a regular file."""
+    devices = tuple(devices)
+    script = (
+        'mask="$1"; count="$2"; shift 2; '
+        'while [ "$count" -gt 0 ]; do '
+        'if [ -e "$1" ]; then mount --bind "$mask" "$1"; fi; '
+        'shift; count=$((count - 1)); '
+        'done; exec "$@"'
+    )
+    traced = ["strace", "-f", "-e", f"trace={trace_events}", "-o", str(trace)] if trace is not None else []
+    return ["unshare", "--mount", "--propagation", "private", "sh", "-ec", script,
+            "sh", str(mask), str(len(devices)), *devices, *traced, *command]
+
+
 def run(argv, timeout, log, *, during=None, pass_fds=(), input_pipe=False):
     deadline = time.monotonic() + timeout
     with log.open("wb") as output:
@@ -346,9 +361,7 @@ def main():
         # The bind mount affects only this process tree. If /dev/kvm exists it
         # becomes a regular file, so it cannot provide KVM ioctls even to root.
         def isolated(command, trace):
-            return ["unshare", "--mount", "--propagation", "private", "sh", "-ec",
-                    'for dev in /dev/kvm /dev/vhost-vsock; do if [ -e "$dev" ]; then mount --bind "$1" "$dev"; fi; done; shift; exec "$@"',
-                    "sh", str(blocked), "strace", "-f", "-e", "trace=file", "-o", str(trace), *command]
+            return mask_devices(blocked, command, trace=trace)
 
         traces = [out / "files.strace"]
         if args.checkpoint:

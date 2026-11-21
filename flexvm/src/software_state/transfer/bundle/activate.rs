@@ -260,9 +260,17 @@ mod tests {
                 import.finish(&consumed.grant).unwrap();
             }
             drop(consumed);
-            crate::software_state::sweep(&host.state).unwrap();
             let path = host.state.join(INCOMING).join(bundle_name(&offer));
-            assert_eq!(path.exists(), !clean);
+            if clean {
+                // Parallel test forks can briefly retain CLOEXEC directory leases.
+                crate::test_util::wait_until("retired import bundle collection", || {
+                    crate::software_state::sweep(&host.state).unwrap();
+                    !path.exists()
+                });
+            } else {
+                crate::software_state::sweep(&host.state).unwrap();
+                assert!(path.exists());
+            }
             assert!(Activation::prepare_offer(&name, offer.clone()).err().unwrap().to_string().contains("already granted"));
             assert_eq!(super::super::receive(&host.state, &offer, &mut bytes.as_slice(), 1 << 20).is_ok(), !clean);
         }

@@ -252,6 +252,23 @@ class SoftwareCheck(unittest.TestCase):
                 proc.kill()
             proc.communicate()
 
+    def test_mask_devices_builds_unshare_wrapper_and_executes_command(self):
+        mask_devices = runpy.run_path(str(ROOT / 'software-boot.py'))['mask_devices']
+        mask = self.root / 'mask'
+        mask.touch()
+        trace = self.root / 'files.strace'
+        argv = mask_devices(mask, ['echo', 'ok'], devices=('/nonexistent-a', '/nonexistent-b'),
+                            trace=trace, trace_events='file,init_module')
+        self.assertEqual(argv[:6], ['unshare', '--mount', '--propagation', 'private', 'sh', '-ec'])
+        self.assertEqual(argv[argv.index('-e') + 1], 'trace=file,init_module')
+        self.assertEqual(argv[argv.index('-o') + 1], str(trace))
+        self.assertEqual(argv[-2:], ['echo', 'ok'])
+        # Run the sh -ec wrapper directly without unshare/strace using nonexistent paths.
+        direct = mask_devices(mask, [sys.executable, '-c', 'import sys; print(",".join(sys.argv[1:]))', 'x', 'y'],
+                              devices=('/nonexistent-a', '/nonexistent-b'))
+        result = subprocess.run(direct[4:], capture_output=True, text=True, timeout=5, check=True)
+        self.assertEqual(result.stdout.strip(), 'x,y')
+
     def test_c_checks_compile_with_strict_warnings(self):
         builds = [
             ('software-init.c', []),

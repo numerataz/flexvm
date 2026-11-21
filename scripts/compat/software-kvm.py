@@ -102,9 +102,7 @@ def main():
         trace = out / 'files.strace'
         cmd = [str(binary), 'software', '--control', 'serial', '--kernel', str(kernel), '--state', state.name,
                '--mem', '512', '--vcpus', '2', str(archive)]
-        isolated = ['unshare', '--mount', '--propagation', 'private', 'sh', '-ec',
-                    'for dev in /dev/kvm /dev/vhost-vsock; do if [ -e "$dev" ]; then mount --bind "$1" "$dev"; fi; done; shift; exec "$@"',
-                    'sh', str(mask), 'strace', '-f', '-e', 'trace=file', '-o', str(trace), *cmd]
+        isolated = HELPERS['mask_devices'](mask, cmd, trace=trace)
         HELPERS['run'](isolated, args.timeout, out / 'guest.log')
         lines = (out / 'guest.log').read_text(errors='replace').splitlines()
         markers = ('FLEXVM_SOFTWARE_KVM_API_PASSED', 'FLEXVM_SOFTWARE_INNER_BOOTED',

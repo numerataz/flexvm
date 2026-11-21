@@ -325,11 +325,12 @@ def main():
             mask = args.output / 'unusable-device'
             mask.touch(mode=0o600)
             trace = args.output / 'files.strace'
-            command = ['unshare', '--mount', '--propagation', 'private', 'sh', '-ec',
-                       'for dev in /dev/kvm /dev/vhost-vsock; do if [ -e "$dev" ]; then mount --bind "$1" "$dev"; fi; done; shift; exec "$@"',
-                       'sh', str(mask), 'strace', '-f', '-e', 'trace=file,init_module,finit_module,delete_module', '-o', str(trace),
-                       sys.executable, str(Path(__file__).resolve()), '--worker', '--bin', str(args.bin), '--kernel', str(args.kernel),
-                       '--sdk', str(args.sdk), '--output', str(args.output), '--state', state, '--timeout', str(args.timeout)]
+            command = HELPERS['mask_devices'](
+                mask,
+                [sys.executable, str(Path(__file__).resolve()), '--worker', '--bin', str(args.bin), '--kernel', str(args.kernel),
+                 '--sdk', str(args.sdk), '--output', str(args.output), '--state', state, '--timeout', str(args.timeout)],
+                trace=trace, trace_events='file,init_module,finit_module,delete_module',
+            )
             try:
                 HELPERS['run'](command, args.timeout, args.output / 'worker.log')
             finally:
