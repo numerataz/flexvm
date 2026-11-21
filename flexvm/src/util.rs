@@ -1231,20 +1231,66 @@ fn open_dir(dir: &Path) -> io::Result<std::fs::File> {
 /// which a relative target resolves from: a hard-linked symlink may be in several).
 type Seen = std::collections::HashSet<((u64, u64), Option<(u64, u64)>)>;
 
+/// Identity and metadata stamp `(dev, ino, ctime_sec, ctime_nsec)` of an ancestor directory
+/// already fsynced in this process.
+type DirStamp = (u64, u64, i64, i64);
+
+const SYNCED_ANCESTORS_CAP: usize = 4096;
+
+fn synced_ancestors() -> &'static std::sync::Mutex<std::collections::HashSet<DirStamp>> {
+    static SYNCED: OnceLock<std::sync::Mutex<std::collections::HashSet<DirStamp>>> = OnceLock::new();
+    SYNCED.get_or_init(Default::default)
+}
+
+fn dir_stamp(fd: RawFd) -> io::Result<DirStamp> {
+    let st = fstat(fd)?;
+    Ok((st.st_dev as u64, st.st_ino as u64, st.st_ctime, st.st_ctime_nsec))
+}
+
+fn sync_uncached_dirs(dirs: Vec<std::fs::File>, use_cache: bool) -> io::Result<()> {
+    let mut stamped = Vec::with_capacity(dirs.len());
+    for dir in dirs {
+        stamped.push((dir_stamp(dir.as_raw_fd())?, dir));
+    }
+    if use_cache {
+        let synced = synced_ancestors().lock().unwrap_or_else(|e| e.into_inner());
+        stamped.retain(|(stamp, _)| !synced.contains(stamp));
+    }
+    if stamped.is_empty() {
+        return Ok(());
+    }
+    let (stamps, dirs): (Vec<_>, Vec<_>) = stamped.into_iter().unzip();
+    sync_dirs_with(&dirs, &std::fs::File::sync_all)?;
+    let mut synced = synced_ancestors().lock().unwrap_or_else(|e| e.into_inner());
+    if synced.len() >= SYNCED_ANCESTORS_CAP {
+        synced.clear();
+    }
+    synced.extend(stamps);
+    Ok(())
+}
+
 /// Syncs every directory above `dir` up to `/`, and the one holding each symlink its path or a
 /// link's target resolves through. Run when publishing in `dir`: an existing directory may have
 /// been made by a process that died before syncing it.
+#[cfg(test)]
 fn sync_ancestors(dir: &Path) -> io::Result<()> {
+    sync_ancestors_cached(dir, true)
+}
+
+fn sync_ancestors_cached(dir: &Path, use_cache: bool) -> io::Result<()> {
     let mut dirs = Vec::new();
     sync_ancestors_with(dir, &mut Seen::new(), &mut |d| d.try_clone().map(|d| dirs.push(d)))?;
-    sync_dirs_with(&dirs, &std::fs::File::sync_all)
+    sync_uncached_dirs(dirs, use_cache)
 }
 
 /// As `sync_ancestors`, from a pinned directory: never by a path, which may since name another.
 pub fn sync_ancestors_fd(dir: RawFd) -> io::Result<()> {
-    sync_ancestors_fd_with(dir, &std::fs::File::sync_all)
+    let mut dirs = Vec::new();
+    walk_up(dir, &mut Seen::new(), &mut |d| d.try_clone().map(|d| dirs.push(d)))?;
+    sync_uncached_dirs(dirs, true)
 }
 
+#[cfg(test)]
 fn sync_ancestors_fd_with(dir: RawFd, sync: &(impl Fn(&std::fs::File) -> io::Result<()> + Sync)) -> io::Result<()> {
     let mut dirs = Vec::new();
     walk_up(dir, &mut Seen::new(), &mut |d| d.try_clone().map(|d| dirs.push(d)))?;
@@ -1254,6 +1300,11 @@ fn sync_ancestors_fd_with(dir: RawFd, sync: &(impl Fn(&std::fs::File) -> io::Res
 /// Entries must already exist, with no dependency between these syncs. Pin all
 /// directories first, deduplicated by the walk; join every sync before returning.
 fn sync_dirs_with(dirs: &[std::fs::File], sync: &(impl Fn(&std::fs::File) -> io::Result<()> + Sync)) -> io::Result<()> {
+    match dirs {
+        [] => return Ok(()),
+        [dir] => return sync(dir),
+        _ => {}
+    }
     let next = AtomicUsize::new(0);
     let work = || {
         let mut result = Ok(());
@@ -1568,8 +1619,9 @@ pub fn write_file_mode(dir: &Path, name: &str, data: &[u8], durable: bool, mode:
 pub fn create_dir_durably(dir: &Path, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     let named = |e: io::Error| io::Error::new(e.kind(), format!("creating {}: {e}", dir.display()));
+    let existed = dir.is_dir();
     std::fs::DirBuilder::new().recursive(true).mode(mode).create(dir).map_err(named)?;
-    sync_ancestors(dir)
+    sync_ancestors_cached(dir, existed)
 }
 
 /// Sent by `at`.
