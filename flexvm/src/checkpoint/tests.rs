@@ -222,10 +222,7 @@ impl GuestPages for Guest {
 fn runs_of(ps: impl IntoIterator<Item = (usize, u8)>) -> Runs {
     let mut out: Runs = Vec::new();
     for (p, s) in ps {
-        match out.last_mut() {
-            Some((f, n, st)) if *st == s && *f + *n == p as u64 => *n += 1,
-            _ => out.push((p as u64, 1, s)),
-        }
+        crate::util::push_tagged_run(&mut out, p as u64, 1, s);
     }
     out
 }

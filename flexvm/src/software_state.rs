@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::template::Stamp;
 use crate::util::Result;
 use crate::{bail, util};
 
@@ -229,7 +228,7 @@ impl Manifest {
 pub struct Input {
     pub file: File,
     pub artifact: Artifact,
-    stamp: Stamp,
+    stamp: util::FileStamp,
 }
 
 impl Input {
@@ -246,7 +245,7 @@ impl Input {
         if expected.is_some_and(|expected| expected.bytes != before.len()) {
             bail!("software artifact length does not match its manifest");
         }
-        let stamp = Stamp::of(&before);
+        let stamp = util::FileStamp::of(&before);
         let mut hash = Sha256::new();
         let mut offset = 0;
         let mut buf = vec![0; 1 << 20];
@@ -260,7 +259,7 @@ impl Input {
             hash.update(&buf[..n]);
             offset += n as u64;
         }
-        if stamp != Stamp::of(&file.metadata()?) || offset != before.len() {
+        if stamp != util::FileStamp::of(&file.metadata()?) || offset != before.len() {
             bail!("software artifact changed while hashing");
         }
         let artifact = Artifact { bytes: offset, sha256: format!("{:x}", hash.finalize()) };
@@ -271,7 +270,7 @@ impl Input {
     }
 
     pub fn unchanged(&self) -> Result<()> {
-        if Stamp::of(&self.file.metadata()?) != self.stamp {
+        if util::FileStamp::of(&self.file.metadata()?) != self.stamp {
             bail!("software input changed since it was pinned");
         }
         Ok(())
@@ -417,14 +416,7 @@ fn owned_directory(path: &Path, forbidden: u32) -> Result<File> {
 }
 
 fn member(dir: &File, name: &str) -> Result<File> {
-    let fd = unsafe {
-        libc::openat(dir.as_raw_fd(), util::cpath(Path::new(name))?.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    use std::os::fd::FromRawFd;
-    let file = unsafe { File::from_raw_fd(fd) };
+    let file = File::from(util::openat(dir.as_raw_fd(), &util::cpath(Path::new(name))?, libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK)?);
     let stat = file.metadata()?;
     if !stat.is_file() || stat.uid() != unsafe { libc::geteuid() } || stat.mode() & 0o222 != 0 || stat.nlink() != 1 {
         bail!("software artifact is not an immutable private regular file");
@@ -962,10 +954,9 @@ impl Staging {
                 let path = self.path.join(format!("disk-{}", disk.id));
                 let target = OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(path)?;
                 target.set_len(disk.size)?;
-                let meta = disk.file.metadata()?;
-                let before = Stamp::of(&meta);
+                let before = util::FileStamp::of(&disk.file.metadata()?);
                 let hashed = crate::volume::copy_raw_hashed(&disk.file, &target, disk.size)?;
-                if before != Stamp::of(&disk.file.metadata()?) || meta.len() != disk.size {
+                if before != util::FileStamp::of(&disk.file.metadata()?) || before.len() != disk.size {
                     bail!("managed disk changed while capturing its checkpoint");
                 }
                 let content = match hashed {

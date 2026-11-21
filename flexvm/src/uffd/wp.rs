@@ -453,10 +453,7 @@ impl Pager {
                         Some(&(f, _, s)) if f <= p as u64 => s,
                         _ => BASE,
                     };
-                    match out.last_mut() {
-                        Some((f, n, s)) if *s == st && *f + *n == p as u64 => *n += 1,
-                        _ => out.push((p as u64, 1, st)),
-                    }
+                    crate::util::push_tagged_run(&mut out, p as u64, 1, st);
                 }
                 out
             }
@@ -710,10 +707,7 @@ fn fill_slots(
         }
         local.clear();
         for s in &slots[i..j] {
-            match local.last_mut() {
-                Some(v) if v.iov_base as usize + v.iov_len == s.as_mut_ptr() as usize => v.iov_len += PAGE_SIZE,
-                _ => local.push(libc::iovec { iov_base: s.as_mut_ptr().cast(), iov_len: PAGE_SIZE }),
-            }
+            crate::util::push_iov(&mut local, s.as_mut_ptr().cast(), PAGE_SIZE);
         }
         read(claimed[i], &local)?;
         i = j;
