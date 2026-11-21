@@ -38,6 +38,34 @@ fn deadline(size: u64) -> Instant {
 /// Where the last connection an agent opened went: its socket's peer, as connected.
 type Peer = Arc<Mutex<Option<SocketAddr>>>;
 
+/// Shares one `RustlsConnector` (and its cached `ClientConfig` / system root certs) across all
+/// agents. Requests set a per-request `timeout_global` via `.config()`, which marks
+/// `details.request_level = true` and would otherwise prevent `RustlsConnector` from populating
+/// its `OnceLock` cache; since we never customize `TlsConfig` per request, clearing
+/// `request_level` here lets it load system root certs once per process.
+#[derive(Debug)]
+struct SharedRustlsConnector;
+
+impl<In: Transport> Connector<In> for SharedRustlsConnector {
+    type Out = <RustlsConnector as Connector<In>>::Out;
+
+    fn connect(&self, details: &ConnectionDetails, chained: Option<In>) -> std::result::Result<Option<Self::Out>, ureq::Error> {
+        static TLS: std::sync::OnceLock<RustlsConnector> = std::sync::OnceLock::new();
+        let details = ConnectionDetails {
+            uri: details.uri,
+            addrs: details.addrs.clone(),
+            config: details.config,
+            request_level: false,
+            resolver: details.resolver,
+            now: details.now,
+            timeout: details.timeout,
+            current_time: details.current_time.clone(),
+            run_connector: details.run_connector.clone(),
+        };
+        TLS.get_or_init(RustlsConnector::default).connect(&details, chained)
+    }
+}
+
 /// An agent for one transfer: DNS, connect, the TLS handshake and every read and write obey the transfer's deadline
 /// (ureq holds each handshake read, not the handshake, to its connect timeout), and its connections are never pooled,
 /// into another transfer or another request of this one: each request opens its own, and records its peer in `peer`.
@@ -54,7 +82,7 @@ fn agent(deadline: Instant, public_only: bool, peer: Peer) -> ureq::Agent {
         .max_idle_connections(0)
         .max_idle_connections_per_host(0)
         .build();
-    let connector = PeerConnector(peer).chain(DeadlineConnector(deadline)).chain(RustlsConnector::default());
+    let connector = PeerConnector(peer).chain(DeadlineConnector(deadline)).chain(SharedRustlsConnector);
     ureq::Agent::with_parts(config, connector, DeadlineResolver { deadline, public_only })
 }
 
@@ -804,9 +832,9 @@ impl Registry {
 /// by the deadline of a `size`-byte transfer: the body, which the caller checks against its pinned digest.
 pub fn download(url: &str, size: u64) -> Result<ureq::Body> {
     let deadline = deadline(size);
+    let client = agent(deadline, false, Peer::default());
     let mut next = url.to_string();
     for redirects in 0.. {
-        let client = agent(deadline, false, Peer::default());
         let shown = log_url(&next);
         let resp = call(&format!("GET {shown}"), deadline, |left| client.get(&next).config().timeout_global(Some(left)).build())?;
         match resp.status().as_u16() {

@@ -230,6 +230,7 @@ fn hide(fd: RawFd, name: &CStr, layer: &mut Layer, depth: u32) -> Result<()> {
 
 pub(super) struct At {
     dir: OwnedFd,
+    dir_id: Option<(libc::dev_t, libc::ino_t)>,
     name: CString,
 }
 
@@ -392,6 +393,8 @@ fn describe<R: Read>(e: &tar::Entry<R>, name: Option<Vec<u8>>, link: Option<Vec<
 
 pub struct Root {
     fd: OwnedFd,
+    root_key: Option<Key>,
+    last_parent: Option<(PathBuf, OwnedFd, (libc::dev_t, libc::ino_t))>,
     limits: Limits,
     pub entries: u64,
     pub has_xattrs: bool,
@@ -407,7 +410,12 @@ impl Root {
     }
 
     pub fn from_fd(fd: OwnedFd, limits: Limits) -> Root {
-        Root { fd, limits, entries: 0, has_xattrs: false, seen: 0, unpacked: 0, root_meta: None }
+        let root_key = key(fd.as_raw_fd(), c"");
+        Root { fd, root_key, last_parent: None, limits, entries: 0, has_xattrs: false, seen: 0, unpacked: 0, root_meta: None }
+    }
+
+    fn invalidate_parent_cache(&mut self) {
+        self.last_parent = None;
     }
 
     /// Check before creating anything, including implicit parents. Deletions do not refund the
@@ -495,8 +503,18 @@ impl Root {
 
     fn at(&mut self, path: &Path, create_parents: bool) -> Result<At> {
         let (parent, name) = split(path)?.ok_or("empty path")?;
-        let dir = if create_parents { self.mkdir_p(&parent, 0)? } else { self.resolve(&parent)? };
-        Ok(At { dir, name })
+        let (dir, dir_id) = match &self.last_parent {
+            Some((cached_path, cached_fd, cached_id)) if cached_path == &parent => (cached_fd.try_clone()?, Some(*cached_id)),
+            _ => {
+                let dir = if create_parents { self.mkdir_p(&parent, 0)? } else { self.resolve(&parent)? };
+                let dir_id = stat_at(dir.as_raw_fd(), c"").map(|st| (st.st_dev, st.st_ino));
+                if let Some(id) = dir_id {
+                    self.last_parent = Some((parent, dir.try_clone()?, id));
+                }
+                (dir, dir_id)
+            }
+        };
+        Ok(At { dir, dir_id, name })
     }
 
     /// Applies one decompressed layer, read to its end; returns its digest (the config's diff_id).
@@ -508,6 +526,7 @@ impl Root {
         let mut mine = Layer::default();
         let res = each_entry(&mut r, &mut seen, self.limits.entries, |e, m| self.apply(e, m, &mut mine))
             .and_then(|_| Ok(io::copy(&mut r, &mut io::sink()).map(|_| ())?));
+        self.invalidate_parent_cache();
         self.seen = seen;
         self.unpacked += r.n;
         if r.n > limit {
@@ -541,6 +560,7 @@ impl Root {
                 Err(e) if matches!(e.raw_os_error(), Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP)) => return Ok(()),
                 Err(e) => bail!("resolve whiteout parent {parent:?}: {e}"),
             };
+            self.invalidate_parent_cache();
             match opq {
                 true => opaque(dir.as_raw_fd(), mine, 0)?,
                 false => hide(dir.as_raw_fd(), &CString::new(rest).unwrap(), mine, 0)?,
@@ -548,14 +568,27 @@ impl Root {
             return Ok(());
         }
         let at = self.entry(e, &parent.join(OsStr::from_bytes(name)), m, mine)?;
-        mine.entries.extend(key(at.dir.as_raw_fd(), &at.name));
+        let dir_id = at.dir_id.or_else(|| stat_at(at.dir.as_raw_fd(), c"").map(|st| (st.st_dev, st.st_ino)));
+        if let Some(st) = stat_at(at.dir.as_raw_fd(), &at.name) {
+            let entry_key = if st.st_mode & libc::S_IFMT == libc::S_IFDIR {
+                Some((st.st_dev, st.st_ino, CString::default()))
+            } else {
+                dir_id.map(|(dev, ino)| (dev, ino, at.name.clone()))
+            };
+            mine.entries.extend(entry_key);
+        }
         // Up from where the entry landed, which a symlinked parent may have moved.
-        let (root, mut dir) = (key(self.fd.as_raw_fd(), c""), at.dir);
-        while let Some(k) = key(dir.as_raw_fd(), c"").filter(|k| Some(k) != root.as_ref()) {
-            if !mine.entries.insert(k) {
-                break;
+        if let Some((dev, ino)) = dir_id {
+            let dir_key = (dev, ino, CString::default());
+            if Some(&dir_key) != self.root_key.as_ref() && mine.entries.insert(dir_key) {
+                let mut dir = open_dir_at(at.dir.as_raw_fd(), c"..")?;
+                while let Some(k) = key(dir.as_raw_fd(), c"").filter(|k| Some(k) != self.root_key.as_ref()) {
+                    if !mine.entries.insert(k) {
+                        break;
+                    }
+                    dir = open_dir_at(dir.as_raw_fd(), c"..")?;
+                }
             }
-            dir = open_dir_at(dir.as_raw_fd(), c"..")?;
         }
         Ok(())
     }
@@ -572,12 +605,16 @@ impl Root {
         }
         // Anything else replaces what is there (a hard link, unless it is that already).
         if kind != T::Directory {
+            if stat_at(at.dir.as_raw_fd(), &at.name).is_some_and(|st| matches!(st.st_mode & libc::S_IFMT, libc::S_IFDIR | libc::S_IFLNK)) {
+                self.invalidate_parent_cache();
+            }
             forget(at.dir.as_raw_fd(), &at.name, mine, 0)?;
         }
         let (dfd, name) = (at.dir.as_raw_fd(), at.name.as_ptr());
         match kind {
             T::Directory => {
                 if !is_type(dfd, &at.name, libc::S_IFDIR) {
+                    self.invalidate_parent_cache();
                     self.create(|| {
                         at.remove()?;
                         check(unsafe { libc::mkdirat(dfd, name, 0o700) }, "mkdir", rel)
@@ -598,6 +635,7 @@ impl Root {
                 return Ok(at);
             }
             T::Symlink => {
+                self.invalidate_parent_cache();
                 let target = m.link.as_ref().ok_or("symlink without target")?;
                 self.create(|| {
                     at.remove()?;
@@ -697,12 +735,15 @@ impl Root {
         }
         injected.secure_kernel_directory(Path::new("lib/modules"))?;
         let old = injected.at(&prefix, true)?;
+        injected.invalidate_parent_cache();
         old.remove()?;
         let module_root = injected.secure_kernel_directory(&prefix)?;
         let manifest_root = injected.secure_kernel_directory(Path::new("usr/lib/flexvm"))?;
         let source_root = if bundle.manifest.development {
             injected.secure_kernel_directory(Path::new("usr/src/flexvm"))?;
+            injected.invalidate_parent_cache();
             injected.at(Path::new("usr/src/flexvm"), false)?.remove()?;
+            injected.invalidate_parent_cache();
             Some(injected.secure_kernel_directory(Path::new("usr/src/flexvm"))?)
         } else {
             None
@@ -750,6 +791,7 @@ impl Root {
             }
             Ok(())
         })?;
+        self.invalidate_parent_cache();
         self.entries = self.entries.saturating_add(injected.entries);
         self.limits.entries = self.limits.entries.saturating_add(injected.entries);
         Ok(())
@@ -774,7 +816,7 @@ impl Root {
     /// Child creation (including injected files) changes the root's mtime.
     pub fn restore_root_metadata(&mut self) -> Result<()> {
         if let Some((h, m)) = &self.root_meta {
-            let at = At { dir: self.resolve(Path::new(""))?, name: c".".to_owned() };
+            let at = At { dir: self.resolve(Path::new(""))?, dir_id: None, name: c".".to_owned() };
             self.has_xattrs |= Self::metadata(&at, h, m, Path::new("/"), None)?;
         }
         Ok(())
@@ -806,6 +848,7 @@ impl Root {
 
     pub fn write_file(&mut self, rel: &str, data: &[u8], mode: u32) -> Result<()> {
         let at = self.at(Path::new(rel), true)?;
+        self.invalidate_parent_cache();
         let mut f = self.create(|| at.create())?;
         f.write_all(data)?;
         own(&f, Path::new(rel))?;
@@ -824,6 +867,7 @@ impl Root {
 
     pub fn write_symlink(&mut self, rel: &str, target: &str) -> Result<()> {
         let at = self.at(Path::new(rel), true)?;
+        self.invalidate_parent_cache();
         if stat_at(at.dir.as_raw_fd(), &at.name).is_some() {
             unlink_at(at.dir.as_raw_fd(), &at.name)?;
         }
@@ -1615,5 +1659,24 @@ pub(super) mod tests {
         let n = unsafe { libc::getxattr(c_path.as_ptr(), c_key.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
         assert_eq!(n, 11);
         assert_eq!(&buf[..11], b"hello xattr");
+    }
+
+    #[test]
+    fn parent_cache_invalidates_on_symlink_replacement_and_whiteout() {
+        // Replacing a self-referential symlink through itself must invalidate the cached parent fd.
+        let s = Sandbox::new("cache-symlink-replace");
+        let tar = layer(&[("a/", 'd', ""), ("a/b", 'l', "."), ("a/b/b", 'f', "file"), ("a/b/c", 'f', "must-fail")]);
+        assert!(s.open().apply_layer(&tar[..]).is_err());
+        assert_eq!(s.read("a/b").as_deref(), Some("file"));
+        assert!(!s.root.join("a/c").exists());
+
+        // A whiteout removing a cached directory must invalidate the cache before subsequent entries.
+        let s = Sandbox::new("cache-whiteout");
+        let mut root = s.open();
+        root.apply_layer(&layer(&[("dir/old", 'f', "1")])[..]).unwrap();
+        root.apply_layer(&layer(&[("dir/x", 'f', "2"), (".wh.dir", 'f', ""), ("dir/new", 'f', "3")])[..]).unwrap();
+        assert_eq!(s.read("dir/old"), None);
+        assert_eq!(s.read("dir/x").as_deref(), Some("2"));
+        assert_eq!(s.read("dir/new").as_deref(), Some("3"));
     }
 }
