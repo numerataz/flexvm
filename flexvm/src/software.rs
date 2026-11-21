@@ -1186,7 +1186,11 @@ fn restore_config(manifest: &software_state::Manifest) -> qemu::Config {
         max_mib: manifest.max_memory_mib.unwrap_or(manifest.memory_mib),
         vcpus: manifest.vcpus,
         boot_timeout: Duration::from_secs(120),
-        parent_kvm: None,
+        parent_kvm: manifest.parent.as_ref().map(|parent| qemu::ParentKvm {
+            bundle: PathBuf::new(),
+            engine: "tcg".into(),
+            child_mem_mib: parent.child_memory_mib,
+        }),
     }
 }
 
