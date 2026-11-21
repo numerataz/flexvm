@@ -16,8 +16,9 @@
 //! in, and a step. `mark` is a leaf lock, never held across admission (the
 //! host lock), which callers may hold around `restore`.
 
-use std::io::{Read, Seek};
+use std::io::Read;
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -260,12 +261,9 @@ impl Limit {
         m.lifted = true;
         self.write(&m);
         drop(m);
-        let throttled = |pid: u32| {
-            let tasks = std::fs::read_dir(format!("/proc/{pid}/task")).into_iter().flatten().flatten();
-            tasks.into_iter().any(|t| std::fs::read_to_string(t.path().join("wchan")).is_ok_and(|w| w.contains("handle_over_high")))
-        };
+        let task_dir = firecracker.map(|pid| format!("/proc/{pid}/task"));
         let since = Instant::now();
-        while firecracker.is_some_and(throttled) && since.elapsed() < THROTTLE_MAX {
+        while task_dir.as_deref().is_some_and(task_throttled) && since.elapsed() < THROTTLE_MAX {
             std::thread::sleep(Duration::from_millis(5));
         }
         Lifted(self)
@@ -283,11 +281,11 @@ impl Limit {
     /// throttled otherwise: nothing is asked for it).
     pub fn watch(&self, host: &Host, tick: Duration, live: impl Fn() -> bool, running: impl Fn() -> bool) {
         let Some(cg) = &self.cgroup else { return };
-        let mut events = std::fs::File::open(cg.join("memory.events")).ok();
+        let events = std::fs::File::open(cg.join("memory.events")).ok();
         // Its own, not the plug path's: that one asks more often for more, and would take each retry.
         let mut backoff = GrantBackoff::default();
         while live() {
-            wait_event(events.as_mut(), tick);
+            wait_event(events.as_ref(), tick);
             if !running() {
                 self.set_throttled(false);
                 std::thread::sleep(tick);
@@ -360,12 +358,22 @@ impl Drop for Building {
     }
 }
 
+/// Whether any thread in `/proc/{pid}/task` is currently sleeping in `handle_over_high`.
+fn task_throttled(task_dir: &str) -> bool {
+    let mut buf = [0u8; 128];
+    std::fs::read_dir(task_dir).into_iter().flatten().flatten().any(|t| {
+        std::fs::File::open(t.path().join("wchan"))
+            .and_then(|mut f| f.read(&mut buf))
+            .is_ok_and(|n| std::str::from_utf8(&buf[..n]).is_ok_and(|w| w.contains("handle_over_high")))
+    })
+}
+
 /// Waits until the cgroup file changes (POLLPRI) or `tick` passes.
-fn wait_event(f: Option<&mut std::fs::File>, tick: Duration) {
+fn wait_event(f: Option<&std::fs::File>, tick: Duration) {
     let Some(f) = f else { return std::thread::sleep(tick) };
     // Reading it rearms the notification.
-    let mut buf = String::new();
-    let _ = f.rewind().and_then(|()| f.read_to_string(&mut buf));
+    let mut buf = [0u8; 256];
+    let _ = f.read_at(&mut buf, 0);
     let mut pfd = libc::pollfd { fd: f.as_raw_fd(), events: libc::POLLPRI, revents: 0 };
     unsafe { libc::poll(&mut pfd, 1, tick.as_millis() as i32) };
 }
@@ -707,5 +715,19 @@ mod tests {
     fn steps_scale_with_the_vm() {
         assert_eq!((step(0), step(1024), step(4096), step(100_000)), (256, 256, 1024, 2048));
         assert_eq!(step(1500), 384);
+    }
+
+    #[test]
+    fn task_throttled_detects_handle_over_high_without_allocating_contents() {
+        let dir = crate::test_util::TempDir::new("limit-wchan");
+        let t1 = dir.join("100");
+        let t2 = dir.join("101");
+        std::fs::create_dir_all(&t1).unwrap();
+        std::fs::create_dir_all(&t2).unwrap();
+        std::fs::write(t1.join("wchan"), "ep_poll").unwrap();
+        std::fs::write(t2.join("wchan"), "0").unwrap();
+        assert!(!task_throttled(dir.to_str().unwrap()));
+        std::fs::write(t2.join("wchan"), "mem_cgroup_handle_over_high").unwrap();
+        assert!(task_throttled(dir.to_str().unwrap()));
     }
 }
