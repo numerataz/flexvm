@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
@@ -250,12 +250,32 @@ fn node(m: &std::fs::Metadata) -> (u64, u64) {
     (m.dev(), m.ino())
 }
 
+/// Immutable boot-time identity cached once per process to avoid re-reading `/proc/cpuinfo` and `boot_id`.
+fn boot_identity() -> Result<&'static (String, Vec<String>)> {
+    static BOOT: OnceLock<(String, Vec<String>)> = OnceLock::new();
+    if let Some(cached) = BOOT.get() {
+        return Ok(cached);
+    }
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    if boot_id.trim().is_empty() {
+        bail!("empty boot id");
+    }
+    // A late microcode load changes what the CPU reports; a host that shows no revision (a guest,
+    // a non-x86 CPU) keeps an empty, still stable, key rather than probing every time.
+    let mut microcode: Vec<_> = std::fs::read_to_string("/proc/cpuinfo")?
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            (key.trim() == "microcode").then(|| value.trim().to_string())
+        })
+        .collect();
+    microcode.dedup();
+    Ok(BOOT.get_or_init(|| (boot_id, microcode)))
+}
+
 impl HostKey {
     fn local(firecracker: Stamp) -> Result<Self> {
-        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
-        if boot_id.trim().is_empty() {
-            bail!("empty boot id");
-        }
+        let (boot_id, microcode) = boot_identity()?.clone();
         let mut modules = vec![None; KVM_MODULES.len()];
         for (slot, name) in modules.iter_mut().zip(KVM_MODULES) {
             match std::fs::metadata(format!("/sys/module/{name}")) {
@@ -265,16 +285,6 @@ impl HostKey {
             }
         }
         let flexvm = Stamp::of(&std::fs::metadata("/proc/self/exe")?);
-        // A late microcode load changes what the CPU reports; a host that shows no revision (a guest,
-        // a non-x86 CPU) keeps an empty, still stable, key rather than probing every time.
-        let mut microcode: Vec<_> = std::fs::read_to_string("/proc/cpuinfo")?
-            .lines()
-            .filter_map(|line| {
-                let (key, value) = line.split_once(':')?;
-                (key.trim() == "microcode").then(|| value.trim().to_string())
-            })
-            .collect();
-        microcode.dedup();
         Ok(Self { boot_id, microcode, flexvm, firecracker, kvm: node(&std::fs::metadata("/dev/kvm")?), modules })
     }
 }
