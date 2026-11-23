@@ -785,7 +785,12 @@ impl Filters {
 
     pub fn matches(&self, v: &Value) -> bool {
         let s = |k: &str| v[k].as_str().unwrap_or_default();
-        let image = v["template"].as_str().map(template::image_of).unwrap_or_default();
+        let image = v["backend"]["image"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| v["template"].as_str().map(template::image_of))
+            .unwrap_or_default();
         self.0.iter().all(|(k, vs)| {
             vs.iter().any(|want| match k.as_str() {
                 // A part of the name, as docker's.
@@ -794,7 +799,10 @@ impl Filters {
                 "status" => s("state") == want || (want == "stopped" && crate::stopped(v)),
                 "image" => {
                     let want_image = template::name_of(want).map(|n| template::image_of(&n));
-                    image == *want || s("template") == want || want_image.is_ok_and(|w| w == image)
+                    let row_image = template::name_of(&image).map(|n| template::image_of(&n));
+                    image == *want
+                        || (!s("template").is_empty() && s("template") == want)
+                        || want_image.as_ref().is_ok_and(|w| *w == image || row_image.as_ref().is_ok_and(|r| w == r))
                 }
                 "ip" => s("ip") == want || want.parse::<std::net::Ipv6Addr>().is_ok_and(|w| s("ipv6").parse() == Ok(w)),
                 _ => false,
@@ -1498,6 +1506,17 @@ mod tests {
             assert!(Filters::parse(&[format!("image={given}")]).unwrap().matches(&web), "{given}");
         }
         assert!(!Filters::parse(&["image=redis".into()]).unwrap().matches(&web));
+    }
+
+    #[test]
+    fn image_filters_match_backend_image() {
+        let mut arm = row("arm", "running", "10.0.0.4", "");
+        arm["backend"] = json!({"kind": "qemu-tcg", "image": "alpine"});
+        for given in ["alpine", "alpine:latest", "docker.io/library/alpine:latest"] {
+            assert!(Filters::parse(&[format!("image={given}")]).unwrap().matches(&arm), "{given}");
+        }
+        assert!(!Filters::parse(&["image=redis".into()]).unwrap().matches(&arm));
+        assert!(!Filters::parse(&["image=".into()]).unwrap().matches(&arm));
     }
 
     #[test]

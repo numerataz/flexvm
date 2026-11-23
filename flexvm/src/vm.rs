@@ -1135,6 +1135,11 @@ impl Resources {
     /// Within what a VM of `meta` has: at most its vCPUs, and from its boot memory plus
     /// what its snapshot plugged (a VM never shrinks below that) to its ceiling.
     pub fn check(&self, meta: &crate::template::Meta) -> Result<()> {
+        self.check_with_plugged(meta, 0)
+    }
+
+    /// Like `check`, also enforcing a checkpoint's already-plugged hotplug memory (`plugged_mib`).
+    pub fn check_with_plugged(&self, meta: &crate::template::Meta, plugged_mib: u64) -> Result<()> {
         if let Some(c) = self.cpus {
             if !(c.is_finite() && c >= 0.01) {
                 bail!("--cpus {c} must be at least 0.01");
@@ -1144,12 +1149,13 @@ impl Resources {
             }
         }
         if let Some(m) = self.memory_mib {
-            let floor = meta.mem_mib + meta.plugged_mib.min(meta.max_mib - meta.mem_mib);
+            let plugged = meta.plugged_mib.max(plugged_mib).min(meta.max_mib - meta.mem_mib);
+            let floor = meta.mem_mib + plugged;
             if m < floor {
+                let what = if plugged_mib > meta.plugged_mib { "its checkpoint" } else { "its snapshot" };
                 bail!(
-                    "--memory {m} MiB is less than the image's boot memory and what its snapshot plugged ({} + {} MiB): give at least {floor}m",
-                    meta.mem_mib,
-                    floor - meta.mem_mib
+                    "--memory {m} MiB is less than the image's boot memory and what {what} plugged ({} + {plugged} MiB): give at least {floor}m",
+                    meta.mem_mib
                 );
             }
             if m > meta.max_mib {
@@ -1467,5 +1473,24 @@ mod tests {
         ] {
             assert!(!rejected(m));
         }
+    }
+
+    #[test]
+    fn check_with_plugged_enforces_checkpoint_hotplug_floor() {
+        let meta: crate::template::Meta = serde_json::from_value(serde_json::json!({
+            "compatibility": {"cpu": "test", "tsc_khz": 2000000, "tsc_control": false, "msrs": [], "firecracker": "test", "features": {}, "xsave": {}},
+            "vcpus": 4, "mem_mib": 384, "max_mib": 384 + 8192, "plugged_mib": 1024, "kernel": "/k", "rootfs": "/r", "id": "tpl", "components": {}
+        }))
+        .unwrap();
+        let mem = |m| super::Resources { cpus: None, memory_mib: Some(m) };
+        // Without checkpoint plugged floor, 384 + 1024 is accepted; with checkpoint hotplug_mib=4096 it is rejected.
+        mem(384 + 1024).check(&meta).unwrap();
+        let err = mem(384 + 2048).check_with_plugged(&meta, 4096).unwrap_err().to_string();
+        assert!(err.contains("its checkpoint") && err.contains("4480m"), "{err}");
+        mem(384 + 4096).check_with_plugged(&meta, 4096).unwrap();
+        // Template's own plugged_mib floor still applies when checkpoint hotplug_mib is smaller.
+        assert!(mem(384 + 512).check_with_plugged(&meta, 256).is_err());
+        // Plugged floor is clamped to max_mib - mem_mib so max_mib remains valid.
+        mem(384 + 8192).check_with_plugged(&meta, 16384).unwrap();
     }
 }
