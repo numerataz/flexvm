@@ -1064,8 +1064,14 @@ pub fn peer_pid(s: &UnixStream) -> io::Result<u32> {
 }
 
 pub fn peer_cred(s: &UnixStream) -> io::Result<libc::ucred> {
-    let cred = rustix::net::sockopt::socket_peercred(s)?;
-    Ok(libc::ucred { pid: cred.pid.as_raw_nonzero().get(), uid: cred.uid.as_raw(), gid: cred.gid.as_raw() })
+    // Do not use `rustix::net::sockopt::socket_peercred`: its `UCred.pid` is `NonZeroI32`,
+    // whereas Linux returns `pid == 0` for a peer in an ancestor/different PID namespace (#1146).
+    let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    if unsafe { libc::getsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&mut cred as *mut libc::ucred).cast(), &mut len) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(cred)
 }
 
 pub fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
@@ -3294,6 +3300,42 @@ mod tests {
         assert!(sync_dir(&root.join("moved/a/b")).is_ok());
         std::fs::write(root.join("f"), "").unwrap();
         assert!(sync_dir(&root.join("f")).is_err());
+    }
+
+    #[test]
+    fn peer_cred_allows_zero_pid_across_pid_namespaces() {
+        const CHILD_SOCK: &str = "FLEXVM_PEERCRED_PIDNS_SOCK";
+        if let Some(sock) = std::env::var_os(CHILD_SOCK) {
+            let stream = UnixStream::connect(sock).unwrap();
+            let cred = peer_cred(&stream).unwrap();
+            assert_eq!(cred.pid, 0, "ancestor PID namespace peer must report pid 0");
+            assert_eq!(cred.uid, rustix::process::geteuid().as_raw());
+            return;
+        }
+        // Same-namespace sanity check.
+        let (a, _b) = UnixStream::pair().unwrap();
+        let cred = peer_cred(&a).unwrap();
+        assert_eq!(cred.pid as u32, std::process::id());
+        assert_eq!(cred.uid, rustix::process::geteuid().as_raw());
+
+        // Cross-PID-namespace check: listener in ancestor PID ns, client in child PID ns.
+        if !std::process::Command::new("unshare").args(["-Urpf", "true"]).status().is_ok_and(|s| s.success()) {
+            return;
+        }
+        let dir = crate::test_util::TempDir::new("peercred-pidns");
+        let sock = dir.join("peer.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let accept = std::thread::spawn(move || listener.accept().unwrap().0);
+        let out = std::process::Command::new("unshare")
+            .args(["-Urpf"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "util::tests::peer_cred_allows_zero_pid_across_pid_namespaces", "--nocapture"])
+            .env(CHILD_SOCK, &sock)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "child failed:\nstdout: {}\nstderr: {}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let accepted = accept.join_within().unwrap();
+        assert_eq!(peer_cred(&accepted).unwrap().uid, rustix::process::geteuid().as_raw());
     }
 }
 
