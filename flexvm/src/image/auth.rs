@@ -98,7 +98,7 @@ fn prompt(label: &str, secret: bool) -> Result<String> {
                 crate::attach::restore_terminal();
                 crate::util::raise_signal(sig)
             });
-            crate::attach::term(|t| t.c_lflag &= !libc::ECHO)
+            crate::attach::term(|t| t.local_modes.remove(rustix::termios::LocalModes::ECHO))
         })
         .transpose()?;
     let mut value = String::new();

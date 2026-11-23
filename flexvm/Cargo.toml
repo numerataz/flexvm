@@ -8,6 +8,7 @@ publish = false
 
 [dependencies]
 libc.workspace = true
+rustix = { version = "1", features = ["fs", "net", "process", "event", "termios"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 # Container image templates: registry pulls over HTTPS, digests, layer formats.

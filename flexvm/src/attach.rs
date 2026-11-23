@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -33,34 +33,33 @@ const MAX_UNACKED: usize = 1 << 20;
 /// docker's detach keys, Ctrl-P Ctrl-Q.
 const DETACH_KEYS: [u8; 2] = [0x10, 0x11];
 
-static SAVED: Mutex<Option<libc::termios>> = Mutex::new(None);
+static SAVED: Mutex<Option<rustix::termios::Termios>> = Mutex::new(None);
 
 pub fn is_tty(fd: i32) -> bool {
-    unsafe { libc::isatty(fd) == 1 }
+    // SAFETY: Caller passes a valid file descriptor (typically 0/1/2).
+    rustix::termios::isatty(unsafe { BorrowedFd::borrow_raw(fd) })
 }
 
 /// Stdin's terminal as `change` made it until dropped (or `restore_terminal`, which a panic's hook calls too).
 pub struct Term(());
 
-pub fn term(change: impl FnOnce(&mut libc::termios)) -> Result<Term> {
-    let mut t: libc::termios = unsafe { std::mem::zeroed() };
-    if unsafe { libc::tcgetattr(0, &mut t) } != 0 {
-        return Err(format!("the terminal: {}", std::io::Error::last_os_error()).into());
-    }
+pub fn term(change: impl FnOnce(&mut rustix::termios::Termios)) -> Result<Term> {
+    let stdin = std::io::stdin();
+    let mut t = rustix::termios::tcgetattr(&stdin).map_err(|e| format!("the terminal: {}", std::io::Error::from(e)))?;
     // Held until changed: a signal's `restore_terminal` meanwhile waits, then puts it back.
     let mut saved = SAVED.lock().unwrap_or_else(|e| e.into_inner());
-    *saved = Some(t);
+    *saved = Some(t.clone());
     change(&mut t);
-    if unsafe { libc::tcsetattr(0, libc::TCSANOW, &t) } != 0 {
+    if let Err(e) = rustix::termios::tcsetattr(&stdin, rustix::termios::OptionalActions::Now, &t) {
         saved.take();
-        return Err(format!("the terminal: {}", std::io::Error::last_os_error()).into());
+        return Err(format!("the terminal: {}", std::io::Error::from(e)).into());
     }
     Ok(Term(()))
 }
 
 /// Raw mode: keys, Ctrl-C too, go to the guest.
 pub fn raw() -> Result<Term> {
-    term(|t| unsafe { libc::cfmakeraw(t) })
+    term(rustix::termios::Termios::make_raw)
 }
 
 impl Drop for Term {
@@ -74,15 +73,21 @@ pub fn restore_terminal() {
     // Waits for a `term` under way (never long: nothing in it panics), so what it changes is put back too.
     let saved = SAVED.lock().unwrap_or_else(|e| e.into_inner()).take();
     if let Some(t) = saved {
-        unsafe { libc::tcsetattr(0, libc::TCSANOW, &t) };
+        let _ = rustix::termios::tcsetattr(std::io::stdin(), rustix::termios::OptionalActions::Now, &t);
     }
 }
 
 /// The terminal's rows and columns.
 pub fn size() -> Option<(u16, u16)> {
-    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
-    [0, 1, 2].into_iter().find(|&fd| unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_row > 0)?;
-    Some((ws.ws_row, ws.ws_col))
+    let (stdin, stdout, stderr) = (std::io::stdin(), std::io::stdout(), std::io::stderr());
+    for fd in [stdin.as_fd(), stdout.as_fd(), stderr.as_fd()] {
+        if let Ok(ws) = rustix::termios::tcgetwinsize(fd) {
+            if ws.ws_row > 0 {
+                return Some((ws.ws_row, ws.ws_col));
+            }
+        }
+    }
+    None
 }
 
 /// Ends the process as if it had not touched the terminal.
