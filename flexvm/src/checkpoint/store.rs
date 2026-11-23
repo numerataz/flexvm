@@ -299,7 +299,7 @@ pub fn remove(state: &Path, whats: &[String], force: bool) -> Result<Vec<Value>>
     if names.iter().any(|n| all.dangling.contains(n)) {
         all.complete().map_err(|e| format!("nothing removed: {e}"))?;
     }
-    let names: Vec<PathBuf> = names.iter().map(|n| all.names.join(n)).collect();
+    let names: Vec<PathBuf> = names.iter().map(|n| all.names.join(n)).collect::<BTreeSet<_>>().into_iter().collect();
     if whats.is_empty() {
         return unname(&names);
     }
@@ -576,5 +576,27 @@ mod tests {
         let error = rows.iter().find(|row| row["id"].is_null()).unwrap();
         assert_eq!(error["directory"], names.to_str().unwrap());
         assert!(error["error"].as_str().unwrap().contains("listing"));
+    }
+
+    #[test]
+    fn duplicate_dangling_and_malformed_names_deduplicate_in_remove() {
+        let state = crate::test_util::TempDir::new("duplicate-dangling");
+        let checkpoint = unreadable(&state);
+        let names = dir(&state).join(NAMES);
+        symlink("../aaaaaaaaaaaaaaaa", names.join("old")).unwrap();
+        assert_eq!(remove(&state, &["old".into(), "old".into()], false).unwrap(), [json!({"deleted": null, "name": "old"})]);
+        assert!(fs::symlink_metadata(names.join("old")).is_err());
+        assert!(checkpoint.exists());
+
+        symlink("../aaaaaaaaaaaaaaaa", names.join("old")).unwrap();
+        fs::write(names.join("bad"), b"not a link").unwrap();
+        let deleted = remove(&state, &["old".into(), "old".into(), "bad".into(), "bad".into(), "0123456789abcdef".into()], true).unwrap();
+        assert_eq!(
+            deleted,
+            [json!({"deleted": null, "name": "bad"}), json!({"deleted": null, "name": "old"}), json!({"deleted": "0123456789abcdef", "name": null}),]
+        );
+        assert!(fs::symlink_metadata(names.join("old")).is_err());
+        assert!(fs::symlink_metadata(names.join("bad")).is_err());
+        assert!(!checkpoint.exists());
     }
 }

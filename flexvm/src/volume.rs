@@ -315,8 +315,8 @@ impl Catalog {
         let mut held = Vec::new();
         for name in &names {
             let file = member(&dir, name, libc::O_RDWR)?;
-            crate::host::flock(&file, libc::LOCK_EX | libc::LOCK_NB).map_err(|error| format!("retired volume is still in use: {error}"))?;
-            held.push(file);
+            let locked = crate::host::Flock::new(file, libc::LOCK_EX | libc::LOCK_NB).map_err(|error| format!("retired volume is still in use: {error}"))?;
+            held.push(locked);
         }
         for name in names {
             util::check(unsafe { libc::unlinkat(dir.as_raw_fd(), util::cname(&name).as_ptr(), 0) })?;
@@ -369,13 +369,18 @@ impl Catalog {
     pub fn clone_volume(&self, source: &str, name: &str) -> Result<Info> {
         let _catalog = self.lock(libc::LOCK_EX)?;
         let (info, disk) = self.locked_writer(source)?;
-        self.create_locked(name, info.metadata.capacity_bytes, |target| {
-            copy_raw(&disk, target, info.metadata.capacity_bytes)?;
-            if disk.metadata()?.len() != info.metadata.capacity_bytes {
+        let disk = crate::host::Flock(disk);
+        let cloned = self.create_locked(name, info.metadata.capacity_bytes, |target| {
+            copy_raw(&disk.0, target, info.metadata.capacity_bytes)?;
+            if disk.0.metadata()?.len() != info.metadata.capacity_bytes {
                 bail!("source volume capacity changed during clone");
             }
             Ok(())
-        })
+        });
+        #[cfg(test)]
+        tests::before_disk_unlock();
+        drop(disk);
+        cloned
     }
 
     // The caller holds the catalog mutation lock through population and publication.
@@ -418,9 +423,11 @@ impl Catalog {
         if entries(&dir)?.iter().any(|n| !MEMBERS.contains(&n.as_str())) {
             bail!("unrecognized volume member; removal refused");
         }
-        crate::host::flock(&disk, libc::LOCK_EX | libc::LOCK_NB).map_err(|error| format!("volume is still in use: {error}"))?;
+        let disk = crate::host::Flock::new(disk, libc::LOCK_EX | libc::LOCK_NB).map_err(|error| format!("volume is still in use: {error}"))?;
         let tombstone = format!(".deleting-v1-{id}");
         rename(&self.directory, &id, &tombstone)?;
+        #[cfg(test)]
+        tests::before_disk_unlock();
         // cleanup obtains a fresh flock, so release only this local removal hold.
         drop(disk);
         self.cleanup(&tombstone)
@@ -430,9 +437,24 @@ impl Catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::io::{Seek, SeekFrom};
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
+
+    type Hook = Box<dyn FnOnce()>;
+
+    thread_local! {
+        static BEFORE_DISK_UNLOCK: RefCell<Option<Hook>> = RefCell::new(None);
+    }
+
+    pub(super) fn before_disk_unlock() {
+        BEFORE_DISK_UNLOCK.with(|hook| {
+            if let Some(run) = hook.borrow_mut().take() {
+                run();
+            }
+        });
+    }
 
     #[test]
     fn retained_sparse_volume_has_stable_identity_and_data() {
@@ -664,5 +686,86 @@ mod tests {
         assert!(catalog.remove("data").is_err());
         assert!(unexpected.exists());
         assert_eq!(catalog.inspect("data").unwrap().metadata.id, id);
+    }
+
+    #[test]
+    fn remove_and_clone_unlock_disk_before_an_inherited_child_execs() {
+        use crate::test_util::JoinWithin;
+        const CHILD: &str = "FLEXVM_TEST_VOLUME_DISK_FORK";
+        if std::env::var_os(CHILD).is_none() {
+            let status = crate::test_util::status(
+                Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "volume::tests::remove_and_clone_unlock_disk_before_an_inherited_child_execs"])
+                    .env(CHILD, "1"),
+            )
+            .unwrap();
+            assert!(status.success(), "volume disk fork helper: {status}");
+            return;
+        }
+        struct Release(std::os::unix::net::UnixStream);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                let _ = self.0.write_all(b"r");
+            }
+        }
+        fn spawn_pre_exec_holder() -> (Release, std::thread::JoinHandle<std::io::Result<std::process::ExitStatus>>) {
+            let (parent, child) = std::os::unix::net::UnixStream::pair().unwrap();
+            parent.set_read_timeout(Some(crate::test_util::WAIT)).unwrap();
+            child.set_read_timeout(Some(crate::test_util::WAIT)).unwrap();
+            let mut release = Release(parent);
+            let spawner = std::thread::spawn(move || {
+                let fd = child.as_raw_fd();
+                let mut command = Command::new("true");
+                unsafe {
+                    command.pre_exec(move || {
+                        if libc::write(fd, b"f".as_ptr().cast(), 1) != 1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        let mut byte = 0u8;
+                        if libc::read(fd, (&mut byte as *mut u8).cast(), 1) != 1 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
+                }
+                command.status()
+            });
+            release.0.read_exact(&mut [0]).unwrap();
+            (release, spawner)
+        }
+
+        let state = crate::test_util::TempDir::new("volume-disk-fork");
+        let catalog = Catalog::open(&state).unwrap();
+        catalog.create("src", 512).unwrap();
+
+        // 1. clone_volume must explicitly LOCK_UN its source disk flock before returning.
+        let holder = std::rc::Rc::new(RefCell::new(None));
+        let holder_clone = holder.clone();
+        BEFORE_DISK_UNLOCK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                *holder_clone.borrow_mut() = Some(spawn_pre_exec_holder());
+            }));
+        });
+        catalog.clone_volume("src", "dst").unwrap();
+        let writer = catalog.writer("src");
+        let (release, spawner) = holder.borrow_mut().take().expect("clone hook must run");
+        drop(release);
+        assert!(spawner.join_within().unwrap().unwrap().success());
+        writer.unwrap();
+
+        // 2. remove must explicitly LOCK_UN its disk flock before cleanup() re-locks it.
+        let holder = std::rc::Rc::new(RefCell::new(None));
+        let holder_clone = holder.clone();
+        BEFORE_DISK_UNLOCK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                *holder_clone.borrow_mut() = Some(spawn_pre_exec_holder());
+            }));
+        });
+        let removed = catalog.remove("src");
+        let (release, spawner) = holder.borrow_mut().take().expect("remove hook must run");
+        drop(release);
+        assert!(spawner.join_within().unwrap().unwrap().success());
+        removed.unwrap();
+        assert!(catalog.inspect("src").is_err());
     }
 }

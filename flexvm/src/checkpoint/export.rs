@@ -803,7 +803,8 @@ pub fn load_dir(state: &Path, paths: &Paths, dir: &Path, name: Option<&str>, sha
 /// The checkpoint name `names/NAME` links to, if any.
 fn named(state: &Path, name: &str) -> Option<String> {
     let target = std::fs::read_link(store::dir(state).join("names").join(name)).ok()?;
-    Some(target.file_name()?.to_string_lossy().into_owned())
+    let id = target.file_name()?.to_str()?;
+    (store::is_id(id) && target == Path::new("..").join(id)).then(|| id.to_string())
 }
 
 /// How a load has the chain's template generation.
@@ -918,7 +919,7 @@ fn import(
     if how != How::Received {
         src.end()?;
     }
-    let (id, stored) = match publish(state, &mut loaded, name.as_deref()) {
+    let (id, stored) = match publish(state, &mut loaded, name.as_deref(), _claim.is_some()) {
         Ok(done) => done,
         // Nothing of it stays: not the template it brought either, unless something here uses it by now.
         Err(Abort::Undo(e)) => {
@@ -964,7 +965,7 @@ impl<E: Into<crate::util::Error>> From<E> for Abort {
 /// revoke it) or removed (`rm`, `prune`) meanwhile. Whatever is under an id now, found before or
 /// published since, is used only if it has the very files verified here, its id being no
 /// cryptographic check. On failure, what it published goes again.
-fn publish(state: &Path, loaded: &mut [Loaded], name: Option<&str>) -> std::result::Result<(String, usize), Abort> {
+fn publish(state: &Path, loaded: &mut [Loaded], name: Option<&str>, claimed: bool) -> std::result::Result<(String, usize), Abort> {
     let store_dir = store::dir(state);
     let dir = open_dir_at(libc::AT_FDCWD, &CString::new(store_dir.as_os_str().as_bytes())?)?;
     crate::util::sync_ancestors_fd(dir.as_raw_fd())?;
@@ -1016,12 +1017,13 @@ fn publish(state: &Path, loaded: &mut [Loaded], name: Option<&str>) -> std::resu
         ensure!(!tests::FAIL_NAMING.get(), "injected: naming it failed");
         if let Some(n) = name {
             if named(state, n).as_deref() != Some(id.as_str()) {
+                let _late_claim = (!claimed).then(|| store::claim(state, n).map_err(|e| format!("{e}; give another with --name"))).transpose()?;
                 if let Err(e) = store::link(state, n, &id) {
                     // Perhaps linked, not durably: it goes before what it names, or that stays (also
                     // when whether it is there is not known).
                     let link = store::dir(state).join("names").join(n);
                     match std::fs::read_link(&link) {
-                        Ok(to) if to.file_name() == Some(id.as_ref()) => {
+                        Ok(to) if to == Path::new("..").join(&id) => {
                             if let Err(u) = crate::util::unlink_durably(&link) {
                                 return Err(Abort::Keep(format!("{e}; removing the name failed too: {u}").into()));
                             }
@@ -1670,5 +1672,62 @@ mod tests {
         let e = load_bytes(&b, &tar, None).err().unwrap().to_string();
         assert!(e.contains("a restore here reads"), "{e}");
         assert!(nothing(&b));
+    }
+
+    #[test]
+    fn named_rejects_malformed_symlink_targets() {
+        let (_dir, paths, _tpl, _state, chain, tar) = saved();
+        let h = fresh(&paths);
+        let names = store::dir(&h.state).join("names");
+        fs::create_dir_all(&names).unwrap();
+        for bad in [Path::new("/outside").join(&chain[0]), Path::new("../..").join(&chain[0]), Path::new("..").join("not-a-hex-id")] {
+            let link = names.join("web");
+            let _ = fs::remove_file(&link);
+            std::os::unix::fs::symlink(&bad, &link).unwrap();
+            assert_eq!(named(&h.state, "web"), None, "malformed target {} must not match", bad.display());
+            let err = load_bytes(&h, &tar, None).unwrap_err().to_string();
+            assert!(err.contains("--name"), "malformed target {}: {err}", bad.display());
+            assert!(nothing(&h));
+        }
+        let link = names.join("web");
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(Path::new("..").join(&chain[0]), &link).unwrap();
+        assert_eq!(named(&h.state, "web").as_deref(), Some(chain[0].as_str()));
+    }
+
+    #[test]
+    fn load_respects_name_claim_taken_after_concurrent_rm() {
+        let (_dir, paths, _tpl, _state, chain, tar) = saved();
+        let h = fresh(&paths);
+        load_bytes(&h, &tar, None).unwrap();
+        assert_eq!(named(&h.state, "web").as_deref(), Some(chain[0].as_str()));
+        struct Race<'a> {
+            bytes: &'a [u8],
+            read: usize,
+            state: &'a Path,
+            head: String,
+            claim: Option<store::NameClaim>,
+        }
+        impl Read for Race<'_> {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                // Trigger after `import()` has read HEADER and passed its initial `named()` check,
+                // while it is still reading `base` (before `receive()` inspects `head`).
+                if self.claim.is_none() && self.read >= 2 * BLOCK {
+                    store::remove(self.state, std::slice::from_ref(&self.head), false).unwrap();
+                    self.claim = Some(store::claim(self.state, "web").unwrap());
+                }
+                let n = self.bytes.read(out)?;
+                self.read += n;
+                Ok(n)
+            }
+        }
+        let mut src = Race { bytes: &tar[..], read: 0, state: &h.state, head: chain[0].clone(), claim: None };
+        let err = load(&h.state, &h.paths, &mut src, None, None, &BTreeSet::new).unwrap_err().to_string();
+        assert!(src.claim.is_some(), "race must have triggered mid-load");
+        assert!(err.contains("being taken"), "{err}");
+        assert_eq!(named(&h.state, "web"), None);
+        assert_eq!(ids(&h.state), [chain[1].clone()]);
+        drop(src.claim);
+        assert!(store::claim(&h.state, "web").is_ok());
     }
 }
