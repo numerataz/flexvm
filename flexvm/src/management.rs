@@ -7,9 +7,10 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use crate::cli::{CheckpointCmd, GlobalArgs};
 use crate::template::Paths;
 use crate::util::Result;
-use crate::{bail, output, Args};
+use crate::{bail, output};
 
 #[derive(Default)]
 pub struct Filters {
@@ -116,29 +117,29 @@ fn confirm(force: bool, what: &str) -> Result<()> {
 
 /// `system df`, and `image prune` / `system prune`: unnamed generations no VM here uses (as `rmi ID`
 /// removes them), and for `system`, failed and lost VM records and the layer blob cache too.
-pub fn system(args: &Args, operation: &str) -> Result<()> {
-    let system = args.positional.first().is_some_and(|c| c == "system");
-    if operation == "prune" {
-        confirm(args.has("force"), if system { "unused <none> images, failed and lost VM records and the layer blob cache" } else { "unused <none> images" })?;
-    }
-    let host = crate::open_host(args)?;
+pub fn system_df(global: &GlobalArgs) -> Result<()> {
+    let host = crate::open_host(global, false)?;
     let paths = Paths::new(&host.state);
-    if operation == "df" {
-        let mut seen = BTreeSet::new();
-        output(format_args!("{:<16} {:>16}\n", "TYPE", "ALLOCATED BYTES"))?;
-        // Checkpoints: stored ones (`checkpoint::store`) and stopped VMs'.
-        for (kind, dirs) in [
-            ("Images", vec![paths.images.join("rootfs")]),
-            ("Templates", vec![paths.templates.clone()]),
-            ("Blobs", vec![paths.images.join("blobs")]),
-            ("VMs", vec![host.run.join("vms")]),
-            ("Checkpoints", vec![crate::checkpoint::store::dir(&host.state), host.state.join("suspended")]),
-        ] {
-            let bytes = dirs.iter().map(|d| root_usage(d, &mut seen)).sum::<Result<u64>>()?;
-            output(format_args!("{kind:<16} {bytes:>16}\n"))?;
-        }
-        return Ok(());
+    let mut seen = BTreeSet::new();
+    output(format_args!("{:<16} {:>16}\n", "TYPE", "ALLOCATED BYTES"))?;
+    // Checkpoints: stored ones (`checkpoint::store`) and stopped VMs'.
+    for (kind, dirs) in [
+        ("Images", vec![paths.images.join("rootfs")]),
+        ("Templates", vec![paths.templates.clone()]),
+        ("Blobs", vec![paths.images.join("blobs")]),
+        ("VMs", vec![host.run.join("vms")]),
+        ("Checkpoints", vec![crate::checkpoint::store::dir(&host.state), host.state.join("suspended")]),
+    ] {
+        let bytes = dirs.iter().map(|d| root_usage(d, &mut seen)).sum::<Result<u64>>()?;
+        output(format_args!("{kind:<16} {bytes:>16}\n"))?;
     }
+    Ok(())
+}
+
+pub fn system_prune(global: &GlobalArgs, system: bool, force: bool, force_shared: bool) -> Result<()> {
+    confirm(force, if system { "unused <none> images, failed and lost VM records and the layer blob cache" } else { "unused <none> images" })?;
+    let host = crate::open_host(global, false)?;
+    let paths = Paths::new(&host.state);
     let total = || -> Result<u64> {
         let mut seen = BTreeSet::new();
         Ok(root_usage(&paths.images, &mut seen)? + root_usage(&paths.templates, &mut seen)? + root_usage(&host.run.join("vms"), &mut seen)?)
@@ -154,7 +155,7 @@ pub fn system(args: &Args, operation: &str) -> Result<()> {
             }
         }
     }
-    for removed in crate::template::prune(&paths, None, &|| host.template_users(), args.has("force-shared"))? {
+    for removed in crate::template::prune(&paths, None, &|| host.template_users(), force_shared)? {
         crate::print(removed)?;
     }
     if system {
@@ -178,41 +179,41 @@ const CHECKPOINT_FIELDS: crate::containers::Fields = &[
     ("Error", "error"),
 ];
 
-/// `checkpoint ls|rm|prune` (`checkpoint create` is the VM's).
-pub fn checkpoints(args: &Args, operation: &str) -> Result<()> {
+/// `checkpoint ls|rm|prune|save|load` (`checkpoint create` is the VM's).
+pub fn checkpoints(global: &GlobalArgs, cmd: &CheckpointCmd) -> Result<()> {
     use crate::checkpoint::store;
-    let host = crate::open_host(args)?;
-    let removed = match operation {
-        "ls" => return list_checkpoints(&host, args),
-        "save" => return save_checkpoint(&host, args),
-        "load" => return load_checkpoint(&host, args),
-        "rm" => store::remove(&host.state, &args.names()[1..], args.has("force"))?,
-        _ => {
-            let before = args.get("older-than").map(|d| -> Result<u64> {
+    let host = crate::open_host(global, false)?;
+    let removed = match cmd {
+        CheckpointCmd::Ls { quiet, format, filter } => return list_checkpoints(&host, *quiet, format.as_deref(), filter),
+        CheckpointCmd::Save { target, output } => return save_checkpoint(&host, target.as_deref().unwrap_or_default(), output.as_deref()),
+        CheckpointCmd::Load { input, name, sha256 } => return load_checkpoint(&host, input.as_deref(), name.as_deref(), sha256.as_deref()),
+        CheckpointCmd::Rm { force, names } => store::remove(&host.state, names, *force)?,
+        CheckpointCmd::Prune { older_than, force } => {
+            let before = older_than.as_deref().map(|d| -> Result<u64> {
                 let age = crate::util::parse_age(d).ok_or_else(|| format!("bad --older-than {d:?}: give a number and s, m, h or d (24h)"))?;
                 let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
                 Ok(since.saturating_sub(age).as_millis() as u64)
             });
             let before = before.transpose()?;
-            let older = args.get("older-than").map_or(String::new(), |d| format!(" older than {d}"));
-            confirm(args.has("force"), &format!("every stored checkpoint{older} that no other kept builds on"))?;
+            let older = older_than.as_deref().map_or(String::new(), |d| format!(" older than {d}"));
+            confirm(*force, &format!("every stored checkpoint{older} that no other kept builds on"))?;
             store::prune(&host.state, before)?
         }
+        CheckpointCmd::Create { .. } => unreachable!("handled in main"),
     };
     removed.into_iter().try_for_each(crate::print)
 }
 
 /// `checkpoint save NAME|ID [-o FILE]`: to stdout (never a terminal), or to FILE once whole.
-fn save_checkpoint(host: &crate::host::Host, args: &Args) -> Result<()> {
+fn save_checkpoint(host: &crate::host::Host, what: &str, file: Option<&str>) -> Result<()> {
     use crate::checkpoint::export;
-    let what = args.names().get(1).cloned().unwrap_or_default();
     let paths = Paths::new(&host.state);
-    let Some(file) = args.get("output") else {
+    let Some(file) = file else {
         if std::io::stdout().is_terminal() {
             bail!("checkpoint save writes a tar: redirect stdout, or give -o FILE");
         }
         let mut out = std::io::BufWriter::with_capacity(1 << 20, std::io::stdout().lock());
-        let saved = export::save(&host.state, &paths, &what, &mut out)?;
+        let saved = export::save(&host.state, &paths, what, &mut out)?;
         out.flush()?;
         // Stdout is the tar: what `load --sha256` takes goes to stderr.
         let _ = writeln!(
@@ -223,7 +224,7 @@ fn save_checkpoint(host: &crate::host::Host, args: &Args) -> Result<()> {
         );
         return Ok(());
     };
-    crate::print(save_checkpoint_file(Path::new(file), |out| export::save(&host.state, &paths, &what, out))?)
+    crate::print(save_checkpoint_file(Path::new(file), |out| export::save(&host.state, &paths, what, out))?)
 }
 
 fn save_checkpoint_file(path: &Path, write: impl FnOnce(&mut dyn Write) -> Result<Value>) -> Result<Value> {
@@ -263,10 +264,10 @@ fn save_checkpoint_file(path: &Path, write: impl FnOnce(&mut dyn Write) -> Resul
 }
 
 /// `checkpoint load [-i FILE|DIR] [--name NAME]`: a save from stdin (never a terminal) or FILE, or a checkpoint directory.
-fn load_checkpoint(host: &crate::host::Host, args: &Args) -> Result<()> {
+fn load_checkpoint(host: &crate::host::Host, input: Option<&str>, name: Option<&str>, sha256: Option<&str>) -> Result<()> {
     use crate::checkpoint::export;
-    let (paths, name, sha256) = (Paths::new(&host.state), args.get("name"), args.get("sha256"));
-    let loaded = match args.get("input") {
+    let paths = Paths::new(&host.state);
+    let loaded = match input {
         Some(dir) if std::path::Path::new(dir).is_dir() => export::load_dir(&host.state, &paths, std::path::Path::new(dir), name, sha256)?,
         Some(file) => {
             let f = std::fs::File::open(file).map_err(|e| format!("{file}: {e}"))?;
@@ -305,10 +306,10 @@ fn format_checkpoints(format: &crate::containers::Format, mut rows: Vec<Value>) 
     format.render(&rows)
 }
 
-fn list_checkpoints(host: &crate::host::Host, args: &Args) -> Result<()> {
-    let format = args.get("format").filter(|f| f.trim() != "table").map(|f| crate::containers::Format::parse_with(f, CHECKPOINT_FIELDS)).transpose()?;
+fn list_checkpoints(host: &crate::host::Host, quiet: bool, format: Option<&str>, raw_filters: &[String]) -> Result<()> {
+    let format = format.filter(|f| f.trim() != "table").map(|f| crate::containers::Format::parse_with(f, CHECKPOINT_FIELDS)).transpose()?;
     let mut filters = vec![];
-    for f in args.all("filter") {
+    for f in raw_filters {
         match f.split_once('=') {
             Some((k @ ("name" | "vm" | "template"), v)) if !v.is_empty() => filters.push((k.to_string(), v.to_string())),
             _ => bail!("bad checkpoint filter {f:?}: use name=NAME, vm=NAME or template=IMAGE|ID"),
@@ -324,7 +325,7 @@ fn list_checkpoints(host: &crate::host::Host, args: &Args) -> Result<()> {
     let mut rows = crate::checkpoint::store::rows(&host.state, &templates);
     // A key again: either value. A listing error (no id) stays: what it hid may match.
     rows.retain(|v| v["id"].is_null() || filters.iter().all(|(k, _)| filters.iter().any(|(k2, want)| k2 == k && matches(v, k, want))));
-    if args.has("quiet") {
+    if quiet {
         for v in &rows {
             match v["id"].as_str() {
                 Some(id) => output(format_args!("{id}\n"))?,

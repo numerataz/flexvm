@@ -6,6 +6,7 @@ mod artifacts;
 mod attach;
 mod bench;
 mod checkpoint;
+mod cli;
 mod compat;
 mod containers;
 mod cow;
@@ -45,6 +46,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::cli::{
+    CheckpointCmd, Cli, Cmd, ExecArgs, GlobalArgs, ImageCmd, ImageFlags, ImagesArgs, PsArgs, PullArgs, RunArgs, SoftwareArgs, SoftwareTransferCmd, SystemCmd,
+    VolumeCmd,
+};
 use crate::host::{Host, Verdict};
 use crate::template::Paths;
 use crate::util::{proc_kb, recv_json, Result};
@@ -217,243 +222,6 @@ flexvm fails, 124 when the VM dies; exec returns the command's status, 127 when 
 "
 );
 
-/// Flags that take no value (`-a`, `-f` and `--standby` depend on the command: `takes_value`).
-const SWITCHES: &[&str] = &[
-    "kernel-sdk",
-    "warm",
-    "force-shared",
-    "stop",
-    "paused",
-    "incremental",
-    "incoming",
-    "json",
-    "detach",
-    "interactive",
-    "tty",
-    "all",
-    "attach",
-    "keep",
-    "rm",
-    "help",
-    "version",
-    "quiet",
-    "password-stdin",
-    "follow",
-    "verbose",
-    "lifecycle",
-];
-
-/// `--flag value`s: last wins. `rest` follows `--`, `exec NAME` or `run IMAGE`;
-/// run and exec still take their IMAGE or NAME after `--`.
-pub struct Args {
-    positional: Vec<String>,
-    flags: Vec<(String, String)>,
-    rest: Vec<String>,
-    child_args: Vec<String>,
-}
-
-/// Whether `--flag` takes a value: `--force GEN` is reclaim's (rm's is a switch), `--standby N`
-/// pull's (run's is the internal standby VM's switch).
-fn takes_value(flag: &str, cmd: Option<&str>) -> Option<bool> {
-    match flag {
-        "force" => cmd.map(|c| c == "reclaim"),
-        "standby" => cmd.map(|c| c == "pull"),
-        f if SWITCHES.contains(&f) => Some(false),
-        f if GLOBAL.contains(&f) || IMAGE_FLAGS.contains(&f) || COMMANDS.iter().any(|(_, _, flags)| flags.contains(&f)) => Some(true),
-        _ => None,
-    }
-}
-
-/// A value that is itself a flag (or `--`) is a forgotten value, as in `--state --run X`; any
-/// other is taken as is, so argv-style ones can start with `--` (`--cmd "--port 8080"`).
-fn is_flag(v: &str) -> bool {
-    v == "--"
-        || v.strip_prefix("--").is_some_and(|f| {
-            let f = f.split_once('=').map_or(f, |(f, _)| f);
-            matches!(f, "force" | "standby") || takes_value(f, None).is_some()
-        })
-}
-
-/// Short switches, with the command's meaning of overloaded letters.
-fn short_switch(flag: u8, cmd: Option<&str>) -> Option<&'static str> {
-    match flag {
-        b'd' => Some("detach"),
-        b'h' if cmd != Some("run") => Some("help"),
-        b'q' => Some("quiet"),
-        b'v' if cmd != Some("run") => Some("verbose"),
-        b'a' => Some(if cmd == Some("start") { "attach" } else { "all" }),
-        b'i' if matches!(cmd, Some("run" | "exec")) => Some("interactive"),
-        b't' if matches!(cmd, Some("run" | "exec")) => Some("tty"),
-        b'f' if matches!(cmd, Some("rm" | "image" | "system" | "checkpoint")) => Some("force"),
-        b'f' if cmd == Some("logs") => Some("follow"),
-        _ => None,
-    }
-}
-
-impl Args {
-    #[cfg(test)]
-    fn parse(it: impl IntoIterator<Item = String>) -> Result<Args> {
-        let (a, e) = Args::parse_partly(it);
-        e.map_or(Ok(a), Err)
-    }
-
-    /// The first error, and everything parsed around it: the command decides the exit status, wherever it is.
-    fn parse_partly(it: impl IntoIterator<Item = String>) -> (Args, Option<util::Error>) {
-        let mut a = Args { positional: Vec::new(), flags: Vec::new(), rest: Vec::new(), child_args: Vec::new() };
-        let mut first = None;
-        let mut it = it.into_iter();
-        while let Err(e) = a.parse_into(&mut it) {
-            first.get_or_insert(e);
-        }
-        (a, first)
-    }
-
-    /// Up to an error; called again, it goes on after it.
-    fn parse_into(&mut self, it: &mut impl Iterator<Item = String>) -> Result<()> {
-        let a = self;
-        while let Some(mut arg) = it.next() {
-            let cmd = a.positional.first().map(String::as_str);
-            // Short switches can be bundled, followed by a valued flag (`-aq`, `-itp 80:80`).
-            if arg.starts_with('-') && !arg.starts_with("--") {
-                let mut n = 0;
-                for b in arg.bytes().skip(1) {
-                    let Some(f) = short_switch(b, cmd) else { break };
-                    if f != "detach" {
-                        a.child_args.push(format!("-{}", b as char));
-                    }
-                    a.flags.push((f.into(), "1".into()));
-                    n += 1;
-                }
-                if n > 0 {
-                    if arg.len() == n + 1 {
-                        continue;
-                    }
-                    arg = format!("-{}", &arg[n + 1..]);
-                }
-            }
-            if arg != "--detach" {
-                a.child_args.push(arg.clone());
-            }
-            // Docker's hostname and volumes must not silently become help or verbose output.
-            if cmd == Some("run") {
-                match arg.as_str() {
-                    "-h" => bail!("hostname (-h) is not supported; the hostname is the VM's name (--name); use --help for help"),
-                    "-v" => bail!("volumes (-v) are not supported (#717); for verbose output, -v or --verbose goes before the command"),
-                    _ => {}
-                }
-            }
-            // Short flags with a value read as their long ones.
-            let (option, attached) = if arg.starts_with("--") {
-                arg.split_once('=').map_or((arg.as_str(), None), |(f, v)| (f, Some(v)))
-            } else if arg.starts_with('-') && arg.len() > 2 && arg.is_char_boundary(2) {
-                (&arg[..2], Some(arg[2..].strip_prefix('=').unwrap_or(&arg[2..])))
-            } else {
-                (arg.as_str(), None)
-            };
-            let valued = match option {
-                "-p" => Some("publish"),
-                "-m" if cmd == Some("run") => Some("memory"),
-                "-n" if cmd == Some("logs") => Some("tail"),
-                "-f" if cmd == Some("ps") => Some("filter"),
-                "-e" if matches!(cmd, Some("run" | "exec")) => Some("env"),
-                "-w" if cmd == Some("exec") => Some("workdir"),
-                "-u" if cmd == Some("exec") => Some("user"),
-                "-s" if cmd == Some("kill") => Some("signal"),
-                "-o" if cmd == Some("checkpoint") => Some("output"),
-                "-i" if cmd == Some("checkpoint") => Some("input"),
-                _ => None,
-            };
-            match valued.or_else(|| option.strip_prefix("--")) {
-                Some("") if attached.is_none() => {
-                    // Before the command, the words after it would be taken as one.
-                    if cmd.is_none() {
-                        bail!("-- must follow the command");
-                    }
-                    if matches!(cmd, Some("run" | "exec" | "software")) {
-                        // `run -- IMAGE` and `exec -- NAME`: the first word is still IMAGE or NAME,
-                        // and as without the `--`, a `--` right after it is dropped.
-                        let mut words = it.by_ref().peekable();
-                        // `run --checkpoint DIR` has no IMAGE: the words are a (refused) CMD.
-                        if a.positional.len() == 1 && !a.has("checkpoint") {
-                            if let Some(word) = words.next() {
-                                a.child_args.push(word.clone());
-                                a.positional.push(word);
-                                if let Some(dashdash) = words.next_if_eq("--") {
-                                    a.child_args.push(dashdash);
-                                }
-                            }
-                        }
-                        a.rest.extend(words);
-                        a.child_args.extend(a.rest.iter().cloned());
-                    } else {
-                        let words: Vec<_> = it.by_ref().collect();
-                        a.child_args.extend(words.iter().cloned());
-                        a.positional.extend(words);
-                    }
-                }
-                Some(f) => {
-                    if cmd.is_none() && matches!(f, "force" | "standby") {
-                        bail!("--{f} must follow the command");
-                    }
-                    let value = match (takes_value(f, cmd), attached) {
-                        (Some(false), Some(_)) => bail!("--{f} does not take a value"),
-                        (Some(false), None) => "1".into(),
-                        (Some(true), Some(v)) => v.into(),
-                        (Some(true), None) => {
-                            let value = it.next().filter(|v| if arg == "-p" { !v.starts_with('-') } else { !is_flag(v) }).ok_or_else(|| match f {
-                                "publish" if arg == "-p" => "-p needs a port mapping".to_string(),
-                                "force" => "--force needs a generation; run flexvm reclaim IP to see GEN".to_string(),
-                                _ => format!("--{f} needs a value"),
-                            })?;
-                            a.child_args.push(value.clone());
-                            value
-                        }
-                        (None, _) => bail!("unknown option --{f} (see flexvm --help)"),
-                    };
-                    a.flags.push((f.into(), value));
-                }
-                // `-` alone is a word: cp's stdin or stdout.
-                None if arg.starts_with('-') && arg != "-" => bail!("unknown option {arg} (see flexvm --help)"),
-                None => {
-                    a.positional.push(arg);
-                    // `exec NAME CMD` and `run IMAGE CMD`: the rest is the command's (a `--` first is dropped).
-                    if a.positional.len() == 2 && matches!(a.positional[0].as_str(), "exec" | "run" | "software") {
-                        let mut cmd = it.by_ref().peekable();
-                        // Kept in child_args, so the VM process drops the same one.
-                        if let Some(dashdash) = cmd.next_if_eq("--") {
-                            a.child_args.push(dashdash);
-                        }
-                        a.rest.extend(cmd);
-                        a.child_args.extend(a.rest.iter().cloned());
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub fn has(&self, name: &str) -> bool {
-        self.get(name).is_some()
-    }
-
-    pub fn get(&self, name: &str) -> Option<&str> {
-        self.flags.iter().rev().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
-    }
-
-    fn all(&self, name: &str) -> Vec<String> {
-        self.flags.iter().filter(|(k, _)| k == name).map(|(_, v)| v.clone()).collect()
-    }
-
-    pub fn parse_or<T: std::str::FromStr>(&self, name: &str, default: T) -> Result<T> {
-        self.get(name).map_or(Ok(default), |v| v.parse().map_err(|_| format!("bad --{name} {v:?}").into()))
-    }
-
-    /// The words after the command: its names.
-    fn names(&self) -> &[String] {
-        self.positional.get(1..).unwrap_or_default()
-    }
-}
-
 /// A VM's command's statuses are its own: flexvm's failures there exit 125.
 fn main() {
     // The logs a `run` handed this process, by token: read before any thread starts, and kept
@@ -473,19 +241,26 @@ fn main() {
             util::output::drain();
         }
     }));
-    let (args, error) = Args::parse_partly(std::env::args().skip(1));
-    // A listener's, an arrival's and a standby's stderr is a log: it keeps what they did (a claim sets its claimer's).
-    let logged = match args.positional.first().map(String::as_str) {
-        Some("listen") => true,
-        Some("run") => args.has("incoming") || args.has("standby"),
-        _ => false,
-    };
-    util::set_verbose(args.has("verbose") || logged);
-    let vm = matches!(args.positional.first().map(String::as_str), Some("run" | "start" | "exec" | "software"))
-        || args.positional.first().is_some_and(|s| s == "software-transfer") && args.positional.get(1).is_some_and(|s| s == "activate");
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let vm = cli::is_vm_command(&raw);
+    let parsed = cli::parse_from(&raw);
+    if let Ok(cli) = &parsed {
+        // A listener's, an arrival's and a standby's stderr is a log: it keeps what they did (a claim sets its claimer's).
+        let logged = match &cli.command {
+            Some(Cmd::Listen(_)) => true,
+            Some(Cmd::Run(r)) => r.incoming || r.standby,
+            _ => false,
+        };
+        util::set_verbose(cli.global.verbose || logged);
+    }
     // Here, not in `real_main`, which unit tests run on any host; after the arguments, whose errors come first.
-    let host_fits = || if reads_only(&args) { Ok(()) } else { check_applies(&args).and_then(|()| util::check_page_size()) };
-    let result = error.map_or_else(|| host_fits().and_then(|()| real_main(&args)), Err);
+    let result = parsed.and_then(|cli| {
+        if !reads_only(&cli) {
+            check_applies(&cli)?;
+            util::check_page_size()?;
+        }
+        real_main(&cli)
+    });
     if let Some(sig) = template::interrupted_signal() {
         util::raise_signal(sig);
     }
@@ -500,288 +275,255 @@ fn main() {
     util::exit(0)
 }
 
-/// Flags every command takes.
-const GLOBAL: &[&str] = &["state", "run", "help", "version", "verbose"];
-
-/// What `pull` takes besides the sizes.
-const IMAGE_FLAGS: &[&str] = &[
-    "boot",
-    "kernel-modules",
-    "kernel-sdk",
-    "init",
-    "entrypoint",
-    "cmd",
-    "env",
-    "workdir",
-    "user",
-    "warm",
-    "ready-port",
-    "ready-cmd",
-    "ready-timeout",
-    "max-download-mib",
-    "max-unpacked-mib",
-    "max-file-mib",
-    "max-entries",
-];
-
-/// Any number of names.
-const NAMES: usize = usize::MAX;
-
-/// Each command's words (itself included) at most, and its flags besides `GLOBAL`.
-const COMMANDS: &[(&str, usize, &[&str])] = &[
-    (
-        "software",
-        2,
-        &["name", "kernel", "qemu", "control", "vsock-backend", "mem", "vcpus", "timeout", "disk", "parent-kvm-bundle", "parent-kvm-engine", "parent-kvm-mem"],
-    ),
-    (
-        "run",
-        2,
-        &[
-            "name",
-            "detach",
-            "interactive",
-            "tty",
-            "ip",
-            "cpus",
-            "memory",
-            "env",
-            "env-file",
-            "entrypoint",
-            "keep",
-            "rm",
-            "checkpoint",
-            "paused",
-            "standby",
-            "incoming",
-            "publish",
-            "restart",
-        ],
-    ),
-    ("standby-refill", 2, &[]), // Internal delayed refill worker.
-    ("restart-due", 2, &[]),    // Internal: a restart policy's (`restart::due`).
-    ("ps", 1, &["all", "json", "quiet", "filter", "format"]),
-    ("exec", 2, &["detach", "interactive", "tty", "env", "workdir", "user"]),
-    ("attach", 2, &[]),
-    ("cp", 3, &[]),
-    ("logs", 2, &["follow", "tail"]),
-    ("inspect", NAMES, &[]),
-    ("wait", NAMES, &[]),
-    ("restart", NAMES, &["parent-kvm-bundle"]),
-    ("rename", 3, &[]),
-    ("stop", NAMES, &[]),
-    ("start", NAMES, &["attach", "parent-kvm-bundle"]),
-    ("pause", NAMES, &[]),
-    ("unpause", NAMES, &[]),
-    ("kill", NAMES, &["signal"]),
-    ("rm", NAMES, &["force"]),
-    ("volume", NAMES, &["size"]),
-    ("checkpoint", NAMES, &["stop", "incremental", "quiet", "format", "filter", "force", "older-than", "output", "input", "name", "sha256"]),
-    ("software-transfer", 4, &["source-key", "signing-key", "destination-key", "handoff-chain", "max-bundle-mib", "qemu"]),
-    ("migrate", 3, &[]),
-    ("reclaim", 2, &["force"]),
-    ("listen", 2, &[]),
-    ("api", 2, &[]),
-    ("info", 1, &[]),
-    ("pull", 2, &["tag", "vcpus", "mem", "plug", "standby"]),
-    ("images", 1, &["json", "quiet", "filter"]),
-    ("tag", 3, &[]),
-    ("image", 2, &["force", "force-shared"]),
-    ("system", 2, &["force", "force-shared"]),
-    ("version", 1, &[]),
-    ("login", 2, &["username", "password-stdin"]),
-    ("logout", 2, &[]),
-    ("rmi", 2, &[]),
-    (
-        "bench",
-        1,
-        &["template", "to", "to-state", "to-run", "timeout", "lifecycle", "iterations", "warmup", "dirty-mib", "settle-ms", "ready-port", "ready-http"],
-    ),
-    ("debug", 4, &[]),
-];
-
-/// Flags and words a command does not take are errors, never ignored.
-fn check_applies(args: &Args) -> Result<()> {
-    let Some(cmd) = args.positional.first() else { return Ok(()) };
-    let Some(&(_, most, flags)) = COMMANDS.iter().find(|(c, ..)| c == cmd) else {
-        bail!("unknown command {cmd:?} (see flexvm --help)");
-    };
-    let first = args.positional.get(1).filter(|w| !w.is_empty());
-    let internal = cmd == "run" && (args.has("standby") || args.has("incoming"));
-    if cmd == "run" && args.has("checkpoint") {
-        if let Some(image) = first {
-            bail!("run --checkpoint takes no IMAGE ({image:?}): the checkpoint has its own");
-        }
-        if !args.rest.is_empty() {
-            bail!("run --checkpoint takes no CMD: the checkpoint's command cannot be replaced");
-        }
-        if let Some(f) = ["env", "env-file", "entrypoint", "keep", "rm", "interactive", "tty", "restart"].into_iter().find(|f| args.has(f)) {
-            bail!("--{f} does not apply to run --checkpoint: the checkpoint's app runs already");
-        }
-    } else if cmd == "run" && args.has("paused") {
-        bail!("--paused applies to run --checkpoint");
-    } else if !internal && first.is_none() {
-        match cmd.as_str() {
-            "run" | "pull" | "rmi" | "software" => bail!("{cmd} needs IMAGE"),
-            "exec" | "attach" | "stop" | "start" | "pause" | "unpause" | "kill" | "rm" | "migrate" | "logs" | "inspect" | "wait" | "restart" => {
-                bail!("{cmd} needs NAME")
-            }
-            "rename" => bail!("rename needs OLD NEW"),
-            _ => {}
-        }
+fn require_word<'a>(value: Option<&'a str>, msg: &str) -> Result<&'a str> {
+    match value {
+        Some(w) if !w.is_empty() => Ok(w),
+        _ => bail!("{msg}"),
     }
-    match cmd.as_str() {
-        "tag" if args.names().len() != 2 => bail!("tag needs SRC DST"),
-        "cp" if args.names().len() != 2 => bail!("cp needs SRC DST"),
-        "image" if first.map(String::as_str) != Some("prune") => bail!("image needs prune"),
-        "system" if !matches!(first.map(String::as_str), Some("prune" | "df")) => bail!("system needs prune or df"),
-        "system" if first.map(String::as_str) == Some("df") && args.has("force") => bail!("system df takes no -f"),
-        "system" if first.map(String::as_str) == Some("df") && args.has("force-shared") => bail!("system df takes no --force-shared"),
-        "images" if args.has("quiet") && args.has("json") => bail!("images takes -q or --json, not both"),
-        "debug" => {
-            let op = first.ok_or("debug fault|ckhash|gc|VM ...")?;
-            let (least, most, words) = match op.as_str() {
-                "gc" => (2, 2, "no arguments"),
-                "fault" => (3, 4, "NAME [MS]"),
-                "ckhash" => (3, 3, "DIR"),
-                _ => (2, 3, "[WHAT]"),
-            };
-            if !(least..=most).contains(&args.positional.len()) {
-                bail!("debug {op} takes {words}");
+}
+
+fn require_names(cmd: &str, names: &[String]) -> Result<()> {
+    if names.first().is_none_or(String::is_empty) {
+        bail!("{cmd} needs NAME");
+    }
+    if let Some(empty) = names.iter().find(|n| n.is_empty()) {
+        bail!("{cmd} takes no empty word {empty:?}");
+    }
+    Ok(())
+}
+
+/// Semantic validation beyond clap's grammar (mutually exclusive flags, required words, etc.).
+fn check_applies(cli: &Cli) -> Result<()> {
+    let Some(cmd) = &cli.command else { return Ok(()) };
+    match cmd {
+        Cmd::Run(r) => {
+            if r.hostname_unsupported {
+                bail!("hostname (-h) is not supported; the hostname is the VM's name (--name); use --help for help");
+            }
+            if r.volume_unsupported {
+                bail!("volumes (-v) are not supported (#717); for verbose output, -v or --verbose goes before the command");
+            }
+            let internal = r.standby || r.incoming;
+            let image = r.image.as_deref().filter(|w| !w.is_empty());
+            if r.checkpoint.is_some() {
+                if let Some(img) = image {
+                    bail!("run --checkpoint takes no IMAGE ({img:?}): the checkpoint has its own");
+                }
+                if !r.cmd.is_empty() {
+                    bail!("run --checkpoint takes no CMD: the checkpoint's command cannot be replaced");
+                }
+                for (flag, set) in [
+                    ("env", !r.env.is_empty()),
+                    ("env-file", !r.env_file.is_empty()),
+                    ("entrypoint", r.entrypoint.is_some()),
+                    ("keep", r.keep),
+                    ("rm", r.rm),
+                    ("interactive", r.interactive),
+                    ("tty", r.tty),
+                    ("restart", r.restart.is_some()),
+                ] {
+                    if set {
+                        bail!("--{flag} does not apply to run --checkpoint: the checkpoint's app runs already");
+                    }
+                }
+            } else if r.paused {
+                bail!("--paused applies to run --checkpoint");
+            } else if !internal && image.is_none() {
+                bail!("run needs IMAGE");
+            }
+            let interactive = r.interactive || r.tty;
+            // Only a background VM leaves the exited record a restart runs again (a foreground one's process is its run's).
+            // (A detached run's VM process has its parent's flags but -d, and answers on FLEXVM_NOTIFY_FD.)
+            if r.restart.as_deref().is_some_and(|p| p != "no") && !r.detach && !internal && std::env::var_os("FLEXVM_NOTIFY_FD").is_none() {
+                bail!("--restart applies to a background vm: give -d");
+            }
+            if r.keep && !r.cmd.is_empty() && !interactive {
+                bail!("--keep applies to the image's app: with CMD, the vm ends with CMD");
+            }
+            if interactive && r.entrypoint.is_some() && !r.cmd.is_empty() {
+                bail!("-i and -t make CMD the app: give --entrypoint or CMD");
             }
         }
-        "volume" => {
-            let words = args.positional.len();
-            let valid = match first.map(String::as_str) {
-                Some("create") => words == 3 && args.get("size").is_some(),
-                Some("clone") => words == 4 && !args.has("size"),
-                Some("inspect" | "rm") => words == 3 && !args.has("size"),
-                Some("ls") => words == 2 && !args.has("size"),
+        Cmd::Software(s) => {
+            require_word(s.image.as_deref(), "software needs IMAGE")?;
+            if s.image_flags.kernel_sdk && s.image_flags.kernel_modules.is_some() {
+                bail!("use --kernel-modules FILE for a custom runtime or SDK bundle, or --kernel-sdk for the reviewed SDK");
+            }
+            for (flag, set) in [
+                ("warm", s.image_flags.warm),
+                ("ready-port", s.image_flags.ready_port.is_some()),
+                ("ready-cmd", s.image_flags.ready_cmd.is_some()),
+                ("ready-timeout", s.image_flags.ready_timeout.is_some()),
+            ] {
+                if set {
+                    bail!("--{flag} does not apply to software execution");
+                }
+            }
+            if !s.cmd.is_empty() && s.image_flags.cmd.is_some() {
+                bail!("software takes CMD or --cmd, not both");
+            }
+        }
+        Cmd::Pull(p) => {
+            require_word(p.image.as_deref(), "pull needs IMAGE")?;
+            if p.image_flags.kernel_sdk && p.image_flags.kernel_modules.is_some() {
+                bail!("use --kernel-modules FILE for a custom runtime or SDK bundle, or --kernel-sdk for the reviewed SDK");
+            }
+        }
+        Cmd::Rmi(a) => {
+            require_word(a.value.as_deref(), "rmi needs IMAGE")?;
+        }
+        Cmd::Exec(e) => {
+            require_word(e.name.as_deref(), "exec needs NAME")?;
+        }
+        Cmd::Attach(a) => {
+            require_word(a.value.as_deref(), "attach needs NAME")?;
+        }
+        Cmd::Logs(l) => {
+            require_word(l.name.as_deref(), "logs needs NAME")?;
+        }
+        Cmd::Cp(a) => {
+            if a.first.as_deref().is_none_or(str::is_empty) || a.second.as_deref().is_none_or(str::is_empty) {
+                bail!("cp needs SRC DST");
+            }
+        }
+        Cmd::Tag(a) => {
+            if a.first.as_deref().is_none_or(str::is_empty) || a.second.as_deref().is_none_or(str::is_empty) {
+                bail!("tag needs SRC DST");
+            }
+        }
+        Cmd::Rename(a) => {
+            if a.first.as_deref().is_none_or(str::is_empty) || a.second.as_deref().is_none_or(str::is_empty) {
+                bail!("rename needs OLD NEW");
+            }
+        }
+        Cmd::Migrate(a) => {
+            require_word(a.first.as_deref(), "migrate needs NAME")?;
+            if a.second.as_deref() == Some("") {
+                bail!("migrate takes no empty word \"\"");
+            }
+        }
+        Cmd::Start(s) => {
+            require_names("start", &s.names)?;
+            if s.attach && s.names.len() > 1 {
+                bail!("start -a takes one NAME");
+            }
+        }
+        Cmd::Restart(r) => require_names("restart", &r.names)?,
+        Cmd::Stop(a) => require_names("stop", &a.names)?,
+        Cmd::Pause(a) => require_names("pause", &a.names)?,
+        Cmd::Unpause(a) => require_names("unpause", &a.names)?,
+        Cmd::Inspect(a) => require_names("inspect", &a.names)?,
+        Cmd::Wait(a) => require_names("wait", &a.names)?,
+        Cmd::Kill(k) => require_names("kill", &k.names)?,
+        Cmd::Rm(r) => require_names("rm", &r.names)?,
+        Cmd::Ps(p) => {
+            if p.quiet && p.json {
+                bail!("ps takes -q or --json, not both");
+            }
+            if p.quiet && p.format.is_some() {
+                bail!("ps takes -q or --format, not both");
+            }
+            if p.json && p.format.is_some() {
+                bail!("ps takes --json or --format, not both");
+            }
+        }
+        Cmd::Images(i) => {
+            if i.quiet && i.json {
+                bail!("images takes -q or --json, not both");
+            }
+        }
+        Cmd::Image(i) => {
+            if i.cmd.is_none() {
+                bail!("image needs prune");
+            }
+        }
+        Cmd::System(s) => {
+            if s.cmd.is_none() {
+                bail!("system needs prune or df");
+            }
+        }
+        Cmd::Volume(v) => {
+            let valid = match &v.cmd {
+                Some(VolumeCmd::Create { name: Some(n), size: Some(_) }) if !n.is_empty() => true,
+                Some(VolumeCmd::Clone { source: Some(s), name: Some(n) }) if !s.is_empty() && !n.is_empty() => true,
+                Some(VolumeCmd::Inspect { target: Some(t) } | VolumeCmd::Rm { target: Some(t) }) if !t.is_empty() => true,
+                Some(VolumeCmd::Ls) => true,
                 _ => false,
             };
             if !valid {
                 bail!("volume needs create NAME --size BYTES, clone SOURCE NAME, inspect NAME|ID, ls, or rm NAME|ID");
             }
         }
-        "software-transfer" => {
-            let words = args.positional.len();
-            let keys = (args.has("source-key"), args.has("signing-key"), args.has("destination-key"));
-            if args.has("handoff-chain") && first.map(String::as_str) != Some("prepare") {
-                bail!("--handoff-chain applies only to software-transfer prepare");
-            }
-            if args.has("max-bundle-mib") && first.map(String::as_str) != Some("receive") {
-                bail!("--max-bundle-mib applies only to software-transfer receive");
-            }
-            let activating = first.map(String::as_str) == Some("activate");
-            if args.has("qemu") != activating {
-                bail!("software-transfer activate requires --qemu FILE; other transfer commands do not take it");
-            }
-            if !matches!(
-                (first.map(String::as_str), words, keys),
-                (Some("id"), 2, (false, false, false))
-                    | (Some("prepare"), 3, (true, false, false))
-                    | (Some("commit" | "abort" | "recover" | "receive"), 3, (false, false, false))
-                    | (Some("acknowledge-abort" | "acknowledge-commit" | "finalize"), 3, (false, true, false))
-                    | (Some("offer" | "send" | "activate"), 4, (false, false, false))
-                    | (Some("retire"), 4, (false, true, true))
-            ) {
+        Cmd::SoftwareTransfer(st) => {
+            if st.cmd.is_none() {
                 bail!("invalid software-transfer arguments (see flexvm --help)");
             }
         }
-        "checkpoint" => {
-            let (op, most, flags): (_, _, &[&str]) = match first.map(String::as_str) {
-                Some(op @ "create") => (op, 4, &["stop", "incremental"]),
-                Some(op @ "ls") => (op, 2, &["quiet", "format", "filter"]),
-                Some(op @ "rm") => (op, NAMES, &["force"]),
-                Some(op @ "prune") => (op, 2, &["older-than", "force"]),
-                Some(op @ "save") => (op, 3, &["output"]),
-                Some(op @ "load") => (op, 2, &["input", "name", "sha256"]),
-                // `checkpoint VM DIR`, before #775.
-                _ => bail!("checkpoint needs create, ls, rm, prune, save or load: flexvm checkpoint create VM [NAME] keeps a VM's checkpoint in STATE/checkpoints (it took a DIR before), and run --checkpoint NAME restores it"),
+        Cmd::Checkpoint(ck) => match &ck.cmd {
+            Some(CheckpointCmd::Create { vm, name, .. }) => {
+                require_word(vm.as_deref(), "checkpoint create needs VM")?;
+                if name.as_deref() == Some("") {
+                    bail!("checkpoint takes no empty word \"\"");
+                }
+            }
+            Some(CheckpointCmd::Ls { quiet, format, .. }) => {
+                if *quiet && format.is_some() {
+                    bail!("checkpoint ls takes -q or --format, not both");
+                }
+            }
+            Some(CheckpointCmd::Rm { names, .. }) => {
+                if names.first().is_none_or(String::is_empty) {
+                    bail!("checkpoint rm needs NAME|ID");
+                }
+            }
+            Some(CheckpointCmd::Save { target, .. }) => {
+                require_word(target.as_deref(), "checkpoint save needs NAME|ID")?;
+            }
+            Some(CheckpointCmd::Prune { .. } | CheckpointCmd::Load { .. }) => {}
+            None => {
+                bail!("checkpoint needs create, ls, rm, prune, save or load: flexvm checkpoint create VM [NAME] keeps a VM's checkpoint in STATE/checkpoints (it took a DIR before), and run --checkpoint NAME restores it");
+            }
+        },
+        Cmd::Debug(d) => {
+            let op = d.words.first().filter(|w| !w.is_empty()).ok_or("debug fault|ckhash|gc|VM ...")?;
+            let (least, most, words) = match op.as_str() {
+                "gc" => (1, 1, "no arguments"),
+                "fault" => (2, 3, "NAME [MS]"),
+                "ckhash" => (2, 2, "DIR"),
+                _ => (1, 2, "[WHAT]"),
             };
-            if let Some((f, _)) = args.flags.iter().find(|(f, _)| !GLOBAL.contains(&f.as_str()) && !flags.contains(&f.as_str())) {
-                bail!("--{f} does not apply to checkpoint {op} (see flexvm --help)");
-            }
-            if let Some(extra) = args.positional.get(most) {
-                bail!("checkpoint {op} does not take {extra:?} (see flexvm --help)");
-            }
-            match op {
-                "ls" if args.has("quiet") && args.has("format") => bail!("checkpoint ls takes -q or --format, not both"),
-                "create" if args.positional.len() < 3 => bail!("checkpoint create needs VM"),
-                "rm" if args.positional.len() < 3 => bail!("checkpoint rm needs NAME|ID"),
-                "save" if args.positional.len() < 3 => bail!("checkpoint save needs NAME|ID"),
-                _ => {}
+            if !(least..=most).contains(&d.words.len()) {
+                bail!("debug {op} takes {words}");
             }
         }
-        _ => {}
-    }
-    if args.has("kernel-sdk") && args.get("kernel-modules").is_some() {
-        bail!("use --kernel-modules FILE for a custom runtime or SDK bundle, or --kernel-sdk for the reviewed SDK");
-    }
-    let image = matches!(cmd.as_str(), "pull" | "software");
-    if let Some((f, _)) = args.flags.iter().find(|(f, _)| ![GLOBAL, flags, if image { IMAGE_FLAGS } else { &[] }].concat().contains(&f.as_str())) {
-        bail!("--{f} does not apply to {cmd} (see flexvm --help)");
-    }
-    if let Some(extra) = args.positional.get(most) {
-        bail!("{cmd} does not take {extra:?} (see flexvm --help)");
-    }
-    if cmd == "software" {
-        for flag in ["warm", "ready-port", "ready-cmd", "ready-timeout"] {
-            if args.has(flag) {
-                bail!("--{flag} does not apply to software execution");
-            }
-        }
-        if !args.rest.is_empty() && args.has("cmd") {
-            bail!("software takes CMD or --cmd, not both");
-        }
-    }
-    if let Some(empty) = args.names().iter().find(|n| n.is_empty()) {
-        bail!("{cmd} takes no empty word {empty:?}");
-    }
-    let interactive = args.has("interactive") || args.has("tty");
-    // Only a background VM leaves the exited record a restart runs again (a foreground one's process is its run's).
-    // (A detached run's VM process has its parent's flags but -d, and answers on FLEXVM_NOTIFY_FD.)
-    if cmd == "run" && args.get("restart").is_some_and(|r| r != "no") && !args.has("detach") && !internal && std::env::var_os("FLEXVM_NOTIFY_FD").is_none() {
-        bail!("--restart applies to a background vm: give -d");
-    }
-    if cmd == "run" && args.has("keep") && !args.rest.is_empty() && !interactive {
-        bail!("--keep applies to the image's app: with CMD, the vm ends with CMD");
-    }
-    if cmd == "run" && interactive && args.has("entrypoint") && !args.rest.is_empty() {
-        bail!("-i and -t make CMD the app: give --entrypoint or CMD");
-    }
-    if cmd == "start" && args.has("attach") && args.names().len() > 1 {
-        bail!("start -a takes one NAME");
-    }
-    if cmd == "rename" && args.positional.len() < 3 {
-        bail!("rename needs OLD NEW");
-    }
-    if cmd == "ps" && args.has("quiet") {
-        if let Some(f) = ["json", "format"].into_iter().find(|f| args.has(f)) {
-            bail!("ps takes -q or --{f}, not both");
-        }
-    }
-    if cmd == "ps" && args.has("json") && args.has("format") {
-        bail!("ps takes --json or --format, not both");
+        Cmd::StandbyRefill(_)
+        | Cmd::RestartDue(_)
+        | Cmd::Reclaim(_)
+        | Cmd::Listen(_)
+        | Cmd::Api(_)
+        | Cmd::Info
+        | Cmd::Version
+        | Cmd::Login(_)
+        | Cmd::Logout(_)
+        | Cmd::Bench(_) => {}
     }
     Ok(())
 }
 
-fn state(args: &Args) -> Result<PathBuf> {
-    Ok(std::path::absolute(args.get("state").unwrap_or(host::DEFAULT_STATE))?)
+fn state(global: &GlobalArgs) -> Result<PathBuf> {
+    Ok(std::path::absolute(global.state.as_deref().unwrap_or(host::DEFAULT_STATE))?)
 }
 
 /// The host, recovered first until this boot's recovery is complete (`gc::after_boot`): a VM
 /// process and a template build only its local part (they leave the rest to a full pass), the
 /// listener the rest after this; any other command all of it here.
-pub fn open_host(args: &Args) -> Result<Host> {
-    let state = state(args)?;
-    let run = match args.get("run") {
+pub fn open_host(global: &GlobalArgs, partly: bool) -> Result<Host> {
+    let state = state(global)?;
+    let run = match global.run.as_deref() {
         Some(run) => PathBuf::from(run),
         None => host::default_run(&state)?,
     };
     let host = Host::open(&state, &run)?;
-    let partly = matches!(args.positional.first().map(String::as_str), Some("run" | "start" | "listen" | "pull" | "restart-due"));
     if let Err(e) = gc::after_boot(&host, !partly) {
         if gc::first_boot_warning(&host, host::boot_id()) {
             crate::log!("flexvm: recovering after boot: {e}");
@@ -790,127 +532,144 @@ pub fn open_host(args: &Args) -> Result<Host> {
     Ok(host)
 }
 
-fn paths(args: &Args) -> Result<Paths> {
-    Ok(Paths::new(&state(args)?))
+fn paths(global: &GlobalArgs) -> Result<Paths> {
+    Ok(Paths::new(&state(global)?))
 }
 
 /// Commands that read state or manage metadata without VM pages, so they run on any host: every other one may start a VM or a
 /// pager (`run`, `pull`, `listen`, `api`, a restart's) or act on one, and is refused on a host whose
 /// pages they cannot work in (`util::check_page_size`).
-fn reads_only(args: &Args) -> bool {
-    if args.has("help") || args.has("version") {
+fn reads_only(cli: &Cli) -> bool {
+    if cli.global.help || cli.global.version {
         return true;
     }
-    let words: Vec<&str> = args.positional.iter().take(2).map(String::as_str).collect();
     matches!(
-        words[..],
-        [] | ["ps" | "images" | "inspect" | "logs" | "info" | "version" | "wait" | "login" | "logout", ..]
-            | ["checkpoint", "ls"]
-            | ["system", "df"]
-            | ["volume", ..]
-    )
+        &cli.command,
+        None | Some(
+            Cmd::Ps(_)
+                | Cmd::Images(_)
+                | Cmd::Inspect(_)
+                | Cmd::Logs(_)
+                | Cmd::Info
+                | Cmd::Version
+                | Cmd::Wait(_)
+                | Cmd::Login(_)
+                | Cmd::Logout(_)
+                | Cmd::Volume(_)
+        )
+    ) || matches!(&cli.command, Some(Cmd::Checkpoint(ck)) if matches!(ck.cmd, Some(CheckpointCmd::Ls { .. })))
+        || matches!(&cli.command, Some(Cmd::System(s)) if matches!(s.cmd, Some(SystemCmd::Df)))
 }
 
-fn real_main(args: &Args) -> Result<()> {
-    if args.has("help") {
+fn real_main(cli: &Cli) -> Result<()> {
+    if cli.global.help {
         return output(format_args!("{USAGE}"));
     }
-    if args.has("version") {
+    if cli.global.version {
         return output(format_args!("flexvm {}\n", env!("CARGO_PKG_VERSION")));
     }
-    check_applies(args)?;
-    let pos: Vec<&str> = args.positional.iter().map(|s| s.as_str()).collect();
-    let (name, arg2) = (pos.get(1).copied().unwrap_or(""), pos.get(2).copied());
-    let call = |req: Value| print(vmproc::call(&open_host(args)?, name, req, None)?);
-    match pos.first().copied() {
-        Some("standby-refill") => standby::retry(&open_host(args)?, &template::name_of(name)?),
-        Some("restart-due") => {
-            let host = open_host(args)?;
-            restart::due(&host, name, |n| start(&host, args, n))
+    check_applies(cli)?;
+    let g = &cli.global;
+    let Some(cmd) = &cli.command else {
+        util::log_line(USAGE.to_string());
+        util::exit(2)
+    };
+    let call = |name: &str, req: Value| print(vmproc::call(&open_host(g, false)?, name, req, None)?);
+    match cmd {
+        Cmd::StandbyRefill(a) => standby::retry(&open_host(g, false)?, &template::name_of(a.value.as_deref().unwrap_or_default())?),
+        Cmd::RestartDue(a) => {
+            let host = open_host(g, true)?;
+            restart::due(&host, a.value.as_deref().unwrap_or_default(), |n| start(&host, g, None, n))
         }
-        Some("volume") => {
-            let catalog = volume::Catalog::open(&state(args)?)?;
-            match name {
-                "create" => print(json!(catalog.create(arg2.unwrap(), args.get("size").unwrap().parse().map_err(|_| "volume --size needs a byte count")?)?)),
-                "clone" => print(json!(catalog.clone_volume(arg2.unwrap(), pos[3])?)),
-                "ls" => print(json!(catalog.list()?)),
-                "inspect" => print(json!(catalog.inspect(arg2.unwrap())?)),
-                "rm" => catalog.remove(arg2.unwrap()),
-                _ => unreachable!("checked volume subcommand"),
+        Cmd::Volume(v) => {
+            let catalog = volume::Catalog::open(&state(g)?)?;
+            match v.cmd.as_ref().expect("checked volume subcommand") {
+                VolumeCmd::Create { name, size } => {
+                    print(json!(catalog.create(name.as_deref().unwrap(), size.as_deref().unwrap().parse().map_err(|_| "volume --size needs a byte count")?)?))
+                }
+                VolumeCmd::Clone { source, name } => print(json!(catalog.clone_volume(source.as_deref().unwrap(), name.as_deref().unwrap())?)),
+                VolumeCmd::Ls => print(json!(catalog.list()?)),
+                VolumeCmd::Inspect { target } => print(json!(catalog.inspect(target.as_deref().unwrap())?)),
+                VolumeCmd::Rm { target } => catalog.remove(target.as_deref().unwrap()),
             }
         }
-        Some("pull") => pull(args, name),
-        Some("software-transfer") if name == "activate" => {
-            util::block_signals(&[libc::SIGTSTP, libc::SIGCONT, libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGHUP]);
-            util::exit(software::activate(open_host(args)?, pos[3], Path::new(pos[2]), Path::new(args.get("qemu").unwrap()))?)
+        Cmd::Pull(p) => pull(g, p, p.image.as_deref().unwrap_or_default()),
+        Cmd::SoftwareTransfer(st) => match st.cmd.as_ref().expect("checked software-transfer subcommand") {
+            SoftwareTransferCmd::Activate { offer, vm, qemu } => {
+                util::block_signals(&[libc::SIGTSTP, libc::SIGCONT, libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGHUP]);
+                util::exit(software::activate(open_host(g, false)?, vm, Path::new(offer), Path::new(qemu))?)
+            }
+            SoftwareTransferCmd::Send { vm, offer } => {
+                software_state::transfer::bundle::send(&open_host(g, false)?, vm, Path::new(offer), &mut std::io::stdout().lock())
+            }
+            SoftwareTransferCmd::Offer { vm, destination } => print(software_state::transfer::offer(&open_host(g, false)?, vm, destination)?),
+            SoftwareTransferCmd::Retire { vm, offer, signing_key, destination_key } => {
+                print(software_state::transfer::retire(&open_host(g, false)?, vm, Path::new(offer), Path::new(signing_key), destination_key)?)
+            }
+            other => {
+                let path = state(g)?;
+                host::host_dir(&path, 0o755)?;
+                match other {
+                    SoftwareTransferCmd::Receive { offer, max_bundle_mib } => {
+                        print(software_state::transfer::bundle::import(&path, Path::new(offer), &mut std::io::stdin().lock(), max_bundle_mib.as_deref())?)
+                    }
+                    SoftwareTransferCmd::AcknowledgeAbort { offer, signing_key } => {
+                        print(software_state::transfer::acknowledge_abort(&path, Path::new(offer), Path::new(signing_key))?)
+                    }
+                    SoftwareTransferCmd::AcknowledgeCommit { offer, signing_key } => {
+                        print(software_state::transfer::finalize::acknowledge(&path, Path::new(offer), Path::new(signing_key))?)
+                    }
+                    SoftwareTransferCmd::Finalize { commit_ack, signing_key } => {
+                        print(software_state::transfer::finalize::outgoing(&path, Path::new(commit_ack), Path::new(signing_key))?)
+                    }
+                    SoftwareTransferCmd::Recover { abort_receipt } => print(software_state::transfer::recover(&path, Path::new(abort_receipt))?),
+                    SoftwareTransferCmd::Id => print(software_state::transfer::command(&path, "id", Path::new(""), None, None)?),
+                    SoftwareTransferCmd::Prepare { offer, source_key, handoff_chain } => {
+                        print(software_state::transfer::command(&path, "prepare", Path::new(offer), Some(source_key), handoff_chain.as_deref().map(Path::new))?)
+                    }
+                    SoftwareTransferCmd::Commit { receipt } => print(software_state::transfer::command(&path, "commit", Path::new(receipt), None, None)?),
+                    SoftwareTransferCmd::Abort { offer } => print(software_state::transfer::command(&path, "abort", Path::new(offer), None, None)?),
+                    _ => unreachable!(),
+                }
+            }
+        },
+        Cmd::Software(s) => util::exit(software(g, s, s.image.as_deref().unwrap_or_default())?),
+        Cmd::Images(i) => images(&open_host(g, false)?, &paths(g)?, i),
+        Cmd::Tag(a) => print(template::tag(&paths(g)?, a.first.as_deref().unwrap(), a.second.as_deref().ok_or("tag needs SRC DST")?)?),
+        Cmd::Image(i) => match i.cmd.as_ref().expect("checked image subcommand") {
+            ImageCmd::Prune { force, force_shared } => management::system_prune(g, false, *force, *force_shared),
+        },
+        Cmd::System(s) => match s.cmd.as_ref().expect("checked system subcommand") {
+            SystemCmd::Prune { force, force_shared } => management::system_prune(g, true, *force, *force_shared),
+            SystemCmd::Df => management::system_df(g),
+        },
+        Cmd::Version => management::version(&paths(g)?),
+        Cmd::Login(l) => image::auth::login(&open_host(g, false)?.state, l.registry.as_deref().unwrap_or_default(), l.username.as_deref(), l.password_stdin),
+        Cmd::Logout(a) => image::auth::logout(&open_host(g, false)?.state, a.value.as_deref().unwrap_or_default()),
+        Cmd::Rmi(a) => rmi(&open_host(g, false)?, &paths(g)?, a.value.as_deref().unwrap_or_default()),
+        Cmd::Run(r) if r.standby => {
+            let template = template::name_of(r.image.as_deref().unwrap_or_default())?;
+            vmproc::main(open_host(g, true)?, paths(g)?, Start::Standby { template }, notify_fd())
         }
-        Some("software-transfer") if name == "send" => {
-            software_state::transfer::bundle::send(&open_host(args)?, pos[2], Path::new(pos[3]), &mut std::io::stdout().lock())
-        }
-        Some("software-transfer") if name == "offer" => print(software_state::transfer::offer(&open_host(args)?, pos[2], pos[3])?),
-        Some("software-transfer") if name == "retire" => print(software_state::transfer::retire(
-            &open_host(args)?,
-            pos[2],
-            Path::new(pos[3]),
-            Path::new(args.get("signing-key").unwrap()),
-            args.get("destination-key").unwrap(),
-        )?),
-        Some("software-transfer") => {
-            let path = state(args)?;
-            host::host_dir(&path, 0o755)?;
-            if name == "receive" {
-                return print(software_state::transfer::bundle::import(&path, Path::new(pos[2]), &mut std::io::stdin().lock(), args.get("max-bundle-mib"))?);
-            }
-            if name == "acknowledge-abort" {
-                return print(software_state::transfer::acknowledge_abort(&path, Path::new(pos[2]), Path::new(args.get("signing-key").unwrap()))?);
-            }
-            if name == "acknowledge-commit" {
-                return print(software_state::transfer::finalize::acknowledge(&path, Path::new(pos[2]), Path::new(args.get("signing-key").unwrap()))?);
-            }
-            if name == "finalize" {
-                return print(software_state::transfer::finalize::outgoing(&path, Path::new(pos[2]), Path::new(args.get("signing-key").unwrap()))?);
-            }
-            if name == "recover" {
-                return print(software_state::transfer::recover(&path, Path::new(pos[2]))?);
-            }
-            print(software_state::transfer::command(
-                &path,
-                name,
-                Path::new(arg2.unwrap_or("")),
-                args.get("source-key"),
-                args.get("handoff-chain").map(Path::new),
-            )?)
-        }
-        Some("software") => util::exit(software(args, name)?),
-        Some("images") => images(&open_host(args)?, &paths(args)?, args),
-        Some("tag") => print(template::tag(&paths(args)?, name, arg2.ok_or("tag needs SRC DST")?)?),
-        Some("image" | "system") => management::system(args, name),
-        Some("version") => management::version(&paths(args)?),
-        Some("login") => image::auth::login(&open_host(args)?.state, name, args.get("username"), args.has("password-stdin")),
-        Some("logout") => image::auth::logout(&open_host(args)?.state, name),
-        Some("rmi") => rmi(&open_host(args)?, &paths(args)?, name),
-        Some("run") if args.has("standby") => {
-            let template = template::name_of(name)?;
-            vmproc::main(open_host(args)?, paths(args)?, Start::Standby { template }, notify_fd())
-        }
-        Some("run") if args.has("incoming") => {
+        Cmd::Run(r) if r.incoming => {
             let req: Value = serde_json::from_str(&std::env::var("FLEXVM_INCOMING").map_err(|_| "run --incoming is the listener's, for migrations")?)?;
             let log = std::env::var_os("FLEXVM_INCOMING_LOG").map(PathBuf::from);
             std::env::remove_var("FLEXVM_INCOMING");
             std::env::remove_var("FLEXVM_INCOMING_LOG");
             unsafe { libc::fcntl(3, libc::F_SETFD, libc::FD_CLOEXEC) };
             // Told once committed or refused: the listener holds an arrival slot until then.
-            vmproc::main(open_host(args)?, paths(args)?, Start::Incoming { req, log }, notify_fd())
+            vmproc::main(open_host(g, true)?, paths(g)?, Start::Incoming { req, log }, notify_fd())
         }
-        Some("run") if args.has("checkpoint") => run_checkpoint(args),
-        Some("run") => run(args, name),
-        Some("start") if args.has("attach") => {
+        Cmd::Run(r) if r.checkpoint.is_some() => run_checkpoint(g, r),
+        Cmd::Run(r) => run(g, r, r.image.as_deref().unwrap_or_default()),
+        Cmd::Start(s) if s.attach => {
+            let name = s.names[0].as_str();
             // A restored software owner (and the ordinary VM owner) consumes
             // these signals itself. Block before Host can start log workers.
             util::block_signals(&[libc::SIGTSTP, libc::SIGCONT, libc::SIGTERM, libc::SIGINT, libc::SIGQUIT, libc::SIGHUP]);
             // A detached start's VM process (`start -a`, answering on FLEXVM_NOTIFY_FD) must answer
             // its parent through vmproc, even if another start won meanwhile.
-            let host = open_host(args)?;
+            let host = open_host(g, true)?;
             if std::env::var_os("FLEXVM_NOTIFY_FD").is_none() {
                 stopped_to_attach(&host, name)?;
                 // Nothing to start: said before taking the name, which would clear a moved VM's hint.
@@ -919,112 +678,117 @@ fn real_main(args: &Args) -> Result<()> {
                 }
             }
             if software_state::identifies(&host.suspended(name)?) {
-                util::exit(software::restore(host, name, args.get("parent-kvm-bundle").map(Path::new), notify_fd())?);
+                util::exit(software::restore(host, name, s.parent_kvm_bundle.as_deref().map(Path::new), notify_fd())?);
             }
             let start = rerun(&host, name)?.unwrap_or(Start::Resume { name: name.into() });
-            vmproc::main(host, paths(args)?, start, notify_fd())
+            vmproc::main(host, paths(g)?, start, notify_fd())
         }
-        Some("start") => {
-            let host = open_host(args)?;
-            each(args.names(), |n| start(&host, args, n))
+        Cmd::Start(s) => {
+            let host = open_host(g, true)?;
+            each(&s.names, |n| start(&host, g, s.parent_kvm_bundle.as_deref(), n))
         }
-        Some("ps") => ps(&open_host(args)?, args),
-        Some("exec") => {
-            let cmd = exec_command(args)?;
-            util::exit(exec(&open_host(args)?, name, &cmd)?)
+        Cmd::Ps(p) => ps(&open_host(g, false)?, p),
+        Cmd::Exec(e) => {
+            let cmd = exec_command(e)?;
+            util::exit(exec(&open_host(g, false)?, e.name.as_deref().unwrap_or_default(), &cmd)?)
         }
-        Some("attach") => {
-            let host = open_host(args)?;
-            util::exit(attach::attach(&host, name, None)?)
+        Cmd::Attach(a) => {
+            let host = open_host(g, false)?;
+            util::exit(attach::attach(&host, a.value.as_deref().unwrap_or_default(), None)?)
         }
-        Some("cp") => {
-            let host = open_host(args)?;
-            util::exit(attach::cp(&host, name, arg2.unwrap_or_default())?)
+        Cmd::Cp(a) => {
+            let host = open_host(g, false)?;
+            util::exit(attach::cp(&host, a.first.as_deref().unwrap_or_default(), a.second.as_deref().unwrap_or_default())?)
         }
-        Some("logs") => {
-            let tail = args
-                .get("tail")
+        Cmd::Logs(l) => {
+            let tail = l
+                .tail
+                .as_deref()
                 .filter(|&t| t != "all")
                 .map(|t| t.parse().map_err(|_| format!("bad --tail {t:?}: give a count of lines, or all")))
                 .transpose()?;
-            containers::logs(&open_host(args)?, name, args.has("follow"), tail)
+            containers::logs(&open_host(g, false)?, l.name.as_deref().unwrap_or_default(), l.follow, tail)
         }
-        Some("inspect") => containers::inspect(&open_host(args)?, &paths(args)?, args.names()),
-        Some("wait") => {
-            let host = open_host(args)?;
-            each(args.names(), |n| output(format_args!("{}\n", containers::wait(&host, n)?)))
+        Cmd::Inspect(a) => containers::inspect(&open_host(g, false)?, &paths(g)?, &a.names),
+        Cmd::Wait(a) => {
+            let host = open_host(g, false)?;
+            each(&a.names, |n| output(format_args!("{}\n", containers::wait(&host, n)?)))
         }
-        Some("rename") => containers::rename(&open_host(args)?, name, arg2.unwrap_or_default()),
-        Some("stop") => {
-            let host = open_host(args)?;
-            each(args.names(), |n| stop(&host, n).and_then(|_| output(format_args!("{n}\n"))))
+        Cmd::Rename(a) => containers::rename(&open_host(g, false)?, a.first.as_deref().unwrap_or_default(), a.second.as_deref().unwrap_or_default()),
+        Cmd::Stop(a) => {
+            let host = open_host(g, false)?;
+            each(&a.names, |n| stop(&host, n).and_then(|_| output(format_args!("{n}\n"))))
         }
-        Some("restart") => {
-            let host = open_host(args)?;
+        Cmd::Restart(r) => {
+            let host = open_host(g, false)?;
             // Started under the name it has last: a rename as it was stopped moved it on (#1189).
-            each(args.names(), |n| {
+            each(&r.names, |n| {
                 let last = stop(&host, n)?;
-                start(&host, args, &last)
+                start(&host, g, r.parent_kvm_bundle.as_deref(), &last)
             })
         }
-        Some("pause") => {
-            let host = open_host(args)?;
-            each(args.names(), |n| pause(&host, n).and_then(|()| output(format_args!("{n}\n"))))
+        Cmd::Pause(a) => {
+            let host = open_host(g, false)?;
+            each(&a.names, |n| pause(&host, n).and_then(|()| output(format_args!("{n}\n"))))
         }
-        Some("unpause") => {
-            let host = open_host(args)?;
-            each(args.names(), |n| unpause_vm(&host, n).and_then(|()| output(format_args!("{n}\n"))))
+        Cmd::Unpause(a) => {
+            let host = open_host(g, false)?;
+            each(&a.names, |n| unpause_vm(&host, n).and_then(|()| output(format_args!("{n}\n"))))
         }
-        Some("kill") if args.has("signal") => {
-            let sig = app::parse_signal(args.get("signal").unwrap_or_default())?;
-            let host = open_host(args)?;
-            each(args.names(), |n| signal_app(&host, n, sig).and_then(|()| output(format_args!("{n}\n"))))
+        Cmd::Kill(k) if k.signal.is_some() => {
+            let sig = app::parse_signal(k.signal.as_deref().unwrap_or_default())?;
+            let host = open_host(g, false)?;
+            each(&k.names, |n| signal_app(&host, n, sig).and_then(|()| output(format_args!("{n}\n"))))
         }
-        Some("kill") => {
-            let host = open_host(args)?;
-            each(args.names(), |n| remove(&host, n, true, false).and_then(|()| output(format_args!("{n}\n"))))
+        Cmd::Kill(k) => {
+            let host = open_host(g, false)?;
+            each(&k.names, |n| remove(&host, n, true, false).and_then(|()| output(format_args!("{n}\n"))))
         }
-        Some("rm") => {
-            let host = open_host(args)?;
-            each(args.names(), |n| remove(&host, n, args.has("force"), true).and_then(|()| output(format_args!("{n}\n"))))
+        Cmd::Rm(r) => {
+            let host = open_host(g, false)?;
+            each(&r.names, |n| remove(&host, n, r.force, true).and_then(|()| output(format_args!("{n}\n"))))
         }
-        Some("reclaim") => {
-            let gen = args.get("force").map(|v| v.parse().map_err(|_| format!("bad --force generation {v:?}"))).transpose()?;
-            reclaim(&open_host(args)?, name, gen)
+        Cmd::Reclaim(r) => {
+            let gen = r.force.as_deref().map(|v| v.parse().map_err(|_| format!("bad --force generation {v:?}"))).transpose()?;
+            reclaim(&open_host(g, false)?, r.ip.as_deref().unwrap_or_default(), gen)
         }
-        Some("checkpoint") if name == "create" => {
-            let req = json!({"op": "checkpoint", "name": pos.get(3), "stop": args.has("stop"), "incremental": args.has("incremental")});
-            print(vmproc::call(&open_host(args)?, arg2.unwrap_or_default(), req, None)?)
+        Cmd::Checkpoint(ck) => match ck.cmd.as_ref().expect("checked checkpoint subcommand") {
+            CheckpointCmd::Create { vm, name, stop, incremental } => {
+                let req = json!({"op": "checkpoint", "name": name, "stop": stop, "incremental": incremental});
+                print(vmproc::call(&open_host(g, false)?, vm.as_deref().unwrap_or_default(), req, None)?)
+            }
+            other => management::checkpoints(g, other),
+        },
+        Cmd::Migrate(a) => {
+            call(a.first.as_deref().unwrap_or_default(), json!({"op": "migrate", "to": a.second.as_deref().ok_or("migrate needs NAME HOST:PORT")?}))
         }
-        Some("checkpoint") => management::checkpoints(args, name),
-        Some("migrate") => call(json!({"op": "migrate", "to": arg2.ok_or("migrate needs NAME HOST:PORT")?})),
-        Some("listen") => {
+        Cmd::Listen(a) => {
             // Before any thread that would take these signals is started.
             util::on_signal(&[libc::SIGTERM, libc::SIGINT, libc::SIGHUP], |sig| util::raise_signal(sig));
-            let mut host = open_host(args)?;
-            let (listeners, validated) = configure_listener(&mut host, pos.get(1).copied(), listen::activated())?;
+            let mut host = open_host(g, true)?;
+            let (listeners, validated) = configure_listener(&mut host, a.value.as_deref(), listen::activated())?;
             listen::main(host, listeners, validated)
         }
-        Some("info") => print(info(&open_host(args)?)),
-        Some("api") => api::main(open_host(args)?, paths(args)?, child_args(args, &[]), pos.get(1).copied()),
-        Some("bench") => bench::run(args),
+        Cmd::Info => print(info(&open_host(g, false)?)),
+        Cmd::Api(a) => api::main(open_host(g, false)?, paths(g)?, g.child_args(&[]), a.value.as_deref()),
+        Cmd::Bench(b) => bench::run(g, b),
         // Test hooks: arm a fault for MS ms (0 disarms), hash a checkpoint, or ask a VM.
-        Some("debug") => match name {
-            "gc" => {
-                let host = open_host(args)?;
-                gc::sweep_now(&host)
+        Cmd::Debug(d) => {
+            let op = d.words.first().map(String::as_str).unwrap_or("");
+            let arg2 = d.words.get(1).map(String::as_str);
+            match op {
+                "gc" => {
+                    let host = open_host(g, false)?;
+                    gc::sweep_now(&host)
+                }
+                "fault" => {
+                    let ms = d.words.get(2).map_or(Ok(1000), |m| m.parse().map_err(|_| format!("bad fault MS {m:?}")))?;
+                    host::arm(&open_host(g, false)?, arg2.ok_or("debug fault NAME MS")?, ms)
+                }
+                "ckhash" => print(lifecycle::ckhash(&paths(g)?, std::path::Path::new(arg2.ok_or("debug ckhash DIR")?))?),
+                "" => Err("debug fault|ckhash|gc|VM ...".into()),
+                _ => call(op, json!({"op": "debug", "what": arg2.unwrap_or("status")})),
             }
-            "fault" => {
-                let ms = pos.get(3).map_or(Ok(1000), |m| m.parse().map_err(|_| format!("bad fault MS {m:?}")))?;
-                host::arm(&open_host(args)?, arg2.ok_or("debug fault NAME MS")?, ms)
-            }
-            "ckhash" => print(lifecycle::ckhash(&paths(args)?, std::path::Path::new(arg2.ok_or("debug ckhash DIR")?))?),
-            "" => Err("debug fault|ckhash|gc|VM ...".into()),
-            _ => call(json!({"op": "debug", "what": arg2.unwrap_or("status")})),
-        },
-        _ => {
-            util::log_line(USAGE.to_string());
-            util::exit(2)
         }
     }
 }
@@ -1039,21 +803,6 @@ fn each(names: &[String], mut f: impl FnMut(&str) -> Result<()>) -> Result<()> {
         bail!("{failed} of {} failed", names.len());
     }
     Ok(())
-}
-
-/// The global flags, then `words`: a command this process runs as a child.
-fn child_args(args: &Args, words: &[&str]) -> Vec<String> {
-    let mut v = Vec::new();
-    for flag in ["state", "run"] {
-        if let Some(value) = args.get(flag) {
-            v.extend([format!("--{flag}"), value.into()]);
-        }
-    }
-    if args.has("verbose") {
-        v.push("--verbose".into());
-    }
-    v.extend(words.iter().map(|w| w.to_string()));
-    v
 }
 
 /// `info`: host.json as set, what is derived for the rest, and what looks like a mistake.
@@ -1156,9 +905,9 @@ fn listener_addresses(addr: &str, resolved: Vec<std::net::SocketAddr>) -> Result
 }
 
 /// `--cpus` and `--memory`.
-fn resources(args: &Args) -> Result<vm::Resources> {
-    let cpus = args.get("cpus").map(|v| v.parse::<f64>().ok().filter(|c| c.is_finite() && *c > 0.0).ok_or_else(|| format!("bad --cpus {v:?}"))).transpose()?;
-    Ok(vm::Resources { cpus, memory_mib: args.get("memory").map(memory_mib).transpose()? })
+fn resources(cpus: Option<&str>, memory: Option<&str>) -> Result<vm::Resources> {
+    let cpus = cpus.map(|v| v.parse::<f64>().ok().filter(|c| c.is_finite() && *c > 0.0).ok_or_else(|| format!("bad --cpus {v:?}"))).transpose()?;
+    Ok(vm::Resources { cpus, memory_mib: memory.map(memory_mib).transpose()? })
 }
 
 /// A size as docker takes it: bytes, or a number (with a fraction) and a unit of b, k, m, g or
@@ -1191,25 +940,25 @@ fn memory_mib(v: &str) -> Result<u64> {
 }
 
 /// `run IMAGE`: claims a standby VM if there is one, else becomes the VM.
-fn run(args: &Args, image: &str) -> Result<()> {
-    let (host, paths) = (open_host(args)?, paths(args)?);
+fn run(global: &GlobalArgs, args: &RunArgs, image: &str) -> Result<()> {
+    let (host, paths) = (open_host(global, true)?, paths(global)?);
     let template = template::name_of(image)?;
-    let resources = resources(args)?;
-    let ip = args.get("ip").filter(|&s| s != "auto");
+    let resources = resources(args.cpus.as_deref(), args.memory.as_deref())?;
+    let ip = args.ip.as_deref().filter(|&s| s != "auto");
     let ip: Option<std::net::Ipv4Addr> = ip.map(|s| s.parse().map_err(|_| format!("bad --ip {s:?}"))).transpose()?;
-    if let Some(name) = args.get("name") {
+    if let Some(name) = args.name.as_deref() {
         host::check_new_name(name)?;
     }
     // Parsed once (its `-p` ports included), before a pull: a bad one is refused at once.
     let spec = run_spec(args, ip)?;
     // Pulled the first time, as docker does (a detached run's VM process finds it there).
     if template::Template::generation(&paths, &template).is_none() && std::fs::symlink_metadata(paths.templates.join(&template)).is_err() {
-        pull_missing(args, &template)?;
+        pull_missing(global, &template)?;
     }
-    let interactive = args.has("interactive") || args.has("tty");
+    let interactive = args.interactive || args.tty;
     // With -i or -t, CMD is the app (`run_spec`), which they are for.
-    let cmd = (!args.rest.is_empty() && !interactive).then(|| args.rest.join(" "));
-    if args.has("interactive") && args.has("tty") && !args.has("detach") && !std::io::stdin().is_terminal() && std::env::var_os("FLEXVM_NOTIFY_FD").is_none() {
+    let cmd = (!args.cmd.is_empty() && !interactive).then(|| args.cmd.join(" "));
+    if args.interactive && args.tty && !args.detach && !std::io::stdin().is_terminal() && std::env::var_os("FLEXVM_NOTIFY_FD").is_none() {
         bail!("the input device is not a TTY");
     }
     // Only settings for the app need the template's (a standby VM's claim is ~5 ms).
@@ -1220,12 +969,12 @@ fn run(args: &Args, image: &str) -> Result<()> {
     // A made-up name is only checked free here: one another run took meanwhile is made up
     // again (a cold foreground run's VM process does that itself, `Proc::run`).
     for _ in 0..20 {
-        let name = match args.get("name") {
+        let name = match args.name.as_deref() {
             Some(name) => name.to_string(),
             None => host::generated_name(&host)?,
         };
-        match run_as(args, &host, &paths, &template, name, ip, cmd.clone(), resources, &spec) {
-            Err(e) if args.get("name").is_none() && host::name_taken(&e) => continue,
+        match run_as(global, args, &host, &paths, &template, name, ip, cmd.clone(), resources, &spec) {
+            Err(e) if args.name.is_none() && host::name_taken(&e) => continue,
             r => return r,
         }
     }
@@ -1235,7 +984,8 @@ fn run(args: &Args, image: &str) -> Result<()> {
 /// `run` of VM `name`: a standby's claim, or this process becomes the VM.
 #[allow(clippy::too_many_arguments)]
 fn run_as(
-    args: &Args,
+    global: &GlobalArgs,
+    args: &RunArgs,
     host: &Host,
     paths: &Paths,
     template: &str,
@@ -1248,9 +998,9 @@ fn run_as(
     // A detached run's VM process (it answers on FLEXVM_NOTIFY_FD): its parent tried them.
     let tried = std::env::var_os("FLEXVM_NOTIFY_FD").is_some();
     // A foreground -i or -t runs it in the background, and attaches to it (as `attach`).
-    let attached = (args.has("interactive") || args.has("tty")) && !args.has("detach") && !tried;
+    let attached = (args.interactive || args.tty) && !args.detach && !tried;
     // A claimed standby VM writes where this process would, to opens made here (`own`).
-    let log = (args.has("detach") || attached).then(|| new_run_log(host, &name)).transpose()?;
+    let log = (args.detach || attached).then(|| new_run_log(host, &name)).transpose()?;
     // Attached: a foreground claimer follows the VM, which goes if it hangs up (killed), as a cold run's would.
     // And joins this process's cgroup, where a cold run's VM process (this one) would be.
     let cgroup = log.is_none().then(util::my_cgroup).flatten();
@@ -1269,7 +1019,7 @@ fn run_as(
         unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, set, std::ptr::null_mut()) };
     }
     match (taken, log) {
-        (Some((v, _)), Some(_)) if attached => run_attached(host, &name, args.has("keep"), &started(&v)),
+        (Some((v, _)), Some(_)) if attached => run_attached(host, &name, args.keep, &started(&v)),
         (Some((v, _)), Some(_)) => print(v),
         (Some((v, conn)), None) => {
             // Its terminal gone, this client's own output is dropped: only the VM's process
@@ -1279,15 +1029,15 @@ fn run_as(
         }
         (None, Some(log)) => {
             // The child takes the name made up here.
-            let child = [&["--name".to_string(), name.clone()][..], &args.child_args].concat();
+            let child = args.child_args(global, Some(&name));
             let v = spawn_detached(host, &name, &child, &log, attached)?;
             match attached {
-                true => run_attached(host, &name, args.has("keep"), &started(&v)),
+                true => run_attached(host, &name, args.keep, &started(&v)),
                 false => print(v),
             }
         }
         (None, None) => {
-            let generated = args.get("name").is_none();
+            let generated = args.name.is_none();
             let (spec, rerun) = (spec.clone(), false);
             // Its child args have no -d either way: its parent says whether it attaches.
             let attacher = std::env::var_os("FLEXVM_ATTACHER").is_some();
@@ -1335,9 +1085,9 @@ fn run_attached(host: &Host, name: &str, keep: bool, started: &host::Ident) -> R
     util::exit(code)
 }
 
-fn port_specs(args: &Args) -> Result<Vec<ports::Port>> {
+fn port_specs(publish: &[String]) -> Result<Vec<ports::Port>> {
     let mut ports = Vec::new();
-    for s in args.all("publish") {
+    for s in publish {
         let p: ports::Port = s.parse()?;
         if let Some(old) = ports.iter().find(|old: &&ports::Port| old.overlaps(&p)) {
             crate::bail!("duplicate port mapping {p}: {old} already publishes that host address and port");
@@ -1348,39 +1098,38 @@ fn port_specs(args: &Args) -> Result<Vec<ports::Port>> {
 }
 
 /// A bare env key takes this environment's value, if present, for run, exec and pull.
-fn env_flags(args: &Args) -> Result<Vec<String>> {
-    let env = args.all("env");
-    for kv in &env {
+fn env_flags(env: &[String]) -> Result<Vec<String>> {
+    for kv in env {
         app::validate_env(kv)?;
     }
     Ok(env
-        .into_iter()
+        .iter()
         .filter_map(|kv| match kv.contains('=') {
-            true => Some(kv),
-            false => std::env::var(&kv).ok().map(|v| format!("{kv}={v}")),
+            true => Some(kv.clone()),
+            false => std::env::var(kv).ok().map(|v| format!("{kv}={v}")),
         })
         .collect())
 }
 
 /// `-e`, `--env-file`, `--entrypoint`, `--keep`, `--rm`, `-p` (and the `--ip` asked for, for a rerun).
-fn run_spec(args: &Args, ip: Option<std::net::Ipv4Addr>) -> Result<app::RunSpec> {
+fn run_spec(args: &RunArgs, ip: Option<std::net::Ipv4Addr>) -> Result<app::RunSpec> {
     let lookup = |k: &str| std::env::var(k).ok();
     let mut env = Vec::new();
-    for f in args.all("env-file") {
-        let text = std::fs::read_to_string(&f).map_err(|e| format!("--env-file {f}: {e}"))?;
+    for f in &args.env_file {
+        let text = std::fs::read_to_string(f).map_err(|e| format!("--env-file {f}: {e}"))?;
         env.extend(app::parse_env_file(&text, lookup).map_err(|e| format!("--env-file {f}: {e}"))?);
     }
     // After the files, as docker: `-e` wins. A bare `K` is this environment's, if it has one.
-    env.extend(env_flags(args)?);
-    let (stdin, tty) = (args.has("interactive"), args.has("tty"));
-    let entrypoint = match args.get("entrypoint") {
+    env.extend(env_flags(&args.env)?);
+    let (stdin, tty) = (args.interactive, args.tty);
+    let entrypoint = match args.entrypoint.as_deref() {
         Some(e) => Some(image::parse_argv(e)?),
         // docker's CMD, whole: images' entrypoints are not kept apart from their commands.
-        None if (stdin || tty) && !args.rest.is_empty() => Some(args.rest.clone()),
+        None if (stdin || tty) && !args.cmd.is_empty() => Some(args.cmd.clone()),
         None => None,
     };
-    let restart = args.get("restart").map(app::Restart::parse).transpose()?.flatten();
-    Ok(app::RunSpec { env, entrypoint, keep: args.has("keep"), rm: args.has("rm"), ip, ports: port_specs(args)?, stdin, tty, restart })
+    let restart = args.restart.as_deref().map(app::Restart::parse).transpose()?.flatten();
+    Ok(app::RunSpec { env, entrypoint, keep: args.keep, rm: args.rm, ip, ports: port_specs(&args.publish)?, stdin, tty, restart })
 }
 
 /// `start` of an exited VM (`app::Exited`): a new run under its name, as its record (read under
@@ -1503,34 +1252,28 @@ pub(crate) fn signal_app(host: &Host, name: &str, sig: i32) -> Result<()> {
 }
 
 /// `run --checkpoint DIR`: the checkpoint's name and address unless `--name`, `--ip`.
-fn run_checkpoint(args: &Args) -> Result<()> {
-    let what = args.get("checkpoint").unwrap_or_default();
+fn run_checkpoint(global: &GlobalArgs, args: &RunArgs) -> Result<()> {
+    let what = args.checkpoint.as_deref().unwrap_or_default();
     // A path (v0.1.0's checkpoints, a stopped VM's) as it is; else a stored one.
     let dir = match what.contains('/') {
         true => std::path::absolute(what)?,
-        false => match checkpoint::store::find(&checkpoint::store::list(&state(args)?), what) {
+        false => match checkpoint::store::find(&checkpoint::store::list(&state(global)?), what) {
             Ok(e) => e.dir.clone(),
             Err(e) if std::path::Path::new(what).is_dir() => bail!("{e}; a checkpoint directory is given by its path: ./{what}"),
             Err(e) => Err(e)?,
         },
     };
-    let resources = resources(args)?;
-    let s = Start::Restore {
-        dir: dir.clone(),
-        name: args.get("name").map(String::from),
-        ip: args.get("ip").map(String::from),
-        paused: args.has("paused"),
-        resources,
-        ports: port_specs(args)?,
-    };
-    if args.has("detach") {
-        let host = open_host(args)?;
+    let resources = resources(args.cpus.as_deref(), args.memory.as_deref())?;
+    let s =
+        Start::Restore { dir: dir.clone(), name: args.name.clone(), ip: args.ip.clone(), paused: args.paused, resources, ports: port_specs(&args.publish)? };
+    if args.detach {
+        let host = open_host(global, true)?;
         // A detached restore logs to the VM's name, which the checkpoint has without --name.
         let own = checkpoint::read_manifest(&dir)?.name;
-        let name = args.get("name").map_or_else(|| own.clone(), String::from);
-        return print(spawn_detached(&host, &name, &args.child_args, &restore_run_log(&host, &name, name == own)?, false)?);
+        let name = args.name.clone().unwrap_or_else(|| own.clone());
+        return print(spawn_detached(&host, &name, &args.child_args(global, None), &restore_run_log(&host, &name, name == own)?, false)?);
     }
-    vmproc::main(open_host(args)?, paths(args)?, s, notify_fd())
+    vmproc::main(open_host(global, true)?, paths(global)?, s, notify_fd())
 }
 
 /// What a foreground `run` that claimed a standby VM forwards to it (SIGHUP is ignored).
@@ -1626,8 +1369,8 @@ fn follow(mut conn: BufReader<std::os::unix::net::UnixStream>, id: host::Ident) 
 /// `start` (and `restart`): a running VM's process resumes it, a stopped or exited one a new
 /// process. A start that lost the name to another meanwhile (two `start`s at once) is that one's:
 /// done once it runs, as resuming a running VM is.
-fn start(host: &Host, args: &Args, name: &str) -> Result<()> {
-    match start_vm(host, &child_args(args, &[]), args.get("parent-kvm-bundle"), name)? {
+fn start(host: &Host, global: &GlobalArgs, parent_kvm_bundle: Option<&str>, name: &str) -> Result<()> {
+    match start_vm(host, &global.child_args(&[]), parent_kvm_bundle, name)? {
         Some(v) => print(v),
         None => output(format_args!("{name}\n")),
     }
@@ -2262,15 +2005,15 @@ fn stopped(v: &Value) -> bool {
 }
 
 /// `ps`: `-a`, `-q`, `--json`, `--filter`s and `--format` (`containers`).
-fn ps(host: &Host, args: &Args) -> Result<()> {
-    let filters = containers::Filters::parse(&args.all("filter"))?;
-    let format = args.get("format").filter(|f| f.trim() != "table").map(containers::Format::parse).transpose()?;
-    let all = args.has("all") || filters.has_status();
+fn ps(host: &Host, args: &PsArgs) -> Result<()> {
+    let filters = containers::Filters::parse(&args.filter)?;
+    let format = args.format.as_deref().filter(|f| f.trim() != "table").map(containers::Format::parse).transpose()?;
+    let all = args.all || filters.has_status();
     let vms: Vec<Value> = vms(host).into_iter().filter(|v| (all || !stopped(v)) && filters.matches(v)).collect();
-    if args.has("quiet") {
+    if args.quiet {
         return vms.iter().try_for_each(|v| output(format_args!("{}\n", containers::field(v, "Name"))));
     }
-    if args.has("json") {
+    if args.json {
         return print(json!(vms));
     }
     if let Some(f) = format {
@@ -2310,25 +2053,25 @@ fn output(text: std::fmt::Arguments<'_>) -> Result<()> {
 }
 
 // Firecracker wants 1 or an even count of vCPUs, at most 32.
-fn template_vcpus(args: &Args) -> Result<u32> {
+fn template_vcpus(vcpus: Option<&str>) -> Result<u32> {
     let cpus = util::host_cpus().min(32) as u32;
-    let cpus = args.parse_or("vcpus", if cpus > 1 { cpus & !1 } else { 1 })?;
+    let cpus = cli::parse_or(vcpus, "vcpus", if cpus > 1 { cpus & !1 } else { 1 })?;
     if cpus != 1 && (cpus == 0 || cpus > 32 || cpus % 2 != 0) {
         bail!("--vcpus must be 1 or an even count up to 32");
     }
     Ok(cpus)
 }
 
-fn pull_missing_args(args: &Args, name: &str) -> Vec<String> {
-    child_args(args, &["pull", &template::image_of(name)])
+fn pull_missing_args(global: &GlobalArgs, name: &str) -> Vec<String> {
+    global.child_args(&["pull", &template::image_of(name)])
 }
 
 /// `run IMAGE` of an image not pulled here: `flexvm pull IMAGE` first, its output on stderr.
-fn pull_missing(args: &Args, name: &str) -> Result<()> {
+fn pull_missing(global: &GlobalArgs, name: &str) -> Result<()> {
     let image = template::image_of(name);
     crate::log!("flexvm: unable to find image {image} here; pulling it");
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
-    cmd.args(pull_missing_args(args, name));
+    cmd.args(pull_missing_args(global, name));
     let status = cmd.stdout(std::io::stderr()).status()?;
     if !status.success() {
         bail!("pulling {image} failed ({status})");
@@ -2336,17 +2079,12 @@ fn pull_missing(args: &Args, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether a pull only adjusts the standby count, leaving its template options intact.
-fn only_standby(args: &Args) -> bool {
-    args.flags.iter().all(|(f, _)| GLOBAL.contains(&f.as_str()) || matches!(f.as_str(), "standby" | "tag"))
-}
-
 /// `--mem` is the memory ceiling (the host's memory unless given, at most what a peer takes and
 /// at most what fits Firecracker's hotplug window beside the root filesystem, `template::hotplug_room`,
 /// of `rootfs_bytes`, or the smallest before it is made). Boot memory is derived automatically from
 /// the ceiling (`template::base_mib(max).min(max)`) so guests always start small and grow elastically
 /// up to `--mem` (or host RAM).
-fn pull_size(args: &Args, ram_mib: u64, rootfs_bytes: Option<u64>, arch: compat::Arch) -> Result<template::Size> {
+fn pull_size(args: &PullArgs, ram_mib: u64, rootfs_bytes: Option<u64>, arch: compat::Arch) -> Result<template::Size> {
     let room = template::hotplug_room(rootfs_bytes.unwrap_or(0))?;
     let mem_of = |max: u64| template::base_mib(max).min(max);
     let fits = |max: u64, mem: u64| max.saturating_sub(mem) / template::SLOT_MIB * template::SLOT_MIB <= room;
@@ -2360,14 +2098,14 @@ fn pull_size(args: &Args, ram_mib: u64, rootfs_bytes: Option<u64>, arch: compat:
         }
         max
     };
-    let max = args.parse_or("mem", largest(ram_mib.min(template::MAX_MEM_MIB)))?;
+    let max = cli::parse_or(args.mem.as_deref(), "mem", largest(ram_mib.min(template::MAX_MEM_MIB)))?;
     if max == 0 {
         bail!("--mem must be at least 1 MiB");
     }
     if max > template::MAX_MEM_MIB {
         bail!("--mem must be at most {} MiB", template::MAX_MEM_MIB);
     }
-    let (mem, plug) = (mem_of(max), args.parse_or("plug", template::PLUG_MIB)?);
+    let (mem, plug) = (mem_of(max), cli::parse_or(args.plug.as_deref(), "plug", template::PLUG_MIB)?);
     if mem > template::boot_room(arch) {
         bail!(
             "--mem {max} MiB does not fit: boot memory ({mem} MiB) exceeds what fits below Firecracker's 64-bit MMIO gap on {arch} (at most {} MiB)",
@@ -2382,7 +2120,7 @@ fn pull_size(args: &Args, ram_mib: u64, rootfs_bytes: Option<u64>, arch: compat:
             largest(template::MAX_MEM_MIB)
         );
     }
-    Ok(template::Size { vcpus: template_vcpus(args)?, mem_mib: mem, max_mib: max, plug_mib: plug })
+    Ok(template::Size { vcpus: template_vcpus(args.vcpus.as_deref())?, mem_mib: mem, max_mib: max, plug_mib: plug })
 }
 
 fn cmdline_tmpfs_mib(cmdline: &str) -> Option<u64> {
@@ -2415,23 +2153,23 @@ fn host_ram_mib() -> u64 {
 
 /// `pull SRC`: the template named after the image (or `--tag`), built unless it is up to date;
 /// then `--standby N`, its count of standby VMs.
-fn pull(args: &Args, src: &str) -> Result<()> {
-    let name = match args.get("tag") {
+fn pull(global: &GlobalArgs, args: &PullArgs, src: &str) -> Result<()> {
+    let name = match args.tag.as_deref() {
         Some(tag) => template::name_of(tag)?,
         None if std::path::Path::new(src).exists() => bail!("{src} is a file or directory: name its image with --tag NAME[:TAG]"),
         None => template::name_of(src)?,
     };
     // Checked again once the root filesystem is made (`image::prepare`), before Firecracker starts.
     pull_size(args, host_ram_mib(), None, compat::Arch::HOST)?;
-    let standby = args.get("standby").map(|n| n.parse::<usize>().map_err(|_| format!("bad --standby {n:?}: give a count"))).transpose()?;
+    let standby = args.standby.as_deref().map(|n| n.parse::<usize>().map_err(|_| format!("bad --standby {n:?}: give a count"))).transpose()?;
     if unsafe { libc::geteuid() } != 0 {
         bail!("run flexvm as root");
     }
     // Of an image pulled here, `--standby N` alone (and its --tag) only sets the count: the
     // pull's other options would have to be given again, or it would be rebuilt without them.
-    if let (Some(n), true) = (standby, only_standby(args)) {
-        if std::fs::symlink_metadata(paths(args)?.templates.join(&name)).is_ok() {
-            return print(standby::set(&open_host(args)?, &name, n)?);
+    if let (Some(n), true) = (standby, args.only_standby()) {
+        if std::fs::symlink_metadata(paths(global)?.templates.join(&name)).is_ok() {
+            return print(standby::set(&open_host(global, true)?, &name, n)?);
         }
     }
     util::check_kvm()?;
@@ -2445,20 +2183,20 @@ fn pull(args: &Args, src: &str) -> Result<()> {
             std::thread::park();
         }
     });
-    let paths = paths(args)?;
-    let opts = image_options(args, src)?;
-    let host = open_host(args)?;
+    let paths = paths(global)?;
+    let opts = image_options(global, &args.image_flags, src)?;
+    let host = open_host(global, true)?;
     let _pull = template::pull_lock(&paths, &name)?;
     artifacts::ensure(&[(&paths.kernel, &artifacts::KERNEL)])?;
-    let modules = kernel_bundle(args, &paths.kernel, true)?;
+    let modules = kernel_bundle(global, &args.image_flags, &paths.kernel, true)?;
     let me = host::Ident::me();
     host::clear_taps(&host.run, &me);
     let tap = template::tap(&host.tap_prefix());
     let tap = net::create_free_tap(&tap, &host::tap_alias(&host.run, &me))?;
     let res = (|| {
-        let init = args.get("init").map(PathBuf::from);
+        let init = args.image_flags.init.as_deref().map(PathBuf::from);
         // Held until the template is published: `rmi` leaves the root filesystem to this build.
-        let (rootfs, meta, _reserved, _cache_lock) = image::prepare(&state(args)?.join("images"), init.as_deref(), &opts, modules.as_ref())?;
+        let (rootfs, meta, _reserved, _cache_lock) = image::prepare(&state(global)?.join("images"), init.as_deref(), &opts, modules.as_ref())?;
         let size = pull_size(args, host_ram_mib(), Some(std::fs::metadata(&rootfs)?.len()), compat::Arch::HOST)?;
         if let Some(id) = template::up_to_date(&paths, &name, size, &rootfs, &meta) {
             output(format_args!("image {} is up to date (template {name}, id {id})\n", template::image_of(&name)))?;
@@ -2494,11 +2232,11 @@ fn pull(args: &Args, src: &str) -> Result<()> {
 }
 
 /// `images`: a row per image (`template::images`), with its standby count.
-fn images(host: &Host, paths: &Paths, args: &Args) -> Result<()> {
-    let filters = management::Filters::parse(&args.all("filter"))?;
+fn images(host: &Host, paths: &Paths, args: &ImagesArgs) -> Result<()> {
+    let filters = management::Filters::parse(&args.filter)?;
     let mut images = template::images(paths)?;
     images.retain(|v| filters.matches(v));
-    if args.has("quiet") {
+    if args.quiet {
         let ids: std::collections::BTreeSet<_> = images.iter().filter_map(|v| v["id"].as_str()).collect();
         for id in ids {
             output(format_args!("{id}\n"))?;
@@ -2510,7 +2248,7 @@ fn images(host: &Host, paths: &Paths, args: &Args) -> Result<()> {
             v["standby"] = json!(standby::target(host, &name));
         }
     }
-    if args.has("json") {
+    if args.json {
         return print(json!(images));
     }
     let row = |c: [&str; 8]| output(format_args!("{:<32} {:<16} {:<16} {:>4} {:>8} {:>8} {:>7} {}\n", c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]));
@@ -2559,13 +2297,13 @@ fn rmi(host: &Host, paths: &Paths, what: &str) -> Result<()> {
     print(result?)
 }
 
-fn image_options(args: &Args, src: &str) -> Result<image::Options> {
-    let boot: image::BootProfile = args.get("boot").unwrap_or("app").parse()?;
-    let warm = args.has("warm");
-    let ready = match (args.get("ready-port"), args.get("ready-cmd")) {
+fn image_options(global: &GlobalArgs, flags: &ImageFlags, src: &str) -> Result<image::Options> {
+    let boot: image::BootProfile = flags.boot.as_deref().unwrap_or("app").parse()?;
+    let warm = flags.warm;
+    let ready = match (flags.ready_port.as_deref(), flags.ready_cmd.as_deref()) {
         (Some(_), Some(_)) => return Err("pass --ready-port or --ready-cmd, not both".into()),
-        (Some(_), None) => {
-            let port = args.parse_or::<u16>("ready-port", 0)?;
+        (Some(p), None) => {
+            let port = cli::parse_or::<u16>(Some(p), "ready-port", 0)?;
             if port == 0 {
                 bail!("--ready-port must be 1..65535");
             }
@@ -2578,50 +2316,51 @@ fn image_options(args: &Args, src: &str) -> Result<image::Options> {
         return Err("--ready-port and --ready-cmd only apply with --warm".into());
     }
     let d = image::Limits::default();
-    let bytes =
-        |flag, default| -> Result<u64> { args.parse_or::<u64>(flag, default)?.checked_mul(1 << 20).ok_or_else(|| format!("--{flag} is too large").into()) };
+    let bytes = |val: Option<&str>, flag, default| -> Result<u64> {
+        cli::parse_or::<u64>(val, flag, default)?.checked_mul(1 << 20).ok_or_else(|| format!("--{flag} is too large").into())
+    };
     Ok(image::Options {
         image: src.into(),
         boot,
-        entrypoint: args.get("entrypoint").map(image::parse_argv).transpose()?,
-        cmd: args.get("cmd").map(image::parse_argv).transpose()?,
-        env: env_flags(args)?,
-        workdir: args.get("workdir").map(String::from),
-        user: args.get("user").map(String::from),
+        entrypoint: flags.entrypoint.as_deref().map(image::parse_argv).transpose()?,
+        cmd: flags.cmd.as_deref().map(image::parse_argv).transpose()?,
+        env: env_flags(&flags.env)?,
+        workdir: flags.workdir.clone(),
+        user: flags.user.clone(),
         warm,
         ready,
-        ready_timeout: Duration::from_secs(args.parse_or::<u32>("ready-timeout", 120)?.into()),
-        staging: state(args)?.join("staging"),
+        ready_timeout: Duration::from_secs(cli::parse_or::<u32>(flags.ready_timeout.as_deref(), "ready-timeout", 120)?.into()),
+        staging: state(global)?.join("staging"),
         limits: image::Limits {
-            download: bytes("max-download-mib", d.download >> 20)?,
-            unpacked: bytes("max-unpacked-mib", d.unpacked >> 20)?,
-            file: bytes("max-file-mib", d.file >> 20)?,
-            entries: args.parse_or("max-entries", d.entries)?,
+            download: bytes(flags.max_download_mib.as_deref(), "max-download-mib", d.download >> 20)?,
+            unpacked: bytes(flags.max_unpacked_mib.as_deref(), "max-unpacked-mib", d.unpacked >> 20)?,
+            file: bytes(flags.max_file_mib.as_deref(), "max-file-mib", d.file >> 20)?,
+            entries: cli::parse_or(flags.max_entries.as_deref(), "max-entries", d.entries)?,
         },
     })
 }
 
 /// A custom kernel can bring adjacent modules; the reviewed kernel fetches
 /// its authenticated runtime bundle by default. The large SDK is opt-in.
-fn kernel_bundle(args: &Args, kernel: &Path, reviewed: bool) -> Result<Option<image::KernelBundle>> {
-    if let Some(custom) = args.get("kernel-modules") {
+fn kernel_bundle(global: &GlobalArgs, flags: &ImageFlags, kernel: &Path, reviewed: bool) -> Result<Option<image::KernelBundle>> {
+    if let Some(custom) = flags.kernel_modules.as_deref() {
         let bundle = image::KernelBundle::open(kernel, Path::new(custom), None)?;
         if reviewed {
             artifacts::KERNEL.check_opened(kernel, &bundle.kernel.artifact.sha256)?;
         }
         return Ok(Some(bundle));
     }
-    let development = args.has("kernel-sdk");
+    let development = flags.kernel_sdk;
     let asset = if development { &artifacts::KERNEL_SDK } else { &artifacts::MODULES };
     let canonical_kernel = kernel.canonicalize()?;
     let adjacent = canonical_kernel.with_file_name(asset.name);
-    let state_kernel = paths(args)?.kernel;
+    let state_kernel = paths(global)?.kernel;
     let state_artifacts = state_kernel.parent().ok_or("kernel has no artifact directory")?;
     let authenticated = reviewed || !adjacent.exists() || state_artifacts.canonicalize().is_ok_and(|directory| adjacent.parent() == Some(directory.as_path()));
     let selected = if reviewed || adjacent.exists() {
         adjacent
     } else if development {
-        paths(args)?.kernel.with_file_name(asset.name)
+        paths(global)?.kernel.with_file_name(asset.name)
     } else {
         return Ok(None);
     };
@@ -2652,24 +2391,24 @@ fn software_memory_limits(named: bool, cap_mib: Option<u32>, host_ram_mib: u64) 
 /// First software execution slice: reuse OCI preparation and the real agent,
 /// with engine processes owned by this foreground command. Named VMs also expose
 /// live management and local suspend/restore; migration remains separate work.
-fn software(args: &Args, src: &str) -> Result<i32> {
-    if args.has("disk") && !args.has("name") {
+fn software(global: &GlobalArgs, args: &SoftwareArgs, src: &str) -> Result<i32> {
+    if !args.disk.is_empty() && args.name.is_none() {
         bail!("--disk requires a named software VM");
     }
-    let mem_mib = args.parse_or("mem", 512)?;
-    let parent_kvm = if let Some(bundle) = args.get("parent-kvm-bundle") {
+    let mem_mib = cli::parse_or(args.mem.as_deref(), "mem", 512)?;
+    let parent_kvm = if let Some(bundle) = args.parent_kvm_bundle.as_deref() {
         Some(qemu::ParentKvm {
             bundle: std::fs::canonicalize(bundle).map_err(|error| format!("parent KVM bundle {bundle:?}: {error}"))?,
-            engine: args.get("parent-kvm-engine").unwrap_or("auto").into(),
-            child_mem_mib: args.parse_or("parent-kvm-mem", mem_mib.min(256))?,
+            engine: args.parent_kvm_engine.as_deref().unwrap_or("auto").into(),
+            child_mem_mib: cli::parse_or(args.parent_kvm_mem.as_deref(), "parent-kvm-mem", mem_mib.min(256))?,
         })
     } else {
-        if args.has("parent-kvm-engine") || args.has("parent-kvm-mem") {
+        if args.parent_kvm_engine.is_some() || args.parent_kvm_mem.is_some() {
             bail!("--parent-kvm-engine and --parent-kvm-mem require --parent-kvm-bundle");
         }
         None
     };
-    if args.get("name").is_some() {
+    if args.name.is_some() {
         // A shell's background SIGINT/SIGQUIT disposition must not disable the
         // normal management kill operation on a named VM.
         unsafe {
@@ -2678,45 +2417,44 @@ fn software(args: &Args, src: &str) -> Result<i32> {
         }
         util::block_signals(&[libc::SIGTSTP, libc::SIGCONT, libc::SIGTERM]);
     }
-    let control = match args
-        .get("control")
-        .unwrap_or(if parent_kvm.is_some() || args.get("name").is_some() || args.get("boot").is_some_and(|boot| boot != "app") { "serial" } else { "vsock" })
-    {
+    let control = match args.control.as_deref().unwrap_or(
+        if parent_kvm.is_some() || args.name.is_some() || args.image_flags.boot.as_deref().is_some_and(|boot| boot != "app") { "serial" } else { "vsock" },
+    ) {
         "vsock" => qemu::Control::Vsock,
         "serial" => qemu::Control::Serial,
         other => bail!("unsupported software control transport {other:?}: use vsock or serial"),
     };
-    if control == qemu::Control::Serial && args.get("vsock-backend").is_some() {
+    if control == qemu::Control::Serial && args.vsock_backend.is_some() {
         bail!("--vsock-backend requires --control vsock");
     }
-    if args.get("name").is_some() && control != qemu::Control::Serial {
+    if args.name.is_some() && control != qemu::Control::Serial {
         bail!("named software VMs require --control serial");
     }
     if unsafe { libc::geteuid() } != 0 {
         bail!("software image preparation currently requires root");
     }
-    let kernel = args.get("kernel").map_or_else(|| paths(args).map(|paths| paths.kernel), |kernel| Ok(PathBuf::from(kernel)))?;
-    let installed = !args.has("kernel");
+    let kernel = args.kernel.as_deref().map_or_else(|| paths(global).map(|paths| paths.kernel), |kernel| Ok(PathBuf::from(kernel)))?;
+    let installed = args.kernel.is_none();
     if installed {
         artifacts::ensure(&[(&kernel, &artifacts::KERNEL)])?;
     }
-    let cap_mib: Option<u32> = args.get("mem").map(|s| s.parse::<u32>().map_err(|_| format!("bad --mem {s:?}"))).transpose()?;
-    let (mem_mib, max_mib) = software_memory_limits(args.get("name").is_some(), cap_mib, host_ram_mib())?;
+    let cap_mib: Option<u32> = args.mem.as_deref().map(|s| s.parse::<u32>().map_err(|_| format!("bad --mem {s:?}"))).transpose()?;
+    let (mem_mib, max_mib) = software_memory_limits(args.name.is_some(), cap_mib, host_ram_mib())?;
     let config = qemu::Config {
         control,
         kernel,
-        qemu: args.get("qemu").map(String::from).unwrap_or_else(|| format!("qemu-system-{}", std::env::consts::ARCH)),
-        vsock_backend: args.get("vsock-backend").unwrap_or("vhost-device-vsock").into(),
+        qemu: args.qemu.clone().unwrap_or_else(|| format!("qemu-system-{}", std::env::consts::ARCH)),
+        vsock_backend: args.vsock_backend.as_deref().unwrap_or("vhost-device-vsock").into(),
         mem_mib,
         max_mib,
-        vcpus: args.parse_or("vcpus", 1)?,
-        boot_timeout: Duration::from_secs(args.parse_or("timeout", 90)?),
+        vcpus: cli::parse_or(args.vcpus.as_deref(), "vcpus", 1)?,
+        boot_timeout: Duration::from_secs(cli::parse_or(args.timeout.as_deref(), "timeout", 90)?),
         parent_kvm,
     };
     config.validate()?;
     let processes = std::sync::Arc::new(qemu::Processes::default());
     let stopping = processes.clone();
-    let signals: &[i32] = if args.get("name").is_some() { &[libc::SIGINT, libc::SIGQUIT, libc::SIGHUP] } else { &[libc::SIGINT, libc::SIGTERM, libc::SIGHUP] };
+    let signals: &[i32] = if args.name.is_some() { &[libc::SIGINT, libc::SIGQUIT, libc::SIGHUP] } else { &[libc::SIGINT, libc::SIGTERM, libc::SIGHUP] };
     util::on_signal(signals, move |sig| {
         template::interrupt(sig);
         stopping.stop();
@@ -2724,30 +2462,31 @@ fn software(args: &Args, src: &str) -> Result<i32> {
             std::thread::park();
         }
     });
-    let mut opts = image_options(args, src)?;
-    if !args.rest.is_empty() {
-        opts.cmd = Some(args.rest.clone());
+    let mut opts = image_options(global, &args.image_flags, src)?;
+    if !args.cmd.is_empty() {
+        opts.cmd = Some(args.cmd.clone());
     }
-    let init = args.get("init").map(PathBuf::from);
-    let modules = kernel_bundle(args, &config.kernel, installed)?;
-    let (rootfs, meta, _reserved, _cache_lock) = image::prepare(&state(args)?.join("images"), init.as_deref(), &opts, modules.as_ref())?;
+    let init = args.image_flags.init.as_deref().map(PathBuf::from);
+    let modules = kernel_bundle(global, &args.image_flags, &config.kernel, installed)?;
+    let (rootfs, meta, _reserved, _cache_lock) = image::prepare(&state(global)?.join("images"), init.as_deref(), &opts, modules.as_ref())?;
     if meta.argv.is_empty() {
         bail!("software execution needs an image command or CMD");
     }
     let named = args
-        .get("name")
+        .name
+        .as_deref()
         .map(|name| -> Result<_> {
-            let host = open_host(args)?;
+            let host = open_host(global, false)?;
             let lock = host.take_name(name, false)?;
             Ok((host, lock))
         })
         .transpose()?;
     let reservation =
         named.as_ref().map(|(host, _)| software::Reservation::new(host, config.mem_mib, Instant::now() + config.boot_timeout, &processes)).transpose()?;
-    let disks = if args.has("disk") {
+    let disks = if !args.disk.is_empty() {
         let (host, _) = named.as_ref().ok_or("--disk requires a named software VM")?;
         let catalog = volume::Catalog::open(&host.state)?;
-        args.all("disk").iter().map(|name| catalog.writer(name)).collect::<Result<Vec<_>>>()?
+        args.disk.iter().map(|name| catalog.writer(name)).collect::<Result<Vec<_>>>()?
     } else {
         Vec::new()
     };
@@ -2811,22 +2550,22 @@ impl Session {
 }
 
 /// CLI exec has no implicit shell; options are serialized with the argv.
-fn exec_command(args: &Args) -> Result<Value> {
-    if args.rest.first().is_none_or(|s| s.is_empty()) {
+fn exec_command(args: &ExecArgs) -> Result<Value> {
+    if args.cmd.first().is_none_or(|s| s.is_empty()) {
         bail!("exec needs CMD");
     }
-    let env = env_flags(args)?;
+    let env = env_flags(&args.env)?;
     // As with docker exec; a relative one would be resolved against a directory the user cannot see.
-    if args.get("workdir").is_some_and(|w| !w.starts_with('/')) {
+    if args.workdir.as_deref().is_some_and(|w| !w.starts_with('/')) {
         bail!("exec -w needs an absolute path");
     }
-    let (stdin, tty) = (args.has("interactive"), args.has("tty"));
+    let (stdin, tty) = (args.interactive, args.tty);
     // As docker's: a terminal's keys, or none.
     if stdin && tty && !std::io::stdin().is_terminal() {
         bail!("the input device is not a TTY");
     }
     let size = tty.then(attach::size).flatten().map(|(rows, cols)| [rows, cols]);
-    let cmd = json!({"argv": args.rest, "env": env, "workdir": args.get("workdir"), "user": args.get("user"), "detach": args.has("detach"),
+    let cmd = json!({"argv": args.cmd, "env": env, "workdir": args.workdir, "user": args.user, "detach": args.detach,
         "stdin": stdin, "tty": tty, "size": size});
     guest::command_body(&cmd)?;
     Ok(cmd)
@@ -3212,8 +2951,32 @@ fn exec_frames(
 mod exec_tests {
     use super::*;
 
-    fn parse(args: &[&str]) -> Args {
-        Args::parse(args.iter().map(|a| a.to_string())).unwrap()
+    fn parse(args: &[&str]) -> Cli {
+        let owned: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+        cli::parse_from(&owned).unwrap()
+    }
+
+    fn try_parse(args: &[&str]) -> Result<Cli> {
+        let owned: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+        cli::parse_from(&owned)
+    }
+
+    fn parse_run(args: &[&str]) -> (GlobalArgs, RunArgs) {
+        let c = parse(args);
+        let Some(Cmd::Run(r)) = c.command else { panic!("expected run") };
+        (c.global, *r)
+    }
+
+    fn parse_pull(args: &[&str]) -> (GlobalArgs, PullArgs) {
+        let c = parse(args);
+        let Some(Cmd::Pull(p)) = c.command else { panic!("expected pull") };
+        (c.global, *p)
+    }
+
+    fn parse_exec(args: &[&str]) -> ExecArgs {
+        let c = parse(args);
+        let Some(Cmd::Exec(e)) = c.command else { panic!("expected exec") };
+        e
     }
 
     #[test]
@@ -3295,15 +3058,13 @@ mod exec_tests {
     #[test]
     fn ambiguous_options_must_follow_the_command() {
         for (flag, cmd, word) in [("force", "reclaim", "10.9.0.2"), ("standby", "pull", "img")] {
-            assert_eq!(takes_value(flag, None), None);
             for option in [format!("--{flag}"), format!("--{flag}=1")] {
-                let (args, error) = Args::parse_partly([option, cmd.into(), word.into()]);
-                assert_eq!(error.unwrap().to_string(), format!("--{flag} must follow the command"));
-                assert!(!args.has(flag));
+                assert!(try_parse(&[&option, cmd, word]).is_err(), "{option} {cmd}");
             }
         }
-        assert_eq!(parse(&["pull", "img", "--standby", "5"]).get("standby"), Some("5"));
-        assert!(parse(&["rm", "--force", "vm"]).has("force"));
+        assert_eq!(parse_pull(&["pull", "img", "--standby", "5"]).1.standby.as_deref(), Some("5"));
+        let Some(Cmd::Rm(rm)) = parse(&["rm", "--force", "vm"]).command else { panic!("expected rm") };
+        assert!(rm.force);
     }
 
     #[test]
@@ -3332,10 +3093,10 @@ mod exec_tests {
             assert_eq!(real_main(&args).unwrap_err().to_string(), message);
         }
         // --max is removed from pull.
-        assert_eq!(Args::parse(["pull", "busybox", "--max", "2048"].map(String::from)).err().unwrap().to_string(), "unknown option --max (see flexvm --help)");
+        assert!(try_parse(&["pull", "busybox", "--max", "2048"]).is_err());
         // The hotplug region is whole slots: what is past the last one is not hotplug.
         for mem in ["128", "256", "523520", "541567"] {
-            let size = pull_size(&parse(&["pull", "busybox", "--mem", mem]), host_ram_mib(), None, compat::Arch::HOST).unwrap();
+            let size = pull_size(&parse_pull(&["pull", "busybox", "--mem", mem]).1, host_ram_mib(), None, compat::Arch::HOST).unwrap();
             assert_eq!(size.max_mib.to_string(), mem);
             assert!(size.mem_mib <= size.max_mib);
         }
@@ -3357,7 +3118,7 @@ mod exec_tests {
         // A root filesystem larger than the window is refused, hotplug or not.
         let err = template::hotplug_room((512 << 30) + 1).unwrap_err().to_string();
         assert_eq!(err, "the root filesystem, 524290 MiB, does not fit Firecracker's 512 GiB window for pmem devices");
-        let args = parse(&["pull", "busybox", "--mem", "256"]);
+        let (_, args) = parse_pull(&["pull", "busybox", "--mem", "256"]);
         assert_eq!(
             pull_size(&args, 16 << 10, Some(513 << 30), compat::Arch::HOST).unwrap_err().to_string(),
             "the root filesystem, 525312 MiB, does not fit Firecracker's 512 GiB window for pmem devices"
@@ -3372,7 +3133,7 @@ mod exec_tests {
         let size = |argv: &[&str], ram: u64, rootfs: Option<u64>| {
             let mut v = vec!["pull", "busybox"];
             v.extend_from_slice(argv);
-            pull_size(&parse(&v), ram, rootfs, compat::Arch::HOST).map(|s| (s.mem_mib, s.max_mib, s.hotplug_mib()))
+            pull_size(&parse_pull(&v).1, ram, rootfs, compat::Arch::HOST).map(|s| (s.mem_mib, s.max_mib, s.hotplug_mib()))
         };
         // (host RAM, root filesystem) -> (boot mem, ceiling --mem, hotplug region): up to 512 GiB the
         // host's memory, unchanged (a template too big for the window never built).
@@ -3422,7 +3183,7 @@ mod exec_tests {
     #[test]
     fn pull_mem_defaults_to_the_host_and_boot_fits_below_mmio_gap_on_both_arches() {
         use compat::Arch::{Aarch64, X86_64};
-        let size = pull_size(&parse(&["pull", "busybox"]), host_ram_mib(), None, compat::Arch::HOST).unwrap();
+        let size = pull_size(&parse_pull(&["pull", "busybox"]).1, host_ram_mib(), None, compat::Arch::HOST).unwrap();
         assert!(size.max_mib <= template::MAX_MEM_MIB && size.mem_mib <= size.max_mib);
         assert!(size.hotplug_mib() <= template::hotplug_room(0).unwrap());
         assert!(size.mem_mib <= template::boot_room(compat::Arch::HOST));
@@ -3431,7 +3192,7 @@ mod exec_tests {
         assert_eq!((template::boot_room(X86_64), template::boot_room(Aarch64)), (255 << 10, 254 << 10));
         // The derived boot memory never comes near the 64-bit MMIO gap: at most 17280 MiB at the ceiling.
         for arch in [X86_64, Aarch64] {
-            let s = pull_size(&parse(&["pull", "busybox"]), 4 << 20, None, arch).unwrap();
+            let s = pull_size(&parse_pull(&["pull", "busybox"]).1, 4 << 20, None, arch).unwrap();
             assert_eq!(s.mem_mib, 17280);
             assert!(s.mem_mib <= template::boot_room(arch));
         }
@@ -3439,12 +3200,13 @@ mod exec_tests {
 
     #[test]
     fn software_keeps_literal_command_argv_and_rejects_unimplemented_lifecycle_flags() {
-        let args = parse(&["software", "--kernel", "/kernel", "--env", "K=value", "image", "/bin/echo", "literal $HOME *", "--detach"]);
-        check_applies(&args).unwrap();
-        assert_eq!(args.rest, ["/bin/echo", "literal $HOME *", "--detach"]);
+        let cli = parse(&["software", "--kernel", "/kernel", "--env", "K=value", "image", "/bin/echo", "literal $HOME *", "--detach"]);
+        check_applies(&cli).unwrap();
+        let Some(Cmd::Software(s)) = &cli.command else { panic!("expected software") };
+        assert_eq!(s.cmd, ["/bin/echo", "literal $HOME *", "--detach"]);
         for flag in ["--detach", "--keep", "--paused", "--warm"] {
-            let args = parse(&["software", flag, "image"]);
-            assert!(check_applies(&args).is_err(), "{flag}");
+            let res = try_parse(&["software", flag, "image"]).and_then(|c| check_applies(&c));
+            assert!(res.is_err(), "{flag}");
         }
         let args = parse(&["software", "--cmd", "true", "image", "false"]);
         assert!(check_applies(&args).unwrap_err().to_string().contains("not both"));
@@ -3484,30 +3246,31 @@ mod exec_tests {
         for name in ["-f", "--force", "-"] {
             host::check_name(name).unwrap();
             assert!(host::check_new_name(name).is_err());
-            let args = parse(&["rm", "--", name]);
-            check_applies(&args).unwrap();
-            assert_eq!(args.names(), &[name]);
-            assert!(!args.has("force"));
+            let cli = parse(&["rm", "--", name]);
+            check_applies(&cli).unwrap();
+            let Some(Cmd::Rm(rm)) = cli.command else { panic!("expected rm") };
+            assert_eq!(rm.names, &[name]);
+            assert!(!rm.force);
         }
         host::check_new_name("vm-1").unwrap();
         // start's VM process, re-run as `start --attach -- NAME`, takes such a name too.
         let child = parse(&["start", "--attach", "--", "-f"]);
         check_applies(&child).unwrap();
-        assert!(child.has("attach") && child.names() == ["-f"]);
+        let Some(Cmd::Start(s)) = child.command else { panic!("expected start") };
+        assert!(s.attach && s.names == ["-f"]);
     }
 
     #[test]
     fn a_bare_dashdash_must_follow_the_command() {
         for argv in [&["--", "run", "img", "sh"][..], &["--", "rm", "x"], &["--state", "/s", "--"]] {
-            let (_, error) = Args::parse_partly(argv.iter().map(|a| a.to_string()));
-            assert_eq!(error.unwrap().to_string(), "-- must follow the command", "{argv:?}");
+            assert_eq!(try_parse(argv).unwrap_err().to_string(), "-- must follow the command", "{argv:?}");
         }
-        assert_eq!(parse(&["run", "img", "--", "sh", "--", "-x"]).rest, ["sh", "--", "-x"]);
-        assert_eq!(parse(&["exec", "web", "--", "-x"]).rest, ["-x"]);
+        assert_eq!(parse_run(&["run", "img", "--", "sh", "--", "-x"]).1.cmd, ["sh", "--", "-x"]);
+        assert_eq!(parse_exec(&["exec", "web", "--", "-x"]).cmd, ["-x"]);
         let cp = parse(&["cp", "--", "-", "web:/x"]);
         check_applies(&cp).unwrap();
-        assert_eq!(cp.names(), ["-", "web:/x"]);
-        assert!(cp.rest.is_empty());
+        let Some(Cmd::Cp(cp)) = cp.command else { panic!("expected cp") };
+        assert_eq!((cp.first.as_deref(), cp.second.as_deref()), (Some("-"), Some("web:/x")));
     }
 
     #[test]
@@ -3519,11 +3282,12 @@ mod exec_tests {
             assert!(containers::rename(&host, "old", name).is_err());
             let path = host.vms(name, "failed").unwrap();
             std::fs::write(&path, "died").unwrap();
-            let args = parse(&["rm", "--", name]);
-            check_applies(&args).unwrap();
-            assert_eq!(args.names(), &[name]);
-            assert!(!args.has("force"));
-            each(args.names(), |n| remove(&host, n, false, true)).unwrap();
+            let cli = parse(&["rm", "--", name]);
+            check_applies(&cli).unwrap();
+            let Some(Cmd::Rm(rm)) = cli.command else { panic!("expected rm") };
+            assert_eq!(rm.names, &[name]);
+            assert!(!rm.force);
+            each(&rm.names, |n| remove(&host, n, false, true)).unwrap();
             assert!(!path.exists());
         }
     }
@@ -3531,81 +3295,84 @@ mod exec_tests {
     #[test]
     fn verbose_is_global_and_preserved_for_children_but_not_app_arguments() {
         for argv in [&["-v", "start", "web"][..], &["start", "--verbose", "web"]] {
-            let args = parse(argv);
-            assert!(args.has("verbose"));
-            assert!(check_applies(&args).is_ok());
-            assert_eq!(child_args(&args, &["start", "--attach", "web"]), ["--verbose", "start", "--attach", "web"]);
+            let cli = parse(argv);
+            assert!(cli.global.verbose);
+            assert!(check_applies(&cli).is_ok());
+            assert_eq!(cli.global.child_args(&["start", "--attach", "web"]), ["--verbose", "start", "--attach", "web"]);
         }
-        let args = parse(&["run", "image", "--verbose", "-v"]);
-        assert!(!args.has("verbose"));
-        assert_eq!(args.rest, ["--verbose", "-v"]);
-        assert!(parse(&["-v", "run", "-d", "image"]).child_args.contains(&"-v".into()));
-        let refused = Args::parse(["run", "-v", "/src:/dst", "image"].map(String::from)).err().unwrap().to_string();
+        let (global, run) = parse_run(&["run", "image", "--verbose", "-v"]);
+        assert!(!global.verbose);
+        assert_eq!(run.cmd, ["--verbose", "-v"]);
+        let (global, run) = parse_run(&["-v", "run", "-d", "image"]);
+        assert!(run.child_args(&global, None).contains(&"--verbose".into()));
+        let refused = try_parse(&["run", "-v", "/src:/dst", "image"]).unwrap_err().to_string();
         assert!(refused.contains("volumes (-v) are not supported"), "{refused}");
     }
 
     #[test]
     fn run_hostname_short_flag_is_refused_without_showing_help() {
         for flag in ["-h", "-dh"] {
-            let (args, error) = Args::parse_partly(["run", flag, "host", "image"].map(String::from));
-            assert!(error.unwrap().to_string().contains("hostname (-h) is not supported"));
-            assert!(!args.has("help"));
+            let error = try_parse(&["run", flag, "host", "image"]).unwrap_err().to_string();
+            assert!(error.contains("hostname (-h) is not supported"), "{error}");
         }
-        assert!(parse(&["-h", "run"]).has("help"));
-        assert!(parse(&["run", "--help"]).has("help"));
-        assert!(parse(&["ps", "-h"]).has("help"));
-        assert_eq!(parse(&["run", "image", "-h"]).rest, ["-h"]);
+        assert!(parse(&["-h", "run"]).global.help);
+        assert!(parse(&["run", "--help"]).global.help);
+        assert!(parse(&["ps", "-h"]).global.help);
+        assert_eq!(parse_run(&["run", "image", "-h"]).1.cmd, ["-h"]);
     }
 
     #[test]
     fn short_bundles_and_value_aliases_follow_the_command() {
-        for (bundled, separate) in [
-            (vec!["ps", "-aq"], vec!["ps", "-a", "-q"]),
-            (vec!["ps", "-qafname=web"], vec!["ps", "-q", "-a", "--filter", "name=web"]),
-            (vec!["ps", "-f", "name=web"], vec!["ps", "--filter", "name=web"]),
-            (vec!["run", "-dm512m", "img"], vec!["run", "-d", "--memory", "512m", "img"]),
-            (vec!["run", "-m", "512m", "img"], vec!["run", "--memory", "512m", "img"]),
-            (vec!["logs", "-fn20", "web"], vec!["logs", "-f", "--tail", "20", "web"]),
-            (vec!["logs", "-n", "20", "web"], vec!["logs", "--tail", "20", "web"]),
-            (vec!["rm", "-fv", "web"], vec!["rm", "-f", "-v", "web"]),
-        ] {
-            let (a, b) = (parse(&bundled), parse(&separate));
-            check_applies(&a).unwrap();
-            assert_eq!(a.flags, b.flags, "{bundled:?}");
-            assert_eq!(a.positional, b.positional);
-            let child = Args::parse(a.child_args).unwrap();
-            assert!(!child.has("detach"));
-            for (flag, value) in &a.flags {
-                if flag != "detach" {
-                    assert_eq!(child.get(flag), Some(value.as_str()));
-                }
-            }
+        let Some(Cmd::Ps(ps_b)) = parse(&["ps", "-aq"]).command else { panic!() };
+        let Some(Cmd::Ps(ps_s)) = parse(&["ps", "-a", "-q"]).command else { panic!() };
+        assert_eq!((ps_b.all, ps_b.quiet), (ps_s.all, ps_s.quiet));
+
+        let Some(Cmd::Ps(ps_b)) = parse(&["ps", "-qafname=web"]).command else { panic!() };
+        let Some(Cmd::Ps(ps_s)) = parse(&["ps", "-q", "-a", "--filter", "name=web"]).command else { panic!() };
+        assert_eq!((ps_b.all, ps_b.quiet, ps_b.filter), (ps_s.all, ps_s.quiet, ps_s.filter));
+
+        let (g_b, r_b) = parse_run(&["run", "-dm512m", "img"]);
+        let (_, r_s) = parse_run(&["run", "-d", "--memory", "512m", "img"]);
+        assert_eq!((r_b.detach, r_b.memory.as_deref(), r_b.image.as_deref()), (r_s.detach, r_s.memory.as_deref(), r_s.image.as_deref()));
+        let child = parse_run(&r_b.child_args(&g_b, None).iter().map(String::as_str).collect::<Vec<_>>()).1;
+        assert!(!child.detach && child.memory.as_deref() == Some("512m"));
+
+        let Some(Cmd::Logs(l_b)) = parse(&["logs", "-fn20", "web"]).command else { panic!() };
+        let Some(Cmd::Logs(l_s)) = parse(&["logs", "-f", "--tail", "20", "web"]).command else { panic!() };
+        assert_eq!((l_b.follow, l_b.tail, l_b.name), (l_s.follow, l_s.tail, l_s.name));
+
+        let rm_b = parse(&["rm", "-fv", "web"]);
+        let rm_s = parse(&["rm", "-f", "-v", "web"]);
+        assert_eq!(rm_b.global.verbose, rm_s.global.verbose);
+        let (Some(Cmd::Rm(rb)), Some(Cmd::Rm(rs))) = (rm_b.command, rm_s.command) else { panic!() };
+        assert_eq!((rb.force, rb.names), (rs.force, rs.names));
+
+        for words in [&["ps", "-ax"][..], &["run", "-m"], &["logs", "-n"], &["ps", "-f"]] {
+            assert!(try_parse(words).is_err(), "{words:?}");
         }
-        for words in [vec!["ps", "-ax"], vec!["run", "-m"], vec!["logs", "-n"], vec!["ps", "-f"]] {
-            assert!(Args::parse(words.into_iter().map(String::from)).is_err());
-        }
-        for words in [vec!["ps", "-m", "512m"], vec!["run", "-n", "20", "img"], vec!["exec", "-f", "x", "true"]] {
-            assert!(Args::parse(words.into_iter().map(String::from)).is_err());
+        for words in [&["ps", "-m", "512m"][..], &["run", "-n", "20", "img"], &["exec", "-f", "x", "true"]] {
+            assert!(try_parse(words).is_err(), "{words:?}");
         }
     }
 
     #[test]
     fn interactive_flags_combine_as_dockers() {
-        let args = parse(&["run", "-dit", "--name", "x", "image", "sh", "-it"]);
-        assert!(args.has("detach") && args.has("interactive") && args.has("tty"));
-        assert_eq!(args.rest, ["sh", "-it"], "CMD's own words are its own");
-        assert_eq!(args.child_args, ["run", "-i", "-t", "--name", "x", "image", "sh", "-it"], "a detached run's VM process is not detached again");
-        check_applies(&args).unwrap();
+        let (global, args) = parse_run(&["run", "-dit", "--name", "x", "image", "sh", "-it"]);
+        assert!(args.detach && args.interactive && args.tty);
+        assert_eq!(args.cmd, ["sh", "-it"], "CMD's own words are its own");
+        let child_argv = args.child_args(&global, None);
+        let (_, child) = parse_run(&child_argv.iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(!child.detach && child.interactive && child.tty && child.name.as_deref() == Some("x") && child.cmd == ["sh", "-it"]);
         let spec = run_spec(&args, None).unwrap();
         assert!(spec.stdin && spec.tty);
         assert_eq!(spec.entrypoint.as_deref(), Some(&["sh".to_string(), "-it".to_string()][..]), "with -i or -t, CMD is the app");
-        assert!(run_spec(&parse(&["run", "image", "sh"]), None).unwrap().entrypoint.is_none(), "without, CMD is the vm's command");
-        let exec = parse(&["exec", "-ti", "vm", "bash"]);
-        assert!(exec.has("interactive") && exec.has("tty") && exec.rest == ["bash"]);
+        assert!(run_spec(&parse_run(&["run", "image", "sh"]).1, None).unwrap().entrypoint.is_none(), "without, CMD is the vm's command");
+        let exec = parse_exec(&["exec", "-ti", "vm", "bash"]);
+        assert!(exec.interactive && exec.tty && exec.cmd == ["bash"]);
         assert!(check_applies(&parse(&["run", "-it", "--keep", "image", "sh"])).is_ok(), "CMD is the app, which --keep is for");
         assert!(check_applies(&parse(&["run", "-it", "--entrypoint", "sh", "image", "x"])).is_err());
         assert!(check_applies(&parse(&["run", "--checkpoint", "/c", "-i"])).is_err());
-        assert!(Args::parse(["ps", "-it"].map(String::from)).is_err());
+        assert!(try_parse(&["ps", "-it"]).is_err());
         assert!(check_applies(&parse(&["attach"])).unwrap_err().to_string().contains("needs NAME"));
         check_applies(&parse(&["cp", "-", "vm:/tmp"])).unwrap();
         assert!(check_applies(&parse(&["cp", "vm:/x"])).unwrap_err().to_string().contains("SRC DST"));
@@ -3613,35 +3380,34 @@ mod exec_tests {
 
     #[test]
     fn published_ports_repeat_and_survive_detaching_and_checkpoint_arguments() {
-        let args = parse(&["run", "-d", "-p", "8080:80", "--publish", "127.0.0.1:5353:53/udp", "image"]);
-        check_applies(&args).unwrap();
-        let ports = port_specs(&args).unwrap();
+        let (global, args) = parse_run(&["run", "-d", "-p", "8080:80", "--publish", "127.0.0.1:5353:53/udp", "image"]);
+        let ports = port_specs(&args.publish).unwrap();
         assert_eq!(ports.len(), 2);
         assert_eq!(ports[0].protocol, ports::Protocol::Tcp);
         assert_eq!(ports[1].protocol, ports::Protocol::Udp);
-        let child = Args::parse(args.child_args.clone()).unwrap();
-        assert!(!child.has("detach"));
-        assert_eq!(port_specs(&child).unwrap(), ports);
-        let restored = parse(&["run", "--checkpoint", "/checkpoint", "-p", "8080:80"]);
-        check_applies(&restored).unwrap();
-        assert_eq!(port_specs(&restored).unwrap(), ports[..1]);
-        assert!(port_specs(&parse(&["run", "--checkpoint", "/checkpoint"])).unwrap().is_empty());
-        assert!(Args::parse(["run", "-p"].map(String::from)).is_err());
-        assert!(check_applies(&parse(&["start", "-p", "8080:80", "vm"])).is_err());
-        let command = parse(&["run", "-p", "8080:80", "image", "echo", "-p", "123"]);
-        assert_eq!(command.rest, ["echo", "-p", "123"]);
-        assert_eq!(port_specs(&command).unwrap().len(), 1);
+        let child_argv = args.child_args(&global, None);
+        let (_, child) = parse_run(&child_argv.iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(!child.detach);
+        assert_eq!(port_specs(&child.publish).unwrap(), ports);
+        let (_, restored) = parse_run(&["run", "--checkpoint", "/checkpoint", "-p", "8080:80"]);
+        assert_eq!(port_specs(&restored.publish).unwrap(), ports[..1]);
+        assert!(port_specs(&parse_run(&["run", "--checkpoint", "/checkpoint"]).1.publish).unwrap().is_empty());
+        assert!(try_parse(&["run", "-p"]).is_err());
+        assert!(try_parse(&["start", "-p", "8080:80", "vm"]).is_err());
+        let (_, command) = parse_run(&["run", "-p", "8080:80", "image", "echo", "-p", "123"]);
+        assert_eq!(command.cmd, ["echo", "-p", "123"]);
+        assert_eq!(port_specs(&command.publish).unwrap().len(), 1);
         // They are the run's settings, which travel with the VM as a unit.
         assert_eq!(run_spec(&args, None).unwrap().ports, ports);
-        assert!(run_spec(&parse(&["run", "-p", "80", "image"]), None).is_err());
+        assert!(run_spec(&parse_run(&["run", "-p", "80", "image"]).1, None).is_err());
     }
 
     #[test]
     fn auto_pull_uses_the_resolved_templates_reference() {
-        let args = Args::parse(["--state", "/s", "run", "ghcr.io+org+app"].map(String::from)).unwrap();
+        let cli = parse(&["--state", "/s", "run", "ghcr.io+org+app"]);
         for input in ["ghcr.io+org+app", "ghcr.io/org/app", "ghcr.io+org+app:v1", "nginx"] {
             let name = template::name_of(input).unwrap();
-            let words = pull_missing_args(&args, &name);
+            let words = pull_missing_args(&cli.global, &name);
             assert_eq!(&words[..3], ["--state", "/s", "pull"]);
             let reference = image::Reference::parse(&words[3]).unwrap();
             assert_eq!(reference.template_name(), name);
@@ -3670,9 +3436,11 @@ mod exec_tests {
     fn numeric_flags_reject_overflow_and_invalid_cpu_counts() {
         for flag in ["max-download-mib", "max-unpacked-mib", "max-file-mib"] {
             for value in ["17592186044416", "18446744073709551615"] {
-                assert!(image_options(&parse(&[&format!("--{flag}"), value]), "busybox").is_err(), "{flag}={value}");
+                let (g, p) = parse_pull(&["pull", &format!("--{flag}"), value, "busybox"]);
+                assert!(image_options(&g, &p.image_flags, "busybox").is_err(), "{flag}={value}");
             }
-            let opts = image_options(&parse(&[&format!("--{flag}"), "17592186044415"]), "busybox").unwrap();
+            let (g, p) = parse_pull(&["pull", &format!("--{flag}"), "17592186044415", "busybox"]);
+            let opts = image_options(&g, &p.image_flags, "busybox").unwrap();
             let bytes = match flag {
                 "max-download-mib" => opts.limits.download,
                 "max-unpacked-mib" => opts.limits.unpacked,
@@ -3680,14 +3448,16 @@ mod exec_tests {
             };
             assert_eq!(bytes, (u64::MAX >> 20) << 20);
         }
-        assert!(image_options(&parse(&["--ready-timeout", "18446744073709551615"]), "busybox").is_err());
-        let opts = image_options(&parse(&["--ready-timeout", "4294967295"]), "busybox").unwrap();
+        let (g, p) = parse_pull(&["pull", "--ready-timeout", "18446744073709551615", "busybox"]);
+        assert!(image_options(&g, &p.image_flags, "busybox").is_err());
+        let (g, p) = parse_pull(&["pull", "--ready-timeout", "4294967295", "busybox"]);
+        let opts = image_options(&g, &p.image_flags, "busybox").unwrap();
         assert_eq!(opts.ready_timeout.as_secs(), u32::MAX as u64);
         for value in ["0", "3", "33", "4294967296", "4294967297", "18446744073709551615"] {
-            assert!(template_vcpus(&parse(&["--vcpus", value])).is_err(), "{value}");
+            assert!(template_vcpus(Some(value)).is_err(), "{value}");
         }
         for value in ["1", "2", "32"] {
-            assert_eq!(template_vcpus(&parse(&["--vcpus", value])).unwrap().to_string(), value);
+            assert_eq!(template_vcpus(Some(value)).unwrap().to_string(), value);
         }
     }
 
@@ -4391,31 +4161,33 @@ s.close()
     #[test]
     fn standby_only_pulls_allow_global_flags() {
         for global in ["-v", "--verbose", "--help", "--version"] {
-            let args = parse(&[global, "--state", "/state", "--run", "/run", "pull", "nginx", "--standby", "3", "--tag", "web"]);
-            assert!(only_standby(&args), "{global}");
+            let (_, pull) = parse_pull(&[global, "--state", "/state", "--run", "/run", "pull", "nginx", "--standby", "3", "--tag", "web"]);
+            assert!(pull.only_standby(), "{global}");
         }
         for option in ["--mem=512", "--warm", "--ready-port=80", "--vcpus=2"] {
-            assert!(!only_standby(&parse(&["-v", "pull", "nginx", "--standby=3", option])), "{option}");
+            assert!(!parse_pull(&["-v", "pull", "nginx", "--standby=3", option]).1.only_standby(), "{option}");
         }
     }
 
     #[test]
     fn attached_option_values_preserve_commands_and_child_args() {
-        let args = parse(&["run", "-dit", "--name=web", "--memory=1g", "-p8080:80", "-eA=one=two", "--env=B=", "-ip=1:1", "nginx", "--name=app"]);
-        check_applies(&args).unwrap();
-        assert_eq!((args.get("name"), args.get("memory")), (Some("web"), Some("1g")));
-        assert_eq!((args.all("publish"), args.all("env")), (vec!["8080:80".to_string(), "1:1".into()], vec!["A=one=two".to_string(), "B=".into()]));
-        assert!(args.has("detach") && args.has("interactive") && args.has("tty"));
-        assert_eq!(args.rest, ["--name=app"]);
-        let child = parse(&args.child_args.iter().map(String::as_str).collect::<Vec<_>>());
-        assert_eq!((child.has("detach"), child.flags.len()), (false, args.flags.len() - 1));
-        let args = parse(&["exec", "-itu", "app", "-w/srv", "-eA=B", "web", "sh", "-c", "true"]);
-        assert_eq!((args.get("workdir"), args.get("user"), args.get("env")), (Some("/srv"), Some("app"), Some("A=B")));
-        assert_eq!(parse(&["kill", "-sTERM", "web"]).get("signal"), Some("TERM"));
+        let (global, args) = parse_run(&["run", "-dit", "--name=web", "--memory=1g", "-p8080:80", "-eA=one=two", "--env=B=", "-ip=1:1", "nginx", "--name=app"]);
+        assert_eq!((args.name.as_deref(), args.memory.as_deref()), (Some("web"), Some("1g")));
+        assert_eq!((&args.publish, &args.env), (&vec!["8080:80".to_string(), "1:1".into()], &vec!["A=one=two".to_string(), "B=".into()]));
+        assert!(args.detach && args.interactive && args.tty);
+        assert_eq!(args.cmd, ["--name=app"]);
+        let child_argv = args.child_args(&global, None);
+        let (_, child) = parse_run(&child_argv.iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(!child.detach && child.interactive && child.tty);
+        assert_eq!((child.name, child.memory, child.publish, child.env, child.cmd), (args.name, args.memory, args.publish, args.env, args.cmd));
+        let exec = parse_exec(&["exec", "-itu", "app", "-w/srv", "-eA=B", "web", "sh", "-c", "true"]);
+        assert_eq!((exec.workdir.as_deref(), exec.user.as_deref(), exec.env.first().map(String::as_str)), (Some("/srv"), Some("app"), Some("A=B")));
+        let Some(Cmd::Kill(k)) = parse(&["kill", "-sTERM", "web"]).command else { panic!() };
+        assert_eq!(k.signal.as_deref(), Some("TERM"));
         for option in ["--detach=true", "-dtrue", "-itx", "-dv", "-é", "--unknown=value"] {
-            assert!(Args::parse(["run", option, "nginx"].map(String::from)).is_err(), "{option}");
+            assert!(try_parse(&["run", option, "nginx"]).is_err(), "{option}");
         }
-        assert!(Args::parse(["run", "--name", "--memory=1g", "nginx"].map(String::from)).is_err());
+        assert!(try_parse(&["run", "--name", "--memory=1g", "nginx"]).is_err());
     }
 
     #[test]
@@ -4429,8 +4201,8 @@ s.close()
             assert!(memory_mib(v).is_err(), "{v}");
         }
         assert_eq!(memory_mib("2048").unwrap_err().to_string(), "--memory 2048 is 2048 bytes: give a unit, as 2048m");
-        assert!(resources(&parse(&["--cpus", "0"])).is_err() && resources(&parse(&["--cpus", "x"])).is_err());
-        let r = resources(&parse(&["--cpus", "1.5", "--memory", "1g"])).unwrap();
+        assert!(resources(Some("0"), None).is_err() && resources(Some("x"), None).is_err());
+        let r = resources(Some("1.5"), Some("1g")).unwrap();
         assert_eq!((r.cpus, r.memory_mib), (Some(1.5), Some(1024)));
     }
 
@@ -4509,22 +4281,22 @@ s.close()
 
     #[test]
     fn detach_only_removes_flexvm_options_from_child_arguments() {
-        let args = parse(&["run", "-d", "--detach", "--name", "web", "--ip", "10.0.0.2", "ubuntu", "tool", "-d", "--detach", "--unknown"]);
-        assert!(args.has("detach"));
-        assert_eq!(args.positional, ["run", "ubuntu"]);
-        assert_eq!(args.rest, ["tool", "-d", "--detach", "--unknown"]);
-        assert_eq!(args.child_args, ["run", "--name", "web", "--ip", "10.0.0.2", "ubuntu", "tool", "-d", "--detach", "--unknown"]);
-        let child = Args::parse(args.child_args).unwrap();
-        assert!(!child.has("detach"));
-        assert_eq!(child.rest, args.rest);
+        let (global, args) = parse_run(&["run", "-d", "--detach", "--name", "web", "--ip", "10.0.0.2", "ubuntu", "tool", "-d", "--detach", "--unknown"]);
+        assert!(args.detach);
+        assert_eq!(args.image.as_deref(), Some("ubuntu"));
+        assert_eq!(args.cmd, ["tool", "-d", "--detach", "--unknown"]);
+        let child_argv = args.child_args(&global, None);
+        let (_, child) = parse_run(&child_argv.iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(!child.detach);
+        assert_eq!(child.cmd, args.cmd);
         // A `--` after IMAGE is dropped, as after exec NAME.
-        assert_eq!(parse(&["run", "ubuntu", "--", "ls", "--", "-d"]).rest, ["ls", "--", "-d"]);
-        assert_eq!(child_args(&parse(&["--state", "/s", "start", "x"]), &["start", "--attach", "x"]), ["--state", "/s", "start", "--attach", "x"]);
+        assert_eq!(parse_run(&["run", "ubuntu", "--", "ls", "--", "-d"]).1.cmd, ["ls", "--", "-d"]);
+        assert_eq!(parse(&["--state", "/s", "start", "x"]).global.child_args(&["start", "--attach", "x"]), ["--state", "/s", "start", "--attach", "x"]);
     }
 
     #[test]
     fn exec_options_preserve_argv_and_repeated_env() {
-        let args = parse(&[
+        let cli = parse(&[
             "exec",
             "-d",
             "-e",
@@ -4544,18 +4316,19 @@ s.close()
             ";",
             "-d",
         ]);
-        check_applies(&args).unwrap();
-        let cmd = exec_command(&args).unwrap();
+        check_applies(&cli).unwrap();
+        let Some(Cmd::Exec(args)) = &cli.command else { panic!() };
+        let cmd = exec_command(args).unwrap();
         assert_eq!(cmd["argv"], json!(["printf", "%s", "", "a b", "$HOME", ";", "-d"]));
         assert_eq!(cmd["env"], json!(["K=first", "K=last=two"]));
         assert_eq!(cmd["workdir"], "/srv");
         assert_eq!(cmd["user"], "app:staff");
         assert_eq!(cmd["detach"], true);
         for words in [&["exec", "vm"][..], &["exec", "vm", ""], &["exec", "-e", "=bad", "vm", "true"]] {
-            assert!(exec_command(&parse(words)).is_err());
+            assert!(exec_command(&parse_exec(words)).is_err());
         }
         for flag in ["-e", "-w", "-u"] {
-            assert!(Args::parse(["exec", flag].map(String::from)).is_err());
+            assert!(try_parse(&["exec", flag]).is_err());
         }
     }
 
@@ -4565,67 +4338,78 @@ s.close()
         let key = "PATH";
         let value = std::env::var(key).unwrap();
         let options = ["-e", "PATH=first", "-e", key, "-e", "FLEXVM_TEST_UNSET_VAR", "-e", "EMPTY=", "-e", "PATH=last"];
-        let run = parse(&[&["run"][..], &options, &["img"]].concat());
-        let exec = parse(&[&["exec"][..], &options, &["vm", "true"]].concat());
+        let (_, run) = parse_run(&[&["run"][..], &options, &["img"]].concat());
+        let exec = parse_exec(&[&["exec"][..], &options, &["vm", "true"]].concat());
         let expected = vec!["PATH=first".to_string(), format!("PATH={value}"), "EMPTY=".into(), "PATH=last".into()];
         assert_eq!(run_spec(&run, None).unwrap().env, expected);
         assert_eq!(exec_command(&exec).unwrap()["env"], json!(expected));
         let options: Vec<_> = options.iter().map(|v| if *v == "-e" { "--env" } else { *v }).collect();
-        let pull = parse(&[&["pull", "img"][..], &options].concat());
-        assert_eq!(image_options(&pull, "img").unwrap().env, expected);
-        let pull = parse(&["pull", "--env", key, "--env", "FLEXVM_TEST_UNSET_VAR", "img"]);
-        assert_eq!(image_options(&pull, "img").unwrap().env, [format!("PATH={value}")]);
+        let (g, pull) = parse_pull(&[&["pull", "img"][..], &options].concat());
+        assert_eq!(image_options(&g, &pull.image_flags, "img").unwrap().env, expected);
+        let (g, pull) = parse_pull(&["pull", "--env", key, "--env", "FLEXVM_TEST_UNSET_VAR", "img"]);
+        assert_eq!(image_options(&g, &pull.image_flags, "img").unwrap().env, [format!("PATH={value}")]);
         for value in ["", "=bad", "K\0", "K=bad\0value"] {
-            assert!(exec_command(&parse(&["exec", "-e", value, "vm", "true"])).is_err());
-            assert!(run_spec(&parse(&["run", "-e", value, "img"]), None).is_err());
-            assert!(image_options(&parse(&["pull", "--env", value, "img"]), "img").is_err());
+            assert!(exec_command(&parse_exec(&["exec", "-e", value, "vm", "true"])).is_err());
+            assert!(run_spec(&parse_run(&["run", "-e", value, "img"]).1, None).is_err());
+            let (g, pull) = parse_pull(&["pull", "--env", value, "img"]);
+            assert!(image_options(&g, &pull.image_flags, "img").is_err());
         }
     }
 
     #[test]
     fn separator_before_run_image_or_exec_name() {
-        for (words, positional, rest) in [
-            (vec!["exec", "--", "web", "ls", "--all"], vec!["exec", "web"], vec!["ls", "--all"]),
-            (vec!["run", "--rm", "--", "alpine", "echo", "hi"], vec!["run", "alpine"], vec!["echo", "hi"]),
-            (vec!["run", "--", "--image", "--", "hi"], vec!["run", "--image"], vec!["hi"]),
-            (vec!["exec", "--", "web", "--", "--", "-x"], vec!["exec", "web"], vec!["--", "-x"]),
-            (vec!["exec", "web", "--", "--", "-x"], vec!["exec", "web"], vec!["--", "-x"]),
-            (vec!["exec", "web", "--", "-flag"], vec!["exec", "web"], vec!["-flag"]),
-            (vec!["run", "img", "--", "cmd"], vec!["run", "img"], vec!["cmd"]),
-            (vec!["exec", "--", "web"], vec!["exec", "web"], vec![]),
-            (vec!["run", "--"], vec!["run"], vec![]),
+        for (words, first, rest) in [
+            (vec!["exec", "--", "web", "ls", "--all"], Some("web"), vec!["ls", "--all"]),
+            (vec!["run", "--rm", "--", "alpine", "echo", "hi"], Some("alpine"), vec!["echo", "hi"]),
+            (vec!["run", "--", "--image", "--", "hi"], Some("--image"), vec!["hi"]),
+            (vec!["exec", "--", "web", "--", "--", "-x"], Some("web"), vec!["--", "-x"]),
+            (vec!["exec", "web", "--", "--", "-x"], Some("web"), vec!["--", "-x"]),
+            (vec!["exec", "web", "--", "-flag"], Some("web"), vec!["-flag"]),
+            (vec!["run", "img", "--", "cmd"], Some("img"), vec!["cmd"]),
+            (vec!["exec", "--", "web"], Some("web"), vec![]),
+            (vec!["run", "--"], None, vec![]),
         ] {
-            let args = parse(&words);
-            assert_eq!(args.positional, positional);
-            assert_eq!(args.rest, rest);
-            assert_eq!(args.child_args, words);
-            // A detached run's VM process parses its child_args to the same command.
-            let child = Args::parse(args.child_args.clone()).unwrap();
-            assert_eq!((child.positional, child.rest), (args.positional, args.rest));
+            let cli = parse(&words);
+            match &cli.command {
+                Some(Cmd::Run(r)) => {
+                    assert_eq!(r.image.as_deref(), first, "{words:?}");
+                    assert_eq!(r.cmd, rest, "{words:?}");
+                    let child_argv = r.child_args(&cli.global, None);
+                    let (_, child) = parse_run(&child_argv.iter().map(String::as_str).collect::<Vec<_>>());
+                    assert_eq!((child.image, child.cmd), (r.image.clone(), r.cmd.clone()));
+                }
+                Some(Cmd::Exec(e)) => {
+                    assert_eq!(e.name.as_deref(), first, "{words:?}");
+                    assert_eq!(e.cmd, rest, "{words:?}");
+                }
+                _ => panic!("unexpected command"),
+            }
         }
     }
 
     #[test]
     fn pull_ready_port_must_be_nonzero() {
         for port in ["0", "65536", "-1", "bad"] {
-            assert!(image_options(&parse(&["pull", "--warm", "--ready-port", port, "img"]), "img").is_err(), "{port}");
+            let (g, p) = parse_pull(&["pull", "--warm", "--ready-port", port, "img"]);
+            assert!(image_options(&g, &p.image_flags, "img").is_err(), "{port}");
         }
         for port in [1, 65535] {
-            let options = image_options(&parse(&["pull", "--warm", "--ready-port", &port.to_string(), "img"]), "img").unwrap();
+            let (g, p) = parse_pull(&["pull", "--warm", "--ready-port", &port.to_string(), "img"]);
+            let options = image_options(&g, &p.image_flags, "img").unwrap();
             assert!(matches!(options.ready, Some(image::Ready::Port(p)) if p == port));
         }
     }
 
     #[test]
     fn exec_preserves_guest_flags_and_drops_only_one_separator() {
-        let args = parse(&["--state", "/tmp/state", "exec", "web", "tool", "-d", "--detach", "--unknown"]);
-        assert_eq!(args.get("state"), Some("/tmp/state"));
-        assert!(!args.has("detach"));
-        assert_eq!(args.positional, ["exec", "web"]);
-        assert_eq!(args.rest, ["tool", "-d", "--detach", "--unknown"]);
-        assert_eq!(args.child_args, ["--state", "/tmp/state", "exec", "web", "tool", "-d", "--detach", "--unknown"]);
-        let args = parse(&["exec", "web", "--", "ls", "--", "-d"]);
-        assert_eq!(args.rest, ["ls", "--", "-d"]);
+        let cli = parse(&["--state", "/tmp/state", "exec", "web", "tool", "-d", "--detach", "--unknown"]);
+        assert_eq!(cli.global.state.as_deref(), Some("/tmp/state"));
+        let Some(Cmd::Exec(e)) = cli.command else { panic!() };
+        assert!(!e.detach);
+        assert_eq!(e.name.as_deref(), Some("web"));
+        assert_eq!(e.cmd, ["tool", "-d", "--detach", "--unknown"]);
+        let e = parse_exec(&["exec", "web", "--", "ls", "--", "-d"]);
+        assert_eq!(e.cmd, ["ls", "--", "-d"]);
     }
 
     #[test]
@@ -4658,23 +4442,26 @@ s.close()
         ] {
             check_applies(&parse(argv)).unwrap();
         }
-        let p = parse(&["checkpoint", "save", "web", "-o", "out.tar"]);
-        assert_eq!((p.get("output"), p.names()), (Some("out.tar"), &["save".to_string(), "web".into()][..]));
-        assert_eq!(parse(&["checkpoint", "load", "-i", "/d"]).get("input"), Some("/d"));
-        let err = |argv: &[&str]| check_applies(&parse(argv)).unwrap_err().to_string();
+        let Some(Cmd::Checkpoint(ck)) = parse(&["checkpoint", "save", "web", "-o", "out.tar"]).command else { panic!() };
+        let Some(CheckpointCmd::Save { target, output }) = ck.cmd else { panic!() };
+        assert_eq!((output.as_deref(), target.as_deref()), (Some("out.tar"), Some("web")));
+        let Some(Cmd::Checkpoint(ck)) = parse(&["checkpoint", "load", "-i", "/d"]).command else { panic!() };
+        let Some(CheckpointCmd::Load { input, .. }) = ck.cmd else { panic!() };
+        assert_eq!(input.as_deref(), Some("/d"));
+        let err = |argv: &[&str]| try_parse(argv).and_then(|c| check_applies(&c)).unwrap_err().to_string();
         assert!(err(&["checkpoint", "web", "/tmp/ck"]).contains("flexvm checkpoint create VM [NAME]"), "the form before #775");
         assert!(err(&["checkpoint"]).contains("needs create, ls, rm, prune, save or load"));
         assert_eq!(err(&["checkpoint", "create"]), "checkpoint create needs VM");
         assert_eq!(err(&["checkpoint", "rm"]), "checkpoint rm needs NAME|ID");
-        assert!(err(&["checkpoint", "ls", "--stop"]).contains("--stop does not apply to checkpoint ls"));
-        assert!(err(&["checkpoint", "create", "web", "a", "b"]).contains("does not take \"b\""));
-        assert!(err(&["checkpoint", "prune", "x"]).contains("does not take"));
+        assert!(try_parse(&["checkpoint", "ls", "--stop"]).is_err());
+        assert!(try_parse(&["checkpoint", "create", "web", "a", "b"]).is_err());
+        assert!(try_parse(&["checkpoint", "prune", "x"]).is_err());
         assert_eq!(err(&["checkpoint", "save"]), "checkpoint save needs NAME|ID");
-        assert!(err(&["checkpoint", "save", "a", "b"]).contains("does not take \"b\""));
-        assert!(err(&["checkpoint", "load", "x"]).contains("does not take"));
-        assert!(err(&["checkpoint", "load", "-o", "x"]).contains("--output does not apply to checkpoint load"));
-        assert!(err(&["checkpoint", "save", "web", "--name", "x"]).contains("--name does not apply to checkpoint save"));
-        assert!(err(&["checkpoint", "create", "web", "-i", "x"]).contains("--input does not apply"));
+        assert!(try_parse(&["checkpoint", "save", "a", "b"]).is_err());
+        assert!(try_parse(&["checkpoint", "load", "x"]).is_err());
+        assert!(try_parse(&["checkpoint", "load", "-o", "x"]).is_err());
+        assert!(try_parse(&["checkpoint", "save", "web", "--name", "x"]).is_err());
+        assert!(try_parse(&["checkpoint", "create", "web", "-i", "x"]).is_err());
         let age = |s| util::parse_age(s).map(|d| d.as_secs());
         assert_eq!(["90s", "30m", "24h", "7d", "0d"].map(age), [Some(90), Some(1800), Some(86400), Some(604800), Some(0)]);
         assert!(["", "h", "1", "1w", "-1h", "1.5h"].into_iter().all(|s| age(s).is_none()));
@@ -4708,57 +4495,53 @@ s.close()
             vec!["logout", "-q"],
             vec!["images", "--password-stdin"],
         ] {
-            assert!(check_applies(&parse(&argv)).is_err(), "{argv:?}");
+            assert!(try_parse(&argv).and_then(|c| check_applies(&c)).is_err(), "{argv:?}");
         }
-        assert_eq!(parse(&["images", "--filter", "reference=a*", "--filter", "reference=b*"]).all("filter").len(), 2);
+        let Some(Cmd::Images(i)) = parse(&["images", "--filter", "reference=a*", "--filter", "reference=b*"]).command else { panic!() };
+        assert_eq!(i.filter.len(), 2);
     }
 
     #[test]
     fn unknown_command_names_the_bad_word() {
-        assert_eq!(real_main(&parse(&["rnu", "web"])).unwrap_err().to_string(), r#"unknown command "rnu" (see flexvm --help)"#);
+        assert!(try_parse(&["rnu", "web"]).unwrap_err().to_string().contains("rnu"));
     }
 
     #[test]
     fn unknown_options_and_missing_values_are_errors() {
         for option in ["--typo", "--listen", "-x", "--keep-running"] {
-            let error = Args::parse(["run", option, "web"].map(String::from)).err().unwrap();
-            assert_eq!(error.to_string(), format!("unknown option {option} (see flexvm --help)"));
+            assert!(try_parse(&["run", option, "web"]).is_err(), "{option}");
         }
-        let error = Args::parse(["run", "--detach=yes", "web"].map(String::from)).err().unwrap();
-        assert_eq!(error.to_string(), "--detach does not take a value");
-        let error = Args::parse(["run", "--ip"].map(String::from)).err().unwrap();
-        assert_eq!(error.to_string(), "--ip needs a value");
+        assert!(try_parse(&["run", "--detach=yes", "web"]).is_err());
+        assert!(try_parse(&["run", "--ip"]).is_err());
     }
 
     #[test]
     fn option_values_cannot_be_flags() {
-        for option in ["--state", "--run", "--ip", "--tag", "--cmd", "--name"] {
+        for (cmd, option) in [("ps", "--state"), ("ps", "--run"), ("run", "--ip"), ("pull", "--tag"), ("pull", "--cmd"), ("run", "--name")] {
             for value in ["--run", "--detach", "--standby", "--"] {
-                let error = Args::parse([option, value, "X"].map(String::from)).err().unwrap();
-                assert_eq!(error.to_string(), format!("{option} needs a value"));
+                assert!(try_parse(&[cmd, option, value, "X"]).is_err(), "{cmd} {option} {value}");
             }
         }
-        let error = Args::parse(["reclaim", "--force", "--state", "X"].map(String::from)).err().unwrap();
-        assert_eq!(error.to_string(), "--force needs a generation; run flexvm reclaim IP to see GEN");
+        assert!(try_parse(&["reclaim", "--force", "--state", "X"]).is_err());
         // Argv-style values may start with `--`: a binary entrypoint's flag-only arguments.
-        let args = parse(&["pull", "app", "--cmd", "--port 8080", "--entrypoint", "--x", "--ready-cmd", "--check", "--warm"]);
-        assert_eq!((args.get("cmd"), args.get("entrypoint"), args.get("ready-cmd")), (Some("--port 8080"), Some("--x"), Some("--check")));
-        check_applies(&args).unwrap();
-        assert_eq!(image_options(&args, "app").unwrap().cmd, Some(vec!["--port".to_string(), "8080".to_string()]));
+        let (g, p) = parse_pull(&["pull", "app", "--cmd", "--port 8080", "--entrypoint", "--x", "--ready-cmd", "--check", "--warm"]);
+        assert_eq!(
+            (p.image_flags.cmd.as_deref(), p.image_flags.entrypoint.as_deref(), p.image_flags.ready_cmd.as_deref()),
+            (Some("--port 8080"), Some("--x"), Some("--check"))
+        );
+        assert_eq!(image_options(&g, &p.image_flags, "app").unwrap().cmd, Some(vec!["--port".to_string(), "8080".to_string()]));
     }
 
     #[test]
     fn reclaim_force_requires_a_generation() {
-        let error = Args::parse(["reclaim", "10.9.0.2", "--force"].map(String::from)).err().unwrap();
+        let error = try_parse(&["reclaim", "10.9.0.2", "--force"]).unwrap_err();
         assert_eq!(error.to_string(), "--force needs a generation; run flexvm reclaim IP to see GEN");
-        let args = parse(&["reclaim", "10.9.0.2", "--force", "42"]);
-        check_applies(&args).unwrap();
-        assert_eq!(args.get("force"), Some("42"));
+        let Some(Cmd::Reclaim(r)) = parse(&["reclaim", "10.9.0.2", "--force", "42"]).command else { panic!() };
+        assert_eq!(r.force.as_deref(), Some("42"));
         for gen in ["1", "42"] {
             let option = format!("--force={gen}");
-            let args = parse(&["reclaim", "10.9.0.2", &option]);
-            check_applies(&args).unwrap();
-            assert_eq!(args.get("force"), Some(gen));
+            let Some(Cmd::Reclaim(r)) = parse(&["reclaim", "10.9.0.2", &option]).command else { panic!() };
+            assert_eq!(r.force.as_deref(), Some(gen));
         }
         for gen in ["", "bad", "-1", "18446744073709551616"] {
             let args = parse(&["reclaim", "10.9.0.2", "--force", gen]);
@@ -4768,54 +4551,66 @@ s.close()
 
     #[test]
     fn switches_repeated_values_and_internal_flags_parse() {
-        let args = parse(&["pull", "x", "--env", "A=1", "--json", "--env", "B=2", "--standby", "3", "--mem", "456", "--mem", "789"]);
-        assert!(args.has("json"));
-        assert_eq!(args.all("env"), ["A=1", "B=2"]);
-        assert_eq!((args.get("standby"), args.parse_or::<u64>("mem", 0).unwrap()), (Some("3"), 789));
-        let args = parse(&["run", "--incoming", "--standby", "--paused"]);
-        assert!(args.has("incoming") && args.has("standby") && args.has("paused"));
-        assert!(args.rest.is_empty());
+        let (_, p) = parse_pull(&["pull", "x", "--env", "A=1", "--env", "B=2", "--standby", "3", "--mem", "456", "--mem", "789"]);
+        assert_eq!(p.image_flags.env, ["A=1", "B=2"]);
+        assert_eq!((p.standby.as_deref(), cli::parse_or::<u64>(p.mem.as_deref(), "mem", 0).unwrap()), (Some("3"), 789));
+        let (_, r) = parse_run(&["run", "--incoming", "--standby", "--paused"]);
+        assert!(r.incoming && r.standby && r.paused && r.cmd.is_empty());
         // -a is start's --attach and ps's --all; -f is rm's --force only.
-        assert!(parse(&["start", "-a", "x"]).has("attach") && parse(&["ps", "-a"]).has("all") && parse(&["rm", "-f", "x"]).has("force"));
-        assert!(Args::parse(["reclaim", "10.0.0.2", "-f"].map(String::from)).is_err());
+        let Some(Cmd::Start(s)) = parse(&["start", "-a", "x"]).command else { panic!() };
+        let Some(Cmd::Ps(ps)) = parse(&["ps", "-a"]).command else { panic!() };
+        let Some(Cmd::Rm(rm)) = parse(&["rm", "-f", "x"]).command else { panic!() };
+        assert!(s.attach && ps.all && rm.force);
+        assert!(try_parse(&["reclaim", "10.0.0.2", "-f"]).is_err());
     }
 
     #[test]
     fn a_parse_error_still_finds_its_command() {
-        for argv in [&["--bogus", "run", "job"][..], &["run", "--bogus", "job"], &["-x", "start", "job"], &["--bogus", "run", "--checkpoint", "/x", "--ip"]] {
-            let (args, e) = Args::parse_partly(argv.iter().map(|a| a.to_string()));
-            assert!(e.is_some() && ["run", "start"].contains(&args.positional[0].as_str()), "{argv:?}");
+        for argv in [
+            &["--bogus", "run", "job"][..],
+            &["run", "--bogus", "job"],
+            &["-x", "start", "job"],
+            &["--bogus", "run", "--checkpoint", "/x", "--ip"],
+            &["exec", "--bogus", "web", "ls"],
+            &["software", "--bogus", "alpine"],
+            &["software-transfer", "activate", "--bogus"],
+        ] {
+            let raw: Vec<String> = argv.iter().map(|s| (*s).to_string()).collect();
+            assert!(cli::parse_from(&raw).is_err(), "{argv:?}");
+            assert!(cli::is_vm_command(&raw), "{argv:?}");
         }
-        let (args, e) = Args::parse_partly(["--state", "run", "ps"].map(String::from));
-        assert!(e.is_none() && args.positional == ["ps"]);
+        let raw: Vec<String> = ["--state", "run", "ps"].iter().map(|s| (*s).to_string()).collect();
+        assert!(!cli::is_vm_command(&raw));
+        assert!(matches!(cli::parse_from(&raw).unwrap().command, Some(Cmd::Ps(_))));
     }
 
     #[test]
     fn run_takes_app_settings_and_kill_a_signal() {
-        let a = parse(&["run", "-e", "A=1", "--env", "B=2", "--env-file", "f", "--entrypoint", "[\"sh\", \"-c\"]", "--rm", "-d", "img", "-e", "x"]);
-        check_applies(&a).unwrap();
-        assert_eq!((a.all("env"), a.get("env-file"), a.has("rm")), (vec!["A=1".to_string(), "B=2".into()], Some("f"), true));
-        assert!(parse(&["run", "--keep", "img"]).has("keep") && check_applies(&parse(&["run", "--keep", "img"])).is_ok());
-        assert_eq!(a.rest, ["-e", "x"], "after IMAGE, the command's");
+        let (global, a) =
+            parse_run(&["run", "-e", "A=1", "--env", "B=2", "--env-file", "f", "--entrypoint", "[\"sh\", \"-c\"]", "--rm", "-d", "img", "-e", "x"]);
+        assert_eq!((&a.env, a.env_file.first().map(String::as_str), a.rm), (&vec!["A=1".to_string(), "B=2".into()], Some("f"), true));
+        assert!(parse_run(&["run", "--keep", "img"]).1.keep);
+        assert_eq!(a.cmd, ["-e", "x"], "after IMAGE, the command's");
         // A detached run's VM process parses its words again.
-        assert_eq!(a.child_args, ["run", "-e", "A=1", "--env", "B=2", "--env-file", "f", "--entrypoint", "[\"sh\", \"-c\"]", "--rm", "img", "-e", "x"]);
-        let spec = run_spec(&parse(&["run", "-e", "A=1", "-e", "FLEXVM_TEST_UNSET_VAR", "--entrypoint", "sleep 1", "img"]), None).unwrap();
+        let child_argv = a.child_args(&global, None);
+        let (_, child) = parse_run(&child_argv.iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(!child.detach && child.env == a.env && child.env_file == a.env_file && child.entrypoint == a.entrypoint && child.rm && child.cmd == a.cmd);
+        let spec = run_spec(&parse_run(&["run", "-e", "A=1", "-e", "FLEXVM_TEST_UNSET_VAR", "--entrypoint", "sleep 1", "img"]).1, None).unwrap();
         assert_eq!(spec, app::RunSpec { env: vec!["A=1".into()], entrypoint: Some(vec!["sleep".into(), "1".into()]), ..Default::default() });
         let dir = test_util::TempDir::new("env-file-flag");
         std::fs::write(dir.join("env"), "A=file\nC=3\n").unwrap();
         let file = dir.join("env").to_string_lossy().into_owned();
-        let spec = run_spec(&parse(&["run", "--env-file", &file, "-e", "A=flag", "--ip", "10.0.0.5", "img"]), Some("10.0.0.5".parse().unwrap())).unwrap();
+        let spec = run_spec(&parse_run(&["run", "--env-file", &file, "-e", "A=flag", "--ip", "10.0.0.5", "img"]).1, Some("10.0.0.5".parse().unwrap())).unwrap();
         assert_eq!(
             (spec.env, spec.ip),
             (vec!["A=file".to_string(), "C=3".into(), "A=flag".into()], Some("10.0.0.5".parse().unwrap())),
             "-e after the files: it wins"
         );
-        assert!(run_spec(&parse(&["run", "--env-file", "/nonexistent/env", "img"]), None).unwrap_err().to_string().contains("--env-file"));
-        let k = parse(&["kill", "-s", "TERM", "a", "b"]);
-        check_applies(&k).unwrap();
-        assert_eq!((k.get("signal"), k.names()), (Some("TERM"), &["a".to_string(), "b".into()][..]));
-        let err = |a: &[&str]| check_applies(&parse(a)).err().map(|e| e.to_string());
-        assert!(Args::parse(["kill", "-s"].map(String::from)).is_err(), "-s needs a signal");
+        assert!(run_spec(&parse_run(&["run", "--env-file", "/nonexistent/env", "img"]).1, None).unwrap_err().to_string().contains("--env-file"));
+        let Some(Cmd::Kill(k)) = parse(&["kill", "-s", "TERM", "a", "b"]).command else { panic!() };
+        assert_eq!((k.signal.as_deref(), k.names.as_slice()), (Some("TERM"), &["a".to_string(), "b".into()][..]));
+        let err = |a: &[&str]| try_parse(a).and_then(|c| check_applies(&c)).err().map(|e| e.to_string());
+        assert!(try_parse(&["kill", "-s"]).is_err(), "-s needs a signal");
         assert!(err(&["stop", "--signal", "TERM", "a"]).is_some());
         assert!(err(&["run", "--checkpoint", "/d", "-e", "A=1"]).unwrap().contains("--checkpoint"));
         assert!(err(&["run", "--checkpoint", "/d", "--keep"]).unwrap().contains("--checkpoint"));
@@ -4825,7 +4620,7 @@ s.close()
 
     #[test]
     fn container_commands_take_their_flags_and_words() {
-        let err = |a: &[&str]| check_applies(&parse(a)).err().map(|e| e.to_string());
+        let err = |a: &[&str]| try_parse(a).and_then(|c| check_applies(&c)).err().map(|e| e.to_string());
         for ok in [
             &["logs", "-f", "--tail", "20", "web"][..],
             &["logs", "--follow", "web"],
@@ -4837,10 +4632,12 @@ s.close()
         ] {
             assert_eq!(err(ok), None, "{ok:?}");
         }
-        let logs = parse(&["logs", "-f", "web"]);
-        assert!(logs.has("follow") && !logs.has("force"), "-f is logs' follow");
-        assert!(parse(&["rm", "-f", "web"]).has("force"), "and rm's force");
-        assert_eq!(parse(&["ps", "--filter", "a=1", "--filter", "b=2"]).all("filter"), ["a=1", "b=2"]);
+        let Some(Cmd::Logs(logs)) = parse(&["logs", "-f", "web"]).command else { panic!() };
+        assert!(logs.follow, "-f is logs' follow");
+        let Some(Cmd::Rm(rm)) = parse(&["rm", "-f", "web"]).command else { panic!() };
+        assert!(rm.force, "and rm's force");
+        let Some(Cmd::Ps(ps)) = parse(&["ps", "--filter", "a=1", "--filter", "b=2"]).command else { panic!() };
+        assert_eq!(ps.filter, ["a=1", "b=2"]);
         assert_eq!(err(&["rename", "a"]).unwrap(), "rename needs OLD NEW");
         assert!(err(&["rename", "a", "b", "c"]).is_some());
         assert_eq!(err(&["logs"]).unwrap(), "logs needs NAME");
@@ -4848,16 +4645,16 @@ s.close()
         assert_eq!(err(&["wait"]).unwrap(), "wait needs NAME");
         assert_eq!(err(&["inspect"]).unwrap(), "inspect needs NAME");
         assert_eq!(err(&["restart"]).unwrap(), "restart needs NAME");
-        assert!(err(&["stop", "-q", "a"]).unwrap().contains("--quiet does not apply"));
+        assert!(err(&["stop", "-q", "a"]).is_some());
         assert!(err(&["ps", "--tail", "3"]).is_some());
         assert!(err(&["ps", "--json", "--format", "json"]).unwrap().contains("not both"));
-        assert!(Args::parse(["kill", "-f", "a"].map(String::from)).is_err(), "-f is only rm's and logs'");
+        assert!(try_parse(&["kill", "-f", "a"]).is_err(), "-f is only rm's and logs'");
     }
 
     #[test]
     fn flags_and_words_a_command_does_not_take_are_errors() {
-        let err = |a: &[&str]| check_applies(&parse(a)).err().map(|e| e.to_string());
-        assert_eq!(err(&["run", "--mem", "512", "web"]).unwrap(), "--mem does not apply to run (see flexvm --help)");
+        let err = |a: &[&str]| try_parse(a).and_then(|c| check_applies(&c)).err().map(|e| e.to_string());
+        assert!(err(&["run", "--mem", "512", "web"]).is_some());
         assert!(err(&["start", "--ip", "10.0.0.1", "web"]).is_some());
         assert!(err(&["run", "--checkpoint", "/d", "ubuntu"]).unwrap().contains("takes no IMAGE"));
         assert_eq!(
@@ -4866,13 +4663,13 @@ s.close()
         );
         assert_eq!(err(&["run", "--paused", "ubuntu"]).unwrap(), "--paused applies to run --checkpoint");
         assert_eq!(err(&["kill", "web", "--", "x"]), None);
-        assert_eq!(err(&["run", "--warm", "t"]).unwrap(), "--warm does not apply to run (see flexvm --help)");
-        assert_eq!(err(&["images", "--tag", "x"]).unwrap(), "--tag does not apply to images (see flexvm --help)");
+        assert!(err(&["run", "--warm", "t"]).is_some());
+        assert!(err(&["images", "--tag", "x"]).is_some());
         assert!(err(&["rmi", "a", "b"]).is_some());
         assert!(err(&["start", "-a", "a", "b"]).unwrap().contains("one NAME"));
-        assert!(err(&["config"]).unwrap().contains("unknown command"));
-        assert!(err(&["recover"]).unwrap().contains("unknown command"));
-        assert!(Args::parse(["listen", "1.2.3.4:7070", "--peer", "a:1"].map(String::from)).is_err());
+        assert!(err(&["config"]).is_some());
+        assert!(err(&["recover"]).is_some());
+        assert!(try_parse(&["listen", "1.2.3.4:7070", "--peer", "a:1"]).is_err());
         for ok in [
             &["--state", "/s", "run", "--name", "web", "-d", "--cpus", "1.5", "--memory", "1g", "ubuntu:24.04", "make", "test"][..],
             &["run", "ubuntu", "--name", "--x"],
@@ -4894,6 +4691,63 @@ s.close()
         ] {
             assert_eq!(err(ok), None, "{ok:?}");
         }
+    }
+
+    #[test]
+    fn clap_trailing_guest_flags_and_nested_subcommands() {
+        // `run` with trailing flags for the guest command
+        let (_, r) = parse_run(&["run", "-it", "--rm", "alpine", "sh", "-c", "echo -n hi"]);
+        assert!(r.interactive && r.tty && r.rm);
+        assert_eq!(r.image.as_deref(), Some("alpine"));
+        assert_eq!(r.cmd, ["sh", "-c", "echo -n hi"]);
+
+        // `exec` with trailing flags for the guest command
+        let e = parse_exec(&["exec", "-it", "-e", "FOO=bar", "web", "sh", "-c", "ls -la --color=never"]);
+        assert!(e.interactive && e.tty);
+        assert_eq!(e.env, ["FOO=bar"]);
+        assert_eq!(e.name.as_deref(), Some("web"));
+        assert_eq!(e.cmd, ["sh", "-c", "ls -la --color=never"]);
+
+        // `volume` nested subcommands
+        for ok in [
+            &["volume", "create", "data", "--size", "1048576"][..],
+            &["volume", "clone", "data", "data2"],
+            &["volume", "ls"],
+            &["volume", "inspect", "data"],
+            &["volume", "rm", "data"],
+        ] {
+            check_applies(&parse(ok)).unwrap();
+        }
+        assert!(try_parse(&["volume", "create", "data"]).and_then(|c| check_applies(&c)).is_err());
+        assert!(try_parse(&["volume", "ls", "--size", "512"]).is_err());
+
+        // `software-transfer` nested subcommands
+        for ok in [
+            &["software-transfer", "id"][..],
+            &["software-transfer", "offer", "vm1", "dest"],
+            &["software-transfer", "retire", "vm1", "offer.json", "--signing-key", "k.pem", "--destination-key", "dk"],
+            &["software-transfer", "prepare", "offer.json", "--source-key", "sk", "--handoff-chain", "chain.json"],
+            &["software-transfer", "commit", "receipt.json"],
+            &["software-transfer", "acknowledge-commit", "offer.json", "--signing-key", "k.pem"],
+            &["software-transfer", "finalize", "ack.json", "--signing-key", "k.pem"],
+            &["software-transfer", "abort", "offer.json"],
+            &["software-transfer", "acknowledge-abort", "offer.json", "--signing-key", "k.pem"],
+            &["software-transfer", "recover", "abort.json"],
+            &["software-transfer", "send", "vm1", "offer.json"],
+            &["software-transfer", "receive", "offer.json", "--max-bundle-mib", "512"],
+            &["software-transfer", "activate", "offer.json", "vm1", "--qemu", "/usr/bin/qemu-system-x86_64"],
+        ] {
+            check_applies(&parse(ok)).unwrap();
+        }
+        assert!(try_parse(&["software-transfer", "activate", "offer.json", "vm1"]).is_err());
+
+        // Exit code 125 for invalid `run`/`exec` CLI args
+        let err = try_parse(&["run", "--no-such-flag", "alpine"]).unwrap_err();
+        assert!(cli::is_vm_command(&["run", "--no-such-flag", "alpine"].map(String::from)));
+        assert_eq!(vmproc::exit_code(&err), 125);
+        let err = try_parse(&["exec", "--no-such-flag", "web", "ls"]).unwrap_err();
+        assert!(cli::is_vm_command(&["exec", "--no-such-flag", "web", "ls"].map(String::from)));
+        assert_eq!(vmproc::exit_code(&err), 125);
     }
 
     #[test]
@@ -5073,9 +4927,9 @@ s.close()
         let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
         std::fs::write(host.vms("web", "moved").unwrap(), b"b:7070").unwrap();
         let args = parse(&["start", "web"]);
-        assert_eq!(start(&host, &args, "web").unwrap_err().to_string(), "vm web moved to b:7070; it runs there");
+        assert_eq!(start(&host, &args.global, None, "web").unwrap_err().to_string(), "vm web moved to b:7070; it runs there");
         assert!(host.has_record("web", "moved"));
-        assert_eq!(start(&host, &args, "nobody").unwrap_err().to_string(), r#"no vm named "nobody""#);
+        assert_eq!(start(&host, &args.global, None, "nobody").unwrap_err().to_string(), r#"no vm named "nobody""#);
     }
 
     #[test]
@@ -5377,7 +5231,7 @@ s.close()
 
     #[test]
     fn exec_needs_an_absolute_workdir() {
-        let e = exec_command(&parse(&["exec", "-w", "srv", "vm", "true"])).unwrap_err();
+        let e = exec_command(&parse_exec(&["exec", "-w", "srv", "vm", "true"])).unwrap_err();
         assert!(e.to_string().contains("absolute"), "{e}");
     }
 

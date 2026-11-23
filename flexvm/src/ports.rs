@@ -1547,10 +1547,7 @@ mod tests {
 
     #[test]
     fn duplicate_port_specs_are_rejected_before_binding() {
-        let specs = |a: &str, b: &str| {
-            let args = crate::Args::parse(["run", "-p", a, "-p", b, "image"].map(String::from)).unwrap();
-            crate::port_specs(&args)
-        };
+        let specs = |a: &str, b: &str| crate::port_specs(&[a.to_string(), b.to_string()]);
         for (a, b) in [
             ("8080:80", "8080:80/tcp"),
             ("127.0.0.1:8080:80", "127.0.0.1:8080:81"),

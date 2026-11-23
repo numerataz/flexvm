@@ -15,9 +15,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 
+use crate::bail;
+use crate::cli::{self, BenchArgs, GlobalArgs};
 use crate::host::Host;
 use crate::util::{ms, Result};
-use crate::{bail, Args};
 
 /// VMs start on `a`; migrations and restores go to `b` (`a` again without `--to`).
 struct Hosts {
@@ -180,7 +181,7 @@ impl Hosts {
     }
 }
 
-pub fn run(args: &Args) -> Result<()> {
+pub fn run(global: &GlobalArgs, args: &BenchArgs) -> Result<()> {
     validate(args)?;
     let cancelled = Arc::new(AtomicBool::new(false));
     let flag = cancelled.clone();
@@ -189,21 +190,21 @@ pub fn run(args: &Args) -> Result<()> {
     let dirty = !command("git", &["status", "--porcelain"])?.is_empty();
     let dir = format!("{}/bench", command("git", &["rev-parse", "--show-toplevel"])?);
     std::fs::create_dir_all(&dir)?;
-    let a = crate::open_host(args)?;
-    let to = args.get("to").map(String::from);
-    let b = match (args.get("to-state"), args.get("to-run")) {
+    let a = crate::open_host(global, false)?;
+    let to = args.to.clone();
+    let b = match (args.to_state.as_deref(), args.to_run.as_deref()) {
         (Some(s), Some(r)) => Host::open(std::path::Path::new(s), std::path::Path::new(r))?,
-        (None, None) if to.is_none() => crate::open_host(args)?,
+        (None, None) if to.is_none() => crate::open_host(global, false)?,
         _ => bail!("--to needs the target host's --to-state and --to-run (on this machine)"),
     };
-    let timeout = Duration::from_secs(args.parse_or::<u64>("timeout", 120)?.max(1));
+    let timeout = Duration::from_secs(cli::parse_or::<u64>(args.timeout.as_deref(), "timeout", 120)?.max(1));
     let hosts = Hosts { a, b, to, timeout, cancelled };
-    let template = &crate::template::name_of(args.get("template").unwrap_or("ubuntu:24.04"))?;
+    let template = &crate::template::name_of(args.template.as_deref().unwrap_or("ubuntu:24.04"))?;
     let date = command("date", &["-u", "+%Y-%m-%dT%H-%M-%SZ"])?;
     let id = format!("{}-{}", std::process::id(), crate::migrate::migration_id());
     // The load before the run, as the one after it is mostly the run's own.
     let loadavg_before = std::fs::read_to_string("/proc/loadavg").ok().map(|s| s.trim().to_string());
-    let (report, suffix) = match args.has("lifecycle") {
+    let (report, suffix) = match args.lifecycle {
         true => (lifecycle(&hosts, args, template, &date, &id), "-lifecycle"),
         false => (runs(&hosts, args, template, &date, &id), ""),
     };
@@ -223,14 +224,19 @@ pub fn run(args: &Args) -> Result<()> {
     Ok(())
 }
 
-fn validate(args: &Args) -> Result<()> {
-    if args.parse_or::<u64>("iterations", 1)? == 0 {
+fn validate(args: &BenchArgs) -> Result<()> {
+    if cli::parse_or::<u64>(args.iterations.as_deref(), "iterations", 1)? == 0 {
         bail!("--iterations must be positive");
     }
-    if args.has("lifecycle") {
+    if args.lifecycle {
         lifecycle_sizes(args)?;
-        for flag in ["warmup", "settle-ms", "ready-port", "ready-http"] {
-            if args.has(flag) {
+        for (flag, present) in [
+            ("warmup", args.warmup.is_some()),
+            ("settle-ms", args.settle_ms.is_some()),
+            ("ready-port", args.ready_port.is_some()),
+            ("ready-http", args.ready_http.is_some()),
+        ] {
+            if present {
                 bail!("--{flag} is unused with --lifecycle");
             }
         }
@@ -251,12 +257,12 @@ fn record(result: Result<Value>, samples: &mut Vec<Value>, error: &mut Option<St
     }
 }
 
-fn runs(h: &Hosts, args: &Args, template: &str, date: &str, id: &str) -> Result<Value> {
-    let iterations = args.parse_or::<u64>("iterations", 50)?;
-    let warmup = args.parse_or::<u64>("warmup", 3)?;
-    let dirty_mib = args.parse_or::<u64>("dirty-mib", 0)?;
-    let settle = Duration::from_millis(args.parse_or::<u64>("settle-ms", 100)?);
-    let ready = match (args.get("ready-port"), args.get("ready-http")) {
+fn runs(h: &Hosts, args: &BenchArgs, template: &str, date: &str, id: &str) -> Result<Value> {
+    let iterations = cli::parse_or::<u64>(args.iterations.as_deref(), "iterations", 50)?;
+    let warmup = cli::parse_or::<u64>(args.warmup.as_deref(), "warmup", 3)?;
+    let dirty_mib = cli::parse_or::<u64>(args.dirty_mib.as_deref(), "dirty-mib", 0)?;
+    let settle = Duration::from_millis(cli::parse_or::<u64>(args.settle_ms.as_deref(), "settle-ms", 100)?);
+    let ready = match (args.ready_port.as_deref(), args.ready_http.as_deref()) {
         (Some(p), None) => Some((p.parse().map_err(|_| "bad --ready-port")?, false)),
         (None, Some(p)) => Some((p.parse().map_err(|_| "bad --ready-http")?, true)),
         (None, None) => None,
@@ -362,9 +368,10 @@ fn iteration(h: &Hosts, name: &str, template: &str, dirty_mib: u64, ready: Optio
     Ok(sample)
 }
 
-fn lifecycle_sizes(args: &Args) -> Result<Vec<u64>> {
+fn lifecycle_sizes(args: &BenchArgs) -> Result<Vec<u64>> {
     let sizes: Vec<u64> = args
-        .get("dirty-mib")
+        .dirty_mib
+        .as_deref()
         .unwrap_or("0,256,1024")
         .split(',')
         .map(|s| s.trim().parse().map_err(|_| format!("bad --dirty-mib {s:?}")))
@@ -378,8 +385,8 @@ fn lifecycle_sizes(args: &Args) -> Result<Vec<u64>> {
     Ok(sizes)
 }
 
-fn lifecycle(h: &Hosts, args: &Args, template: &str, date: &str, id: &str) -> Result<Value> {
-    let iterations = args.parse_or::<u64>("iterations", 5)?;
+fn lifecycle(h: &Hosts, args: &BenchArgs, template: &str, date: &str, id: &str) -> Result<Value> {
+    let iterations = cli::parse_or::<u64>(args.iterations.as_deref(), "iterations", 5)?;
     let sizes = lifecycle_sizes(args)?;
     let mut summary = Map::new();
     let mut all = Map::new();
@@ -637,13 +644,21 @@ mod tests {
         }
     }
 
+    fn parse_bench(argv: &[&str]) -> (GlobalArgs, BenchArgs) {
+        let mut full = vec!["bench".to_string()];
+        full.extend(argv.iter().map(|s| (*s).to_string()));
+        let parsed = cli::parse_from(&full).unwrap();
+        let Some(cli::Cmd::Bench(bench)) = parsed.command else { panic!("expected bench") };
+        (parsed.global, bench)
+    }
+
     #[test]
     fn duplicate_lifecycle_sizes_are_rejected_before_running() {
         for sizes in ["1,1", "0,256,0", "1, 01"] {
-            let args = Args::parse(["--lifecycle", "--dirty-mib", sizes].map(String::from)).unwrap();
+            let (_, args) = parse_bench(&["--lifecycle", "--dirty-mib", sizes]);
             assert!(validate(&args).unwrap_err().to_string().contains("duplicate --dirty-mib"));
         }
-        let args = Args::parse(["--lifecycle", "--dirty-mib", "256,0,1"].map(String::from)).unwrap();
+        let (_, args) = parse_bench(&["--lifecycle", "--dirty-mib", "256,0,1"]);
         assert_eq!(lifecycle_sizes(&args).unwrap(), [256, 0, 1]);
     }
 
@@ -743,13 +758,13 @@ mod tests {
             if lifecycle {
                 argv.push("--lifecycle");
             }
-            assert!(validate(&Args::parse(argv.into_iter().map(String::from)).unwrap()).is_err());
+            assert!(validate(&parse_bench(&argv).1).is_err());
         }
         for flag in ["--warmup", "--settle-ms", "--ready-port", "--ready-http"] {
-            let args = Args::parse(["--lifecycle", flag, "1"].map(String::from)).unwrap();
+            let (_, args) = parse_bench(&["--lifecycle", flag, "1"]);
             assert!(validate(&args).unwrap_err().to_string().contains(flag));
         }
-        assert!(validate(&Args::parse(["--lifecycle", "--iterations", "1"].map(String::from)).unwrap()).is_ok());
+        assert!(validate(&parse_bench(&["--lifecycle", "--iterations", "1"]).1).is_ok());
     }
 
     #[test]
@@ -764,8 +779,8 @@ mod tests {
     fn sha_is_resolved_before_opening_hosts_or_running_iterations() {
         const CHILD: &str = "FLEXVM_TEST_BENCH_NO_GIT";
         if std::env::var_os(CHILD).is_some() {
-            let args = Args::parse(["--state", "state", "--run", "run"].map(String::from)).unwrap();
-            let error = run(&args).unwrap_err().to_string();
+            let (global, args) = parse_bench(&["--state", "state", "--run", "run"]);
+            let error = run(&global, &args).unwrap_err().to_string();
             assert!(error.starts_with("git failed:"), "{error}");
             assert!(!std::path::Path::new("state").exists());
             assert!(!std::path::Path::new("run").exists());
