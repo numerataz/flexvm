@@ -126,7 +126,15 @@ PY
         done
         test -f "$root"/lib/ld-musl-*.so.1
         for applet in sh cat wget nc sleep printf mv test; do ln -s busybox "$root/bin/$applet"; done
-        printf "#!/bin/sh\nprintf '\''HTTP/1.0 200 OK\\r\\n\\r\\n'\''\ncat /data/marker\n" > "$root/bin/serve"
+        cat <<\EOF > "$root/bin/serve"
+#!/bin/sh
+cr=$(printf "\r")
+while IFS= read -r line; do
+    case $line in ""|"$cr") break ;; esac
+done
+printf "HTTP/1.0 200 OK\r\n\r\n"
+cat /data/marker
+EOF
         chmod 755 "$root/bin/serve"
         tar -C "$root" -cf /tmp/nested-base.tar .
         docker import /tmp/nested-base.tar flexvm-nested-base:local
