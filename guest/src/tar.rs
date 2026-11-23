@@ -762,8 +762,8 @@ pub fn extract(input: &mut dyn Read, dest: Dest, owner: Option<(u32, u32)>) -> i
         Ok(comps)
     };
     // Each directory by its path as unpacked (its components joined by `/`, kept once), with the order it first
-    // came in and its last entry's metadata: that goes on at the end, deepest (last come) first. Bounded: a guest's
-    // archive must not make the host keep more than `MAX_DIRS`.
+    // came in and its last entry's metadata: that goes on at the end, deepest first (breaking ties by reverse
+    // archive order). Bounded: a guest's archive must not make the host keep more than `MAX_DIRS`.
     let (mut dirs, mut kept) = (std::collections::HashMap::<Vec<u8>, (usize, Header)>::new(), 0);
     let mut next = Some(first);
     while let Some(e) = next.take() {
@@ -788,7 +788,7 @@ pub fn extract(input: &mut dyn Read, dest: Dest, owner: Option<(u32, u32)>) -> i
         next = rd.next()?;
     }
     let mut dirs: Vec<_> = dirs.into_iter().collect();
-    dirs.sort_unstable_by_key(|(_, (n, _))| std::cmp::Reverse(*n));
+    dirs.sort_unstable_by_key(|(path, (n, _))| (std::cmp::Reverse(path.iter().filter(|&&b| b == b'/').count()), std::cmp::Reverse(*n)));
     for (path, (_, e)) in dirs {
         let comps: Vec<Vec<u8>> = path.split(|&b| b == b'/').map(<[u8]>::to_vec).collect();
         let fd = walk_dir(&base, &comps, None).map_err(|err| with(String::from_utf8_lossy(&path), err))?;
@@ -1881,5 +1881,29 @@ mod tests {
         let leaked =
             std::fs::read_dir("/proc/self/fd").unwrap().filter_map(|e| e.ok()).filter_map(|e| std::fs::read_link(e.path()).ok()).any(|p| p == leaked_target);
         assert!(!leaked, "directory fd leaked after fchown error");
+    }
+
+    #[test]
+    fn extract_applies_deferred_dir_metadata_deepest_first() {
+        let t = Tmp::new("deepest-first-dirs");
+        let mut v = Vec::new();
+        for (name, mode, mtime) in [("a/b/", 0o755, 1_700_000_200), ("a/", 0o400, 1_700_000_100)] {
+            write_header(&mut v, &Header { path: name.into(), kind: b'5', mode, mtime, ..Default::default() }).unwrap();
+        }
+        v.extend_from_slice(&[0; BLOCK * 2]);
+
+        extract(&mut &v[..], Dest::Into(t.0.to_str().unwrap()), None).unwrap();
+
+        let a = t.0.join("a");
+        let ab = a.join("b");
+        let a_meta = std::fs::metadata(&a).unwrap();
+        assert_eq!(a_meta.mode() & 0o7777, 0o400);
+        assert_eq!(a_meta.mtime(), 1_700_000_100);
+
+        // Restore traverse/write bits on `a` so non-root can stat `a/b` and `Tmp` can clean up.
+        std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ab_meta = std::fs::metadata(&ab).unwrap();
+        assert_eq!(ab_meta.mode() & 0o7777, 0o755);
+        assert_eq!(ab_meta.mtime(), 1_700_000_200);
     }
 }
