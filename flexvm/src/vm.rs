@@ -262,6 +262,12 @@ impl Vm {
         }
     }
 
+    /// The stored lifecycle state, ignoring pager failure so a migration source
+    /// keeps its `Source(mig)` ownership even if its pager fails.
+    pub fn lifecycle_state(&self) -> State {
+        *self.state.lock().unwrap()
+    }
+
     pub fn fc<R>(&self, f: impl FnOnce(&Firecracker) -> Result<R>) -> Result<R> {
         match self.fc.lock().unwrap().as_ref() {
             Some(fc) => f(fc),
@@ -1149,9 +1155,11 @@ impl Resources {
             }
         }
         if let Some(m) = self.memory_mib {
-            let plugged = meta.plugged_mib.max(plugged_mib).min(meta.max_mib - meta.mem_mib);
-            let floor = meta.mem_mib + plugged;
-            if m < floor {
+            let total = meta.max_mib - meta.mem_mib;
+            let plugged = meta.plugged_mib.max(plugged_mib).min(total);
+            let min_hotplug = plugged.div_ceil(crate::template::STEP_MIB).saturating_mul(crate::template::STEP_MIB).min(total);
+            let floor = meta.mem_mib + min_hotplug;
+            if m < meta.mem_mib + plugged || self.hotplug_cap(meta) < plugged {
                 let what = if plugged_mib > meta.plugged_mib { "its checkpoint" } else { "its snapshot" };
                 bail!(
                     "--memory {m} MiB is less than the image's boot memory and what {what} plugged ({} + {plugged} MiB): give at least {floor}m",
@@ -1492,5 +1500,18 @@ mod tests {
         assert!(mem(384 + 512).check_with_plugged(&meta, 256).is_err());
         // Plugged floor is clamped to max_mib - mem_mib so max_mib remains valid.
         mem(384 + 8192).check_with_plugged(&meta, 16384).unwrap();
+
+        // Partially completed resize (not a multiple of STEP_MIB=128): hotplug_cap rounds down,
+        // so --memory must be large enough that hotplug_cap() >= plugged.
+        let mut partial = meta;
+        partial.mem_mib = 256;
+        partial.max_mib = 256 + 8192;
+        partial.plugged_mib = 512;
+        for too_small in [256 + 1088, 256 + 1151] {
+            let err = mem(too_small).check_with_plugged(&partial, 1088).unwrap_err().to_string();
+            assert!(err.contains("its checkpoint") && err.contains("1408m"), "{too_small}: {err}");
+        }
+        mem(256 + 1152).check_with_plugged(&partial, 1088).unwrap();
+        assert_eq!(mem(256 + 1152).hotplug_cap(&partial), 1152);
     }
 }

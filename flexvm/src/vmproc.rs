@@ -760,10 +760,8 @@ pub struct Proc {
     announcer: Arc<Announcer>,
 }
 
-/// Sentinel for `Runtime::destroying` meaning no destroy is waiting (distinct from exit code `0`).
-const NO_DESTROY: i32 = i32::MIN;
-
 // Kept contiguous so runtime resources retain their field drop order.
+#[derive(Default)]
 pub struct Runtime {
     vm: OnceLock<Arc<Vm>>,
     forwards: Mutex<Option<crate::ports::Forwarder>>,
@@ -844,8 +842,9 @@ pub struct Runtime {
     serving: Mutex<bool>,
     /// SIGTSTP and SIGCONT, serialized in arrival order off the signal thread (which a later SIGINT needs).
     pauses: Latest,
-    /// The code of a destroy waiting for `op` (`NO_DESTROY`: none): a pause or resume that gets it first does nothing.
-    destroying: AtomicI32,
+    /// Codes of pending destroy requests waiting for `op`, in arrival order: a pause or resume
+    /// that gets `op` first yields while any request is still pending.
+    destroying: Mutex<Vec<i32>>,
     /// The controller's tick gaps, for `debug status`.
     ticks: Mutex<Ticks>,
     /// How fast the VM's memory grew lately (MiB/s), for eviction's ranking.
@@ -859,57 +858,32 @@ pub struct Runtime {
     record_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 
-impl Default for Runtime {
-    fn default() -> Self {
-        Self {
-            vm: Default::default(),
-            forwards: Default::default(),
-            op: Default::default(),
-            holder: Default::default(),
-            arrived: Default::default(),
-            held_in: Default::default(),
-            app_log: Default::default(),
-            leaving: Default::default(),
-            lent_here: Default::default(),
-            standby: Default::default(),
-            claimer: Default::default(),
-            claimer_gone: Default::default(),
-            watching_death: Default::default(),
-            cmd: Default::default(),
-            spec: Default::default(),
-            restart_kept: Default::default(),
-            stop_asked: Default::default(),
-            guest_reboot: Default::default(),
-            tty: Default::default(),
-            attached: Default::default(),
-            attacher: Default::default(),
-            attaching: Default::default(),
-            app_started: Default::default(),
-            exiting: Default::default(),
-            resources: Default::default(),
-            cmd_session: Default::default(),
-            suspending: Default::default(),
-            reconciling: Default::default(),
-            settling: Default::default(),
-            early: Default::default(),
-            paused_by_request: Default::default(),
-            consumed: Default::default(),
-            pending_route: Default::default(),
-            files: Default::default(),
-            granted: Default::default(),
-            charged: Default::default(),
-            held_grant: Default::default(),
-            sizes: Default::default(),
-            standby_grant: Default::default(),
-            serving: Default::default(),
-            pauses: Default::default(),
-            destroying: AtomicI32::new(NO_DESTROY),
-            ticks: Default::default(),
-            growth: Default::default(),
-            publishing: Default::default(),
-            recording: Default::default(),
-            #[cfg(test)]
-            record_hook: Default::default(),
+/// Keeps one pending destroy request recorded until dropped (on refusal or unwind).
+struct DestroyGuard<'a> {
+    destroying: &'a Mutex<Vec<i32>>,
+    code: i32,
+}
+
+impl Drop for DestroyGuard<'_> {
+    fn drop(&mut self) {
+        let mut pending = self.destroying.lock().unwrap();
+        if let Some(i) = pending.iter().position(|&c| c == self.code) {
+            pending.remove(i);
+        }
+    }
+}
+
+/// Owned counterpart of `DestroyGuard`, carried into the `signal-destroy` worker thread.
+struct OwnedDestroyGuard {
+    proc: Arc<Proc>,
+    code: i32,
+}
+
+impl Drop for OwnedDestroyGuard {
+    fn drop(&mut self) {
+        let mut pending = self.proc.destroying.lock().unwrap();
+        if let Some(i) = pending.iter().position(|&c| c == self.code) {
+            pending.remove(i);
         }
     }
 }
@@ -1728,16 +1702,24 @@ impl Proc {
         self.destroy_with(code, None)
     }
 
+    fn begin_destroy(&self, code: i32) -> DestroyGuard<'_> {
+        self.destroying.lock().unwrap().push(code);
+        DestroyGuard { destroying: &self.destroying, code }
+    }
+
+    fn begin_destroy_owned(self: &Arc<Self>, code: i32) -> OwnedDestroyGuard {
+        self.destroying.lock().unwrap().push(code);
+        OwnedDestroyGuard { proc: self.clone(), code }
+    }
+
     fn destroy_with(&self, code: i32, last: Option<&mut dyn std::io::Write>) -> Error {
-        let _ = self.destroying.compare_exchange(NO_DESTROY, code, Ordering::SeqCst, Ordering::SeqCst);
-        let refused = self.try_destroy(code, last);
-        let _ = self.destroying.compare_exchange(code, NO_DESTROY, Ordering::SeqCst, Ordering::SeqCst);
-        refused
+        let _guard = self.begin_destroy(code);
+        self.try_destroy(code, last)
     }
 
     /// The code a destroy asked for, if one is waiting (a kill that cancelled a suspend).
     pub fn destroy_code(&self) -> Option<i32> {
-        Some(self.destroying.load(Ordering::SeqCst)).filter(|&c| c != NO_DESTROY)
+        self.destroying.lock().unwrap().first().copied()
     }
 
     /// For a pause or resume: refused once a destroy waits for `op` too.
@@ -1759,7 +1741,7 @@ impl Proc {
         let vm = self.vm();
         let res = self.try_destroy_inner(
             &vm.name,
-            || vm.state(),
+            || vm.lifecycle_state(),
             || {
                 vm.cancel_checkpoint.fetch_add(1, Ordering::SeqCst);
                 vm.pager.abort_copy();
@@ -2280,8 +2262,8 @@ impl Proc {
             if self.vm.get().is_none() {
                 if !early.contains(&libc::SIGINT) {
                     early.push(libc::SIGINT);
+                    self.destroying.lock().unwrap().push(128 + libc::SIGINT);
                 }
-                let _ = self.destroying.compare_exchange(NO_DESTROY, 128 + libc::SIGINT, Ordering::SeqCst, Ordering::SeqCst);
                 return Ok(json!({"name": self.name(), "state": "killed"}));
             }
         }
@@ -2344,15 +2326,15 @@ impl Proc {
             libc::SIGINT | libc::SIGQUIT => match self.arc() {
                 Some(p) => {
                     let code = 128 + sig;
-                    let _ = self.destroying.compare_exchange(NO_DESTROY, code, Ordering::SeqCst, Ordering::SeqCst);
+                    let guard = p.begin_destroy_owned(code);
                     thread::Builder::new()
                         .name("signal-destroy".into())
-                        .spawn(move || crate::log!("vm {}: signal {sig}: {}", p.name(), p.destroy(code)))
-                        .map(drop)
-                        .map_err(|e| {
-                            let _ = self.destroying.compare_exchange(code, NO_DESTROY, Ordering::SeqCst, Ordering::SeqCst);
-                            format!("destroying: {e}").into()
+                        .spawn(move || {
+                            let _guard = guard;
+                            crate::log!("vm {}: signal {sig}: {}", p.name(), p.try_destroy(code, None))
                         })
+                        .map(drop)
+                        .map_err(|e| format!("destroying: {e}").into())
                 }
                 None => Err(self.destroy(128 + sig)),
             },
@@ -5458,7 +5440,7 @@ mod tests {
         waiting.recv_timeout(WAIT).unwrap();
         assert!(matches!(reply.recv_timeout(Duration::from_millis(100)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
         // A destroy requested during the operation wins before the signal reaches the VM.
-        p.destroying.store(128 + libc::SIGQUIT, Ordering::SeqCst);
+        let _guard = p.begin_destroy(128 + libc::SIGQUIT);
         drop(held);
         let e = reply.recv_timeout(WAIT).unwrap().unwrap_err();
         assert!(e.contains("being destroyed"), "{e}");
@@ -5473,36 +5455,43 @@ mod tests {
         let pause = thread::spawn(move || q.op_unless_destroyed().map(drop).map_err(|e| e.to_string()));
         thread::sleep(Duration::from_millis(50));
         // As `destroy` does before it waits for `op`; the pause gets it first.
-        p.destroying.store(128 + libc::SIGQUIT, Ordering::SeqCst);
+        let guard = p.begin_destroy(128 + libc::SIGQUIT);
         drop(held);
         assert!(pause.join_within().unwrap().unwrap_err().contains("being destroyed"));
         assert_eq!(p.destroy_code(), Some(131), "a kill that cancels a suspend reports it");
         // Refused (`destroy` takes its code back): the next pause goes ahead.
-        let _ = p.destroying.compare_exchange(131, NO_DESTROY, Ordering::SeqCst, Ordering::SeqCst);
+        drop(guard);
         assert!(p.op_unless_destroyed().is_ok());
     }
 
     #[test]
-    fn destroy_code_zero_is_tracked_and_does_not_overwrite_pending_signal() {
+    fn destroy_code_zero_is_tracked_and_overlapping_refusal_keeps_pending_destroy_marked() {
         let (p, _root) = test_proc("destroy-zero", Some("destroy-zero"));
         assert_eq!(p.destroy_code(), None);
         assert!(p.not_destroyed().is_ok());
-        // Exit code 0 must be distinguished from NO_DESTROY.
-        assert!(p.destroying.compare_exchange(NO_DESTROY, 0, Ordering::SeqCst, Ordering::SeqCst).is_ok());
+        // Exit code 0 must be distinguished from "no destroy".
+        let g0 = p.begin_destroy(0);
         assert_eq!(p.destroy_code(), Some(0));
         assert!(p.not_destroyed().unwrap_err().to_string().contains("being destroyed"));
         let mut sink = Vec::new();
         assert_eq!(p.stop_request(&mut sink).unwrap(), json!({"suspending": true, "name": "destroy-zero"}));
-        // Clearing 0 restores NO_DESTROY.
-        assert!(p.destroying.compare_exchange(0, NO_DESTROY, Ordering::SeqCst, Ordering::SeqCst).is_ok());
+        drop(g0);
         assert_eq!(p.destroy_code(), None);
-        // A pending signal destroy code (130) must not be overwritten by a concurrent exit_with(0).
+        assert!(p.not_destroyed().is_ok());
+
+        // Overlapping destroy requests: a pending signal (130) is not overwritten by exit_with(0),
+        // and refusing the first request must keep destruction marked while the second is still pending.
         let sigint = 128 + libc::SIGINT;
-        assert!(p.destroying.compare_exchange(NO_DESTROY, sigint, Ordering::SeqCst, Ordering::SeqCst).is_ok());
-        assert!(p.destroying.compare_exchange(NO_DESTROY, 0, Ordering::SeqCst, Ordering::SeqCst).is_err());
+        let g_sig = p.begin_destroy(sigint);
+        let g_zero = p.begin_destroy(0);
         assert_eq!(p.destroy_code(), Some(sigint));
-        assert!(p.destroying.compare_exchange(0, NO_DESTROY, Ordering::SeqCst, Ordering::SeqCst).is_err());
-        assert_eq!(p.destroy_code(), Some(sigint));
+        drop(g_sig);
+        assert_eq!(p.destroy_code(), Some(0), "second pending destroy must keep destruction marked");
+        assert!(p.not_destroyed().unwrap_err().to_string().contains("being destroyed"));
+        assert!(p.op_unless_destroyed().is_err());
+        drop(g_zero);
+        assert_eq!(p.destroy_code(), None);
+        assert!(p.not_destroyed().is_ok());
     }
 
     #[test]
@@ -5533,7 +5522,7 @@ mod tests {
         drop(held);
         assert_eq!(killer.join_within().unwrap(), Ok(()));
 
-        // Negative case: if migration committed (state stays Source(7), reconciling cleared), kill is refused.
+        // Negative case 1: if migration committed (state stays Source(7), reconciling cleared), kill is refused.
         *state.lock().unwrap() = State::Source(7);
         *p.reconciling.lock().unwrap() = Some((7, "peer:1".into()));
         let held = p.op();
@@ -5560,6 +5549,41 @@ mod tests {
         drop(held);
         let err = killer.join_within().unwrap().unwrap_err();
         assert!(err.contains("source of a migration in progress"), "{err}");
+
+        // Negative case 2: if the source pager fails while waiting for `op`, Vm::state() becomes Failed
+        // but the stored lifecycle state is still Source(7): try_destroy must still go through
+        // end_reconciling (owed), never returning Ok(op) / End::Gone.
+        *state.lock().unwrap() = State::Source(7);
+        *p.reconciling.lock().unwrap() = Some((7, "peer:1".into()));
+        let pager_failed = Arc::new(AtomicBool::new(false));
+        let called_owed = Arc::new(AtomicBool::new(false));
+        let held = p.op();
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (q, s, pf, owed) = (p.clone(), state.clone(), pager_failed.clone(), called_owed.clone());
+        let killer = thread::spawn(move || {
+            tid_tx.send(unsafe { libc::gettid() }).unwrap();
+            // `try_destroy` queries `vm.lifecycle_state()` (not `vm.state()` which masks Source as Failed).
+            q.try_destroy_inner(
+                "reconcile-abort",
+                || *s.lock().unwrap(),
+                || panic!("reconciling path should not cancel checkpoint"),
+                || panic!("reconciling path should not uncancel checkpoint"),
+                |_, mig| {
+                    assert_eq!(mig, 7);
+                    assert!(pf.load(Ordering::SeqCst), "pager already failed while waiting for op");
+                    owed.store(true, Ordering::SeqCst);
+                    Some("owed-recorded".into())
+                },
+            )
+            .map(drop)
+            .map_err(|e| e.to_string())
+        });
+        let tid = tid_rx.recv_timeout(WAIT).unwrap();
+        wait_until("try_destroy to block on op", || crate::test_util::asleep(tid));
+        pager_failed.store(true, Ordering::SeqCst);
+        drop(held);
+        assert_eq!(killer.join_within().unwrap(), Err("owed-recorded".to_string()));
+        assert!(called_owed.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -5696,7 +5720,7 @@ mod tests {
         let (p, _root) = test_proc("stop-destroying", Some("stop-destroying"));
         // App exiting on its own sets `destroying` via `exit_with`: `stop` must wait
         // for the process to finish exiting rather than failing with "is being destroyed".
-        p.destroying.store(4, Ordering::SeqCst);
+        let _guard = p.begin_destroy(4);
         let mut sink = Vec::new();
         assert_eq!(p.stop_request(&mut sink).unwrap(), json!({"suspending": true, "name": "stop-destroying"}));
         assert!(p.stop_asked.load(Ordering::SeqCst));
