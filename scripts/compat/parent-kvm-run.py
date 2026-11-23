@@ -3200,7 +3200,9 @@ def main():
                 "boot-source": {
                     "kernel_image_path": "/firecracker-kernel",
                     "initrd_path": "/firecracker-initrd",
-                    "boot_args": "console=ttyS0 panic=1 rdinit=/init reboot=k",
+                    # Keep `quiet` (loglevel=4 / KERN_WARNING) so nested TCG serial PIO
+                    # stays fast while kernel warnings, Oops, BUG, and Panic still print.
+                    "boot_args": "console=ttyS0 quiet panic=1 rdinit=/init reboot=k",
                 },
                 "machine-config": {"vcpu_count": args.firecracker_vcpus, "mem_size_mib": args.ram_pages * PAGE_SIZE // MIB},
                 "drives": [],

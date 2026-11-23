@@ -468,7 +468,9 @@ int main(int argc, char **argv)
         self.assertIn('test_datagram_socket(60)', init_source)
         self.assertNotIn('test_datagram_socket(20)', init_source)
         runner_source = (ROOT / 'parent-kvm-run.py').read_text()
-        self.assertIn('"boot_args": "console=ttyS0 panic=1 rdinit=/init reboot=k"', runner_source)
+        # Keep `quiet` (loglevel=4 / KERN_WARNING) so nested TCG serial PIO stays fast
+        # while kernel warnings, Oops, BUG, and Panic messages still print to ttyS0.
+        self.assertIn('"boot_args": "console=ttyS0 quiet panic=1 rdinit=/init reboot=k"', runner_source)
 
 
 class LifecycleFailureState(unittest.TestCase):
