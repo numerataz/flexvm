@@ -48,6 +48,9 @@ impl Header {
         if !self.manifest.disks.is_empty() {
             bail!("software bundle needs managed disk transport support");
         }
+        if self.manifest.parent.is_some() {
+            bail!("software bundle needs parent KVM artifact transport support");
+        }
         if self.manifest.firmware.len() != firmware_names().len() || firmware_names().iter().any(|name| !self.manifest.firmware.contains_key(*name)) {
             bail!("software bundle firmware set does not match this architecture profile");
         }
@@ -417,5 +420,32 @@ mod tests {
         let mut stream = AbortAtEnd { bytes: &bytes, target: &target, offer: &offer };
         assert!(receive(&target, &offer, &mut stream, 1 << 20).unwrap_err().to_string().contains("aborted"));
         assert_eq!(std::fs::read_dir(target.join(INCOMING)).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn header_check_rejects_parent_kvm_manifest() {
+        let source = TempDir::new("transfer-bundle-parent-source");
+        let target = TempDir::new("transfer-bundle-parent-target");
+        let (path, _) = crate::software_state::tests::checkpoint(&source);
+        let checkpoint = private_directory(&path).unwrap();
+        let mut manifest = read_manifest(&checkpoint).unwrap();
+        manifest.parent = Some(crate::software_state::ParentArtifacts {
+            child_memory_mib: 64,
+            native: false,
+            frontend: Artifact { bytes: 16, sha256: "aa".repeat(32) },
+            worker: Artifact { bytes: 16, sha256: "bb".repeat(32) },
+            broker: Artifact { bytes: 16, sha256: "cc".repeat(32) },
+        });
+        let offer = Offer {
+            vm_id: manifest.vm_id.clone(),
+            source_host: manifest.host_id.clone(),
+            destination_host: super::super::host_id(&target).unwrap(),
+            transfer_id: "33".repeat(16),
+            manifest_sha256: Retirement::of(&manifest).unwrap().manifest_sha256,
+            generation: manifest.owner_generation + 1,
+        };
+        let header = Header { offer: offer.clone(), manifest };
+        let err = header.check(&offer).unwrap_err().to_string();
+        assert!(err.contains("parent KVM"), "{err}");
     }
 }

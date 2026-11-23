@@ -237,6 +237,9 @@ fn retired_checkpoint(checkpoint: &File) -> Result<(Manifest, Retirement)> {
     if !manifest.disks.is_empty() {
         bail!("software transfer needs managed disk transport support");
     }
+    if manifest.parent.is_some() {
+        bail!("software transfer needs parent KVM artifact transport support");
+    }
     let retirement = Retirement::of(&manifest)?;
     if present(checkpoint, "STARTED")? || present(checkpoint, "DISCARDED")? {
         bail!("software transfer needs an unconsumed checkpoint");
@@ -745,5 +748,47 @@ mod tests {
         issue(&source, &checkpoint, next, &sender, &receiver_key).unwrap();
         assert!(recover_source(&source, signed_receipt(outgoing, &receiver, ABORT_DOMAIN).unwrap()).is_err());
         assert!(prepared.grant(crate::host::Ident::me()).err().unwrap().to_string().contains("cannot restart"));
+    }
+
+    #[test]
+    fn parent_kvm_checkpoint_is_rejected_by_offer_and_issue_before_fencing() {
+        let root = TempDir::new("transfer-parent-kvm");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let target = TempDir::new("transfer-parent-kvm-target");
+        let (path, _) = super::super::tests::checkpoint(&root);
+        let suspended = host.suspended("vm").unwrap();
+        std::fs::create_dir_all(suspended.parent().unwrap()).unwrap();
+        std::fs::rename(&path, &suspended).unwrap();
+
+        let checkpoint = private_directory(&suspended).unwrap();
+        let mut manifest = read_manifest(&checkpoint).unwrap();
+        manifest.host_id = host_id(&host.state).unwrap();
+        manifest.source_owner = manifest.source_engine.clone();
+        manifest.parent = Some(super::super::ParentArtifacts {
+            child_memory_mib: 64,
+            native: false,
+            frontend: super::super::Artifact { bytes: 16, sha256: "aa".repeat(32) },
+            worker: super::super::Artifact { bytes: 16, sha256: "bb".repeat(32) },
+            broker: super::super::Artifact { bytes: 16, sha256: "cc".repeat(32) },
+        });
+        rewrite_manifest(&checkpoint, &manifest);
+
+        let local = parent_directory(&host.state).unwrap();
+        let destination = host_id(&target).unwrap();
+        let offer_err = super::offer(&host, "vm", &destination).unwrap_err().to_string();
+        assert!(offer_err.contains("parent KVM"), "{offer_err}");
+
+        let outgoing = Offer {
+            source_host: manifest.host_id.clone(),
+            vm_id: manifest.vm_id.clone(),
+            manifest_sha256: Retirement::of(&manifest).unwrap().manifest_sha256,
+            generation: manifest.owner_generation + 1,
+            ..offer(&target)
+        };
+        let signer = key(1);
+        let destination_key = STANDARD.encode(key(4).public_key());
+        let issue_err = issue(&local, &checkpoint, outgoing.clone(), &signer, &destination_key).unwrap_err().to_string();
+        assert!(issue_err.contains("parent KVM"), "{issue_err}");
+        assert!(!present(&local, &source_record(&outgoing.vm_id)).unwrap());
     }
 }
