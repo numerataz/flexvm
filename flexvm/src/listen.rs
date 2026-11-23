@@ -1445,8 +1445,8 @@ pub(crate) fn routable_by(
     }
     // Its IPv6 address, the same on every host (`vm_ipv6_prefix`), is never one either.
     if let Some(v6) = cfg.vm_ipv6(ip).map(IpAddr::V6) {
-        if is_peer(peers, v6) || is_peer(&peer_underlays, v6) || gateways.contains(&v6) || local(v6)? {
-            bail!("{ip} is not a vm's address: its IPv6 address {v6} is a local, peer or gateway address");
+        if is_peer(peers, v6) || is_peer(&peer_underlays, v6) || cfg.underlay.contains(v6) || listen == Some(v6) || gateways.contains(&v6) || local(v6)? {
+            bail!("{ip} is not a vm's address: its IPv6 address {v6} is a local, peer, underlay or gateway address");
         }
     }
     Ok(())
@@ -2286,7 +2286,30 @@ mod tests {
         routable_by(vm, &cfg, &peers, &gateways, local).unwrap();
         for ip in [peer, here, gw] {
             let e = routable_by(ip, &cfg, &peers, &gateways, local).unwrap_err().to_string();
-            assert!(e.contains(&format!("its IPv6 address {} is a local, peer or gateway address", prefix.vm(ip))), "{e}");
+            assert!(e.contains(&format!("its IPv6 address {} is a local, peer, underlay or gateway address", prefix.vm(ip))), "{e}");
+        }
+    }
+
+    #[test]
+    fn a_vms_ipv6_address_is_never_the_hosts_underlay_or_listen_address() {
+        let prefix = crate::net::Ipv6Prefix::parse("fd00:7::/96").unwrap();
+        let ip = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        let (vm, underlay_ip, listen_ip) = (ip("10.200.0.7"), ip("10.200.0.11"), ip("10.200.0.12"));
+        let mut cfg = crate::host::Config {
+            vm_ipv6_prefix: Some(prefix),
+            underlay: crate::host::Underlay { v4: None, v6: Some(prefix.vm(underlay_ip)) },
+            listen: Some(format!("[{}]:7000", prefix.vm(listen_ip))),
+            ..Default::default()
+        };
+        routable_by(vm, &cfg, &[], &[], |_| Ok(false)).unwrap();
+        for collided in [underlay_ip, listen_ip] {
+            let e = routable_by(collided, &cfg, &[], &[], |_| Ok(false)).unwrap_err().to_string();
+            assert!(e.contains(&format!("its IPv6 address {} is a local, peer, underlay or gateway address", prefix.vm(collided))), "{e}");
+        }
+        // Without a VM IPv6 prefix, the same IPv4 addresses are unaffected.
+        cfg.vm_ipv6_prefix = None;
+        for addr in [underlay_ip, listen_ip] {
+            routable_by(addr, &cfg, &[], &[], |_| Ok(false)).unwrap();
         }
     }
 

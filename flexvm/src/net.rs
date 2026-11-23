@@ -1319,13 +1319,9 @@ fn exchange<'a>(sock: &OwnedFd, kind: u16, flags: c_int, body: &[u8], buf: &'a m
     let msg = [&((16 + body.len()) as u32).to_ne_bytes()[..], &kind.to_ne_bytes(), &flags, &[1, 0, 0, 0, 0, 0, 0, 0], body].concat();
     let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     addr.nl_family = libc::AF_NETLINK as u16;
-    if send_to(sock, &msg, &addr) < 0 {
-        return Err(Failed::Unchanged(format!("netlink: {}", std::io::Error::last_os_error()).into()));
-    }
-    let n = unsafe { libc::recv(sock.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
-    if n < 0 {
-        return Err(Failed::Unanswered(format!("netlink: {}", std::io::Error::last_os_error()).into()));
-    }
+    crate::util::eintr(|| send_to(sock, &msg, &addr)).map_err(|e| Failed::Unchanged(format!("netlink: {e}").into()))?;
+    let n = crate::util::eintr(|| unsafe { libc::recv(sock.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) })
+        .map_err(|e| Failed::Unanswered(format!("netlink: {e}").into()))?;
     Ok(&buf[..n as usize])
 }
 
@@ -1338,9 +1334,14 @@ pub fn ifindex(dev: &str) -> Result<u32> {
 }
 
 pub fn parse_mac(s: &str) -> Result<[u8; 6]> {
+    let mut parts = s.trim().split(':');
     let mut mac = [0u8; 6];
-    for (m, part) in mac.iter_mut().zip(s.trim().split(':')) {
+    for m in &mut mac {
+        let part = parts.next().ok_or_else(|| format!("bad MAC address {s:?}"))?;
         *m = u8::from_str_radix(part, 16)?;
+    }
+    if parts.next().is_some() {
+        bail!("bad MAC address {s:?}");
     }
     Ok(mac)
 }
@@ -1539,14 +1540,24 @@ fn dump(kind: u16, body: &[u8], mut each: impl FnMut(&[u8])) -> Result<()> {
     // The kernel always ends a dump; never waited on longer than this all the same.
     let (sock, wait) = take_timed_netlink(std::time::Duration::from_secs(5))?;
     let mut buf = vec![0u8; 32 << 10];
-    let mut n = exchange(&sock, kind, libc::NLM_F_DUMP, body, &mut buf).map_err(|(Failed::Unchanged(e) | Failed::Unanswered(e))| e)?.len();
+    let n = exchange(&sock, kind, libc::NLM_F_DUMP, body, &mut buf).map_err(|(Failed::Unchanged(e) | Failed::Unanswered(e))| e)?.len();
+    dump_read(&sock, &mut buf, n, &mut each)?;
+    TIMED_FD.set(Some((sock, wait)));
+    Ok(())
+}
+
+/// Continues reading dump parts from `sock` starting with the `n` bytes already in `buf`, until
+/// `NLMSG_DONE` or an error (including unexpected EOF).
+fn dump_read(sock: &OwnedFd, buf: &mut [u8], mut n: usize, each: &mut impl FnMut(&[u8])) -> Result<()> {
     loop {
-        if dump_part(&buf[..n], &mut each)? {
-            TIMED_FD.set(Some((sock, wait)));
+        if n == 0 {
+            bail!("netlink dump: unexpected EOF");
+        }
+        if dump_part(&buf[..n], each)? {
             return Ok(());
         }
-        let got = unsafe { libc::recv(sock.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) };
-        crate::syscall_check!(got < 0, "netlink dump");
+        let got =
+            crate::util::eintr(|| unsafe { libc::recv(sock.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len(), 0) }).map_err(|e| format!("netlink dump: {e}"))?;
         n = got as usize;
     }
 }
@@ -3010,5 +3021,51 @@ mod tests {
         std::fs::write(&w, "0").unwrap();
         enable(&w).unwrap();
         assert_eq!(std::fs::read_to_string(&w).unwrap(), "1");
+    }
+
+    #[test]
+    fn parse_mac_requires_six_colon_separated_octets() {
+        assert_eq!(parse_mac("aa:bb:cc:dd:ee:ff").unwrap(), [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        assert_eq!(parse_mac(" 06:00:a9:fe:01:01\n").unwrap(), GATEWAY_MAC);
+        for bad in ["", "aa:bb:cc:dd", "aa:bb:cc:dd:ee", "aa:bb:cc:dd:ee:ff:00", "aa:bb:cc:dd:ee:ff:", "aa:bb:cc:dd:ee:gg"] {
+            assert!(parse_mac(bad).is_err(), "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn dump_read_returns_err_on_eof_instead_of_spinning() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+
+        let nlmsg = |kind: u16| -> [u8; 16] {
+            let mut m = [0u8; 16];
+            m[..4].copy_from_slice(&16u32.to_ne_bytes());
+            m[4..6].copy_from_slice(&kind.to_ne_bytes());
+            m
+        };
+
+        // EOF on subsequent recv after a non-DONE message.
+        let (rx, tx) = UnixStream::pair().unwrap();
+        drop(tx);
+        let sock: OwnedFd = rx.into();
+        let mut buf = [0u8; 64];
+        buf[..16].copy_from_slice(&nlmsg(RTM_NEWNEIGH));
+        let mut seen = 0;
+        let err = dump_read(&sock, &mut buf, 16, &mut |_| seen += 1).unwrap_err().to_string();
+        assert_eq!(seen, 1);
+        assert!(err.contains("EOF"), "{err}");
+
+        // EOF on the initial read (n == 0).
+        let err = dump_read(&sock, &mut buf, 0, &mut |_| panic!("unexpected message")).unwrap_err().to_string();
+        assert!(err.contains("EOF"), "{err}");
+
+        // Multi-part dump ending with NLMSG_DONE succeeds.
+        let (rx, mut tx) = UnixStream::pair().unwrap();
+        tx.write_all(&nlmsg(libc::NLMSG_DONE as u16)).unwrap();
+        let sock: OwnedFd = rx.into();
+        buf[..16].copy_from_slice(&nlmsg(RTM_NEWNEIGH));
+        let mut seen = 0;
+        dump_read(&sock, &mut buf, 16, &mut |_| seen += 1).unwrap();
+        assert_eq!(seen, 1);
     }
 }
