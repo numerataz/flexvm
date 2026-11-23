@@ -264,16 +264,23 @@ impl SocketRoot {
                 let dir = base.join(format!("{SOFTWARE_PREFIX}{}", crate::util::random_hex(16)?));
                 check(&dir.join("ffffffffffffffff/v.sock_4294967295"))?;
                 DirBuilder::new().mode(0o700).create(&dir)?;
-                let lease = open_software_dir(&dir)?;
-                crate::host::flock(&lease, libc::LOCK_SH)?;
-                // Collectors must not observe a new root before its owner record.
-                // No SocketRoot exists yet: its destructor would reacquire this
-                // base lock if publication failed while we still held it.
-                if let Err(error) = publish(&dir) {
-                    // No caller has received the root, so no child can exist.
-                    let _ = fs::remove_dir_all(&dir);
-                    return Err(error);
-                }
+                let initialized = (|| -> Result<File> {
+                    let lease = open_software_dir(&dir)?;
+                    crate::host::flock(&lease, libc::LOCK_SH)?;
+                    // Collectors must not observe a new root before its owner record.
+                    // No SocketRoot exists yet: its destructor would reacquire this
+                    // base lock if publication failed while we still held it.
+                    publish(&dir)?;
+                    Ok(lease)
+                })();
+                let lease = match initialized {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        // No caller has received the root, so no child can exist.
+                        let _ = fs::remove_dir_all(&dir);
+                        return Err(error);
+                    }
+                };
                 let root = Arc::new(Self { dir, next: AtomicU64::new(0), software_lease: Some(lease) });
                 drop(creating);
                 Ok(root)
@@ -417,18 +424,31 @@ fn sweep_software_in(bases: &[PathBuf], selected: Option<&crate::host::Ident>) -
             let pinned = crate::host::fd_path(directory.as_raw_fd());
             let owner = match crate::host::load::<SoftwareOwner>(&pinned.join("software-owner")) {
                 Ok(Some(owner)) if owner.version == 1 => owner,
-                Ok(None) if selected.is_none() => {
-                    // No child can spawn until the initial owner record exists.
-                    if crate::host::flock(&directory, libc::LOCK_EX | libc::LOCK_NB).is_ok() {
+                Ok(None) => {
+                    // No child can spawn until the initial owner record exists, and
+                    // interrupted cleanup only unlinks `software-owner` after all
+                    // leases and recorded children are gone.
+                    let abandoned = crate::host::flock(&directory, libc::LOCK_EX | libc::LOCK_NB).is_ok()
+                        && software_children(&pinned)
+                            .is_ok_and(|children| children.iter().all(|child| matches!(crate::host::PidFd::open(&child.process), Ok(None))));
+                    if abandoned {
                         fs::remove_dir_all(entry.path())?;
+                        continue;
+                    }
+                    if selected.is_some() {
+                        return Err(format!(
+                            "cannot fence a software runtime with an unknown owner record at {}: missing software-owner record",
+                            entry.path().display()
+                        )
+                        .into());
                     }
                     continue;
                 }
                 unknown if selected.is_some() => {
                     let reason = match unknown {
-                        Ok(None) => "missing software-owner record".to_string(),
                         Ok(Some(owner)) => format!("unsupported software-owner version {}", owner.version),
                         Err(error) => error.to_string(),
+                        Ok(None) => unreachable!(),
                     };
                     return Err(format!("cannot fence a software runtime with an unknown owner record at {}: {reason}", entry.path().display()).into());
                 }
@@ -678,6 +698,64 @@ mod tests {
             sweep_software_in(&bases, None).unwrap();
             assert_eq!(fs::read(&record).unwrap(), bytes);
         }
+    }
+
+    #[test]
+    fn targeted_fencing_collects_abandoned_initialization_and_refuses_leased_or_child_bearing_missing_owner() {
+        let temp = crate::test_util::TempDir::new("qaband");
+        let bases = [temp.join("s")];
+        base_dir(&bases[0]).unwrap();
+        let mut selected = crate::host::Ident::me();
+        selected.start += 1;
+
+        // An unleased root with no owner record (e.g. creator killed before
+        // publication) is safe to collect during targeted fencing.
+        let abandoned = bases[0].join(format!("{SOFTWARE_PREFIX}{}", "a".repeat(32)));
+        DirBuilder::new().mode(0o700).create(&abandoned).unwrap();
+        sweep_software_in(&bases, Some(&selected)).unwrap();
+        assert!(!abandoned.exists(), "abandoned initialization blocked targeted fencing");
+
+        // Interrupted cleanup that already unlinked `software-owner` with only
+        // proven-dead child records left is also safe to collect.
+        let interrupted = bases[0].join(format!("{SOFTWARE_PREFIX}{}", "b".repeat(32)));
+        DirBuilder::new().mode(0o700).create(&interrupted).unwrap();
+        let dead_child = SoftwareChild { kind: SoftwareKind::QemuTcg, process: selected.clone() };
+        crate::util::write_file(&interrupted, "child-0", &serde_json::to_vec(&dead_child).unwrap(), false).unwrap();
+        sweep_software_in(&bases, Some(&selected)).unwrap();
+        assert!(!interrupted.exists(), "interrupted cleanup with dead child blocked targeted fencing");
+
+        // A missing owner record with a held lease must still be refused and preserved.
+        let leased = bases[0].join(format!("{SOFTWARE_PREFIX}{}", "c".repeat(32)));
+        DirBuilder::new().mode(0o700).create(&leased).unwrap();
+        let lease = open_software_dir(&leased).unwrap();
+        crate::host::flock(&lease, libc::LOCK_SH).unwrap();
+        let error = sweep_software_in(&bases, Some(&selected)).unwrap_err().to_string();
+        assert!(
+            error.contains("unknown owner record") && error.contains("missing software-owner record") && error.contains(leased.to_str().unwrap()),
+            "{error}"
+        );
+        sweep_software_in(&bases, None).unwrap();
+        assert!(leased.exists(), "leased root without owner was removed");
+        drop(lease);
+        sweep_software_in(&bases, Some(&selected)).unwrap();
+        assert!(!leased.exists());
+
+        // An unleased root with missing owner and an unreadable or live child
+        // record must still be refused and preserved.
+        let with_child = bases[0].join(format!("{SOFTWARE_PREFIX}{}", "d".repeat(32)));
+        DirBuilder::new().mode(0o700).create(&with_child).unwrap();
+        fs::write(with_child.join("child-0"), b"partial record").unwrap();
+        let error = sweep_software_in(&bases, Some(&selected)).unwrap_err().to_string();
+        assert!(error.contains("unknown owner record") && error.contains("missing software-owner record"), "{error}");
+        sweep_software_in(&bases, None).unwrap();
+        assert!(with_child.exists(), "unreadable child record under missing owner was removed");
+
+        let live_child = SoftwareChild { kind: SoftwareKind::QemuTcg, process: crate::host::Ident::me() };
+        crate::util::write_file(&with_child, "child-0", &serde_json::to_vec(&live_child).unwrap(), false).unwrap();
+        let error = sweep_software_in(&bases, Some(&selected)).unwrap_err().to_string();
+        assert!(error.contains("unknown owner record") && error.contains("missing software-owner record"), "{error}");
+        sweep_software_in(&bases, None).unwrap();
+        assert!(with_child.exists(), "live child record under missing owner was removed");
     }
 
     #[test]
