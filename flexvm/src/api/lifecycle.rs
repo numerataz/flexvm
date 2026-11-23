@@ -62,15 +62,65 @@ pub async fn create(api: &Arc<Api>, q: Query, body: Value) -> Reply {
 }
 
 /// `run -d` of a created container's record; then the record says it started.
-async fn run_created(api: &Arc<Api>, mut r: Record) -> Result<(), Error> {
-    let run = r.clone();
-    api.blocking(move |api| {
+async fn run_created(api: &Arc<Api>, name: String) -> Result<(), Error> {
+    run_created_with(api, name, |api, run| {
         let template = if run.generation.is_empty() { run.template.clone() } else { run.generation.clone() };
         crate::run_detached(&api.host, &api.paths, &api.globals, &template, run.name, run.cmd, run.resources, &run.spec)
     })
-    .await?;
-    r.started = true;
-    api.blocking(move |api| create::store(api, &r, false).map(drop)).await
+    .await
+}
+
+async fn run_created_with<F>(api: &Arc<Api>, name: String, spawn: F) -> Result<(), Error>
+where
+    F: FnOnce(&Api, Record) -> crate::util::Result<()> + Send + 'static,
+{
+    let load_name = name.clone();
+    let r = api
+        .blocking(move |api| {
+            let renames = api.renames.lock().unwrap_or_else(|e| e.into_inner());
+            if renames.contains_key(&load_name) {
+                return Ok(Err(Error::conflict(format!("container {load_name} is being renamed: try again"))));
+            }
+            if api.host.alive(&load_name) {
+                return Ok(Err(Error::conflict(format!("container {load_name} is already running"))));
+            }
+            let Some(r) = create::load(api, &load_name) else {
+                return Ok(Err(Error::missing(format!("No such container: {load_name}"))));
+            };
+            if r.reserved {
+                return Ok(Err(Error::conflict(format!("container {load_name} is being renamed: try again"))));
+            }
+            if r.started {
+                return Ok(Err(Error::conflict(format!("container {load_name} was already started: try again"))));
+            }
+            Ok(Ok(r))
+        })
+        .await??;
+    let expected = r.clone();
+    api.blocking(move |api| spawn(api, r)).await?;
+    api.blocking(move |api| {
+        let renames = api.renames.lock().unwrap_or_else(|e| e.into_inner());
+        if !renames.contains_key(&name) {
+            if let Some(mut cur) = create::load(api, &name) {
+                if cur == expected {
+                    cur.started = true;
+                    create::store(api, &cur, false)?;
+                }
+            }
+        }
+        Ok(())
+    })
+    .await
+}
+
+async fn start_found(api: &Arc<Api>, name: String, v: &Value) -> Reply {
+    match v["state"].as_str().unwrap_or("") {
+        "created" => run_created(api, name).await?,
+        "paused" => return Err(Error::conflict(format!("cannot start a paused container {name}, try unpause instead"))),
+        _ if state(v).running => return empty(StatusCode::NOT_MODIFIED),
+        _ => api.blocking(move |api| crate::start_vm(&api.host, &api.globals, None, &name).map(drop)).await?,
+    }
+    empty(StatusCode::NO_CONTENT)
 }
 
 /// `POST /containers/{id}/start`: a created container's `run -d`, a stopped or exited one's `start`.
@@ -79,16 +129,7 @@ pub async fn start(api: &Arc<Api>, key: &str, q: Query) -> Reply {
         return Err(Error::unsupported("start from a checkpoint"));
     }
     let (name, v) = found(api, key).await?;
-    match v["state"].as_str().unwrap_or("") {
-        "created" => {
-            let r: Record = serde_json::from_value(v["docker"].clone()).map_err(|e| Error::from(crate::util::Error::from(e.to_string())))?;
-            run_created(api, r).await?;
-        }
-        "paused" => return Err(Error::conflict(format!("cannot start a paused container {name}, try unpause instead"))),
-        _ if state(&v).running => return empty(StatusCode::NOT_MODIFIED),
-        _ => api.blocking(move |api| crate::start_vm(&api.host, &api.globals, None, &name).map(drop)).await?,
-    }
-    empty(StatusCode::NO_CONTENT)
+    start_found(api, name, &v).await
 }
 
 /// `POST /containers/{id}/stop`: `flexvm stop`, which suspends it to disk (docker's next `start` resumes
@@ -288,15 +329,35 @@ where
 
 /// Removes an already-resolved container: `flexvm rm [-f]` if it is a VM, then its created record.
 async fn remove_vm(api: &Arc<Api>, name: String, v: &Value, force: bool) -> Result<(), Error> {
-    if v["state"] != "created" {
-        if state(v).running && !force {
-            return Err(Error::conflict(format!(
-                "cannot remove container \"/{name}\": container is running: stop the container before removing or force remove"
-            )));
-        }
-        let rm_name = name.clone();
-        api.blocking(move |api| crate::remove(&api.host, &rm_name, force, true)).await?;
+    if v["state"] == "created" {
+        return api
+            .blocking(move |api| {
+                let renames = api.renames.lock().unwrap_or_else(|e| e.into_inner());
+                if renames.contains_key(&name) {
+                    return Ok(Err(Error::conflict(format!("container {name} is being renamed: try again"))));
+                }
+                if api.host.alive(&name) {
+                    return Ok(Err(Error::conflict(format!("container {name} is running: try again"))));
+                }
+                let Some(r) = create::load(api, &name) else {
+                    return Ok(Err(Error::missing(format!("No such container: {name}"))));
+                };
+                if r.reserved {
+                    return Ok(Err(Error::conflict(format!("container {name} is being renamed: try again"))));
+                }
+                if r.started {
+                    return Ok(Err(Error::conflict(format!("container {name} was started: try again"))));
+                }
+                create::remove(api, &name);
+                Ok(Ok(()))
+            })
+            .await?;
     }
+    if state(v).running && !force {
+        return Err(Error::conflict(format!("cannot remove container \"/{name}\": container is running: stop the container before removing or force remove")));
+    }
+    let rm_name = name.clone();
+    api.blocking(move |api| crate::remove(&api.host, &rm_name, force, true)).await?;
     api.blocking(move |api| {
         create::remove(api, &name);
         Ok(())
@@ -796,5 +857,72 @@ mod tests {
             assert!(create::load(&api, name).is_none());
             assert!(deleted.contains(&json!(id_of(name))));
         }
+    }
+
+    #[tokio::test]
+    async fn stale_created_remove_refuses_started_renaming_or_missing_containers() {
+        let (_d, api) = fixture();
+        create(&api, Query::parse("name=web"), json!({"Image": "image"})).await.unwrap();
+        let (_, stale) = found(&api, "web").await.unwrap();
+
+        // Once started = true, a stale "created" snapshot must fail with 409 and preserve web.json.
+        let mut started = create::load(&api, "web").unwrap();
+        started.started = true;
+        create::store(&api, &started, false).unwrap();
+        let e = remove_vm(&api, "web".into(), &stale, false).await.unwrap_err();
+        assert_eq!(e.status, StatusCode::CONFLICT);
+        assert_eq!(create::load(&api, "web"), Some(started.clone()));
+
+        // While a rename is in progress, remove_vm must fail with 409 and preserve the record.
+        started.started = false;
+        create::store(&api, &started, false).unwrap();
+        let rename_guard = Rename::begin(&api, "web", "web2").unwrap();
+        let e = remove_vm(&api, "web".into(), &stale, false).await.unwrap_err();
+        assert_eq!(e.status, StatusCode::CONFLICT);
+        assert_eq!(create::load(&api, "web"), Some(started));
+        drop(rename_guard);
+
+        // Once the record is gone, remove_vm must fail with 404.
+        create::remove(&api, "web");
+        let e = remove_vm(&api, "web".into(), &stale, false).await.unwrap_err();
+        assert_eq!(e.status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn stale_created_start_refuses_renamed_renaming_or_started_containers() {
+        let (_d, api) = fixture();
+        create(&api, Query::parse("name=web"), json!({"Image": "image"})).await.unwrap();
+        let (_, stale) = found(&api, "web").await.unwrap();
+
+        // Concurrent rename to web2: stale start must fail with 404 and not recreate web.json.
+        rename(&api, "web", Query::parse("name=web2")).await.unwrap();
+        let e = start_found(&api, "web".into(), &stale).await.unwrap_err();
+        assert_eq!(e.status, StatusCode::NOT_FOUND);
+        assert!(create::load(&api, "web").is_none());
+        assert!(create::load(&api, "web2").is_some());
+
+        // Concurrent rename in progress: start must fail with 409.
+        let rename_guard = Rename::begin(&api, "web2", "web3").unwrap();
+        let e = run_created_with(&api, "web2".into(), |_, _| panic!("must not spawn while renaming")).await.unwrap_err();
+        assert_eq!(e.status, StatusCode::CONFLICT);
+        drop(rename_guard);
+
+        // Already started record: start must fail with 409 without spawning.
+        let mut started = create::load(&api, "web2").unwrap();
+        started.started = true;
+        create::store(&api, &started, false).unwrap();
+        let e = run_created_with(&api, "web2".into(), |_, _| panic!("must not spawn when started")).await.unwrap_err();
+        assert_eq!(e.status, StatusCode::CONFLICT);
+
+        // Record removed during spawn: post-start store must not recreate it.
+        started.started = false;
+        create::store(&api, &started, false).unwrap();
+        run_created_with(&api, "web2".into(), |api, _| {
+            create::remove(api, "web2");
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(create::load(&api, "web2").is_none());
     }
 }
