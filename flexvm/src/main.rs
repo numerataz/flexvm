@@ -2150,6 +2150,7 @@ fn remove_held(host: &Host, name: &str, had: bool, logs: bool, of: Option<&host:
             _ => {}
         }
     }
+    restart::forget(host, name);
     Ok(())
 }
 
@@ -5065,6 +5066,27 @@ s.close()
         assert!(refused.contains("is not running"), "{refused}");
         assert!(dir.join("manifest.json").exists() && !dir.join("DISCARDED").exists());
         assert!(host.has_record("web", "exited"));
+    }
+
+    #[test]
+    fn rm_of_exited_vm_in_backoff_forgets_restart_record() {
+        let root = crate::test_util::TempDir::new("rm-backoff");
+        let host = Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let mut r = app::Exited::new(
+            1,
+            "t".into(),
+            None,
+            Default::default(),
+            app::RunSpec { restart: app::Restart::parse("always").unwrap(), ..Default::default() },
+            1,
+        );
+        assert!(restart::on_exit(&mut r, Duration::ZERO));
+        host::store_private(&host.vms("job", "exited").unwrap(), &r, true).unwrap();
+        restart::keep(&host, "job", &r).unwrap();
+        assert!(host.state.join("restart/job.json").exists());
+        remove(&host, "job", false, true).unwrap();
+        assert!(!host.has_record("job", "exited"));
+        assert!(!host.state.join("restart/job.json").exists());
     }
 
     #[test]

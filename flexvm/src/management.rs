@@ -371,13 +371,15 @@ fn prune_vm_record(host: &crate::host::Host, name: &str) -> Result<bool> {
     if host.is_suspended(name) || host.has_record(name, "moved") {
         return Ok(false);
     }
+    let mut removed = false;
     for ext in ["failed", "lost"] {
         match std::fs::remove_file(host.vms(name, ext)?) {
+            Ok(()) => removed = true,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            r => r?,
+            Err(e) => return Err(e.into()),
         }
     }
-    Ok(true)
+    Ok(removed)
 }
 
 fn prune_blobs(paths: &Paths) -> Result<()> {
@@ -523,6 +525,16 @@ mod tests {
         std::fs::write(host.vms("moved", "moved").unwrap(), b"peer").unwrap();
         assert!(!prune_vm_record(&host, "moved").unwrap());
         assert!(host.vms("moved", "moved").unwrap().exists());
+    }
+
+    #[test]
+    fn prune_vm_record_returns_false_when_neither_failed_nor_lost_exists() {
+        let root = crate::test_util::TempDir::new("prune-records-absent");
+        let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+        assert!(!prune_vm_record(&host, "absent").unwrap());
+        std::fs::write(host.vms("exited", "exited").unwrap(), b"{}").unwrap();
+        assert!(!prune_vm_record(&host, "exited").unwrap());
+        assert!(host.vms("exited", "exited").unwrap().exists());
     }
 
     #[test]
