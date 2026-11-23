@@ -785,17 +785,25 @@ impl Filters {
 
     pub fn matches(&self, v: &Value) -> bool {
         let s = |k: &str| v[k].as_str().unwrap_or_default();
-        let image = v["template"].as_str().map(template::image_of).unwrap_or_default();
+        let backend_image = v["backend"]["image"].as_str().filter(|s| !s.is_empty());
+        let template_image = v["template"].as_str().map(template::image_of).unwrap_or_default();
         self.0.iter().all(|(k, vs)| {
             vs.iter().any(|want| match k.as_str() {
                 // A part of the name, as docker's.
                 "name" => s("name").contains(want.as_str()),
                 // `stopped`: any state no process runs.
                 "status" => s("state") == want || (want == "stopped" && crate::stopped(v)),
-                "image" => {
-                    let want_image = template::name_of(want).map(|n| template::image_of(&n));
-                    image == *want || s("template") == want || want_image.is_ok_and(|w| w == image)
-                }
+                "image" => match backend_image {
+                    Some(src) => {
+                        let path = Path::new(src);
+                        let local = path.is_dir() || path.is_file();
+                        src == want || (!local && crate::image::Reference::parse(src).is_ok_and(|r| crate::image::Reference::parse(want).is_ok_and(|w| w == r)))
+                    }
+                    None => {
+                        let want_image = template::name_of(want).map(|n| template::image_of(&n));
+                        template_image == *want || s("template") == want || want_image.is_ok_and(|w| w == template_image)
+                    }
+                },
                 "ip" => s("ip") == want || want.parse::<std::net::Ipv6Addr>().is_ok_and(|w| s("ipv6").parse() == Ok(w)),
                 _ => false,
             })
@@ -1498,6 +1506,45 @@ mod tests {
             assert!(Filters::parse(&[format!("image={given}")]).unwrap().matches(&web), "{given}");
         }
         assert!(!Filters::parse(&["image=redis".into()]).unwrap().matches(&web));
+    }
+
+    #[test]
+    fn image_filters_match_backend_image() {
+        let mut arm = row("arm", "running", "10.0.0.4", "");
+        arm["backend"] = json!({"kind": "qemu-tcg", "image": "alpine"});
+        for given in ["alpine", "alpine:latest", "docker.io/library/alpine:latest"] {
+            assert!(Filters::parse(&[format!("image={given}")]).unwrap().matches(&arm), "{given}");
+        }
+        assert!(!Filters::parse(&["image=redis".into()]).unwrap().matches(&arm));
+        assert!(!Filters::parse(&["image=".into()]).unwrap().matches(&arm));
+
+        // IPv6 registry references also get OCI alias matching.
+        let mut v6 = row("v6", "running", "10.0.0.5", "");
+        v6["backend"] = json!({"kind": "qemu-tcg", "image": "[::1]:5000/alpine"});
+        for given in ["[::1]:5000/alpine", "[::1]:5000/alpine:latest"] {
+            assert!(Filters::parse(&[format!("image={given}")]).unwrap().matches(&v6), "{given}");
+        }
+        assert!(!Filters::parse(&["image=[::1]:5000/alpine:3.20".into()]).unwrap().matches(&v6));
+
+        // Local OCI directory/file sources match only exactly, never as registry references.
+        let dir = TempDir::new("backend-local-image");
+        let local_dir = dir.join("alpine");
+        std::fs::create_dir(&local_dir).unwrap();
+        let local_str = local_dir.to_str().unwrap().to_string();
+        let mut local = row("local", "running", "10.0.0.6", "");
+        local["backend"] = json!({"kind": "qemu-tcg", "image": local_str});
+        assert!(Filters::parse(&[format!("image={local_str}")]).unwrap().matches(&local));
+        assert!(!Filters::parse(&["image=alpine".into()]).unwrap().matches(&local));
+
+        // Relative local path that would otherwise parse as a Docker Hub repository (`images/alpine`).
+        let rel_dir = std::path::Path::new("target/test-backend-local-images/alpine");
+        std::fs::create_dir_all(rel_dir).unwrap();
+        let rel_str = rel_dir.to_str().unwrap();
+        let mut rel = row("rel", "running", "10.0.0.7", "");
+        rel["backend"] = json!({"kind": "qemu-tcg", "image": rel_str});
+        assert!(Filters::parse(&[format!("image={rel_str}")]).unwrap().matches(&rel));
+        assert!(!Filters::parse(&[format!("image=docker.io/{rel_str}:latest")]).unwrap().matches(&rel));
+        let _ = std::fs::remove_dir_all("target/test-backend-local-images");
     }
 
     #[test]

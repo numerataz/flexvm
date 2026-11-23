@@ -346,7 +346,7 @@ impl Proc {
         // Checked again, as a restore's is: safe when suspended, it may be a peer's or local now.
         crate::listen::check_vm_ip(&self.host, ip, &crate::listen::known_peers(&self.host)?)?;
         let tpl = self.admit_checkpoint(&ck, &mut t)?;
-        self.set_resources(ck.manifest.resources, &tpl.meta)?;
+        self.set_resources_with_plugged(ck.manifest.resources, &tpl.meta, ck.manifest.hotplug_mib)?;
         self.bind_ports()?;
         let claim = {
             let l = self.host.lock()?;
@@ -441,7 +441,7 @@ impl Proc {
         self.set_name(self.host.take_restoring_name(&name, name == ck.manifest.name)?);
         let tpl = self.admit_checkpoint(&ck, &mut t)?;
         drop(held);
-        self.set_resources(resources.or(ck.manifest.resources), &tpl.meta)?;
+        self.set_resources_with_plugged(resources.or(ck.manifest.resources), &tpl.meta, ck.manifest.hotplug_mib)?;
         self.bind_ports()?;
         // Snapshot netlink state outside the host lock, then decide and claim under one lock by one
         // reading of the range: a change between them cannot send a local address to `claim_new` as foreign.
@@ -1295,5 +1295,22 @@ mod tests {
         assert_eq!(quarantined("b1", "b1"), Some(""));
         assert_eq!(quarantined("", "b1"), None);
         assert_eq!(quarantined("b1x why", "b1"), None, "the whole first word is the boot id");
+    }
+
+    #[test]
+    fn restore_rejects_memory_below_checkpoint_hotplug_mib() {
+        let root = crate::test_util::TempDir::new("restore-mem-floor");
+        let host = crate::host::Host::open(&root.join("state"), &root.join("run")).unwrap();
+        let p = crate::vmproc::Proc::new(host, crate::template::Paths::new(&root)).unwrap();
+        let meta: crate::template::Meta = serde_json::from_value(serde_json::json!({
+            "compatibility": {"cpu": "test", "tsc_khz": 2000000, "tsc_control": false, "msrs": [], "firecracker": "test", "features": {}, "xsave": {}},
+            "vcpus": 2, "mem_mib": 256, "max_mib": 256 + 8192, "plugged_mib": 512, "kernel": "/k", "rootfs": "/r", "id": "tpl", "components": {}
+        }))
+        .unwrap();
+        let requested = crate::vm::Resources { cpus: None, memory_mib: Some(256 + 1024) };
+        let err = p.set_resources_with_plugged(requested, &meta, 2048).unwrap_err().to_string();
+        assert!(err.contains("its checkpoint") && err.contains("2304m"), "{err}");
+        let ok = crate::vm::Resources { cpus: None, memory_mib: Some(256 + 2048) };
+        p.set_resources_with_plugged(ok, &meta, 2048).unwrap();
     }
 }

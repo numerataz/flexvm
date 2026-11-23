@@ -842,8 +842,9 @@ pub struct Runtime {
     serving: Mutex<bool>,
     /// SIGTSTP and SIGCONT, serialized in arrival order off the signal thread (which a later SIGINT needs).
     pauses: Latest,
-    /// The code of a destroy waiting for `op` (0: none): a pause or resume that gets it first does nothing.
-    destroying: AtomicI32,
+    /// Codes of pending destroy requests waiting for `op`, in arrival order: a pause or resume
+    /// that gets `op` first yields while any request is still pending.
+    destroying: Mutex<Vec<i32>>,
     /// The controller's tick gaps, for `debug status`.
     ticks: Mutex<Ticks>,
     /// How fast the VM's memory grew lately (MiB/s), for eviction's ranking.
@@ -855,6 +856,36 @@ pub struct Runtime {
     /// Test hook: called by `record_again` holding the host lock.
     #[cfg(test)]
     record_hook: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+}
+
+/// Keeps one pending destroy request recorded until dropped (on refusal or unwind).
+struct DestroyGuard<'a> {
+    destroying: &'a Mutex<Vec<i32>>,
+    code: i32,
+}
+
+impl Drop for DestroyGuard<'_> {
+    fn drop(&mut self) {
+        let mut pending = self.destroying.lock().unwrap();
+        if let Some(i) = pending.iter().position(|&c| c == self.code) {
+            pending.remove(i);
+        }
+    }
+}
+
+/// Owned counterpart of `DestroyGuard`, carried into the `signal-destroy` worker thread.
+struct OwnedDestroyGuard {
+    proc: Arc<Proc>,
+    code: i32,
+}
+
+impl Drop for OwnedDestroyGuard {
+    fn drop(&mut self) {
+        let mut pending = self.proc.destroying.lock().unwrap();
+        if let Some(i) = pending.iter().position(|&c| c == self.code) {
+            pending.remove(i);
+        }
+    }
 }
 
 impl std::ops::Deref for Proc {
@@ -1036,7 +1067,12 @@ impl Proc {
 
     /// What the VM will be capped at, checked against its template first.
     pub fn set_resources(&self, r: crate::vm::Resources, meta: &crate::template::Meta) -> Result<()> {
-        r.check(meta)?;
+        self.set_resources_with_plugged(r, meta, 0)
+    }
+
+    /// What the VM will be capped at, checked against its template and a checkpoint's plugged memory.
+    pub fn set_resources_with_plugged(&self, r: crate::vm::Resources, meta: &crate::template::Meta, plugged_mib: u64) -> Result<()> {
+        r.check_with_plugged(meta, plugged_mib)?;
         self.keep_resources(r)
     }
 
@@ -1666,16 +1702,24 @@ impl Proc {
         self.destroy_with(code, None)
     }
 
+    fn begin_destroy(&self, code: i32) -> DestroyGuard<'_> {
+        self.destroying.lock().unwrap().push(code);
+        DestroyGuard { destroying: &self.destroying, code }
+    }
+
+    fn begin_destroy_owned(self: &Arc<Self>, code: i32) -> OwnedDestroyGuard {
+        self.destroying.lock().unwrap().push(code);
+        OwnedDestroyGuard { proc: self.clone(), code }
+    }
+
     fn destroy_with(&self, code: i32, last: Option<&mut dyn std::io::Write>) -> Error {
-        self.destroying.store(code, Ordering::SeqCst);
-        let refused = self.try_destroy(code, last);
-        let _ = self.destroying.compare_exchange(code, 0, Ordering::SeqCst, Ordering::SeqCst);
-        refused
+        let _guard = self.begin_destroy(code);
+        self.try_destroy(code, last)
     }
 
     /// The code a destroy asked for, if one is waiting (a kill that cancelled a suspend).
     pub fn destroy_code(&self) -> Option<i32> {
-        Some(self.destroying.load(Ordering::SeqCst)).filter(|&c| c != 0)
+        self.destroying.lock().unwrap().first().copied()
     }
 
     /// For a pause or resume: refused once a destroy waits for `op` too.
@@ -1693,32 +1737,61 @@ impl Proc {
         }
     }
 
-    fn try_destroy(&self, code: i32, last: Option<&mut dyn std::io::Write>) -> Error {
+    fn try_destroy(&self, code: i32, mut last: Option<&mut dyn std::io::Write>) -> Error {
         let vm = self.vm();
-        let source =
-            || format!("vm {} is the source of a migration in progress; it ends once the target has its memory (kill it where it runs)", vm.name).into();
-        if let State::Source(mig) = vm.state() {
+        let res = self.try_destroy_inner(
+            &vm.name,
+            || vm.lifecycle_state(),
+            || {
+                vm.cancel_checkpoint.fetch_add(1, Ordering::SeqCst);
+                vm.pager.abort_copy();
+            },
+            || {
+                let _ = vm.cancel_checkpoint.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+            },
+            |op, mig| self.end_reconciling(op, mig, code, last.take()),
+        );
+        match res {
+            Ok(op) => {
+                let reply = last.map(|w| (w, json!({"ok": true, "result": {"name": vm.name, "state": "killed"}})));
+                self.finish(&op, End::Gone, code, reply)
+            }
+            Err(refused) => refused,
+        }
+    }
+
+    fn try_destroy_inner<'a>(
+        &'a self,
+        name: impl std::fmt::Display,
+        state: impl Fn() -> State,
+        cancel: impl FnOnce(),
+        uncancel: impl FnOnce(),
+        end_reconciling: impl FnOnce(&Op<'a>, u64) -> Option<Error>,
+    ) -> std::result::Result<Op<'a>, Error> {
+        let source = || format!("vm {name} is the source of a migration in progress; it ends once the target has its memory (kill it where it runs)").into();
+        if let State::Source(mig) = state() {
             if self.reconciling.lock().unwrap().as_ref().is_some_and(|(m, _)| *m == mig) {
                 let op = self.op();
-                return self.end_reconciling(&op, mig, code, last).unwrap_or_else(source);
+                if let State::Source(mig) = state() {
+                    return Err(end_reconciling(&op, mig).unwrap_or_else(source));
+                }
+                return Ok(op);
             }
-            return source();
+            return Err(source());
         }
-        vm.cancel_checkpoint.fetch_add(1, Ordering::SeqCst);
-        vm.pager.abort_copy();
+        cancel();
         // Test marker: a destroy waits for `op` (a migration still preparing gives up once it sees it).
         crate::host::tripped("destroy_wait");
         let op = self.op();
-        if let State::Source(mig) = vm.state() {
+        if let State::Source(mig) = state() {
             // It became one while this waited (a migration that holds `op` until its outcome is unknown).
-            let refused = self.end_reconciling(&op, mig, code, last).unwrap_or_else(source);
+            let refused = end_reconciling(&op, mig).unwrap_or_else(source);
             // Refused: the next checkpoint must not take this kill for its own
             // (one it already cancelled consumed it).
-            let _ = vm.cancel_checkpoint.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
-            return refused;
+            uncancel();
+            return Err(refused);
         }
-        let reply = last.map(|w| (w, json!({"ok": true, "result": {"name": vm.name, "state": "killed"}})));
-        self.finish(&op, End::Gone, code, reply)
+        Ok(op)
     }
 
     /// Marks migration `mig` to `to` as one whose outcome is unknown, until `known` takes it back.
@@ -2189,8 +2262,8 @@ impl Proc {
             if self.vm.get().is_none() {
                 if !early.contains(&libc::SIGINT) {
                     early.push(libc::SIGINT);
+                    self.destroying.lock().unwrap().push(128 + libc::SIGINT);
                 }
-                self.destroying.store(128 + libc::SIGINT, Ordering::SeqCst);
                 return Ok(json!({"name": self.name(), "state": "killed"}));
             }
         }
@@ -2253,15 +2326,15 @@ impl Proc {
             libc::SIGINT | libc::SIGQUIT => match self.arc() {
                 Some(p) => {
                     let code = 128 + sig;
-                    self.destroying.store(code, Ordering::SeqCst);
+                    let guard = p.begin_destroy_owned(code);
                     thread::Builder::new()
                         .name("signal-destroy".into())
-                        .spawn(move || crate::log!("vm {}: signal {sig}: {}", p.name(), p.destroy(code)))
-                        .map(drop)
-                        .map_err(|e| {
-                            let _ = self.destroying.compare_exchange(code, 0, Ordering::SeqCst, Ordering::SeqCst);
-                            format!("destroying: {e}").into()
+                        .spawn(move || {
+                            let _guard = guard;
+                            crate::log!("vm {}: signal {sig}: {}", p.name(), p.try_destroy(code, None))
                         })
+                        .map(drop)
+                        .map_err(|e| format!("destroying: {e}").into())
                 }
                 None => Err(self.destroy(128 + sig)),
             },
@@ -3366,7 +3439,7 @@ fn resize(vm: &Vm, host: &Host, hint: Option<u64>, grow_only: bool) -> Result<Re
     } else if requested == plugged {
         vm.limit.settled(meta.mem_mib + plugged);
     }
-    Ok(Resized::of(new > plugged, plan.short, plugged == hotplug_total, refused))
+    Ok(Resized::of(new > plugged, plan.short, plugged >= hotplug_total, refused))
 }
 
 impl Resized {
@@ -3479,7 +3552,7 @@ impl Sizes {
         }
         // Sizes count from what is plugged: urgent growth cancels a pending shrink.
         let new = if urgent {
-            (plugged + round(headroom * 2 - avail).min(round(total / 4).max(STEP_MIB))).min(self.hotplug_total)
+            (plugged + round(headroom * 2 - avail).min(round(total / 4).max(STEP_MIB))).min(self.hotplug_total.max(plugged))
         } else if !asked && !grow_only && avail > headroom * 3 && plugged > self.floor && since > Duration::from_secs(10) {
             plugged.saturating_sub((avail - headroom * 2) / STEP_MIB * STEP_MIB).max(self.floor)
         } else {
@@ -5367,7 +5440,7 @@ mod tests {
         waiting.recv_timeout(WAIT).unwrap();
         assert!(matches!(reply.recv_timeout(Duration::from_millis(100)), Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
         // A destroy requested during the operation wins before the signal reaches the VM.
-        p.destroying.store(128 + libc::SIGQUIT, Ordering::SeqCst);
+        let _guard = p.begin_destroy(128 + libc::SIGQUIT);
         drop(held);
         let e = reply.recv_timeout(WAIT).unwrap().unwrap_err();
         assert!(e.contains("being destroyed"), "{e}");
@@ -5382,13 +5455,135 @@ mod tests {
         let pause = thread::spawn(move || q.op_unless_destroyed().map(drop).map_err(|e| e.to_string()));
         thread::sleep(Duration::from_millis(50));
         // As `destroy` does before it waits for `op`; the pause gets it first.
-        p.destroying.store(128 + libc::SIGQUIT, Ordering::SeqCst);
+        let guard = p.begin_destroy(128 + libc::SIGQUIT);
         drop(held);
         assert!(pause.join_within().unwrap().unwrap_err().contains("being destroyed"));
         assert_eq!(p.destroy_code(), Some(131), "a kill that cancels a suspend reports it");
         // Refused (`destroy` takes its code back): the next pause goes ahead.
-        let _ = p.destroying.compare_exchange(131, 0, Ordering::SeqCst, Ordering::SeqCst);
+        drop(guard);
         assert!(p.op_unless_destroyed().is_ok());
+    }
+
+    #[test]
+    fn destroy_code_zero_is_tracked_and_overlapping_refusal_keeps_pending_destroy_marked() {
+        let (p, _root) = test_proc("destroy-zero", Some("destroy-zero"));
+        assert_eq!(p.destroy_code(), None);
+        assert!(p.not_destroyed().is_ok());
+        // Exit code 0 must be distinguished from "no destroy".
+        let g0 = p.begin_destroy(0);
+        assert_eq!(p.destroy_code(), Some(0));
+        assert!(p.not_destroyed().unwrap_err().to_string().contains("being destroyed"));
+        let mut sink = Vec::new();
+        assert_eq!(p.stop_request(&mut sink).unwrap(), json!({"suspending": true, "name": "destroy-zero"}));
+        drop(g0);
+        assert_eq!(p.destroy_code(), None);
+        assert!(p.not_destroyed().is_ok());
+
+        // Overlapping destroy requests: a pending signal (130) is not overwritten by exit_with(0),
+        // and refusing the first request must keep destruction marked while the second is still pending.
+        let sigint = 128 + libc::SIGINT;
+        let g_sig = p.begin_destroy(sigint);
+        let g_zero = p.begin_destroy(0);
+        assert_eq!(p.destroy_code(), Some(sigint));
+        drop(g_sig);
+        assert_eq!(p.destroy_code(), Some(0), "second pending destroy must keep destruction marked");
+        assert!(p.not_destroyed().unwrap_err().to_string().contains("being destroyed"));
+        assert!(p.op_unless_destroyed().is_err());
+        drop(g_zero);
+        assert_eq!(p.destroy_code(), None);
+        assert!(p.not_destroyed().is_ok());
+    }
+
+    #[test]
+    fn try_destroy_succeeds_when_reconciling_migration_aborts_while_waiting_for_op() {
+        let (p, _root) = test_proc("destroy-reconcile-abort", Some("reconcile-abort"));
+        let state = Arc::new(Mutex::new(State::Source(7)));
+        *p.reconciling.lock().unwrap() = Some((7, "peer:1".into()));
+        let held = p.op();
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (q, s) = (p.clone(), state.clone());
+        let killer = thread::spawn(move || {
+            tid_tx.send(unsafe { libc::gettid() }).unwrap();
+            q.try_destroy_inner(
+                "reconcile-abort",
+                || *s.lock().unwrap(),
+                || panic!("reconciling path should not cancel checkpoint"),
+                || panic!("reconciling path should not uncancel checkpoint"),
+                |_, _| panic!("must not call end_reconciling after migration aborted"),
+            )
+            .map(drop)
+            .map_err(|e| e.to_string())
+        });
+        let tid = tid_rx.recv_timeout(WAIT).unwrap();
+        wait_until("try_destroy to block on op", || crate::test_util::asleep(tid));
+        // Migration aborts while holding `op`: state returns to Running and reconciling is cleared.
+        *state.lock().unwrap() = State::Running;
+        assert!(p.known(7));
+        drop(held);
+        assert_eq!(killer.join_within().unwrap(), Ok(()));
+
+        // Negative case 1: if migration committed (state stays Source(7), reconciling cleared), kill is refused.
+        *state.lock().unwrap() = State::Source(7);
+        *p.reconciling.lock().unwrap() = Some((7, "peer:1".into()));
+        let held = p.op();
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (q, s) = (p.clone(), state.clone());
+        let killer = thread::spawn(move || {
+            tid_tx.send(unsafe { libc::gettid() }).unwrap();
+            q.try_destroy_inner(
+                "reconcile-abort",
+                || *s.lock().unwrap(),
+                || panic!("reconciling path should not cancel checkpoint"),
+                || panic!("reconciling path should not uncancel checkpoint"),
+                |_, mig| {
+                    assert_eq!(mig, 7);
+                    None
+                },
+            )
+            .map(drop)
+            .map_err(|e| e.to_string())
+        });
+        let tid = tid_rx.recv_timeout(WAIT).unwrap();
+        wait_until("try_destroy to block on op", || crate::test_util::asleep(tid));
+        assert!(p.known(7));
+        drop(held);
+        let err = killer.join_within().unwrap().unwrap_err();
+        assert!(err.contains("source of a migration in progress"), "{err}");
+
+        // Negative case 2: if the source pager fails while waiting for `op`, Vm::state() becomes Failed
+        // but the stored lifecycle state is still Source(7): try_destroy must still go through
+        // end_reconciling (owed), never returning Ok(op) / End::Gone.
+        *state.lock().unwrap() = State::Source(7);
+        *p.reconciling.lock().unwrap() = Some((7, "peer:1".into()));
+        let pager_failed = Arc::new(AtomicBool::new(false));
+        let called_owed = Arc::new(AtomicBool::new(false));
+        let held = p.op();
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let (q, s, pf, owed) = (p.clone(), state.clone(), pager_failed.clone(), called_owed.clone());
+        let killer = thread::spawn(move || {
+            tid_tx.send(unsafe { libc::gettid() }).unwrap();
+            // `try_destroy` queries `vm.lifecycle_state()` (not `vm.state()` which masks Source as Failed).
+            q.try_destroy_inner(
+                "reconcile-abort",
+                || *s.lock().unwrap(),
+                || panic!("reconciling path should not cancel checkpoint"),
+                || panic!("reconciling path should not uncancel checkpoint"),
+                |_, mig| {
+                    assert_eq!(mig, 7);
+                    assert!(pf.load(Ordering::SeqCst), "pager already failed while waiting for op");
+                    owed.store(true, Ordering::SeqCst);
+                    Some("owed-recorded".into())
+                },
+            )
+            .map(drop)
+            .map_err(|e| e.to_string())
+        });
+        let tid = tid_rx.recv_timeout(WAIT).unwrap();
+        wait_until("try_destroy to block on op", || crate::test_util::asleep(tid));
+        pager_failed.store(true, Ordering::SeqCst);
+        drop(held);
+        assert_eq!(killer.join_within().unwrap(), Err("owed-recorded".to_string()));
+        assert!(called_owed.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -5525,7 +5720,7 @@ mod tests {
         let (p, _root) = test_proc("stop-destroying", Some("stop-destroying"));
         // App exiting on its own sets `destroying` via `exit_with`: `stop` must wait
         // for the process to finish exiting rather than failing with "is being destroyed".
-        p.destroying.store(4, Ordering::SeqCst);
+        let _guard = p.begin_destroy(4);
         let mut sink = Vec::new();
         assert_eq!(p.stop_request(&mut sink).unwrap(), json!({"suspending": true, "name": "stop-destroying"}));
         assert!(p.stop_asked.load(Ordering::SeqCst));
@@ -6030,6 +6225,18 @@ mod tests {
         // Shrink 4096 -> 3072 outstanding, guest short: grow from what is plugged.
         let p = SIZES.plan(3072, 4096, 512, secs(2), true, false).unwrap();
         assert!(!p.settle && p.new > 4096 && p.charge == p.new - 4096, "{p:?}");
+    }
+
+    #[test]
+    fn urgent_growth_never_shrinks_when_plugged_exceeds_hotplug_total() {
+        let sizes = Sizes { mem_mib: 256, floor: 1024, hotplug_total: 2048 };
+        // Plugged (4096) > hotplug_total (2048), urgent (avail = 0, asked = true), grow_only = true:
+        // must clamp at plugged (4096), never shrink down to hotplug_total (2048).
+        let p = sizes.plan(4096, 4096, 0, secs(5), true, true).unwrap();
+        assert_eq!(p.new, 4096, "{p:?}");
+        assert_eq!(p.charge, 0, "{p:?}");
+        assert!(p.short, "{p:?}");
+        assert_eq!(Resized::of(p.new > 4096, p.short, 4096 >= sizes.hotplug_total, false), Resized::Full);
     }
 
     #[test]
