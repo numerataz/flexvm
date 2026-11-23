@@ -14,6 +14,7 @@ serde_json = { version = "1", features = ["raw_value"] }
 # 3.x: its chunked decoder and header parser read into a fixed buffer (2.x grows a chunk-size line without bound).
 # `unversioned` (resolver, connector) is used, so minor versions are taken by hand.
 ureq = { version = "~3.4.2", default-features = false, features = ["rustls"] }
+url = "2"
 base64 = "0.22"
 ring = "0.17"
 zeroize = "1"
