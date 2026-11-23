@@ -525,10 +525,17 @@ fn backoff(n: u32) -> Duration {
 /// The longest wait a `Retry-After` gets: a registry asking for more is asked again after this.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(120);
 
-/// The wait before retry `n`: `retry_after` in seconds, at most `MAX_RETRY_AFTER`, or else (also for an HTTP date,
-/// which is rare) `backoff`.
+/// The wait before retry `n`: `retry_after` (delay-seconds or RFC 9110 HTTP-date), at most `MAX_RETRY_AFTER`, or else
+/// `backoff` (including for an HTTP-date in the past or unparseable).
 fn retry_wait(retry_after: Option<&str>, n: u32) -> Duration {
-    retry_after.and_then(|v| v.trim().parse().ok()).map_or(backoff(n), |s| Duration::from_secs(s).min(MAX_RETRY_AFTER))
+    retry_wait_at(retry_after, n, std::time::SystemTime::now())
+}
+
+fn retry_wait_at(retry_after: Option<&str>, n: u32, now: std::time::SystemTime) -> Duration {
+    retry_after
+        .map(str::trim)
+        .and_then(|v| v.parse::<u64>().ok().map(Duration::from_secs).or_else(|| httpdate::parse_http_date(v).ok()?.duration_since(now).ok()))
+        .map_or_else(|| backoff(n), |d| d.min(MAX_RETRY_AFTER))
 }
 
 fn retry_sleep(wait: Duration) -> Result<()> {
@@ -1237,7 +1244,15 @@ pub(super) mod tests {
         assert_eq!(retry_wait(Some("18446744073709551615"), 0), MAX_RETRY_AFTER);
         assert_eq!(retry_wait(Some(" 7 "), 0), Duration::from_secs(7));
         assert_eq!(retry_wait(Some("Wed, 21 Oct 2015 07:28:00 GMT"), 2), backoff(2));
+        assert_eq!(retry_wait(Some("not-a-date"), 2), backoff(2));
         assert_eq!(retry_wait(None, 1), backoff(1));
+        let now = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let soon = httpdate::fmt_http_date(now + Duration::from_secs(30));
+        assert_eq!(retry_wait_at(Some(&soon), 0, now), Duration::from_secs(30));
+        let far = httpdate::fmt_http_date(now + Duration::from_secs(3600));
+        assert_eq!(retry_wait_at(Some(&far), 0, now), MAX_RETRY_AFTER);
+        let past = httpdate::fmt_http_date(now - Duration::from_secs(1));
+        assert_eq!(retry_wait_at(Some(&past), 2, now), backoff(2));
     }
 
     #[test]
