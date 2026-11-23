@@ -361,6 +361,25 @@ pub fn pages_per_host_page() -> usize {
     1usize << (host_page_shift() - PAGE_SIZE.trailing_zeros())
 }
 
+const DEFAULT_HUGE_PAGE_SIZE: usize = 2 << 20;
+
+/// Host PMD transparent huge-page size from `/sys/kernel/mm/transparent_hugepage/hpage_pmd_size`,
+/// falling back to 2 MiB if the file is absent, unreadable, or invalid (512 MiB on 64 KiB-page kernels).
+pub fn huge_page_size() -> usize {
+    static SIZE: OnceLock<usize> = OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size")
+            .ok()
+            .and_then(|s| parse_huge_page_size(&s, host_page_size()))
+            .unwrap_or(DEFAULT_HUGE_PAGE_SIZE)
+    })
+}
+
+fn parse_huge_page_size(contents: &str, host_page: usize) -> Option<usize> {
+    let size = contents.trim().parse::<usize>().ok()?;
+    (size >= host_page && size.is_power_of_two()).then_some(size)
+}
+
 /// Fail before any VM or pager when host pages are not `PAGE_SIZE`: userfaultfd and pagemap
 /// work in host pages, which flexvm takes for guest ones (#1270).
 pub fn check_page_size() -> Result<()> {
@@ -2146,6 +2165,24 @@ mod tests {
         assert_eq!(parse_host_page_size(4096), 4096);
         assert_eq!(parse_host_page_size(16384), 16384);
         assert_eq!(parse_host_page_size(65536), 65536);
+    }
+
+    #[test]
+    fn huge_page_size_parses_valid_and_rejects_invalid() {
+        let hps = huge_page_size();
+        assert!(hps >= host_page_size() && hps.is_power_of_two());
+        assert_eq!(parse_huge_page_size("2097152\n", 4096), Some(2 << 20));
+        assert_eq!(parse_huge_page_size("  2097152 \r\n", 4096), Some(2 << 20));
+        assert_eq!(parse_huge_page_size("536870912\n", 65536), Some(512 << 20));
+        assert_eq!(parse_huge_page_size("536870912", 4096), Some(512 << 20));
+        assert_eq!(parse_huge_page_size("65536\n", 65536), Some(65536));
+        for bad in ["", "   ", "not-a-number", "-2097152", "0", "3145728", "2097153"] {
+            assert_eq!(parse_huge_page_size(bad, 4096), None, "{bad:?}");
+        }
+        // Smaller than host page size.
+        assert_eq!(parse_huge_page_size("4096\n", 65536), None);
+        assert_eq!(parse_huge_page_size("32768\n", 65536), None);
+        assert_eq!(parse_huge_page_size("2048\n", 4096), None);
     }
 
     #[test]

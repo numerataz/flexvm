@@ -101,7 +101,8 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 const UFFDIO_COPY: libc::c_ulong = 0xC028_AA03;
 const UFFDIO_ZEROPAGE: libc::c_ulong = 0xC020_AA04;
 const UFFDIO_COPY_MODE_WP: u64 = 2;
-/// Pages write-protected per call while the VM runs (2 MiB).
+/// Pages write-protected per call while the VM runs (2 MiB; decoupled from the host THP size, which is 512 MiB on
+/// 64 KiB-page kernels, and aligned to host pages).
 const ARM_CHUNK: usize = 512;
 
 /// One zero-filled host page, for `UFFDIO_COPY` of zero pages with `UFFDIO_COPY_MODE_WP`.

@@ -3,10 +3,11 @@
 //! Firecracker maps guest memory and only then registers it with the userfaultfd it hands the pager. A process that
 //! reads Firecracker's memory in between (`/proc/PID/mem`, `process_vm_readv`: a debugger, a memory scanner; GitHub's
 //! runners have an agent that does) faults pages in as for any anonymous memory: the zero page, or, with THP enabled,
-//! the huge zero page for a whole 2 MiB chunk. Registering the range later leaves them mapped, so the guest never
-//! faults on them and the pager never installs them: the guest reads zeroes where the template has data. Firecracker's
-//! own write of its vmclock page then copies the huge zero page into a zeroed huge page, and with it the guest's DSDT
-//! (in the same first 2 MiB) is gone: the VMGenID notification never runs and the guest never reseeds its RNG.
+//! the huge zero page for a whole huge page (`util::huge_page_size()`, e.g. 2 MiB on 4 KiB hosts or 512 MiB on 64 KiB
+//! hosts). Registering the range later leaves them mapped, so the guest never faults on them and the pager never
+//! installs them: the guest reads zeroes where the template has data. Firecracker's own write of its vmclock page then
+//! copies the huge zero page into a zeroed huge page, and with it the guest's DSDT (in the same first huge page) is
+//! gone: the VMGenID notification never runs and the guest never reseeds its RNG.
 //!
 //! Such pages are mapped while the pager has them BASE or REMOTE (it installs every other page itself, through the
 //! userfaultfd), or turn up as EEXIST when it installs them (`Pages::preset`). `Pager::foreign_pages` looks for both

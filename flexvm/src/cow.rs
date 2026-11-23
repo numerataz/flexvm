@@ -637,10 +637,11 @@ impl Slot {
     }
 }
 
-/// Rescued copies' memory, a page a slot, in chunks of `SLOT_CHUNK` faulted in whole when mapped (huge pages where the
-/// kernel gives them): a rescue writes into memory that is there already, where a page fault on fresh memory costs
-/// several µs here, more than copying the page (#630). Slots the writers are done with are reused. Unmapped only with
-/// the copy (`Cow` dropped), so a writer never reads memory a stop took away.
+/// Rescued copies' memory, a page a slot, in chunks of `SLOT_CHUNK` faulted in whole when mapped (huge pages where
+/// `SLOT_CHUNK` fits a whole host huge page and the kernel gives them): a rescue writes into memory that is there
+/// already, where a page fault on fresh memory costs several µs here, more than copying the page (#630). Slots the
+/// writers are done with are reused. Unmapped only with the copy (`Cow` dropped), so a writer never reads memory a
+/// stop took away.
 #[derive(Default)]
 pub struct Slots {
     /// The chunks mapped, and the slots of them free.
@@ -660,6 +661,17 @@ struct SlotsInner {
 }
 
 const SLOT_CHUNK: usize = 2 << 20;
+
+/// Alignment for a `SLOT_CHUNK` mapping: `huge_page` when a whole host huge page fits in `SLOT_CHUNK` (so `Mmap::new`
+/// aligns it and requests `MADV_HUGEPAGE`), or `0` (ordinary pages) when `huge_page > SLOT_CHUNK` (e.g. 512 MiB on
+/// 64 KiB-page kernels, which would exceed `BUDGET_MIB`).
+fn slot_chunk_align(huge_page: usize) -> usize {
+    if huge_page <= SLOT_CHUNK {
+        huge_page
+    } else {
+        0
+    }
+}
 
 /// What host memory rescue memory, hot pages' memory and writer buffers may still take, in MiB. That memory is not
 /// admitted like a guest's (its copy would wait), so it keeps out of the host's reserve instead: once `attach`ed, each
@@ -776,7 +788,7 @@ impl Slots {
         // Each chunk populated as it is mapped, within the take.
         let grow = |inner: &mut SlotsInner| -> std::io::Result<()> {
             while inner.free.len() < n {
-                let mut chunk = Mmap::new(SLOT_CHUNK, SLOT_CHUNK)?;
+                let mut chunk = Mmap::new(SLOT_CHUNK, slot_chunk_align(crate::util::huge_page_size()))?;
                 chunk.populate();
                 let c = chunk.ptr() as usize;
                 inner.chunks.push(chunk);
@@ -1187,6 +1199,13 @@ mod tests {
             buf.fill(0);
             Ok(())
         }
+    }
+
+    #[test]
+    fn slot_chunk_align_uses_huge_page_only_when_it_fits() {
+        assert_eq!(slot_chunk_align(2 << 20), 2 << 20);
+        assert_eq!(slot_chunk_align(64 << 10), 64 << 10);
+        assert_eq!(slot_chunk_align(512 << 20), 0);
     }
 
     /// Rescue memory is reused, and kept for the next copy as much of it as one used at most at once.
