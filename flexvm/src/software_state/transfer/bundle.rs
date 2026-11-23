@@ -62,6 +62,9 @@ impl Header {
         [("engine".into(), &manifest.engine), ("kernel".into(), &manifest.kernel), ("rootfs".into(), &manifest.rootfs), ("state".into(), &manifest.state)]
             .into_iter()
             .chain(manifest.firmware.iter().map(|(name, artifact)| (format!("firmware-{name}"), artifact)))
+            .chain(manifest.parent.iter().flat_map(|parent| {
+                [("parent-frontend".into(), &parent.frontend), ("parent-worker".into(), &parent.worker), ("parent-broker".into(), &parent.broker)]
+            }))
     }
 
     fn bytes(&self, limit: u64) -> Result<u64> {

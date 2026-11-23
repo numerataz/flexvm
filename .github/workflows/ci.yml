@@ -740,6 +740,7 @@ jobs:
           run_public_arm tcg "$bundle"
           run_public_arm tcg "$bundle" --pause
           run_public_arm tcg "$bundle" --suspend
+          run_public_arm tcg "$bundle" --move
           software_bundle="$RUNNER_TEMP/arm-parent-software-bundle"
           mkdir "$software_bundle"
           cp "$bundle/flexvm-pvkvm.img" "$software_bundle/"
