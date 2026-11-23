@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use ureq::unversioned::resolver::{DefaultResolver, ResolvedSocketAddrs, Resolver};
 use ureq::unversioned::transport::{Buffers, ConnectionDetails, Connector, LazyBuffers, NextTimeout, RustlsConnector, Transport};
 use ureq::Timeout;
+use url::Url;
 
 use super::reference::Reference;
 use super::unpack::{Hashed, MAX_DOCUMENT};
@@ -448,77 +449,68 @@ fn error_body(reader: impl Read) -> String {
 
 /// URLs in diagnostics must not expose signed queries or userinfo.
 fn log_url(url: &str) -> String {
-    let url = url.split(['?', '#']).next().unwrap_or("");
-    let Some((scheme, rest)) = url.split_once("://") else { return "<invalid URL>".into() };
-    let (authority, path) = rest.split_once('/').map_or((rest, ""), |(a, p)| (a, p));
-    let host = authority.rsplit('@').next().unwrap_or("");
-    format!("{scheme}://{host}/{path}")
+    let Ok(mut parsed) = Url::parse(url) else { return "<invalid URL>".into() };
+    let _ = parsed.set_username("");
+    let _ = parsed.set_password(None);
+    parsed.set_query(None);
+    parsed.set_fragment(None);
+    parsed.into()
 }
 
 /// Where redirect `redirects` (0 for the first) from `url` to `loc` goes: refused from an HTTPS `base` to anything
 /// else, and past the fifth.
 fn next_hop(base: &str, url: &str, loc: &str, redirects: usize) -> Result<String> {
-    let next = resolve_location(url, loc)?;
-    if base.starts_with("https://") && !next.starts_with("https://") {
-        bail!("refusing a redirect from HTTPS to {}", log_url(&next));
+    let next = resolve_url(url, loc)?;
+    if Url::parse(base).is_ok_and(|u| u.scheme() == "https") && next.scheme() != "https" {
+        bail!("refusing a redirect from HTTPS to {}", log_url(next.as_str()));
     }
     if redirects >= 5 {
         bail!("too many redirects from {}", log_url(base));
     }
+    Ok(next.into())
+}
+
+/// `loc` resolved against `base` (an absolute http(s) URL), without its fragment or any userinfo;
+/// only http(s) URLs with a host are accepted.
+fn resolve_url(base: &str, loc: &str) -> Result<Url> {
+    let base_url = Url::parse(base)
+        .ok()
+        .filter(|u| matches!(u.scheme(), "http" | "https") && u.has_host())
+        .ok_or_else(|| format!("redirect from a relative URL {}", log_url(base)))?;
+    let loc = loc.trim();
+    // Reject WHATWG shorthand that RFC 3986 treats as missing an authority (e.g. `https:blob`,
+    // `https:///blob`, `///blob`), which `Url::join` would otherwise reinterpret as a host or path.
+    let authority_after = if let Some((scheme, rest)) = loc.split_once(':') {
+        if !scheme.is_empty()
+            && scheme.as_bytes()[0].is_ascii_alphabetic()
+            && scheme.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+        {
+            if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+                bail!("unsupported redirect to {}", log_url(loc));
+            }
+            Some(rest.strip_prefix("//").ok_or_else(|| format!("unsupported redirect to {}", log_url(loc)))?)
+        } else {
+            loc.strip_prefix("//")
+        }
+    } else {
+        loc.strip_prefix("//")
+    };
+    if authority_after.is_some_and(|rest| rest.starts_with(['/', '\\'])) {
+        bail!("unsupported redirect to {}", log_url(loc));
+    }
+    let mut next = base_url.join(loc).map_err(|_| format!("unsupported redirect to {}", log_url(loc)))?;
+    if !matches!(next.scheme(), "http" | "https") || !next.has_host() {
+        bail!("unsupported redirect to {}", log_url(loc));
+    }
+    let _ = next.set_username("");
+    let _ = next.set_password(None);
+    next.set_fragment(None);
     Ok(next)
 }
 
-/// `loc` resolved against `base` (an absolute http(s) URL) as RFC 3986 section 5.2 does, without its fragment or any
-/// userinfo; only http(s) URLs with a host are accepted.
+#[cfg(test)]
 fn resolve_location(base: &str, loc: &str) -> Result<String> {
-    // Scheme, authority, path and query (RFC 3986 appendix B).
-    fn split(r: &str) -> (Option<&str>, Option<&str>, &str, Option<&str>) {
-        let r = r.split('#').next().unwrap_or("");
-        let (r, query) = r.split_once('?').map_or((r, None), |(r, q)| (r, Some(q)));
-        let (scheme, r) = match r.split_once(':') {
-            Some((s, rest)) if !s.is_empty() && !s.contains('/') => (Some(s), rest),
-            _ => (None, r),
-        };
-        let (auth, path) = match r.strip_prefix("//") {
-            Some(r) => r.find('/').map_or((Some(r), ""), |i| (Some(&r[..i]), &r[i..])),
-            None => (None, r),
-        };
-        (scheme, auth, path, query)
-    }
-    // Section 5.2.4, for a path from the root.
-    fn remove_dots(path: &str) -> String {
-        let segs: Vec<&str> = path.strip_prefix('/').unwrap_or(path).split('/').collect();
-        let mut out = Vec::new();
-        for (i, seg) in segs.iter().enumerate() {
-            match *seg {
-                "." | ".." => {
-                    if *seg == ".." {
-                        out.pop();
-                    }
-                    if i + 1 == segs.len() {
-                        out.push("");
-                    }
-                }
-                s => out.push(s),
-            }
-        }
-        format!("/{}", out.join("/"))
-    }
-    let (Some(scheme), Some(auth), path, query) = split(base) else { bail!("redirect from a relative URL {}", log_url(base)) };
-    let (s, a, p, q) = split(loc);
-    let (scheme, auth, path, query) = match (s, a) {
-        (Some(s), _) => (s, a.unwrap_or(""), remove_dots(p), q),
-        (None, Some(a)) => (scheme, a, remove_dots(p), q),
-        (None, None) if p.is_empty() => (scheme, auth, if path.is_empty() { "/".into() } else { path.to_string() }, q.or(query)),
-        (None, None) if p.starts_with('/') => (scheme, auth, remove_dots(p), q),
-        (None, None) => (scheme, auth, remove_dots(&format!("{}{p}", &path[..path.rfind('/').map_or(0, |i| i + 1)])), q),
-    };
-    let scheme = scheme.to_ascii_lowercase();
-    let host = auth.rsplit_once('@').map_or(auth, |(_, host)| host);
-    if !matches!(scheme.as_str(), "http" | "https") || host.is_empty() {
-        bail!("unsupported redirect to {}", log_url(loc));
-    }
-    Ok(format!("{scheme}://{host}{path}{}", query.map(|q| format!("?{q}")).unwrap_or_default()))
+    resolve_url(base, loc).map(String::from)
 }
 
 /// Retries of a 429 or 503 (a registry's rate limit, or one briefly unavailable) per request, within its transfer's
@@ -660,10 +652,18 @@ impl Registry {
     /// credentials. Private registries requiring those realms are currently unsupported; a
     /// challenge alone must not authorize forwarding a saved password to another authority.
     fn trusted(&self, url: &str) -> bool {
-        let Some(rest) = url.strip_prefix("https://") else { return false };
-        let host = rest.split(['/', '?', '#']).next().unwrap_or("");
-        host == self.r.registry
-            || matches!((self.r.registry.as_str(), host), ("registry-1.docker.io", "auth.docker.io") | ("registry.gitlab.com", "gitlab.com"))
+        let Ok(u) = Url::parse(url) else { return false };
+        if u.scheme() != "https" || !u.username().is_empty() || u.password().is_some() {
+            return false;
+        }
+        let Some(host) = u.host_str() else { return false };
+        if let Ok(reg) = Url::parse(&format!("https://{}", self.r.registry)) {
+            if u.host_str() == reg.host_str() && u.port_or_known_default() == reg.port_or_known_default() {
+                return true;
+            }
+        }
+        u.port_or_known_default() == Some(443)
+            && matches!((self.r.registry.as_str(), host), ("registry-1.docker.io", "auth.docker.io") | ("registry.gitlab.com", "gitlab.com"))
     }
 
     /// The time left before `deadline`, for the next request: ureq's own limit for it, under `Deadlined`'s.
@@ -1679,9 +1679,21 @@ pub(super) mod tests {
             assert_eq!(resolve_location(base, loc).unwrap(), want, "{loc:?}");
         }
         assert_eq!(resolve_location("http://127.0.0.1:5000/v2/x", "//cdn/y").unwrap(), "http://cdn/y");
-        for loc in ["ftp://cdn.example/blob", "https:///blob", "https:blob", "file:/etc/passwd", "javascript:x"] {
+        for loc in [
+            "ftp://cdn.example/blob",
+            "https:///blob",
+            "https:blob",
+            " https:///blob",
+            "https:\\\\evil.com/blob",
+            "///blob",
+            "file:/etc/passwd",
+            "javascript:x",
+        ] {
             assert!(resolve_location(base, loc).is_err(), "{loc:?}");
         }
+        assert_eq!(resolve_location(base, "https://user:pw@cdn.example:443/blob?sig=1#frag").unwrap(), "https://cdn.example/blob?sig=1");
+        assert_eq!(resolve_location(base, "https://[::1]:5000/a/../b").unwrap(), "https://[::1]:5000/b");
+        assert!(resolve_location("/relative/base", "/other").is_err());
     }
 
     /// `get` follows a protocol-relative redirect to its host, not the registry's, without credentials; one to
@@ -2010,6 +2022,8 @@ pub(super) mod tests {
         }
         assert_eq!(log_url("https://cdn.example?secret"), "https://cdn.example/");
         assert_eq!(log_url("http://[::1]:5000/blob?secret"), "http://[::1]:5000/blob");
+        assert_eq!(log_url("https://user:secret@cdn.example:443/blob?sig=1#frag"), "https://cdn.example/blob");
+        assert_eq!(log_url("not a url"), "<invalid URL>");
         let err = next_hop("https://reg.example/blob?secret", "https://reg.example/blob?secret", "/blob", 5).unwrap_err().to_string();
         assert!(!err.contains("secret"));
         let err = next_hop("https://reg.example/blob", "https://reg.example/blob", "http://cdn.example/blob?secret", 0).unwrap_err().to_string();
@@ -2020,7 +2034,10 @@ pub(super) mod tests {
     fn credentials_only_go_to_trusted_realms() {
         let hub = Registry::new(Reference::parse("nginx").unwrap());
         assert!(hub.trusted("https://auth.docker.io/token"));
+        assert!(hub.trusted("https://auth.docker.io:443/token"));
         assert!(hub.trusted("https://registry-1.docker.io/token?x"));
+        assert!(!hub.trusted("https://auth.docker.io:8443/token"));
+        assert!(!hub.trusted("https://user:pw@auth.docker.io/token"));
         assert!(!hub.trusted("http://auth.docker.io/token"));
         assert!(!hub.trusted("https://auth.docker.io.evil.com/token"));
         assert!(!hub.trusted("https://evil.com/?https://auth.docker.io"));
