@@ -10,6 +10,31 @@ pub struct Reference {
     pub reference: String,
 }
 
+fn valid_port(port: &str) -> bool {
+    !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) && port.parse::<u16>().is_ok_and(|p| p != 0)
+}
+
+fn valid_registry(registry: &str) -> bool {
+    if let Some(rest) = registry.strip_prefix('[') {
+        let Some((addr, rest)) = rest.split_once(']') else { return false };
+        if addr.parse::<std::net::Ipv6Addr>().is_err() {
+            return false;
+        }
+        return rest.is_empty() || rest.strip_prefix(':').is_some_and(valid_port);
+    }
+    let (host, port) = match registry.split_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (registry, None),
+    };
+    if port.is_some_and(|p| !valid_port(p)) {
+        return false;
+    }
+    !host.is_empty()
+        && host
+            .split('.')
+            .all(|label| !label.is_empty() && !label.starts_with('-') && !label.ends_with('-') && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+}
+
 impl Reference {
     pub fn parse(s: &str) -> Result<Reference> {
         let (name, digest) = s.split_once('@').map_or((s, None), |(n, d)| (n, Some(d)));
@@ -30,6 +55,9 @@ impl Reference {
             }
             d => (d.to_string(), path),
         };
+        if !valid_registry(&registry) {
+            bail!("bad registry in {s:?}");
+        }
         if repository.split('/').any(|p| matches!(p, "" | "." | ".."))
             || !repository.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._-/".contains(c))
         {
@@ -152,6 +180,45 @@ mod tests {
             assert!(Reference::parse(&format!("app@sha256:{hex}")).is_err(), "{hex}");
         }
         assert!(Reference::parse(&format!("app@sha256:{}", "ab09".repeat(16))).is_ok());
+    }
+
+    #[test]
+    fn registries_must_be_valid_hosts_with_optional_ports() {
+        for bad in [
+            "../app",
+            "./app",
+            "evil.com?q/app",
+            "evil.com#f/app",
+            "evil.com\\x/app",
+            "a b.c/app",
+            "ghcr.io:notaport/app",
+            "ghcr.io:0/app",
+            "ghcr.io:99999/app",
+            "ghcr.io:+443/app",
+            "ghcr.io:/app",
+            ":5000/app",
+            "a..b/app",
+            "-a.com/app",
+            "a-.com/app",
+            "[::1/app",
+            "[::1]:0/app",
+            "[not-v6]/app",
+            "evil.com\n/app",
+        ] {
+            assert!(Reference::parse(bad).is_err(), "{bad:?}");
+        }
+        for good in [
+            "localhost/app",
+            "localhost:5000/app",
+            "127.0.0.1:5000/app",
+            "[::1]:5000/app",
+            "[::1]/app",
+            "ghcr.io/org/app",
+            "public.ecr.aws/docker/library/busybox",
+            "docker.io/library/nginx",
+        ] {
+            assert!(Reference::parse(good).is_ok(), "{good:?}");
+        }
     }
 
     #[test]
