@@ -441,6 +441,22 @@ fn validate_name(value: &str) -> Result<(), Error> {
     Ok(())
 }
 
+fn validate_filter(key: &str, value: &str) -> Result<(), Error> {
+    match key {
+        "id" | "label" | "ancestor" | "network" => Ok(()),
+        "name" => validate_name(value),
+        "status" => match value {
+            "created" | "restarting" | "running" | "removing" | "paused" | "exited" | "dead" => Ok(()),
+            _ => Err(Error::bad(format!("invalid filter 'status={value}'"))),
+        },
+        "exited" => {
+            value.parse::<i64>().map_err(|_| Error::bad(format!("invalid filter 'exited={value}'")))?;
+            Ok(())
+        }
+        _ => Err(Error::bad(format!("invalid filter '{key}': flexvm takes id, name, status, exited, label, ancestor and network"))),
+    }
+}
+
 /// A `filters` key and value against a container, as docker matches them.
 fn matches(d: &Detail, key: &str, value: &str) -> Result<bool, Error> {
     Ok(match key {
@@ -483,8 +499,8 @@ fn matches(d: &Detail, key: &str, value: &str) -> Result<bool, Error> {
 /// `GET /containers/json?all&limit&filters`.
 pub async fn list(api: &Arc<Api>, q: Query) -> Reply {
     let (all, limit, filters) = (q.flag("all", false)?, q.number::<i64>("limit")?, q.filters()?);
-    for (_, value) in filters.iter().filter(|(k, _)| k == "name") {
-        validate_name(value)?;
+    for (key, value) in &filters {
+        validate_filter(key, value)?;
     }
     let status_filtered = filters.iter().any(|(k, _)| k == "status" || k == "exited");
     let details = api
@@ -1209,6 +1225,15 @@ mod tests {
         }
         for value in ["abcd", "sha256:abcd", "sha256:abcdef012345"] {
             assert!(matches(&d, "ancestor", value).unwrap(), "expected match for {value:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn list_validates_all_filters_even_when_empty() {
+        let (_d, api) = fixture();
+        for filter in [r#"filters={"bogus":["1"]}"#, r#"filters={"status":["invalid"]}"#, r#"filters={"exited":["abc"]}"#] {
+            let e = list(&api, Query::parse(filter)).await.unwrap_err();
+            assert_eq!(e.status, StatusCode::BAD_REQUEST, "{filter}: {e:?}");
         }
     }
 }
