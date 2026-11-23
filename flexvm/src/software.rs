@@ -806,7 +806,7 @@ impl Owner {
                 "pause" => self.switch(true),
                 "resume" if self.suspended.load(Ordering::SeqCst) || self.entry.lock().unwrap().state == "suspending" => Ok(json!({"suspending":true})),
                 "resume" => self.switch(false),
-                "suspend" => {
+                "stop" | "suspend" => {
                     terminal_reply = true;
                     self.suspend()
                 }
