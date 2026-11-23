@@ -360,6 +360,13 @@ fn visit_entries<R: Read>(
     Ok(())
 }
 
+fn tar_id(v: u64, what: &str) -> Result<u32> {
+    match u32::try_from(v) {
+        Ok(id) if id != u32::MAX => Ok(id),
+        _ => bail!("tar {what} {v} is out of range"),
+    }
+}
+
 fn describe<R: Read>(e: &tar::Entry<R>, name: Option<Vec<u8>>, link: Option<Vec<u8>>, pax: Option<Vec<u8>>) -> Result<Meta> {
     let h = e.header();
     let trim = |mut v: Vec<u8>| {
@@ -368,7 +375,7 @@ fn describe<R: Read>(e: &tar::Entry<R>, name: Option<Vec<u8>>, link: Option<Vec<
     };
     let mut path = name.map(trim).unwrap_or_else(|| h.path_bytes().into_owned());
     let mut link = link.map(trim).or_else(|| h.link_name_bytes().map(|l| l.into_owned()));
-    let (mut uid, mut gid) = (h.uid()? as u32, h.gid()? as u32);
+    let (mut uid, mut gid) = (tar_id(h.uid()?, "uid")?, tar_id(h.gid()?, "gid")?);
     let mut xattrs = Vec::new();
     for (i, ext) in tar::PaxExtensions::new(pax.as_deref().unwrap_or_default()).enumerate() {
         if i == MAX_PAX_RECORDS {
@@ -381,8 +388,8 @@ fn describe<R: Read>(e: &tar::Entry<R>, name: Option<Vec<u8>>, link: Option<Vec<
             k if k.starts_with("GNU.sparse.") => bail!("GNU sparse PAX entries are not supported"),
             "path" => path = value.to_vec(),
             "linkpath" => link = Some(value.to_vec()),
-            "uid" => uid = num().ok_or("bad PAX uid")? as u32,
-            "gid" => gid = num().ok_or("bad PAX gid")? as u32,
+            "uid" => uid = tar_id(num().ok_or("bad PAX uid")?, "uid")?,
+            "gid" => gid = tar_id(num().ok_or("bad PAX gid")?, "gid")?,
             "size" if num() != Some(e.size()) => bail!("PAX size overrides are not supported"),
             k => xattrs.extend(k.strip_prefix("SCHILY.xattr.").map(|x| (x.to_string(), value.to_vec()))),
         }
@@ -678,6 +685,9 @@ impl Root {
         let kind = h.entry_type();
         let nofollow = libc::AT_SYMLINK_NOFOLLOW;
         let mode = (h.mode()? & 0o7777) as libc::mode_t;
+        if m.uid == u32::MAX || m.gid == u32::MAX {
+            bail!("invalid uid/gid on {rel:?}");
+        }
         match fd {
             Some(fd) => {
                 check(unsafe { libc::fchown(fd, m.uid, m.gid) }, "chown", rel)?;
@@ -1423,6 +1433,41 @@ pub(super) mod tests {
         let mut v = raw_entry(b"PaxHeader", T::XHeader, data.len() as u64);
         v[512..512 + data.len()].copy_from_slice(&data);
         v
+    }
+
+    #[test]
+    fn pax_and_header_uid_gid_overflow_and_sentinel_are_rejected() {
+        for (key, value) in [
+            ("uid", "4294967296"),
+            ("gid", "4294967296"),
+            ("uid", "4294967295"),
+            ("gid", "4294967295"),
+            ("uid", "18446744073709551615"),
+            ("gid", "18446744073709551615"),
+        ] {
+            let s = Sandbox::new("pax-id");
+            let bytes = end([pax(&[(key, value)]), raw_entry(b"file", T::Regular, 0)].concat());
+            let err = s.apply(Limits::default(), &bytes);
+            assert!(err.contains(key) && err.contains("out of range"), "{key}={value}: {err}");
+            assert!(!s.root.join("file").exists(), "{key}={value} created file");
+        }
+        for (is_uid, value) in [(true, u32::MAX as u64), (true, 1u64 << 32), (false, u32::MAX as u64), (false, 1u64 << 32)] {
+            let s = Sandbox::new("hdr-id");
+            let mut b = tar::Builder::new(Vec::new());
+            let mut h = tar::Header::new_gnu();
+            h.set_entry_type(T::Regular);
+            h.set_mode(0o644);
+            h.set_size(0);
+            h.set_mtime(1);
+            h.set_uid(if is_uid { value } else { unsafe { libc::getuid() as u64 } });
+            h.set_gid(if is_uid { unsafe { libc::getgid() as u64 } } else { value });
+            b.append_data(&mut h, "file", &[][..]).unwrap();
+            let bytes = b.into_inner().unwrap();
+            let key = if is_uid { "uid" } else { "gid" };
+            let err = s.apply(Limits::default(), &bytes);
+            assert!(err.contains(key) && err.contains("out of range"), "{key}={value}: {err}");
+            assert!(!s.root.join("file").exists(), "{key}={value} created file");
+        }
     }
 
     #[test]

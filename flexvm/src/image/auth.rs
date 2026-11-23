@@ -154,8 +154,8 @@ mod tests {
         assert_eq!(registry("").unwrap(), "registry-1.docker.io");
         assert_eq!(registry("index.docker.io").unwrap(), "registry-1.docker.io");
         assert_eq!(registry("ghcr.io:443").unwrap(), "ghcr.io:443");
-        for name in ["https://ghcr.io", "ghcr.io/path", "a@b", "ghcr.io?x"] {
-            assert!(registry(name).is_err());
+        for name in ["https://ghcr.io", "ghcr.io/path", "a@b", "ghcr.io?x", "..", ".", "ghcr.io:abc", "ghcr.io:0", "ghcr.io:99999", "evil.com\\x", "[::1"] {
+            assert!(registry(name).is_err(), "{name:?}");
         }
         assert!(Registry::verify("localhost:5000", "secret").unwrap_err().to_string().contains("HTTPS"));
     }
