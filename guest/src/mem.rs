@@ -6,7 +6,7 @@
 //! at its ceiling or nothing arrives within `GIVE_UP`, the throttle is lifted. A plug the host's
 //! reserve refuses keeps it (`ok`): slow, not OOM-killed, until a plug or relief comes.
 
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -51,16 +51,49 @@ pub fn work_procs() -> Option<CString> {
 
 /// Moves the child into `procs`' group before exec (and before dropping privileges); fails the spawn only if `required`.
 pub fn enter(cmd: &mut Command, procs: CString, required: bool) {
+    enter_inner(cmd, procs, required, false);
+}
+
+/// Like [`enter`], for a distro check cgroup that disappears when the runtime service restarts:
+/// translates `ENOENT` and `ENODEV` into `EAGAIN` (`WouldBlock`) so the caller can ask to retry.
+pub(crate) fn enter_distro_check(cmd: &mut Command, procs: CString) {
+    enter_inner(cmd, procs, true, true);
+}
+
+fn enter_inner(cmd: &mut Command, procs: CString, required: bool, retry_missing: bool) {
     unsafe {
-        cmd.pre_exec(move || {
-            // "0" moves the writing process; only raw syscalls after fork.
-            let fd = libc::open(procs.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC);
-            let moved = fd >= 0 && libc::write(fd, b"0".as_ptr().cast(), 1) == 1;
-            if fd >= 0 {
-                libc::close(fd);
-            }
-            (moved || !required).then_some(()).ok_or_else(io::Error::last_os_error)
+        cmd.pre_exec(move || match write_procs(&procs, retry_missing) {
+            Ok(()) => Ok(()),
+            Err(_) if !required => Ok(()),
+            Err(err) => Err(err),
         });
+    }
+}
+
+fn write_procs(procs: &CStr, retry_missing: bool) -> io::Result<()> {
+    // "0" moves the writing process; only raw syscalls after fork.
+    let fd = unsafe { libc::open(procs.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+    let err = if fd < 0 {
+        io::Error::last_os_error()
+    } else {
+        let written = unsafe { libc::write(fd, b"0".as_ptr().cast(), 1) };
+        let err = if written == 1 {
+            None
+        } else if written == 0 {
+            Some(io::Error::from(io::ErrorKind::WriteZero))
+        } else {
+            Some(io::Error::last_os_error())
+        };
+        unsafe { libc::close(fd) };
+        match err {
+            None => return Ok(()),
+            Some(err) => err,
+        }
+    };
+    if retry_missing && matches!(err.raw_os_error(), Some(libc::ENOENT | libc::ENODEV)) {
+        Err(io::Error::from_raw_os_error(libc::EAGAIN))
+    } else {
+        Err(err)
     }
 }
 
@@ -688,5 +721,37 @@ mod tests {
         settle(&high);
         assert_eq!(*installed.lock().unwrap(), Some(high_limit(3072 << 10)));
         assert!(waiting.is_none());
+    }
+
+    #[test]
+    fn enter_preserves_errno_and_distro_check_maps_missing_to_eagain() {
+        let dir = crate::test_util::TempDir::new("mem-enter-check");
+        let group = dir.join("flexvm-check-0");
+        std::fs::create_dir(&group).unwrap();
+        let procs = CString::new(group.join("cgroup.procs").to_str().unwrap()).unwrap();
+        std::fs::remove_dir(&group).unwrap();
+
+        let mut cmd = Command::new("/bin/true");
+        enter_distro_check(&mut cmd, procs.clone());
+        let err = cmd.spawn().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(err.raw_os_error(), Some(libc::EAGAIN));
+
+        let mut cmd = Command::new("/bin/true");
+        enter(&mut cmd, procs.clone(), true);
+        let err = cmd.spawn().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert_eq!(err.raw_os_error(), Some(libc::ENOENT));
+
+        let mut cmd = Command::new("/bin/true");
+        enter(&mut cmd, procs, false);
+        assert!(cmd.status().unwrap().success());
+
+        if Path::new("/dev/full").exists() {
+            let mut cmd = Command::new("/bin/true");
+            enter(&mut cmd, CString::new("/dev/full").unwrap(), true);
+            let err = cmd.spawn().unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(libc::ENOSPC));
+        }
     }
 }

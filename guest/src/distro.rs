@@ -3,10 +3,11 @@
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -124,18 +125,31 @@ pub(crate) fn broker(descriptor: i32) -> io::Result<()> {
 }
 
 pub(crate) fn atomic_file(path: &str, bytes: &[u8], mode: u32) -> io::Result<()> {
-    let temporary = format!("{path}.flexvm-new");
-    let _ = fs::remove_file(&temporary);
-    let mut file = File::options().write(true).create_new(true).open(&temporary)?;
-    file.set_permissions(fs::Permissions::from_mode(mode))?;
-    file.write_all(bytes)?;
-    let renamed = fs::rename(&temporary, path);
-    if renamed.as_ref().is_err_and(|error| error.raw_os_error() == Some(libc::EBUSY)) {
-        let result = crate::rewrite_bound_file(std::path::Path::new(path), bytes);
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let seq = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
+    let temporary = format!("{path}.flexvm-new.{seq}");
+    let mut file = File::options().write(true).create_new(true).mode(mode).open(&temporary)?;
+    let write = (|| {
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+        file.write_all(bytes)
+    })();
+    drop(file);
+    if let Err(error) = write {
         let _ = fs::remove_file(&temporary);
-        return result;
+        return Err(error);
     }
-    renamed
+    match fs::rename(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(libc::EBUSY) => {
+            let result = crate::rewrite_bound_file(std::path::Path::new(path), bytes);
+            let _ = fs::remove_file(&temporary);
+            result
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(error)
+        }
+    }
 }
 
 /// Idempotent across an APP retry: a released gate never assigns a new identity.
@@ -299,4 +313,58 @@ fn notify_ready() -> io::Result<()> {
     let socket = unsafe { File::from_raw_fd(socket) };
     os(unsafe { libc::sendto(socket.as_raw_fd(), b"READY=1\n".as_ptr().cast(), 8, 0, (&address as *const libc::sockaddr_un).cast(), length as _) })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use std::os::unix::fs::MetadataExt;
+
+    #[test]
+    fn atomic_file_handles_concurrent_writers_and_cleans_up_on_error() {
+        let dir = crate::test_util::TempDir::new("distro-atomic-file");
+        let target = dir.join("hostname");
+        let target_str = target.to_str().unwrap().to_string();
+
+        let mut valid = HashSet::new();
+        for tid in 0..8usize {
+            for iter in 0..40usize {
+                valid.insert(format!("host-{tid:02}-{iter:03}\n"));
+            }
+        }
+
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8usize)
+                .map(|tid| {
+                    let path = target_str.clone();
+                    s.spawn(move || {
+                        for iter in 0..40usize {
+                            let body = format!("host-{tid:02}-{iter:03}\n");
+                            atomic_file(&path, body.as_bytes(), 0o644).unwrap();
+                        }
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+
+        let contents = fs::read_to_string(&target).unwrap();
+        assert!(valid.contains(&contents), "unexpected final contents: {contents:?}");
+        assert_eq!(fs::metadata(&target).unwrap().mode() & 0o7777, 0o644);
+
+        let leftovers: Vec<_> =
+            fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().contains(".flexvm-new")).collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
+
+        // Rename onto an existing directory must fail and clean up its temp file.
+        let subdir = dir.join("target-dir");
+        fs::create_dir(&subdir).unwrap();
+        assert!(atomic_file(subdir.to_str().unwrap(), b"ignored\n", 0o644).is_err());
+        let leftovers: Vec<_> =
+            fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).filter(|e| e.file_name().to_string_lossy().contains(".flexvm-new")).collect();
+        assert!(leftovers.is_empty(), "leftover temp files after error: {leftovers:?}");
+    }
 }

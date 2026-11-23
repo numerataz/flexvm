@@ -435,6 +435,7 @@ fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
     let mut cmd = command(c, &["/bin/sh", "-c", &String::from_utf8_lossy(&bytes)]);
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
     match &cg {
+        Some(g) if g.context.is_some() => mem::enter_distro_check(&mut cmd, g.procs.clone()),
         Some(g) => mem::enter(&mut cmd, g.procs.clone(), true),
         None => mem::work_procs().into_iter().for_each(|work| mem::enter(&mut cmd, work, false)),
     }
@@ -446,10 +447,7 @@ fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
         confine_check(&mut cmd);
     }
     credentials(&mut cmd, c, true);
-    let (child, _, token) = spawn_watched(&mut cmd, statuses, false).map_err(|e| {
-        let hint = if crate::distro::is_broker() && e.kind() == io::ErrorKind::WouldBlock { crate::proto::TRY_AGAIN } else { "" };
-        io::Error::new(e.kind(), format!("cannot run /bin/sh: {e}{hint}"))
-    })?;
+    let (child, _, token) = spawn_watched(&mut cmd, statuses, false).map_err(|e| format_check_spawn_error(e, crate::distro::is_broker()))?;
     let pid = child.id() as i32;
     let code = wait_exit(statuses, token, Some(deadline));
     // Kill whatever is left, the leader included if it timed out. Without a cgroup only its session
@@ -474,6 +472,11 @@ fn check(arg: &str, statuses: &Statuses) -> io::Result<String> {
         Some(code) => format!("exit {code}"),
         None => "timeout".into(),
     })
+}
+
+fn format_check_spawn_error(e: io::Error, is_broker: bool) -> io::Error {
+    let hint = if is_broker && e.kind() == io::ErrorKind::WouldBlock { crate::proto::TRY_AGAIN } else { "" };
+    io::Error::new(e.kind(), format!("cannot run /bin/sh: {e}{hint}"))
 }
 
 fn check_deadline(now: Instant, ms: u64) -> io::Result<Instant> {
@@ -1503,5 +1506,28 @@ mod tests {
         assert_eq!((c.cwd.as_str(), c.uid, c.gid, c.groups), ("/srv", 7, 8, vec![9, 10]));
         assert!(parse_conf("cwd /").unwrap().argv.is_empty(), "no app");
         assert!(parse_conf("arg x\nuid root").is_err());
+    }
+
+    #[test]
+    fn distro_check_deleted_cgroup_returns_would_block_with_try_again() {
+        let dir = crate::test_util::TempDir::new("app-check-deleted-cg");
+        let group = dir.join("flexvm-check-0");
+        std::fs::create_dir(&group).unwrap();
+        let procs = CString::new(group.join("cgroup.procs").to_str().unwrap()).unwrap();
+        std::fs::remove_dir(&group).unwrap();
+
+        let mut cmd = Command::new("/bin/true");
+        mem::enter_distro_check(&mut cmd, procs);
+        let raw = spawn_watched(&mut cmd, &Statuses::default(), false).unwrap_err();
+        assert_eq!(raw.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(raw.raw_os_error(), Some(libc::EAGAIN));
+
+        let non_broker = format_check_spawn_error(io::Error::from_raw_os_error(libc::EAGAIN), false);
+        assert_eq!(non_broker.kind(), io::ErrorKind::WouldBlock);
+        assert!(!non_broker.to_string().ends_with(crate::proto::TRY_AGAIN));
+
+        let broker = format_check_spawn_error(raw, true);
+        assert_eq!(broker.kind(), io::ErrorKind::WouldBlock);
+        assert!(broker.to_string().ends_with(crate::proto::TRY_AGAIN), "{broker}");
     }
 }
