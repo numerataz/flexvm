@@ -524,7 +524,7 @@ fn exchange(r: &mut BufReader<crate::util::By<UnixStream>>, mut req: &[u8], sent
     if parsed != head.len() {
         bail!("invalid response headers");
     }
-    let code = resp.code.ok_or("invalid response status")?;
+    let code = resp.code.filter(|c| (100..=599).contains(c)).ok_or("invalid response status")?;
     let mut len = None;
     let mut close = false;
     for h in resp.headers {
@@ -1306,6 +1306,7 @@ mod tests {
             &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nx"[..],
             &b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
             &b"GARBAGE 200 OK\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/1.1 000 Bad\r\nContent-Length: 0\r\n\r\n"[..],
             &b"HTTP/1.1 200 OK\r\nBad Header: 1\r\nContent-Length: 0\r\n\r\n"[..],
         ] {
             let server = Server::new(move |listener| answer(&mut accept(&listener), response));
