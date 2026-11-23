@@ -369,6 +369,17 @@ impl ActiveStream {
             first_byte_deadline,
         }
     }
+
+    fn take_window_update(&mut self) -> u32 {
+        if self.recv_consumed >= WINDOW_UPDATE_THRESHOLD && !self.remote_fin && !self.remote_rst {
+            let delta = self.recv_consumed;
+            self.recv_window = self.recv_window.saturating_add(delta);
+            self.recv_consumed = 0;
+            delta
+        } else {
+            0
+        }
+    }
 }
 
 enum StreamEntry {
@@ -611,7 +622,9 @@ impl Mux {
                             send_rst = true;
                             remove = true;
                         } else {
+                            let discarded = stream.to_local.len() as u32;
                             stream.to_local.clear();
+                            stream.recv_consumed = stream.recv_consumed.saturating_add(discarded);
                             stream.local_write_shutdown = true;
                         }
                         break;
@@ -631,7 +644,9 @@ impl Mux {
                             send_rst = true;
                             remove = true;
                         } else {
+                            let discarded = stream.to_local.len() as u32;
                             stream.to_local.clear();
+                            stream.recv_consumed = stream.recv_consumed.saturating_add(discarded);
                             stream.local_write_shutdown = true;
                         }
                         break;
@@ -639,11 +654,7 @@ impl Mux {
                 }
             }
             if !remove {
-                if stream.recv_consumed >= WINDOW_UPDATE_THRESHOLD && !stream.remote_fin && !stream.remote_rst {
-                    window_update = stream.recv_consumed;
-                    stream.recv_window = stream.recv_window.saturating_add(window_update);
-                    stream.recv_consumed = 0;
-                }
+                window_update = stream.take_window_update();
                 if stream.to_local.is_empty() {
                     if stream.remote_rst {
                         remove = true;
@@ -897,6 +908,14 @@ impl Mux {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "control stream window exceeded"));
         }
         stream.recv_window -= payload.len() as u32;
+        if self.side == Side::Agent && stream.local_write_shutdown {
+            stream.recv_consumed = stream.recv_consumed.saturating_add(payload.len() as u32);
+            let window_update = stream.take_window_update();
+            if window_update > 0 {
+                self.queue_frame(FRAME_WINDOW, id, window_update, &[]);
+            }
+            return Ok(());
+        }
         stream.to_local.extend(payload);
         self.try_write_local(id);
         Ok(())
@@ -1421,5 +1440,23 @@ mod tests {
         }
         drop(client);
         done.recv_timeout(Duration::from_secs(3)).unwrap().unwrap();
+    }
+
+    #[test]
+    fn closing_agent_read_end_still_replenishes_client_send_window() {
+        let (client, requests, done) = pair();
+        let (mut host, mut guest) = open(&client, &requests);
+        guest.shutdown(Shutdown::Read).unwrap();
+        let payload = vec![b'q'; 1 << 20];
+        host.write_all(&payload).unwrap();
+        guest.write_all(b"early reply").unwrap();
+        let mut reply = [0; 11];
+        host.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"early reply");
+        host.shutdown(Shutdown::Write).unwrap();
+        guest.shutdown(Shutdown::Write).unwrap();
+        drop(client);
+        let closed = done.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(closed.is_ok() || closed.is_err_and(|e| e.kind() == io::ErrorKind::BrokenPipe));
     }
 }
