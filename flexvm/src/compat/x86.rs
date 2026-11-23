@@ -172,7 +172,16 @@ fn saved_msrs(kvm: &std::fs::File) -> Result<BTreeSet<u32>> {
     crate::syscall_check!(result < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::E2BIG), "KVM_GET_MSR_INDEX_LIST");
     buf.resize(1 + buf[0] as usize, 0);
     crate::syscall_check!(unsafe { libc::ioctl(kvm.as_raw_fd(), 0xc004_ae02u32 as _, buf.as_mut_ptr()) } < 0, "KVM_GET_MSR_INDEX_LIST");
-    Ok(buf[1..].iter().copied().filter(|&index| msr_should_serialize(index)).collect())
+    Ok(parse_msr_list(&buf))
+}
+
+#[cfg(any(target_arch = "x86_64", test))]
+fn parse_msr_list(buf: &[u32]) -> BTreeSet<u32> {
+    let Some(&count) = buf.first() else {
+        return BTreeSet::new();
+    };
+    let n = (count as usize).min(buf.len().saturating_sub(1));
+    buf[1..1 + n].iter().copied().filter(|&index| msr_should_serialize(index)).collect()
 }
 
 /// Firecracker v1.17.0 arch/x86_64/msr.rs SERIALIZABLE_MSR_RANGES,
@@ -382,6 +391,14 @@ pub(crate) mod tests {
         for index in [0x17b, 0xc1, 0x300, 0x480, 0xc00, 0x4b564e00, u32::MAX] {
             assert!(!msr_should_serialize(index), "{index:#x}");
         }
+    }
+
+    #[test]
+    fn parse_msr_list_clamps_to_reported_count() {
+        assert_eq!(parse_msr_list(&[1, 0x10, 0, 0]), BTreeSet::from([0x10]));
+        assert_eq!(parse_msr_list(&[0, 0x10, 0]), BTreeSet::new());
+        assert_eq!(parse_msr_list(&[5, 0x10, 0x17b, 0x122]), BTreeSet::from([0x10, 0x122]));
+        assert_eq!(parse_msr_list(&[]), BTreeSet::new());
     }
 
     #[test]

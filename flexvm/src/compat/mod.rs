@@ -250,9 +250,9 @@ fn node(m: &std::fs::Metadata) -> (u64, u64) {
     (m.dev(), m.ino())
 }
 
-/// Immutable boot-time identity cached once per process to avoid re-reading `/proc/cpuinfo` and `boot_id`.
-fn boot_identity() -> Result<&'static (String, Vec<String>)> {
-    static BOOT: OnceLock<(String, Vec<String>)> = OnceLock::new();
+/// Immutable boot-time identity cached once per process to avoid re-reading `boot_id`.
+fn boot_id() -> Result<&'static str> {
+    static BOOT: OnceLock<String> = OnceLock::new();
     if let Some(cached) = BOOT.get() {
         return Ok(cached);
     }
@@ -260,9 +260,13 @@ fn boot_identity() -> Result<&'static (String, Vec<String>)> {
     if boot_id.trim().is_empty() {
         bail!("empty boot id");
     }
-    // A late microcode load changes what the CPU reports; a host that shows no revision (a guest,
-    // a non-x86 CPU) keeps an empty, still stable, key rather than probing every time.
-    let mut microcode: Vec<_> = std::fs::read_to_string("/proc/cpuinfo")?
+    Ok(BOOT.get_or_init(|| boot_id))
+}
+
+/// A late microcode load changes what the CPU reports; a host that shows no revision (a guest,
+/// a non-x86 CPU) keeps an empty, still stable, key rather than probing every time.
+fn microcode_revisions(cpuinfo: &Path) -> Result<Vec<String>> {
+    let mut microcode: Vec<_> = std::fs::read_to_string(cpuinfo)?
         .lines()
         .filter_map(|line| {
             let (key, value) = line.split_once(':')?;
@@ -270,12 +274,17 @@ fn boot_identity() -> Result<&'static (String, Vec<String>)> {
         })
         .collect();
     microcode.dedup();
-    Ok(BOOT.get_or_init(|| (boot_id, microcode)))
+    Ok(microcode)
 }
 
 impl HostKey {
     fn local(firecracker: Stamp) -> Result<Self> {
-        let (boot_id, microcode) = boot_identity()?.clone();
+        Self::local_at(firecracker, Path::new("/proc/cpuinfo"), Path::new("/dev/kvm"))
+    }
+
+    fn local_at(firecracker: Stamp, cpuinfo: &Path, kvm: &Path) -> Result<Self> {
+        let boot_id = boot_id()?.to_owned();
+        let microcode = microcode_revisions(cpuinfo)?;
         let mut modules = vec![None; KVM_MODULES.len()];
         for (slot, name) in modules.iter_mut().zip(KVM_MODULES) {
             match std::fs::metadata(format!("/sys/module/{name}")) {
@@ -285,7 +294,7 @@ impl HostKey {
             }
         }
         let flexvm = Stamp::of(&std::fs::metadata("/proc/self/exe")?);
-        Ok(Self { boot_id, microcode, flexvm, firecracker, kvm: node(&std::fs::metadata("/dev/kvm")?), modules })
+        Ok(Self { boot_id, microcode, flexvm, firecracker, kvm: node(&std::fs::metadata(kvm)?), modules })
     }
 }
 
@@ -646,5 +655,20 @@ mod tests {
         std::fs::create_dir(root.join("firecracker.json")).unwrap();
         assert_eq!(firecracker_id(&binary, Some(&root)).unwrap(), changed);
         assert_eq!(std::fs::read_to_string(calls).unwrap().lines().count(), 5);
+    }
+
+    #[test]
+    fn microcode_update_changes_host_key_within_same_process() {
+        let root = crate::test_util::TempDir::new("host-compat-microcode");
+        let cpuinfo = root.join("cpuinfo");
+        let stamp = Stamp::of(&std::fs::metadata(&root).unwrap());
+        std::fs::write(&cpuinfo, "processor\t: 0\nmicrocode\t: 0x10\nprocessor\t: 1\nmicrocode\t: 0x10\n").unwrap();
+        let before = HostKey::local_at(stamp.clone(), &cpuinfo, &root).unwrap();
+        assert_eq!(before.microcode, vec!["0x10"]);
+        std::fs::write(&cpuinfo, "processor\t: 0\nmicrocode\t: 0x11\nprocessor\t: 1\nmicrocode\t: 0x11\n").unwrap();
+        let after = HostKey::local_at(stamp, &cpuinfo, &root).unwrap();
+        assert_eq!(after.microcode, vec!["0x11"]);
+        assert_eq!(before.boot_id, after.boot_id);
+        assert_ne!(before, after);
     }
 }
