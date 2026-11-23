@@ -1819,8 +1819,6 @@ pub fn spawn_self_child<S: AsRef<std::ffi::OsStr>>(
                     None => Ok(None),
                 }
             };
-            // A VM process's raised limit is its own: a flexvm child raises its own if it needs to.
-            restore_nofile()?;
             default_stop_signals()?;
             let (fd4, fd5) = (aside(fd4)?, aside(fd5)?);
             // dup2 onto itself would leave it close-on-exec.
@@ -1832,6 +1830,10 @@ pub fn spawn_self_child<S: AsRef<std::ffi::OsStr>>(
                     libc::close(k);
                 }
             }
+            // A VM process's raised limit is its own: a flexvm child raises its own if it needs to.
+            // Restored after `aside` (`F_DUPFD`) so open O_CLOEXEC descriptors >= original soft limit
+            // do not cause EMFILE before exec closes them.
+            restore_nofile()?;
             Ok(())
         });
     }
@@ -2875,6 +2877,64 @@ mod tests {
         let was = was.to_string();
         let args = ["--exact", "util::tests::a_raised_open_file_limit_is_not_passed_on"];
         let mut child = spawn_self_child(&args, &log, log.as_raw_fd(), None, None, &[(CHILD, "self"), ("FLEXVM_TEST_NOFILE_WAS", &was)]).unwrap();
+        let status = child.wait().unwrap();
+        assert!(status.success(), "{status}: {}", std::fs::read_to_string(dir.join("log")).unwrap_or_default());
+    }
+
+    #[test]
+    fn spawn_self_child_restores_nofile_after_dup_when_parent_exceeds_original_soft_limit() {
+        const CHILD: &str = "FLEXVM_TEST_NOFILE_EMFILE";
+        let soft = || unsafe {
+            let mut limit: libc::rlimit = std::mem::zeroed();
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+            (limit.rlim_cur, limit.rlim_max)
+        };
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::process::CommandExt;
+            let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+            cmd.args(["--exact", "util::tests::spawn_self_child_restores_nofile_after_dup_when_parent_exceeds_original_soft_limit"]).env(CHILD, "1");
+            unsafe {
+                cmd.pre_exec(|| {
+                    let mut limit: libc::rlimit = std::mem::zeroed();
+                    check(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit))?;
+                    limit.rlim_cur = 64.min(limit.rlim_max);
+                    check(libc::setrlimit(libc::RLIMIT_NOFILE, &limit))
+                });
+            }
+            assert!(cmd.status().unwrap().success());
+            return;
+        }
+        let (was, hard) = soft();
+        if std::env::var(CHILD).unwrap() == "self" {
+            assert_eq!(std::env::var("FLEXVM_TEST_NOFILE_WAS").unwrap(), was.to_string());
+            return;
+        }
+        raise_nofile();
+        assert_eq!(soft(), (hard, hard));
+        let dir = crate::test_util::TempDir::new("nofile-emfile");
+        let log = std::fs::File::create(dir.join("log")).unwrap();
+        let fd4 = std::fs::File::open("/dev/null").unwrap();
+        let fd5 = std::fs::File::open("/dev/null").unwrap();
+        // Occupy every descriptor slot below the original soft limit with O_CLOEXEC files.
+        let mut held = Vec::new();
+        if hard > was {
+            let target = (was as usize + 16).min((hard as usize).saturating_sub(16));
+            for _ in 0..target {
+                held.push(std::fs::File::open("/dev/null").unwrap());
+            }
+        }
+        let was_str = was.to_string();
+        let args = ["--exact", "util::tests::spawn_self_child_restores_nofile_after_dup_when_parent_exceeds_original_soft_limit"];
+        let mut child = spawn_self_child(
+            &args,
+            &log,
+            log.as_raw_fd(),
+            Some(fd4.as_raw_fd()),
+            Some(fd5.as_raw_fd()),
+            &[(CHILD, "self"), ("FLEXVM_TEST_NOFILE_WAS", &was_str)],
+        )
+        .unwrap();
+        drop(held);
         let status = child.wait().unwrap();
         assert!(status.success(), "{status}: {}", std::fs::read_to_string(dir.join("log")).unwrap_or_default());
     }

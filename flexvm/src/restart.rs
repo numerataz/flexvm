@@ -116,8 +116,13 @@ pub fn due(host: &Host, name: &str, start: impl Fn(&str) -> Result<()>) -> Resul
             Ok(()) => return Ok(()),
             Err(e) => {
                 // Unless it was started, stopped, removed or run again meanwhile: then that is what holds.
+                let _lock = match crate::host::lock_path(&host.vms(name, "lock")?, libc::LOCK_EX | libc::LOCK_NB) {
+                    Ok(lock) => lock,
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(err) => return Err(err.into()),
+                };
                 match pending(host, name) {
-                    Some(mut r) if r.restart_due == Some(at) && !host.alive(name) => {
+                    Some(mut r) if r.restart_due == Some(at) => {
                         retry = (retry * 2).min(crate::app::MAX_BACKOFF);
                         crate::log!("vm {name}: restart failed: {e}; trying again in {} ms", retry.as_millis());
                         r.restart_due = Some(now_ms() + retry.as_millis() as u64);
@@ -133,6 +138,7 @@ pub fn due(host: &Host, name: &str, start: impl Fn(&str) -> Result<()>) -> Resul
 /// `stop` of a VM whose restart is due: it is not run again (as docker's stop ends a restart loop), and is left
 /// exited. False if none was due.
 pub fn cancel(host: &Host, name: &str) -> Result<bool> {
+    let _lock = crate::host::lock_path(&host.vms(name, "lock")?, libc::LOCK_EX)?;
     let Some(mut rec) = pending(host, name) else { return Ok(false) };
     rec.restart_due = None;
     crate::host::store_private(&host.vms(name, "exited")?, &rec, true)?;
@@ -155,6 +161,10 @@ pub fn after_boot(host: &Host) {
 }
 
 fn boot_one(host: &Host, name: &str) -> Result<()> {
+    boot_one_with(host, name, |n| schedule(host, n))
+}
+
+fn boot_one_with(host: &Host, name: &str, schedule: impl FnOnce(&str) -> Result<()>) -> Result<()> {
     let mut rec: Exited = match crate::host::load(&kept_path(host, name)?)? {
         Some(r) => r,
         None => return Ok(()),
@@ -172,9 +182,10 @@ fn boot_one(host: &Host, name: &str) -> Result<()> {
         return Ok(());
     }
     let lost = host.has_record(name, "lost");
+    let waiting = rec.restart_due.is_some();
     // An exited record (one written since the boot) is its own, as is a VM gone without a trace of it here.
-    if !lost || !policy.after_boot(false) || host.has_record(name, "exited") {
-        if !lost && !host.has_record(name, "exited") {
+    if (!lost && !waiting) || !policy.after_boot(false) || host.has_record(name, "exited") {
+        if !lost && !waiting && !host.has_record(name, "exited") {
             forget(host, name);
         }
         return Ok(());
@@ -185,7 +196,7 @@ fn boot_one(host: &Host, name: &str) -> Result<()> {
     crate::host::store_private(&host.vms(name, "exited")?, &rec, true)?;
     // The loss is told by the restart now: its lost record would refuse the name to it.
     let _ = std::fs::remove_file(host.vms(name, "lost")?);
-    schedule(host, name)
+    schedule(name)
 }
 
 /// The VMs stopped by hand (on disk, which a reboot keeps) whose policy is `always`: started, as docker starts
@@ -299,5 +310,77 @@ mod tests {
         std::fs::write(host.vms("failing", "lost").unwrap(), "rebooted").unwrap();
         let r: Exited = crate::host::load(&kept_path(&host, "failing").unwrap()).unwrap().unwrap();
         assert!(r.spec.restart.as_ref().unwrap().after_boot(false), "a reboot's loss is no stop");
+    }
+
+    #[test]
+    fn a_reboot_during_backoff_recreates_exited_and_keeps_restart_record() {
+        let dir = crate::test_util::TempDir::new("restart-boot-backoff");
+        let host = Host::open(&dir.join("state"), &dir.join("run")).unwrap();
+        let mut r = rec(1, "on-failure");
+        assert!(on_exit(&mut r, Duration::ZERO));
+        keep(&host, "backoff", &r).unwrap();
+        // Clean exit withdrew its IP before reboot, so no `.lost` marker exists and tmpfs `.exited` is gone.
+        assert!(!host.has_record("backoff", "lost"));
+        assert!(!host.has_record("backoff", "exited"));
+        let mut scheduled = Vec::new();
+        boot_one_with(&host, "backoff", |n| {
+            scheduled.push(n.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(scheduled, ["backoff"]);
+        assert!(host.has_record("backoff", "exited"));
+        assert!(Exited::read(&host.vms("backoff", "exited").unwrap()).unwrap().restart_due.is_some());
+        assert!(kept_path(&host, "backoff").unwrap().exists());
+    }
+
+    #[test]
+    fn due_and_cancel_serialize_on_name_lock_and_do_not_resurrect_removed_or_cancelled_records() {
+        let dir = crate::test_util::TempDir::new("restart-lock");
+        let host = Host::open(&dir.join("state"), &dir.join("run")).unwrap();
+
+        // 1. If `NAME.lock` is held when `due`'s `start` fails, `due` yields without overwriting `.exited`.
+        let mut r = rec(1, "always");
+        r.restart_due = Some(1);
+        crate::host::store_private(&host.vms("held", "exited").unwrap(), &r, true).unwrap();
+        let held_lock = std::sync::Mutex::new(None);
+        due(&host, "held", |_| {
+            *held_lock.lock().unwrap() = Some(crate::host::lock_path(&host.vms("held", "lock").unwrap(), libc::LOCK_EX | libc::LOCK_NB).unwrap());
+            Err("busy".into())
+        })
+        .unwrap();
+        drop(held_lock);
+        assert_eq!(Exited::read(&host.vms("held", "exited").unwrap()).unwrap().restart_due, Some(1));
+
+        // 2. If `cancel` clears `restart_due` while `due`'s `start` fails, `due` does not overwrite the cancellation.
+        let mut r = rec(1, "always");
+        r.restart_due = Some(1);
+        crate::host::store_private(&host.vms("cancelled", "exited").unwrap(), &r, true).unwrap();
+        due(&host, "cancelled", |_| {
+            assert!(cancel(&host, "cancelled").unwrap());
+            Err("stopped".into())
+        })
+        .unwrap();
+        assert_eq!(Exited::read(&host.vms("cancelled", "exited").unwrap()).unwrap().restart_due, None);
+
+        // 3. `cancel` blocks on `NAME.lock` and re-reads `pending` under the lock, so a concurrent `rm` is not resurrected.
+        let mut r = rec(1, "always");
+        r.restart_due = Some(now_ms() + 60_000);
+        crate::host::store_private(&host.vms("removed", "exited").unwrap(), &r, true).unwrap();
+        let lock = crate::host::lock_path(&host.vms("removed", "lock").unwrap(), libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let state = host.state.clone();
+        let run = host.run.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let h = Host::open(&state, &run).unwrap();
+            tx.send(()).unwrap();
+            cancel(&h, "removed").unwrap()
+        });
+        rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::remove_file(host.vms("removed", "exited").unwrap()).unwrap();
+        drop(lock);
+        assert!(!handle.join().unwrap());
+        assert!(!host.has_record("removed", "exited"));
     }
 }
