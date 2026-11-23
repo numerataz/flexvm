@@ -450,29 +450,11 @@ pub fn rfc3339_secs(secs: u64) -> String {
 
 /// Percent-decoding, `+` as a space (form encoding, as Go's query parser).
 fn decode(s: &str) -> String {
-    let b = s.as_bytes();
-    let (mut out, mut i) = (Vec::with_capacity(b.len()), 0);
-    while i < b.len() {
-        match b[i] {
-            b'+' => out.push(b' '),
-            // Two hex digits (from_str_radix alone would take a sign).
-            b'%' => match b
-                .get(i + 1..i + 3)
-                .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
-                .and_then(|h| u8::from_str_radix(std::str::from_utf8(h).ok()?, 16).ok())
-            {
-                Some(v) => {
-                    out.push(v);
-                    i += 3;
-                    continue;
-                }
-                None => out.push(b'%'),
-            },
-            c => out.push(c),
-        }
-        i += 1;
+    if s.contains('+') {
+        percent_encoding::percent_decode_str(&s.replace('+', " ")).decode_utf8_lossy().into_owned()
+    } else {
+        percent_encoding::percent_decode_str(s).decode_utf8_lossy().into_owned()
     }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -608,6 +590,8 @@ mod tests {
         assert_eq!(old.filters().unwrap(), [("status".to_string(), "running".to_string())]);
         assert!(Query::parse("filters=%5B%5D").filters().is_err());
         assert_eq!(decode("%41%4a%4B"), "AJK");
+        assert_eq!(decode("a%2Bb"), "a+b");
+        assert_eq!(decode("%ff"), "\u{fffd}");
         assert_eq!(decode("100%"), "100%");
         assert_eq!(decode("%4"), "%4");
         assert_eq!(decode("%-1"), "%-1", "two hex digits, not a sign");

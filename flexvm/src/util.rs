@@ -1518,10 +1518,7 @@ fn run_until_with_stdin(cmd: &mut std::process::Command, input: Option<&[u8]>, s
 /// `n` random bytes, hex-encoded.
 pub fn random_hex(n: usize) -> io::Result<String> {
     let mut random = vec![0u8; n];
-    let mut filled = 0;
-    while filled < n {
-        filled += eintr(|| unsafe { libc::getrandom(random[filled..].as_mut_ptr().cast(), n - filled, 0) })? as usize;
-    }
+    getrandom::getrandom(&mut random).map_err(|e| e.raw_os_error().map_or_else(|| io::Error::other(e.to_string()), io::Error::from_raw_os_error))?;
     Ok(random.iter().map(|b| format!("{b:02x}")).collect())
 }
 

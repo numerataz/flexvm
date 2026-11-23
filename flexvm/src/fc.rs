@@ -494,30 +494,42 @@ fn exchange(r: &mut BufReader<crate::util::By<UnixStream>>, mut req: &[u8], sent
     if line.is_empty() {
         bail!("closed the connection without answering");
     }
-    let code: u16 = line.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
-    if code == 0 || !line.ends_with("\r\n") {
+    if !line.ends_with("\r\n") {
         bail!("invalid response status");
     }
-    let mut len = None;
-    let mut close = false;
-    let mut headers = 0;
+    let mut head = line.as_bytes().to_vec();
+    let mut header_lines = 0;
     loop {
         response_line(r, &mut line)?;
         if !line.ends_with("\r\n") {
             bail!("incomplete response headers");
         }
+        head.extend_from_slice(line.as_bytes());
         if line == "\r\n" {
             break;
         }
-        headers += 1;
-        if headers > API_HEADERS {
+        header_lines += 1;
+        if header_lines > API_HEADERS {
             bail!("too many response headers");
         }
-        let Some((k, v)) = line.trim_end().split_once(':') else {
-            bail!("invalid response header");
-        };
-        if k.eq_ignore_ascii_case("content-length") {
-            let n: usize = v.trim().parse()?;
+    }
+    let mut header_buf = [httparse::EMPTY_HEADER; API_HEADERS];
+    let mut resp = httparse::Response::new(&mut header_buf);
+    let parsed = match resp.parse(&head) {
+        Ok(httparse::Status::Complete(n)) => n,
+        Ok(httparse::Status::Partial) => bail!("incomplete response headers"),
+        Err(httparse::Error::TooManyHeaders) => bail!("too many response headers"),
+        Err(e) => bail!("invalid response: {e}"),
+    };
+    if parsed != head.len() {
+        bail!("invalid response headers");
+    }
+    let code = resp.code.ok_or("invalid response status")?;
+    let mut len = None;
+    let mut close = false;
+    for h in resp.headers {
+        if h.name.eq_ignore_ascii_case("content-length") {
+            let n: usize = std::str::from_utf8(h.value)?.trim().parse()?;
             if n > API_BODY {
                 bail!("response body too large");
             }
@@ -525,9 +537,9 @@ fn exchange(r: &mut BufReader<crate::util::By<UnixStream>>, mut req: &[u8], sent
                 bail!("conflicting content lengths");
             }
             len = Some(n);
-        } else if k.eq_ignore_ascii_case("connection") {
-            close |= v.split(',').any(|v| v.trim().eq_ignore_ascii_case("close"));
-        } else if k.eq_ignore_ascii_case("transfer-encoding") {
+        } else if h.name.eq_ignore_ascii_case("connection") {
+            close |= std::str::from_utf8(h.value)?.split(',').any(|v| v.trim().eq_ignore_ascii_case("close"));
+        } else if h.name.eq_ignore_ascii_case("transfer-encoding") {
             bail!("unsupported transfer encoding");
         }
     }
@@ -1293,6 +1305,8 @@ mod tests {
             &b"HTTP/1.1 200 OK\r\n\r\n"[..],
             &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nx"[..],
             &b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
+            &b"GARBAGE 200 OK\r\nContent-Length: 0\r\n\r\n"[..],
+            &b"HTTP/1.1 200 OK\r\nBad Header: 1\r\nContent-Length: 0\r\n\r\n"[..],
         ] {
             let server = Server::new(move |listener| answer(&mut accept(&listener), response));
             let api = Api::default();
