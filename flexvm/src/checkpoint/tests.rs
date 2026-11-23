@@ -793,9 +793,7 @@ fn instances_with_different_run_directories_share_a_destinations_lock() {
     let _b = crate::host::Host::open(&two.join("state"), &two.join("run")).unwrap();
     let st = |p: &std::path::Path| {
         let f = fs::File::open(p).unwrap();
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        assert_eq!(unsafe { libc::fstat(std::os::fd::AsRawFd::as_raw_fd(&f), &mut st) }, 0);
-        st
+        crate::util::fstat(std::os::fd::AsRawFd::as_raw_fd(&f)).unwrap()
     };
     let held = super::staging::parent_lock(&st(&dest), libc::LOCK_EX).unwrap();
     // As the other instance would take it, through another path to the same directory.

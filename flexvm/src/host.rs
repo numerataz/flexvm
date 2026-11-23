@@ -6021,7 +6021,7 @@ pub fn host_locks() -> std::io::Result<OwnedFd> {
 pub const HOST_LOCKS: &str = "/run/flexvm-locks";
 
 /// A host lock's name: `KIND-DEV-INO` of the directory `st` describes, then `rest`.
-pub fn keyed(kind: &str, st: &libc::stat, rest: &str) -> String {
+pub fn keyed(kind: &str, st: &rustix::fs::Stat, rest: &str) -> String {
     format!("{kind}-{}-{}{rest}", st.st_dev, st.st_ino)
 }
 
@@ -6044,7 +6044,7 @@ impl Directory {
         Self { path: fd_path(fd.as_raw_fd()), fd }
     }
 
-    pub fn stat(&self) -> std::io::Result<libc::stat> {
+    pub fn stat(&self) -> std::io::Result<rustix::fs::Stat> {
         crate::util::fstat(self.fd.as_raw_fd())
     }
 }
@@ -6107,7 +6107,7 @@ fn acquire(dir: &OwnedFd, name: &std::ffi::OsStr, take: impl Fn(&File) -> std::i
 
 /// The use lock of the file or directory `st` describes (`shared_at` while used, `lock_at`
 /// exclusively to remove it): image root filesystems and template generations.
-pub fn use_lock(st: &libc::stat) -> String {
+pub fn use_lock(st: &rustix::fs::Stat) -> String {
     keyed("use", st, "")
 }
 
@@ -6174,7 +6174,16 @@ mod lock_tests {
 }
 
 pub fn flock(f: &File, how: i32) -> std::io::Result<()> {
-    crate::util::eintr(|| unsafe { libc::flock(f.as_raw_fd(), how) }).map(drop)
+    let op = match how {
+        x if x == libc::LOCK_SH => rustix::fs::FlockOperation::LockShared,
+        x if x == libc::LOCK_EX => rustix::fs::FlockOperation::LockExclusive,
+        x if x == libc::LOCK_UN => rustix::fs::FlockOperation::Unlock,
+        x if x == (libc::LOCK_SH | libc::LOCK_NB) => rustix::fs::FlockOperation::NonBlockingLockShared,
+        x if x == (libc::LOCK_EX | libc::LOCK_NB) => rustix::fs::FlockOperation::NonBlockingLockExclusive,
+        x if x == (libc::LOCK_UN | libc::LOCK_NB) => rustix::fs::FlockOperation::NonBlockingUnlock,
+        _ => return Err(std::io::Error::from_raw_os_error(libc::EINVAL)),
+    };
+    crate::util::retry_eintr(|| rustix::fs::flock(f, op)).map_err(Into::into)
 }
 
 /// One blocked flock per lock file in this process, shared by every bounded wait for it

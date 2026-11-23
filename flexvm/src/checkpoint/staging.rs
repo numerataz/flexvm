@@ -22,14 +22,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-fn publish_permissions(fd: RawFd, mode: libc::mode_t, owner: &libc::stat) -> io::Result<()> {
+fn publish_permissions(fd: RawFd, mode: libc::mode_t, owner: &rustix::fs::Stat) -> io::Result<()> {
     check(unsafe { libc::fchown(fd, owner.st_uid, owner.st_gid) })?;
     check(unsafe { libc::fchmod(fd, mode) })
 }
 
 /// The lock on a checkpoint destination's directory (`st`, its stat) while staging is made
 /// there and stale staging cleared: one per directory on the host, whichever instance.
-pub(super) fn parent_lock(st: &libc::stat, how: i32) -> io::Result<crate::host::HeldLock> {
+pub(super) fn parent_lock(st: &rustix::fs::Stat, how: i32) -> io::Result<crate::host::HeldLock> {
     crate::host::lock_at(crate::host::host_locks()?, &crate::host::keyed("checkpoint", st, ""), how)
 }
 
@@ -301,7 +301,7 @@ impl Staging {
     /// accepts an existing content-addressed entry (`Ok(false)`); a checkpoint must be new.
     fn publish(&mut self, import: bool) -> std::result::Result<bool, CommitError> {
         let (outer, parent) = (self.outer.as_raw_fd(), self.parent.as_raw_fd());
-        match check(crate::util::rename_at(outer, c"ck", parent, &self.base, libc::RENAME_NOREPLACE)) {
+        match crate::util::rename_at(outer, c"ck", parent, &self.base, libc::RENAME_NOREPLACE) {
             Err(e) if import && matches!(e.raw_os_error(), Some(libc::EEXIST | libc::ENOTEMPTY)) => return Ok(false),
             r => r.map_err(|e| format!("publish checkpoint at {}: {e}", self.dest.display()))?,
         }

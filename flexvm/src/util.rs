@@ -1,6 +1,6 @@
 use std::ffi::{CStr, CString};
 use std::io::{self, BufRead, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
@@ -505,9 +505,14 @@ pub fn check(rc: libc::c_int) -> io::Result<()> {
 
 /// Opens `name` in `dir` with close-on-exec; callers choose whether to follow symlinks.
 pub fn openat(dir: RawFd, name: &CStr, flags: libc::c_int) -> io::Result<OwnedFd> {
-    let fd = unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_CLOEXEC, 0o600) };
-    check(fd)?;
-    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    let dir = if dir == libc::AT_FDCWD {
+        rustix::fs::CWD
+    } else {
+        // SAFETY: Callers pass an open directory descriptor that outlives this syscall.
+        unsafe { BorrowedFd::borrow_raw(dir) }
+    };
+    let oflags = rustix::fs::OFlags::from_bits_retain(flags as u32) | rustix::fs::OFlags::CLOEXEC;
+    Ok(rustix::fs::openat(dir, name, oflags, rustix::fs::Mode::from_raw_mode(0o600))?)
 }
 
 pub fn open_dir_at(dir: RawFd, name: &CStr) -> io::Result<OwnedFd> {
@@ -527,23 +532,36 @@ pub fn open_readonly_at(dir: RawFd, name: &CStr) -> io::Result<std::fs::File> {
 /// Whether `fd` is owned by this effective UID with none of `forbidden` permission bits set.
 pub fn is_owned_fd(fd: RawFd, forbidden: libc::mode_t) -> io::Result<bool> {
     let st = fstat(fd)?;
-    Ok(st.st_uid == unsafe { libc::geteuid() } && st.st_mode & forbidden == 0)
+    Ok(st.st_uid == rustix::process::geteuid().as_raw() && st.st_mode & forbidden == 0)
 }
 
-pub fn fstat(fd: RawFd) -> io::Result<libc::stat> {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    check(unsafe { libc::fstat(fd, &mut st) })?;
-    Ok(st)
+pub fn fstat(fd: RawFd) -> io::Result<rustix::fs::Stat> {
+    // SAFETY: Callers pass an open file descriptor that outlives this syscall.
+    Ok(rustix::fs::fstat(unsafe { BorrowedFd::borrow_raw(fd) })?)
 }
 
 pub fn cpath(p: &Path) -> Result<CString> {
     Ok(CString::new(p.as_os_str().as_bytes()).map_err(|_| format!("NUL in path {p:?}"))?)
 }
 
-pub fn stat_at(dir: RawFd, name: &CStr) -> Option<libc::stat> {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH) };
-    (rc == 0).then_some(st)
+pub fn stat_at(dir: RawFd, name: &CStr) -> Option<rustix::fs::Stat> {
+    let dir = if dir == libc::AT_FDCWD {
+        rustix::fs::CWD
+    } else {
+        // SAFETY: Callers pass an open directory descriptor that outlives this syscall.
+        unsafe { BorrowedFd::borrow_raw(dir) }
+    };
+    rustix::fs::statat(dir, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW | rustix::fs::AtFlags::EMPTY_PATH).ok()
+}
+
+/// Retries a `rustix` syscall on `EINTR`.
+pub fn retry_eintr<T>(mut f: impl FnMut() -> rustix::io::Result<T>) -> rustix::io::Result<T> {
+    loop {
+        match f() {
+            Err(rustix::io::Errno::INTR) => continue,
+            res => return res,
+        }
+    }
 }
 
 /// Retries on EINTR; a negative return is the OS error.
@@ -1046,6 +1064,8 @@ pub fn peer_pid(s: &UnixStream) -> io::Result<u32> {
 }
 
 pub fn peer_cred(s: &UnixStream) -> io::Result<libc::ucred> {
+    // Do not use `rustix::net::sockopt::socket_peercred`: its `UCred.pid` is `NonZeroI32`,
+    // whereas Linux returns `pid == 0` for a peer in an ancestor/different PID namespace (#1146).
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
     if unsafe { libc::getsockopt(s.as_raw_fd(), libc::SOL_SOCKET, libc::SO_PEERCRED, (&mut cred as *mut libc::ucred).cast(), &mut len) } < 0 {
@@ -1055,16 +1075,26 @@ pub fn peer_cred(s: &UnixStream) -> io::Result<libc::ucred> {
 }
 
 pub fn pidfd_open(pid: u32) -> io::Result<OwnedFd> {
-    let fd = eintr(|| unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) })?;
-    Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+    let pid = rustix::process::Pid::from_raw(pid as i32).ok_or_else(|| io::Error::from_raw_os_error(libc::EINVAL))?;
+    Ok(retry_eintr(|| rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()))?)
 }
 
 pub fn pidfd_signal(pidfd: &OwnedFd, sig: i32) -> io::Result<()> {
+    if let Some(signal) = rustix::process::Signal::from_named_raw(sig) {
+        return Ok(retry_eintr(|| rustix::process::pidfd_send_signal(pidfd, signal))?);
+    }
+    // Signal 0 (liveness probe) and real-time signals have no `rustix::process::Signal` constant.
     eintr(|| unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd.as_raw_fd(), sig, std::ptr::null::<libc::siginfo_t>(), 0) }).map(drop)
 }
 
 pub fn pidfd_kill(pidfd: &OwnedFd) -> io::Result<()> {
-    pidfd_signal(pidfd, libc::SIGKILL).or_else(|e| if e.raw_os_error() == Some(libc::ESRCH) { Ok(()) } else { Err(e) })
+    retry_eintr(|| rustix::process::pidfd_send_signal(pidfd, rustix::process::Signal::KILL)).map_err(io::Error::from).or_else(|e| {
+        if e.raw_os_error() == Some(libc::ESRCH) {
+            Ok(())
+        } else {
+            Err(e)
+        }
+    })
 }
 
 /// Whether `fd` has input (or hung up) within `timeout`.
@@ -1263,7 +1293,7 @@ fn synced_ancestors() -> &'static std::sync::Mutex<std::collections::HashSet<Dir
 
 fn dir_stamp(fd: RawFd) -> io::Result<DirStamp> {
     let st = fstat(fd)?;
-    Ok((st.st_dev as u64, st.st_ino as u64, st.st_ctime, st.st_ctime_nsec))
+    Ok((st.st_dev as u64, st.st_ino as u64, st.st_ctime, st.st_ctime_nsec as i64))
 }
 
 fn sync_uncached_dirs(dirs: Vec<std::fs::File>, use_cache: bool) -> io::Result<()> {
@@ -1380,9 +1410,7 @@ fn walk_up(dir: RawFd, seen: &mut Seen, sync: &mut impl FnMut(&std::fs::File) ->
     let (mut cur, mut id) = (None::<std::fs::File>, dir_id(dir)?);
     loop {
         let fd = cur.as_ref().map_or(dir, |f| f.as_raw_fd());
-        let up = unsafe { libc::openat(fd, c"..".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
-        check(up)?;
-        let up = unsafe { std::fs::File::from_raw_fd(up) };
+        let up = std::fs::File::from(openat(fd, c"..", libc::O_RDONLY | libc::O_DIRECTORY)?);
         let up_id = dir_id(up.as_raw_fd())?;
         if up_id == id || !seen.insert((up_id, None)) {
             return Ok(());
@@ -1393,10 +1421,8 @@ fn walk_up(dir: RawFd, seen: &mut Seen, sync: &mut impl FnMut(&std::fs::File) ->
 }
 
 fn dir_id(fd: RawFd) -> io::Result<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    // Borrowed, never closed here.
-    let f = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
-    f.metadata().map(|m| (m.dev(), m.ino()))
+    let st = fstat(fd)?;
+    Ok((st.st_dev as u64, st.st_ino as u64))
 }
 
 /// Removes `path` if it is there, then fsyncs its directory.
@@ -1414,19 +1440,17 @@ static NOFILE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(
 /// connection). Children spawned through `unblock_signals_in` or `spawn_self_child` get the limit this process had back:
 /// some programs close every descriptor up to it, or `select` on them.
 pub fn raise_nofile() {
-    unsafe {
-        let mut limit: libc::rlimit = std::mem::zeroed();
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 || limit.rlim_cur >= limit.rlim_max {
-            return;
-        }
-        let was = limit.rlim_cur;
-        limit.rlim_cur = limit.rlim_max;
-        if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
-            crate::log!("raising the open file limit: {}", io::Error::last_os_error());
-            return;
-        }
-        NOFILE.store(was.saturating_add(1), std::sync::atomic::Ordering::SeqCst);
+    let mut limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+    let (Some(was), max) = (limit.current, limit.maximum) else { return };
+    if max.is_some_and(|m| was >= m) {
+        return;
     }
+    limit.current = max;
+    if let Err(e) = rustix::process::setrlimit(rustix::process::Resource::Nofile, limit) {
+        crate::log!("raising the open file limit: {}", io::Error::from(e));
+        return;
+    }
+    NOFILE.store(was.saturating_add(1), std::sync::atomic::Ordering::SeqCst);
 }
 
 /// In a child before exec: the soft open-file limit back to what `raise_nofile` found.
@@ -1435,12 +1459,10 @@ fn restore_nofile() -> io::Result<()> {
     if was == 0 {
         return Ok(());
     }
-    unsafe {
-        let mut limit: libc::rlimit = std::mem::zeroed();
-        check(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit))?;
-        limit.rlim_cur = (was - 1).min(limit.rlim_max);
-        check(libc::setrlimit(libc::RLIMIT_NOFILE, &limit))
-    }
+    let mut limit = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+    let target = was - 1;
+    limit.current = Some(limit.maximum.map_or(target, |m| target.min(m)));
+    Ok(rustix::process::setrlimit(rustix::process::Resource::Nofile, limit)?)
 }
 
 /// Clears the signal mask of `cmd`'s child, which exec keeps: a spawner that blocks signals to
@@ -1530,19 +1552,26 @@ pub fn is_nonce(s: &str) -> bool {
     s.len() == 16 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-/// Linux renameat2 is not exported by every libc, including musl. Both names
-/// stay valid C strings for the synchronous syscall; its result is 0 or -1.
-pub fn rename_at(from_dir: RawFd, from: &CStr, to_dir: RawFd, to: &CStr, flags: libc::c_uint) -> libc::c_int {
-    unsafe { libc::syscall(libc::SYS_renameat2, from_dir, from.as_ptr(), to_dir, to.as_ptr(), flags) as libc::c_int }
+/// Linux `renameat2` via `rustix`.
+pub fn rename_at(from_dir: RawFd, from: &CStr, to_dir: RawFd, to: &CStr, flags: libc::c_uint) -> io::Result<()> {
+    let borrow = |fd: RawFd| {
+        if fd == libc::AT_FDCWD {
+            rustix::fs::CWD
+        } else {
+            // SAFETY: Callers pass an open directory descriptor that outlives this syscall.
+            unsafe { BorrowedFd::borrow_raw(fd) }
+        }
+    };
+    let flags = rustix::fs::RenameFlags::from_bits_retain(flags);
+    Ok(rustix::fs::renameat_with(borrow(from_dir), from, borrow(to_dir), to, flags)?)
 }
 
 /// False if `path` exists.
 pub fn rename_noreplace(tmp: &Path, path: &Path) -> io::Result<bool> {
-    use std::os::unix::ffi::OsStrExt;
-    let (src, dest) = (std::ffi::CString::new(tmp.as_os_str().as_bytes())?, std::ffi::CString::new(path.as_os_str().as_bytes())?);
-    match eintr(|| rename_at(libc::AT_FDCWD, &src, libc::AT_FDCWD, &dest, libc::RENAME_NOREPLACE)) {
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-        res => res.map(|_| true),
+    match retry_eintr(|| rustix::fs::renameat_with(rustix::fs::CWD, tmp, rustix::fs::CWD, path, rustix::fs::RenameFlags::NOREPLACE)) {
+        Err(rustix::io::Errno::EXIST) => Ok(false),
+        Ok(()) => Ok(true),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -1645,25 +1674,19 @@ pub fn create_dir_durably(dir: &Path, mode: u32) -> io::Result<()> {
 
 /// Sent by `at`.
 pub fn send_with_fds(s: &UnixStream, line: &[u8], fds: &[RawFd], at: Instant) -> io::Result<()> {
-    let mut iov = libc::iovec { iov_base: line.as_ptr() as *mut libc::c_void, iov_len: line.len() };
-    let space = unsafe { libc::CMSG_SPACE(std::mem::size_of_val(fds) as u32) } as usize;
-    let mut cbuf = vec![0u64; space.div_ceil(std::mem::size_of::<u64>())];
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    if !fds.is_empty() {
-        msg.msg_control = cbuf.as_mut_ptr().cast();
-        msg.msg_controllen = space as _;
-        unsafe {
-            let c = libc::CMSG_FIRSTHDR(&msg);
-            (*c).cmsg_level = libc::SOL_SOCKET;
-            (*c).cmsg_type = libc::SCM_RIGHTS;
-            (*c).cmsg_len = libc::CMSG_LEN(std::mem::size_of_val(fds) as u32) as _;
-            std::ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(c) as *mut RawFd, fds.len());
-        }
+    use rustix::net::{sendmsg, SendAncillaryBuffer, SendAncillaryMessage, SendFlags};
+    use std::mem::MaybeUninit;
+
+    let iov = [io::IoSlice::new(line)];
+    // SAFETY: Callers pass open file descriptors that outlive this syscall.
+    let borrowed: Vec<BorrowedFd<'_>> = fds.iter().map(|&fd| unsafe { BorrowedFd::borrow_raw(fd) }).collect();
+    let mut space = vec![MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(fds.len()))];
+    let mut control = SendAncillaryBuffer::new(&mut space);
+    if !borrowed.is_empty() {
+        assert!(control.push(SendAncillaryMessage::ScmRights(&borrowed)));
     }
     s.set_write_timeout(Some(By { s: (), at }.left()?))?;
-    let n = eintr(|| unsafe { libc::sendmsg(s.as_raw_fd(), &msg, libc::MSG_NOSIGNAL) }).map_err(timed_out)? as usize;
+    let n = retry_eintr(|| sendmsg(s, &iov, &mut control, SendFlags::NOSIGNAL)).map_err(|e| timed_out(e.into()))?;
     By { s, at }.write_all(&line[n..])
 }
 
@@ -1702,32 +1725,25 @@ pub fn recv_with_fds(s: &UnixStream, max: usize, mut ready: impl FnMut() -> io::
 
 /// Receives one message and owns all SCM_RIGHTS descriptors, closing them on error.
 pub fn recvmsg_fds(fd: RawFd, buf: &mut [u8]) -> io::Result<(usize, Vec<OwnedFd>)> {
+    use rustix::net::{recvmsg, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags};
+    use std::mem::MaybeUninit;
+
+    let mut iov = [io::IoSliceMut::new(buf)];
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(64))];
+    let mut control = RecvAncillaryBuffer::new(&mut space);
+    // SAFETY: Callers pass an open socket descriptor that outlives this syscall.
+    let socket = unsafe { BorrowedFd::borrow_raw(fd) };
+    let msg = retry_eintr(|| recvmsg(socket, &mut iov, &mut control, RecvFlags::CMSG_CLOEXEC))?;
     let mut fds = Vec::new();
-    let mut iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
-    let mut cbuf = [0u64; 32];
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = cbuf.as_mut_ptr().cast();
-    msg.msg_controllen = std::mem::size_of_val(&cbuf) as _;
-    let n = eintr(|| unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_CMSG_CLOEXEC) })?;
-    unsafe {
-        let mut c = libc::CMSG_FIRSTHDR(&msg);
-        while !c.is_null() {
-            if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
-                let n = ((*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / std::mem::size_of::<RawFd>();
-                let data = libc::CMSG_DATA(c) as *const RawFd;
-                for i in 0..n {
-                    fds.push(OwnedFd::from_raw_fd(std::ptr::read_unaligned(data.add(i))));
-                }
-            }
-            c = libc::CMSG_NXTHDR(&msg, c);
+    for cmsg in control.drain() {
+        if let RecvAncillaryMessage::ScmRights(received) = cmsg {
+            fds.extend(received);
         }
     }
-    if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+    if msg.flags.contains(ReturnFlags::CTRUNC) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "ancillary fds truncated"));
     }
-    Ok((n as usize, fds))
+    Ok((msg.bytes, fds))
 }
 
 /// Also in threads started afterwards, so only `wait_signal` sees them.
@@ -1870,9 +1886,7 @@ pub fn start_reaper() -> io::Result<RawFd> {
     if let Some(fd) = &*wake {
         return Ok(fd.as_raw_fd());
     }
-    let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-    check(fd)?;
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let fd = rustix::event::eventfd(0, rustix::event::EventfdFlags::CLOEXEC | rustix::event::EventfdFlags::NONBLOCK)?;
     let raw = fd.as_raw_fd();
     // Never closed: the thread polls it for good.
     std::thread::Builder::new().name("reaper".into()).spawn(move || reaper(raw))?;
@@ -3287,6 +3301,42 @@ mod tests {
         std::fs::write(root.join("f"), "").unwrap();
         assert!(sync_dir(&root.join("f")).is_err());
     }
+
+    #[test]
+    fn peer_cred_allows_zero_pid_across_pid_namespaces() {
+        const CHILD_SOCK: &str = "FLEXVM_PEERCRED_PIDNS_SOCK";
+        if let Some(sock) = std::env::var_os(CHILD_SOCK) {
+            let stream = UnixStream::connect(sock).unwrap();
+            let cred = peer_cred(&stream).unwrap();
+            assert_eq!(cred.pid, 0, "ancestor PID namespace peer must report pid 0");
+            assert_eq!(cred.uid, rustix::process::geteuid().as_raw());
+            return;
+        }
+        // Same-namespace sanity check.
+        let (a, _b) = UnixStream::pair().unwrap();
+        let cred = peer_cred(&a).unwrap();
+        assert_eq!(cred.pid as u32, std::process::id());
+        assert_eq!(cred.uid, rustix::process::geteuid().as_raw());
+
+        // Cross-PID-namespace check: listener in ancestor PID ns, client in child PID ns.
+        if !std::process::Command::new("unshare").args(["-Urpf", "true"]).status().is_ok_and(|s| s.success()) {
+            return;
+        }
+        let dir = crate::test_util::TempDir::new("peercred-pidns");
+        let sock = dir.join("peer.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let accept = std::thread::spawn(move || listener.accept().unwrap().0);
+        let out = std::process::Command::new("unshare")
+            .args(["-Urpf"])
+            .arg(std::env::current_exe().unwrap())
+            .args(["--exact", "util::tests::peer_cred_allows_zero_pid_across_pid_namespaces", "--nocapture"])
+            .env(CHILD_SOCK, &sock)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "child failed:\nstdout: {}\nstderr: {}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        let accepted = accept.join_within().unwrap();
+        assert_eq!(peer_cred(&accepted).unwrap().uid, rustix::process::geteuid().as_raw());
+    }
 }
 
 /// A VM process's stdout and stderr: pipes that relay threads copy to the
@@ -3550,8 +3600,9 @@ pub mod output {
 
     /// `name` in `dir`, opened with `flags` (and 0600 if made); never through a link.
     pub fn open_in(dir: &File, name: &std::ffi::CStr, flags: i32) -> std::io::Result<File> {
-        let fd = super::eintr(|| unsafe { libc::openat(dir.as_raw_fd(), name.as_ptr(), flags | libc::O_CLOEXEC | libc::O_NOFOLLOW, 0o600) })?;
-        Ok(unsafe { File::from_raw_fd(fd) })
+        let oflags = rustix::fs::OFlags::from_bits_retain(flags as u32) | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW;
+        let fd = super::retry_eintr(|| rustix::fs::openat(dir, name, oflags, rustix::fs::Mode::from_raw_mode(0o600)))?;
+        Ok(File::from(fd))
     }
 
     /// Appends `data` to `log` in `dir` (a VM's logs), holding the directory's lock (a flock of
@@ -3566,8 +3617,7 @@ pub mod output {
         let written = open_in(dir, c"log", libc::O_WRONLY | libc::O_APPEND | libc::O_CREAT).is_ok_and(|mut f| {
             let written = f.write_all(data).is_ok();
             if lock.is_some() && f.metadata().is_ok_and(|m| m.len() > cap) {
-                let d = dir.as_raw_fd();
-                unsafe { libc::renameat(d, c"log".as_ptr(), d, c"log.1".as_ptr()) };
+                let _ = rustix::fs::renameat(dir, c"log", dir, c"log.1");
             }
             written
         });

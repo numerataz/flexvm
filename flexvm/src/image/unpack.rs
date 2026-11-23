@@ -5,11 +5,14 @@ use std::collections::HashSet;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 
+use rustix::fs::{self as rfs, AtFlags, FileType, Mode, OFlags, ResolveFlags, Timespec, Timestamps, XattrFlags};
+use rustix::io::Errno;
+use rustix::process::{Gid, Uid};
 use sha2::{Digest, Sha256};
 
 use crate::bail;
@@ -45,6 +48,10 @@ const MAX_ZSTD_WINDOW: u64 = 128 << 20;
 
 pub fn check(rc: libc::c_int, what: &str, path: &Path) -> Result<()> {
     crate::util::check(rc).map_err(|e| format!("{what} {path:?}: {e}").into())
+}
+
+fn check_io(res: rustix::io::Result<()>, what: &str, path: &Path) -> Result<()> {
+    res.map_err(|e| format!("{what} {path:?}: {}", io::Error::from(e)).into())
 }
 
 /// `p` with `..` applied lexically, clamped at the root as inside a root.
@@ -85,8 +92,8 @@ pub fn open_at(dir: RawFd, name: &CStr, flags: i32) -> Result<OwnedFd> {
 
 /// Gives an injected file to the builder: root in production (unpacking chowns to any image uid),
 /// the test user in an unprivileged test run.
-fn own(fd: &impl AsRawFd, rel: &Path) -> Result<()> {
-    check(unsafe { libc::fchown(fd.as_raw_fd(), libc::geteuid(), libc::getegid()) }, "chown", rel)
+fn own(fd: &impl AsFd, rel: &Path) -> Result<()> {
+    check_io(rfs::fchown(fd, Some(rustix::process::geteuid()), Some(rustix::process::getegid())), "chown", rel)
 }
 
 pub fn open_dir_at(dir: RawFd, name: &CStr) -> Result<OwnedFd> {
@@ -106,18 +113,18 @@ fn list_dir(dir: RawFd) -> Result<Vec<CString>> {
     names.map(|e| Ok(CString::new(e?.file_name().into_vec()).unwrap())).collect()
 }
 
-fn unlink_at(dir: RawFd, name: &CStr) -> Result<()> {
-    match (unsafe { libc::unlinkat(dir, name.as_ptr(), 0) } < 0).then(io::Error::last_os_error) {
-        Some(e) if e.raw_os_error() != Some(libc::ENOENT) => bail!("unlink {name:?}: {e}"),
+fn unlink_at(dir: impl AsFd, name: &CStr) -> Result<()> {
+    match rfs::unlinkat(dir, name, AtFlags::empty()) {
+        Err(e) if e != Errno::NOENT => bail!("unlink {name:?}: {}", io::Error::from(e)),
         _ => Ok(()),
     }
 }
 
 /// Unlinks everything in `dir` but directories, which it returns.
-fn empty_but_dirs(dir: RawFd) -> Result<Vec<CString>> {
+fn empty_but_dirs(dir: BorrowedFd<'_>) -> Result<Vec<CString>> {
     let mut dirs = Vec::new();
-    for child in list_dir(dir)? {
-        match is_type(dir, &child, libc::S_IFDIR) {
+    for child in list_dir(dir.as_raw_fd())? {
+        match is_type(dir.as_raw_fd(), &child, libc::S_IFDIR) {
             true => dirs.push(child),
             false => unlink_at(dir, &child)?,
         }
@@ -128,19 +135,22 @@ fn empty_but_dirs(dir: RawFd) -> Result<Vec<CString>> {
 /// Removes `name` in `dir` recursively, never leaving `dir`. However deep the tree, it holds
 /// one descriptor: it climbs back out through `..`, keeping only names.
 pub fn remove_at(dir: RawFd, name: &CStr) -> Result<()> {
-    if !is_type(dir, name, libc::S_IFDIR) {
+    // SAFETY: Callers pass an open directory descriptor that outlives this call.
+    remove_at_fd(unsafe { BorrowedFd::borrow_raw(dir) }, name)
+}
+
+fn remove_at_fd(dir: BorrowedFd<'_>, name: &CStr) -> Result<()> {
+    if !is_type(dir.as_raw_fd(), name, libc::S_IFDIR) {
         return unlink_at(dir, name);
     }
-    let rmdir = |at: RawFd, name: &CStr| {
-        check(unsafe { libc::unlinkat(at, name.as_ptr(), libc::AT_REMOVEDIR) }, "rmdir", Path::new(OsStr::from_bytes(name.to_bytes())))
-    };
-    let mut cur = open_dir_at(dir, name)?;
+    let rmdir = |at: BorrowedFd<'_>, name: &CStr| check_io(rfs::unlinkat(at, name, AtFlags::REMOVEDIR), "rmdir", Path::new(OsStr::from_bytes(name.to_bytes())));
+    let mut cur = open_dir_at(dir.as_raw_fd(), name)?;
     // Each level's name and the subdirectories still to remove in it.
-    let mut stack = vec![(name.to_owned(), empty_but_dirs(cur.as_raw_fd())?)];
+    let mut stack = vec![(name.to_owned(), empty_but_dirs(cur.as_fd())?)];
     while let Some((name, pending)) = stack.last_mut() {
         if let Some(child) = pending.pop() {
             cur = open_dir_at(cur.as_raw_fd(), &child)?;
-            stack.push((child, empty_but_dirs(cur.as_raw_fd())?));
+            stack.push((child, empty_but_dirs(cur.as_fd())?));
             continue;
         }
         let name = std::mem::take(name);
@@ -149,7 +159,7 @@ pub fn remove_at(dir: RawFd, name: &CStr) -> Result<()> {
             return rmdir(dir, &name);
         }
         cur = open_dir_at(cur.as_raw_fd(), c"..")?;
-        rmdir(cur.as_raw_fd(), &name)?;
+        rmdir(cur.as_fd(), &name)?;
     }
     unreachable!()
 }
@@ -236,7 +246,7 @@ pub(super) struct At {
 
 impl At {
     fn remove(&self) -> Result<()> {
-        remove_at(self.dir.as_raw_fd(), &self.name)
+        remove_at_fd(self.dir.as_fd(), &self.name)
     }
 
     fn create(&self) -> Result<File> {
@@ -247,16 +257,17 @@ impl At {
     /// Sets an xattr on the entry itself. When an open descriptor is provided (for regular files),
     /// sets it directly via `fsetxattr` to avoid reopening and procfs resolution.
     /// Otherwise uses an O_PATH fd so device nodes and FIFOs are never opened and symlinks never followed.
-    fn set_xattr(&self, key: &str, value: &[u8], fd: Option<RawFd>) -> Result<()> {
+    fn set_xattr(&self, key: &str, value: &[u8], fd: Option<BorrowedFd<'_>>) -> Result<()> {
         let key = CString::new(key).map_err(|_| "NUL in xattr name")?;
         let res = match fd {
-            Some(fd) => unsafe { libc::fsetxattr(fd, key.as_ptr(), value.as_ptr().cast(), value.len(), 0) },
+            Some(fd) => rfs::fsetxattr(fd, key.as_c_str(), value, XattrFlags::empty()),
             None => {
-                let fd = open_at(self.dir.as_raw_fd(), &self.name, libc::O_PATH | libc::O_NOFOLLOW)?;
-                unsafe { libc::setxattr(proc_path(&fd).as_ptr(), key.as_ptr(), value.as_ptr().cast(), value.len(), 0) }
+                let fd = rfs::openat(&self.dir, self.name.as_c_str(), OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())
+                    .map_err(|e| format!("open {:?}: {}", self.name, io::Error::from(e)))?;
+                rfs::setxattr(proc_path(&fd).as_c_str(), key.as_c_str(), value, XattrFlags::empty())
             }
         };
-        check(res, "setxattr", Path::new(""))
+        check_io(res, "setxattr", Path::new(""))
     }
 }
 
@@ -441,27 +452,23 @@ impl Root {
         Ok(made)
     }
 
-    fn openat2(&self, rel: &[u8], flags: i32) -> io::Result<OwnedFd> {
+    fn openat2(&self, rel: &[u8], flags: OFlags) -> io::Result<OwnedFd> {
         let path = CString::new(if rel.is_empty() { b".".as_slice() } else { rel }).map_err(|_| io::Error::other("NUL in path"))?;
-        let mut how: libc::open_how = unsafe { std::mem::zeroed() };
-        how.flags = (flags | libc::O_CLOEXEC) as u64;
-        how.resolve = libc::RESOLVE_IN_ROOT | libc::RESOLVE_NO_MAGICLINKS;
+        let flags = flags | OFlags::CLOEXEC;
+        let resolve = ResolveFlags::IN_ROOT | ResolveFlags::NO_MAGICLINKS;
         for attempt in 0..100 {
-            let fd = unsafe { libc::syscall(libc::SYS_openat2, self.fd.as_raw_fd(), path.as_ptr(), &how, std::mem::size_of::<libc::open_how>()) };
-            if fd >= 0 {
-                return Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) });
-            }
-            let err = io::Error::last_os_error();
-            // RESOLVE_IN_ROOT can race even with unrelated renames elsewhere on the system.
-            if attempt == 99 || !matches!(err.raw_os_error(), Some(libc::EAGAIN | libc::EINTR)) {
-                return Err(err);
+            match rfs::openat2(&self.fd, path.as_c_str(), flags, Mode::empty(), resolve) {
+                Ok(fd) => return Ok(fd),
+                // RESOLVE_IN_ROOT can race even with unrelated renames elsewhere on the system.
+                Err(Errno::AGAIN | Errno::INTR) if attempt < 99 => continue,
+                Err(err) => return Err(err.into()),
             }
         }
         unreachable!()
     }
 
     fn resolve(&self, rel: &Path) -> io::Result<OwnedFd> {
-        self.openat2(rel.as_os_str().as_bytes(), libc::O_PATH | libc::O_DIRECTORY)
+        self.openat2(rel.as_os_str().as_bytes(), OFlags::PATH | OFlags::DIRECTORY)
     }
 
     fn mkdir_p(&mut self, rel: &Path, depth: u32) -> Result<OwnedFd> {
@@ -483,15 +490,13 @@ impl Root {
                 Ok(next) => next,
                 Err(e) if e.raw_os_error() == Some(libc::ENOENT) => {
                     self.check_entry_limit()?;
-                    if unsafe { libc::mkdirat(fd.as_raw_fd(), name.as_ptr(), 0o755) } == 0 {
+                    if rfs::mkdirat(&fd, name.as_c_str(), Mode::from_raw_mode(0o755)).is_ok() {
                         self.entries += 1;
                     } else {
                         // A dangling symlink (say var/run -> /run): create its target, as container runtimes do.
-                        let mut buf = vec![0u8; 4096];
-                        let n = unsafe { libc::readlinkat(fd.as_raw_fd(), name.as_ptr(), buf.as_mut_ptr().cast(), buf.len()) };
-                        check(n as i32, "mkdir", &cur)?;
+                        let link = rfs::readlinkat(&fd, name.as_c_str(), Vec::new()).map_err(|e| format!("mkdir {cur:?}: {}", io::Error::from(e)))?;
                         // Relative to where the link really is, which a symlinked parent may have moved.
-                        let target = self.real(&fd)?.join(OsStr::from_bytes(&buf[..n as usize]));
+                        let target = self.real(&fd)?.join(OsStr::from_bytes(link.as_bytes()));
                         self.mkdir_p(&lexical(&target), depth + 1)?;
                     }
                     self.resolve(&cur)?
@@ -617,14 +622,13 @@ impl Root {
             }
             forget(at.dir.as_raw_fd(), &at.name, mine, 0)?;
         }
-        let (dfd, name) = (at.dir.as_raw_fd(), at.name.as_ptr());
         match kind {
             T::Directory => {
-                if !is_type(dfd, &at.name, libc::S_IFDIR) {
+                if !is_type(at.dir.as_raw_fd(), &at.name, libc::S_IFDIR) {
                     self.invalidate_parent_cache();
                     self.create(|| {
                         at.remove()?;
-                        check(unsafe { libc::mkdirat(dfd, name, 0o700) }, "mkdir", rel)
+                        check_io(rfs::mkdirat(&at.dir, at.name.as_c_str(), Mode::from_raw_mode(0o700)), "mkdir", rel)
                     })?;
                 }
             }
@@ -638,7 +642,7 @@ impl Root {
                 // No bigger than the file: most are small, and a 256 KiB buffer each would be an mmap.
                 let mut file = self.create(|| Ok(BufWriter::with_capacity((e.size() as usize).min(256 << 10), at.create()?)))?;
                 io::copy(e, &mut file).and_then(|_| file.flush()).map_err(|err| format!("write {rel:?}: {err}"))?;
-                self.has_xattrs |= Self::file_metadata(&at, &h, &m, rel, file.get_ref().as_raw_fd())?;
+                self.has_xattrs |= Self::file_metadata(&at, &h, &m, rel, file.get_ref().as_fd())?;
                 return Ok(at);
             }
             T::Symlink => {
@@ -646,14 +650,14 @@ impl Root {
                 let target = m.link.as_ref().ok_or("symlink without target")?;
                 self.create(|| {
                     at.remove()?;
-                    check(unsafe { libc::symlinkat(cpath(target)?.as_ptr(), dfd, name) }, "symlink", rel)
+                    check_io(rfs::symlinkat(cpath(target)?.as_c_str(), &at.dir, at.name.as_c_str()), "symlink", rel)
                 })?;
             }
             T::Link => {
                 let src = src.unwrap();
                 self.create(|| {
                     at.remove()?;
-                    check(unsafe { libc::linkat(src.dir.as_raw_fd(), src.name.as_ptr(), dfd, name, 0) }, "link", rel)
+                    check_io(rfs::linkat(&src.dir, src.name.as_c_str(), &at.dir, at.name.as_c_str(), AtFlags::empty()), "link", rel)
                 })?;
                 // A hard link shares its target's inode and metadata.
                 return Ok(at);
@@ -661,13 +665,13 @@ impl Root {
             T::Char | T::Block | T::Fifo => {
                 self.create(|| {
                     at.remove()?;
-                    let fmt = match kind {
-                        T::Char => libc::S_IFCHR,
-                        T::Block => libc::S_IFBLK,
-                        _ => libc::S_IFIFO,
+                    let file_type = match kind {
+                        T::Char => FileType::CharacterDevice,
+                        T::Block => FileType::BlockDevice,
+                        _ => FileType::Fifo,
                     };
-                    let dev = libc::makedev(h.device_major()?.unwrap_or(0), h.device_minor()?.unwrap_or(0));
-                    check(unsafe { libc::mknodat(dfd, name, fmt | 0o600, dev) }, "mknod", rel)
+                    let dev = rfs::makedev(h.device_major()?.unwrap_or(0), h.device_minor()?.unwrap_or(0));
+                    check_io(rfs::mknodat(&at.dir, at.name.as_c_str(), file_type, Mode::from_raw_mode(0o600), dev), "mknod", rel)
                 })?;
             }
             other => bail!("unsupported tar entry type {other:?} at {rel:?}"),
@@ -676,28 +680,27 @@ impl Root {
         Ok(at)
     }
 
-    fn file_metadata(at: &At, h: &tar::Header, m: &Meta, rel: &Path, fd: RawFd) -> Result<bool> {
+    fn file_metadata(at: &At, h: &tar::Header, m: &Meta, rel: &Path, fd: BorrowedFd<'_>) -> Result<bool> {
         Self::metadata(at, h, m, rel, Some(fd))
     }
 
-    fn metadata(at: &At, h: &tar::Header, m: &Meta, rel: &Path, fd: Option<RawFd>) -> Result<bool> {
-        let (dfd, name) = (at.dir.as_raw_fd(), at.name.as_ptr());
+    fn metadata(at: &At, h: &tar::Header, m: &Meta, rel: &Path, fd: Option<BorrowedFd<'_>>) -> Result<bool> {
         let kind = h.entry_type();
-        let nofollow = libc::AT_SYMLINK_NOFOLLOW;
-        let mode = (h.mode()? & 0o7777) as libc::mode_t;
+        let mode = Mode::from_raw_mode((h.mode()? & 0o7777) as libc::mode_t);
         if m.uid == u32::MAX || m.gid == u32::MAX {
             bail!("invalid uid/gid on {rel:?}");
         }
+        let (uid, gid) = (Some(Uid::from_raw(m.uid)), Some(Gid::from_raw(m.gid)));
         match fd {
             Some(fd) => {
-                check(unsafe { libc::fchown(fd, m.uid, m.gid) }, "chown", rel)?;
-                check(unsafe { libc::fchmod(fd, mode) }, "chmod", rel)?;
+                check_io(rfs::fchown(fd, uid, gid), "chown", rel)?;
+                check_io(rfs::fchmod(fd, mode), "chmod", rel)?;
             }
             None => {
-                check(unsafe { libc::fchownat(dfd, name, m.uid, m.gid, nofollow) }, "chown", rel)?;
+                check_io(rfs::chownat(&at.dir, at.name.as_c_str(), uid, gid, AtFlags::SYMLINK_NOFOLLOW), "chown", rel)?;
                 if kind != tar::EntryType::Symlink {
                     // After chown, which clears setuid/setgid bits.
-                    check(unsafe { libc::fchmodat(dfd, name, mode, 0) }, "chmod", rel)?;
+                    check_io(rfs::chmodat(&at.dir, at.name.as_c_str(), mode, AtFlags::empty()), "chmod", rel)?;
                 }
             }
         }
@@ -716,10 +719,11 @@ impl Root {
                 }
             }
         }
-        let ts = [libc::timespec { tv_sec: h.mtime().unwrap_or(0) as i64, tv_nsec: 0 }; 2];
+        let ts = Timespec { tv_sec: h.mtime().unwrap_or(0) as i64, tv_nsec: 0 };
+        let times = Timestamps { last_access: ts, last_modification: ts };
         match fd {
-            Some(fd) => check(unsafe { libc::futimens(fd, ts.as_ptr()) }, "futimens", rel)?,
-            None => check(unsafe { libc::utimensat(dfd, name, ts.as_ptr(), nofollow) }, "utimensat", rel)?,
+            Some(fd) => check_io(rfs::futimens(fd, &times), "futimens", rel)?,
+            None => check_io(rfs::utimensat(&at.dir, at.name.as_c_str(), &times, AtFlags::SYMLINK_NOFOLLOW), "utimensat", rel)?,
         }
         Ok(wrote_xattr)
     }
@@ -788,13 +792,13 @@ impl Root {
             if !kind.is_symlink() && entry.header().mode()? & 0o7000 != 0 {
                 bail!("kernel module artifact has special permission bits");
             }
-            meta.uid = unsafe { libc::geteuid() };
-            meta.gid = unsafe { libc::getegid() };
+            meta.uid = rustix::process::geteuid().as_raw();
+            meta.gid = rustix::process::getegid().as_raw();
             meta.xattrs.clear();
             let at = injected.entry(entry, &rel, meta, &mut mine)?;
             if !kind.is_symlink() {
-                check(
-                    unsafe { libc::fchmodat(at.dir.as_raw_fd(), at.name.as_ptr(), (entry.header().mode()? & 0o755) as libc::mode_t, 0) },
+                check_io(
+                    rfs::chmodat(&at.dir, at.name.as_c_str(), Mode::from_raw_mode((entry.header().mode()? & 0o755) as libc::mode_t), AtFlags::empty()),
                     "chmod module input",
                     &rel,
                 )?;
@@ -813,13 +817,13 @@ impl Root {
             Some(st) if st.st_mode & libc::S_IFMT == libc::S_IFDIR => {}
             Some(_) => bail!("kernel module injection requires a real directory at {rel:?}"),
             None => {
-                self.create(|| check(unsafe { libc::mkdirat(at.dir.as_raw_fd(), at.name.as_ptr(), 0o755) }, "mkdir module directory", rel))?;
+                self.create(|| check_io(rfs::mkdirat(&at.dir, at.name.as_c_str(), Mode::from_raw_mode(0o755)), "mkdir module directory", rel))?;
             }
         }
         let directory = open_dir_at(at.dir.as_raw_fd(), &at.name)?;
         let real = self.real(&directory)?;
         own(&directory, rel)?;
-        check(unsafe { libc::fchmod(directory.as_raw_fd(), 0o755) }, "chmod module directory", rel)?;
+        check_io(rfs::fchmod(&directory, Mode::from_raw_mode(0o755)), "chmod module directory", rel)?;
         Ok(real)
     }
 
@@ -835,9 +839,8 @@ impl Root {
     pub fn ensure_dir(&mut self, rel: &str, mode: u32) -> Result<At> {
         let at = self.at(Path::new(rel), true)?;
         if stat_at(at.dir.as_raw_fd(), &at.name).is_none() {
-            let (dfd, name) = (at.dir.as_raw_fd(), at.name.as_ptr());
-            self.create(|| check(unsafe { libc::mkdirat(dfd, name, 0o700) }, "mkdir", Path::new(rel)))?;
-            check(unsafe { libc::fchmodat(dfd, name, mode, 0) }, "chmod", Path::new(rel))?;
+            self.create(|| check_io(rfs::mkdirat(&at.dir, at.name.as_c_str(), Mode::from_raw_mode(0o700)), "mkdir", Path::new(rel)))?;
+            check_io(rfs::chmodat(&at.dir, at.name.as_c_str(), Mode::from_raw_mode(mode), AtFlags::empty()), "chmod", Path::new(rel))?;
         }
         Ok(at)
     }
@@ -852,7 +855,7 @@ impl Root {
         let at = self.ensure_dir(rel, mode)?;
         let dir = open_dir_at(at.dir.as_raw_fd(), &at.name)?;
         own(&dir, Path::new(rel))?;
-        check(unsafe { libc::fchmod(dir.as_raw_fd(), mode) }, "chmod", Path::new(rel))?;
+        check_io(rfs::fchmod(&dir, Mode::from_raw_mode(mode)), "chmod", Path::new(rel))?;
         Ok(())
     }
 
@@ -862,7 +865,7 @@ impl Root {
         let mut f = self.create(|| at.create())?;
         f.write_all(data)?;
         own(&f, Path::new(rel))?;
-        check(unsafe { libc::fchmod(f.as_raw_fd(), mode) }, "chmod", Path::new(rel))?;
+        check_io(rfs::fchmod(&f, Mode::from_raw_mode(mode)), "chmod", Path::new(rel))?;
         Ok(())
     }
 
@@ -871,7 +874,7 @@ impl Root {
     }
 
     pub fn executable(&self, rel: &str) -> bool {
-        self.openat2(rel.trim_start_matches('/').as_bytes(), libc::O_PATH)
+        self.openat2(rel.trim_start_matches('/').as_bytes(), OFlags::PATH)
             .is_ok_and(|fd| File::from(fd).metadata().is_ok_and(|meta| meta.is_file() && meta.mode() & 0o111 != 0))
     }
 
@@ -879,15 +882,15 @@ impl Root {
         let at = self.at(Path::new(rel), true)?;
         self.invalidate_parent_cache();
         if stat_at(at.dir.as_raw_fd(), &at.name).is_some() {
-            unlink_at(at.dir.as_raw_fd(), &at.name)?;
+            unlink_at(&at.dir, &at.name)?;
         }
         let target = CString::new(target)?;
-        self.create(|| check(unsafe { libc::symlinkat(target.as_ptr(), at.dir.as_raw_fd(), at.name.as_ptr()) }, "symlink", Path::new(rel)))
+        self.create(|| check_io(rfs::symlinkat(target.as_c_str(), &at.dir, at.name.as_c_str()), "symlink", Path::new(rel)))
     }
 
     /// At most 1 MiB of a regular file; anything else (a FIFO, a device) is never opened.
     pub fn read(&self, rel: &str) -> Option<Vec<u8>> {
-        let fd = self.openat2(rel.trim_start_matches('/').as_bytes(), libc::O_PATH).ok()?;
+        let fd = self.openat2(rel.trim_start_matches('/').as_bytes(), OFlags::PATH).ok()?;
         if !is_type(fd.as_raw_fd(), c"", libc::S_IFREG) {
             return None;
         }
@@ -969,8 +972,8 @@ pub(super) mod tests {
         let mut b = tar::Builder::new(Vec::new());
         for &(path, kind, data) in entries {
             let mut h = tar::Header::new_gnu();
-            h.set_uid(unsafe { libc::getuid() } as u64);
-            h.set_gid(unsafe { libc::getgid() } as u64);
+            h.set_uid(rustix::process::getuid().as_raw() as u64);
+            h.set_gid(rustix::process::getgid().as_raw() as u64);
             h.set_mtime(1);
             h.set_mode(if kind == 'f' { 0o4755 } else { 0o755 });
             h.set_size(if kind == 'f' { data.len() as u64 } else { 0 });
@@ -999,8 +1002,8 @@ pub(super) mod tests {
         h.set_entry_type(kind);
         h.set_mode(0o644);
         h.set_size(size);
-        h.set_uid(unsafe { libc::getuid() } as u64);
-        h.set_gid(unsafe { libc::getgid() } as u64);
+        h.set_uid(rustix::process::getuid().as_raw() as u64);
+        h.set_gid(rustix::process::getgid().as_raw() as u64);
         h.set_cksum();
         let mut v = h.as_bytes().to_vec();
         v.resize(512 + size.div_ceil(512) as usize * 512, 0);
@@ -1683,8 +1686,8 @@ pub(super) mod tests {
         h.set_mode(0o4755);
         h.set_mtime(12345678);
         h.set_size(11);
-        h.set_uid(unsafe { libc::getuid() } as u64);
-        h.set_gid(unsafe { libc::getgid() } as u64);
+        h.set_uid(rustix::process::getuid().as_raw() as u64);
+        h.set_gid(rustix::process::getgid().as_raw() as u64);
         h.set_entry_type(tar::EntryType::Regular);
         h.set_cksum();
         b.append_data(&mut h, "regular.txt", b"hello world".as_slice()).unwrap();
