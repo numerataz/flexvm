@@ -264,11 +264,15 @@ otherwise. Then:
    `git tag vX.Y.Z <commit> && git push origin vX.Y.Z`, with the
    `ARTIFACTS_TAG` it names.
    `.github/workflows/release.yml` checks that `versions.sh` there names it,
-   builds the assets with `scripts/release-assets.sh` in a read-only job per
-   architecture, each natively on its own runner (`ubuntu-24.04` and
-   `ubuntu-24.04-arm`; Firecracker uses `cargo build --locked`). A separate
-   job downloads those jobs' uploaded artifacts, attests the six assets and
-   publishes them; only it has write and signing permissions.
+   opens a draft release, and builds the assets with
+   `scripts/release-assets.sh` in a job per architecture, each natively on
+   its own runner (`ubuntu-24.04` and `ubuntu-24.04-arm`; Firecracker uses
+   `cargo build --locked`). Each build job adds its assets to the draft (its
+   token goes to that step only, not to the build). A separate job downloads
+   the draft's assets, checks and attests them, and publishes the release;
+   only it has signing permissions. The assets never become workflow
+   artifacts: they are ~350 MB, and the organisation's artifact storage is
+   500 MB.
 3. Run `scripts/pin-artifacts.sh` on main once the release exists (on either
    architecture). It checks that the tag's commit is in your history, verifies
    the attestations (release.yml at that tag and commit, on a GitHub-hosted
